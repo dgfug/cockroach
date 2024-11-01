@@ -1,3 +1,5 @@
+# knob-opt: sync-event-log
+
 statement ok
 SET CLUSTER SETTING sql.cross_db_views.enabled = TRUE
 
@@ -16,6 +18,15 @@ query TT rowsort
 SELECT table_name, type FROM [SHOW TABLES]
 ----
 tbl  table
+
+# Verify that temp schema is visible in pg_namespace index.
+let $tempSchemaOID
+SELECT oid FROM pg_namespace where nspname LIKE 'pg_temp%'
+
+query B
+SELECT nspname LIKE 'pg_temp%' FROM pg_namespace where oid = $tempSchemaOID
+----
+true
 
 statement ok
 DROP TABLE tbl
@@ -139,10 +150,17 @@ SELECT * from pg_temp.view_on_temp
 2
 
 # A "permanent" view on a temporary table gets upgraded to temporary.
+# Weak isolation levels emit extra notices, so skip them.
+skipif config weak-iso-level-configs
 query T noticetrace
 CREATE VIEW upgrade_temp_view AS SELECT a FROM temp_table
 ----
 NOTICE: view "upgrade_temp_view" will be a temporary view
+
+onlyif config weak-iso-level-configs
+statement ok
+CREATE VIEW upgrade_temp_view AS SELECT a FROM temp_table
+
 
 query I
 SELECT * from pg_temp.upgrade_temp_view
@@ -207,7 +225,13 @@ statement ok
 DROP TABLE perm_table; DROP TABLE ref_temp_table
 
 statement ok
-DROP SEQUENCE pg_temp.temp_seq; DROP SEQUENCE pg_temp.ref_temp_table_a_seq; DROP TABLE a
+DROP SEQUENCE pg_temp.temp_seq; DROP TABLE a
+
+query ITT
+SELECT table_id, name, state
+FROM crdb_internal.tables WHERE name
+LIKE 'ref_temp_table%' AND state = 'PUBLIC'
+----
 
 statement ok
 SET serial_normalization='rowid'
@@ -228,7 +252,10 @@ SELECT * FROM regression_47030
 1
 
 statement ok
-TRUNCATE regression_47030; INSERT INTO regression_47030 VALUES (2)
+TRUNCATE regression_47030
+
+statement ok
+INSERT INTO regression_47030 VALUES (2)
 
 query I
 SELECT * FROM regression_47030
@@ -247,7 +274,7 @@ ALTER TABLE regression_48233 RENAME TO reg_48233
 query IITI rowsort
 SELECT * FROM system.namespace WHERE name LIKE '%48233'
 ----
-50  65  reg_48233  78
+100  117  reg_48233  130
 
 statement error pq: cannot change schema of table with RENAME
 ALTER TABLE reg_48233 RENAME TO public.reg_48233
@@ -263,6 +290,7 @@ ALTER TABLE persistent_48233 RENAME TO pg_temp.pers_48233
 query T
 SELECT schema_name FROM information_schema.schemata WHERE crdb_is_user_defined = 'YES'
 ----
+public
 
 subtest test_53163
 statement ok
@@ -300,6 +328,8 @@ user testuser
 statement ok
 USE to_drop;
 SET experimental_enable_temp_tables=true;
+
+statement ok
 CREATE TABLE not_temp (i INT PRIMARY KEY);
 CREATE TEMPORARY TABLE testuser_tmp (i INT PRIMARY KEY);
 CREATE TEMPORARY VIEW tempuser_view AS SELECT i FROM testuser_tmp;
@@ -309,6 +339,8 @@ user root
 
 statement ok
 USE to_drop;
+
+statement ok
 CREATE TEMPORARY TABLE root_temp (i INT PRIMARY KEY);
 
 let $before_drop
@@ -316,6 +348,8 @@ SELECT now()
 
 statement ok
 USE test;
+
+statement ok
 DROP DATABASE to_drop CASCADE
 
 query T
@@ -335,4 +369,115 @@ to_drop.pg_temp.testuser_tmp
 to_drop.pg_temp.tempuser_view
 to_drop.pg_temp.root_temp
 
+subtest create_after_discard_and_drop_database
+
+statement ok
+ALTER ROLE testuser WITH CREATEDB;
+
 user testuser
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+USE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+DISCARD TEMP
+
+statement error pgcode 42P01 relation "pg_temp.t" does not exist
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+
+statement ok
+DROP DATABASE to_drop CASCADE;
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+
+statement ok
+DROP DATABASE to_drop CASCADE;
+
+subtest end
+
+subtest temp_table_in_other_session
+
+user testuser
+
+statement ok
+USE defaultdb;
+
+statement ok
+CREATE TEMPORARY TABLE from_other_session(i INT PRIMARY KEY)
+
+user root
+
+statement ok
+USE defaultdb
+
+query TT
+SELECT c.relname, a.attname FROM pg_attribute a
+INNER LOOKUP JOIN pg_class c ON c.oid = a.attrelid
+WHERE c.relname = 'from_other_session'
+----
+from_other_session  i
+
+subtest end
+
+# The descriptor for a temp view should not persist after the session creating
+# the temp view ends.
+subtest regression_108751
+
+user root nodeidx=0
+
+statement ok
+CREATE DATABASE database_108751
+
+statement ok
+USE database_108751
+
+statement ok
+SET experimental_enable_temp_tables TO on
+
+statement ok
+CREATE TABLE t_108751 (x int)
+
+statement ok
+CREATE TEMP VIEW t_108751_view (x) AS SELECT x FROM t_108751
+
+let $t_108751_view_id
+SELECT id FROM system.namespace WHERE name = 't_108751_view'
+
+user root nodeidx=0 newsession
+
+statement ok
+USE database_108751
+
+# There should be no descriptor returned here since the session that
+# created the temp view has ended.
+# We retry because dropping a descriptor is not instantaneous.
+query T retry
+SELECT descriptor FROM system.descriptor WHERE id = $t_108751_view_id
+----
+
+statement ok
+DROP DATABASE database_108751 CASCADE
+
+subtest end

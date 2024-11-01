@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geo
 
@@ -18,7 +13,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/s1"
 	"github.com/pierrre/geohash"
 	"github.com/twpayne/go-geom"
@@ -31,8 +27,10 @@ import (
 	"github.com/twpayne/go-geom/encoding/wkt"
 )
 
-// DefaultGeoJSONDecimalDigits is the default number of digits coordinates in GeoJSON.
-const DefaultGeoJSONDecimalDigits = 9
+// FullPrecisionGeoJSON, when used in place of max decimal digits in
+// GeoJSON functions, indicates to GeoJSON that it should use full
+// precision when encoding JSON.
+const FullPrecisionGeoJSON = -1
 
 // SpatialObjectToWKT transforms a given SpatialObject to WKT.
 func SpatialObjectToWKT(so geopb.SpatialObject, maxDecimalDigits int) (geopb.WKT, error) {
@@ -209,7 +207,8 @@ func SpatialObjectToGeoHash(so geopb.SpatialObject, p int) (string, error) {
 		}
 	}
 	if bbox.LoX < -180 || bbox.HiX > 180 || bbox.LoY < -90 || bbox.HiY > 90 {
-		return "", errors.Newf(
+		return "", pgerror.Newf(
+			pgcode.InvalidParameterValue,
 			"object has bounds greater than the bounds of lat/lng, got (%f %f, %f %f)",
 			bbox.LoX, bbox.LoY,
 			bbox.HiX, bbox.HiY,

@@ -1,19 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package democluster
 
 import (
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils/regionlatency"
 )
 
 // DemoLocalityList represents a list of localities for the cockroach
@@ -60,3 +57,10 @@ var defaultLocalities = DemoLocalityList{
 	{Tiers: []roachpb.Tier{{Key: "region", Value: "europe-west1"}, {Key: "az", Value: "c"}}},
 	{Tiers: []roachpb.Tier{{Key: "region", Value: "europe-west1"}, {Key: "az", Value: "d"}}},
 }
+
+// Round-trip latencies collected from http://cloudping.co on 2019-09-11.
+var localityLatencies = regionlatency.RoundTripPairs{
+	{A: "us-east1", B: "us-west1"}:     66 * time.Millisecond,
+	{A: "us-east1", B: "europe-west1"}: 64 * time.Millisecond,
+	{A: "us-west1", B: "europe-west1"}: 146 * time.Millisecond,
+}.ToLatencyMap()

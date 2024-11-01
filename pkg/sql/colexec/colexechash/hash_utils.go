@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexechash
 
@@ -15,8 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // initHash, rehash, and finalizeHash work together to compute the hash value
@@ -38,11 +32,19 @@ import (
 const DefaultInitHashValue = 1
 
 var (
+	uint32OneColumn []uint32
+	uint32TwoColumn []uint32
 	uint64OneColumn []uint64
 	uint64TwoColumn []uint64
 )
 
 func init() {
+	uint32OneColumn = make([]uint32, coldata.MaxBatchSize)
+	uint32TwoColumn = make([]uint32, coldata.MaxBatchSize)
+	for i := range uint32OneColumn {
+		uint32OneColumn[i] = 1
+		uint32TwoColumn[i] = 2
+	}
 	uint64OneColumn = make([]uint64, coldata.MaxBatchSize)
 	uint64TwoColumn = make([]uint64, coldata.MaxBatchSize)
 	for i := range uint64OneColumn {
@@ -60,7 +62,25 @@ func init() {
 // initHash initializes the hash value of each key to its initial state for
 // rehashing purposes.
 // NOTE: initValue *must* be non-zero and nKeys is assumed to be positive.
-func initHash(buckets []uint64, nKeys int, initValue uint64) {
+func initHash(buckets []uint32, nKeys int, initValue uint32) {
+	switch initValue {
+	case 1:
+		for n := 0; n < nKeys; n += copy(buckets[n:], uint32OneColumn) {
+		}
+	case 2:
+		for n := 0; n < nKeys; n += copy(buckets[n:], uint32TwoColumn) {
+		}
+	default:
+		// Early bounds checks.
+		_ = buckets[nKeys-1]
+		for i := 0; i < nKeys; i++ {
+			//gcassert:bce
+			buckets[i] = initValue
+		}
+	}
+}
+
+func initHash64(buckets []uint64, nKeys int, initValue uint64) {
 	switch initValue {
 	case 1:
 		for n := 0; n < nKeys; n += copy(buckets[n:], uint64OneColumn) {
@@ -81,7 +101,7 @@ func initHash(buckets []uint64, nKeys int, initValue uint64) {
 // finalizeHash takes each key's hash value and applies a final transformation
 // onto it so that it fits within numBuckets buckets.
 // NOTE: nKeys is assumed to be positive.
-func finalizeHash(buckets []uint64, nKeys int, numBuckets uint64) {
+func finalizeHash[T uint32 | uint64](buckets []T, nKeys int, numBuckets T) {
 	// Early bounds checks.
 	_ = buckets[nKeys-1]
 	isPowerOfTwo := numBuckets&(numBuckets-1) == 0
@@ -117,9 +137,8 @@ type TupleHashDistributor struct {
 	selections [][]int
 	// cancelChecker is used during the hashing of the rows to distribute to
 	// check for query cancellation.
-	cancelChecker  colexecutils.CancelChecker
-	overloadHelper execgen.OverloadHelper
-	datumAlloc     rowenc.DatumAlloc
+	cancelChecker colexecutils.CancelChecker
+	datumAlloc    tree.DatumAlloc
 }
 
 // NewTupleHashDistributor returns a new TupleHashDistributor.
@@ -148,16 +167,16 @@ func (d *TupleHashDistributor) Distribute(b coldata.Batch, hashCols []uint32) []
 	} else {
 		d.buckets = d.buckets[:n]
 	}
-	initHash(d.buckets, n, d.InitHashValue)
+	initHash64(d.buckets, n, d.InitHashValue)
 
 	// Check if we received a batch with more tuples than the current
 	// allocation size and increase it if so.
-	if n > d.datumAlloc.AllocSize {
-		d.datumAlloc.AllocSize = n
+	if n > d.datumAlloc.DefaultAllocSize {
+		d.datumAlloc.DefaultAllocSize = n
 	}
 
 	for _, i := range hashCols {
-		rehash(d.buckets, b.ColVec(int(i)), n, b.Selection(), d.cancelChecker, &d.overloadHelper, &d.datumAlloc)
+		rehash(d.buckets, b.ColVec(int(i)), n, b.Selection(), d.cancelChecker, &d.datumAlloc)
 	}
 
 	finalizeHash(d.buckets, n, uint64(len(d.selections)))
@@ -199,7 +218,5 @@ func (d *TupleHashDistributor) ResetNumOutputs(numOutputs int) {
 	// old selection vectors and reuse them if possible.
 	oldSelections := d.selections
 	d.selections = make([][]int, numOutputs)
-	for i := range oldSelections {
-		d.selections[i] = oldSelections[i]
-	}
+	copy(d.selections, oldSelections)
 }

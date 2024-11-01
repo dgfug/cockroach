@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -20,13 +15,13 @@ import (
 // indicate that the local execution behavior operates in batches.
 // The word "complement" here contrasts with "specializes" as follows:
 //
-// - batchedPlanNode specializes planNode for the purpose of logical
-//   planning: a node implementing batchedPlanNode behaves in all
-//   respects like a planNode from the perspective of the various
-//   logical planning transforms.
+//   - batchedPlanNode specializes planNode for the purpose of logical
+//     planning: a node implementing batchedPlanNode behaves in all
+//     respects like a planNode from the perspective of the various
+//     logical planning transforms.
 //
-// - batchedPlanNode *replaces* planNode for the purpose of local
-//   execution.
+//   - batchedPlanNode *replaces* planNode for the purpose of local
+//     execution.
 type batchedPlanNode interface {
 	// batchedPlanNode specializes planNode for the purpose of the recursions
 	// on planNode trees performed during logical planning, so it should "inherit"

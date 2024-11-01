@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -29,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -130,7 +125,7 @@ func (o *_OP_LOWERProjOp) ChildCount(verbose bool) int {
 	return 3
 }
 
-func (o *_OP_LOWERProjOp) Child(nth int, verbose bool) execinfra.OpNode {
+func (o *_OP_LOWERProjOp) Child(nth int, verbose bool) execopnode.OpNode {
 	switch nth {
 	case 0:
 		return o.input
@@ -151,7 +146,19 @@ func (o *_OP_LOWERProjOp) Init(ctx context.Context) {
 		return
 	}
 	o.input.Init(o.Ctx)
+	o.leftProjOpChain.Init(o.Ctx)
+	o.rightProjOpChain.Init(o.Ctx)
 }
+
+// {{/*
+//     TODO(yuzefovich): this operator is a bit sketchy because it works only
+//     under the assumption that the projection arms return exactly the same
+//     batch as they are fed (i.e. the projection operators aren't allowed to
+//     populate their own output batches from scratch) and that the deselection
+//     step isn't performed. Refactor this to make more resilient, and this will
+//     allow for simplifying the CASE operator by planning a deselector on top
+//     of its input.
+// */}}
 
 // Next is part of the colexecop.Operator interface.
 // The idea to handle the short-circuiting logic is similar to what caseOp
@@ -163,15 +170,6 @@ func (o *_OP_LOWERProjOp) Init(ctx context.Context) {
 // side projection only on the remaining tuples (i.e. those that were not
 // "subtracted"). Next, it restores the original selection vector and
 // populates the result of the logical operation.
-// {{/*
-//     TODO(yuzefovich): this operator is a bit sketchy because it works only
-//     under the assumption that the projection arms return exactly the same
-//     batch as they are fed (i.e. the projection operators aren't allowed to
-//     populate their own output batches from scratch) and that the deselection
-//     step isn't performed. Refactor this to make more resilient, and this will
-//     allow for simplifying the CASE operator by planning a deselector on top
-//     of its input.
-// */}}
 func (o *_OP_LOWERProjOp) Next() coldata.Batch {
 	batch := o.input.Next()
 	origLen := batch.Length()
@@ -199,7 +197,7 @@ func (o *_OP_LOWERProjOp) Next() coldata.Batch {
 	// fully determines the result of the logical operation.
 	var (
 		knownResult                   bool
-		leftVec, rightVec             coldata.Vec
+		leftVec, rightVec             *coldata.Vec
 		leftValIsNull, rightValIsNull bool
 		leftVal, rightVal             bool
 	)
@@ -274,11 +272,6 @@ func (o *_OP_LOWERProjOp) Next() coldata.Batch {
 	outputCol := batch.ColVec(o.outputIdx)
 	outputVals := outputCol.Bool()
 	outputNulls := outputCol.Nulls()
-	if outputCol.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		outputNulls.UnsetNulls()
-	}
 	// This is where we populate the output - do the actual evaluation of the
 	// logical operation.
 	if leftVec.MaybeHasNulls() {

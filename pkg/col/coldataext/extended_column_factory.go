@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldataext
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -22,14 +18,22 @@ import (
 // operators as well as avoiding introducing dependency from coldata on tree
 // package.
 type extendedColumnFactory struct {
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 }
 
 var _ coldata.ColumnFactory = &extendedColumnFactory{}
 
 // NewExtendedColumnFactory returns an extendedColumnFactory instance.
-func NewExtendedColumnFactory(evalCtx *tree.EvalContext) coldata.ColumnFactory {
+func NewExtendedColumnFactory(evalCtx *eval.Context) coldata.ColumnFactory {
 	return &extendedColumnFactory{evalCtx: evalCtx}
+}
+
+// NewExtendedColumnFactoryNoEvalCtx returns an extendedColumnFactory that will
+// be producing coldata.DatumVecs that aren't fully initialized - the eval
+// context is not set on those vectors. This can be acceptable if the caller
+// cannot provide the eval.Context but also doesn't intend to compare datums.
+func NewExtendedColumnFactoryNoEvalCtx() coldata.ColumnFactory {
+	return &extendedColumnFactory{}
 }
 
 func (cf *extendedColumnFactory) MakeColumn(t *types.T, n int) coldata.Column {
@@ -37,4 +41,23 @@ func (cf *extendedColumnFactory) MakeColumn(t *types.T, n int) coldata.Column {
 		return newDatumVec(t, n, cf.evalCtx)
 	}
 	return coldata.StandardColumnFactory.MakeColumn(t, n)
+}
+
+func (cf *extendedColumnFactory) MakeColumns(columns []coldata.Column, t *types.T, length int) {
+	if typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) != typeconv.DatumVecCanonicalTypeFamily {
+		coldata.StandardColumnFactory.MakeColumns(columns, t, length)
+		return
+	}
+	alloc := make([]tree.Datum, len(columns)*length)
+	wrapperAlloc := make([]datumVec, len(columns))
+	for i := range columns {
+		wrapperAlloc[i] = datumVec{
+			// Deliberately leave type unset since the caller must update it for
+			// each vector.
+			data:    alloc[:length:length],
+			evalCtx: cf.evalCtx,
+		}
+		columns[i] = &wrapperAlloc[i]
+		alloc = alloc[length:]
+	}
 }

@@ -1,20 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package typedesc_test
 
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/redact"
@@ -32,7 +28,7 @@ func TestSafeMessage(t *testing.T) {
 				Name:                     "foo",
 				ID:                       21,
 				Version:                  3,
-				Privileges:               descpb.NewBasePrivilegeDescriptor(security.RootUserName()),
+				Privileges:               catpb.NewBasePrivilegeDescriptor(username.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
 				ArrayTypeID:              117,
@@ -49,7 +45,7 @@ func TestSafeMessage(t *testing.T) {
 				Name:                     "foo",
 				ID:                       21,
 				Version:                  3,
-				Privileges:               descpb.NewBasePrivilegeDescriptor(security.RootUserName()),
+				Privileges:               catpb.NewBasePrivilegeDescriptor(username.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
 				ArrayTypeID:              117,

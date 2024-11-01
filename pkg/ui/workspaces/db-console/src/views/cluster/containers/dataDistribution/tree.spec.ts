@@ -1,14 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import { assert } from "chai";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import {
   flatten,
@@ -62,7 +55,7 @@ describe("tree", () => {
           },
         ],
       ];
-      assert.deepEqual(layoutTreeHorizontal(tree, []), expectedLayout);
+      expect(layoutTreeHorizontal(tree, [])).toEqual(expectedLayout);
     });
 
     it("lays out a tree of inconsistent depth, inserting a placeholder", () => {
@@ -142,7 +135,7 @@ describe("tree", () => {
         ],
       ];
       const actualLayout = layoutTreeHorizontal(tree, []);
-      assert.deepEqual(actualLayout, expectedLayout);
+      expect(actualLayout).toEqual(expectedLayout);
     });
 
     it("inserts placeholders under a collapsed node, if other subtrees are deeper", () => {
@@ -238,7 +231,7 @@ describe("tree", () => {
         ],
       ];
       const actualLayout = layoutTreeHorizontal(tree, []);
-      assert.deepEqual(actualLayout, expectedLayout);
+      expect(actualLayout).toEqual(expectedLayout);
 
       // Collapse e:
       // |      a      |
@@ -301,7 +294,7 @@ describe("tree", () => {
         ],
       ];
       const actualLayoutCollapseE = layoutTreeHorizontal(tree, [["e"]]);
-      assert.deepEqual(actualLayoutCollapseE, expectedLayoutCollapseE);
+      expect(actualLayoutCollapseE).toEqual(expectedLayoutCollapseE);
 
       // Collapse e and b:
       // |     a     |
@@ -337,7 +330,7 @@ describe("tree", () => {
         ],
       ];
       const actualLayoutCollapseBE = layoutTreeHorizontal(tree, [["b"], ["e"]]);
-      assert.deepEqual(actualLayoutCollapseBE, expectedLayoutCollapseBE);
+      expect(actualLayoutCollapseBE).toEqual(expectedLayoutCollapseBE);
     });
   });
 
@@ -414,7 +407,7 @@ describe("tree", () => {
           },
         ];
 
-        assert.deepEqual(actualFlattened, expectedFlattened);
+        expect(actualFlattened).toEqual(expectedFlattened);
       });
 
       it("lays out a tree with a node collapsed", () => {
@@ -451,7 +444,7 @@ describe("tree", () => {
           },
         ];
 
-        assert.deepEqual(actualFlattened, expectedFlattened);
+        expect(actualFlattened).toEqual(expectedFlattened);
       });
     });
 
@@ -489,7 +482,7 @@ describe("tree", () => {
           },
         ];
 
-        assert.deepEqual(actualFlattened, expectedFlattened);
+        expect(actualFlattened).toEqual(expectedFlattened);
       });
 
       it("lays out a tree with a node collapsed", () => {
@@ -518,7 +511,7 @@ describe("tree", () => {
           },
         ];
 
-        assert.deepEqual(actualFlattened, expectedFlattened);
+        expect(actualFlattened).toEqual(expectedFlattened);
       });
     });
   });
@@ -551,7 +544,7 @@ describe("tree", () => {
     it("computes a sum for the roots of both trees", () => {
       const actualSum = sumValuesUnderPaths(rowTree, colTree, [], [], getValue);
       const expectedSum = 1 + 2 + 3 + 4;
-      assert.equal(actualSum, expectedSum);
+      expect(actualSum).toEqual(expectedSum);
     });
 
     it("computes a sum for the root of one tree and the leaf of another", () => {
@@ -563,7 +556,7 @@ describe("tree", () => {
         getValue,
       );
       const expectedSum = 1 + 2;
-      assert.equal(actualSum, expectedSum);
+      expect(actualSum).toEqual(expectedSum);
     });
 
     it("computes a sum for a single cell (two leaves)", () => {
@@ -575,7 +568,7 @@ describe("tree", () => {
         getValue,
       );
       const expectedSum = 2;
-      assert.equal(actualSum, expectedSum);
+      expect(actualSum).toEqual(expectedSum);
     });
   });
 });

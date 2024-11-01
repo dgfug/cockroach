@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 @require '~styl/base/palette.styl'
 @require '~styl/base/layout-vars.styl'
@@ -36,7 +31,7 @@ $subnav-background  = $background-color
     align-items center
 
     .page-config__item
-      margin-right 24px
+      margin-right 12px
 
   &__spread
     display flex
@@ -64,8 +59,7 @@ $subnav-background  = $background-color
 
 .section
   flex 0 0 auto
-  padding 12px 24px 12px 0px
-  max-width $max-window-width
+  padding 12px 40px 12px 0px
   clearfix()
 
   &--heading

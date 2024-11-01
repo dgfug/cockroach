@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -17,7 +12,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -42,15 +38,15 @@ import (
 //
 // Here is the diagram of relationships for argTypeOverload struct:
 //
-//   argTypeOverloadBase            overloadBase
-//            \          \              |
-//            \           ------        |
-//            ↓                 ↓       ↓
-//   argWidthOverloadBase       argTypeOverload
-//               \                /
-//                \              | (single)
-//                ↓              ↓
-//                argWidthOverload
+//	argTypeOverloadBase            overloadBase
+//	         \          \              |
+//	         \           ------        |
+//	         ↓                 ↓       ↓
+//	argWidthOverloadBase       argTypeOverload
+//	            \                /
+//	             \              | (single)
+//	             ↓              ↓
+//	             argWidthOverload
 //
 // lastArgTypeOverload is similar in nature to argTypeOverload in that it
 // describes an overloaded argument, but that argument is the last one, so the
@@ -61,15 +57,15 @@ import (
 //
 // Here is the diagram of relationships for lastArgTypeOverload struct:
 //
-//   argTypeOverloadBase            overloadBase
-//            \          \              |
-//            \           ------        |
-//            ↓                 ↓       ↓
-//   argWidthOverloadBase     lastArgTypeOverload
-//               \                /
-//                \              | (multiple)
-//                ↓              ↓
-//                lastArgWidthOverload
+//	argTypeOverloadBase            overloadBase
+//	         \          \              |
+//	         \           ------        |
+//	         ↓                 ↓       ↓
+//	argWidthOverloadBase     lastArgTypeOverload
+//	            \                /
+//	             \              | (multiple)
+//	             ↓              ↓
+//	             lastArgWidthOverload
 //
 // Two argument overload consists of multiple corresponding to each other
 // argTypeOverloads and lastArgTypeOverloads.
@@ -81,21 +77,21 @@ import (
 // These structs (or their "resolved" equivalents) are intended to be used by
 // the code generation with the following patterns:
 //
-//   switch canonicalTypeFamily {
-//     switch width {
-//       <resolved one arg overload>
-//     }
-//   }
+//	switch canonicalTypeFamily {
+//	  switch width {
+//	    <resolved one arg overload>
+//	  }
+//	}
 //
-//   switch leftCanonicalTypeFamily {
-//     switch leftWidth {
-//       switch rightCanonicalTypeFamily {
-//         switch rightWidth {
-//           <resolved two arg overload>
-//         }
-//       }
-//     }
-//   }
+//	switch leftCanonicalTypeFamily {
+//	  switch leftWidth {
+//	    switch rightCanonicalTypeFamily {
+//	      switch rightWidth {
+//	        <resolved two arg overload>
+//	      }
+//	    }
+//	  }
+//	}
 type overloadBase struct {
 	kind overloadKind
 
@@ -104,8 +100,8 @@ type overloadBase struct {
 	// Only one of CmpOp and BinOp will be set, depending on whether the
 	// overload is a binary operator or a comparison operator. Neither of the
 	// fields will be set when it is a hash or cast overload.
-	CmpOp tree.ComparisonOperator
-	BinOp tree.BinaryOperatorSymbol
+	CmpOp treecmp.ComparisonOperator
+	BinOp treebin.BinaryOperatorSymbol
 }
 
 // overloadKind describes the type of an overload. The word "kind" was chosen
@@ -122,7 +118,7 @@ func (b *overloadBase) String() string {
 	return fmt.Sprintf("%s: %s", b.Name, b.OpStr)
 }
 
-func toString(family types.Family) string {
+func familyToString(family types.Family) string {
 	switch family {
 	case typeconv.DatumVecCanonicalTypeFamily:
 		return "typeconv.DatumVecCanonicalTypeFamily"
@@ -139,7 +135,7 @@ type argTypeOverloadBase struct {
 func newArgTypeOverloadBase(canonicalTypeFamily types.Family) *argTypeOverloadBase {
 	return &argTypeOverloadBase{
 		CanonicalTypeFamily:    canonicalTypeFamily,
-		CanonicalTypeFamilyStr: toString(canonicalTypeFamily),
+		CanonicalTypeFamilyStr: familyToString(canonicalTypeFamily),
 	}
 }
 
@@ -235,7 +231,7 @@ func newArgWidthOverloadBase(
 
 func (b *argWidthOverloadBase) IsBytesLike() bool {
 	switch b.CanonicalTypeFamily {
-	case types.JsonFamily, types.BytesFamily:
+	case types.BytesFamily, types.JsonFamily:
 		return true
 	}
 	return false
@@ -271,6 +267,7 @@ type lastArgWidthOverload struct {
 
 	AssignFunc  assignFunc
 	CompareFunc compareFunc
+	HashFunc    hashFunc
 }
 
 // newLastArgWidthOverload creates a new lastArgWidthOverload. Note that it
@@ -304,12 +301,24 @@ func (o *oneArgOverload) String() string {
 }
 
 // twoArgsResolvedOverload is a utility struct that represents an overload that
-// takes it two arguments and that has been "resolved" (meaning it supports
+// takes in two arguments and that has been "resolved" (meaning it supports
 // only a single type family and a single type width on both sides).
 type twoArgsResolvedOverload struct {
 	*overloadBase
 	Left  *argWidthOverload
 	Right *lastArgWidthOverload
+
+	// Negatable and CaseInsensitive are only used by the LIKE overloads. We
+	// cannot easily extract out a separate struct for those since we're reusing
+	// the same templates as all of the selection / projection operators.
+	Negatable       bool
+	CaseInsensitive bool
+}
+
+// NeedsBinaryOverloadHelper returns true iff the overload is such that it needs
+// access to colexecutils.BinaryOverloadHelper.
+func (o *twoArgsResolvedOverload) NeedsBinaryOverloadHelper() bool {
+	return o.kind == binaryOverload && o.Right.RetVecMethod == "Datum"
 }
 
 // twoArgsResolvedOverloadsInfo contains all overloads that take in two
@@ -351,7 +360,8 @@ type twoArgsResolvedOverloadRightWidthInfo struct {
 
 type assignFunc func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string
 type compareFunc func(targetElem, leftElem, rightElem, leftCol, rightCol string) string
-type castFunc func(to, from, evalCtx, toType string) string
+type castFunc func(to, from, evalCtx, toType, buf string) string
+type hashFunc func(targetElem, vElem, vVec, vIdx string) string
 
 // Assign produces a Go source string that assigns the "targetElem" variable to
 // the result of applying the overload to the two inputs, "leftElem" and
@@ -399,14 +409,8 @@ func (o *lastArgWidthOverload) Compare(
 		leftElem, rightElem, targetElem, leftElem, rightElem, targetElem, targetElem)
 }
 
-func (o *lastArgWidthOverload) UnaryAssign(targetElem, vElem, targetCol, vVec string) string {
-	if o.AssignFunc != nil {
-		if ret := o.AssignFunc(o, targetElem, vElem, "", targetCol, vVec, ""); ret != "" {
-			return ret
-		}
-	}
-	// Default assign form assumes a function operator.
-	return fmt.Sprintf("%s = %s(%s)", targetElem, o.overloadBase.OpStr, vElem)
+func (o *lastArgWidthOverload) AssignHash(targetElem, vElem, vVec, vIdx string) string {
+	return o.HashFunc(targetElem, vElem, vVec, vIdx)
 }
 
 func goTypeSliceName(canonicalTypeFamily types.Family, width int32) string {
@@ -551,7 +555,9 @@ func (b *argWidthOverloadBase) AppendSlice(
 // AppendVal is a function that should only be used in templates.
 func (b *argWidthOverloadBase) AppendVal(target, v string) string {
 	switch b.CanonicalTypeFamily {
-	case types.BytesFamily, types.JsonFamily, typeconv.DatumVecCanonicalTypeFamily:
+	case types.BytesFamily, types.JsonFamily:
+		colexecerror.InternalError(errors.AssertionFailedf("AppendVal should not be called on Bytes vector"))
+	case typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf("%s.AppendVal(%s)", target, v)
 	case types.DecimalFamily:
 		return fmt.Sprintf(`%[1]s = append(%[1]s, apd.Decimal{})
@@ -575,7 +581,7 @@ if %[2]s != nil {
     %[1]s = %[2]s.Size()
 }`, target, value)
 	case types.DecimalFamily:
-		return fmt.Sprintf(`%s := tree.SizeOfDecimal(&%s)`, target, value)
+		return fmt.Sprintf(`%s := %s.Size()`, target, value)
 	case typeconv.DatumVecCanonicalTypeFamily:
 		return fmt.Sprintf(`
 		var %[1]s uintptr
@@ -597,8 +603,8 @@ func (b *argWidthOverloadBase) SetVariableSize(target, value string) string {
 var (
 	lawo = &lastArgWidthOverload{}
 	_    = lawo.Assign
+	_    = lawo.AssignHash
 	_    = lawo.Compare
-	_    = lawo.UnaryAssign
 
 	awob = &argWidthOverloadBase{}
 	_    = awob.GoTypeSliceName
@@ -757,6 +763,7 @@ type nonDatumDatumCustomizer struct {
 
 func registerTypeCustomizers() {
 	typeCustomizers = make(map[typePair]typeCustomizer)
+	// Same type customizers.
 	registerTypeCustomizer(typePair{types.BoolFamily, anyWidth, types.BoolFamily, anyWidth}, boolCustomizer{})
 	registerTypeCustomizer(typePair{types.BytesFamily, anyWidth, types.BytesFamily, anyWidth}, bytesCustomizer{})
 	registerTypeCustomizer(typePair{types.DecimalFamily, anyWidth, types.DecimalFamily, anyWidth}, decimalCustomizer{})
@@ -764,8 +771,6 @@ func registerTypeCustomizers() {
 	registerTypeCustomizer(typePair{types.TimestampTZFamily, anyWidth, types.TimestampTZFamily, anyWidth}, timestampCustomizer{})
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.IntervalFamily, anyWidth}, intervalCustomizer{})
 	registerTypeCustomizer(typePair{types.JsonFamily, anyWidth, types.JsonFamily, anyWidth}, jsonCustomizer{})
-	registerTypeCustomizer(typePair{types.JsonFamily, anyWidth, types.BytesFamily, anyWidth}, jsonBytesCustomizer{})
-	registerTypeCustomizer(typePair{types.JsonFamily, anyWidth, typeconv.DatumVecCanonicalTypeFamily, anyWidth}, jsonDatumCustomizer{})
 	registerTypeCustomizer(typePair{typeconv.DatumVecCanonicalTypeFamily, anyWidth, typeconv.DatumVecCanonicalTypeFamily, anyWidth}, datumCustomizer{})
 	for _, leftIntWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
 		for _, rightIntWidth := range supportedWidthsByCanonicalTypeFamily[types.IntFamily] {
@@ -796,6 +801,8 @@ func registerTypeCustomizers() {
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.TimestampTZFamily, anyWidth}, intervalTimestampCustomizer{})
 	registerTypeCustomizer(typePair{types.IntervalFamily, anyWidth, types.DecimalFamily, anyWidth}, intervalDecimalCustomizer{})
 	registerTypeCustomizer(typePair{types.DecimalFamily, anyWidth, types.IntervalFamily, anyWidth}, decimalIntervalCustomizer{})
+	registerTypeCustomizer(typePair{types.JsonFamily, anyWidth, types.BytesFamily, anyWidth}, jsonBytesCustomizer{})
+	registerTypeCustomizer(typePair{types.JsonFamily, anyWidth, typeconv.DatumVecCanonicalTypeFamily, anyWidth}, jsonDatumCustomizer{})
 
 	for _, compatibleFamily := range compatibleCanonicalTypeFamilies[typeconv.DatumVecCanonicalTypeFamily] {
 		if compatibleFamily != typeconv.DatumVecCanonicalTypeFamily {
@@ -843,8 +850,8 @@ var supportedWidthsByCanonicalTypeFamily = map[types.Family][]int32{
 
 var numericCanonicalTypeFamilies = []types.Family{types.IntFamily, types.FloatFamily, types.DecimalFamily}
 
-// toVecMethod returns the method name from coldata.Vec interface that can be
-// used to get the well-typed underlying memory from a vector.
+// toVecMethod returns the method name from coldata.Vec struct that can be used
+// to get the well-typed underlying memory from a vector.
 func toVecMethod(canonicalTypeFamily types.Family, width int32) string {
 	switch canonicalTypeFamily {
 	case types.BoolFamily:

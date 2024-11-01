@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package physicalplan
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -125,7 +121,7 @@ var DistAggregationTable = map[execinfrapb.AggregatorSpec_Func]DistAggregationIn
 			count := h.IndexedVar(varIdxs[1])
 
 			expr := &tree.BinaryExpr{
-				Operator: tree.MakeBinaryOperator(tree.Div),
+				Operator: treebin.MakeBinaryOperator(treebin.Div),
 				Left:     sum,
 				Right:    count,
 			}
@@ -139,7 +135,7 @@ var DistAggregationTable = map[execinfrapb.AggregatorSpec_Func]DistAggregationIn
 					Type: types.Float,
 				}
 			}
-			semaCtx := tree.MakeSemaContext()
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
 			semaCtx.IVarContainer = h.Container()
 			return expr.TypeCheck(context.TODO(), &semaCtx, types.Any)
 		},
@@ -209,6 +205,20 @@ var DistAggregationTable = map[execinfrapb.AggregatorSpec_Func]DistAggregationIn
 		},
 	},
 
+	execinfrapb.StddevPop: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{
+			execinfrapb.Sqrdiff,
+			execinfrapb.Sum,
+			execinfrapb.Count,
+		},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalStddevPop,
+				LocalIdxs: []uint32{0, 1, 2},
+			},
+		},
+	},
+
 	execinfrapb.Sum: {
 		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.Sum},
 		FinalStage: []FinalStageInfo{
@@ -261,6 +271,20 @@ var DistAggregationTable = map[execinfrapb.AggregatorSpec_Func]DistAggregationIn
 		},
 	},
 
+	execinfrapb.VarPop: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{
+			execinfrapb.Sqrdiff,
+			execinfrapb.Sum,
+			execinfrapb.Count,
+		},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalVarPop,
+				LocalIdxs: []uint32{0, 1, 2},
+			},
+		},
+	},
+
 	execinfrapb.XorAgg: {
 		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.XorAgg},
 		FinalStage: []FinalStageInfo{
@@ -297,6 +321,145 @@ var DistAggregationTable = map[execinfrapb.AggregatorSpec_Func]DistAggregationIn
 			{
 				Fn:        execinfrapb.BitOr,
 				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.CovarPop: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalCovarPop,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrSxx: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrSxx,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrSxy: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrSxy,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrSyy: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrSyy,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrAvgx: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrAvgx,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrAvgy: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrAvgy,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrIntercept: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrIntercept,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrR2: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrR2,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrSlope: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalRegrSlope,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.CovarSamp: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalCovarSamp,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.Corr: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.TransitionRegrAggregate},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalCorr,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	execinfrapb.RegrCount: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{execinfrapb.RegrCount},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.SumInt,
+				LocalIdxs: passThroughLocalIdxs,
+			},
+		},
+	},
+
+	// For SQRDIFF the local stage consists of three aggregations,
+	// and the final stage aggregation uses all three values.
+	// respectively:
+	//  - the local stage accumulates the SQRDIFF, SUM and the COUNT
+	//  - the final stage calculates the FINAL_SQRDIFF
+	execinfrapb.Sqrdiff: {
+		LocalStage: []execinfrapb.AggregatorSpec_Func{
+			execinfrapb.Sqrdiff,
+			execinfrapb.Sum,
+			execinfrapb.Count,
+		},
+		FinalStage: []FinalStageInfo{
+			{
+				Fn:        execinfrapb.FinalSqrdiff,
+				LocalIdxs: []uint32{0, 1, 2},
 			},
 		},
 	},

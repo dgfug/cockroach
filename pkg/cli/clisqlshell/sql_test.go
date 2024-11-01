@@ -1,18 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -23,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlshell"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -37,7 +32,7 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
 	c.RunWithArgs([]string{`sql`, `--execute=SELECT database_name, owner FROM [show databases]`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\l`, `-e`, `\echo hello`})
+	c.RunWithArgs([]string{`sql`, `-e`, `\echo hello`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
@@ -57,17 +52,23 @@ func Example_sql() {
 	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
 	// and with the query below the division by zero error will occur after the
 	// first batch consisting of 1 row has been returned to the client.
-	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(i-2) from generate_series(1,3) g(i)`})
 	c.RunWithArgs([]string{`sql`, `-e`, `SELECT '20:01:02+03:04:05'::timetz AS regression_65066`})
-	c.RunWithArgs([]string{`sql`, `-e`, `CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\du my_user`})
+
+	// Check that previous SQL error message is not displayed when the CLI is exited.
+	c.RunWithArgs([]string{`sql`, `-e`, `SELECT 1 FROM hoge`})
+	c.RunWithArgs([]string{`sql`, `-e`, `exit`})
+	c.RunWithArgs([]string{`sql`, `-e`, `SELECT 1 FROM hoge`})
+	c.RunWithArgs([]string{`sql`, `-e`, `\q`})
 
 	// Output:
 	// sql -e show application_name
 	// application_name
 	// $ cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
-	// INSERT 1
+	// CREATE DATABASE
+	// CREATE TABLE
+	// INSERT 0 1
 	// sql -e select 3 as "3" -e select * from t.f
 	// 3
 	// 3
@@ -87,12 +88,7 @@ func Example_sql() {
 	// postgres	root
 	// system	node
 	// t	root
-	// sql -e \l -e \echo hello
-	// database_name	owner	primary_region	regions	survival_goal
-	// defaultdb	root	NULL	{}	NULL
-	// postgres	root	NULL	{}	NULL
-	// system	node	NULL	{}	NULL
-	// t	root	NULL	{}	NULL
+	// sql -e \echo hello
 	// hello
 	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
@@ -110,23 +106,27 @@ func Example_sql() {
 	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
 	// count
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
+	// CREATE DATABASE
+	// CREATE TABLE
 	// x
 	// sql -e copy t.f from stdin
-	// ERROR: -e: woops! COPY has confused this client! Suggestion: use 'psql' for COPY
-	// sql -e select 1/(@1-2) from generate_series(1,3)
+	// sql -e select 1/(i-2) from generate_series(1,3) g(i)
 	// ?column?
-	// -1
+	// -1.0000000000000000000
 	// (error encountered after some results were delivered)
 	// ERROR: division by zero
 	// SQLSTATE: 22012
 	// sql -e SELECT '20:01:02+03:04:05'::timetz AS regression_65066
 	// regression_65066
 	// 20:01:02+03:04:05
-	// sql -e CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;
-	// GRANT
-	// sql -e \du my_user
-	// username	options	member_of
-	// my_user	CREATEDB	{admin}
+	// sql -e SELECT 1 FROM hoge
+	// ERROR: relation "hoge" does not exist
+	// SQLSTATE: 42P01
+	// sql -e exit
+	// sql -e SELECT 1 FROM hoge
+	// ERROR: relation "hoge" does not exist
+	// SQLSTATE: 42P01
+	// sql -e \q
 }
 
 func Example_sql_config() {
@@ -168,14 +168,13 @@ func Example_sql_config() {
 	// 123
 	// # 1 row
 	// sql --set unknownoption -e select 123 as "123"
-	// invalid syntax: \set unknownoption. Try \? for help.
-	// ERROR: -e: invalid syntax
+	// ERROR: -e: unknown variable name: "unknownoption"
 	// sql --set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
-	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, unnumbered-html, raw.
 	// sql -e \set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
-	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, unnumbered-html, raw.
 }
 
 func Example_sql_watch() {
@@ -187,12 +186,13 @@ func Example_sql_watch() {
 
 	// Output:
 	// sql -e create table d(x int); insert into d values(3)
-	// INSERT 1
+	// CREATE TABLE
+	// INSERT 0 1
 	// sql --watch .1s -e update d set x=x-1 returning 1/x as dec
 	// dec
-	// 0.5
+	// 0.50000000000000000000
 	// dec
-	// 1
+	// 1.0000000000000000000
 	// ERROR: division by zero
 	// SQLSTATE: 22012
 }
@@ -207,6 +207,7 @@ func Example_misc_table() {
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE DATABASE
 	// CREATE TABLE
 	// sql --format=table -e select '  hai' as x
 	//     x
@@ -244,7 +245,9 @@ func Example_in_memory() {
 
 	// Output:
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
-	// INSERT 1
+	// CREATE DATABASE
+	// CREATE TABLE
+	// INSERT 0 1
 	// node ls
 	// id
 	// 1
@@ -265,15 +268,16 @@ func Example_pretty_print_numerical_strings() {
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE DATABASE
 	// CREATE TABLE
 	// sql -e insert into t.t values (e'0', 'positive numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'-1', 'negative numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'1.0', 'decimal numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'aaaaa', 'non-numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql --format=table -e select * from t.t
 	//     s   |             d
 	// --------+----------------------------
@@ -301,7 +305,7 @@ func Example_read_from_file() {
 	// SET
 	// CREATE TABLE
 	// > INSERT INTO test(s) VALUES ('hello'), ('world');
-	// INSERT 2
+	// INSERT 0 2
 	// > SELECT * FROM test;
 	// s
 	// hello
@@ -340,19 +344,17 @@ func Example_includes() {
 	// SELECT -- incomplete statement, \i invalid
 	// \i testdata/i_twolevels2.sql
 	// ^
-	// HINT: try \h SELECT
 	// ERROR: at or near "\": syntax error
 	// SQLSTATE: 42601
 	// DETAIL: source SQL:
 	// SELECT -- incomplete statement, \i invalid
 	// \i testdata/i_twolevels2.sql
 	// ^
-	// HINT: try \h SELECT
 	// sql -f testdata/i_stopmiddle.sql
 	// ?column?
 	// 123
 	// sql -f testdata/i_maxrecursion.sql
-	// \i: too many recursion levels (max 10)
+	// ERROR: \i: too many recursion levels (max 10)
 	// ERROR: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: \i: too many recursion levels (max 10)
 }
 
@@ -362,9 +364,9 @@ func Example_sql_lex() {
 	defer c.Cleanup()
 
 	var sqlConnCtx clisqlclient.Context
-	conn := sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard,
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard,
 		fmt.Sprintf("postgres://%s@%s/?sslmode=disable",
-			security.RootUser, c.ServingSQLAddr()))
+			username.RootUser, c.Server.AdvSQLAddr()))
 	defer func() {
 		if err := conn.Close(); err != nil {
 			fmt.Printf("error closing connection: %v\n", err)
@@ -391,7 +393,7 @@ select '''
 
 	// We need a temporary file with a name guaranteed to be available.
 	// So open a dummy file.
-	f, err := ioutil.TempFile("", "input")
+	f, err := os.CreateTemp("", "input")
 	if err != nil {
 		fmt.Println(err)
 		return

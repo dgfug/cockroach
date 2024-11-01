@@ -2,16 +2,17 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "slinstance",
-    srcs = [
-        "slinstance.go",
-        "test_helpers.go",
-    ],
+    srcs = ["slinstance.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/settings",
+        "//pkg/kv/kvpb",
         "//pkg/settings/cluster",
+        "//pkg/sql/enum",
         "//pkg/sql/sqlliveness",
+        "//pkg/sql/sqlliveness/slbase",
+        "//pkg/sql/sqlliveness/slstorage",
+        "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/retry",
@@ -19,6 +20,8 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_logtags//:logtags",
     ],
 )
 
@@ -29,14 +32,21 @@ go_test(
     deps = [
         ":slinstance",
         "//pkg/clusterversion",
+        "//pkg/kv/kvpb",
+        "//pkg/roachpb",
         "//pkg/settings/cluster",
+        "//pkg/sql/enum",
         "//pkg/sql/sqlliveness",
+        "//pkg/sql/sqlliveness/slbase",
         "//pkg/sql/sqlliveness/slstorage",
         "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/stop",
+        "//pkg/util/syncutil",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
     ],
 )

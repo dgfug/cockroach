@@ -1,33 +1,32 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/spf13/cobra"
+)
 
 func init() {
-	cockroachCmd.AddCommand(mtCmd)
-	mtCmd.AddCommand(mtStartSQLCmd)
-	mtCmd.AddCommand(mtStartSQLProxyCmd)
-	mtCmd.AddCommand(mtTestDirectorySvr)
+	cockroachCmd.AddCommand(MTCmd)
+	MTCmd.AddCommand(mtStartSQLCmd)
 
 	mtCertsCmd.AddCommand(
 		mtCreateTenantCACertCmd,
 		mtCreateTenantCertCmd,
+		mtCreateTenantSigningCertCmd,
 	)
 
-	mtCmd.AddCommand(mtCertsCmd)
+	MTCmd.AddCommand(mtCertsCmd)
 }
 
-// mtCmd is the base command for functionality related to multi-tenancy.
-var mtCmd = &cobra.Command{
+// MTCmd is the base command for functionality related to multi-tenancy.
+var MTCmd = &cobra.Command{
 	Use:   "mt [command]",
 	Short: "commands related to multi-tenancy",
 	Long: `
@@ -51,4 +50,19 @@ command.
 This functionality is **experimental** and for internal use only.
 `,
 	RunE: UsageAndErr,
+}
+
+// ClearStoresAndSetupLoggingForMTCommands will clear the cluster name, the
+// store specs, and then sets up default logging.
+func ClearStoresAndSetupLoggingForMTCommands(
+	cmd *cobra.Command, ctx context.Context,
+) (*stop.Stopper, error) {
+	serverCfg.ClusterName = ""
+	serverCfg.Stores.Specs = nil
+
+	stopper, err := setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
+	if err != nil {
+		return nil, err
+	}
+	return stopper, nil
 }

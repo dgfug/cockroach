@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -14,11 +9,14 @@ import (
 	"encoding/csv"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/lib/pq/oid"
@@ -30,14 +28,16 @@ import (
 //
 // Dump command below:
 // COPY (
-//   SELECT o.oprname, o.oprleft, o.oprright, o.oprresult, p.provolatile, p.proleakproof
-//   FROM pg_operator AS o JOIN pg_proc AS p ON (o.oprcode = p.oid)
-//   ORDER BY o.oprname, o.oprleft, o.oprright, o.oprresult
+//
+//	SELECT o.oprname, o.oprleft, o.oprright, o.oprresult, p.provolatile, p.proleakproof
+//	FROM pg_operator AS o JOIN pg_proc AS p ON (o.oprcode = p.oid)
+//	ORDER BY o.oprname, o.oprleft, o.oprright, o.oprresult
+//
 // ) TO STDOUT WITH CSV DELIMITER '|' HEADER;
 func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	csvPath := filepath.Join("testdata", "pg_operator_provolatile_dump.csv")
+	csvPath := datapathutils.TestDataPath(t, "pg_operator_provolatile_dump.csv")
 	f, err := os.Open(csvPath)
 	require.NoError(t, err)
 
@@ -54,7 +54,7 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 		name       string
 		leftType   oid.Oid
 		rightType  oid.Oid
-		volatility Volatility
+		volatility volatility.V
 	}
 	var pgOps []pgOp
 	for {
@@ -81,7 +81,7 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 		proleakproof := line[5]
 		require.Len(t, proleakproof, 1)
 
-		v, err := VolatilityFromPostgres(provolatile, proleakproof[0] == 't')
+		v, err := volatility.FromPostgres(provolatile, proleakproof[0] == 't')
 		require.NoError(t, err)
 		pgOps = append(pgOps, pgOp{
 			name:       name,
@@ -91,7 +91,7 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 		})
 	}
 
-	check := func(name string, leftType, rightType *types.T, volatility Volatility) {
+	check := func(name string, leftType, rightType *types.T, volatility volatility.V) {
 		t.Helper()
 		if volatility == 0 {
 			t.Errorf("operator %s(%v,%v) has no volatility set", name, leftType, rightType)
@@ -102,8 +102,8 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 		// Postgres doesn't have separate operators for IS (NOT) DISTINCT FROM; remap
 		// to equality.
 		switch name {
-		case IsDistinctFrom.String(), IsNotDistinctFrom.String():
-			pgName = EQ.String()
+		case treecmp.IsDistinctFrom.String(), treecmp.IsNotDistinctFrom.String():
+			pgName = treecmp.EQ.String()
 		}
 
 		var leftOid oid.Oid
@@ -132,25 +132,25 @@ func TestOperatorVolatilityMatchesPostgres(t *testing.T) {
 	// Check unary ops. We don't just go through the map so we process them in
 	// an orderly fashion.
 	for op := UnaryOperatorSymbol(0); op < NumUnaryOperatorSymbols; op++ {
-		for _, impl := range UnaryOps[op] {
-			o := impl.(*UnaryOp)
+		_ = UnaryOps[op].ForEachUnaryOp(func(o *UnaryOp) error {
 			check(op.String(), nil /* leftType */, o.Typ, o.Volatility)
-		}
+			return nil
+		})
 	}
 
 	// Check comparison ops.
-	for op := ComparisonOperatorSymbol(0); op < NumComparisonOperatorSymbols; op++ {
-		for _, impl := range CmpOps[op] {
-			o := impl.(*CmpOp)
+	for op := treecmp.ComparisonOperatorSymbol(0); op < treecmp.NumComparisonOperatorSymbols; op++ {
+		_ = CmpOps[op].ForEachCmpOp(func(o *CmpOp) error {
 			check(op.String(), o.LeftType, o.RightType, o.Volatility)
-		}
+			return nil
+		})
 	}
 
 	// Check binary ops.
-	for op := BinaryOperatorSymbol(0); op < NumBinaryOperatorSymbols; op++ {
-		for _, impl := range BinOps[op] {
-			o := impl.(*BinOp)
+	for op := treebin.BinaryOperatorSymbol(0); op < treebin.NumBinaryOperatorSymbols; op++ {
+		_ = BinOps[op].ForEachBinOp(func(o *BinOp) error {
 			check(op.String(), o.LeftType, o.RightType, o.Volatility)
-		}
+			return nil
+		})
 	}
 }

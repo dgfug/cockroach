@@ -1,32 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
-	"fmt"
 	"math"
-	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"github.com/cockroachdb/redact"
 )
 
 type splitDelayHelperI interface {
 	RaftStatus(context.Context) (roachpb.RangeID, *raft.Status)
-	ProposeEmptyCommand(ctx context.Context)
-	MaxTicks() int
+	MaxDelay() time.Duration
 	TickDuration() time.Duration
 	Sleep(context.Context, time.Duration)
 }
@@ -41,8 +35,7 @@ func (sdh *splitDelayHelper) RaftStatus(ctx context.Context) (roachpb.RangeID, *
 		updateRaftProgressFromActivity(
 			ctx, raftStatus.Progress, r.descRLocked().Replicas().Descriptors(),
 			func(replicaID roachpb.ReplicaID) bool {
-				return r.mu.lastUpdateTimes.isFollowerActiveSince(
-					ctx, replicaID, timeutil.Now(), r.store.cfg.RangeLeaseActiveDuration())
+				return r.mu.lastUpdateTimes.isFollowerActiveSince(replicaID, timeutil.Now(), r.store.cfg.RangeLeaseDuration)
 			},
 		)
 	}
@@ -57,21 +50,7 @@ func (sdh *splitDelayHelper) Sleep(ctx context.Context, dur time.Duration) {
 	}
 }
 
-func (sdh *splitDelayHelper) ProposeEmptyCommand(ctx context.Context) {
-	r := (*Replica)(sdh)
-	r.raftMu.Lock()
-	_ = r.withRaftGroup(true /* campaignOnWake */, func(rawNode *raft.RawNode) (bool, error) {
-		// NB: intentionally ignore the error (which can be ErrProposalDropped
-		// when there's an SST inflight).
-		data := encodeRaftCommand(raftVersionStandard, makeIDKey(), nil)
-		_ = rawNode.Propose(data)
-		// NB: we need to unquiesce as the group might be quiesced.
-		return true /* unquiesceAndWakeLeader */, nil
-	})
-	r.raftMu.Unlock()
-}
-
-func (sdh *splitDelayHelper) MaxTicks() int {
+func (sdh *splitDelayHelper) MaxDelay() time.Duration {
 	// There is a related mechanism regarding snapshots and splits that is worth
 	// pointing out here: Incoming MsgApp (see the _ assignment below) are
 	// dropped if they are addressed to uninitialized replicas likely to become
@@ -79,13 +58,13 @@ func (sdh *splitDelayHelper) MaxTicks() int {
 	// per heartbeat interval, but sometimes there's an additional delay thanks
 	// to having to wait for a GC run. In effect, it shouldn't take more than a
 	// small number of heartbeats until the follower leaves probing status, so
-	// MaxTicks should at least match that.
+	// MaxDelay should at least match that.
 	_ = maybeDropMsgApp // guru assignment
 	// Snapshots can come up for other reasons and at the end of the day, the
 	// delay introduced here needs to make sure that the snapshot queue
 	// processes at a higher rate than splits happen, so the number of attempts
 	// will typically be much higher than what's suggested by maybeDropMsgApp.
-	return (*Replica)(sdh).store.cfg.RaftDelaySplitToSuppressSnapshotTicks
+	return (*Replica)(sdh).store.cfg.RaftDelaySplitToSuppressSnapshot
 }
 
 func (sdh *splitDelayHelper) TickDuration() time.Duration {
@@ -93,21 +72,22 @@ func (sdh *splitDelayHelper) TickDuration() time.Duration {
 	return r.store.cfg.RaftTickInterval
 }
 
-func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) string {
-	maxDelaySplitToAvoidSnapshotTicks := sdh.MaxTicks()
+func maybeDelaySplitToAvoidSnapshot(
+	ctx context.Context, sdh splitDelayHelperI,
+) redact.RedactableString {
 	tickDur := sdh.TickDuration()
-	budget := tickDur * time.Duration(maxDelaySplitToAvoidSnapshotTicks)
+	budget := sdh.MaxDelay()
 
 	var slept time.Duration
-	var problems []string
-	var lastProblems []string
+	var problems []redact.RedactableString
+	var lastProblems []redact.RedactableString
 	var i int
 	for slept < budget {
 		i++
 		problems = problems[:0]
 		rangeID, raftStatus := sdh.RaftStatus(ctx)
 
-		if raftStatus == nil || raftStatus.RaftState == raft.StateFollower {
+		if raftStatus == nil || raftStatus.RaftState == raftpb.StateFollower {
 			// Don't delay on followers (we don't have information about the
 			// peers in that state and thus can't determine when it is safe
 			// to continue). This case is hit rarely enough to not matter,
@@ -166,31 +146,21 @@ func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) 
 		//
 		// See TestSplitBurstWithSlowFollower for end-to-end verification of this
 		// mechanism.
-		if raftStatus.RaftState != raft.StateLeader {
-			problems = append(problems, fmt.Sprintf("not leader (%s)", raftStatus.RaftState))
+		if raftStatus.RaftState != raftpb.StateLeader {
+			problems = append(problems, redact.Sprintf("not leader (%s)", redact.Safe(raftStatus.RaftState)))
 		}
 
 		for replicaID, pr := range raftStatus.Progress {
 			if pr.State != tracker.StateReplicate {
+				// NB: RecentActive is populated by updateRaftProgressFromActivity().
 				if !pr.RecentActive {
 					if slept < tickDur {
 						// We don't want to delay splits for a follower who hasn't responded within a tick.
-						problems = append(problems, fmt.Sprintf("r%d/%d inactive", rangeID, replicaID))
-						if i == 1 {
-							// Propose an empty command which works around a Raft bug that can
-							// leave a follower in ProgressStateProbe even though it has caught
-							// up.
-							//
-							// We have long picked up a fix[1] for the bug, but there might be similar
-							// issues we're not aware of and this doesn't hurt, so leave it in for now.
-							//
-							// [1]: https://github.com/etcd-io/etcd/commit/bfaae1ba462c91aaf149a285b8d2369807044f71
-							sdh.ProposeEmptyCommand(ctx)
-						}
+						problems = append(problems, redact.Sprintf("r%d/%d inactive", rangeID, replicaID))
 					}
 					continue
 				}
-				problems = append(problems, fmt.Sprintf("replica r%d/%d not caught up: %+v", rangeID, replicaID, &pr))
+				problems = append(problems, redact.Sprintf("replica r%d/%d not caught up: %+v", rangeID, replicaID, redact.Safe(&pr)))
 			}
 		}
 		if len(problems) == 0 {
@@ -199,30 +169,30 @@ func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) 
 
 		lastProblems = problems
 
-		// The second factor starts out small and reaches ~0.7 approximately at i=maxDelaySplitToAvoidSnapshotTicks.
-		// In effect we loop approximately 2*maxDelaySplitToAvoidSnapshotTicks to exhaust the entire budget we have.
+		// The second factor starts out small and reaches ~0.7 approximately at i=budget/tickDur.
+		// In effect we loop approximately 2*MaxDelay to exhaust the entire budget we have.
 		// By having shorter sleeps at the beginning, we optimize for the common case in which things get fixed up
 		// quickly early on. In particular, splitting in a tight loop will usually always wait on the election of the
 		// previous split's right-hand side, which finishes within a few network latencies (which is typically much
 		// less than a full tick).
-		sleepDur := time.Duration(float64(tickDur) * (1.0 - math.Exp(-float64(i-1)/float64(maxDelaySplitToAvoidSnapshotTicks+1))))
+		sleepDur := time.Duration(float64(tickDur) * (1.0 - math.Exp(-float64(i-1)/float64(budget/tickDur+1))))
 		sdh.Sleep(ctx, sleepDur)
 		slept += sleepDur
 
 		if err := ctx.Err(); err != nil {
-			problems = append(problems, err.Error())
+			problems = append(problems, redact.Sprintf("error: %s", err.Error()))
 			break
 		}
 	}
 
-	var msg string
+	var msg redact.RedactableString
 	// If we exited the loop with problems, use them as lastProblems
 	// and indicate that we did not manage to "delay the problems away".
 	if len(problems) != 0 {
 		lastProblems = problems
 	}
 	if len(lastProblems) != 0 {
-		msg = fmt.Sprintf("; delayed by %.1fs to resolve: %s", slept.Seconds(), strings.Join(lastProblems, "; "))
+		msg = redact.Sprintf("; delayed by %.1fs to resolve: %s", slept.Seconds(), redact.Join("; ", lastProblems))
 		if len(problems) != 0 {
 			msg += " (without success)"
 		}

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -15,8 +10,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 // MakeDefaultExprs returns a slice of the default expressions for the slice
@@ -29,7 +27,7 @@ func MakeDefaultExprs(
 	ctx context.Context,
 	cols []catalog.Column,
 	txCtx *transform.ExprTransformContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 ) ([]tree.TypedExpr, error) {
 	// Check to see if any of the columns have DEFAULT expressions. If there
@@ -70,7 +68,27 @@ func MakeDefaultExprs(
 		if err != nil {
 			return nil, err
 		}
-		if typedExpr, err = txCtx.NormalizeExpr(evalCtx, typedExpr); err != nil {
+		// If the DEFAULT expression has a type that is not identical to the
+		// column's type, wrap the default expression in an assignment cast.
+		if !typedExpr.ResolvedType().Identical(col.GetType()) {
+			const fnName = "crdb_internal.assignment_cast"
+			funcRef := tree.WrapFunction(fnName)
+			props, overloads := builtinsregistry.GetBuiltinProperties(fnName)
+			if typedExpr, err = tree.TypeCheck(ctx, tree.NewTypedFuncExpr(
+				funcRef,
+				0, /* aggQualifier */
+				tree.TypedExprs{typedExpr, tree.NewTypedCastExpr(tree.DNull, col.GetType())},
+				nil, /* filter */
+				nil, /* windowDef */
+				col.GetType(),
+				props,
+				&overloads[0],
+			), semaCtx, col.GetType()); err != nil {
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+					"failed to type check the cast of %v to %v", expr, col.GetType())
+			}
+		}
+		if typedExpr, err = txCtx.NormalizeExpr(ctx, evalCtx, typedExpr); err != nil {
 			return nil, err
 		}
 		defaultExprs = append(defaultExprs, typedExpr)
@@ -89,7 +107,7 @@ func ProcessColumnSet(
 		colIDSet.Add(cols[i].GetID())
 	}
 
-	// Add all public or columns in DELETE_AND_WRITE_ONLY state
+	// Add all public or columns in WRITE_ONLY state
 	// that satisfy the condition.
 	ret := make([]catalog.Column, 0, len(tableDesc.AllColumns()))
 	ret = append(ret, cols...)

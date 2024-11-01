@@ -1,25 +1,20 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -31,21 +26,34 @@ var rewriteResultsInTestfiles = flag.Bool(
 )
 
 func assertEncodeRoundTrip(t *testing.T, j JSON) {
-	encoded, err := EncodeJSON(nil, j)
+	beforeStr := j.String()
+	encoding, err := EncodeJSON(nil, j)
 	if err != nil {
 		t.Fatal(j, err)
 	}
-	_, decoded, err := DecodeJSON(encoded)
+	encoded, err := newEncodedFromRoot(encoding)
 	if err != nil {
 		t.Fatal(j, err)
 	}
+	encodedStr := encoded.String()
+	_, decoded, err := DecodeJSON(encoding)
+	if err != nil {
+		t.Fatal(j, err)
+	}
+	afterStr := decoded.String()
 
 	c, err := j.Compare(decoded)
 	if err != nil {
 		t.Fatal(j, err)
 	}
 	if c != 0 {
-		t.Fatalf("expected %s, got %s (encoding %v)", j, decoded, encoded)
+		t.Fatalf("expected %s, got %s (encoding %v)", j, decoded, encoding)
+	}
+	if beforeStr != encodedStr {
+		t.Fatalf("expected %s, got %s (encoding %v)", beforeStr, encodedStr, encoding)
+	}
+	if beforeStr != afterStr {
+		t.Fatalf("expected %s, got %s (encoding %v)", beforeStr, afterStr, encoding)
 	}
 }
 
@@ -62,8 +70,8 @@ func TestJSONRandomEncodeRoundTrip(t *testing.T) {
 }
 
 func TestFilesEncode(t *testing.T) {
-	dir := testutils.TestDataPath(t, "raw")
-	dirContents, err := ioutil.ReadDir(dir)
+	dir := datapathutils.TestDataPath(t, "raw")
+	dirContents, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +85,7 @@ func TestFilesEncode(t *testing.T) {
 		t.Run(tc.Name(), func(t *testing.T) {
 			numFilesRan++
 			path := filepath.Join(dir, tc.Name())
-			contents, err := ioutil.ReadFile(path)
+			contents, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -109,17 +117,17 @@ func TestFilesEncode(t *testing.T) {
 			// rerun with -rewrite-results-in-testfiles.
 			t.Run(`explicit encoding`, func(t *testing.T) {
 				stringifiedEncoding := fmt.Sprintf("%v", encoded)
-				fixtureFilename := testutils.TestDataPath(
+				fixtureFilename := datapathutils.TestDataPath(
 					t, "encoded", tc.Name()+".bytes")
 
 				if *rewriteResultsInTestfiles {
-					err := ioutil.WriteFile(fixtureFilename, []byte(stringifiedEncoding), 0644)
+					err := os.WriteFile(fixtureFilename, []byte(stringifiedEncoding), 0644)
 					if err != nil {
 						t.Fatal(err)
 					}
 				}
 
-				expected, err := ioutil.ReadFile(fixtureFilename)
+				expected, err := os.ReadFile(fixtureFilename)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -256,7 +264,7 @@ const sampleJSON = `{
 }`
 
 func BenchmarkEncodeJSON(b *testing.B) {
-	j := jsonTestShorthand(sampleJSON)
+	j := parseJSON(b, sampleJSON)
 
 	b.ResetTimer()
 
@@ -266,7 +274,7 @@ func BenchmarkEncodeJSON(b *testing.B) {
 }
 
 func BenchmarkDecodeJSON(b *testing.B) {
-	j := jsonTestShorthand(sampleJSON)
+	j := parseJSON(b, sampleJSON)
 
 	b.ResetTimer()
 	bytes, err := EncodeJSON(nil, j)
@@ -277,4 +285,30 @@ func BenchmarkDecodeJSON(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _, _ = DecodeJSON(bytes)
 	}
+}
+
+func BenchmarkFormatJSON(b *testing.B) {
+	j := parseJSON(b, sampleJSON)
+
+	b.Run("decoded", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = j.String()
+		}
+	})
+
+	b.Run("encoded", func(b *testing.B) {
+		encoding, err := EncodeJSON(nil, j)
+		if err != nil {
+			b.Fatal(err)
+		}
+		encoded, err := newEncodedFromRoot(encoding)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = encoded.String()
+		}
+	})
 }

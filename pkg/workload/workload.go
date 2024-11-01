@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package workload provides an abstraction for generators of sql query loads
 // (and requisite initial data) as well as tools for working with these
@@ -26,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
@@ -42,6 +38,19 @@ type Generator interface {
 	// Tables returns the set of tables for this generator, including schemas
 	// and initial data.
 	Tables() []Table
+}
+
+// SupportsFixtures returns whether the Generator supports initialization
+// via fixtures.
+func SupportsFixtures(gen Generator) bool {
+	tt := gen.Tables()
+	for _, t := range tt {
+		if t.InitialRows.FillBatch == nil {
+			return false
+		}
+	}
+	// Don't use fixtures if there are no tables.
+	return len(tt) != 0
 }
 
 // FlagMeta is metadata about a workload flag.
@@ -70,10 +79,24 @@ type Flagser interface {
 	Flags() Flags
 }
 
+// ConnFlagser returns the connection flags this Generator is configured with.
+type ConnFlagser interface {
+	Generator
+	ConnFlags() *ConnFlags
+}
+
 // Opser returns the work functions for this generator. The tables are required
 // to have been created and initialized before running these.
 type Opser interface {
 	Generator
+	// Ops sets up the QueryLoad.
+	//
+	// NB: Ops is problematic to implement. In practice, it is possibly invoked
+	// multiple times with the same registry (see workload/cli.runRun), so naive
+	// implementations are prone to panics due to double-registration of metrics.
+	// We need to either avoid the required idempotency or tease apart a call-once
+	// registration part so that the registration happens in a separate, call-once
+	// method.
 	Ops(ctx context.Context, urls []string, reg *histogram.Registry) (QueryLoad, error)
 }
 
@@ -103,7 +126,7 @@ type Hooks struct {
 	// PostLoad is called after workload tables are created workload data is
 	// loaded. It called after restoring a fixture. This, for example, is where
 	// creating foreign keys should go. Implementations should be idempotent.
-	PostLoad func(*gosql.DB) error
+	PostLoad func(context.Context, *gosql.DB) error
 	// PostRun is called after workload run has ended, with the duration of the
 	// run. This is where any post-run special printing or validation can be done.
 	PostRun func(time.Duration) error
@@ -124,17 +147,20 @@ type Meta struct {
 	Name string
 	// Description is a short description of this generator.
 	Description string
+	// RandomSeed points to the random seed to be used by this
+	// generator, if any.
+	RandomSeed RandomSeed
 	// Details optionally allows specifying longer, more in-depth usage details.
 	Details string
 	// Version is a semantic version for this generator. It should be bumped
 	// whenever InitialRowFn or InitialRowCount change for any of the tables.
 	Version string
-	// PublicFacing indicates that this workload is also intended for use by
-	// users doing their own testing and evaluations. This allows hiding workloads
-	// that are only expected to be used in CockroachDB's internal development to
-	// avoid confusion. Workloads setting this to true should pay added attention
-	// to their documentation and help-text.
-	PublicFacing bool
+
+	// TestInfraOnly indicates that a workload was primarily designed for
+	// internal testing by one team Cockroach Labs, and is expected to
+	// be of limited teaching value to other teams or end-users.
+	TestInfraOnly bool
+
 	// New returns an unconfigured instance of this generator.
 	New func() Generator
 }
@@ -144,6 +170,8 @@ type Meta struct {
 type Table struct {
 	// Name is the unqualified table name, pre-escaped for use directly in SQL.
 	Name string
+	// ObjectPrefix is an optional database and schema prefix.
+	ObjectPrefix *tree.ObjectNamePrefix
 	// Schema is the SQL formatted schema for this table, with the `CREATE TABLE
 	// <name>` prefix omitted.
 	Schema string
@@ -158,6 +186,16 @@ type Table struct {
 	// Stats is the pre-calculated set of statistics on this table. They can be
 	// injected using `ALTER TABLE <name> INJECT STATISTICS ...`.
 	Stats []JSONStatistic
+}
+
+// GetResolvedName gets a resolved name with the prefix applied, if one
+// exists.
+func (t Table) GetResolvedName() tree.TableName {
+	if t.ObjectPrefix == nil {
+		return tree.MakeUnqualifiedTableName(tree.Name(t.Name))
+	}
+	return tree.MakeTableNameFromPrefix(*t.ObjectPrefix,
+		tree.Name(t.Name))
 }
 
 // BatchedTuples is a generic generator of tuples (SQL rows, PKs to split at,
@@ -187,6 +225,9 @@ func Tuples(count int, fn func(int) []interface{}) BatchedTuples {
 const (
 	// timestampOutputFormat is used to output all timestamps.
 	timestampOutputFormat = "2006-01-02 15:04:05.999999-07:00"
+
+	// defaultDNSCacheRefresh is used to change the default --dns-refresh interval
+	defaultDNSCacheRefresh = 30 * time.Second
 )
 
 // TypedTuples returns a BatchedTuples where each batch has size 1. It's
@@ -233,6 +274,8 @@ func TypedTuples(count int, typs []*types.T, fn func(int) []interface{}) Batched
 					col.Bool()[0] = d
 				case int:
 					col.Int64()[0] = int64(d)
+				case int64:
+					col.Int64()[0] = d
 				case float64:
 					col.Float64()[0] = d
 				case string:
@@ -307,7 +350,7 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 			// Notably, this means a SQL STRING column is represented the same as a
 			// BYTES column (ditto UUID, etc). We could get the fidelity back by
 			// parsing the SQL schema, which in fact we do in
-			// `importccl.makeDatumFromColOffset`. At the moment, the set of types
+			// `importer.makeDatumFromColOffset`. At the moment, the set of types
 			// used in workloads is limited enough that the users of initial
 			// data/splits are okay with the fidelity loss. So, to avoid the
 			// complexity and the undesirable pkg/sql/parser dep, we simply treat them
@@ -342,6 +385,10 @@ type InitialDataLoader interface {
 // IMPORT-based InitialDataLoader implementation.
 var ImportDataLoader InitialDataLoader = requiresCCLBinaryDataLoader(`IMPORT`)
 
+// ImportDataLoaderConcurrencyFlag that can be used to control import concurrency.
+const ImportDataLoaderConcurrencyFlag = "import-concurrency-limit"
+const ImportDataLoaderConcurrencyFlagDescription = "limit for concurrency of import operations"
+
 type requiresCCLBinaryDataLoader string
 
 func (l requiresCCLBinaryDataLoader) InitialDataLoad(
@@ -353,18 +400,16 @@ func (l requiresCCLBinaryDataLoader) InitialDataLoad(
 // QueryLoad represents some SQL query workload performable on a database
 // initialized with the requisite tables.
 type QueryLoad struct {
-	SQLDatabase string
-
 	// WorkerFns is one function per worker. It is to be called once per unit of
 	// work to be done.
 	WorkerFns []func(context.Context) error
 
 	// Close, if set, is called before the process exits, giving workloads a
-	// chance to print some information.
+	// chance to print some information or perform cleanup.
 	// It's guaranteed that the ctx passed to WorkerFns (if they're still running)
 	// has been canceled by the time this is called (so an implementer can
 	// synchronize with the WorkerFns if need be).
-	Close func(context.Context)
+	Close func(context.Context) error
 
 	// ResultHist is the name of the NamedHistogram to use for the benchmark
 	// formatted results output at the end of `./workload run`. The empty string

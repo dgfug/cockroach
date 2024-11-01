@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -18,7 +13,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -66,7 +63,7 @@ func rangeOffsetHandlerGenerator(inputFileContents string, wr io.Writer) error {
 	}
 
 	var rangeOffsetHandlerTmplInfos []windowFrameOffsetBoundInfo
-	for _, bound := range []tree.WindowFrameBoundType{tree.OffsetPreceding, tree.OffsetFollowing} {
+	for _, bound := range []treewindow.WindowFrameBoundType{treewindow.OffsetPreceding, treewindow.OffsetFollowing} {
 		boundInfo := windowFrameOffsetBoundInfo{BoundType: bound}
 		for _, isStart := range []bool{true, false} {
 			isStartInfo := windowFrameOffsetIsStartInfo{IsStart: isStart}
@@ -74,7 +71,7 @@ func rangeOffsetHandlerGenerator(inputFileContents string, wr io.Writer) error {
 				ordColDirInfo := windowFrameOrdDirInfo{IsOrdColAsc: isOrdColAsc}
 				for _, typeFamily := range rangeOrderColTypeFamilies {
 					canonicalTypeFamily := typeconv.TypeFamilyToCanonicalTypeFamily(typeFamily)
-					typeFamilyStr := toString(typeFamily)
+					typeFamilyStr := familyToString(typeFamily)
 					typeFamilyInfo := windowFrameOrderTypeFamilyInfo{
 						TypeFamily: typeFamilyStr,
 					}
@@ -122,7 +119,7 @@ func init() {
 }
 
 type windowFrameOffsetBoundInfo struct {
-	BoundType tree.WindowFrameBoundType
+	BoundType treewindow.WindowFrameBoundType
 	Bounds    []windowFrameOffsetIsStartInfo
 }
 
@@ -152,7 +149,7 @@ type windowFrameOrderWidthOverload struct {
 	IsOrdColAsc     bool
 	cmpFunc         compareFunc
 	assignFunc      assignFunc
-	valueByOffsetOp tree.BinaryOperatorSymbol
+	valueByOffsetOp treebin.BinaryOperatorSymbol
 }
 
 func (overload windowFrameOrderWidthOverload) ValueByOffset(
@@ -197,7 +194,7 @@ func getAssignFunc(typeFamily types.Family) assignFunc {
 	}
 	canonicalTypeFamily := typeconv.TypeFamilyToCanonicalTypeFamily(typeFamily)
 	var overload *oneArgOverload
-	for _, o := range sameTypeBinaryOpToOverloads[tree.Plus] {
+	for _, o := range sameTypeBinaryOpToOverloads[treebin.Plus] {
 		if o.CanonicalTypeFamily == canonicalTypeFamily {
 			overload = o
 			break
@@ -213,18 +210,18 @@ func getAssignFunc(typeFamily types.Family) assignFunc {
 }
 
 func getValueByOffsetOp(
-	bound tree.WindowFrameBoundType, isOrdColAsc bool,
-) tree.BinaryOperatorSymbol {
-	if bound == tree.OffsetFollowing {
+	bound treewindow.WindowFrameBoundType, isOrdColAsc bool,
+) treebin.BinaryOperatorSymbol {
+	if bound == treewindow.OffsetFollowing {
 		if isOrdColAsc {
-			return tree.Plus
+			return treebin.Plus
 		}
-		return tree.Minus
+		return treebin.Minus
 	}
 	if isOrdColAsc {
-		return tree.Minus
+		return treebin.Minus
 	}
-	return tree.Plus
+	return treebin.Plus
 }
 
 func getCmpFunc(typeFamily types.Family) compareFunc {
@@ -246,7 +243,7 @@ func getCmpFunc(typeFamily types.Family) compareFunc {
 	}
 	canonicalTypeFamily := typeconv.TypeFamilyToCanonicalTypeFamily(typeFamily)
 	var overload *oneArgOverload
-	for _, o := range sameTypeComparisonOpToOverloads[tree.EQ] {
+	for _, o := range sameTypeComparisonOpToOverloads[treecmp.EQ] {
 		if o.CanonicalTypeFamily == canonicalTypeFamily {
 			overload = o
 			break
@@ -262,7 +259,7 @@ func getCmpFunc(typeFamily types.Family) compareFunc {
 }
 
 func (overload windowFrameOrderWidthOverload) BinOpIsPlus() bool {
-	return overload.valueByOffsetOp == tree.Plus
+	return overload.valueByOffsetOp == treebin.Plus
 }
 
 var _ = windowFrameOrderWidthOverload{}.BinOpIsPlus()

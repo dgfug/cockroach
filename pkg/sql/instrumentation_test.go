@@ -1,24 +1,22 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 	gosql "database/sql"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -32,9 +30,10 @@ func TestSampledStatsCollection(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	st := cluster.MakeTestingClusterSettings()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
+	tt := s.ApplicationLayer()
+	sv, sqlStats := &tt.ClusterSettings().SV, tt.SQLServer().(*Server).sqlStats
 
 	sqlutils.CreateTable(
 		t, db, "test", "x INT", 10, sqlutils.ToRowFn(sqlutils.RowIdxFn),
@@ -43,29 +42,26 @@ func TestSampledStatsCollection(t *testing.T) {
 	getStmtStats :=
 		func(
 			t *testing.T,
-			server serverutils.TestServerInterface,
 			stmt string,
 			implicitTxn bool,
 			database string,
-		) *roachpb.CollectedStatementStatistics {
+		) *appstatspb.CollectedStatementStatistics {
 			t.Helper()
-			key := roachpb.StatementStatisticsKey{
+			key := appstatspb.StatementStatisticsKey{
 				Query:       stmt,
 				ImplicitTxn: implicitTxn,
 				Database:    database,
-				Failed:      false,
 			}
-			var stats *roachpb.CollectedStatementStatistics
-			require.NoError(t, server.SQLServer().(*Server).sqlStats.
+			var stats *appstatspb.CollectedStatementStatistics
+			require.NoError(t, sqlStats.
 				GetLocalMemProvider().
 				IterateStatementStats(
 					ctx,
-					&sqlstats.IteratorOptions{},
-					func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+					sqlstats.IteratorOptions{},
+					func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 						if statistics.Key.Query == key.Query &&
 							statistics.Key.ImplicitTxn == key.ImplicitTxn &&
-							statistics.Key.Database == key.Database &&
-							statistics.Key.Failed == key.Failed {
+							statistics.Key.Database == key.Database {
 							stats = statistics
 						}
 
@@ -73,23 +69,23 @@ func TestSampledStatsCollection(t *testing.T) {
 					},
 				))
 			require.NotNil(t, stats)
+			require.NotZero(t, stats.Key.PlanHash)
 			return stats
 		}
 
 	getTxnStats := func(
 		t *testing.T,
-		server serverutils.TestServerInterface,
-		key roachpb.TransactionFingerprintID,
-	) *roachpb.CollectedTransactionStatistics {
+		key appstatspb.TransactionFingerprintID,
+	) *appstatspb.CollectedTransactionStatistics {
 		t.Helper()
-		var stats *roachpb.CollectedTransactionStatistics
+		var stats *appstatspb.CollectedTransactionStatistics
 
-		require.NoError(t, server.SQLServer().(*Server).sqlStats.
+		require.NoError(t, sqlStats.
 			GetLocalMemProvider().
 			IterateTransactionStats(
 				ctx,
-				&sqlstats.IteratorOptions{},
-				func(ctx context.Context, statistics *roachpb.CollectedTransactionStatistics) error {
+				sqlstats.IteratorOptions{},
+				func(ctx context.Context, statistics *appstatspb.CollectedTransactionStatistics) error {
 					if statistics.TransactionFingerprintID == key {
 						stats = statistics
 					}
@@ -107,7 +103,7 @@ func TestSampledStatsCollection(t *testing.T) {
 		if enable {
 			v = 1
 		}
-		collectTxnStatsSampleRate.Override(ctx, &st.SV, v)
+		collectTxnStatsSampleRate.Override(ctx, sv, v)
 	}
 
 	type queryer interface {
@@ -127,7 +123,7 @@ func TestSampledStatsCollection(t *testing.T) {
 		toggleSampling(true)
 		queryDB(t, db, selectOrderBy)
 
-		stats := getStmtStats(t, s, selectOrderBy, true /* implicitTxn */, "defaultdb")
+		stats := getStmtStats(t, selectOrderBy, true /* implicitTxn */, "defaultdb")
 
 		require.Equal(t, int64(2), stats.Stats.Count, "expected to have collected two sets of general stats")
 		require.Equal(t, int64(1), stats.Stats.ExecStats.Count, "expected to have collected exactly one set of execution stats")
@@ -152,8 +148,8 @@ func TestSampledStatsCollection(t *testing.T) {
 		toggleSampling(true)
 		doTxn(t)
 
-		aggStats := getStmtStats(t, s, aggregation, false /* implicitTxn */, "defaultdb")
-		selectStats := getStmtStats(t, s, selectOrderBy, false /* implicitTxn */, "defaultdb")
+		aggStats := getStmtStats(t, aggregation, false /* implicitTxn */, "defaultdb")
+		selectStats := getStmtStats(t, selectOrderBy, false /* implicitTxn */, "defaultdb")
 
 		require.Equal(t, int64(2), aggStats.Stats.Count, "expected to have collected two sets of general stats")
 		require.Equal(t, int64(1), aggStats.Stats.ExecStats.Count, "expected to have collected exactly one set of execution stats")
@@ -168,7 +164,7 @@ func TestSampledStatsCollection(t *testing.T) {
 		key := util.MakeFNV64()
 		key.Add(uint64(aggStats.ID))
 		key.Add(uint64(selectStats.ID))
-		txStats := getTxnStats(t, s, roachpb.TransactionFingerprintID(key.Sum()))
+		txStats := getTxnStats(t, appstatspb.TransactionFingerprintID(key.Sum()))
 
 		require.Equal(t, int64(2), txStats.Stats.Count, "expected to have collected two sets of general stats")
 		require.Equal(t, int64(1), txStats.Stats.ExecStats.Count, "expected to have collected exactly one set of execution stats")
@@ -190,7 +186,7 @@ func TestSampledStatsCollection(t *testing.T) {
 
 		// Make sure DEALLOCATE statements are grouped together rather than having
 		// one key per prepared statement name.
-		stats := getStmtStats(t, s, "DEALLOCATE _", true /* implicitTxn */, "defaultdb")
+		stats := getStmtStats(t, "DEALLOCATE _", true /* implicitTxn */, "defaultdb")
 
 		require.Equal(t, int64(2), stats.Stats.Count, "expected to have collected two sets of general stats")
 		require.Equal(t, int64(0), stats.Stats.ExecStats.Count, "expected to have collected zero execution stats")
@@ -202,4 +198,94 @@ func TestSampledStatsCollection(t *testing.T) {
 		// stats are collected. Should we make DEALLOCATE similar to that, or
 		// should we change PREPARE so that stats are collected?
 	})
+}
+
+// TestSampledStatsCollectionOnNewFingerprint tests that we sample
+// a fingerprint if it's the first time the current sql stats
+// container has seen it, unless the container is full.
+func TestSampledStatsCollectionOnNewFingerprint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testApp := `sampling-test`
+	ctx := context.Background()
+	var collectedTxnStats []sqlstats.RecordedTxnStats
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &ExecutorTestingKnobs{
+				DisableProbabilisticSampling: true,
+				OnRecordTxnFinish: func(isInternal bool, _ *sessionphase.Times, stmt string, txnStats sqlstats.RecordedTxnStats) {
+					// We won't run into a race here because we'll only observe
+					// txns from a single connection.
+					if txnStats.SessionData.ApplicationName == testApp {
+						if strings.Contains(stmt, `SET application_name`) {
+							return
+						}
+						collectedTxnStats = append(collectedTxnStats, txnStats)
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	ts := s.ApplicationLayer()
+	st := &ts.ClusterSettings().SV
+	conn := sqlutils.MakeSQLRunner(ts.SQLConn(t))
+	conn.Exec(t, "SET application_name = $1", testApp)
+
+	t.Run("do-sampling-when-container-not-full", func(t *testing.T) {
+		// All of these statements should be sampled because they are new
+		// fingerprints.
+		queries := []string{
+			"SELECT 1",
+			"SELECT 1, 2, 3",
+			"CREATE TABLE IF NOT EXISTS foo (x INT)",
+			"SELECT * FROM foo",
+			// An explicit txn results in the queries inside being recorded as 'new' statements.
+			"BEGIN; SELECT 1; COMMIT;",
+		}
+
+		for _, q := range queries {
+			conn.Exec(t, q)
+		}
+
+		require.Equal(t, len(queries), len(collectedTxnStats))
+
+		// We should have collected stats for each of the queries.
+		for i := range collectedTxnStats {
+			require.True(t, collectedTxnStats[i].CollectedExecStats)
+		}
+	})
+
+	collectedTxnStats = nil
+
+	t.Run("skip-sampling-when-container-full", func(t *testing.T) {
+		// We'll set the in-memory container cap to 1 statement. The container
+		// will be full after the first statement is recorded, and thus each
+		// subsequent statement will be new to the container.
+		persistedsqlstats.MinimumInterval.Override(ctx, st, 10*time.Minute)
+		sqlstats.MaxMemSQLStatsStmtFingerprints.Override(ctx, st, 1)
+		// Use a new conn to ensure we hit the cap (the limit is node-wide).
+		conn2 := sqlutils.MakeSQLRunner(ts.SQLConn(t))
+		conn2.Exec(t, "SELECT 1")
+
+		queries := []string{
+			"SELECT 'aaaaaa'",
+			"CREATE TABLE IF NOT EXISTS bar (x INT)",
+			"SELECT * FROM bar",
+			"BEGIN; SELECT 1; SELECT 1, 2; COMMIT;",
+		}
+
+		// Back to our observed connection.
+		for _, q := range queries {
+			conn.Exec(t, q)
+		}
+		require.Equal(t, len(queries), len(collectedTxnStats))
+
+		// Verify we did not collect execution stats for any of the queries.
+		for i := range collectedTxnStats {
+			require.False(t, collectedTxnStats[i].CollectedExecStats)
+		}
+	})
+
 }

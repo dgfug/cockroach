@@ -1,0 +1,621 @@
+@startuml
+object AliasType
+
+AliasType :  TypeID
+AliasType :  TypeT
+
+object CheckConstraint
+
+CheckConstraint :  TableID
+CheckConstraint :  ConstraintID
+CheckConstraint : []ColumnIDs
+CheckConstraint :  Expression
+CheckConstraint :  FromHashShardedColumn
+CheckConstraint :  IndexIDForValidation
+
+object CheckConstraintUnvalidated
+
+CheckConstraintUnvalidated :  TableID
+CheckConstraintUnvalidated :  ConstraintID
+CheckConstraintUnvalidated : []ColumnIDs
+CheckConstraintUnvalidated :  Expression
+
+object Column
+
+Column :  TableID
+Column :  ColumnID
+Column :  IsHidden
+Column :  IsInaccessible
+Column :  GeneratedAsIdentityType
+Column :  GeneratedAsIdentitySequenceOption
+Column :  PgAttributeNum
+Column :  IsSystemColumn
+
+object ColumnComment
+
+ColumnComment :  TableID
+ColumnComment :  ColumnID
+ColumnComment :  Comment
+ColumnComment :  PgAttributeNum
+
+object ColumnComputeExpression
+
+ColumnComputeExpression :  TableID
+ColumnComputeExpression :  ColumnID
+ColumnComputeExpression :  Expression
+
+object ColumnDefaultExpression
+
+ColumnDefaultExpression :  TableID
+ColumnDefaultExpression :  ColumnID
+ColumnDefaultExpression :  Expression
+
+object ColumnFamily
+
+ColumnFamily :  TableID
+ColumnFamily :  FamilyID
+ColumnFamily :  Name
+
+object ColumnName
+
+ColumnName :  TableID
+ColumnName :  ColumnID
+ColumnName :  Name
+ColumnName :  AbsentName
+
+object ColumnNotNull
+
+ColumnNotNull :  TableID
+ColumnNotNull :  ColumnID
+ColumnNotNull :  IndexIDForValidation
+
+object ColumnOnUpdateExpression
+
+ColumnOnUpdateExpression :  TableID
+ColumnOnUpdateExpression :  ColumnID
+ColumnOnUpdateExpression :  Expression
+
+object ColumnType
+
+ColumnType :  TableID
+ColumnType :  FamilyID
+ColumnType :  ColumnID
+ColumnType :  TypeT
+ColumnType :  IsNullable
+ColumnType :  ComputeExpr
+ColumnType :  IsVirtual
+ColumnType :  ElementCreationMetadata
+
+object CompositeType
+
+CompositeType :  TypeID
+CompositeType :  ArrayTypeID
+
+object CompositeTypeAttrName
+
+CompositeTypeAttrName :  CompositeTypeID
+CompositeTypeAttrName :  Name
+
+object CompositeTypeAttrType
+
+CompositeTypeAttrType :  CompositeTypeID
+CompositeTypeAttrType :  TypeT
+
+object ConstraintComment
+
+ConstraintComment :  TableID
+ConstraintComment :  ConstraintID
+ConstraintComment :  Comment
+
+object ConstraintWithoutIndexName
+
+ConstraintWithoutIndexName :  TableID
+ConstraintWithoutIndexName :  ConstraintID
+ConstraintWithoutIndexName :  Name
+
+object Database
+
+Database :  DatabaseID
+
+object DatabaseComment
+
+DatabaseComment :  DatabaseID
+DatabaseComment :  Comment
+
+object DatabaseData
+
+DatabaseData :  DatabaseID
+
+object DatabaseRegionConfig
+
+DatabaseRegionConfig :  DatabaseID
+DatabaseRegionConfig :  RegionEnumTypeID
+
+object DatabaseRoleSetting
+
+DatabaseRoleSetting :  DatabaseID
+DatabaseRoleSetting :  RoleName
+
+object DatabaseZoneConfig
+
+DatabaseZoneConfig :  DatabaseID
+DatabaseZoneConfig :  ZoneConfig
+DatabaseZoneConfig :  SeqNum
+
+object EnumType
+
+EnumType :  TypeID
+EnumType :  ArrayTypeID
+EnumType :  IsMultiRegion
+
+object EnumTypeValue
+
+EnumTypeValue :  TypeID
+EnumTypeValue : []PhysicalRepresentation
+EnumTypeValue :  LogicalRepresentation
+
+object ForeignKeyConstraint
+
+ForeignKeyConstraint :  TableID
+ForeignKeyConstraint :  ConstraintID
+ForeignKeyConstraint : []ColumnIDs
+ForeignKeyConstraint :  ReferencedTableID
+ForeignKeyConstraint : []ReferencedColumnIDs
+ForeignKeyConstraint :  OnUpdateAction
+ForeignKeyConstraint :  OnDeleteAction
+ForeignKeyConstraint :  CompositeKeyMatchMethod
+ForeignKeyConstraint :  IndexIDForValidation
+
+object ForeignKeyConstraintUnvalidated
+
+ForeignKeyConstraintUnvalidated :  TableID
+ForeignKeyConstraintUnvalidated :  ConstraintID
+ForeignKeyConstraintUnvalidated : []ColumnIDs
+ForeignKeyConstraintUnvalidated :  ReferencedTableID
+ForeignKeyConstraintUnvalidated : []ReferencedColumnIDs
+ForeignKeyConstraintUnvalidated :  OnUpdateAction
+ForeignKeyConstraintUnvalidated :  OnDeleteAction
+ForeignKeyConstraintUnvalidated :  CompositeKeyMatchMethod
+
+object Function
+
+Function :  FunctionID
+Function : []Params
+Function :  ReturnSet
+Function :  ReturnType
+Function :  IsProcedure
+
+object FunctionBody
+
+FunctionBody :  FunctionID
+FunctionBody :  Body
+FunctionBody :  Lang
+FunctionBody : []UsesTables
+FunctionBody : []UsesViews
+FunctionBody : []UsesSequenceIDs
+FunctionBody : []UsesTypeIDs
+FunctionBody : []UsesFunctionIDs
+
+object FunctionLeakProof
+
+FunctionLeakProof :  FunctionID
+FunctionLeakProof :  LeakProof
+
+object FunctionName
+
+FunctionName :  FunctionID
+FunctionName :  Name
+
+object FunctionNullInputBehavior
+
+FunctionNullInputBehavior :  FunctionID
+FunctionNullInputBehavior :  NullInputBehavior
+
+object FunctionSecurity
+
+FunctionSecurity :  FunctionID
+FunctionSecurity :  Security
+
+object FunctionVolatility
+
+FunctionVolatility :  FunctionID
+FunctionVolatility :  Volatility
+
+object IndexColumn
+
+IndexColumn :  TableID
+IndexColumn :  IndexID
+IndexColumn :  ColumnID
+IndexColumn :  OrdinalInKind
+IndexColumn :  Kind
+IndexColumn :  Direction
+IndexColumn :  Implicit
+IndexColumn :  InvertedKind
+
+object IndexComment
+
+IndexComment :  TableID
+IndexComment :  IndexID
+IndexComment :  Comment
+
+object IndexData
+
+IndexData :  TableID
+IndexData :  IndexID
+
+object IndexName
+
+IndexName :  TableID
+IndexName :  IndexID
+IndexName :  Name
+
+object IndexPartitioning
+
+IndexPartitioning :  TableID
+IndexPartitioning :  IndexID
+IndexPartitioning :  PartitioningDescriptor
+
+object IndexZoneConfig
+
+IndexZoneConfig :  TableID
+IndexZoneConfig :  IndexID
+IndexZoneConfig :  Subzone
+IndexZoneConfig : []SubzoneSpans
+IndexZoneConfig :  SeqNum
+
+object LDRJobIDs
+
+LDRJobIDs :  TableID
+LDRJobIDs : []JobIDs
+
+object Namespace
+
+Namespace :  DatabaseID
+Namespace :  SchemaID
+Namespace :  DescriptorID
+Namespace :  Name
+
+object Owner
+
+Owner :  DescriptorID
+Owner :  Owner
+
+object PartitionZoneConfig
+
+PartitionZoneConfig :  TableID
+PartitionZoneConfig :  IndexID
+PartitionZoneConfig :  PartitionName
+PartitionZoneConfig :  Subzone
+PartitionZoneConfig : []SubzoneSpans
+PartitionZoneConfig :  SeqNum
+
+object PrimaryIndex
+
+PrimaryIndex :  Index
+
+object RowLevelTTL
+
+RowLevelTTL :  TableID
+RowLevelTTL :  RowLevelTTL
+RowLevelTTL :  TTLExpr
+
+object Schema
+
+Schema :  SchemaID
+Schema :  IsTemporary
+Schema :  IsPublic
+Schema :  IsVirtual
+
+object SchemaChild
+
+SchemaChild :  ChildObjectID
+SchemaChild :  SchemaID
+
+object SchemaComment
+
+SchemaComment :  SchemaID
+SchemaComment :  Comment
+
+object SchemaParent
+
+SchemaParent :  SchemaID
+SchemaParent :  ParentDatabaseID
+
+object SecondaryIndex
+
+SecondaryIndex :  Index
+SecondaryIndex :  EmbeddedExpr
+SecondaryIndex :  RecreateSourceIndexID
+
+object SecondaryIndexPartial
+
+SecondaryIndexPartial :  TableID
+SecondaryIndexPartial :  IndexID
+SecondaryIndexPartial :  Expression
+
+object Sequence
+
+Sequence :  SequenceID
+Sequence :  RestartWith
+Sequence :  UseRestartWith
+Sequence :  IsTemporary
+
+object SequenceOption
+
+SequenceOption :  SequenceID
+SequenceOption :  Key
+SequenceOption :  Value
+
+object SequenceOwner
+
+SequenceOwner :  SequenceID
+SequenceOwner :  TableID
+SequenceOwner :  ColumnID
+
+object Table
+
+Table :  TableID
+Table :  IsTemporary
+
+object TableComment
+
+TableComment :  TableID
+TableComment :  Comment
+
+object TableData
+
+TableData :  TableID
+TableData :  DatabaseID
+
+object TableLocalityGlobal
+
+TableLocalityGlobal :  TableID
+
+object TableLocalityPrimaryRegion
+
+TableLocalityPrimaryRegion :  TableID
+
+object TableLocalityRegionalByRow
+
+TableLocalityRegionalByRow :  TableID
+TableLocalityRegionalByRow :  As
+
+object TableLocalitySecondaryRegion
+
+TableLocalitySecondaryRegion :  TableID
+TableLocalitySecondaryRegion :  RegionEnumTypeID
+TableLocalitySecondaryRegion :  RegionName
+
+object TablePartitioning
+
+TablePartitioning :  TableID
+
+object TableSchemaLocked
+
+TableSchemaLocked :  TableID
+
+object TableZoneConfig
+
+TableZoneConfig :  TableID
+TableZoneConfig :  ZoneConfig
+TableZoneConfig :  SeqNum
+
+object TemporaryIndex
+
+TemporaryIndex :  Index
+TemporaryIndex :  IsUsingSecondaryEncoding
+TemporaryIndex :  Expr
+
+object Trigger
+
+Trigger :  TableID
+Trigger :  TriggerID
+
+object TriggerDeps
+
+TriggerDeps :  TableID
+TriggerDeps :  TriggerID
+TriggerDeps : []UsesRelationIDs
+TriggerDeps : []UsesTypeIDs
+TriggerDeps : []UsesRoutineIDs
+
+object TriggerEnabled
+
+TriggerEnabled :  TableID
+TriggerEnabled :  TriggerID
+TriggerEnabled :  Enabled
+
+object TriggerEvents
+
+TriggerEvents :  TableID
+TriggerEvents :  TriggerID
+TriggerEvents : []Events
+
+object TriggerFunctionCall
+
+TriggerFunctionCall :  TableID
+TriggerFunctionCall :  TriggerID
+TriggerFunctionCall :  FuncID
+TriggerFunctionCall : []FuncArgs
+TriggerFunctionCall :  FuncBody
+
+object TriggerName
+
+TriggerName :  TableID
+TriggerName :  TriggerID
+TriggerName :  Name
+
+object TriggerTiming
+
+TriggerTiming :  TableID
+TriggerTiming :  TriggerID
+TriggerTiming :  ActionTime
+TriggerTiming :  ForEachRow
+
+object TriggerTransition
+
+TriggerTransition :  TableID
+TriggerTransition :  TriggerID
+TriggerTransition :  NewTransitionAlias
+TriggerTransition :  OldTransitionAlias
+
+object TriggerWhen
+
+TriggerWhen :  TableID
+TriggerWhen :  TriggerID
+TriggerWhen :  WhenExpr
+
+object TypeComment
+
+TypeComment :  TypeID
+TypeComment :  Comment
+
+object UniqueWithoutIndexConstraint
+
+UniqueWithoutIndexConstraint :  TableID
+UniqueWithoutIndexConstraint :  ConstraintID
+UniqueWithoutIndexConstraint : []ColumnIDs
+UniqueWithoutIndexConstraint :  Predicate
+UniqueWithoutIndexConstraint :  IndexIDForValidation
+
+object UniqueWithoutIndexConstraintUnvalidated
+
+UniqueWithoutIndexConstraintUnvalidated :  TableID
+UniqueWithoutIndexConstraintUnvalidated :  ConstraintID
+UniqueWithoutIndexConstraintUnvalidated : []ColumnIDs
+UniqueWithoutIndexConstraintUnvalidated :  Predicate
+
+object UserPrivileges
+
+UserPrivileges :  DescriptorID
+UserPrivileges :  UserName
+UserPrivileges :  Privileges
+UserPrivileges :  WithGrantOption
+
+object View
+
+View :  ViewID
+View : []UsesTypeIDs
+View : []UsesRelationIDs
+View : []ForwardReferences
+View :  IsTemporary
+View :  IsMaterialized
+
+Table <|-- CheckConstraint
+Table <|-- CheckConstraintUnvalidated
+Table <|-- Column
+View <|-- Column
+Column <|-- ColumnComment
+Column <|-- ColumnComputeExpression
+Column <|-- ColumnDefaultExpression
+Table <|-- ColumnFamily
+Column <|-- ColumnName
+Column <|-- ColumnNotNull
+Column <|-- ColumnOnUpdateExpression
+Column <|-- ColumnType
+CompositeType <|-- CompositeTypeAttrName
+CompositeType <|-- CompositeTypeAttrType
+PrimaryIndex <|-- ConstraintComment
+SecondaryIndex <|-- ConstraintComment
+UniqueWithoutIndexConstraint <|-- ConstraintComment
+CheckConstraint <|-- ConstraintComment
+ForeignKeyConstraint <|-- ConstraintComment
+UniqueWithoutIndexConstraint <|-- ConstraintWithoutIndexName
+CheckConstraint <|-- ConstraintWithoutIndexName
+ForeignKeyConstraint <|-- ConstraintWithoutIndexName
+Database <|-- DatabaseComment
+Database <|-- DatabaseData
+Database <|-- DatabaseRegionConfig
+Database <|-- DatabaseRoleSetting
+Database <|-- DatabaseZoneConfig
+EnumType <|-- EnumTypeValue
+Table <|-- ForeignKeyConstraint
+Table <|-- ForeignKeyConstraintUnvalidated
+Function <|-- FunctionBody
+Function <|-- FunctionLeakProof
+Function <|-- FunctionName
+Function <|-- FunctionNullInputBehavior
+Function <|-- FunctionSecurity
+Function <|-- FunctionVolatility
+PrimaryIndex <|-- IndexColumn
+SecondaryIndex <|-- IndexColumn
+TemporaryIndex <|-- IndexColumn
+Column <|-- IndexColumn
+PrimaryIndex <|-- IndexComment
+SecondaryIndex <|-- IndexComment
+PrimaryIndex <|-- IndexData
+SecondaryIndex <|-- IndexData
+TemporaryIndex <|-- IndexData
+PrimaryIndex <|-- IndexName
+SecondaryIndex <|-- IndexName
+PrimaryIndex <|-- IndexPartitioning
+SecondaryIndex <|-- IndexPartitioning
+Index <|-- IndexZoneConfig
+Table <|-- LDRJobIDs
+Table <|-- Namespace
+View <|-- Namespace
+Sequence <|-- Namespace
+Database <|-- Namespace
+Schema <|-- Namespace
+AliasType <|-- Namespace
+EnumType <|-- Namespace
+Table <|-- Owner
+View <|-- Owner
+Sequence <|-- Owner
+Database <|-- Owner
+Schema <|-- Owner
+AliasType <|-- Owner
+EnumType <|-- Owner
+TablePartitioning <|-- PartitionZoneConfig
+Table <|-- PrimaryIndex
+View <|-- PrimaryIndex
+Table <|-- RowLevelTTL
+AliasType <|-- SchemaChild
+EnumType <|-- SchemaChild
+Table <|-- SchemaChild
+View <|-- SchemaChild
+Sequence <|-- SchemaChild
+Schema <|-- SchemaComment
+Schema <|-- SchemaParent
+Table <|-- SecondaryIndex
+View <|-- SecondaryIndex
+SecondaryIndex <|-- SecondaryIndexPartial
+Sequence <|-- SequenceOption
+Column <|-- SequenceOwner
+Table <|-- TableComment
+View <|-- TableComment
+Sequence <|-- TableComment
+Table <|-- TableData
+View <|-- TableData
+Sequence <|-- TableData
+Table <|-- TableLocalityGlobal
+Table <|-- TableLocalityPrimaryRegion
+Table <|-- TableLocalityRegionalByRow
+Table <|-- TableLocalitySecondaryRegion
+Table <|-- TablePartitioning
+Table <|-- TableSchemaLocked
+Table <|-- TableZoneConfig
+View <|-- TableZoneConfig
+Table <|-- TemporaryIndex
+View <|-- TemporaryIndex
+Table <|-- Trigger
+View <|-- Trigger
+Trigger <|-- TriggerDeps
+Trigger <|-- TriggerEnabled
+Trigger <|-- TriggerEvents
+Trigger <|-- TriggerFunctionCall
+Trigger <|-- TriggerName
+Trigger <|-- TriggerTiming
+Trigger <|-- TriggerTransition
+Trigger <|-- TriggerWhen
+CompositeType,EnumType <|-- TypeComment
+Table <|-- UniqueWithoutIndexConstraint
+Table <|-- UniqueWithoutIndexConstraintUnvalidated
+Table <|-- UserPrivileges
+View <|-- UserPrivileges
+Sequence <|-- UserPrivileges
+Database <|-- UserPrivileges
+Schema <|-- UserPrivileges
+AliasType <|-- UserPrivileges
+EnumType <|-- UserPrivileges
+@enduml

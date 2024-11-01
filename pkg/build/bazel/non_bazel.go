@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build !bazel
 // +build !bazel
@@ -19,6 +14,21 @@ package bazel
 // BuiltWithBazel returns true iff this library was built with Bazel.
 func BuiltWithBazel() bool {
 	return false
+}
+
+// InBazelTest returns true iff called from a test run by Bazel.
+func InBazelTest() bool {
+	return false
+}
+
+// InTestWrapper returns true iff called from Bazel's generated test wrapper.
+func InTestWrapper() bool {
+	return false
+}
+
+// FindBinary is not implemented.
+func FindBinary(pkg, name string) (string, bool) {
+	panic("not build with Bazel")
 }
 
 // Runfile is not implemented.

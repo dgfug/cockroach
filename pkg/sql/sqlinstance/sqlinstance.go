@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqlinstance provides interfaces that will be exposed
 // to interact with the sqlinstance subsystem.
@@ -17,19 +12,57 @@ package sqlinstance
 
 import (
 	"context"
+	"encoding/base64"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/cockroachdb/redact/interfaces"
 )
 
-// InstanceInfo exposes information on a SQL instance such as ID, network address and
-// the associated sqlliveness.SessionID.
+// InstanceInfo exposes information on a SQL instance such as ID, network
+// address, the associated sqlliveness.SessionID, and the instance's locality.
 type InstanceInfo struct {
-	InstanceID   base.SQLInstanceID
-	InstanceAddr string
-	SessionID    sqlliveness.SessionID
+	Region          []byte
+	InstanceID      base.SQLInstanceID
+	InstanceSQLAddr string
+	InstanceRPCAddr string
+	SessionID       sqlliveness.SessionID
+	Locality        roachpb.Locality
+	BinaryVersion   roachpb.Version
+	IsDraining      bool
 }
+
+func (ii InstanceInfo) GetInstanceID() base.SQLInstanceID {
+	return ii.InstanceID
+}
+
+func (ii InstanceInfo) GetLocality() roachpb.Locality {
+	return ii.Locality
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (ii InstanceInfo) SafeFormat(s interfaces.SafePrinter, verb rune) {
+	s.Printf(
+		"Instance{RegionPrefix: %v, InstanceID: %d, SQLAddr: %v, RPCAddr: %v, SessionID: %s, Locality: %v, BinaryVersion: %v}",
+		redact.SafeString(base64.StdEncoding.EncodeToString(ii.Region)),
+		ii.InstanceID,
+		ii.InstanceSQLAddr,
+		ii.InstanceRPCAddr,
+		ii.SessionID,
+		ii.Locality,
+		ii.BinaryVersion,
+	)
+}
+
+// String implements fmt.Stringer.
+func (ii InstanceInfo) String() string {
+	return redact.Sprint(ii).StripMarkers()
+}
+
+var _ redact.SafeFormatter = InstanceInfo{}
 
 // AddressResolver exposes API for retrieving the instance address and all live instances for a tenant.
 type AddressResolver interface {
@@ -41,19 +74,5 @@ type AddressResolver interface {
 	GetAllInstances(context.Context) ([]InstanceInfo, error)
 }
 
-// Provider is a wrapper around sqlinstance subsystem for external consumption.
-type Provider interface {
-	AddressResolver
-	// Instance returns the instance ID and sqlliveness.SessionID for the
-	// current SQL instance.
-	Instance(context.Context) (base.SQLInstanceID, sqlliveness.SessionID, error)
-	// Start starts the instanceprovider. This will block until
-	// the underlying instance data reader has been started.
-	Start(context.Context) error
-}
-
 // NonExistentInstanceError can be returned if a SQL instance does not exist.
 var NonExistentInstanceError = errors.Errorf("non existent SQL instance")
-
-// NotStartedError can be returned if the sqlinstance subsystem has not been started yet.
-var NotStartedError = errors.Errorf("sqlinstance subsystem not started")

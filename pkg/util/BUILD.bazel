@@ -5,16 +5,8 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "util",
     srcs = [
-        "constants.go",
-        "crdb_test_off.go",
-        "crdb_test_on.go",  # keep
         "every_n.go",
         "fast_int_map.go",
-        "fast_int_set.go",  # keep
-        "fast_int_set_large.go",
-        "fast_int_set_small.go",
-        "fast_int_set_str.go",
-        "fast_int_set_testonly.go",
         "hash.go",
         "nocopy.go",
         "pluralize.go",
@@ -33,13 +25,20 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/util",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/util/envutil",
+        "//pkg/util/intsets",
         "//pkg/util/netutil/addr",
-        "//pkg/util/randutil",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
-        "@org_golang_x_tools//container/intsets",
-    ],
+        "@com_github_cockroachdb_redact//:redact",
+    ] + select({
+        "@io_bazel_rules_go//go/platform:android": [
+            "//pkg/util/randutil",
+        ],
+        "@io_bazel_rules_go//go/platform:linux": [
+            "//pkg/util/randutil",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 go_test(
@@ -48,7 +47,6 @@ go_test(
     srcs = [
         "every_n_test.go",
         "fast_int_map_test.go",
-        "fast_int_set_test.go",
         "slices_test.go",
         "smalltrace_test.go",
         "strings_test.go",

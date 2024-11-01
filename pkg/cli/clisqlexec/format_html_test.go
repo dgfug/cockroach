@@ -1,19 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlexec
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -87,7 +82,7 @@ func TestRenderHTML(t *testing.T) {
 		name := fmt.Sprintf("escape=%v/rowStats=%v", tc.reporter.escape, tc.reporter.rowStats)
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
-			err := render(&tc.reporter, &buf, ioutil.Discard,
+			err := render(&tc.reporter, &buf, io.Discard,
 				cols, NewRowSliceIter(rows, align),
 				nil /* completedHook */, nil /* noRowsHook */)
 			if err != nil {

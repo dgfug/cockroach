@@ -1,19 +1,15 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.util.log.eventpb;
-option go_package = "eventpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/util/log/eventpb";
 
 import "gogoproto/gogo.proto";
 import "util/log/eventpb/events.proto";
+import "util/log/logpb/event.proto";
 
 // Category: SQL Privilege changes
 // Channel: PRIVILEGES
@@ -82,6 +78,14 @@ message ChangeTypePrivilege {
   string type_name = 4 [(gogoproto.jsontag) = ",omitempty"];
 }
 
+message ChangeFunctionPrivilege {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLPrivilegeEventDetails privs = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the affected function.
+  string func_name = 4 [(gogoproto.jsontag) = ",omitempty"];
+}
+
 
 // AlterDatabaseOwner is recorded when a database's owner is changed.
 message AlterDatabaseOwner {
@@ -123,6 +127,16 @@ message AlterTableOwner {
   string owner = 4 [(gogoproto.jsontag) = ",omitempty"];
 }
 
+// AlterTableOwner is recorded when the owner of a user-defined function is changed.
+message AlterFunctionOwner {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the affected user-defined function.
+  string function_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // The name of the new owner.
+  string owner = 5 [(gogoproto.jsontag) = ",omitempty"];
+}
+
 // AlterDefaultPrivileges is recorded when default privileges are changed.
 message AlterDefaultPrivileges {
   CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
@@ -134,5 +148,7 @@ message AlterDefaultPrivileges {
   // The role having its default privileges altered.
   string role_name = 5 [(gogoproto.jsontag) = ",omitempty"];
   // Identifies if FOR ALL ROLES is used.
-  bool for_all_roles = 6 [(gogoproto.jsontag) = ",omitempty"];;
+  bool for_all_roles = 6 [(gogoproto.jsontag) = ",omitempty"];
+  // The name of the affected schema.
+  string schema_name = 7 [(gogoproto.jsontag) = ",omitempty"];
 }

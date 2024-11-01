@@ -1,19 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ssmemstorage
 
 import (
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 )
 
 type stmtList []stmtKey
@@ -25,7 +20,7 @@ func (s stmtList) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func (s stmtList) Less(i, j int) bool {
-	cmp := strings.Compare(s[i].anonymizedStmt, s[j].anonymizedStmt)
+	cmp := strings.Compare(s[i].stmtNoConstants, s[j].stmtNoConstants)
 	if cmp == -1 {
 		return true
 	}
@@ -36,7 +31,7 @@ func (s stmtList) Less(i, j int) bool {
 	return s[i].transactionFingerprintID < s[j].transactionFingerprintID
 }
 
-type txnList []roachpb.TransactionFingerprintID
+type txnList []appstatspb.TransactionFingerprintID
 
 func (t txnList) Len() int {
 	return len(t)

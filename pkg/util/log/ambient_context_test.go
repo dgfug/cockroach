@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -47,7 +43,7 @@ func TestAnnotateCtxSpan(t *testing.T) {
 
 	// Annotate a context that has an open span.
 
-	sp1 := tracer.StartSpan("root", tracing.WithRecording(tracing.RecordingVerbose))
+	sp1 := tracer.StartSpan("root", tracing.WithRecording(tracingpb.RecordingVerbose))
 	ctx1 := tracing.ContextWithSpan(context.Background(), sp1)
 	Event(ctx1, "a")
 
@@ -57,7 +53,7 @@ func TestAnnotateCtxSpan(t *testing.T) {
 	Event(ctx1, "c")
 	sp2.Finish()
 
-	if err := tracing.CheckRecordedSpans(sp1.FinishAndGetRecording(tracing.RecordingVerbose), `
+	if err := tracing.CheckRecordedSpans(sp1.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: root
 			tags: _verbose=1
 			event: a
@@ -75,6 +71,7 @@ func TestAnnotateCtxSpan(t *testing.T) {
 
 	ac.Tracer = tracer
 	ctx, sp := ac.AnnotateCtxWithSpan(context.Background(), "s")
+	defer sp.Finish()
 	require.Equal(t, sp, tracing.SpanFromContext(ctx))
 	require.NotNil(t, sp)
 	require.False(t, sp.IsVerbose())
@@ -109,6 +106,13 @@ func TestResetAndAnnotateCtx(t *testing.T) {
 	ctx = logtags.AddTag(ctx, "b", 2)
 	ctx = ac.ResetAndAnnotateCtx(ctx)
 	if exp, val := "[a1] test", FormatWithContextTags(ctx, "test"); val != exp {
+		t.Errorf("expected '%s', got '%s'", exp, val)
+	}
+
+	ctx = logtags.AddTag(context.Background(), "b", 2)
+	ac = AmbientContext{}
+	ctx = ac.ResetAndAnnotateCtx(ctx)
+	if exp, val := "test", FormatWithContextTags(ctx, "test"); val != exp {
 		t.Errorf("expected '%s', got '%s'", exp, val)
 	}
 }

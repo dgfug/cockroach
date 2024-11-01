@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -16,10 +11,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/redact"
 )
 
 // sqlFnInfo stores information about a tree.SQLClass function, which is a
@@ -58,17 +54,17 @@ func (b *Builder) buildSQLFn(
 	for i := range exprs {
 		if !memo.CanExtractConstDatum(info.args[i]) {
 			panic(unimplemented.NewWithIssuef(49448, "non-constant argument passed to %s\n",
-				log.Safe(info.def.Name),
+				redact.Safe(info.def.Name),
 			))
 		}
 		exprs[i] = memo.ExtractConstDatum(info.args[i])
-		if exprs[i] == tree.DNull && !info.def.Properties.NullableArgs {
+		if exprs[i] == tree.DNull && !info.def.Overload.CalledOnNullInput {
 			return b.factory.ConstructNull(info.ResolvedType())
 		}
 	}
 
 	// Get the SQL statement and parse it.
-	sql, err := info.def.Overload.SQLFn(b.evalCtx, exprs)
+	sql, err := info.def.Overload.SQLFn.(eval.SQLFnOverload)(b.ctx, b.evalCtx, exprs)
 	if err != nil {
 		panic(err)
 	}

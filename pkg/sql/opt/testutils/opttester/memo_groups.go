@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
@@ -85,11 +80,7 @@ func (g *memoGroups) FindPath(root opt.Expr, target opt.Expr) []memoLoc {
 		// Enforcers aren't actually part of the memo group.
 		target = target.Child(0)
 	}
-	path := g.depthFirstSearch(root, target, make(map[groupID]struct{}), nil /* path */)
-	if path == nil {
-		panic(errors.AssertionFailedf("could not find path to expr (%s)", target.Op()))
-	}
-	return path
+	return g.depthFirstSearch(root, target, make(map[groupID]struct{}), nil /* path */)
 }
 
 // depthFirstSearch is used to find a path from any expression in the group that
@@ -130,22 +121,6 @@ func (g *memoGroups) depthFirstSearch(
 		for i, n := 0, expr.ChildCount(); i < n; i++ {
 			if r := g.depthFirstSearch(expr.Child(i), target, visited, nextPath); r != nil {
 				return r
-			}
-		}
-		// Special hack for scalar expressions that hang off the table meta - we
-		// treat these as children of Scan expressions.
-		if scan, ok := expr.(*memo.ScanExpr); ok {
-			md := scan.Memo().Metadata()
-			meta := md.TableMeta(scan.Table)
-			if meta.Constraints != nil {
-				if r := g.depthFirstSearch(meta.Constraints, target, visited, nextPath); r != nil {
-					return r
-				}
-			}
-			for _, expr := range meta.ComputedCols {
-				if r := g.depthFirstSearch(expr, target, visited, nextPath); r != nil {
-					return r
-				}
 			}
 		}
 	}

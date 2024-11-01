@@ -1,29 +1,28 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestSetupLogging checks the behavior of logging flags.
@@ -40,22 +39,29 @@ func TestSetupLogging(t *testing.T) {
 		`format: json-fluent-compact, ` +
 		`redactable: true, ` +
 		`exit-on-error: false, ` +
-		`buffering: NONE}`
+		`buffering: {max-staleness: 5s, ` +
+		`flush-trigger-size: 1.0MiB, ` +
+		`max-buffer-size: 50MiB, ` +
+		`format: newline}}`
 	const defaultHTTPConfig = `http-defaults: {` +
 		`method: POST, ` +
 		`unsafe-tls: false, ` +
-		`timeout: 0s, ` +
+		`timeout: 2s, ` +
 		`disable-keep-alives: false, ` +
+		`compression: gzip, ` +
 		`filter: INFO, ` +
 		`format: json-compact, ` +
 		`redactable: true, ` +
 		`exit-on-error: false, ` +
-		`buffering: NONE}`
+		`buffering: {max-staleness: 5s, ` +
+		`flush-trigger-size: 1.0MiB, ` +
+		`max-buffer-size: 50MiB, ` +
+		`format: newline}}`
 	stdFileDefaultsRe := regexp.MustCompile(
 		`file-defaults: \{` +
 			`dir: (?P<path>[^,]+), ` +
 			`max-file-size: 10MiB, ` +
-			`file-permissions: "0644", ` +
+			`file-permissions: "0640", ` +
 			`buffered-writes: true, ` +
 			`filter: INFO, ` +
 			`format: crdb-v2, ` +
@@ -64,14 +70,14 @@ func TestSetupLogging(t *testing.T) {
 	fileDefaultsNoMaxSizeRe := regexp.MustCompile(
 		`file-defaults: \{` +
 			`dir: (?P<path>[^,]+), ` +
-			`file-permissions: "0644", ` +
+			`file-permissions: "0640", ` +
 			`buffered-writes: true, ` +
 			`filter: INFO, ` +
 			`format: crdb-v2, ` +
 			`redactable: true, ` +
 			`buffering: NONE\}`)
 	const fileDefaultsNoDir = `file-defaults: {` +
-		`file-permissions: "0644", ` +
+		`file-permissions: "0640", ` +
 		`buffered-writes: true, ` +
 		`filter: INFO, ` +
 		`format: crdb-v2, ` +
@@ -86,7 +92,7 @@ func TestSetupLogging(t *testing.T) {
 		`\{channels: \{(?P<chans>[^}]*)\}, ` +
 			`dir: (?P<path>[^,]+), ` +
 			`max-file-size: 10MiB, ` +
-			`file-permissions: "0644", ` +
+			`file-permissions: "0640", ` +
 			`buffered-writes: (?P<buf>[^,]+), ` +
 			`filter: INFO, ` +
 			`format: (?P<format>[^,]+), ` +
@@ -97,7 +103,7 @@ func TestSetupLogging(t *testing.T) {
 			`dir: (?P<path>[^,]+), ` +
 			`max-file-size: 100KiB, ` +
 			`max-group-size: 1.0MiB, ` +
-			`file-permissions: "0644", ` +
+			`file-permissions: "0640", ` +
 			`buffered-writes: true, ` +
 			`filter: INFO, ` +
 			`format: crdb-v2, ` +
@@ -126,9 +132,14 @@ func TestSetupLogging(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	require.NoError(t, os.Setenv("HOST_IP", "1.2.3.4"))
+	defer func() {
+		require.NoError(t, os.Unsetenv("HOST_IP"))
+	}()
+
 	ctx := context.Background()
 
-	datadriven.RunTest(t, "testdata/logflags", func(t *testing.T, td *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "logflags"), func(t *testing.T, td *datadriven.TestData) string {
 		args := strings.Split(td.Input, "\n")
 
 		initCLIDefaults()
@@ -140,6 +151,14 @@ func TestSetupLogging(t *testing.T) {
 			t.Fatal(err)
 		}
 		log.TestingResetActive()
+		if isServerCmd(cmd) {
+			// Since server commands copy store options into server configs in PersistentPreRunE,
+			// we need to invoke those functions manually because logging relies on paths for the
+			// first declared store.
+			// The expectation here is that extraStoreFlagInit will be called in PersistentPreRunE
+			// which is called before PreRunE where logging is normally initialized.
+			require.NoError(t, extraStoreFlagInit(cmd))
+		}
 		if err := setupLogging(ctx, cmd, isServerCmd(cmd), false /* applyConfig */); err != nil {
 			return "error: " + err.Error()
 		}
@@ -197,8 +216,89 @@ func isServerCmd(thisCmd *cobra.Command) bool {
 	return false
 }
 
+func TestValidateLogConfigVars(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	for i, tc := range []struct {
+		vars        []string
+		expectedErr error
+	}{
+		{
+			vars: []string{"HOST_IP"},
+		},
+		{
+			vars:        []string{"COCKROACH_TEST"},
+			expectedErr: errors.Newf(`use of COCKROACH_TEST is not allowed as a logging configuration variable`),
+		},
+	} {
+		err := validateLogConfigVars(tc.vars)
+
+		if !errors.Is(tc.expectedErr, err) {
+			t.Errorf("%d. validateLogConfigVars err expected '%s', but got '%s'.",
+				i, tc.expectedErr, err)
+		}
+	}
+}
+
+func TestExpandEnvironmentVariables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	require.NoError(t, os.Setenv("HOST_IP1", "1.2.3.4"))
+	require.NoError(t, os.Setenv("HOST_IP2", "5.6.7.8"))
+	defer func() {
+		require.NoError(t, os.Unsetenv("HOST_IP1"))
+		require.NoError(t, os.Unsetenv("HOST_IP2"))
+	}()
+	require.NoError(t, os.Unsetenv("EXPAND_ABSENT_VAR1"))
+	require.NoError(t, os.Unsetenv("EXPAND_ABSENT_VAR2"))
+
+	for _, tc := range []struct {
+		in             string
+		vars           []string
+		expectedOut    string
+		expectedErrMsg string
+	}{
+		{
+			in:          "$HOST_IP1",
+			vars:        []string{"HOST_IP1"},
+			expectedOut: "1.2.3.4",
+		},
+		{
+			in:          "${HOST_IP2}",
+			vars:        []string{"HOST_IP2"},
+			expectedOut: "5.6.7.8",
+		},
+		{
+			in:             "$EXPAND_ABSENT_VAR1",
+			vars:           []string{"EXPAND_ABSENT_VAR1"},
+			expectedErrMsg: `variable "EXPAND_ABSENT_VAR1" is not defined in environment`,
+		},
+		{
+			in:             "${EXPAND_ABSENT_VAR2}",
+			vars:           []string{"EXPAND_ABSENT_VAR2"},
+			expectedErrMsg: `variable "EXPAND_ABSENT_VAR2" is not defined in environment`,
+		},
+		{
+			in:             "$HOST_IP3",
+			expectedErrMsg: `unknown variable "HOST_IP3" used in configuration`,
+		},
+		{
+			in:             "${HOST_IP4}",
+			expectedErrMsg: `unknown variable "HOST_IP4" used in configuration`,
+		},
+	} {
+		out, err := expandEnvironmentVariables(tc.in, tc.vars)
+
+		if tc.expectedErrMsg != "" {
+			assert.EqualError(t, err, tc.expectedErrMsg)
+		} else {
+			assert.Nil(t, err)
+		}
+		assert.Equal(t, tc.expectedOut, out)
+	}
+}
+
 // TestLogFlagCombinations checks that --log and --log-config-file properly
-// override each other.
+// override each other and that --log-config-vars stores the appropriate values
+// in the cliContext struct.
 func TestLogFlagCombinations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -208,7 +308,7 @@ func TestLogFlagCombinations(t *testing.T) {
 
 	// Generate some random file content for the yaml input.
 	const filecontents = "filecontents"
-	tmpfile, err := ioutil.TempFile("", t.Name()+".yaml")
+	tmpfile, err := os.CreateTemp("", t.Name()+".yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,15 +328,44 @@ func TestLogFlagCombinations(t *testing.T) {
 
 	f := startCmd.Flags()
 	testData := []struct {
-		args           []string
-		expectedLogCfg string
+		args            []string
+		expectedLogCfg  string
+		expectedLogVars []string
 	}{
-		{[]string{"start"}, ""},
-		{[]string{"start", "--log=foo"}, "foo"},
-		{[]string{"start", "--log-config-file=" + tmpfile.Name()}, filecontents},
-		{[]string{"start", "--log=foo", "--log=bar"}, "bar"},
-		{[]string{"start", "--log=foo", "--log-config-file=" + tmpfile.Name()}, filecontents},
-		{[]string{"start", "--log-config-file=" + tmpfile.Name(), "--log=bar"}, "bar"},
+		{
+			args:           []string{"start"},
+			expectedLogCfg: "",
+		},
+		{
+			args:           []string{"start", "--log=foo"},
+			expectedLogCfg: "foo",
+		},
+		{
+			args:           []string{"start", "--log-config-file=" + tmpfile.Name()},
+			expectedLogCfg: filecontents,
+		},
+		{
+			args:           []string{"start", "--log=foo", "--log=bar"},
+			expectedLogCfg: "bar",
+		},
+		{
+			args:           []string{"start", "--log=foo", "--log-config-file=" + tmpfile.Name()},
+			expectedLogCfg: filecontents,
+		},
+		{
+			args:           []string{"start", "--log-config-file=" + tmpfile.Name(), "--log=bar"},
+			expectedLogCfg: "bar",
+		},
+		{
+			args:            []string{"start", "--log-config-file=" + tmpfile.Name(), "--log-config-vars=HOST_IP"},
+			expectedLogCfg:  filecontents,
+			expectedLogVars: []string{"HOST_IP"},
+		},
+		{
+			args:            []string{"start", "--log-config-file=" + tmpfile.Name(), "--log-config-vars=HOST_IP,POD_NAME"},
+			expectedLogCfg:  filecontents,
+			expectedLogVars: []string{"HOST_IP", "POD_NAME"},
+		},
 	}
 
 	for i, td := range testData {
@@ -248,6 +377,11 @@ func TestLogFlagCombinations(t *testing.T) {
 		if td.expectedLogCfg != cliCtx.logConfigInput.s {
 			t.Errorf("%d. cliCtx.logConfigInput.s expected '%s', but got '%s'. td.args was '%#v'.",
 				i, td.expectedLogCfg, cliCtx.logConfigInput.s, td.args)
+		}
+
+		if !reflect.DeepEqual(td.expectedLogVars, cliCtx.logConfigVars) {
+			t.Errorf("%d. cliCtx.logConfigVars expected '%s', but got '%s'. td.args was '%#v'.",
+				i, td.expectedLogCfg, cliCtx.logConfigVars, td.args)
 		}
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
@@ -67,41 +62,40 @@ func (u UUID) MarshalText() ([]byte, error) {
 // UnmarshalText implements the encoding.TextUnmarshaler interface.
 // Following formats are supported:
 //
-//   "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-//   "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
-//   "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-//   "6ba7b8109dad11d180b400c04fd430c8"
-//   "{6ba7b8109dad11d180b400c04fd430c8}",
-//   "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
-//   "urn:uuid:6ba7b8109dad11d180b400c04fd430c8",
-//   "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-//	 "6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8"
+//	  "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+//	  "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
+//	  "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+//	  "6ba7b8109dad11d180b400c04fd430c8"
+//	  "{6ba7b8109dad11d180b400c04fd430c8}",
+//	  "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
+//	  "urn:uuid:6ba7b8109dad11d180b400c04fd430c8",
+//	  "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+//		 "6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8"
 //
 // ABNF for supported UUID text representation follows:
 //
-//   URN := 'urn'
-//   UUID-NID := 'uuid'
+//	URN := 'urn'
+//	UUID-NID := 'uuid'
 //
-//   hexdig := '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' |
-//             'a' | 'b' | 'c' | 'd' | 'e' | 'f' |
-//             'A' | 'B' | 'C' | 'D' | 'E' | 'F'
+//	hexdig := '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' |
+//	          'a' | 'b' | 'c' | 'd' | 'e' | 'f' |
+//	          'A' | 'B' | 'C' | 'D' | 'E' | 'F'
 //
-//   hexoct := hexdig hexdig
-//   2hexoct := hexoct hexoct
-//   4hexoct := 2hexoct 2hexoct
-//   6hexoct := 4hexoct 2hexoct
-//   12hexoct := 6hexoct 6hexoct
+//	hexoct := hexdig hexdig
+//	2hexoct := hexoct hexoct
+//	4hexoct := 2hexoct 2hexoct
+//	6hexoct := 4hexoct 2hexoct
+//	12hexoct := 6hexoct 6hexoct
 //
-//   hashlike := 12hexoct
-//   hyphenated := hyphen after any group of 4 hexdig
-//   Ex.6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8
-//   Ex.6ba7-b810-9dad11d1-80b400c0-4fd4-30c8
+//	hashlike := 12hexoct
+//	hyphenated := hyphen after any group of 4 hexdig
+//	Ex.6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8
+//	Ex.6ba7-b810-9dad11d1-80b400c0-4fd4-30c8
 //
-//   uuid := hyphenated | hashlike | braced | urn
+//	uuid := hyphenated | hashlike | braced | urn
 //
-//   braced := '{' hyphenated '}' | '{' hashlike  '}'
-//   urn := URN ':' UUID-NID ':' hyphenated
-//
+//	braced := '{' hyphenated '}' | '{' hashlike  '}'
+//	urn := URN ':' UUID-NID ':' hyphenated
 func (u *UUID) UnmarshalText(text []byte) error {
 	l := len(text)
 	stringifiedText := string(text)
@@ -118,7 +112,8 @@ func (u *UUID) UnmarshalText(text []byte) error {
 }
 
 // decodeHashLike decodes UUID strings that are using the following format:
-//  "6ba7b8109dad11d180b400c04fd430c8".
+//
+//	"6ba7b8109dad11d180b400c04fd430c8".
 func (u *UUID) decodeHashLike(t []byte) error {
 	src := t[:]
 	dst := u[:]
@@ -128,8 +123,9 @@ func (u *UUID) decodeHashLike(t []byte) error {
 }
 
 // decodeHyphenated decodes UUID strings that are using the following format:
-//  "6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8"
-//  "6ba7b810-9dad-11d1-80b400c0-4fd4-30c8"
+//
+//	"6ba7-b810-9dad-11d1-80b4-00c0-4fd4-30c8"
+//	"6ba7b810-9dad-11d1-80b400c0-4fd4-30c8"
 func (u *UUID) decodeHyphenated(t []byte) error {
 	l := len(t)
 	if l < 32 || l > 40 {

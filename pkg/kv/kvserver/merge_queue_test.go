@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -35,17 +31,18 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 	testCtx := testContext{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	testCtx.Start(t, stopper)
+	tsc := TestStoreConfig(nil)
+	testCtx.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 	mq := newMergeQueue(testCtx.store, testCtx.store.DB())
 	kvserverbase.MergeQueueEnabled.Override(ctx, &testCtx.store.ClusterSettings().SV, true)
 
-	tableKey := func(i uint32) []byte {
-		return keys.SystemSQLCodec.TablePrefix(keys.MaxReservedDescID + i)
+	tableKey := func(offset uint32) []byte {
+		return keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(offset))
 	}
 
-	config.TestingSetZoneConfig(keys.MaxReservedDescID+1, *zonepb.NewZoneConfig())
-	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, *zonepb.NewZoneConfig())
+	config.TestingSetZoneConfig(config.ObjectID(bootstrap.TestingUserDescID(0)), *zonepb.NewZoneConfig())
+	config.TestingSetZoneConfig(config.ObjectID(bootstrap.TestingUserDescID(1)), *zonepb.NewZoneConfig())
 
 	type testCase struct {
 		startKey, endKey []byte
@@ -58,13 +55,13 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 	testCases := []testCase{
 		// The last range of table 1 should not be mergeable because table 2 exists.
 		{
-			startKey: tableKey(1),
-			endKey:   tableKey(2),
+			startKey: tableKey(0),
+			endKey:   tableKey(1),
 			minBytes: 1,
 		},
 		{
-			startKey: append(tableKey(1), 'z'),
-			endKey:   tableKey(2),
+			startKey: append(tableKey(0), 'z'),
+			endKey:   tableKey(1),
 			minBytes: 1,
 		},
 
@@ -72,15 +69,15 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 		// because there is no table that follows. (In this test, the system only
 		// knows about tables on which TestingSetZoneConfig has been called.)
 		{
-			startKey:    tableKey(2),
-			endKey:      tableKey(3),
+			startKey:    tableKey(1),
+			endKey:      tableKey(2),
 			minBytes:    1,
 			expShouldQ:  true,
 			expPriority: 1,
 		},
 		{
-			startKey:    append(tableKey(2), 'z'),
-			endKey:      tableKey(3),
+			startKey:    append(tableKey(1), 'z'),
+			endKey:      tableKey(2),
 			minBytes:    1,
 			expShouldQ:  true,
 			expPriority: 1,
@@ -88,12 +85,12 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 
 		// The last range is never mergeable.
 		{
-			startKey: tableKey(3),
+			startKey: tableKey(2),
 			endKey:   roachpb.KeyMax,
 			minBytes: 1,
 		},
 		{
-			startKey: append(tableKey(3), 'z'),
+			startKey: append(tableKey(2), 'z'),
 			endKey:   roachpb.KeyMax,
 			minBytes: 1,
 		},
@@ -101,16 +98,16 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 		// An interior range of a table is not mergeable if it meets or exceeds the
 		// minimum byte threshold.
 		{
-			startKey:    tableKey(1),
-			endKey:      append(tableKey(1), 'a'),
+			startKey:    tableKey(0),
+			endKey:      append(tableKey(0), 'a'),
 			minBytes:    1024,
 			bytes:       1024,
 			expShouldQ:  false,
 			expPriority: 0,
 		},
 		{
-			startKey:    tableKey(1),
-			endKey:      append(tableKey(1), 'a'),
+			startKey:    tableKey(0),
+			endKey:      append(tableKey(0), 'a'),
 			minBytes:    1024,
 			bytes:       1024,
 			expShouldQ:  false,
@@ -119,8 +116,8 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 		// Edge case: a minimum byte threshold of zero. This effectively disables
 		// the threshold, as an empty range is no longer considered mergeable.
 		{
-			startKey:    tableKey(1),
-			endKey:      append(tableKey(1), 'a'),
+			startKey:    tableKey(0),
+			endKey:      append(tableKey(0), 'a'),
 			minBytes:    0,
 			bytes:       0,
 			expShouldQ:  false,
@@ -130,16 +127,16 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 		// An interior range of a table is mergeable if it does not meet the minimum
 		// byte threshold. Its priority is inversely related to its size.
 		{
-			startKey:    tableKey(1),
-			endKey:      append(tableKey(1), 'a'),
+			startKey:    tableKey(0),
+			endKey:      append(tableKey(0), 'a'),
 			minBytes:    1024,
 			bytes:       0,
 			expShouldQ:  true,
 			expPriority: 1,
 		},
 		{
-			startKey:    tableKey(1),
-			endKey:      append(tableKey(1), 'a'),
+			startKey:    tableKey(0),
+			endKey:      append(tableKey(0), 'a'),
 			minBytes:    1024,
 			bytes:       768,
 			expShouldQ:  true,
@@ -149,12 +146,12 @@ func TestMergeQueueShouldQueue(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
-			repl := &Replica{}
-			repl.mu.state.Desc = &roachpb.RangeDescriptor{StartKey: tc.startKey, EndKey: tc.endKey}
-			repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: tc.bytes}
+			repl := &Replica{store: testCtx.store}
+			repl.shMu.state.Desc = &roachpb.RangeDescriptor{StartKey: tc.startKey, EndKey: tc.endKey}
+			repl.shMu.state.Stats = &enginepb.MVCCStats{KeyBytes: tc.bytes}
 			zoneConfig := zonepb.DefaultZoneConfigRef()
 			zoneConfig.RangeMinBytes = proto.Int64(tc.minBytes)
-			repl.SetSpanConfig(zoneConfig.AsSpanConfig())
+			repl.SetSpanConfig(zoneConfig.AsSpanConfig(), roachpb.Span{Key: tc.startKey, EndKey: tc.endKey})
 			shouldQ, priority := mq.shouldQueue(ctx, hlc.ClockTimestamp{}, repl, config.NewSystemConfig(zoneConfig))
 			if tc.expShouldQ != shouldQ {
 				t.Errorf("incorrect shouldQ: expected %v but got %v", tc.expShouldQ, shouldQ)

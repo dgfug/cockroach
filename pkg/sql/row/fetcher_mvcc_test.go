@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row_test
 
@@ -19,23 +14,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
-func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
+func slurpUserDataKVs(t testing.TB, e storage.Engine, codec keys.SQLCodec) []roachpb.KeyValue {
 	t.Helper()
 
 	// Scan meta keys directly from engine. We put this in a retry loop
@@ -44,9 +39,12 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 	var kvs []roachpb.KeyValue
 	testutils.SucceedsSoon(t, func() error {
 		kvs = nil
-		it := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		it, err := e.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: codec.TenantEndKey()})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer it.Close()
-		for it.SeekGE(storage.MVCCKey{Key: keys.UserTableDataMin}); ; it.NextKey() {
+		for it.SeekGE(storage.MVCCKey{Key: bootstrap.TestingUserTableDataMin(codec)}); ; it.NextKey() {
 			ok, err := it.Valid()
 			if err != nil {
 				t.Fatal(err)
@@ -57,10 +55,14 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 			if !it.UnsafeKey().IsValue() {
 				return errors.Errorf("found intent key %v", it.UnsafeKey())
 			}
-			kvs = append(kvs, roachpb.KeyValue{
-				Key:   it.Key().Key,
-				Value: roachpb.Value{RawBytes: it.Value(), Timestamp: it.UnsafeKey().Timestamp},
-			})
+			mvccValue, err := storage.DecodeMVCCValueAndErr(it.Value())
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := mvccValue.Value
+			value.Timestamp = it.UnsafeKey().Timestamp
+			kv := roachpb.KeyValue{Key: it.UnsafeKey().Key.Clone(), Value: value}
+			kvs = append(kvs, kv)
 		}
 		return nil
 	})
@@ -69,11 +71,14 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 
 func TestRowFetcherMVCCMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-	store, _ := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	srv, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	codec := s.Codec()
+	store, _ := srv.StorageLayer().GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `CREATE DATABASE d`)
@@ -82,33 +87,21 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		a STRING PRIMARY KEY, b STRING, c STRING, d STRING,
 		FAMILY (a, b, c), FAMILY (d)
 	)`)
-	desc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
-	var colIdxMap catalog.TableColMap
-	var valNeededForCol util.FastIntSet
-	for i, col := range desc.PublicColumns() {
-		colIdxMap.Set(col.GetID(), i)
-		valNeededForCol.Add(i)
-	}
-	table := row.FetcherTableArgs{
-		Desc:             desc,
-		Index:            desc.GetPrimaryIndex(),
-		ColIdxMap:        colIdxMap,
-		IsSecondaryIndex: false,
-		Cols:             desc.PublicColumns(),
-		ValNeededForCol:  valNeededForCol,
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, `d`, `parent`)
+	var spec fetchpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(
+		&spec, codec, desc, desc.GetPrimaryIndex(), desc.PublicColumnIDs(),
+	); err != nil {
+		t.Fatal(err)
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
 		ctx,
-		keys.SystemSQLCodec,
-		false, /* reverse */
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,    /* lockTimeout */
-		true, /* isCheck */
-		&rowenc.DatumAlloc{},
-		nil, /* memMonitor */
-		table,
+		row.FetcherInitArgs{
+			WillUseKVProvider: true,
+			Alloc:             &tree.DatumAlloc{},
+			Spec:              &spec,
+		},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -123,12 +116,12 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
-		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {
+		if err := rf.ConsumeKVProvider(ctx, &row.KVProvider{KVs: kvs}); err != nil {
 			t.Fatal(err)
 		}
 		var rows []rowWithMVCCMetadata
 		for {
-			datums, _, _, err := rf.NextRowDecoded(ctx)
+			datums, err := rf.NextRowDecoded(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -137,7 +130,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			}
 			row := rowWithMVCCMetadata{
 				RowIsDeleted:    rf.RowIsDeleted(),
-				RowLastModified: tree.TimestampToDecimalDatum(rf.RowLastModified()).String(),
+				RowLastModified: eval.TimestampToDecimalDatum(rf.RowLastModified()).String(),
 			}
 			for _, datum := range datums {
 				if datum == tree.DNull {
@@ -157,7 +150,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts1)
 
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine(), codec)), []rowWithMVCCMetadata{
 		{[]string{`1`, `a`, `a`, `a`}, false, ts1},
 		{[]string{`2`, `b`, `b`, `b`}, false, ts1},
 	}; !reflect.DeepEqual(expected, actual) {
@@ -171,7 +164,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts2)
 
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine(), codec)), []rowWithMVCCMetadata{
 		{[]string{`1`, `NULL`, `NULL`, `NULL`}, false, ts2},
 		{[]string{`2`, `b`, `b`, `NULL`}, false, ts2},
 	}; !reflect.DeepEqual(expected, actual) {
@@ -183,7 +176,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		DELETE FROM parent WHERE a = '1';
 		SELECT cluster_logical_timestamp();
 	END;`).Scan(&ts3)
-	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.Engine())), []rowWithMVCCMetadata{
+	if actual, expected := kvsToRows(slurpUserDataKVs(t, store.TODOEngine(), codec)), []rowWithMVCCMetadata{
 		{[]string{`1`, `NULL`, `NULL`, `NULL`}, true, ts3},
 		{[]string{`2`, `b`, `b`, `NULL`}, false, ts2},
 	}; !reflect.DeepEqual(expected, actual) {

@@ -6,10 +6,9 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/gossipsim",
     visibility = ["//visibility:private"],
     deps = [
-        "//pkg/config/zonepb",
         "//pkg/gossip",
         "//pkg/gossip/simulation",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/encoding",
         "//pkg/util/log",
         "//pkg/util/randutil",

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -22,7 +17,7 @@
 package colexecbase
 
 import (
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -105,13 +100,8 @@ func (c const_TYPEOp) Next() coldata.Batch {
 	}
 	vec := batch.ColVec(c.outputIdx)
 	col := vec.TemplateType()
-	if vec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		vec.Nulls().UnsetNulls()
-	}
 	c.allocator.PerformOperation(
-		[]coldata.Vec{vec},
+		[]*coldata.Vec{vec},
 		func() {
 			// Shallow copy col to work around Go issue
 			// https://github.com/golang/go/issues/39756 which prevents bound check

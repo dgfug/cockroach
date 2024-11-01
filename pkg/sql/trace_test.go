@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -18,16 +13,19 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -42,11 +40,13 @@ func TestTrace(t *testing.T) {
 	// These are always appended, even without the test specifying it.
 	alwaysOptionalSpans := []string{
 		"drain",
-		"storage.pendingLeaseRequest: requesting lease",
-		"storage.Store: gossip on capacity change",
+		"pendingLeaseRequest: requesting lease",
+		"gossip on capacity change",
 		"outbox",
 		"request range lease",
 		"range lookup",
+		"local proposal",
+		"admissionWorkQueueWait",
 	}
 
 	testData := []struct {
@@ -77,7 +77,8 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"exec stmt",
+				"sql query",
+				"optimizer",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -86,6 +87,7 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
+				"commit sql txn",
 			},
 		},
 		{
@@ -108,25 +110,28 @@ func TestTrace(t *testing.T) {
 				// Check that stat collection from the above SELECT statement is output
 				// to trace. We don't insert any rows in this test, thus the expected
 				// num tuples value plus one is 1.
-				rows, err := sqlDB.Query(
-					"SELECT count(message) FROM crdb_internal.session_trace " +
-						"WHERE message LIKE '%component%num_tuples%value_plus_one:1%'",
-				)
+				rows, err := sqlDB.Query("SELECT message FROM crdb_internal.session_trace")
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !rows.Next() {
-					t.Fatal("unable to retrieve count")
-				}
-
-				var count int
-				if err := rows.Scan(&count); err != nil {
+				var trace strings.Builder
+				if err := func() error {
+					for rows.Next() {
+						var msg string
+						if err := rows.Scan(&msg); err != nil {
+							return err
+						}
+						fmt.Fprintln(&trace, msg)
+					}
+					return rows.Close()
+				}(); err != nil {
 					t.Fatal(err)
 				}
-				if err := rows.Close(); err != nil {
-					t.Fatal(err)
+				t.Logf("trace:\n%s", trace.String())
+				if trace.Len() == 0 {
+					t.Fatalf("empty trace")
 				}
-				if count == 0 {
+				if !strings.Contains(trace.String(), "ComponentStats") {
 					t.Fatalf("no stat messages found")
 				}
 
@@ -137,18 +142,22 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"exec stmt",
+				"sql query",
+				"optimizer",
 				"flow",
 				"table reader",
 				"consuming rows",
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
+				"commit sql txn",
 			},
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
+				"setup-flow-async",
 				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/FlowStream",
 				"noop",
 			},
 		},
@@ -172,7 +181,8 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"exec stmt",
+				"sql query",
+				"optimizer",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -181,6 +191,7 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
+				"commit sql txn",
 			},
 		},
 		{
@@ -205,18 +216,22 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"exec stmt",
+				"sql query",
+				"optimizer",
 				"flow",
 				"table reader",
 				"consuming rows",
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
+				"commit sql txn",
 			},
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
+				"setup-flow-async",
 				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/FlowStream",
 				"noop",
 			},
 		},
@@ -229,6 +244,11 @@ func TestTrace(t *testing.T) {
 				if _, err := sqlDB.Exec("SET vectorize = on"); err != nil {
 					t.Fatal(err)
 				}
+				// Disable the direct columnar scans to make the vectorized
+				// planning deterministic.
+				if _, err := sqlDB.Exec(`SET direct_columnar_scans_enabled = false`); err != nil {
+					t.Fatal(err)
+				}
 				if _, err := sqlDB.Exec("SET tracing = on; SELECT * FROM test.foo; SET tracing = off"); err != nil {
 					t.Fatal(err)
 				}
@@ -239,7 +259,8 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"exec stmt",
+				"sql query",
+				"optimizer",
 				"flow",
 				"batch flow coordinator",
 				"colbatchscan",
@@ -247,26 +268,28 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
+				"commit sql txn",
 			},
 		},
 	}
 
 	// Create a cluster. We'll run sub-tests using each node of this cluster.
 	const numNodes = 3
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{})
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{})
 	defer cluster.Stopper().Stop(context.Background())
 
 	clusterDB := cluster.ServerConn(0)
+	if _, err := clusterDB.Exec(`CREATE DATABASE test;`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := clusterDB.Exec(`
-		CREATE DATABASE test;
-
 		--- test.foo is a single range table.
 		CREATE TABLE test.foo (id INT PRIMARY KEY);
-
 		--- test.bar is a multi-range table.
-		CREATE TABLE test.bar (id INT PRIMARY KEY);
-		ALTER TABLE  test.bar SPLIT AT VALUES (5);
-	`); err != nil {
+		CREATE TABLE test.bar (id INT PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clusterDB.Exec(`ALTER TABLE  test.bar SPLIT AT VALUES (5);`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -297,8 +320,12 @@ func TestTrace(t *testing.T) {
 							// TODO(andrei): Pull the check for an empty session_trace out of
 							// the sub-tests so we can use cluster.ServerConn(i) here.
 							pgURL, cleanup := sqlutils.PGUrl(
-								t, cluster.Server(i).ServingSQLAddr(), "TestTrace", url.User(security.RootUser))
+								t, cluster.Server(i).AdvSQLAddr(), "TestTrace", url.User(username.RootUser))
 							defer cleanup()
+							q := pgURL.Query()
+							// This makes it easier to test with the `tracing` sesssion var.
+							q.Add("enable_implicit_transaction_for_batch_statements", "false")
+							pgURL.RawQuery = q.Encode()
 							sqlDB, err := gosql.Open("postgres", pgURL.String())
 							if err != nil {
 								t.Fatal(err)
@@ -315,7 +342,7 @@ func TestTrace(t *testing.T) {
 							}
 
 							if _, err := cluster.ServerConn(0).Exec(
-								fmt.Sprintf(`SET CLUSTER SETTING trace.debug.enable = %t`, enableTr),
+								fmt.Sprintf(`SET CLUSTER SETTING trace.debug_http_endpoint.enabled = %t`, enableTr),
 							); err != nil {
 								t.Fatal(err)
 							}
@@ -337,17 +364,22 @@ func TestTrace(t *testing.T) {
 							}
 							defer rows.Close()
 
-							ignoreSpans := make(map[string]bool)
-							for _, s := range test.optionalSpans {
-								ignoreSpans[s] = true
+							ignoreSpan := func(op string) bool {
+								for _, s := range test.optionalSpans {
+									if strings.Contains(op, s) {
+										return true
+									}
+								}
+								return false
 							}
+
 							r := 0
 							for rows.Next() {
 								var op string
 								if err := rows.Scan(&op); err != nil {
 									t.Fatal(err)
 								}
-								if ignoreSpans[op] {
+								if ignoreSpan(op) {
 									continue
 								}
 
@@ -364,7 +396,7 @@ func TestTrace(t *testing.T) {
 										if err := rows.Scan(&op); err != nil {
 											t.Fatal(err)
 										}
-										if ignoreSpans[op] {
+										if ignoreSpan(op) {
 											continue
 										}
 										t.Errorf("remaining span: %q", op)
@@ -395,7 +427,7 @@ func TestTraceFieldDecomposition(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				BeforeExecute: func(ctx context.Context, stmt string) {
+				BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 					if strings.Contains(stmt, query) {
 						// We need to check a tag containing brackets (e.g. an
 						// IPv6 address).  See #18558.
@@ -536,7 +568,7 @@ func TestKVTraceDistSQL(t *testing.T) {
 
 	// Test that kv tracing works in distsql.
 	const numNodes = 2
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",
@@ -583,16 +615,16 @@ func TestTraceDistSQL(t *testing.T) {
 
 	ctx := context.Background()
 	countStmt := "SELECT count(1) FROM test.a"
-	recCh := make(chan tracing.Recording, 2)
+	recCh := make(chan tracingpb.Recording, 2)
 
 	const numNodes = 2
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WithStatementTrace: func(trace tracing.Recording, stmt string) {
+					WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 						if stmt == countStmt {
 							recCh <- trace
 						}
@@ -626,5 +658,28 @@ func TestTraceDistSQL(t *testing.T) {
 	require.True(t, ok, "table reader span not found")
 	require.Empty(t, rec.OrphanSpans())
 	// Check that the table reader indeed came from a remote note.
-	require.Equal(t, "2", sp.Tags["node"])
+	anonTagGroup := sp.FindTagGroup(tracingpb.AnonymousTagGroupName)
+	require.NotNil(t, anonTagGroup)
+	val, ok := anonTagGroup.FindTag("node")
+	require.True(t, ok)
+	require.Equal(t, "2", val)
+}
+
+// Test the sql.trace.stmt.enable_threshold cluster setting.
+func TestStatementThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettings()
+	sql.TraceStmtThreshold.Override(ctx, &settings.SV, 1*time.Nanosecond)
+	args := base.TestServerArgs{
+		Settings: settings,
+	}
+	// Check that the server starts (no crash).
+	s, db, _ := serverutils.StartServer(t, args)
+	defer s.Stopper().Stop(ctx)
+	r := sqlutils.MakeSQLRunner(db)
+	r.Exec(t, "select 1")
+	// TODO(andrei): check the logs for traces somehow.
 }

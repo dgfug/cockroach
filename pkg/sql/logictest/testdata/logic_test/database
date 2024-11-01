@@ -10,15 +10,15 @@ CREATE DATABASE IF NOT EXISTS a
 statement error pgcode 42601 empty database name
 CREATE DATABASE ""
 
-query TTTTT colnames
+query TTTTTT colnames,rowsort
 SHOW DATABASES
 ----
-database_name  owner  primary_region  regions  survival_goal
-a              root   NULL            {}       NULL
-defaultdb      root   NULL            {}       NULL
-postgres       root   NULL            {}       NULL
-system         node   NULL            {}       NULL
-test           root   NULL            {}       NULL
+database_name  owner  primary_region  secondary_region  regions  survival_goal
+a              root   NULL            NULL              {}       NULL
+defaultdb      root   NULL            NULL              {}       NULL
+postgres       root   NULL            NULL              {}       NULL
+system         node   NULL            NULL              {}       NULL
+test           root   NULL            NULL              {}       NULL
 
 statement ok
 CREATE ROLE newrole LOGIN
@@ -31,25 +31,43 @@ true
 statement ok
 COMMENT ON DATABASE a IS 'A'
 
-query TTTTTT colnames
+query TTTTTTT colnames,rowsort
 SHOW DATABASES WITH COMMENT
 ----
-database_name  owner  primary_region  regions  survival_goal  comment
-a              root   NULL            {}       NULL           A
-defaultdb      root   NULL            {}       NULL           NULL
-postgres       root   NULL            {}       NULL           NULL
-system         node   NULL            {}       NULL           NULL
-test           root   NULL            {}       NULL           NULL
+database_name  owner  primary_region  secondary_region  regions  survival_goal  comment
+a              root   NULL            NULL              {}       NULL           A
+defaultdb      root   NULL            NULL              {}       NULL           NULL
+postgres       root   NULL            NULL              {}       NULL           NULL
+system         node   NULL            NULL              {}       NULL           NULL
+test           root   NULL            NULL              {}       NULL           NULL
 
-query TT colnames
+statement ok
+COMMENT ON DATABASE a IS 'AAA'
+
+query TTTTTTT colnames,rowsort
+SHOW DATABASES WITH COMMENT
+----
+database_name  owner  primary_region  secondary_region  regions  survival_goal  comment
+a              root   NULL            NULL              {}       NULL           AAA
+defaultdb      root   NULL            NULL              {}       NULL           NULL
+postgres       root   NULL            NULL              {}       NULL           NULL
+system         node   NULL            NULL              {}       NULL           NULL
+test           root   NULL            NULL              {}       NULL           NULL
+
+# Verify that SHOW SCHEMAS FROM a includes user-defined schemas.
+statement ok
+CREATE SCHEMA a.s
+
+query TT colnames,rowsort
 SHOW SCHEMAS FROM a
 ----
 schema_name         owner
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
-public              admin
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
+s                   root
 
 statement ok
 CREATE DATABASE b TEMPLATE=template0
@@ -102,22 +120,22 @@ CREATE DATABASE b8 WITH CONNECTION LIMIT = 1
 statement ok
 CREATE DATABASE c
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-a          root  NULL  {}  NULL
-b          root  NULL  {}  NULL
-b2         root  NULL  {}  NULL
-b3         root  NULL  {}  NULL
-b4         root  NULL  {}  NULL
-b5         root  NULL  {}  NULL
-b6         root  NULL  {}  NULL
-b7         root  NULL  {}  NULL
-c          root  NULL  {}  NULL
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+a          root  NULL  NULL  {}  NULL
+b          root  NULL  NULL  {}  NULL
+b2         root  NULL  NULL  {}  NULL
+b3         root  NULL  NULL  {}  NULL
+b4         root  NULL  NULL  {}  NULL
+b5         root  NULL  NULL  {}  NULL
+b6         root  NULL  NULL  {}  NULL
+b7         root  NULL  NULL  {}  NULL
+c          root  NULL  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 statement ok
 CREATE TABLE b.a (id INT PRIMARY KEY)
@@ -149,25 +167,35 @@ DROP DATABASE IF EXISTS b
 
 statement ok
 DROP DATABASE b2 CASCADE;
-  DROP DATABASE b3 CASCADE;
-  DROP DATABASE b4 CASCADE;
-  DROP DATABASE b5 CASCADE;
-  DROP DATABASE b6 CASCADE;
-  DROP DATABASE b7 CASCADE
+
+statement ok
+DROP DATABASE b3 CASCADE;
+
+statement ok
+DROP DATABASE b4 CASCADE;
+
+statement ok
+DROP DATABASE b5 CASCADE;
+
+statement ok
+DROP DATABASE b6 CASCADE;
+
+statement ok
+DROP DATABASE b7 CASCADE
 
 statement error pgcode 42601 empty database name
 DROP DATABASE ""
 
-query TTTTT colnames
+query TTTTTT colnames,rowsort
 SHOW DATABASES
 ----
-database_name  owner  primary_region  regions  survival_goal
-a              root   NULL            {}       NULL
-c              root   NULL            {}       NULL
-defaultdb      root   NULL            {}       NULL
-postgres       root   NULL            {}       NULL
-system         node   NULL            {}       NULL
-test           root   NULL            {}       NULL
+database_name  owner  primary_region  secondary_region  regions  survival_goal
+a              root   NULL            NULL              {}       NULL
+c              root   NULL            NULL              {}       NULL
+defaultdb      root   NULL            NULL              {}       NULL
+postgres       root   NULL            NULL              {}       NULL
+system         node   NULL            NULL              {}       NULL
+test           root   NULL            NULL              {}       NULL
 
 statement ok
 CREATE DATABASE b
@@ -243,8 +271,14 @@ SET sql_safe_updates=false;
 statement ok
 DROP DATABASE db1;
 
-statement error pq: database "db1" does not exist
+statement error pgcode 3D000 pq: database "db1" does not exist
 SELECT * FROM crdb_internal.session_variables;
+
+statement error pgcode 3D000 pq: database "db1" does not exist
+SELECT * FROM pg_catalog.pg_attribute;
+
+statement error pgcode 3D000 pq: database "db1" does not exist
+SELECT * FROM unknown_table;
 
 subtest missing-schema-error-69713
 
@@ -274,3 +308,131 @@ CREATE TABLE db69713.s.pg_constraintdef_test (
 
 statement ok
 DROP DATABASE db69713;
+
+statement ok
+RESET DATABASE;
+
+subtest end
+
+# Ensure user must exist to create with owner.
+statement error role/user "fake_user" does not exist
+CREATE DATABASE aa with owner fake_user
+
+statement ok
+CREATE DATABASE a with owner testuser
+
+query TTTTTT colnames,rowsort
+SHOW DATABASES
+----
+database_name  owner     primary_region  secondary_region  regions  survival_goal
+a              testuser  NULL            NULL              {}       NULL
+b              root      NULL            NULL              {}       NULL
+c              root      NULL            NULL              {}       NULL
+defaultdb      root      NULL            NULL              {}       NULL
+postgres       root      NULL            NULL              {}       NULL
+system         node      NULL            NULL              {}       NULL
+test           root      NULL            NULL              {}       NULL
+
+# Non-superusers also must be a member of the new owning role.
+statement ok
+CREATE USER testuser2
+
+user testuser
+
+statement error permission denied to create database
+CREATE DATABASE d WITH OWNER testuser2
+
+user root
+
+# Fix for https://github.com/cockroachdb/cockroach/issues/97938.
+subtest if_not_exists_with_owner
+
+statement ok
+CREATE DATABASE IF NOT EXISTS ifnotexistsownerdb WITH OWNER testuser
+
+query TTTTTT colnames
+SELECT * FROM [SHOW DATABASES] WHERE database_name = 'ifnotexistsownerdb'
+----
+database_name       owner     primary_region  secondary_region  regions  survival_goal
+ifnotexistsownerdb  testuser  NULL            NULL              {}       NULL
+
+statement ok
+CREATE DATABASE IF NOT EXISTS ifnotexistsownerdb WITH OWNER testuser
+
+query TTTTTT colnames
+SELECT * FROM [SHOW DATABASES] WHERE database_name = 'ifnotexistsownerdb'
+----
+database_name       owner     primary_region  secondary_region  regions  survival_goal
+ifnotexistsownerdb  testuser  NULL            NULL              {}       NULL
+
+subtest end
+
+subtest regression_105906
+
+statement ok
+CREATE SCHEMA regression_105906
+
+statement ok
+CREATE DATABASE regression_105906
+
+query TT colnames,rowsort
+SHOW SCHEMAS
+----
+schema_name         owner
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
+regression_105906   root
+
+# Note: regression_105906 should not appear in the list of schemas below
+query TT colnames,rowsort
+SHOW SCHEMAS FROM regression_105906
+----
+schema_name         owner
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
+
+statement ok
+DROP DATABASE regression_105906
+
+statement ok
+DROP SCHEMA regression_105906
+
+statement ok
+CREATE SCHEMA "rEgReSsIoN 105906"
+
+statement ok
+CREATE DATABASE "rEgReSsIoN 105906"
+
+query T rowsort
+SELECT schema_name FROM [SHOW SCHEMAS]
+----
+public
+rEgReSsIoN 105906
+crdb_internal
+information_schema
+pg_catalog
+pg_extension
+
+# Note: "rEgReSsIoN 105906" should not appear in the list of schemas below
+query T rowsort
+SELECT schema_name FROM [SHOW SCHEMAS FROM "rEgReSsIoN 105906"]
+----
+public
+crdb_internal
+information_schema
+pg_catalog
+pg_extension
+
+statement ok
+DROP SCHEMA "rEgReSsIoN 105906"
+
+statement ok
+DROP DATABASE "rEgReSsIoN 105906"
+
+subtest end

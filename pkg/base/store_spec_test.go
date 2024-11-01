@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -151,6 +145,13 @@ target_file_size=2097152`
 		{"path=/mnt/hda1,type=other", "other is not a valid store type", StoreSpec{}},
 		{"path=/mnt/hda1,type=mem,size=20GiB", "path specified for in memory store", StoreSpec{}},
 
+		// provisioned rate
+		{"path=/mnt/hda1,provisioned-rate=bandwidth=200MiB/s", "",
+			StoreSpec{Path: "/mnt/hda1", ProvisionedRateSpec: base.ProvisionedRateSpec{ProvisionedBandwidth: 200 << 20}}},
+		{"path=/mnt/hda1,provisioned-rate=bandwidth=200MiB", "provisioned-rate field does not have bandwidth sub-field 200MiB ending in /s", StoreSpec{}},
+		{"path=/mnt/hda1,provisioned-rate=200MiB/s", "provisioned-rate field has invalid value 200MiB/s", StoreSpec{}},
+		{"path=/mnt/hda1,provisioned-rate=bandwidth=0B/s", "provisioned-rate field is trying to set bandwidth to 0", StoreSpec{}},
+
 		// RocksDB
 		{"path=/,rocksdb=key1=val1;key2=val2", "", StoreSpec{Path: "/", RocksDBOptions: "key1=val1;key2=val2"}},
 
@@ -287,7 +288,7 @@ func TestStoreSpecListPreventedStartupMessage(t *testing.T) {
 	err := ssl.PriorCriticalAlertError()
 	require.NoError(t, err)
 
-	require.NoError(t, ioutil.WriteFile(ssl.Specs[2].PreventedStartupFile(), []byte("boom"), 0644))
+	require.NoError(t, os.WriteFile(ssl.Specs[2].PreventedStartupFile(), []byte("boom"), 0644))
 
 	err = ssl.PriorCriticalAlertError()
 	require.Error(t, err)

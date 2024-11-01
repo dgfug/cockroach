@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -30,11 +25,12 @@ func (d *delegator) delegateShowRegions(n *tree.ShowRegions) (tree.Statement, er
 	switch n.ShowRegionsFrom {
 	case tree.ShowRegionsFromAllDatabases:
 		sqltelemetry.IncrementShowCounter(sqltelemetry.RegionsFromAllDatabases)
-		return parse(`
+		return d.parse(`
 SELECT
 	name as database_name,
 	regions,
-	primary_region
+	primary_region,
+	secondary_region
 FROM crdb_internal.databases
 ORDER BY database_name
 			`,
@@ -56,6 +52,7 @@ SELECT
 	r.name AS "database",
 	r.region as "region",
 	r.region = r.primary_region AS "primary",
+	r.region = r.secondary_region AS "secondary",
 	COALESCE(zones_table.zones, '{}'::string[])
 AS
 	zones
@@ -63,16 +60,18 @@ FROM [
 	SELECT
 		name,
 		unnest(dbs.regions) AS region,
-		dbs.primary_region AS primary_region
+		dbs.primary_region AS primary_region,
+		dbs.secondary_region AS secondary_region
 	FROM crdb_internal.databases dbs
 	WHERE dbs.name = %s
 ] r
 LEFT JOIN zones_table ON (r.region = zones_table.region)
-ORDER BY "primary" DESC, "region"`,
+ORDER BY "primary" DESC, "secondary" DESC, "region"`,
 			zonesClause,
 			lexbase.EscapeSQLString(dbName),
 		)
-		return parse(query)
+
+		return d.parse(query)
 
 	case tree.ShowRegionsFromCluster:
 		sqltelemetry.IncrementShowCounter(sqltelemetry.RegionsFromCluster)
@@ -90,7 +89,7 @@ ORDER BY
 			zonesClause,
 		)
 
-		return parse(query)
+		return d.parse(query)
 	case tree.ShowRegionsFromDefault:
 		sqltelemetry.IncrementShowCounter(sqltelemetry.Regions)
 
@@ -114,20 +113,39 @@ databases_by_primary_region(region, database_names) AS (
 	FROM crdb_internal.databases
 	GROUP BY primary_region
 ),
+databases_by_secondary_region(region, database_names) AS (
+	SELECT
+		secondary_region,
+		array_agg(name)
+	FROM crdb_internal.databases
+	GROUP BY secondary_region
+),
 zones_table(region, zones) AS (%s)
 SELECT
 	zones_table.region,
 	zones_table.zones,
 	COALESCE(databases_by_region.database_names, '{}'::string[]) AS database_names,
-	COALESCE(databases_by_primary_region.database_names, '{}'::string[]) AS primary_region_of
+	COALESCE(databases_by_primary_region.database_names, '{}'::string[]) AS primary_region_of,
+	COALESCE(databases_by_secondary_region.database_names, '{}'::string[]) AS secondary_region_of
 FROM zones_table
 LEFT JOIN databases_by_region ON (zones_table.region = databases_by_region.region)
 LEFT JOIN databases_by_primary_region ON (zones_table.region = databases_by_primary_region.region)
+LEFT JOIN databases_by_secondary_region ON (zones_table.region = databases_by_secondary_region.region)
 ORDER BY zones_table.region
 `,
 			zonesClause,
 		)
-		return parse(query)
+		return d.parse(query)
+	case tree.ShowSuperRegionsFromDatabase:
+		sqltelemetry.IncrementShowCounter(sqltelemetry.SuperRegions)
+
+		query := fmt.Sprintf(
+			`
+SELECT database_name, super_region_name, regions
+  FROM crdb_internal.super_regions
+ WHERE database_name = '%s'`, n.DatabaseName)
+
+		return d.parse(query)
 	}
 	return nil, errors.Newf("unhandled ShowRegionsFrom: %v", n.ShowRegionsFrom)
 }

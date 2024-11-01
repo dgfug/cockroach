@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keysutil
 
@@ -42,23 +37,34 @@ type PrettyScanner struct {
 // pretty-printed keys from the table part of the keys space (i.e. inputs
 // starting with "/Table"). The supplied function needs to parse the part that
 // comes after "/Table".
-func MakePrettyScanner(tableParser keys.KeyParserFunc) PrettyScanner {
+//
+// If tenantParser is not nil, it will replace the default function for scanning
+// pretty-printed keys from the tenant part of the keys space (i.e. inputs
+// starting with "/Tenant"). The supplied function needs to parse the part that
+// comes after "/Tenant".
+//
+// At most one function can be non-nil.
+func MakePrettyScanner(tableParser, tenantParser keys.KeyParserFunc) PrettyScanner {
 	dict := keys.KeyDict
-	if tableParser != nil {
-		dict = customizeKeyComprehension(dict, tableParser)
+	if tableParser != nil && tenantParser != nil {
+		panic("both tableParser and tenantParser are non-nil")
+	}
+	if tableParser != nil || tenantParser != nil {
+		dict = customizeKeyComprehension(dict, tableParser, tenantParser)
 	}
 	return PrettyScanner{
 		keyComprehension: dict,
 		// If we specified a custom parser, forget about the roundtrip.
-		validateRoundTrip: tableParser == nil,
+		validateRoundTrip: tableParser == nil && tenantParser == nil,
 	}
 }
 
 // customizeKeyComprehension takes as input a KeyComprehensionTable and
 // overwrites the "pretty scanner" function for the tables key space (i.e. for
-// keys starting with "/Table"). The modified table is returned.
+// keys starting with "/Table") or for the tenant keys space (i.e. for keys
+// starting with "/Tenant"). The modified table is returned.
 func customizeKeyComprehension(
-	table keys.KeyComprehensionTable, tableParser keys.KeyParserFunc,
+	table keys.KeyComprehensionTable, tableParser, tenantParser keys.KeyParserFunc,
 ) keys.KeyComprehensionTable {
 	// Make a deep copy of the table.
 	cpy := make(keys.KeyComprehensionTable, len(table))
@@ -69,20 +75,28 @@ func customizeKeyComprehension(
 	}
 	table = cpy
 
-	// Find the part of the table that deals with parsing table data.
-	// We'll perform surgery on it to apply `tableParser`.
+	// Find the part of the table that deals with parsing table / tenant data.
+	// We'll perform surgery on it to apply `tableParser` or 'tenantParser'.
 	for i := range table {
 		region := &table[i]
-		if region.Name == "/Table" {
+		if region.Name == "/Table" && tableParser != nil {
 			if len(region.Entries) != 1 {
-				panic(fmt.Sprintf("expected a single entry under \"/Table\", got: %d", len(region.Entries)))
+				panic(fmt.Sprintf(`expected a single entry under "/Table", got: %d`, len(region.Entries)))
 			}
 			subRegion := &region.Entries[0]
 			subRegion.PSFunc = tableParser
 			return table
 		}
+		if region.Name == "/Tenant" && tenantParser != nil {
+			if len(region.Entries) != 1 {
+				panic(fmt.Sprintf(`expected a single entry under "/Tenant", got: %d`, len(region.Entries)))
+			}
+			subRegion := &region.Entries[0]
+			subRegion.PSFunc = tenantParser
+			return table
+		}
 	}
-	panic("failed to find required \"/Table\" entry")
+	panic(`failed to find required "/Table" and / or "/Tenant" entry`)
 }
 
 // Scan is a partial right inverse to PrettyPrint: it takes a key formatted for
@@ -107,8 +121,8 @@ func (s PrettyScanner) Scan(input string) (_ roachpb.Key, rErr error) {
 		if err == nil {
 			err = errIllegalInput
 		}
-		err = errors.Errorf(`can't parse "%s" after reading %s: %s`,
-			input, origInput[:len(origInput)-len(input)], err)
+		err = errors.Wrapf(err, `can't parse "%s" after reading %s`,
+			input, origInput[:len(origInput)-len(input)])
 		return nil, &keys.ErrUglifyUnsupported{Wrapped: err}
 	}
 
@@ -117,7 +131,7 @@ outer:
 	for len(input) > 0 {
 		if entries != nil {
 			for _, v := range entries {
-				if strings.HasPrefix(input, v.Name) {
+				if strings.HasPrefix(input, string(v.Name)) {
 					input = input[len(v.Name):]
 					if v.PSFunc == nil {
 						return mkErr(nil)
@@ -133,15 +147,15 @@ outer:
 				Wrapped: errors.New("known key, but unsupported subtype"),
 			}
 		}
-		for _, v := range keys.ConstKeyDict {
-			if strings.HasPrefix(input, v.Name) {
+		for _, v := range keys.ConstKeyOverrides {
+			if strings.HasPrefix(input, string(v.Name)) {
 				output = append(output, v.Value...)
 				input = input[len(v.Name):]
 				continue outer
 			}
 		}
 		for _, v := range s.keyComprehension {
-			if strings.HasPrefix(input, v.Name) {
+			if strings.HasPrefix(input, string(v.Name)) {
 				// No appending to output yet, the dictionary will take care of
 				// it.
 				input = input[len(v.Name):]

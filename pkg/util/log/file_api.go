@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -21,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 )
@@ -29,8 +25,8 @@ import (
 // accidentally and it splits the details of the filename into groups for easy
 // parsing. The log file format is
 //
-//   {program}.{host}.{username}.{timestamp}.{pid}.log
-//   cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
+//	{program}.{host}.{username}.{timestamp}.{pid}.log
+//	cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
 //
 // All underscore in process, host and username are escaped to double
 // underscores and all periods are escaped to an underscore.
@@ -114,10 +110,11 @@ func listLogGroups() (logGroups [][]logpb.FileInfo, err error) {
 // the log configuration. For example, consider the following config:
 //
 // file-groups:
-//    groupA:
-//      dir: dir1
-//    groupB:
-//      dir: dir2
+//
+//	groupA:
+//	  dir: dir1
+//	groupB:
+//	  dir: dir2
 //
 // The result of ListLogFiles on this config will return the list
 // {cockroach-groupA.XXX.log, cockroach-groupB.XXX.log}, without
@@ -130,7 +127,7 @@ func ListLogFiles() (logFiles []logpb.FileInfo, err error) {
 		l.mu.Lock()
 		thisLogDir := l.mu.logDir
 		l.mu.Unlock()
-		if !l.enabled.Get() || thisLogDir == "" {
+		if !l.enabled.Load() || thisLogDir == "" {
 			// This file sink is detached from file storage.
 			return nil
 		}
@@ -207,18 +204,21 @@ func GetLogReader(filename string) (io.ReadCloser, error) {
 		return nil
 	})
 	// Check whether we found a sink and it has a log directory.
-	if fs == nil || !fs.enabled.Get() {
+	if fs == nil || !fs.enabled.Load() {
 		return nil, errors.Newf("no log directory found for %s", filename)
 	}
-	fs.mu.Lock()
-	dir := fs.mu.logDir
-	fs.mu.Unlock()
+	dir := func() string {
+		fs.mu.RLock()
+		defer fs.mu.RUnlock()
+		return fs.mu.logDir
+	}()
 	if dir == "" {
 		// This error should never happen: .enabled should be unset in
 		// that case.
 		return nil, errors.Newf("no log directory found for %s", filename)
 	}
 
+	baseFileName := filename
 	filename = filepath.Join(dir, filename)
 
 	info, err := os.Lstat(filename)
@@ -236,7 +236,23 @@ func GetLogReader(filename string) (io.ReadCloser, error) {
 		return nil, errors.Errorf("not a regular file")
 	}
 
-	return os.Open(filename)
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	sb, ok := fs.mu.file.(*syncBuffer)
+	if ok && baseFileName == filepath.Base(sb.file.Name()) {
+		// If the file being read is also the file being written to, then we
+		// want mutual exclusion between the reader and the runFlusher.
+		lr := &lockedReader{}
+		lr.mu.RWMutex = &fs.mu.RWMutex
+		lr.mu.wrappedFile = file
+		return lr, nil
+	}
+	return file, nil
 }
 
 // sortablelogpb.FileInfoSlice is required so we can sort logpb.FileInfos.
@@ -346,6 +362,40 @@ func (a sortableEntries) Less(i, j int) bool {
 	return a[i].Time > a[j].Time
 }
 
+var _ io.ReadCloser = (*lockedReader)(nil)
+
+// lockedReader locks accesses to a wrapped io.ReadCloser,
+// using a RWMutex shared with another component.
+// We use this when reading log files (using the GetLogReader API)
+// that are concurrently being written to by the log runFlusher,
+// to ensure that read operations cannot observe partial flushes.
+type lockedReader struct {
+	mu struct {
+		// We use a mutex by reference, so that we can point this
+		// lockedReader to the same mutex as used by the corresponding
+		// fileSink.
+		// This mutex is only defined if the file being read from
+		// can also be written to concurrently.
+		*syncutil.RWMutex
+
+		wrappedFile io.ReadCloser
+	}
+}
+
+func (r *lockedReader) Read(b []byte) (int, error) {
+	if r.mu.RWMutex != nil {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+	}
+	return r.mu.wrappedFile.Read(b)
+}
+
+func (r *lockedReader) Close() error {
+	// We do not need to hold the mutex to call Close() since there is
+	// no flushing needed on read-only file access during Close() calls.
+	return r.mu.wrappedFile.Close()
+}
+
 // readAllEntriesFromFile reads in all log entries from a given file that are
 // between the 'startTimestamp' and 'endTimestamp' and match the 'pattern' if it
 // exists. It returns the entries in the reverse chronological order. It also
@@ -366,6 +416,7 @@ func readAllEntriesFromFile(
 		return nil, false, err
 	}
 	defer reader.Close()
+
 	entries := []logpb.Entry{}
 	decoder, err := NewEntryDecoderWithFormat(reader, editMode, format)
 	if err != nil {

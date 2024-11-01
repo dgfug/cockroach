@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -32,11 +27,31 @@ const (
 	OnSchema = "on_schema"
 	// OnTable is used when a GRANT/REVOKE is happening on a table.
 	OnTable = "on_table"
+	// OnSequence is used when a GRANT/REVOKE is happening on a sequence.
+	OnSequence = "on_sequence"
 	// OnType is used when a GRANT/REVOKE is happening on a type.
 	OnType = "on_type"
+	// OnFunction is used when a GRANT/REVOKE is happening on a function.
+	OnFunction = "on_function"
+	// OnProcedure is used when a GRANT/REVOKE is happening on a procedure.
+	OnProcedure = "on_procedure"
 	// OnAllTablesInSchema is used when a GRANT/REVOKE is happening on
 	// all tables in a set of schemas.
 	OnAllTablesInSchema = "on_all_tables_in_schemas"
+	// OnAllSequencesInSchema is used when a GRANT/REVOKE is happening on
+	// all sequences in a set of schemas.
+	OnAllSequencesInSchema = "on_all_sequences_in_schemas"
+	// OnAllFunctionsInSchema is used when a GRANT/REVOKE is happening on
+	// all functions in a set of schemas.
+	OnAllFunctionsInSchema = "on_all_functions_in_schemas"
+	// OnAllProceduresInSchema is used when a GRANT/REVOKE is happening on
+	// all procedures in a set of schemas.
+	OnAllProceduresInSchema = "on_all_functions_in_schemas"
+	// OnSystem is used when a GRANT/REVOKE is happening on system.
+	OnSystem = "on_system"
+	// OnExternalConnection is used when a GRANT/REVOKE is happening on an
+	// external connection object.
+	OnExternalConnection = "on_external_connection"
 
 	iamRoles = "iam.roles"
 )

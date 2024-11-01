@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,13 +12,18 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/stretchr/testify/require"
 )
 
 var libPQReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var libPQSupportedTag = "v1.10.0"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var libPQSupportedTag = "v1.10.5"
 
 func registerLibPQ(r registry.Registry) {
 	runLibPQ := func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -32,14 +32,13 @@ func registerLibPQ(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, c.All())
+		c.Start(ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB), install.MakeClusterSettings(), c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0])
+		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, t, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 
@@ -68,9 +67,14 @@ func registerLibPQ(r registry.Registry) {
 		// Install go-junit-report to convert test results to .xml format we know
 		// how to work with.
 		err = repeatRunE(ctx, t, c, node, "install go-junit-report",
-			fmt.Sprintf("GOPATH=%s go get -u github.com/jstemmer/go-junit-report", goPath),
+			fmt.Sprintf("GOPATH=%s go install github.com/jstemmer/go-junit-report@latest", goPath),
 		)
 		require.NoError(t, err)
+		// It's safer to clean up dependencies this way than it is to give the cluster
+		// wipe root access.
+		defer func() {
+			c.Run(ctx, option.WithNodes(c.All()), "go clean -modcache")
+		}()
 
 		err = repeatGitCloneE(
 			ctx,
@@ -82,41 +86,38 @@ func registerLibPQ(r registry.Registry) {
 			node,
 		)
 		require.NoError(t, err)
-		if err := c.RunE(ctx, node, fmt.Sprintf("mkdir -p %s", resultsDir)); err != nil {
+		if err := c.RunE(ctx, option.WithNodes(node), fmt.Sprintf("mkdir -p %s", resultsDir)); err != nil {
 			t.Fatal(err)
 		}
 
-		blocklistName, expectedFailures, ignorelistName, ignoreList := libPQBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No lib/pq blocklist defined for cockroach version %s", version)
-		}
-		t.L().Printf("Running cockroach version %s, using blocklist %s, using ignorelist %s", version, blocklistName, ignorelistName)
+		t.L().Printf("Running cockroach version %s, using blocklist %s, using ignorelist %s", version, "libPQBlocklist", "libPQIgnorelist")
 
 		t.Status("running lib/pq test suite and collecting results")
 
 		// List all the tests that start with Test or Example.
 		testListRegex := "^(Test|Example)"
-		buf, err := c.RunWithBuffer(
-			ctx,
-			t.L(),
-			node,
-			fmt.Sprintf(`cd %s && PGPORT=26257 PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -list "%s"`, libPQPath, testListRegex),
+		result, err := c.RunWithDetailsSingleNode(
+			ctx, t.L(),
+			option.WithNodes(node),
+			fmt.Sprintf(
+				`cd %s && PGPORT={pgport:1} PGUSER=%s PGPASSWORD=%s PGSSLMODE=require PGDATABASE=postgres go test -list "%s"`,
+				libPQPath, install.DefaultUser, install.DefaultPassword, testListRegex),
 		)
 		require.NoError(t, err)
 
 		// Convert the output of go test -list into an list.
-		tests := strings.Fields(string(buf))
+		tests := strings.Fields(result.Stdout)
 		var allowedTests []string
+		testListR, err := regexp.Compile(testListRegex)
+		require.NoError(t, err)
 
 		for _, testName := range tests {
 			// Ignore tests that do not match the test regex pattern.
-			matched, err := regexp.MatchString(testListRegex, testName)
-			require.NoError(t, err)
-			if !matched {
+			if !testListR.MatchString(testName) {
 				continue
 			}
 			// If the test is part of ignoreList, do not run the test.
-			if _, ok := ignoreList[testName]; !ok {
+			if _, ok := libPQIgnorelist[testName]; !ok {
 				allowedTests = append(allowedTests, testName)
 			}
 		}
@@ -126,22 +127,24 @@ func registerLibPQ(r registry.Registry) {
 		// Ignore the error as there will be failing tests.
 		_ = c.RunE(
 			ctx,
-			node,
-			fmt.Sprintf("cd %s && PGPORT=26257 PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -run %s -v 2>&1 | %s/bin/go-junit-report > %s",
-				libPQPath, allowedTestsRegExp, goPath, resultsPath),
+			option.WithNodes(node),
+			fmt.Sprintf("cd %s && PGPORT={pgport:1} PGUSER=%s PGPASSWORD=%s PGSSLMODE=require PGDATABASE=postgres go test -run %s -v 2>&1 | %s/bin/go-junit-report > %s",
+				libPQPath, install.DefaultUser, install.DefaultPassword, allowedTestsRegExp, goPath, resultsPath),
 		)
 
 		parseAndSummarizeJavaORMTestsResults(
 			ctx, t, c, node, "lib/pq" /* ormName */, []byte(resultsPath),
-			blocklistName, expectedFailures, ignoreList, version, latestTag,
+			"libPQBlocklist", libPQBlocklist, libPQIgnorelist, version, libPQSupportedTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "lib/pq",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `driver`},
-		Run:     runLibPQ,
+		Name:             "lib/pq",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.Driver),
+		Run:              runLibPQ,
 	})
 }

@@ -1,32 +1,122 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIsEndTxnExceedingDeadline(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		name     string
+		commitTS int64
+		deadline int64
+		exp      bool
+	}{
+		{"no deadline", 10, 0, false},
+		{"later deadline", 10, 11, false},
+		{"equal deadline", 10, 10, true},
+		{"earlier deadline", 10, 9, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			commitTS := hlc.Timestamp{WallTime: tt.commitTS}
+			deadline := hlc.Timestamp{WallTime: tt.deadline}
+			require.Equal(t, tt.exp, IsEndTxnExceedingDeadline(commitTS, deadline))
+		})
+	}
+}
+
+func TestIsEndTxnTriggeringRetryError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		txnIsoLevel             isolation.Level
+		txnWriteTooOld          bool
+		txnWriteTimestampPushed bool
+		txnExceedingDeadline    bool
+
+		expRetry  bool
+		expReason kvpb.TransactionRetryReason
+	}{
+		{isolation.Serializable, false, false, false, false, 0},
+		{isolation.Serializable, false, false, true, true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED},
+		{isolation.Serializable, false, true, false, true, kvpb.RETRY_SERIALIZABLE},
+		{isolation.Serializable, false, true, true, true, kvpb.RETRY_SERIALIZABLE},
+		{isolation.Serializable, true, false, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Serializable, true, false, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Serializable, true, true, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Serializable, true, true, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Snapshot, false, false, false, false, 0},
+		{isolation.Snapshot, false, false, true, true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED},
+		{isolation.Snapshot, false, true, false, false, 0},
+		{isolation.Snapshot, false, true, true, true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED},
+		{isolation.Snapshot, true, false, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Snapshot, true, false, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Snapshot, true, true, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.Snapshot, true, true, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.ReadCommitted, false, false, false, false, 0},
+		{isolation.ReadCommitted, false, false, true, true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED},
+		{isolation.ReadCommitted, false, true, false, false, 0},
+		{isolation.ReadCommitted, false, true, true, true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED},
+		{isolation.ReadCommitted, true, false, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.ReadCommitted, true, false, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.ReadCommitted, true, true, false, true, kvpb.RETRY_WRITE_TOO_OLD},
+		{isolation.ReadCommitted, true, true, true, true, kvpb.RETRY_WRITE_TOO_OLD},
+	}
+	for _, tt := range tests {
+		name := fmt.Sprintf("iso=%s/wto=%t/pushed=%t/deadline=%t",
+			tt.txnIsoLevel, tt.txnWriteTooOld, tt.txnWriteTimestampPushed, tt.txnExceedingDeadline)
+		t.Run(name, func(t *testing.T) {
+			txn := roachpb.MakeTransaction("test", nil, tt.txnIsoLevel, 0, hlc.Timestamp{WallTime: 10}, 0, 1, 0, false /* omitInRangefeeds */)
+			if tt.txnWriteTooOld {
+				txn.WriteTooOld = true
+			}
+			if tt.txnWriteTimestampPushed {
+				txn.WriteTimestamp = txn.WriteTimestamp.Add(1, 0)
+			}
+			deadline := txn.WriteTimestamp.Next()
+			if tt.txnExceedingDeadline {
+				deadline = txn.WriteTimestamp.Prev()
+			}
+
+			gotRetry, gotReason, _ := IsEndTxnTriggeringRetryError(&txn, deadline)
+			require.Equal(t, tt.expRetry, gotRetry)
+			require.Equal(t, tt.expReason, gotReason)
+		})
+	}
+}
 
 // TestEndTxnUpdatesTransactionRecord tests EndTxn request across its various
 // possible transaction record state transitions and error cases.
@@ -46,7 +136,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 
 	k, k2 := roachpb.Key("a"), roachpb.Key("b")
 	ts, ts2, ts3 := hlc.Timestamp{WallTime: 1}, hlc.Timestamp{WallTime: 2}, hlc.Timestamp{WallTime: 3}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1, 0, false /* omitInRangefeeds */)
 	writes := []roachpb.SequencedWrite{{Key: k, Sequence: 0}}
 	intents := []roachpb.Span{{Key: k2}}
 
@@ -92,14 +182,15 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 	testCases := []struct {
 		name string
 		// Replica state.
-		existingTxn  *roachpb.TransactionRecord
-		canCreateTxn func() (can bool, minTS hlc.Timestamp)
+		existingTxn    *roachpb.TransactionRecord
+		canCreateTxn   bool
+		minTxnCommitTS hlc.Timestamp
 		// Request state.
 		headerTxn      *roachpb.Transaction
 		commit         bool
 		noLockSpans    bool
 		inFlightWrites []roachpb.SequencedWrite
-		deadline       *hlc.Timestamp
+		deadline       hlc.Timestamp
 		// Expected result.
 		expError string
 		expTxn   *roachpb.TransactionRecord
@@ -109,8 +200,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// there are intents to clean up.
 			name: "record missing, try rollback",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: nil, // not needed
+			existingTxn: nil,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    false,
@@ -124,8 +214,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// when all intents are on the transaction record's range.
 			name: "record missing, try rollback without intents",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: nil, // not needed
+			existingTxn: nil,
 			// Request state.
 			headerTxn:   headerTxn,
 			commit:      false,
@@ -142,7 +231,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can't create, try stage",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return false, hlc.Timestamp{} },
+			canCreateTxn: false,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -157,7 +246,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can't create, try commit",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return false, hlc.Timestamp{} },
+			canCreateTxn: false,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -170,7 +259,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -184,7 +273,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -197,7 +286,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage without intents",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -218,7 +307,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit without intents",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:   headerTxn,
 			commit:      true,
@@ -235,7 +324,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage at pushed timestamp",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      pushedHeaderTxn,
 			commit:         true,
@@ -250,7 +339,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit at pushed timestamp",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: pushedHeaderTxn,
 			commit:    true,
@@ -264,7 +353,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage at pushed timestamp after refresh",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      refreshedHeaderTxn,
 			commit:         true,
@@ -283,7 +372,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit at pushed timestamp after refresh",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: refreshedHeaderTxn,
 			commit:    true,
@@ -296,11 +385,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
-			// transaction can be created with. This will trigger a retry error.
-			name: "record missing, can create with min timestamp, try stage",
+			// transaction can be committed with. This will trigger a retry error.
+			name: "record missing, can commit with min timestamp, try stage",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -310,11 +400,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
-			// transaction can be created with. This will trigger a retry error.
-			name: "record missing, can create with min timestamp, try commit",
+			// transaction can be committed with. This will trigger a retry error.
+			name: "record missing, can commit with min timestamp, try commit",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -323,12 +414,13 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
-			// the transaction can be created with. Luckily, the transaction has
+			// the transaction can be committed with. Luckily, the transaction has
 			// already refreshed above this time, so it can avoid a retry error.
-			name: "record missing, can create with min timestamp, try stage at pushed timestamp after refresh",
+			name: "record missing, can commit with min timestamp, try stage at pushed timestamp after refresh",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn:      refreshedHeaderTxn,
 			commit:         true,
@@ -342,12 +434,13 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
-			// the transaction can be created with. Luckily, the transaction has
+			// the transaction can be committed with. Luckily, the transaction has
 			// already refreshed above this time, so it can avoid a retry error.
-			name: "record missing, can create with min timestamp, try commit at pushed timestamp after refresh",
+			name: "record missing, can commit with min timestamp, try commit at pushed timestamp after refresh",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn: refreshedHeaderTxn,
 			commit:    true,
@@ -364,7 +457,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage after write too old",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: func() *roachpb.Transaction {
 				clone := txn.Clone()
@@ -382,7 +475,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit after write too old",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: func() *roachpb.Transaction {
 				clone := txn.Clone()
@@ -406,9 +499,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: abortedRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// parallel commit. The record already exists because it has been
-			// heartbeated.
+			// Standard case where a transaction record is staged by a parallel
+			// commit. The record already exists because it has been heartbeated.
 			name: "record pending, try stage",
 			// Replica state.
 			existingTxn: pendingRecord,
@@ -420,9 +512,9 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: stagingRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because it has
-			// been heartbeated.
+			// Standard case where a transaction record is committed during a
+			// non-parallel commit. The record already exists because it has been
+			// heartbeated.
 			name: "record pending, try commit",
 			// Replica state.
 			existingTxn: pendingRecord,
@@ -495,6 +587,74 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
+			// transaction can be committed with. The record already exists because
+			// it has been heartbeated. This will trigger a retry error.
+			name: "record pending, can commit with min timestamp, try stage",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn:      headerTxn,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
+			// transaction can be committed with. The record already exists because
+			// it has been heartbeated. This will trigger a retry error.
+			name: "record pending, can commit with min timestamp, try commit",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: headerTxn,
+			commit:    true,
+			// Expected result.
+			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
+			// the transaction can be committed with. The record already exists
+			// because it has been heartbeated. Luckily, the transaction has
+			// already refreshed above this time, so it can avoid a retry error.
+			name: "record pending, can commit with min timestamp, try stage at pushed timestamp after refresh",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn:      refreshedHeaderTxn,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expTxn: func() *roachpb.TransactionRecord {
+				record := *stagingRecord
+				record.WriteTimestamp.Forward(ts2)
+				return &record
+			}(),
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
+			// the transaction can be committed with. The record already exists
+			// because it has been heartbeated. Luckily, the transaction has
+			// already refreshed above this time, so it can avoid a retry error.
+			name: "record pending, can commit with min timestamp, try commit at pushed timestamp after refresh",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: refreshedHeaderTxn,
+			commit:    true,
+			// Expected result.
+			expTxn: func() *roachpb.TransactionRecord {
+				record := *committedRecord
+				record.WriteTimestamp.Forward(ts2)
+				return &record
+			}(),
+		},
+		{
 			// The transaction has run into a WriteTooOld error during its
 			// lifetime. The stage will be rejected.
 			name: "record pending, try stage after write too old",
@@ -546,7 +706,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is staged during a
 			// parallel commit after it has written a record at a lower epoch.
 			// The existing record is upgraded.
 			name: "record pending, try stage at higher epoch",
@@ -565,7 +725,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is committed during a
 			// non-parallel commit after it has written a record at a lower
 			// epoch. The existing record is upgraded.
 			name: "record pending, try commit at higher epoch",
@@ -611,18 +771,23 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// Standard case where a transaction is rolled back. The record
-			// already exists because of a failed parallel commit attempt.
-			name: "record staging, try rollback",
+			// already exists because of a failed parallel commit attempt in
+			// the same epoch.
+			//
+			// The rollback is not considered an authoritative indication that the
+			// transaction is not implicitly committed, so an indeterminate commit
+			// error is returned to force transaction recovery to be performed.
+			name: "record staging, try rollback at same epoch",
 			// Replica state.
 			existingTxn: stagingRecord,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    false,
 			// Expected result.
-			expTxn: abortedRecord,
+			expError: "found txn in indeterminate STAGING state",
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is re-staged during a
 			// parallel commit. The record already exists because of a failed
 			// parallel commit attempt.
 			name: "record staging, try re-stage",
@@ -636,9 +801,9 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: stagingRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because of a
-			// failed parallel commit attempt.
+			// Standard case where a transaction record is explicitly committed.
+			// The record already exists and is staging because it was previously
+			// implicitly committed.
 			name: "record staging, try commit",
 			// Replica state.
 			existingTxn: stagingRecord,
@@ -649,8 +814,39 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: committedRecord,
 		},
 		{
-			// Non-standard case where a transaction record is created during a
+			// Standard case where a transaction record is re-staged during a
 			// parallel commit. The record already exists because of a failed
+			// parallel commit attempt. The timestamp cache's minimum commit
+			// timestamp is ignored when the transaction record is staging.
+			name: "record staging, can commit with min timestamp, try re-stage",
+			// Replica state.
+			existingTxn: stagingRecord,
+			// Request state.
+			headerTxn:      headerTxn,
+			minTxnCommitTS: ts2,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expTxn: stagingRecord,
+		},
+		{
+			// Non-standard case where a transaction record is explicitly committed.
+			// The record already exists and is staging because it was previously
+			// implicitly committed. The timestamp cache's minimum commit timestamp is
+			// ignored when the transaction record is staging.
+			name: "record staging, can commit with min timestamp, try commit",
+			// Replica state.
+			existingTxn:    stagingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: headerTxn,
+			commit:    true,
+			// Expected result.
+			expTxn: committedRecord,
+		},
+		{
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt. The re-stage will fail because of the
 			// pushed timestamp.
 			name: "record staging, try re-stage at pushed timestamp",
@@ -664,7 +860,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
 		},
 		{
-			// Non-standard case where a transaction record is created during
+			// Non-standard case where a transaction record is committed during
 			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt. The commit will fail because of
 			// the pushed timestamp.
@@ -696,8 +892,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// parallel commit. The record already exists because of a failed
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt in a prior epoch.
 			name: "record staging, try re-stage at higher epoch",
 			// Replica state.
@@ -715,7 +911,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during
+			// Non-standard case where a transaction record is committed during
 			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt in a prior epoch.
 			name: "record staging, try commit at higher epoch",
@@ -733,8 +929,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// parallel commit. The record already exists because of a failed
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt in a prior epoch. The re-stage will fail
 			// because of the pushed timestamp.
 			name: "record staging, try re-stage at higher epoch and pushed timestamp",
@@ -748,8 +944,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because of a
+			// Non-standard case where a transaction record is committed during
+			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt in a prior epoch. The commit will
 			// fail because of the pushed timestamp.
 			name: "record staging, try commit at higher epoch and pushed timestamp",
@@ -903,7 +1099,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// Write the existing transaction record, if necessary.
 			txnKey := keys.TransactionKey(txn.Key, txn.ID)
 			if c.existingTxn != nil {
-				if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, nil, c.existingTxn); err != nil {
+				if err := storage.MVCCPutProto(ctx, batch, txnKey, hlc.Timestamp{}, c.existingTxn, storage.MVCCWriteOptions{}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -911,12 +1107,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// Sanity check request args.
 			if !c.commit {
 				require.Nil(t, c.inFlightWrites)
-				require.Nil(t, c.deadline)
+				require.Zero(t, c.deadline)
 			}
 
 			// Issue an EndTxn request.
-			req := roachpb.EndTxnRequest{
-				RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+			req := kvpb.EndTxnRequest{
+				RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 				Commit:        c.commit,
 
 				InFlightWrites: c.inFlightWrites,
@@ -925,21 +1121,23 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			if !c.noLockSpans {
 				req.LockSpans = intents
 			}
-			var resp roachpb.EndTxnResponse
+			var resp kvpb.EndTxnResponse
 			_, err := EndTxn(ctx, batch, CommandArgs{
 				EvalCtx: (&MockEvalCtx{
 					Desc:      &desc,
 					AbortSpan: as,
-					CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-						require.NotNil(t, c.canCreateTxn, "CanCreateTxnRecord unexpectedly called")
-						if can, minTS := c.canCreateTxn(); can {
-							return true, minTS, 0
+					CanCreateTxnRecordFn: func() (bool, kvpb.TransactionAbortedReason) {
+						if c.canCreateTxn {
+							return true, 0
 						}
-						return false, hlc.Timestamp{}, roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
+						return false, kvpb.ABORT_REASON_ABORTED_RECORD_FOUND
+					},
+					MinTxnCommitTSFn: func() hlc.Timestamp {
+						return c.minTxnCommitTS
 					},
 				}).EvalContext(),
 				Args: &req,
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Timestamp: ts,
 					Txn:       c.headerTxn,
 				},
@@ -983,7 +1181,7 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 	k := roachpb.Key("a")
 	ts := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1, 0, false /* omitInRangefeeds */)
 	endKey := roachpb.Key("z")
 	desc := roachpb.RangeDescriptor{
 		RangeID:  99,
@@ -991,10 +1189,6 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 		EndKey:   roachpb.RKey(endKey),
 	}
 	intents := []roachpb.Span{{Key: k}}
-
-	// We want to inspect the final txn record after EndTxn, to
-	// ascertain that it persists the ignore list.
-	defer TestingSetTxnAutoGC(false)()
 
 	testutils.RunTrueAndFalse(t, "withStoredTxnRecord", func(t *testing.T, storeTxnBeforeEndTxn bool) {
 		db := storage.NewDefaultInMemForTesting()
@@ -1007,13 +1201,13 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 		// Write a first value at key.
 		v.SetString("a")
 		txn.Sequence = 1
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, v, &txn); err != nil {
+		if _, err := storage.MVCCPut(ctx, batch, k, ts, v, storage.MVCCWriteOptions{Txn: &txn}); err != nil {
 			t.Fatal(err)
 		}
 		// Write another value.
 		v.SetString("b")
 		txn.Sequence = 2
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, v, &txn); err != nil {
+		if _, err := storage.MVCCPut(ctx, batch, k, ts, v, storage.MVCCWriteOptions{Txn: &txn}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1026,27 +1220,27 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 		txnKey := keys.TransactionKey(txn.Key, txn.ID)
 		if storeTxnBeforeEndTxn {
 			txnRec := txn.AsRecord()
-			if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, nil, &txnRec); err != nil {
+			if err := storage.MVCCPutProto(ctx, batch, txnKey, hlc.Timestamp{}, &txnRec, storage.MVCCWriteOptions{}); err != nil {
 				t.Fatal(err)
 			}
 		}
 
 		// Issue the end txn command.
-		req := roachpb.EndTxnRequest{
-			RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+		req := kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 			Commit:        true,
 			LockSpans:     intents,
 		}
-		var resp roachpb.EndTxnResponse
+		var resp kvpb.EndTxnResponse
 		if _, err := EndTxn(ctx, batch, CommandArgs{
 			EvalCtx: (&MockEvalCtx{
 				Desc: &desc,
-				CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-					return true, ts, 0
-				},
+				// We want to inspect the final txn record after EndTxn, to
+				// ascertain that it persists the ignore list.
+				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{DisableTxnAutoGC: true},
 			}).EvalContext(),
 			Args: &req,
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Timestamp: ts,
 				Txn:       &txn,
 			},
@@ -1056,17 +1250,17 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 
 		// The second write has been rolled back; verify that the remaining
 		// value is from the first write.
-		res, i, err := storage.MVCCGet(ctx, batch, k, ts2, storage.MVCCGetOptions{})
+		res, err := storage.MVCCGet(ctx, batch, k, ts2, storage.MVCCGetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if i != nil {
-			t.Errorf("found intent, expected none: %+v", i)
+		if res.Intent != nil {
+			t.Errorf("found intent, expected none: %+v", res.Intent)
 		}
-		if res == nil {
+		if res.Value == nil {
 			t.Errorf("no value found, expected one")
 		} else {
-			s, err := res.GetBytes()
+			s, err := res.Value.GetBytes()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1108,13 +1302,8 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 				expError: false,
 			},
 			{
-				name:     "past-syn",
-				commitTS: func(now hlc.Timestamp) hlc.Timestamp { return now.WithSynthetic(true) },
-				expError: false,
-			},
-			{
-				name:     "future-syn",
-				commitTS: func(now hlc.Timestamp) hlc.Timestamp { return now.Add(100, 0).WithSynthetic(true) },
+				name:     "future",
+				commitTS: func(now hlc.Timestamp) hlc.Timestamp { return now.Add(100, 0) },
 				// If the EndTxn carried a commit trigger and its transaction will need
 				// to commit-wait because the transaction has a future-time commit
 				// timestamp, evaluating the request should return an error.
@@ -1128,8 +1317,7 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 				batch := db.NewBatch()
 				defer batch.Close()
 
-				manual := hlc.NewManualClock(123)
-				clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+				clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 				desc := roachpb.RangeDescriptor{
 					RangeID:  99,
 					StartKey: roachpb.RKey("a"),
@@ -1138,31 +1326,28 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 
 				now := clock.Now()
 				commitTS := cfg.commitTS(now)
-				txn := roachpb.MakeTransaction("test", desc.StartKey.AsRawKey(), 0, now, 0)
+				txn := roachpb.MakeTransaction("test", desc.StartKey.AsRawKey(), 0, 0, now, 0, 1, 0, false /* omitInRangefeeds */)
 				txn.ReadTimestamp = commitTS
 				txn.WriteTimestamp = commitTS
 
 				// Issue the end txn command.
-				req := roachpb.EndTxnRequest{
-					RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+				req := kvpb.EndTxnRequest{
+					RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 					Commit:        true,
 				}
 				if commitTrigger {
 					req.InternalCommitTrigger = &roachpb.InternalCommitTrigger{
-						ModifiedSpanTrigger: &roachpb.ModifiedSpanTrigger{SystemConfigSpan: true},
+						ModifiedSpanTrigger: &roachpb.ModifiedSpanTrigger{NodeLivenessSpan: &roachpb.Span{}},
 					}
 				}
-				var resp roachpb.EndTxnResponse
+				var resp kvpb.EndTxnResponse
 				_, err := EndTxn(ctx, batch, CommandArgs{
 					EvalCtx: (&MockEvalCtx{
 						Desc:  &desc,
 						Clock: clock,
-						CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-							return true, hlc.Timestamp{}, 0
-						},
 					}).EvalContext(),
 					Args: &req,
-					Header: roachpb.Header{
+					Header: kvpb.Header{
 						Timestamp: commitTS,
 						Txn:       &txn,
 					},
@@ -1170,11 +1355,450 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 
 				if cfg.expError {
 					require.Error(t, err)
-					require.Regexp(t, `txn .* with modified-span \(system-config\) commit trigger needs commit wait`, err)
+					require.Regexp(t, `txn .* with modified-span \(node-liveness\) commit trigger needs commit wait`, err)
 				} else {
 					require.NoError(t, err)
 				}
 			})
 		}
 	})
+}
+
+func TestComputeSplitRangeKeyStatsDelta(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	storage.DisableMetamorphicSimpleValueEncoding(t)
+
+	emptyValue := func() storage.MVCCValue {
+		return storage.MVCCValue{}
+	}
+
+	localTSValue := func(ts int) storage.MVCCValue {
+		var v storage.MVCCValue
+		v.MVCCValueHeader.LocalTimestamp = hlc.ClockTimestamp{WallTime: int64(ts)}
+		return v
+	}
+
+	rangeKV := func(start, end string, ts int, value storage.MVCCValue) storage.MVCCRangeKeyValue {
+		valueRaw, err := storage.EncodeMVCCValue(value)
+		require.NoError(t, err)
+		return storage.MVCCRangeKeyValue{
+			RangeKey: storage.MVCCRangeKey{
+				StartKey:  roachpb.Key(start),
+				EndKey:    roachpb.Key(end),
+				Timestamp: hlc.Timestamp{WallTime: int64(ts)},
+			},
+			Value: valueRaw,
+		}
+	}
+
+	const nowNanos = 10e9
+	lhsDesc := roachpb.RangeDescriptor{StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("l")}
+	rhsDesc := roachpb.RangeDescriptor{StartKey: roachpb.RKey("l"), EndKey: roachpb.RKey("z").PrefixEnd()}
+
+	testcases := map[string]struct {
+		rangeKVs []storage.MVCCRangeKeyValue
+		expect   enginepb.MVCCStats
+	}{
+		// Empty stats shouldn't do anything.
+		"empty": {nil, enginepb.MVCCStats{}},
+		// a-z splits into a-l and l-z: simple +1 range key
+		"full": {[]storage.MVCCRangeKeyValue{rangeKV("a", "z", 1e9, emptyValue())}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			GCBytesAge:    117,
+		}},
+		// a-z with local timestamp splits into a-l and l-z: simple +1 range key with value
+		"full value": {[]storage.MVCCRangeKeyValue{rangeKV("a", "z", 2e9, localTSValue(1))}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			RangeValBytes: 9,
+			GCBytesAge:    176,
+		}},
+		// foo-zz splits into foo-l and l-zzzz: contribution is same as for short
+		// keys, because we have to adjust for the change in LHS end key which ends
+		// up only depending on the split key, and that doesn't change.
+		"different key length": {[]storage.MVCCRangeKeyValue{rangeKV("foo", "zzzz", 1e9, emptyValue())}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			GCBytesAge:    117,
+		}},
+		// Two abutting keys at different timestamps at the split point should not
+		// require a delta.
+		"no straddling, timestamp": {[]storage.MVCCRangeKeyValue{
+			rangeKV("a", "l", 1e9, emptyValue()),
+			rangeKV("l", "z", 2e9, emptyValue()),
+		}, enginepb.MVCCStats{}},
+		// Two abutting keys at different local timestamps (values) at the split
+		// point should not require a delta.
+		"no straddling, value": {[]storage.MVCCRangeKeyValue{
+			rangeKV("a", "l", 2e9, localTSValue(1)),
+			rangeKV("l", "z", 2e9, localTSValue(2)),
+		}, enginepb.MVCCStats{}},
+		// Multiple straddling keys.
+		"multiple": {
+			[]storage.MVCCRangeKeyValue{
+				rangeKV("a", "z", 2e9, localTSValue(1)),
+				rangeKV("k", "p", 3e9, localTSValue(2)),
+				rangeKV("foo", "m", 4e9, emptyValue()),
+			}, enginepb.MVCCStats{
+				RangeKeyCount: 1,
+				RangeKeyBytes: 31,
+				RangeValCount: 3,
+				RangeValBytes: 18,
+				GCBytesAge:    348,
+			}},
+	}
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			engine := storage.NewDefaultInMemForTesting()
+			defer engine.Close()
+
+			for _, rkv := range tc.rangeKVs {
+				value, err := storage.DecodeMVCCValue(rkv.Value)
+				require.NoError(t, err)
+				require.NoError(t, engine.PutMVCCRangeKey(rkv.RangeKey, value))
+			}
+
+			tc.expect.LastUpdateNanos = nowNanos
+
+			msDelta, err := computeSplitRangeKeyStatsDelta(context.Background(), engine, lhsDesc, rhsDesc)
+			require.NoError(t, err)
+			msDelta.AgeTo(nowNanos)
+			require.Equal(t, tc.expect, msDelta)
+		})
+	}
+}
+
+// TestResolveLocalLocks tests resolveLocalLocks for point and ranged intents
+// as well as under a max key or max byte limit, ensuring the returned
+// resolvedLocks, externalLocks, and numBytes are as expected.
+func TestResolveLocalLocks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	intToKey := func(i int) roachpb.Key {
+		return roachpb.Key(fmt.Sprintf("%01000d", i))
+	}
+	ceil := func(i int, j int) int {
+		return (i + j - 1) / j
+	}
+
+	const (
+		numKeys             = 20
+		keysPerRangedLock   = 4
+		maxKeys             = 11 // not divisible by keysPerRangedLock
+		targetBytes         = 11900
+		keysFromTargetBytes = 12 // divisible by keysPerRangedLock
+	)
+
+	pointLocks := make([]roachpb.Span, numKeys)
+	for i := range pointLocks {
+		pointLocks[i].Key = intToKey(i)
+	}
+	rangedLocks := make([]roachpb.Span, numKeys/keysPerRangedLock)
+	for i := range rangedLocks {
+		rangedLocks[i].Key = intToKey(i * keysPerRangedLock)
+		rangedLocks[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksPointMaxKeys := make([]roachpb.Span, maxKeys)
+	for i := range expectedResolvedLocksPointMaxKeys {
+		expectedResolvedLocksPointMaxKeys[i].Key = intToKey(i)
+	}
+	expectedExternalLocksPointMaxKeys := make([]roachpb.Span, numKeys-maxKeys)
+	for i := range expectedExternalLocksPointMaxKeys {
+		expectedExternalLocksPointMaxKeys[i].Key = intToKey(i + maxKeys)
+	}
+
+	expectedResolvedLocksRangedMaxKeys := make([]roachpb.Span, ceil(maxKeys, keysPerRangedLock))
+	for i := range expectedResolvedLocksRangedMaxKeys {
+		expectedResolvedLocksRangedMaxKeys[i].Key = intToKey(i * keysPerRangedLock)
+		if i == len(expectedResolvedLocksRangedMaxKeys)-1 {
+			expectedResolvedLocksRangedMaxKeys[i].EndKey = intToKey(maxKeys - 1).Next()
+		} else {
+			expectedResolvedLocksRangedMaxKeys[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+		}
+	}
+	expectedExternalLocksRangedMaxKeys := make([]roachpb.Span, ceil(numKeys, keysPerRangedLock)-ceil(maxKeys, keysPerRangedLock)+1)
+	for i := range expectedExternalLocksRangedMaxKeys {
+		offset := maxKeys / keysPerRangedLock
+		if i == 0 {
+			expectedExternalLocksRangedMaxKeys[i].Key = intToKey(maxKeys - 1).Next()
+		} else {
+			expectedExternalLocksRangedMaxKeys[i].Key = intToKey((i + offset) * keysPerRangedLock)
+		}
+		expectedExternalLocksRangedMaxKeys[i].EndKey = intToKey((i + offset + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksPointTargetBytes := make([]roachpb.Span, keysFromTargetBytes)
+	for i := range expectedResolvedLocksPointTargetBytes {
+		expectedResolvedLocksPointTargetBytes[i].Key = intToKey(i)
+	}
+	expectedExternalLocksPointTargetBytes := make([]roachpb.Span, numKeys-keysFromTargetBytes)
+	for i := range expectedExternalLocksPointTargetBytes {
+		expectedExternalLocksPointTargetBytes[i].Key = intToKey(i + keysFromTargetBytes)
+	}
+
+	expectedResolvedLocksRangedTargetBytes := make([]roachpb.Span, keysFromTargetBytes/keysPerRangedLock)
+	for i := range expectedResolvedLocksRangedTargetBytes {
+		expectedResolvedLocksRangedTargetBytes[i].Key = intToKey(i * keysPerRangedLock)
+		expectedResolvedLocksRangedTargetBytes[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+	}
+	expectedExternalLocksRangedTargetBytes := make([]roachpb.Span, ceil(numKeys, keysPerRangedLock)-keysFromTargetBytes/keysPerRangedLock)
+	for i := range expectedExternalLocksRangedTargetBytes {
+		offset := keysFromTargetBytes / keysPerRangedLock
+		expectedExternalLocksRangedTargetBytes[i].Key = intToKey((i + offset) * keysPerRangedLock)
+		expectedExternalLocksRangedTargetBytes[i].EndKey = intToKey((i + offset + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksNoLimit := make([]roachpb.Span, numKeys)
+	for i := range expectedResolvedLocksNoLimit {
+		expectedResolvedLocksNoLimit[i].Key = intToKey(i)
+	}
+	expectedExternalLocksNoLimit := make([]roachpb.Span, 0)
+
+	testCases := []struct {
+		desc                  string
+		lockSpans             []roachpb.Span
+		resolveAllowance      int64
+		targetBytes           int64
+		expectedResolvedLocks []roachpb.Span
+		expectedExternalLocks []roachpb.Span
+	}{
+		// Point intent resolution with a max keys limit. 20 point intents, 11
+		// become resolved locks and 9 become external locks.
+		{
+			desc:                  "Point locks with max keys",
+			lockSpans:             pointLocks,
+			resolveAllowance:      maxKeys,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksPointMaxKeys,
+			expectedExternalLocks: expectedExternalLocksPointMaxKeys,
+		},
+		// Ranged intent resolution with a max keys limit. 5 ranged locks (each
+		// containing 4 keys), 3 become resolved locks (containing the first 2
+		// locks and part of the 3rd lock) and 3 become external locks (containing
+		// the remaining part of the 3rd lock and the last 2 locks). Note that the
+		// max key limit splits in between the 3rd lock, so the resolved locks will
+		// contain the first part of the 3rd lock span and the external locks will
+		// contain the remaining part of the 3rd lock span.
+		{
+			desc:                  "Ranged locks with max keys",
+			lockSpans:             rangedLocks,
+			resolveAllowance:      maxKeys,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksRangedMaxKeys,
+			expectedExternalLocks: expectedExternalLocksRangedMaxKeys,
+		},
+		// Point intent resolution with a target bytes limit. 20 point intents, 12
+		// become resolved locks and 8 become external locks.
+		{
+			desc:                  "Point span with target bytes",
+			lockSpans:             pointLocks,
+			resolveAllowance:      0,
+			targetBytes:           targetBytes,
+			expectedResolvedLocks: expectedResolvedLocksPointTargetBytes,
+			expectedExternalLocks: expectedExternalLocksPointTargetBytes,
+		},
+		// Ranged intent resolution with a target bytes limit. 5 ranged locks (each
+		// containing 4 keys), 3 become resolved locks (containing the first 3
+		// locks) and 2 become external locks (containing the last 2 locks). Note
+		// that the target byte limit does not split in between any locks, so the
+		// resolved and external locks do not contain part of a lock span for any
+		// lock.
+		{
+			desc:                  "Ranged span with target bytes",
+			lockSpans:             rangedLocks,
+			resolveAllowance:      0,
+			targetBytes:           targetBytes,
+			expectedResolvedLocks: expectedResolvedLocksRangedTargetBytes,
+			expectedExternalLocks: expectedExternalLocksRangedTargetBytes,
+		},
+		// Point intent resolution without any limit. 20 point intents, 20 become
+		// resolved locks and 0 become external locks.
+		{
+			desc:                  "No key or byte limit",
+			lockSpans:             pointLocks,
+			resolveAllowance:      0,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksNoLimit,
+			expectedExternalLocks: expectedExternalLocksNoLimit,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			db := storage.NewDefaultInMemForTesting()
+			defer db.Close()
+			batch := db.NewBatch()
+			defer batch.Close()
+
+			ts := hlc.Timestamp{WallTime: 1}
+			txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, 0, ts, 0, 1, 0, false /* omitInRangefeeds */)
+			txn.Status = roachpb.COMMITTED
+
+			for i := 0; i < numKeys; i++ {
+				_, err := storage.MVCCPut(ctx, batch, intToKey(i), ts, roachpb.MakeValueFromString("a"), storage.MVCCWriteOptions{Txn: &txn})
+				require.NoError(t, err)
+			}
+			resolvedLocks, releasedReplLocks, externalLocks, err := resolveLocalLocksWithPagination(
+				ctx,
+				batch,
+				(&MockEvalCtx{
+					Desc: &roachpb.RangeDescriptor{
+						StartKey: roachpb.RKeyMin,
+						EndKey:   roachpb.RKeyMax,
+					}}).EvalContext(),
+				nil,
+				&kvpb.EndTxnRequest{
+					LockSpans:             tc.lockSpans,
+					InternalCommitTrigger: &roachpb.InternalCommitTrigger{},
+				},
+				&txn,
+				tc.resolveAllowance,
+				tc.targetBytes,
+			)
+			require.NoError(t, err)
+			require.Equal(t, len(tc.expectedResolvedLocks), len(resolvedLocks))
+			for i, lock := range resolvedLocks {
+				require.Equal(t, tc.expectedResolvedLocks[i].Key, lock.Key)
+				require.Equal(t, tc.expectedResolvedLocks[i].EndKey, lock.EndKey)
+			}
+			require.Len(t, releasedReplLocks, 0)
+			require.Equal(t, len(tc.expectedExternalLocks), len(externalLocks))
+			for i, lock := range externalLocks {
+				require.Equal(t, tc.expectedExternalLocks[i].Key, lock.Key)
+				require.Equal(t, tc.expectedExternalLocks[i].EndKey, lock.EndKey)
+			}
+		})
+	}
+}
+
+// TestSplitTriggerWritesInitialReplicaState tests that a split trigger sets up
+// the split's right-hand side range by writing the initial replica state into
+// the evaluation write batch.
+func TestSplitTriggerWritesInitialReplicaState(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	version := st.Version.LatestVersion()
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 10))
+	clock := hlc.NewClockForTesting(manual)
+
+	db := storage.NewDefaultInMemForTesting()
+	defer db.Close()
+	batch := db.NewBatch()
+	defer batch.Close()
+
+	rangeLeaseDuration := 99 * time.Nanosecond
+	startKey := roachpb.Key("0000")
+	endKey := roachpb.Key("9999")
+	desc := roachpb.RangeDescriptor{
+		RangeID:  99,
+		StartKey: roachpb.RKey(startKey),
+		EndKey:   roachpb.RKey(endKey),
+	}
+	desc.AddReplica(1, 1, roachpb.VOTER_FULL)
+	lease := roachpb.Lease{
+		Replica: desc.InternalReplicas[0],
+		// The range was using a leader lease. The split will need to swap this to
+		// an expiration-based lease.
+		Term:          10,
+		MinExpiration: hlc.Timestamp{WallTime: 100},
+	}
+	gcThreshold := hlc.Timestamp{WallTime: 4}
+	lastGCTimestamp := hlc.Timestamp{WallTime: 5}
+	gcHint := roachpb.GCHint{GCTimestamp: gcThreshold}
+	abortSpanTxnID := uuid.MakeV4()
+	as := abortspan.New(desc.RangeID)
+	sl := stateloader.Make(desc.RangeID)
+	rec := (&MockEvalCtx{
+		ClusterSettings:        st,
+		Desc:                   &desc,
+		Clock:                  clock,
+		AbortSpan:              as,
+		LastReplicaGCTimestamp: lastGCTimestamp,
+		RangeLeaseDuration:     rangeLeaseDuration,
+	}).EvalContext()
+
+	splitKey := roachpb.RKey("5555")
+	leftDesc, rightDesc := desc, desc
+	leftDesc.EndKey = splitKey
+	rightDesc.RangeID++
+	rightDesc.StartKey = splitKey
+	rightDesc.InternalReplicas = slices.Clone(leftDesc.InternalReplicas)
+	rightDesc.InternalReplicas[0].ReplicaID++
+	split := &roachpb.SplitTrigger{
+		LeftDesc:  leftDesc,
+		RightDesc: rightDesc,
+	}
+
+	// Write the range state that will be consulted and copied during the split.
+	err := as.Put(ctx, batch, nil, abortSpanTxnID, &roachpb.AbortSpanEntry{})
+	require.NoError(t, err)
+	err = sl.SetLease(ctx, batch, nil, lease)
+	require.NoError(t, err)
+	err = sl.SetGCThreshold(ctx, batch, nil, &gcThreshold)
+	require.NoError(t, err)
+	err = sl.SetGCHint(ctx, batch, nil, &gcHint)
+	require.NoError(t, err)
+	err = sl.SetVersion(ctx, batch, nil, &version)
+	require.NoError(t, err)
+
+	// Run the split trigger, which is normally run as a subset of EndTxn request
+	// evaluation.
+	_, _, err = splitTrigger(ctx, rec, batch, enginepb.MVCCStats{}, split, hlc.Timestamp{})
+	require.NoError(t, err)
+
+	// Verify that range state was migrated to the right-hand side properly.
+	asRight := abortspan.New(rightDesc.RangeID)
+	slRight := stateloader.Make(rightDesc.RangeID)
+	// The abort span should have been transferred over.
+	ok, err := asRight.Get(ctx, batch, abortSpanTxnID, &roachpb.AbortSpanEntry{})
+	require.NoError(t, err)
+	require.True(t, ok)
+	// The lease should be present, pointing at the replica in the right-hand side
+	// range, and switched to an expiration-based lease.
+	expLease := roachpb.Lease{
+		Replica:    rightDesc.InternalReplicas[0],
+		Expiration: &hlc.Timestamp{WallTime: manual.Now().Add(rangeLeaseDuration).UnixNano()},
+	}
+	loadedLease, err := slRight.LoadLease(ctx, batch)
+	require.NoError(t, err)
+	require.Equal(t, expLease, loadedLease)
+	loadedGCThreshold, err := slRight.LoadGCThreshold(ctx, batch)
+	require.NoError(t, err)
+	require.NotNil(t, loadedGCThreshold)
+	require.Equal(t, gcThreshold, *loadedGCThreshold)
+	loadedGCHint, err := slRight.LoadGCHint(ctx, batch)
+	require.NoError(t, err)
+	require.NotNil(t, loadedGCHint)
+	require.Equal(t, gcHint, *loadedGCHint)
+	expTruncState := kvserverpb.RaftTruncatedState{
+		Term:  stateloader.RaftInitialLogTerm,
+		Index: stateloader.RaftInitialLogIndex,
+	}
+	loadedTruncState, err := slRight.LoadRaftTruncatedState(ctx, batch)
+	require.NoError(t, err)
+	require.Equal(t, expTruncState, loadedTruncState)
+	loadedVersion, err := slRight.LoadVersion(ctx, batch)
+	require.NoError(t, err)
+	require.Equal(t, version, loadedVersion)
+	expAppliedState := kvserverpb.RangeAppliedState{
+		RaftAppliedIndexTerm: stateloader.RaftInitialLogTerm,
+		RaftAppliedIndex:     stateloader.RaftInitialLogIndex,
+	}
+	loadedAppliedState, err := slRight.LoadRangeAppliedState(ctx, batch)
+	require.NoError(t, err)
+	require.NotNil(t, loadedAppliedState)
+	loadedAppliedState.RangeStats = kvserverpb.MVCCPersistentStats{} // ignore
+	require.Equal(t, &expAppliedState, loadedAppliedState)
 }

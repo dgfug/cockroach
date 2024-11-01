@@ -1,81 +1,84 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catprivilege
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 )
 
-// MaybeFixUsagePrivForTablesAndDBs fixes cases where privilege descriptors
-// with ZONECONFIG were corrupted after upgrading from 20.1 to 20.2.
-// USAGE was mistakenly added in the privilege bitfield above ZONECONFIG
-// causing privilege descriptors with ZONECONFIG in 20.1 to have USAGE privilege
-// instead of ZONECONFIG.
-// Fortunately ZONECONFIG was only valid on TABLES/DB while USAGE is not valid
-// on either so we know if the descriptor was corrupted.
-func MaybeFixUsagePrivForTablesAndDBs(ptr **descpb.PrivilegeDescriptor) bool {
-	if *ptr == nil {
-		*ptr = &descpb.PrivilegeDescriptor{}
-	}
-	p := *ptr
-
-	if p.Version > descpb.InitialVersion {
-		// InitialVersion is for descriptors that were created in versions 20.1 and
-		// earlier. If the privilege descriptor was created after 20.1, then we
-		// do not have to fix it. Furthermore privilege descriptor versions are
-		// currently never updated so we're guaranteed to only have this issue
-		// on privilege descriptors that are on "InitialVersion".
-		return false
-	}
-
-	modified := false
-	for i := range p.Users {
-		// Users is a slice of values, we need pointers to make them mutable.
-		userPrivileges := &p.Users[i]
-		// Tables and Database should not have USAGE privilege in 20.2 onwards.
-		// The only reason they would have USAGE privilege is because they had
-		// ZoneConfig in 20.1 and upgrading to 20.2 where USAGE was added
-		// in the privilege bitfield where ZONECONFIG previously was.
-		if privilege.USAGE.Mask()&userPrivileges.Privileges != 0 {
-			// Remove USAGE privilege and add ZONECONFIG. The privilege was
-			// originally ZONECONFIG in 20.1 but got changed to USAGE in 20.2
-			// due to changing the bitfield values.
-			userPrivileges.Privileges = (userPrivileges.Privileges - privilege.USAGE.Mask()) | privilege.ZONECONFIG.Mask()
-			modified = true
-		}
-	}
-
-	return modified
+// PrivilegeDescriptorBuilder used to potentially mutate privilege descriptors,
+// only if a change exists to avoid copying.
+type PrivilegeDescriptorBuilder interface {
+	// GetReadOnlyPrivilege gets an immutable privilege descriptor
+	// reference. This copy should *never* be modified.
+	GetReadOnlyPrivilege() *catpb.PrivilegeDescriptor
+	// GetMutablePrivilege gets a mutable privilege descriptor
+	// that is safe to modify.
+	GetMutablePrivilege() *catpb.PrivilegeDescriptor
 }
 
-// MaybeFixPrivileges fixes the privilege descriptor if needed, including:
+// simplePrivilegeDescriptorBuilder implements PrivilegeDescriptorBuilder with
+// the assumption that the privilege descriptor is mutable.
+type simplePrivilegeDescriptorBuilder struct {
+	p **catpb.PrivilegeDescriptor
+}
+
+// GetReadOnlyPrivilege implements PrivilegeDescriptorBuilder.
+func (d simplePrivilegeDescriptorBuilder) GetReadOnlyPrivilege() *catpb.PrivilegeDescriptor {
+	if *d.p == nil {
+		*d.p = &catpb.PrivilegeDescriptor{}
+	}
+	return *d.p
+}
+
+// GetMutablePrivilege implements PrivilegeDescriptorBuilder.g
+func (d simplePrivilegeDescriptorBuilder) GetMutablePrivilege() *catpb.PrivilegeDescriptor {
+	return d.GetReadOnlyPrivilege()
+}
+
+func MaybeFixPrivileges(
+	ptr **catpb.PrivilegeDescriptor,
+	parentID, parentSchemaID descpb.ID,
+	objectType privilege.ObjectType,
+	objectName string,
+) (bool, error) {
+	return MaybeFixPrivilegesWithBuilder(simplePrivilegeDescriptorBuilder{
+		p: ptr,
+	},
+		parentID,
+		parentSchemaID,
+		objectType,
+		objectName)
+}
+
+// MaybeFixPrivilegesWithBuilder fixes the privilege descriptor if
+// needed, including:
 // * adding default privileges for the "admin" role
 // * fixing default privileges for the "root" user
 // * fixing maximum privileges for users.
 // * populating the owner field if previously empty.
-// * updating version field to Version21_2.
-// MaybeFixPrivileges can be removed after v21.2.
-func MaybeFixPrivileges(
-	ptr **descpb.PrivilegeDescriptor,
+// * updating version field older than 21.2 to Version21_2.
+// MaybeFixPrivileges can be removed after v22.2.
+func MaybeFixPrivilegesWithBuilder(
+	reader PrivilegeDescriptorBuilder,
 	parentID, parentSchemaID descpb.ID,
 	objectType privilege.ObjectType,
 	objectName string,
-) bool {
-	if *ptr == nil {
-		*ptr = &descpb.PrivilegeDescriptor{}
+) (bool, error) {
+	// This privilege descriptor is meant to be read only,
+	// and may not show any changes applied below.
+	readOnlyPriv := reader.GetReadOnlyPrivilege()
+	privList, err := privilege.GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return false, err
 	}
-	p := *ptr
-	allowedPrivilegesBits := privilege.GetValidPrivilegesForObject(objectType).ToBitField()
+	allowedPrivilegesBits := privList.ToBitField()
 	systemPrivs := SystemSuperuserPrivileges(descpb.NameInfo{
 		ParentID:       parentID,
 		ParentSchemaID: parentSchemaID,
@@ -88,30 +91,32 @@ func MaybeFixPrivileges(
 
 	changed := false
 
-	fixSuperUser := func(user security.SQLUsername) {
-		privs := p.FindOrCreateUser(user)
+	fixSuperUser := func(user username.SQLUsername) {
+		privs, found := readOnlyPriv.FindUser(user)
+		if !found {
+			privs = reader.GetMutablePrivilege().FindOrCreateUser(user)
+		}
 		oldPrivilegeBits := privs.Privileges
-		if oldPrivilegeBits != allowedPrivilegesBits {
-			if privilege.ALL.IsSetIn(allowedPrivilegesBits) {
+		if privilege.ALL.IsSetIn(allowedPrivilegesBits) {
+			if oldPrivilegeBits != privilege.ALL.Mask() {
+				privs, _ = reader.GetMutablePrivilege().FindUser(user)
 				privs.Privileges = privilege.ALL.Mask()
-			} else {
-				privs.Privileges = allowedPrivilegesBits
+				changed = true
 			}
-			changed = (privs.Privileges != oldPrivilegeBits) || changed
+		} else if oldPrivilegeBits != allowedPrivilegesBits {
+			privs, _ = reader.GetMutablePrivilege().FindUser(user)
+			privs.Privileges = allowedPrivilegesBits
+			changed = true
 		}
 	}
 
 	// Check "root" user and "admin" role.
-	fixSuperUser(security.RootUserName())
-	fixSuperUser(security.AdminRoleName())
+	fixSuperUser(username.RootUserName())
+	fixSuperUser(username.AdminRoleName())
 
-	if objectType == privilege.Table || objectType == privilege.Database {
-		changed = MaybeFixUsagePrivForTablesAndDBs(&p) || changed
-	}
-
-	for i := range p.Users {
+	for i := range readOnlyPriv.Users {
 		// Users is a slice of values, we need pointers to make them mutable.
-		u := &p.Users[i]
+		u := &readOnlyPriv.Users[i]
 		if u.User().IsRootUser() || u.User().IsAdminRole() {
 			// we've already checked super users.
 			continue
@@ -119,22 +124,22 @@ func MaybeFixPrivileges(
 
 		if u.Privileges&allowedPrivilegesBits != u.Privileges {
 			changed = true
+			reader.GetMutablePrivilege().Users[i].Privileges &= allowedPrivilegesBits
 		}
-		u.Privileges &= allowedPrivilegesBits
 	}
 
-	if p.Owner().Undefined() {
+	if readOnlyPriv.Owner().Undefined() {
 		if systemPrivs != nil {
-			p.SetOwner(security.NodeUserName())
+			reader.GetMutablePrivilege().SetOwner(username.NodeUserName())
 		} else {
-			p.SetOwner(security.RootUserName())
+			reader.GetMutablePrivilege().SetOwner(username.RootUserName())
 		}
 		changed = true
 	}
 
-	if p.Version < descpb.Version21_2 {
-		p.SetVersion(descpb.Version21_2)
+	if readOnlyPriv.Version < catpb.Version21_2 {
+		reader.GetMutablePrivilege().SetVersion(catpb.Version21_2)
 		changed = true
 	}
-	return changed
+	return changed, nil
 }

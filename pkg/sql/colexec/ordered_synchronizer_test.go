@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -148,7 +143,7 @@ func TestOrderedSync(t *testing.T) {
 			typs[i] = types.Int
 		}
 		colexectestutils.RunTests(t, testAllocator, tc.sources, tc.expected, colexectestutils.OrderedVerifier, func(inputs []colexecop.Operator) (colexecop.Operator, error) {
-			return NewOrderedSynchronizer(testAllocator, execinfra.DefaultMemoryLimit, colexectestutils.MakeInputs(inputs), typs, tc.ordering), nil
+			return NewOrderedSynchronizer(&execinfra.FlowCtx{Gateway: true}, 0 /* processorID */, testAllocator, execinfra.DefaultMemoryLimit, colexectestutils.MakeInputs(inputs), typs, tc.ordering, 0 /* tuplesToMerge */), nil
 		})
 	}
 }
@@ -189,7 +184,7 @@ func TestOrderedSyncRandomInput(t *testing.T) {
 		inputs[i].Root = colexectestutils.NewOpTestInput(testAllocator, batchSize, sources[i], typs)
 	}
 	ordering := colinfo.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}
-	op := NewOrderedSynchronizer(testAllocator, execinfra.DefaultMemoryLimit, inputs, typs, ordering)
+	op := NewOrderedSynchronizer(&execinfra.FlowCtx{Gateway: true}, 0 /* processorID */, testAllocator, execinfra.DefaultMemoryLimit, inputs, typs, ordering, 0 /* tuplesToMerge */)
 	op.Init(context.Background())
 	out := colexectestutils.NewOpTestOutput(op, expected)
 	if err := out.Verify(); err != nil {
@@ -198,7 +193,6 @@ func TestOrderedSyncRandomInput(t *testing.T) {
 }
 
 func BenchmarkOrderedSynchronizer(b *testing.B) {
-	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 
 	numInputs := int64(3)
@@ -219,7 +213,7 @@ func BenchmarkOrderedSynchronizer(b *testing.B) {
 	}
 
 	ordering := colinfo.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}
-	op := NewOrderedSynchronizer(testAllocator, execinfra.DefaultMemoryLimit, inputs, typs, ordering)
+	op := NewOrderedSynchronizer(&execinfra.FlowCtx{Gateway: true}, 0 /* processorID */, testAllocator, execinfra.DefaultMemoryLimit, inputs, typs, ordering, 0 /* tuplesToMerge */)
 	op.Init(ctx)
 
 	b.SetBytes(8 * int64(coldata.BatchSize()) * numInputs)

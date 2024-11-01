@@ -1,33 +1,33 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import {
+  Loading,
+  SortedTable,
+  util,
+  Timestamp,
+} from "@cockroachlabs/cluster-ui";
+import sortBy from "lodash/sortBy";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 
 import * as protos from "src/js/protos";
-import { INodeStatus } from "src/util/proto";
-import { nodeIDAttr } from "src/util/constants";
-import { LogEntriesResponseMessage } from "src/util/api";
-import { LongToMoment } from "src/util/convert";
-import { SortableTable } from "src/views/shared/components/sortabletable";
-import { AdminUIState } from "src/redux/state";
 import { refreshLogs, refreshNodes } from "src/redux/apiReducers";
-import { currentNode } from "src/views/cluster/containers/nodeOverview";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { getDisplayName } from "src/redux/nodes";
-import { Loading } from "@cockroachlabs/cluster-ui";
+import { AdminUIState } from "src/redux/state";
+import { LogEntriesResponseMessage } from "src/util/api";
+import { nodeIDAttr } from "src/util/constants";
+import { INodeStatus } from "src/util/proto";
 import { getMatchParamByName } from "src/util/query";
+import { currentNode } from "src/views/cluster/containers/nodeOverview";
 import "./logs.styl";
+
+type LogEntries = protos.cockroach.util.log.IEntry;
 
 interface LogProps {
   logs: CachedDataReducerState<LogEntriesResponseMessage>;
@@ -49,40 +49,42 @@ export class Logs extends React.Component<LogProps & RouteComponentProps, {}> {
   }
 
   renderContent = () => {
-    const logEntries = _.sortBy(this.props.logs.data.entries, e => e.time);
+    const logEntries = sortBy(this.props.logs.data.entries, e => e.time);
     const columns = [
       {
         title: "Time",
-        cell: (index: number) =>
-          LongToMoment(logEntries[index].time).format("YYYY-MM-DD HH:mm:ss"),
+        name: "time",
+        cell: (logEntry: LogEntries) => (
+          <Timestamp
+            time={util.LongToMoment(logEntry.time)}
+            format={util.DATE_WITH_SECONDS_FORMAT_24_TZ}
+          />
+        ),
       },
       {
         title: "Severity",
-        cell: (index: number) =>
-          protos.cockroach.util.log.Severity[logEntries[index].severity],
+        name: "severity",
+        cell: (logEntry: LogEntries) =>
+          protos.cockroach.util.log.Severity[logEntry.severity],
       },
       {
         title: "Message",
-        cell: (index: number) => (
+        name: "message",
+        cell: (logEntry: LogEntries) => (
           <pre className="sort-table__unbounded-column logs-table__message">
-            {(logEntries[index].tags
-              ? "[" + logEntries[index].tags + "] "
-              : "") + logEntries[index].message}
+            {(logEntry.tags ? "[" + logEntry.tags + "] " : "") +
+              logEntry.message}
           </pre>
         ),
       },
       {
         title: "File:Line",
-        cell: (index: number) =>
-          `${logEntries[index].file}:${logEntries[index].line}`,
+        name: "file",
+        cell: (logEntry: LogEntries) => `${logEntry.file}:${logEntry.line}`,
       },
     ];
     return (
-      <SortableTable
-        count={logEntries.length}
-        columns={columns}
-        className="logs-table"
-      />
+      <SortedTable data={logEntries} columns={columns} className="logs-table" />
     );
   };
 
@@ -106,6 +108,7 @@ export class Logs extends React.Component<LogProps & RouteComponentProps, {}> {
         <section className="section">
           <Loading
             loading={!this.props.logs.data}
+            page={"node logs"}
             error={this.props.logs.lastError}
             render={this.renderContent}
           />

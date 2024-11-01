@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -16,6 +11,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // Boundary returns the boundary of a given Geometry.
@@ -42,6 +39,10 @@ func Centroid(g geo.Geometry) (geo.Geometry, error) {
 
 // MinimumBoundingCircle returns minimum bounding circle of an EWKB
 func MinimumBoundingCircle(g geo.Geometry) (geo.Geometry, geo.Geometry, float64, error) {
+	if BoundingBoxHasInfiniteCoordinates(g) || BoundingBoxHasNaNCoordinates(g) {
+		return geo.Geometry{}, geo.Geometry{}, 0, pgerror.Newf(pgcode.InvalidParameterValue, "value out of range: overflow")
+	}
+
 	polygonEWKB, centroidEWKB, radius, err := geos.MinimumBoundingCircle(g.EWKB())
 	if err != nil {
 		return geo.Geometry{}, geo.Geometry{}, 0, err
@@ -206,4 +207,38 @@ func MinimumRotatedRectangle(g geo.Geometry) (geo.Geometry, error) {
 		return geo.Geometry{}, err
 	}
 	return gm, nil
+}
+
+// BoundingBoxHasInfiniteCoordinates checks if the bounding box of a Geometry
+// has an infinite coordinate.
+func BoundingBoxHasInfiniteCoordinates(g geo.Geometry) bool {
+	boundingBox := g.BoundingBoxRef()
+	if boundingBox == nil {
+		return false
+	}
+	// Don't use `:= range []float64{...}` to avoid memory allocation.
+	isInf := func(ord float64) bool {
+		return math.IsInf(ord, 0)
+	}
+	if isInf(boundingBox.LoX) || isInf(boundingBox.LoY) || isInf(boundingBox.HiX) || isInf(boundingBox.HiY) {
+		return true
+	}
+	return false
+}
+
+// BoundingBoxHasNaNCoordinates checks if the bounding box of a Geometry
+// has a NaN coordinate.
+func BoundingBoxHasNaNCoordinates(g geo.Geometry) bool {
+	boundingBox := g.BoundingBoxRef()
+	if boundingBox == nil {
+		return false
+	}
+	// Don't use `:= range []float64{...}` to avoid memory allocation.
+	isNaN := func(ord float64) bool {
+		return math.IsNaN(ord)
+	}
+	if isNaN(boundingBox.LoX) || isNaN(boundingBox.LoY) || isNaN(boundingBox.HiX) || isNaN(boundingBox.HiY) {
+		return true
+	}
+	return false
 }

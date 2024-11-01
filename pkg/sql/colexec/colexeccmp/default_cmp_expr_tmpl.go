@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -22,13 +17,16 @@
 package colexeccmp
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
 
 type cmpExprAdapterBase struct {
-	fn      tree.TwoArgFn
-	evalCtx *tree.EvalContext
+	op      tree.BinaryEvalOp
+	evalCtx *eval.Context
 }
 
 // {{range .}}
@@ -39,8 +37,8 @@ type _EXPR_NAME struct {
 
 var _ ComparisonExprAdapter = &_EXPR_NAME{}
 
-func (c *_EXPR_NAME) Eval(left, right tree.Datum) (tree.Datum, error) {
-	// {{if not .NullableArgs}}
+func (c *_EXPR_NAME) Eval(ctx context.Context, left, right tree.Datum) (tree.Datum, error) {
+	// {{if not .CalledOnNullInput}}
 	if left == tree.DNull || right == tree.DNull {
 		return tree.DNull, nil
 	}
@@ -48,7 +46,7 @@ func (c *_EXPR_NAME) Eval(left, right tree.Datum) (tree.Datum, error) {
 	// {{if .FlippedArgs}}
 	left, right = right, left
 	// {{end}}
-	d, err := c.fn(c.evalCtx, left, right)
+	d, err := eval.BinaryOp(ctx, c.evalCtx, c.op, left, right)
 	if d == tree.DNull || err != nil {
 		return d, err
 	}
@@ -73,6 +71,8 @@ type cmpWithSubOperatorExprAdapter struct {
 
 var _ ComparisonExprAdapter = &cmpWithSubOperatorExprAdapter{}
 
-func (c *cmpWithSubOperatorExprAdapter) Eval(left, right tree.Datum) (tree.Datum, error) {
-	return tree.EvalComparisonExprWithSubOperator(c.evalCtx, c.expr, left, right)
+func (c *cmpWithSubOperatorExprAdapter) Eval(
+	ctx context.Context, left, right tree.Datum,
+) (tree.Datum, error) {
+	return eval.ComparisonExprWithSubOperator(ctx, c.evalCtx, c.expr, left, right)
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo
 
@@ -22,11 +17,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // RelExpr is implemented by all operators tagged as Relational. Relational
@@ -36,12 +35,12 @@ import (
 // in the same memo group are linked together in a list that can be traversed
 // via calls to FirstExpr and NextExpr:
 //
-//      +--------------------------------------+
-//      |  +---------------+                   |
-//      |  |               |FirstExpr          |FirstExpr
-//      v  v               |                   |
-//    member #1 -------> member #2 --------> member #3 -------> nil
-//              NextExpr           NextExpr            NextExpr
+//	  +--------------------------------------+
+//	  |  +---------------+                   |
+//	  |  |               |FirstExpr          |FirstExpr
+//	  v  v               |                   |
+//	member #1 -------> member #2 --------> member #3 -------> nil
+//	          NextExpr           NextExpr            NextExpr
 //
 // A relational expression's physical properties and cost are defined once it
 // has been optimized.
@@ -143,8 +142,7 @@ var CountRowsSingleton = &CountRowsExpr{}
 // TrueFilter is a global instance of the empty FiltersExpr, used in situations
 // where the filter should always evaluate to true:
 //
-//   SELECT * FROM a INNER JOIN b ON True
-//
+//	SELECT * FROM a INNER JOIN b ON True
 var TrueFilter = FiltersExpr{}
 
 // EmptyTuple is a global instance of a TupleExpr that contains no elements.
@@ -155,8 +153,7 @@ var EmptyTuple = &TupleExpr{Typ: types.EmptyTuple}
 // a TupleExpr that contains no elements. It's used when constructing an empty
 // ValuesExpr:
 //
-//   SELECT 1
-//
+//	SELECT 1
 var ScalarListWithEmptyTuple = ScalarListExpr{EmptyTuple}
 
 // EmptyGroupingPrivate is a global instance of a GroupingPrivate that has no
@@ -269,6 +266,62 @@ func (n FiltersExpr) Difference(other FiltersExpr) FiltersExpr {
 	return newFilters
 }
 
+// NoOpDistribution returns true if a DistributeExpr has the same distribution
+// as its input.
+func (e *DistributeExpr) NoOpDistribution() bool {
+	if target, source, ok := e.GetDistributions(); ok {
+		return target.Equals(source)
+	}
+	return false
+}
+
+// GetDistributions returns the target and source Distributions of this
+// `DistributeExpr`, if the provided physical properties have been built.
+func (e *DistributeExpr) GetDistributions() (target, source physical.Distribution, ok bool) {
+	distributionProvidedPhysical := e.ProvidedPhysical()
+	inputDistributionProvidedPhysical := e.Input.ProvidedPhysical()
+	if distributionProvidedPhysical != nil && inputDistributionProvidedPhysical != nil {
+		target = distributionProvidedPhysical.Distribution
+		source = inputDistributionProvidedPhysical.Distribution
+		return target, source, true
+	}
+	return physical.Distribution{}, physical.Distribution{}, false
+}
+
+// HasHomeRegion returns true if the operation tree being distributed has a home
+// region.
+func (e *DistributeExpr) HasHomeRegion() bool {
+	inputDistributionProvidedPhysical := e.Input.ProvidedPhysical()
+
+	if inputDistributionProvidedPhysical != nil {
+		inputDistribution := inputDistributionProvidedPhysical.Distribution
+		return len(inputDistribution.Regions) == 1
+	}
+	return false
+}
+
+// GetRegionOfDistribution returns the single region name of the provided
+// distribution, if there is exactly one.
+func (e *DistributeExpr) GetRegionOfDistribution() (region string, ok bool) {
+	distributionProvidedPhysical := e.ProvidedPhysical()
+
+	if distributionProvidedPhysical != nil {
+		return distributionProvidedPhysical.Distribution.GetSingleRegion()
+	}
+	return "", false
+}
+
+// GetInputHomeRegion returns the single region name of the home region of the
+// input expression tree to the Distribute operation, if there is exactly one.
+func (e *DistributeExpr) GetInputHomeRegion() (inputHomeRegion string, ok bool) {
+	inputDistributionProvidedPhysical := e.Input.ProvidedPhysical()
+
+	if inputDistributionProvidedPhysical != nil {
+		return inputDistributionProvidedPhysical.Distribution.GetSingleRegion()
+	}
+	return "", false
+}
+
 // OutputCols returns the set of columns constructed by the Aggregations
 // expression.
 func (n AggregationsExpr) OutputCols() opt.ColSet {
@@ -358,19 +411,39 @@ type ScanFlags struct {
 
 	// ForceIndex forces the use of a specific index (specified in Index).
 	// ForceIndex and NoIndexJoin cannot both be set at the same time.
-	ForceIndex  bool
-	ForceZigzag bool
-	Direction   tree.Direction
-	Index       int
+	ForceIndex bool
+	// ForceInvertedIndex forces the use of an inverted index.
+	ForceInvertedIndex bool
+	ForceZigzag        bool
+
+	// When the optimizer is performing unique constraint or foreign key
+	// constraint check, we will temporarily disable the not visible index feature
+	// and treat all indexes as they are visible. Default behaviour is to enable
+	// the not visible feature. We will pass this flag, DisableNotVisibleIndex, to
+	// the memo group when we are building a memo group for a ScanOp expression on
+	// the given table. Later on, optimizer will enumerate all indexes on the
+	// table to generate equivalent memo groups. If DisableNotVisibleIndex is
+	// true, optimizer will also generate equivalent memo group using the
+	// invisible index. Otherwise, optimizer will ignore the invisible indexes.
+	DisableNotVisibleIndex bool
+
+	Direction tree.Direction
+	Index     int
 
 	// ZigzagIndexes makes planner prefer a zigzag with particular indexes.
 	// ForceZigzag must also be true.
-	ZigzagIndexes util.FastIntSet
+	ZigzagIndexes intsets.Fast
 }
 
 // Empty returns true if there are no flags set.
 func (sf *ScanFlags) Empty() bool {
 	return *sf == ScanFlags{}
+}
+
+// onlyNotVisibleIndexFlagOn returns true if DisableNotVisibleIndex is the only
+// flag set on.
+func (sf *ScanFlags) onlyNotVisibleIndexFlagOn() bool {
+	return *sf == ScanFlags{DisableNotVisibleIndex: true}
 }
 
 // JoinFlags stores restrictions on the join execution method, derived from
@@ -384,14 +457,12 @@ type JoinFlags uint16
 
 // Each flag indicates if a certain type of join is disallowed.
 const (
-	// DisallowHashJoinStoreLeft corresponds to a hash join where the left side is
-	// stored into the hashtable. Note that execution can override the stored side
-	// if it finds that the other side is smaller (up to a certain size).
+	// DisallowHashJoinStoreLeft corresponds to a hash join where the left side
+	// is stored into the hashtable.
 	DisallowHashJoinStoreLeft JoinFlags = 1 << iota
 
-	// DisallowHashJoinStoreRight corresponds to a hash join where the right side
-	// is stored into the hashtable. Note that execution can override the stored
-	// side if it finds that the other side is smaller (up to a certain size).
+	// DisallowHashJoinStoreRight corresponds to a hash join where the right
+	// side is stored into the hashtable.
 	DisallowHashJoinStoreRight
 
 	// DisallowMergeJoin corresponds to a merge join.
@@ -445,6 +516,11 @@ const (
 
 	// AllowOnlyMergeJoin has all "disallow" flags set except DisallowMergeJoin.
 	AllowOnlyMergeJoin = disallowAll ^ DisallowMergeJoin
+
+	// AllowAllJoinsIntoRight has all "disallow" flags set except
+	// DisallowHashJoinStoreRight, DisallowLookupJoinIntoRight,
+	// DisallowInvertedJoinIntoRight, and DisallowMergeJoin.
+	AllowAllJoinsIntoRight = disallowAll ^ DisallowHashJoinStoreRight ^ DisallowLookupJoinIntoRight ^ DisallowInvertedJoinIntoRight ^ DisallowMergeJoin
 )
 
 var joinFlagStr = map[JoinFlags]string{
@@ -466,9 +542,9 @@ func (jf JoinFlags) Empty() bool {
 	return jf == 0
 }
 
-// Has returns true if the given flag is set.
-func (jf JoinFlags) Has(flag JoinFlags) bool {
-	return jf&flag != 0
+// Has returns true if all of the given flags are set in the receiver.
+func (jf JoinFlags) Has(flags JoinFlags) bool {
+	return jf&flags == flags
 }
 
 func (jf JoinFlags) String() string {
@@ -590,13 +666,118 @@ func (sj *SemiJoinExpr) getMultiplicity() props.JoinMultiplicity {
 	return sj.multiplicity
 }
 
+// UDFDefinition stores details about the SQL body of a UDF. It is stored
+// separately from the call-site to allow different invocations of the same UDF
+// to point to the same definition; this is necessary for recursive UDFs.
+type UDFDefinition struct {
+	// Name is the name of the function.
+	Name string
+
+	// Typ is the return type of the function.
+	Typ *types.T
+
+	// Volatility is the user-provided volatility of the function given during
+	// CREATE FUNCTION.
+	//
+	// Volatility affects the visibility of mutations made by the statement
+	// calling the function. A volatile function will see these mutations. Also,
+	// statements within a volatile function's body will see changes made by
+	// previous statements in the function body. In contrast, a stable,
+	// immutable, or leakproof function will see a snapshot of the data as of the
+	// start of the statement calling the function.
+	Volatility volatility.V
+
+	// SetReturning is true if the UDF has a SETOF return type.
+	SetReturning bool
+
+	// CalledOnNullInput is true if the function should be called when any of its
+	// inputs are NULL. If false, the function will not be evaluated in the
+	// presence of NULL inputs, and will instead evaluate directly to NULL.
+	//
+	// Note that this field only affects evaluation of UDFs within project-set
+	// operators. Non-scalar UDFs are always in a project-set operator, while
+	// scalar UDFs can be if used as a data source (e.g. SELECT * FROM udf()).
+	CalledOnNullInput bool
+
+	// MultiColDataSource is true if the function may return multiple columns.
+	// This is only the case if the UDF returns a composite type and is used as a
+	// data source.
+	MultiColDataSource bool
+
+	// IsRecursive indicates whether the routine recursively calls itself. This
+	// applies to direct as well as indirect recursive calls (mutual recursion).
+	IsRecursive bool
+
+	// BlockStart indicates whether the routine marks the start of a PL/pgSQL
+	// block with an exception handler. This is used to determine when to
+	// initialize the common state held between sub-routines within the same
+	// block.
+	BlockStart bool
+
+	// RoutineType indicates whether this routine is a UDF, stored procedure, or
+	// builtin function.
+	RoutineType tree.RoutineType
+
+	// RoutineLang indicates the language of the routine (SQL or PL/pgSQL).
+	RoutineLang tree.RoutineLanguage
+
+	// Params is the list of columns representing parameters of the function. The
+	// i-th column in the list corresponds to the i-th parameter of the function.
+	// During execution of the UDF, these columns are replaced with the arguments
+	// of the function invocation.
+	Params opt.ColList
+
+	// Body contains a relational expression for each statement in the function
+	// body. It is unset during construction of a recursive UDF.
+	Body []RelExpr
+
+	// BodyProps contains the physical properties with which each body statement
+	// should be optimized if it is rebuilt. Each props corresponds to the RelExpr
+	// at the same position in Body.
+	BodyProps []*physical.Required
+
+	// BodyStmts, if set, is the string representation of each statement in
+	// Body. It is only populated when verbose tracing is enabled.
+	BodyStmts []string
+
+	// ExceptionBlock contains information needed for exception-handling when the
+	// body of this routine returns an error. It can be unset.
+	ExceptionBlock *ExceptionBlock
+
+	// BlockState is shared between the routines that encapsulate a PLpgSQL block.
+	// It is used to coordinate between the nested routines during exception
+	// handling.
+	BlockState *tree.BlockState
+
+	// CursorDeclaration contains the information needed to open a SQL cursor with
+	// the result of the *first* body statement. If it is set, there will be at
+	// least two body statements - one to open the cursor, and one to evaluate the
+	// result of the routine. This invariant is enforced when the PLpgSQL routine
+	// is built. CursorDeclaration may be unset.
+	CursorDeclaration *tree.RoutineOpenCursor
+}
+
+// ExceptionBlock contains the information needed to match and handle errors in
+// the EXCEPTION block of a routine defined with PLpgSQL.
+type ExceptionBlock struct {
+	// Codes is a list of pgcode strings (see pgcode/codes.go). When the body of a
+	// routine with an ExceptionBlock returns an error, the code of that error is
+	// compared against the Codes slice for a match. As a special case, the code
+	// may be "OTHERS", indicating that (almost) any error code should be matched.
+	Codes []pgcode.Code
+
+	// Actions contains routine definitions that represent exception handlers for
+	// each code in the Codes slice.
+	Actions []*UDFDefinition
+}
+
 // WindowFrame denotes the definition of a window frame for an individual
 // window function, excluding the OFFSET expressions, if present.
 type WindowFrame struct {
-	Mode           tree.WindowFrameMode
-	StartBoundType tree.WindowFrameBoundType
-	EndBoundType   tree.WindowFrameBoundType
-	FrameExclusion tree.WindowFrameExclusion
+	Mode           treewindow.WindowFrameMode
+	StartBoundType treewindow.WindowFrameBoundType
+	EndBoundType   treewindow.WindowFrameBoundType
+	FrameExclusion treewindow.WindowFrameExclusion
 }
 
 // HasOffset returns true if the WindowFrame contains a specific offset.
@@ -607,21 +788,21 @@ func (f *WindowFrame) HasOffset() bool {
 func (f *WindowFrame) String() string {
 	var bld strings.Builder
 	switch f.Mode {
-	case tree.GROUPS:
+	case treewindow.GROUPS:
 		fmt.Fprintf(&bld, "groups")
-	case tree.ROWS:
+	case treewindow.ROWS:
 		fmt.Fprintf(&bld, "rows")
-	case tree.RANGE:
+	case treewindow.RANGE:
 		fmt.Fprintf(&bld, "range")
 	}
 
-	frameBoundName := func(b tree.WindowFrameBoundType) string {
+	frameBoundName := func(b treewindow.WindowFrameBoundType) string {
 		switch b {
-		case tree.UnboundedFollowing, tree.UnboundedPreceding:
+		case treewindow.UnboundedFollowing, treewindow.UnboundedPreceding:
 			return "unbounded"
-		case tree.CurrentRow:
+		case treewindow.CurrentRow:
 			return "current-row"
-		case tree.OffsetFollowing, tree.OffsetPreceding:
+		case treewindow.OffsetFollowing, treewindow.OffsetPreceding:
 			return "offset"
 		}
 		panic(errors.AssertionFailedf("unexpected bound"))
@@ -631,11 +812,11 @@ func (f *WindowFrame) String() string {
 		frameBoundName(f.EndBoundType),
 	)
 	switch f.FrameExclusion {
-	case tree.ExcludeCurrentRow:
+	case treewindow.ExcludeCurrentRow:
 		bld.WriteString(" exclude current row")
-	case tree.ExcludeGroup:
+	case treewindow.ExcludeGroup:
 		bld.WriteString(" exclude group")
-	case tree.ExcludeTies:
+	case treewindow.ExcludeTies:
 		bld.WriteString(" exclude ties")
 	}
 	return bld.String()
@@ -643,6 +824,8 @@ func (f *WindowFrame) String() string {
 
 // IsCanonical returns true if the ScanPrivate indicates an original unaltered
 // primary index Scan operator (i.e. unconstrained and not limited).
+// s.InvertedConstraint is implicitly nil because a primary index cannot
+// be inverted.
 func (s *ScanPrivate) IsCanonical() bool {
 	return s.Index == cat.PrimaryIndex &&
 		s.Constraint == nil &&
@@ -656,15 +839,57 @@ func (s *ScanPrivate) IsUnfiltered(md *opt.Metadata) bool {
 	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
 		s.InvertedConstraint == nil &&
 		s.HardLimit == 0 &&
-		s.PartialIndexPredicate(md) == nil
+		s.PartialIndexPredicate(md) == nil &&
+		s.Locking.WaitPolicy != tree.LockWaitSkipLocked
 }
 
 // IsFullIndexScan returns true if the ScanPrivate will produce all rows in the
 // index.
-func (s *ScanPrivate) IsFullIndexScan(md *opt.Metadata) bool {
+func (s *ScanPrivate) IsFullIndexScan() bool {
 	return (s.Constraint == nil || s.Constraint.IsUnconstrained()) &&
 		s.InvertedConstraint == nil &&
 		s.HardLimit == 0
+}
+
+// IsInvertedScan returns true if the index being scanned is an inverted
+// index.
+func (s *ScanPrivate) IsInvertedScan(md *opt.Metadata) bool {
+	return md.Table(s.Table).Index(s.Index).IsInverted()
+}
+
+// IsVirtualTable returns true if the table being scanned is a virtual table.
+func (s *ScanPrivate) IsVirtualTable(md *opt.Metadata) bool {
+	tab := md.Table(s.Table)
+	return tab.IsVirtualTable()
+}
+
+// IsNotVisibleIndexScan returns true if the index being scanned is not fully
+// visible.
+func (s *ScanPrivate) IsNotVisibleIndexScan(md *opt.Metadata) bool {
+	index := md.Table(s.Table).Index(s.Index)
+	return index.GetInvisibility() != 0.0
+}
+
+// showNotVisibleIndexInfo is a helper function that checks if we want to show
+// invisible index info. We don't want to show the information is
+// hideShowNotVisibleIndexInfo is true, and we are not scanning an invisible
+// index. Otherwise, we want to show invisible index info.
+func (s *ScanPrivate) showNotVisibleIndexInfo(md *opt.Metadata, hideNotVisibleIndexInfo bool) bool {
+	return !(hideNotVisibleIndexInfo && !s.IsNotVisibleIndexScan(md))
+}
+
+// shouldPrintFlags is a helper function to check if we want to print the
+// "flags:" for ScanFlags formatting.
+func (s *ScanPrivate) shouldPrintFlags(md *opt.Metadata, hideNotVisibleIndexInfo bool) bool {
+	if s.Flags.Empty() {
+		return false
+	}
+	// If DisableNotVisibleIndex is the only flag on, we only want to print
+	// "flags:" if we are actually going to show invisible index info.
+	if s.Flags.onlyNotVisibleIndexFlagOn() && !s.showNotVisibleIndexInfo(md, hideNotVisibleIndexInfo) {
+		return false
+	}
+	return true
 }
 
 // IsLocking returns true if the ScanPrivate is configured to use a row-level
@@ -672,7 +897,7 @@ func (s *ScanPrivate) IsFullIndexScan(md *opt.Metadata) bool {
 // a SELECT .. FOR [KEY] UPDATE/SHARE clause or because the Scan was configured
 // as part of the row retrieval of a DELETE or UPDATE statement.
 func (s *ScanPrivate) IsLocking() bool {
-	return s.Locking != nil
+	return s.Locking.IsLocking()
 }
 
 // PartialIndexPredicate returns the FiltersExpr representing the predicate of
@@ -691,13 +916,33 @@ func (s *ScanPrivate) PartialIndexPredicate(md *opt.Metadata) FiltersExpr {
 // SetConstraint sets the constraint in the ScanPrivate and caches the exact
 // prefix. This function should always be used instead of modifying the
 // constraint directly.
-func (s *ScanPrivate) SetConstraint(evalCtx *tree.EvalContext, c *constraint.Constraint) {
+func (s *ScanPrivate) SetConstraint(
+	ctx context.Context, evalCtx *eval.Context, c *constraint.Constraint,
+) {
 	s.Constraint = c
 	if c == nil {
 		s.ExactPrefix = 0
 	} else {
-		s.ExactPrefix = c.ExactPrefix(evalCtx)
+		s.ExactPrefix = c.ExactPrefix(ctx, evalCtx)
 	}
+}
+
+// GetConstExprFromFilter finds the constant expression which is equated with
+// the column with the given `colID` in the inverted join constant filters, if
+// one exists. Otherwise, returns nil, ok=false.
+func (ij *InvertedJoinPrivate) GetConstExprFromFilter(colID opt.ColumnID) (expr opt.Expr, ok bool) {
+
+	for _, filter := range ij.ConstFilters {
+		if filter.Condition.Op() == opt.EqOp {
+			leftChild := filter.Condition.Child(0)
+			if variableExpr, ok := leftChild.(*VariableExpr); ok {
+				if variableExpr.Col == colID {
+					return filter.Condition.Child(1), true
+				}
+			}
+		}
+	}
+	return nil, false
 }
 
 // UsesPartialIndex returns true if the LookupJoinPrivate looks-up via a
@@ -705,6 +950,53 @@ func (s *ScanPrivate) SetConstraint(evalCtx *tree.EvalContext, c *constraint.Con
 func (lj *LookupJoinPrivate) UsesPartialIndex(md *opt.Metadata) bool {
 	_, isPartialIndex := md.Table(lj.Table).Index(lj.Index).Predicate()
 	return isPartialIndex
+}
+
+// GetConstPrefixFilter finds the position of the filter in the lookup join
+// expression filters that constrains the first index column to one or more
+// constant values. If such a filter is found, GetConstPrefixFilter returns the
+// position of the filter and ok=true. Otherwise, returns ok=false.
+func (lj *LookupJoinPrivate) GetConstPrefixFilter(md *opt.Metadata) (pos int, ok bool) {
+	lookupTable := md.Table(lj.Table)
+	lookupIndex := lookupTable.Index(lj.Index)
+
+	idxCol := lj.Table.IndexColumnID(lookupIndex, 0)
+	for i := range lj.LookupExpr {
+		props := lj.LookupExpr[i].ScalarProps()
+		if !props.TightConstraints {
+			continue
+		}
+		if props.OuterCols.Len() != 1 {
+			continue
+		}
+		col := props.OuterCols.SingleColumn()
+		if col == idxCol {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// LookupIndexPrefixIsEquatedWithColInColSet returns true if there is a term in
+// `LookupExpr` equating the first column in the lookup index with a column in
+// `colSet`.
+func (lj *LookupJoinPrivate) LookupIndexPrefixIsEquatedWithColInColSet(
+	md *opt.Metadata, colSet opt.ColSet,
+) bool {
+	lookupTable := md.Table(lj.Table)
+	lookupIndex := lookupTable.Index(lj.Index)
+
+	idxCol := lj.Table.IndexColumnID(lookupIndex, 0)
+
+	for i := range lj.LookupExpr {
+		props := lj.LookupExpr[i].ScalarProps()
+
+		equivCols := props.FuncDeps.ComputeEquivGroup(idxCol)
+		if colSet.Intersects(equivCols) {
+			return true
+		}
+	}
+	return false
 }
 
 // NeedResults returns true if the mutation operator can return the rows that
@@ -749,7 +1041,7 @@ func (m *MutationPrivate) MapToInputCols(cols opt.ColSet) opt.ColSet {
 	tabCols.ForEach(func(t opt.ColumnID) {
 		id := m.MapToInputID(t)
 		if id == 0 {
-			panic(errors.AssertionFailedf("could not find input column for %d", log.Safe(t)))
+			panic(errors.AssertionFailedf("could not find input column for %d", redact.Safe(t)))
 		}
 		inCols.Add(id)
 	})
@@ -817,7 +1109,7 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 			// This does not necessarily hold for "composite" types like decimals or
 			// collated strings. For example if d is a decimal, d::TEXT can have
 			// different values for equal values of d, like 1 and 1.0.
-			if !CanBeCompositeSensitive(mem.Metadata(), item.Element) {
+			if !CanBeCompositeSensitive(item.Element) {
 				prj.internalFuncDeps.AddSynthesizedCol(from, item.Col)
 			}
 		}
@@ -829,6 +1121,71 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 // columns plus the synthesized columns.
 func (prj *ProjectExpr) InternalFDs() *props.FuncDepSet {
 	return &prj.internalFuncDeps
+}
+
+// GetProjectedEnumConstant looks for the projection with target colID in prj,
+// and if it contains a constant enum, returns its string representation, or the
+// empty string if not found.
+func (prj *ProjectExpr) GetProjectedEnumConstant(colID opt.ColumnID) string {
+	for _, projection := range prj.Projections {
+		if projection.Col == colID {
+			if projection.Element.Op() == opt.ConstOp {
+				constExpr := projection.Element.(*ConstExpr)
+				if enumValue, ok := constExpr.Value.(*tree.DEnum); ok {
+					return enumValue.LogicalRep
+				}
+			} else {
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+// FindInlinableConstants returns the set of input columns that are synthesized
+// constant value expressions: ConstOp, TrueOp, FalseOp, or NullOp. Constant
+// value expressions can often be inlined into referencing expressions. Only
+// Project and Values operators synthesize constant value expressions.
+func FindInlinableConstants(input RelExpr) opt.ColSet {
+	var cols opt.ColSet
+	if project, ok := input.(*ProjectExpr); ok {
+		for i := range project.Projections {
+			item := &project.Projections[i]
+			if opt.IsConstValueOp(item.Element) {
+				cols.Add(item.Col)
+			}
+		}
+	} else if values, ok := input.(*ValuesExpr); ok && len(values.Rows) == 1 {
+		tup := values.Rows[0].(*TupleExpr)
+		for i, scalar := range tup.Elems {
+			if opt.IsConstValueOp(scalar) {
+				cols.Add(values.Cols[i])
+			}
+		}
+	}
+	return cols
+}
+
+// ExtractColumnFromProjectOrValues searches a Project or Values input
+// expression for the column having the given id. It returns the expression for
+// that column.
+func ExtractColumnFromProjectOrValues(input RelExpr, col opt.ColumnID) opt.ScalarExpr {
+	if project, ok := input.(*ProjectExpr); ok {
+		for i := range project.Projections {
+			item := &project.Projections[i]
+			if item.Col == col {
+				return item.Element
+			}
+		}
+	} else if values, ok := input.(*ValuesExpr); ok && len(values.Rows) == 1 {
+		tup := values.Rows[0].(*TupleExpr)
+		for i, scalar := range tup.Elems {
+			if values.Cols[i] == col {
+				return scalar
+			}
+		}
+	}
+	panic(errors.AssertionFailedf("could not find column to extract"))
 }
 
 // ExprIsNeverNull makes a best-effort attempt to prove that the provided
@@ -888,7 +1245,7 @@ func ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) bool {
 		}
 		return ExprIsNeverNull(t.Input, notNullCols) && ExprIsNeverNull(t.OrElse, notNullCols)
 
-	case *CastExpr, *NotExpr, *RangeExpr:
+	case *CastExpr, *AssignmentCastExpr, *NotExpr, *RangeExpr:
 		return ExprIsNeverNull(t.Child(0).(opt.ScalarExpr), notNullCols)
 
 	case *AndExpr, *OrExpr, *GeExpr, *GtExpr, *NeExpr, *EqExpr, *LeExpr, *LtExpr, *LikeExpr,
@@ -976,60 +1333,65 @@ type FKCascades []FKCascade
 // FKCascade stores metadata necessary for building a cascading query.
 // Cascading queries are built as needed, after the original query is executed.
 type FKCascade struct {
-	// FKName is the name of the FK constraint.
-	FKName string
+	FKConstraint cat.ForeignKeyConstraint
 
 	// Builder is an object that can be used as the "optbuilder" for the cascading
 	// query.
-	Builder CascadeBuilder
+	Builder PostQueryBuilder
 
 	// WithID identifies the buffer for the mutation input in the original
 	// expression tree. 0 if the cascade does not require input.
 	WithID opt.WithID
-
-	// OldValues are column IDs from the mutation input that correspond to the
-	// old values of the modified rows. The list maps 1-to-1 to foreign key
-	// columns. Empty if the cascade does not require input.
-	OldValues opt.ColList
-
-	// NewValues are column IDs from the mutation input that correspond to the
-	// new values of the modified rows. The list maps 1-to-1 to foreign key columns.
-	// It is empty if the mutation is a deletion. Empty if the cascade does not
-	// require input.
-	NewValues opt.ColList
 }
 
-// CascadeBuilder is an interface used to construct a cascading query for a
-// specific FK relation. For example: if we are deleting rows from a parent
-// table, after deleting the rows from the parent table this interface will be
-// used to build the corresponding deletion in the child table.
-type CascadeBuilder interface {
-	// Build constructs a cascading query that mutates the child table. The input
-	// is scanned using WithScan with the given WithID; oldValues and newValues
-	// columns correspond 1-to-1 to foreign key columns. For deletes, newValues is
-	// empty.
+// AfterTriggers stores metadata necessary for building a set of AFTER triggers.
+// AFTER triggers are built as needed, after the original query is executed.
+type AfterTriggers struct {
+	Triggers []cat.Trigger
+
+	// Builder is an object that can be used as the "optbuilder" for the cascading
+	// query.
+	Builder PostQueryBuilder
+
+	// WithID identifies the buffer for the mutation input in the original
+	// expression tree. It is always nonzero.
+	WithID opt.WithID
+}
+
+// PostQueryBuilder is an interface used to construct either a cascading query
+// for a specific FK relation, or an AFTER trigger action. For example: if we
+// are deleting rows from a parent table, after deleting the rows from the
+// parent table this interface will be used to build the corresponding deletion
+// in the child table.
+type PostQueryBuilder interface {
+	// Build constructs the plan for the cascading query or AFTER trigger action.
+	// The input is scanned using WithScan with the given WithID; colMap is
+	// provided to map from columns in the original memo to those in the new memo
+	// that is used for the With binding.
 	//
 	// The query does not need to be built in the same memo as the original query;
 	// the only requirement is that the mutation input columns
-	// (oldValues/newValues) are valid in the metadata.
+	// (oldValues/newValues, canaryCol) are valid in the metadata and have entries
+	// in the ColMap.
 	//
 	// The method does not mutate any captured state; it is ok to call Build
 	// concurrently (e.g. if the plan it originates from is cached and reused).
 	//
 	// Some cascades (delete fast path) don't require an input binding. In that
-	// case binding is 0, bindingProps is nil, and oldValues/newValues are empty.
+	// case binding is 0, bindingProps is nil, and colMap is empty. Triggers
+	// always require an input binding.
 	//
 	// Note: factory is always *norm.Factory; it is an interface{} only to avoid
 	// circular package dependencies.
 	Build(
 		ctx context.Context,
 		semaCtx *tree.SemaContext,
-		evalCtx *tree.EvalContext,
+		evalCtx *eval.Context,
 		catalog cat.Catalog,
 		factory interface{},
 		binding opt.WithID,
 		bindingProps *props.Relational,
-		oldValues, newValues opt.ColList,
+		colMap opt.ColMap,
 	) (RelExpr, error)
 }
 
@@ -1041,36 +1403,117 @@ const (
 	// NoStreaming means that the grouping columns have no useful order, so a
 	// hash aggregator should be used.
 	NoStreaming GroupingOrderType = iota
-	// PartialStreaming means that the grouping columns are partially ordered, so
-	// some optimizations can be done during aggregation.
+	// PartialStreaming means that the grouping columns are partially ordered,
+	// so some optimizations can be done during aggregation.
 	PartialStreaming
 	// Streaming means that the grouping columns are fully ordered.
 	Streaming
 )
 
-// GroupingOrderType calculates how many ordered columns that the grouping
-// and input columns have in common and returns NoStreaming if there are none, Streaming if
-// all columns match, and PartialStreaming if only some match. It is similar to
-// StreamingGroupingColOrdering, but does not build an ordering.
+// GroupingOrderType calculates how many ordered columns that the grouping and
+// input columns have in common and returns NoStreaming if there are none,
+// Streaming if all columns match, and PartialStreaming if only some match. It
+// is similar to StreamingGroupingColOrdering, but does not build an ordering.
 func (g *GroupingPrivate) GroupingOrderType(required *props.OrderingChoice) GroupingOrderType {
 	inputOrdering := required.Intersection(&g.Ordering)
-	count := 0
+	var orderedGroupingCols opt.ColSet
 	for i := range inputOrdering.Columns {
 		// Get any grouping column from the set. Normally there would be at most one
 		// because we have rules that remove redundant grouping columns.
 		cols := inputOrdering.Group(i).Intersection(g.GroupingCols)
-		_, ok := cols.Next(0)
+		c, ok := cols.Next(0)
 		if !ok {
 			// This group refers to a column that is not a grouping column.
 			// The rest of the ordering is not useful.
 			break
 		}
-		count++
+		orderedGroupingCols.Add(c)
 	}
-	if count == g.GroupingCols.Len() || g.GroupingCols.Len() == 0 {
+	if orderedGroupingCols.Len() == g.GroupingCols.Len() || g.GroupingCols.Len() == 0 {
 		return Streaming
-	} else if count == 0 {
+	} else if orderedGroupingCols.Len() == 0 {
 		return NoStreaming
 	}
 	return PartialStreaming
+}
+
+// IsConstantsAndPlaceholders returns true if all values in the list are
+// constant, placeholders or tuples containing constants, placeholders or other
+// such nested tuples.
+func (v *ValuesExpr) IsConstantsAndPlaceholders() bool {
+	// Constant expressions should be leak-proof, so this is a quick test to
+	// determine if the ValuesExpr even needs to be checked.
+	if !v.Relational().VolatilitySet.IsLeakproof() {
+		return false
+	}
+	// Another quick check for something other than constants
+	if !v.Relational().OuterCols.Empty() {
+		return false
+	}
+	// A safety check
+	if len(v.Rows) == 0 {
+		return false
+	}
+	if !v.Rows.IsConstantsAndPlaceholders() {
+		return false
+	}
+	return true
+}
+
+// IsConstantsAndPlaceholders returns true if all scalar expressions in the list
+// are constants, placeholders or tuples containing constants or placeholders.
+// If a tuple nested within a tuple is found, false is returned.
+func (e ScalarListExpr) IsConstantsAndPlaceholders() bool {
+	return e.isConstantsAndPlaceholders(false /* insideTuple */)
+}
+
+func (e ScalarListExpr) isConstantsAndPlaceholders(insideTuple bool) bool {
+	for _, scalarExpr := range e {
+		if tupleExpr, ok := scalarExpr.(*TupleExpr); ok {
+			if insideTuple {
+				return false
+			}
+			if !tupleExpr.Elems.isConstantsAndPlaceholders(true) {
+				return false
+			}
+		} else {
+			if scalarExpr == nil {
+				panic(errors.AssertionFailedf("nil scalar expression in list"))
+			}
+			if !opt.IsConstValueOp(scalarExpr) && scalarExpr.Op() != opt.PlaceholderOp {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// IsConstantsAndPlaceholdersAndVariables returns true if all scalar expressions
+// in the list are constants, placeholders, variables, or tuples containing
+// constants, placeholders, or variables. If a tuple nested within a tuple is
+// found, false is returned.
+func (e ScalarListExpr) IsConstantsAndPlaceholdersAndVariables() bool {
+	return e.isConstantsAndPlaceholdersAndVariables(false /* insideTuple */)
+}
+
+func (e ScalarListExpr) isConstantsAndPlaceholdersAndVariables(insideTuple bool) bool {
+	for _, scalarExpr := range e {
+		if tupleExpr, ok := scalarExpr.(*TupleExpr); ok {
+			if insideTuple {
+				return false
+			}
+			if !tupleExpr.Elems.isConstantsAndPlaceholdersAndVariables(true) {
+				return false
+			}
+		} else {
+			if scalarExpr == nil {
+				panic(errors.AssertionFailedf("nil scalar expression in list"))
+			}
+			if !opt.IsConstValueOp(scalarExpr) && scalarExpr.Op() != opt.PlaceholderOp &&
+				scalarExpr.Op() != opt.VariableOp {
+				return false
+			}
+		}
+	}
+	return true
 }

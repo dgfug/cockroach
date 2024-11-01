@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -16,39 +11,40 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ui"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -70,13 +66,11 @@ import (
 func TestSelfBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	if s.RPCContext().ClusterID.Get() == uuid.Nil {
+	if s.RPCContext().StorageClusterID.Get() == uuid.Nil {
 		t.Error("cluster ID failed to be set on the RPC context")
 	}
 }
@@ -86,50 +80,43 @@ func TestHealthCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
+
 	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	sCfg := zonepb.DefaultSystemZoneConfig()
+	sCfg.NumReplicas = proto.Int32(1)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
-				DefaultZoneConfigOverride: &cfg,
+				DefaultZoneConfigOverride:       &cfg,
+				DefaultSystemZoneConfigOverride: &sCfg,
 			},
 		},
 	})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Stopper().Stop(context.Background())
-
-	ctx := context.Background()
-
-	recorder := s.(*TestServer).Server.recorder
+	defer s.Stopper().Stop(ctx)
+	recorder := s.StorageLayer().MetricsRecorder()
 
 	{
 		summary := *recorder.GenerateNodeStatus(ctx)
 		result := recorder.CheckHealth(ctx, summary)
-		if len(result.Alerts) != 0 {
-			t.Fatal(result)
-		}
+		require.Equal(t, 0, len(result.Alerts), "unexpected health alerts: %v", result)
 	}
 
-	store, err := s.(*TestServer).Server.node.stores.GetStore(1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, err := s.StorageLayer().GetStores().(*kvserver.Stores).GetStore(1)
+	require.NoError(t, err)
 
-	store.Metrics().UnavailableRangeCount.Inc(100)
-
-	{
-		summary := *recorder.GenerateNodeStatus(ctx)
-		result := recorder.CheckHealth(ctx, summary)
+	testutils.SucceedsSoon(t, func() error {
+		store.Metrics().UnavailableRangeCount.Update(100)
+		result := recorder.CheckHealth(ctx, *recorder.GenerateNodeStatus(ctx))
 		expAlerts := []statuspb.HealthAlert{
 			{StoreID: 1, Category: statuspb.HealthAlert_METRICS, Description: "ranges.unavailable", Value: 100.0},
 		}
 		if !reflect.DeepEqual(expAlerts, result.Alerts) {
-			t.Fatalf("expected %+v, got %+v", expAlerts, result.Alerts)
+			return errors.Newf("expected %+v, got %+v", expAlerts, result.Alerts)
 		}
-	}
+		return nil
+	})
 }
 
 // TestEngineTelemetry tests that the server increments a telemetry counter on
@@ -175,15 +162,16 @@ func TestServerStartClock(t *testing.T) {
 				MaxOffset: time.Second,
 			},
 		},
+		DisableSQLServer: true,
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	// Run a command so that we are sure to touch the timestamp cache. This is
 	// actually not needed because other commands run during server
 	// initialization, but we cannot guarantee that's going to stay that way.
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: roachpb.Key("a")},
 	}
 	if _, err := kv.SendWrapped(
 		context.Background(), s.DB().NonTransactionalSender(), get,
@@ -204,53 +192,57 @@ func TestServerStartClock(t *testing.T) {
 func TestPlainHTTPServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		// The default context uses embedded certs.
 		Insecure: true,
 	})
 	defer s.Stopper().Stop(context.Background())
 
-	// First, make sure that the TestServer's built-in client interface
+	// First, make sure that the testServer's built-in client interface
 	// still works in insecure mode.
 	var data serverpb.JSONResponse
 	testutils.SucceedsSoon(t, func() error {
-		return getStatusJSONProto(s, "metrics/local", &data)
+		return srvtestutils.GetStatusJSONProto(s, "metrics/local", &data)
 	})
 
 	// Now make a couple of direct requests using both http and https.
 	// They won't succeed because we're not jumping through
 	// authentication hoops, but they verify that the server is using
 	// the correct protocol.
-	url := s.AdminURL()
+	url := s.AdminURL().String()
 	if !strings.HasPrefix(url, "http://") {
 		t.Fatalf("expected insecure admin url to start with http://, but got %s", url)
 	}
 	if resp, err := httputil.Get(context.Background(), url); err != nil {
 		t.Error(err)
 	} else {
-		if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
-			t.Error(err)
-		}
-		if err := resp.Body.Close(); err != nil {
-			t.Error(err)
-		}
+		func() {
+			defer resp.Body.Close()
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Error(err)
+			}
+		}()
 	}
 
 	// Attempting to connect to the insecure server with HTTPS doesn't work.
 	secureURL := strings.Replace(url, "http://", "https://", 1)
-	if _, err := httputil.Get(context.Background(), secureURL); !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
+	resp, err := httputil.Get(context.Background(), secureURL)
+	if !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
 		t.Error(err)
+	}
+	if err == nil {
+		resp.Body.Close()
 	}
 }
 
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
-	ts := s.(*TestServer)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
-	httpClient, err := s.GetHTTPClient()
+	httpClient, err := ts.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,8 +251,8 @@ func TestSecureHTTPRedirect(t *testing.T) {
 		return http.ErrUseLastResponse
 	}
 
-	origURL := "http://" + ts.Cfg.HTTPAddr
-	expURL := url.URL{Scheme: "https", Host: ts.Cfg.HTTPAddr, Path: "/"}
+	origURL := "http://" + ts.HTTPAddr()
+	expURL := url.URL{Scheme: "https", Host: ts.HTTPAddr(), Path: "/"}
 
 	if resp, err := httpClient.Get(origURL); err != nil {
 		t.Fatal(err)
@@ -297,12 +289,15 @@ func TestSecureHTTPRedirect(t *testing.T) {
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	client, err := s.GetAdminAuthenticatedHTTPClient()
+	client, err := s.GetAdminHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	var uncompressedSize int64
+	var compressedSize int64
 
 	testData := []struct {
 		acceptEncoding string
@@ -324,108 +319,45 @@ func TestAcceptEncoding(t *testing.T) {
 		},
 	}
 	for _, d := range testData {
-		req, err := http.NewRequest("GET", s.AdminURL()+statusPrefix+"metrics/local", nil)
-		if err != nil {
-			t.Fatalf("could not create request: %s", err)
-		}
-		if d.acceptEncoding != "" {
-			req.Header.Set(httputil.AcceptEncodingHeader, d.acceptEncoding)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("could not make request to %s: %s", req.URL, err)
-		}
-		defer resp.Body.Close()
-		if ce := resp.Header.Get(httputil.ContentEncodingHeader); ce != d.acceptEncoding {
-			t.Fatalf("unexpected content encoding: '%s' != '%s'", ce, d.acceptEncoding)
-		}
-		r := d.newReader(resp.Body)
-		var data serverpb.JSONResponse
-		if err := jsonpb.Unmarshal(r, &data); err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestSystemConfigGossip(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-	ts := s.(*TestServer)
-
-	key := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, keys.MaxReservedDescID)
-	valAt := func(i int) *descpb.Descriptor {
-		return dbdesc.NewInitial(
-			descpb.ID(i), "foo", security.AdminRoleName(),
-		).DescriptorProto()
-	}
-
-	// Register a callback for gossip updates.
-	resultChan := ts.Gossip().RegisterSystemConfigChannel()
-
-	// The span gets gossiped when it first shows up.
-	select {
-	case <-resultChan:
-
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("did not receive gossip message")
-	}
-
-	// Write a system key with the transaction marked as having a Gossip trigger.
-	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
-			return err
-		}
-		return txn.Put(ctx, key, valAt(2))
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// This has to be wrapped in a SucceedSoon because system migrations on the
-	// testserver's startup can trigger system config updates without the key we
-	// wrote.
-	testutils.SucceedsSoon(t, func() error {
-		// New system config received.
-		var systemConfig *config.SystemConfig
-		select {
-		case <-resultChan:
-			systemConfig = ts.gossip.GetSystemConfig()
-
-		case <-time.After(500 * time.Millisecond):
-			return errors.Errorf("did not receive gossip message")
-		}
-
-		// Now check the new config.
-		var val *roachpb.Value
-		for _, kv := range systemConfig.Values {
-			if bytes.Equal(key, kv.Key) {
-				val = &kv.Value
-				break
+		func() {
+			req, err := http.NewRequest("GET", s.AdminURL().WithPath(apiconstants.StatusPrefix+"metrics/local").String(), nil)
+			if err != nil {
+				t.Fatalf("could not create request: %s", err)
 			}
-		}
-		if val == nil {
-			return errors.Errorf("key not found in gossiped info")
-		}
+			if d.acceptEncoding != "" {
+				req.Header.Set(httputil.AcceptEncodingHeader, d.acceptEncoding)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("could not make request to %s: %s", req.URL, err)
+			}
+			defer resp.Body.Close()
+			if ce := resp.Header.Get(httputil.ContentEncodingHeader); ce != d.acceptEncoding {
+				t.Fatalf("unexpected content encoding: '%s' != '%s'", ce, d.acceptEncoding)
+			}
 
-		// Make sure the returned value is valAt(2).
-		var got descpb.Descriptor
-		if err := val.GetProto(&got); err != nil {
-			return err
-		}
+			// Measure and stash resposne body length for later comparison
+			rawBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			rawBodyLength := int64(len(rawBytes))
+			if d.acceptEncoding == "" {
+				uncompressedSize = rawBodyLength
+			} else {
+				compressedSize = rawBodyLength
+			}
 
-		_, expected, _, _ := descpb.FromDescriptor(valAt(2))
-		_, db, _, _ := descpb.FromDescriptor(&got)
-		if db == nil {
-			panic(errors.Errorf("found nil database: %v", got))
-		}
-		if !reflect.DeepEqual(*db, *expected) {
-			panic(errors.Errorf("mismatch: expected %+v, got %+v", *expected, *db))
-		}
-		return nil
-	})
+			r := d.newReader(bytes.NewReader(rawBytes))
+			var data serverpb.JSONResponse
+			if err := jsonpb.Unmarshal(r, &data); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+
+	// Ensure compressed responses are smaller than uncompressed ones when the
+	// uncompressed body would be larger than one MTU.
+	require.Greater(t, uncompressedSize, int64(1400), "gzip compression testing requires a response body > 1400 bytes (one MTU). Please update the test response.")
+	require.Less(t, compressedSize, uncompressedSize, "Compressed response body must be smaller than uncompressed response body")
 }
 
 func TestListenerFileCreation(t *testing.T) {
@@ -435,14 +367,11 @@ func TestListenerFileCreation(t *testing.T) {
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{{
 			Path: dir,
 		}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer s.Stopper().Stop(context.Background())
 
 	files, err := filepath.Glob(filepath.Join(dir, "cockroach.*"))
@@ -452,9 +381,9 @@ func TestListenerFileCreation(t *testing.T) {
 
 	li := listenerInfo{
 		listenRPC:    s.RPCAddr(),
-		advertiseRPC: s.ServingRPCAddr(),
+		advertiseRPC: s.AdvRPCAddr(),
 		listenSQL:    s.SQLAddr(),
-		advertiseSQL: s.ServingSQLAddr(),
+		advertiseSQL: s.AdvSQLAddr(),
 		listenHTTP:   s.HTTPAddr(),
 	}
 	expectedFiles := li.Iter()
@@ -467,7 +396,7 @@ func TestListenerFileCreation(t *testing.T) {
 		}
 		delete(expectedFiles, base)
 
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -498,8 +427,8 @@ func TestClusterIDMismatch(t *testing.T) {
 			StoreID:   roachpb.StoreID(i + 1),
 		}
 		if err := storage.MVCCPutProto(
-			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, nil, &sIdent); err != nil {
-
+			context.Background(), e, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
+		); err != nil {
 			t.Fatal(err)
 		}
 		engines[i] = e
@@ -554,13 +483,13 @@ func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
 			a := assert.New(t)
 
 			const maxOffset = 500 * time.Millisecond
-			m := hlc.NewManualClock(test.clockStartTime)
-			c := hlc.NewClock(m.UnixNano, maxOffset)
+			m := timeutil.NewManualTime(timeutil.Unix(0, test.clockStartTime))
+			c := hlc.NewClock(m, maxOffset, maxOffset, hlc.PanicLogger)
 
 			sleepUntilFn := func(ctx context.Context, t hlc.Timestamp) error {
-				delta := t.WallTime - c.Now().WallTime
+				delta := t.GoTime().Sub(c.Now().GoTime())
 				if delta > 0 {
-					m.Increment(delta)
+					m.Advance(delta)
 				}
 				return nil
 			}
@@ -607,7 +536,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 	var fatal bool
 	defer log.ResetExitFunc()
 	log.SetExitFunc(true /* hideStack */, func(r exit.Code) {
-		defer log.Flush()
+		defer log.FlushFiles()
 		if r == exit.FatalError() {
 			fatal = true
 		}
@@ -630,8 +559,8 @@ func TestPersistHLCUpperBound(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
-			m := hlc.NewManualClock(int64(1))
-			c := hlc.NewClock(m.UnixNano, time.Nanosecond)
+			m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+			c := hlc.NewClock(m, 0 /* maxOffset */, 0 /* toleratedOffset */, logger.CRDBLogger)
 
 			var persistErr error
 			var persistedUpperBound int64
@@ -669,7 +598,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			fatal = false
 			// persist an upper bound
-			m.Increment(100)
+			m.Advance(100)
 			wallTime3 := c.Now().WallTime
 			persistHLCUpperBoundIntervalCh <- test.persistInterval
 			<-tickProcessedCh
@@ -698,7 +627,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			// Increment clock by 100 and tick the timer.
 			// A persist should have happened
-			m.Increment(100)
+			m.Advance(100)
 			tickerCh <- timeutil.Now()
 			<-tickProcessedCh
 			secondPersist := persistedUpperBound
@@ -728,7 +657,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			persistHLCUpperBoundIntervalCh <- test.persistInterval
 			<-tickProcessedCh
-			m.Increment(100)
+			m.Advance(100)
 			tickerCh <- timeutil.Now()
 			<-tickProcessedCh
 			// If persisting fails, a fatal error is expected
@@ -754,17 +683,12 @@ func TestServeIndexHTML(t *testing.T) {
 	</head>
 	<body>
 		<div id="react-layout"></div>
-
-		<script>
-			window.dataFromServer = %s;
-		</script>
-
-		<script src="protos.dll.js" type="text/javascript"></script>
-		<script src="vendor.dll.js" type="text/javascript"></script>
 		<script src="bundle.js" type="text/javascript"></script>
 	</body>
 </html>
 `
+
+	ctx := context.Background()
 
 	linkInFakeUI := func() {
 		ui.HaveUI = true
@@ -772,92 +696,85 @@ func TestServeIndexHTML(t *testing.T) {
 	unlinkFakeUI := func() {
 		ui.HaveUI = false
 	}
+	major, minor := build.BranchReleaseSeries()
+	version := fmt.Sprintf("v%d.%d", major, minor)
 
 	t.Run("Insecure mode", func(t *testing.T) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		srv := serverutils.StartServerOnly(t, base.TestServerArgs{
 			Insecure: true,
-			// This test server argument has the same effect as setting the environment variable
-			// `COCKROACH_EXPERIMENTAL_REQUIRE_WEB_SESSION` to false, or not setting it.
-			// In test servers, web sessions are required by default.
-			DisableWebSessionAuthentication: true,
 		})
-		defer s.Stopper().Stop(context.Background())
-		tsrv := s.(*TestServer)
+		defer srv.Stopper().Stop(ctx)
+		s := srv.ApplicationLayer()
 
-		client, err := tsrv.GetHTTPClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		client, err := s.GetUnauthenticatedHTTPClient()
+		require.NoError(t, err)
 
 		t.Run("short build", func(t *testing.T) {
-			resp, err := client.Get(s.AdminURL())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resp.StatusCode != 200 {
-				t.Fatalf("expected status code 200; got %d", resp.StatusCode)
-			}
-			respBytes, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
+			resp, err := client.Get(s.AdminURL().String())
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, 200, resp.StatusCode)
+
+			respBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
 			respString := string(respBytes)
+			// Since server test package links ccl, build.GetInfo() says that we
+			// think we're using CCL distribution (even though this test file is
+			// in `server` and not in `server_test`). However, serverutils
+			// doesn't link ccl, so it says it uses OSS distribution. Reconcile
+			// this mismatch.
+			buildInfo := strings.Replace(build.GetInfo().Short(), "CockroachDB CCL", "CockroachDB OSS", 1)
 			expected := fmt.Sprintf(`<!DOCTYPE html>
 <title>CockroachDB</title>
 Binary built without web UI.
 <hr>
-<em>%s</em>`,
-				build.GetInfo().Short())
-			if respString != expected {
-				t.Fatalf("expected %s; got %s", expected, respString)
-			}
+<em>%s</em>`, buildInfo)
+			require.Equal(t, expected, respString)
 		})
 
 		t.Run("non-short build", func(t *testing.T) {
 			linkInFakeUI()
 			defer unlinkFakeUI()
-			resp, err := client.Get(s.AdminURL())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resp.StatusCode != 200 {
-				t.Fatalf("expected status code 200; got %d", resp.StatusCode)
-			}
-			respBytes, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
+			resp, err := client.Get(s.AdminURL().String())
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, 200, resp.StatusCode)
+
+			respBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
 			respString := string(respBytes)
+			require.Equal(t, htmlTemplate, respString)
+
+			resp, err = client.Get(s.AdminURL().WithPath("/uiconfig").String())
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, 200, resp.StatusCode)
+
+			respBytes, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
 			expected := fmt.Sprintf(
-				htmlTemplate,
-				fmt.Sprintf(
-					`{"ExperimentalUseLogin":false,"LoginEnabled":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
-					build.GetInfo().Tag,
-					build.BinaryVersionPrefix(),
-					1,
-				),
+				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
+				build.GetInfo().Tag,
+				version,
+				1,
 			)
-			if respString != expected {
-				t.Fatalf("expected %s; got %s", expected, respString)
-			}
+			require.Equal(t, expected, string(respBytes))
 		})
 	})
 
 	t.Run("Secure mode", func(t *testing.T) {
 		linkInFakeUI()
 		defer unlinkFakeUI()
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-		defer s.Stopper().Stop(context.Background())
-		tsrv := s.(*TestServer)
+		srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+		defer srv.Stopper().Stop(ctx)
+		s := srv.ApplicationLayer()
 
-		loggedInClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
-		if err != nil {
-			t.Fatal(err)
-		}
-		loggedOutClient, err := tsrv.GetHTTPClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		loggedInClient, err := s.GetAdminHTTPClient()
+		require.NoError(t, err)
+		loggedOutClient, err := s.GetUnauthenticatedHTTPClient()
+		require.NoError(t, err)
 
 		cases := []struct {
 			client http.Client
@@ -866,40 +783,129 @@ Binary built without web UI.
 			{
 				loggedInClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
+					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
 					build.GetInfo().Tag,
-					build.BinaryVersionPrefix(),
+					version,
 					1,
 				),
 			},
 			{
 				loggedOutClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
+					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
 					build.GetInfo().Tag,
-					build.BinaryVersionPrefix(),
+					version,
 					1,
 				),
 			},
 		}
 
+		for i, testCase := range cases {
+			t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+				req, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().String(), nil)
+				require.NoError(t, err)
+
+				resp, err := testCase.client.Do(req)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, 200, resp.StatusCode)
+
+				respBytes, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+
+				respString := string(respBytes)
+				require.Equal(t, htmlTemplate, respString)
+
+				req, err = http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/uiconfig").String(), nil)
+				require.NoError(t, err)
+
+				resp, err = testCase.client.Do(req)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, 200, resp.StatusCode)
+
+				respBytes, err = io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				require.Equal(t, testCase.json, string(respBytes))
+			})
+		}
+	})
+
+	t.Run("Client-side caching", func(t *testing.T) {
+		linkInFakeUI()
+		defer unlinkFakeUI()
+
+		// Set up fake asset FS
+		mapfs := fstest.MapFS{
+			"bundle.js": &fstest.MapFile{
+				Data: []byte("console.log('hello world');"),
+			},
+		}
+		fsys, err := mapfs.Sub(".")
+		require.NoError(t, err)
+		ui.Assets = fsys
+
+		// Clear fake asset FS when we're done
+		defer func() {
+			ui.Assets = nil
+		}()
+
+		srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+		defer srv.Stopper().Stop(ctx)
+		s := srv.ApplicationLayer()
+
+		loggedInClient, err := s.GetAdminHTTPClient()
+		require.NoError(t, err)
+		loggedOutClient, err := s.GetUnauthenticatedHTTPClient()
+		require.NoError(t, err)
+
+		cases := []struct {
+			desc   string
+			client http.Client
+		}{
+			{
+				desc:   "unauthenticated user",
+				client: loggedOutClient,
+			},
+			{
+				desc:   "authenticated user",
+				client: loggedInClient,
+			},
+		}
+
 		for _, testCase := range cases {
-			resp, err := testCase.client.Get(s.AdminURL())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resp.StatusCode != 200 {
-				t.Fatalf("expected status code 200; got %d", resp.StatusCode)
-			}
-			respBytes, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			respString := string(respBytes)
-			expected := fmt.Sprintf(htmlTemplate, testCase.json)
-			if respString != expected {
-				t.Fatalf("expected %s; got %s", expected, respString)
-			}
+			t.Run(fmt.Sprintf("bundle caching for %s", testCase.desc), func(t *testing.T) {
+				// Request bundle.js without an If-None-Match header first, to simulate the initial load
+				uncachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/bundle.js").String(), nil)
+				require.NoError(t, err)
+
+				uncachedResp, err := testCase.client.Do(uncachedReq)
+				require.NoError(t, err)
+				defer uncachedResp.Body.Close()
+				require.Equal(t, 200, uncachedResp.StatusCode)
+
+				etag := uncachedResp.Header.Get("ETag")
+				require.NotEmpty(t, etag, "Server must provide ETag response header with asset responses")
+
+				// Use that ETag header on the next request to simulate a client reload
+				cachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/bundle.js").String(), nil)
+				require.NoError(t, err)
+				cachedReq.Header.Add("If-None-Match", etag)
+
+				cachedResp, err := testCase.client.Do(cachedReq)
+				require.NoError(t, err)
+				defer cachedResp.Body.Close()
+				require.Equal(t, 304, cachedResp.StatusCode)
+
+				respBytes, err := io.ReadAll(cachedResp.Body)
+				require.NoError(t, err)
+				require.Empty(t, respBytes, "Server must provide empty body for cached response")
+
+				etagFromEmptyResp := cachedResp.Header.Get("ETag")
+				require.NotEmpty(t, etag, "Server must provide ETag response header with asset responses")
+
+				require.Equal(t, etag, etagFromEmptyResp, "Server must provide consistent ETag response headers")
+			})
 		}
 	})
 }
@@ -927,7 +933,7 @@ func TestDecommissionNodeStatus(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -959,7 +965,7 @@ func TestSQLDecommissioned(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 		ServerArgs: base.TestServerArgs{
 			Insecure: true, // to set up a simple SQL client
@@ -1002,8 +1008,7 @@ func TestSQLDecommissioned(t *testing.T) {
 		require.True(t, ok, "expected gRPC status error, got %T: %s", err, err)
 		require.Equal(t, codes.PermissionDenied, s.Code())
 
-		sqlClient, err := serverutils.OpenDBConnE(decomSrv.ServingSQLAddr(), "", true, tc.Stopper())
-		require.NoError(t, err)
+		sqlClient := decomSrv.SQLConn(t)
 
 		var result int
 		err = sqlClient.QueryRow("SELECT 1").Scan(&result)
@@ -1020,14 +1025,14 @@ func TestAssertEnginesEmpty(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	eng, err := storage.Open(ctx, storage.InMemory())
+	eng, err := storage.Open(ctx, storage.InMemory(), cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer eng.Close()
 
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
-	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.StoreClusterVersionKey(),
-		hlc.Timestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, keys.DeprecatedStoreClusterVersionKey(),
+		hlc.Timestamp{}, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}, storage.MVCCWriteOptions{}))
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
 	batch := eng.NewBatch()
@@ -1035,7 +1040,131 @@ func TestAssertEnginesEmpty(t *testing.T) {
 		Key:       []byte{0xde, 0xad, 0xbe, 0xef},
 		Timestamp: hlc.Timestamp{WallTime: 100},
 	}
-	require.NoError(t, batch.PutMVCC(key, []byte("foo")))
+	value := storage.MVCCValue{
+		Value: roachpb.MakeValueFromString("foo"),
+	}
+	require.NoError(t, batch.PutMVCC(key, value))
 	require.NoError(t, batch.Commit(false))
 	require.Error(t, assertEnginesEmpty([]storage.Engine{eng}))
+}
+
+// TestAssertExternalStorageInitializedBeforeJobSchedulerStart is a
+// bit silly, but the goal is to make sure we don't accidentally move
+// things around related to external storage in a way that would break
+// the job scheduler.
+func TestAssertExternalStorageInitializedBeforeJobSchedulerStart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	tlServer := &topLevelServer{
+		externalStorageBuilder: &externalStorageBuilder{},
+	}
+	require.Error(t, tlServer.initJobScheduler(context.Background()))
+}
+
+func Test_makeFakeNodeStatuses(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	n1Desc := roachpb.NodeDescriptor{NodeID: 1}
+	n9Desc := roachpb.NodeDescriptor{NodeID: 9}
+	tests := []struct {
+		name       string
+		mapping    map[roachpb.StoreID]roachpb.NodeID
+		storesSeen map[string]struct{}
+
+		exp    []statuspb.NodeStatus
+		expErr string
+	}{
+		{
+			name:       "store-missing-in-mapping",
+			mapping:    map[roachpb.StoreID]roachpb.NodeID{1: 1},
+			storesSeen: map[string]struct{}{"1": {}, "2": {}},
+			expErr:     `need to map the remaining stores`,
+		},
+		{
+			name:       "store-only-in-mapping",
+			mapping:    map[roachpb.StoreID]roachpb.NodeID{1: 1, 3: 9},
+			storesSeen: map[string]struct{}{"9": {}},
+			expErr:     `s1 supplied in input mapping, but no timeseries found for it`,
+		},
+		{
+			name:       "success",
+			mapping:    map[roachpb.StoreID]roachpb.NodeID{1: 1, 3: 9},
+			storesSeen: map[string]struct{}{"1": {}, "3": {}},
+			exp: []statuspb.NodeStatus{
+				{Desc: n1Desc, StoreStatuses: []statuspb.StoreStatus{{Desc: roachpb.StoreDescriptor{
+					StoreID: 1,
+					Node:    n1Desc,
+				}}}},
+				{Desc: n9Desc, StoreStatuses: []statuspb.StoreStatus{{Desc: roachpb.StoreDescriptor{
+					StoreID: 3,
+					Node:    n9Desc,
+				}}}},
+			},
+		},
+		{
+			name: "success-multi-store",
+			// n1 has [s1,s12], n3 has [s3,s6].
+			mapping:    map[roachpb.StoreID]roachpb.NodeID{1: 1, 3: 9, 12: 1, 6: 9},
+			storesSeen: map[string]struct{}{"1": {}, "3": {}, "6": {}, "12": {}},
+			exp: []statuspb.NodeStatus{
+				{Desc: n1Desc, StoreStatuses: []statuspb.StoreStatus{
+					{Desc: roachpb.StoreDescriptor{StoreID: 1, Node: n1Desc}},
+					{Desc: roachpb.StoreDescriptor{StoreID: 12, Node: n1Desc}},
+				}},
+				{Desc: n9Desc, StoreStatuses: []statuspb.StoreStatus{
+					{Desc: roachpb.StoreDescriptor{StoreID: 3, Node: n9Desc}},
+					{Desc: roachpb.StoreDescriptor{StoreID: 6, Node: n9Desc}},
+				}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := makeFakeNodeStatuses(tt.mapping, nil, nil)
+			var err error
+			if err = checkFakeStatuses(result, tt.storesSeen); err != nil {
+				result = nil
+			}
+			require.Equal(t, tt.exp, result)
+			require.True(t, testutils.IsError(err, tt.expErr), "%+v didn't match expectation %s", err, tt.expErr)
+		})
+	}
+}
+
+// TestStorageBlockLoadConcurrencyLimit verifies that the server correctly
+// distributes the limit set by the "storage.block_load.node_max_active"
+// cluster setting between the stores.
+func TestStorageBlockLoadConcurrencyLimit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	for _, n := range []int{1, 2, 5} {
+		t.Run(fmt.Sprintf("%d", n), func(t *testing.T) {
+			storeSpecs := make([]base.StoreSpec, n)
+			for i := range storeSpecs {
+				storeSpecs[i] = base.DefaultTestStoreSpec
+			}
+			s := serverutils.StartServerOnly(t, base.TestServerArgs{StoreSpecs: storeSpecs})
+			defer s.Stopper().Stop(context.Background())
+
+			check := func(expected int64) error {
+				return s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+					metrics := s.TODOEngine().GetMetrics()
+					if metrics.BlockLoadConcurrencyLimit != expected {
+						return fmt.Errorf("expected %d, got %d", expected, metrics.BlockLoadConcurrencyLimit)
+					}
+					return nil
+				})
+			}
+
+			require.NoError(t, check((storage.BlockLoadConcurrencyLimit.Default()+int64(n)-1)/int64(n)))
+
+			db := s.SQLConn(t)
+			_, err := db.Exec("SET CLUSTER SETTING storage.block_load.node_max_active = 13")
+			require.NoError(t, err)
+			testutils.SucceedsSoon(t, func() error {
+				return check((13 + int64(n) - 1) / int64(n))
+			})
+		})
+	}
 }

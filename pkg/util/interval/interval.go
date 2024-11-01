@@ -1,19 +1,14 @@
 // Copyright ©2012 The bíogo Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in licenses/BSD-biogo.txt.
 
 // Portions of this file are additionally subject to the following
 // license and copyright.
 //
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code originated in the github.com/biogo/store/interval package.
 
@@ -122,9 +117,9 @@ type Interface interface {
 //
 // Given c = Compare(a, b):
 //
-//  c == -1  if (a.Range().Start, a.ID()) < (b.Range().Start, b.ID());
-//  c == 0 if (a.Range().Start, a.ID()) == (b.Range().Start, b.ID()); and
-//  c == 1 if (a.Range().Start, a.ID()) > (b.Range().Start, b.ID()).
+//	c == -1  if (a.Range().Start, a.ID()) < (b.Range().Start, b.ID());
+//	c == 0 if (a.Range().Start, a.ID()) == (b.Range().Start, b.ID()); and
+//	c == 1 if (a.Range().Start, a.ID()) > (b.Range().Start, b.ID()).
 //
 // "c == 0" is equivalent to "Equal(a, b) == true".
 func Compare(a, b Interface) int {
@@ -159,10 +154,10 @@ type Comparable []byte
 // receiver and the parameter.
 //
 // Given c = a.Compare(b):
-//  c == -1 if a < b;
-//  c == 0 if a == b; and
-//  c == 1 if a > b.
 //
+//	c == -1 if a < b;
+//	c == 0 if a == b; and
+//	c == 1 if a > b.
 func (c Comparable) Compare(o Comparable) int {
 	return bytes.Compare(c, o)
 }
@@ -234,7 +229,8 @@ type TreeIterator interface {
 var useBTreeImpl = envutil.EnvOrDefaultBool("COCKROACH_INTERVAL_BTREE", false)
 
 // NewTree creates a new interval tree with the given overlapper function. It
-// uses the augmented Left-Leaning Red Black tree implementation.
+// uses the augmented Left-Leaning Red Black tree implementation unless the
+// envvar COCKROACH_INTERVAL_BTREE is set.
 func NewTree(overlapper Overlapper) Tree {
 	if useBTreeImpl {
 		return newBTree(overlapper)

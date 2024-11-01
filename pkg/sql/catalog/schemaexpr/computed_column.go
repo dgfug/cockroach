@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -15,13 +10,17 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -44,8 +43,9 @@ func ValidateComputedColumnExpression(
 	desc catalog.TableDescriptor,
 	d *tree.ColumnTableDef,
 	tn *tree.TableName,
-	context string,
+	context tree.SchemaExprContext,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) (serializedExpr string, _ *types.T, _ error) {
 	if d.HasDefaultExpr() {
 		return "", nil, pgerror.Newf(
@@ -98,8 +98,9 @@ func ValidateComputedColumnExpression(
 		defType,
 		context,
 		semaCtx,
-		tree.VolatilityImmutable,
+		volatility.Immutable,
 		tn,
+		version,
 	)
 	if err != nil {
 		return "", nil, err
@@ -117,7 +118,7 @@ func ValidateComputedColumnExpression(
 				return
 			}
 			var col catalog.Column
-			if col, err = desc.FindColumnWithID(colID); err != nil {
+			if col, err = catalog.MustFindColumnByID(desc, colID); err != nil {
 				err = errors.WithAssertionFailure(err)
 				return
 			}
@@ -130,7 +131,7 @@ func ValidateComputedColumnExpression(
 			return "", nil, err
 		}
 		if len(mutationColumnNames) > 0 {
-			if context == "index element" {
+			if context == tree.ExpressionIndexElementExpr {
 				return "", nil, unimplemented.Newf(
 					"index element expression referencing mutation columns",
 					"index element expression referencing columns (%s) added in the current transaction",
@@ -164,12 +165,7 @@ func ValidateColumnHasNoDependents(desc catalog.TableDescriptor, col catalog.Col
 
 		err = iterColDescriptors(desc, expr, func(colVar catalog.Column) error {
 			if colVar.GetID() == col.GetID() {
-				return pgerror.Newf(
-					pgcode.InvalidColumnReference,
-					"column %q is referenced by computed column %q",
-					col.GetName(),
-					c.GetName(),
-				)
+				return sqlerrors.NewColumnReferencedByComputedColumnError(col.GetName(), c.GetName())
 			}
 			return nil
 		})
@@ -196,7 +192,7 @@ func MakeComputedExprs(
 	input, sourceColumns []catalog.Column,
 	tableDesc catalog.TableDescriptor,
 	tn *tree.TableName,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 ) (_ []tree.TypedExpr, refColIDs catalog.TableColSet, _ error) {
 	// Check to see if any of the columns have computed expressions. If there
@@ -256,7 +252,7 @@ func MakeComputedExprs(
 		if err != nil {
 			return nil, catalog.TableColSet{}, err
 		}
-		if typedExpr, err = txCtx.NormalizeExpr(evalCtx, typedExpr); err != nil {
+		if typedExpr, err = txCtx.NormalizeExpr(ctx, evalCtx, typedExpr); err != nil {
 			return nil, catalog.TableColSet{}, err
 		}
 		computedExprs = append(computedExprs, typedExpr)

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lang
 
@@ -15,7 +10,7 @@ import "bytes"
 // AnyDataType is a data type about which nothing is known, and so could be any
 // data type. Among other uses, it is assigned to custom functions:
 //
-//   (Scan $def:*) => (ConstrainScan $def)
+//	(Scan $def:*) => (ConstrainScan $def)
 //
 // The ConstrainScan custom function has the AnyDataType assigned to it, since
 // the return type of the function is not known.
@@ -24,7 +19,7 @@ var AnyDataType = &ExternalDataType{Name: "<any>"}
 // ListDataType indicates that a pattern matches or constructs a list of
 // expressions. For example:
 //
-//   (Tuple $list:[ $item:* ]) => $item
+//	(Tuple $list:[ $item:* ]) => $item
 //
 // The $list binding will have the ListDataType.
 var ListDataType = &ExternalDataType{Name: "<list>"}
@@ -46,7 +41,7 @@ type DataType interface {
 // DefineSetDataType indicates that a pattern matches or constructs one of
 // several possible defined operators. For example:
 //
-//   (Eq | Ne $left:* $right:*) => (True)
+//	(Eq | Ne $left:* $right:*) => (True)
 //
 // The top-level match pattern would have a DefineSetDataType that referenced
 // the defines for the Eq and Ne operators.
@@ -78,11 +73,11 @@ func (d *DefineSetDataType) String() string {
 // ExternalDataType indicates that a pattern matches or constructs a non-
 // operator type referenced in a Define. For example:
 //
-//   define Scan {
-//     Def ScanDef
-//   }
+//	define Scan {
+//	  Def ScanDef
+//	}
 //
-//   (Scan $def:*) => (ConstrainScan $def)
+//	(Scan $def:*) => (ConstrainScan $def)
 //
 // Here, $def will have an ExternalDataType with Name equal to "ScanDef".
 type ExternalDataType struct {

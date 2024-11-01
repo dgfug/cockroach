@@ -9,15 +9,17 @@ send "PS1=':''/# '\r"
 eexpect ":/# "
 
 start_test "Check that dangerous statements are properly rejected when running interactively with terminal output."
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
-send "create database d;\rcreate table d.t(x int);\r"
+send "create database d;\r"
 eexpect "CREATE"
+eexpect root@
+send "create table d.t(x int);\r"
 eexpect "CREATE"
 eexpect root@
 
 send "delete from d.t;\r"
-eexpect "rejected (sql_safe_updates = true): DELETE without WHERE clause"
+eexpect "rejected (sql_safe_updates = true): DELETE without WHERE or LIMIT clause"
 eexpect root@
 end_test
 
@@ -33,7 +35,7 @@ send "show sql_safe_updates;\r"
 eexpect "on"
 eexpect "\r\n"
 send "delete from d.t;\r"
-eexpect "rejected (sql_safe_updates = true): DELETE without WHERE clause"
+eexpect "rejected (sql_safe_updates = true): DELETE without WHERE or LIMIT clause"
 send "\\q\r"
 eexpect ":/# "
 end_test
@@ -52,7 +54,7 @@ end_test
 
 start_test "Check that dangerous statements are properly rejected when using --safe-updates -e."
 send "$argv sql --safe-updates -e 'delete from d.t'\r"
-eexpect "rejected (sql_safe_updates = true): DELETE without WHERE clause"
+eexpect "rejected (sql_safe_updates = true): DELETE without WHERE or LIMIT clause"
 eexpect ":/# "
 end_test
 

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv_test
 
@@ -19,15 +14,20 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,6 +52,11 @@ func TestRollbackAfterAmbiguousCommit(t *testing.T) {
 		// If txnStatus == COMMITTED, setting txnRecordCleanedUp will make us
 		// cleanup the transaction. The txn record will be deleted.
 		txnRecordCleanedUp bool
+		// If txnStatus == STAGING, setting txnImplicitlyCommitted will make
+		// the transaction qualify for the implicit commit condition. Otherwise,
+		// the transaction will not qualify because the test will attach a fake
+		// in-flight write to the transaction's STAGING record.
+		txnImplictlyCommitted bool
 		// The error that we expect from txn.Rollback().
 		expRollbackErr string
 		// Is the transaction expected to be committed or not after the
@@ -76,49 +81,116 @@ func TestRollbackAfterAmbiguousCommit(t *testing.T) {
 			expRollbackErr:     "already committed",
 		},
 		{
-			name:      "STAGING",
-			txnStatus: roachpb.STAGING,
-			// The rollback succeeds. This behavior is undersired. See #48301.
+			name:                  "STAGING, implicitly committed",
+			txnStatus:             roachpb.STAGING,
+			txnImplictlyCommitted: true,
+			// The rollback fails after performing txn recovery and moving the
+			// transaction to committed.
+			expCommitted:   true,
+			expRollbackErr: "already committed",
+		},
+		{
+			name:                  "STAGING, not implicitly committed",
+			txnStatus:             roachpb.STAGING,
+			txnImplictlyCommitted: false,
+			// The rollback succeeds after performing txn recovery and moving the
+			// transaction to aborted.
+			expCommitted:   false,
+			expRollbackErr: "",
+		},
+		{
+			name:      "PENDING",
+			txnStatus: roachpb.PENDING,
+			// The rollback succeeds.
 			expCommitted:   false,
 			expRollbackErr: "",
 		},
 	}
 	for _, testCase := range testCases {
+		// Sanity-check test cases.
 		if testCase.txnRecordCleanedUp {
 			require.Equal(t, roachpb.COMMITTED, testCase.txnStatus)
 		}
+		if testCase.txnImplictlyCommitted {
+			require.Equal(t, roachpb.STAGING, testCase.txnStatus)
+		}
+
 		t.Run(testCase.name, func(t *testing.T) {
 			var filterSet int64
 			var key roachpb.Key
 			commitBlocked := make(chan struct{})
+			onCommitReqFilter := func(
+				ba *kvpb.BatchRequest, fn func(et *kvpb.EndTxnRequest) *kvpb.Error,
+			) *kvpb.Error {
+				if atomic.LoadInt64(&filterSet) == 0 {
+					return nil
+				}
+				req, ok := ba.GetArg(kvpb.EndTxn)
+				if !ok {
+					return nil
+				}
+				et := req.(*kvpb.EndTxnRequest)
+				if et.Key.Equal(key) && et.Commit {
+					return fn(et)
+				}
+				return nil
+			}
+			blockCommitReqFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+				return onCommitReqFilter(ba, func(et *kvpb.EndTxnRequest) *kvpb.Error {
+					// Inform the test that the commit is blocked.
+					commitBlocked <- struct{}{}
+					// Block until the client interrupts the commit. The client will
+					// cancel its context, at which point gRPC will return an error
+					// to the client and marshall the cancelation to the server.
+					<-ctx.Done()
+					return kvpb.NewError(ctx.Err())
+				})
+			}
+			addInFlightWriteToCommitReqFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+				return onCommitReqFilter(ba, func(et *kvpb.EndTxnRequest) *kvpb.Error {
+					// Add a fake in-flight write.
+					et.InFlightWrites = append(et.InFlightWrites, roachpb.SequencedWrite{
+						Key: key.Next(), Sequence: et.Sequence,
+					})
+					// Be sure to update the EndTxn and Txn's sequence accordingly.
+					et.Sequence++
+					ba.Txn.Sequence++
+					return nil
+				})
+			}
 			args := base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						// We're going to block the commit of the test's txn, letting the
-						// test cancel the request's ctx while the request is blocked.
-						TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
-							if atomic.LoadInt64(&filterSet) == 0 {
-								return nil
+						// test cancel the request's ctx while the request is blocked. We
+						// do this either before or after the request completes, depending
+						// on the status that the test wants the txn record to be in when
+						// the rollback is performed.
+						TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+							if testCase.txnStatus == roachpb.PENDING {
+								// Block and reject before the request writes the txn record.
+								return blockCommitReqFilter(ctx, ba)
 							}
-							req, ok := ba.GetArg(roachpb.EndTxn)
-							if !ok {
-								return nil
+							if testCase.txnStatus == roachpb.STAGING && !testCase.txnImplictlyCommitted {
+								// If the test wants the upcoming rollback to find a STAGING
+								// record for a transaction that is not implicitly committed,
+								// add an in-flight write for a (key, sequence) that does not
+								// exist to the EndTxn request.
+								_ = addInFlightWriteToCommitReqFilter(ctx, ba)
 							}
-							commit := req.(*roachpb.EndTxnRequest)
-							if commit.Key.Equal(key) && commit.Commit {
-								// Inform the test that the commit is blocked.
-								commitBlocked <- struct{}{}
-								// Block until the client interrupts the commit. The client will
-								// cancel its context, at which point gRPC will return an error
-								// to the client and marshall the cancelation to the server.
-								<-ctx.Done()
+							return nil
+						},
+						TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) *kvpb.Error {
+							if testCase.txnStatus != roachpb.PENDING {
+								// Block and reject after the request writes the txn record.
+								return blockCommitReqFilter(ctx, ba)
 							}
 							return nil
 						},
 					},
 				},
 			}
-			tci := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{ServerArgs: args})
+			tci := serverutils.StartCluster(t, 2, base.TestClusterArgs{ServerArgs: args})
 			tc := tci.(*testcluster.TestCluster)
 			defer tc.Stopper().Stop(ctx)
 
@@ -179,18 +251,16 @@ func TestRollbackAfterAmbiguousCommit(t *testing.T) {
 
 			cancelCommit()
 			commitErr := <-commitCh
-			require.IsType(t, &roachpb.AmbiguousResultError{}, commitErr)
-			require.Regexp(t, `result is ambiguous \(context done during DistSender.Send: context canceled\)`,
-				commitErr)
+			require.IsType(t, &kvpb.AmbiguousResultError{}, commitErr)
 
 			// If the test wants the upcoming rollback to find a COMMITTED record,
 			// we'll perform transaction recovery. This will leave the transaction in
 			// the COMMITTED state, without cleaning it up.
-			if !testCase.txnRecordCleanedUp && testCase.txnStatus == roachpb.COMMITTED {
+			if testCase.txnStatus == roachpb.COMMITTED && !testCase.txnRecordCleanedUp {
 				// Sanity check - verify that the txn is STAGING.
 				txnProto := txn.TestingCloneTxn()
-				queryTxn := roachpb.QueryTxnRequest{
-					RequestHeader: roachpb.RequestHeader{
+				queryTxn := kvpb.QueryTxnRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key: txnProto.Key,
 					},
 					Txn: txnProto.TxnMeta,
@@ -279,9 +349,19 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	const testTime = 1 * time.Second
 	ctx := context.Background()
 
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-	})
+	tc := testcluster.StartTestCluster(t, 3,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					// This test is setting specific routing policies and
+					// looking at the traces to determine what nodes were
+					// part of the routing.
+					KVClient: &kvcoord.ClientTestingKnobs{RouteToLeaseholderFirst: true},
+				},
+			},
+		},
+	)
 	defer tc.Stopper().Stop(ctx)
 
 	// Create a scratch range. Then add one voting follower and one non-voting
@@ -339,8 +419,9 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	// Reader goroutines: perform bounded-staleness reads that hit the server-side
 	// negotiation fast-path.
 	for _, s := range tc.Servers {
-		store, err := s.Stores().GetStore(s.GetFirstStoreID())
+		store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 		require.NoError(t, err)
+		tracer := s.Tracer()
 		g.Go(func() error {
 			// Prime range cache so that follower read attempts don't initially miss.
 			if _, err := store.DB().Scan(ctx, keySpan.Key, keySpan.EndKey, 0); err != nil {
@@ -356,33 +437,32 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 					// error (WriteIntentError) under conditions that would otherwise
 					// cause us to block on an intent. Otherwise, allow the request to be
 					// redirected to the leaseholder and to block on intents.
-					var ba roachpb.BatchRequest
+					ba := &kvpb.BatchRequest{}
 					if strict {
-						ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+						ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 							MinTimestampBound:       minTSBound,
 							MinTimestampBoundStrict: true,
 						}
 						ba.WaitPolicy = lock.WaitPolicy_Error
 					} else {
-						ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+						ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 							MinTimestampBound:       store.Clock().Now(),
 							MinTimestampBoundStrict: false,
 						}
 						ba.WaitPolicy = lock.WaitPolicy_Block
 					}
-					ba.RoutingPolicy = roachpb.RoutingPolicy_LEASEHOLDER
+					ba.RoutingPolicy = kvpb.RoutingPolicy_LEASEHOLDER
 					if routeNearest {
-						ba.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
+						ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
 					}
-					ba.Add(&roachpb.ScanRequest{
-						RequestHeader: roachpb.RequestHeaderFromSpan(keySpan),
+					ba.Add(&kvpb.ScanRequest{
+						RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 					})
 
 					// Trace the request so we can determine whether it was served as a
 					// follower read. If running on a store with a follower replica and
 					// with a NEAREST routing policy, we expect follower reads.
-					ctx, collectAndFinish := tracing.ContextWithRecordingSpan(
-						ctx, tracing.NewTracer(), "reader")
+					ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx, tracer, "reader")
 					defer collectAndFinish()
 
 					br, pErr := txn.NegotiateAndSend(ctx, ba)
@@ -390,14 +470,14 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 						return pErr.GoError()
 					}
 
-					// Validate that the transaction timestamp is now fixed and set to the
-					// request timestamp.
-					if !txn.CommitTimestampFixed() {
-						return errors.Errorf("transaction timestamp not fixed")
+					// Validate that the transaction's read timestamp is now fixed and set
+					// to the request timestamp.
+					if !txn.ReadTimestampFixed() {
+						return errors.Errorf("transaction's read timestamp not fixed")
 					}
-					txnTS := txn.CommitTimestamp()
+					txnTS := txn.ReadTimestamp()
 					if txnTS != br.Timestamp {
-						return errors.Errorf("transaction timestamp (%s) does not equal request timestamp (%s)", txnTS, br.Timestamp)
+						return errors.Errorf("transaction's read timestamp (%s) does not equal request timestamp (%s)", txnTS, br.Timestamp)
 					}
 
 					// Validate that the transaction timestamp increases monotonically
@@ -445,4 +525,601 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	time.Sleep(testTime)
 	atomic.StoreInt32(&done, 1)
 	require.NoError(t, g.Wait())
+}
+
+// TestRevScanAndGet tests that Get and ReverseScan requests in the same batch
+// can be executed correctly. See illustration below for the various
+// combinations tested.
+func TestRevScanAndGet(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	tci := serverutils.StartCluster(t, 1, base.TestClusterArgs{})
+	tc := tci.(*testcluster.TestCluster)
+	defer tc.Stopper().Stop(ctx)
+	db := tc.Servers[0].DB()
+
+	require.NoError(t, db.AdminSplit(ctx, "b", hlc.MaxTimestamp))
+	require.NoError(t, db.AdminSplit(ctx, "h", hlc.MaxTimestamp))
+
+	// Setup:
+	// Ranges:      [keyMin-------b) [b--------h) [h------keyMax)
+	// ReverseScan:                     [d-f)
+	// Gets:                     *  *  *  *   *  *   *
+	testCases := []struct {
+		getKey string
+	}{
+		{
+			// Get on a range to the left of the reverse scan.
+			getKey: "a",
+		},
+		{
+			// Get on the left split boundary.
+			getKey: "b",
+		},
+		{
+			// Get on the same range as the reverse scan but to the left.
+			getKey: "c",
+		},
+		{
+			// Get on the same range and enclosed by the reverse scan.
+			getKey: "e",
+		},
+		{
+			// Get on the same range as the reverse scan but to the right.
+			getKey: "g",
+		},
+		{
+			// Get on the right split boundary.
+			getKey: "h",
+		},
+		{
+			// Get on a range to the right of the reverse scan.
+			getKey: "i",
+		},
+	}
+
+	for _, tc := range testCases {
+		txn := db.NewTxn(ctx, "test")
+		b := txn.NewBatch()
+		b.Get(tc.getKey)
+		b.ReverseScan("d", "f")
+		require.NoError(t, txn.Run(ctx, b))
+	}
+}
+
+// TestGenerateForcedRetryableErrorAfterRollback poisons the txn handle and then
+// rolls it back. This should fail - a retryable error should not be returned
+// after a rollback.
+func TestGenerateForcedRetryableErrorAfterRollback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, testGenerateForcedRetryableErrorAfterRollback)
+}
+
+func testGenerateForcedRetryableErrorAfterRollback(t *testing.T, isoLevel isolation.Level) {
+	ctx := context.Background()
+	ts, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(ctx)
+	k, err := ts.ScratchRange()
+	require.NoError(t, err)
+	mkKey := func(s string) roachpb.Key {
+		return encoding.EncodeStringAscending(k[:len(k):len(k)], s)
+	}
+	checkKey := func(t *testing.T, s string, exp int64) {
+		got, err := db.Get(ctx, mkKey(s))
+		require.NoError(t, err)
+		require.Equal(t, exp, got.ValueInt())
+	}
+	var i int
+	txnErr := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		i++
+		require.Equal(t, 1, i)
+		e1 := txn.Put(ctx, mkKey("a"), 1)
+		require.NoError(t, e1)
+		// Prepare an error to return after the rollback.
+		retryErr := txn.GenerateForcedRetryableErr(ctx, "force retry")
+		// Rolling back completes the transaction, returning an error is invalid.
+		require.NoError(t, txn.Rollback(ctx))
+		return retryErr
+	})
+	require.ErrorContains(t, txnErr, "client already committed or rolled back")
+	require.True(t, errors.IsAssertionFailure(txnErr))
+	checkKey(t, "a", 0)
+}
+
+// TestGenerateForcedRetryableErrorSimple verifies the retryable func can return
+// a forced retryable error, and then the retry will not see writes from the
+// first run, and can succeed on the second run.
+func TestGenerateForcedRetryableErrorSimple(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, testGenerateForcedRetryableErrorSimple)
+}
+
+func testGenerateForcedRetryableErrorSimple(t *testing.T, isoLevel isolation.Level) {
+	ctx := context.Background()
+	ts, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(ctx)
+	k, err := ts.ScratchRange()
+	require.NoError(t, err)
+	mkKey := func(s string) roachpb.Key {
+		return encoding.EncodeStringAscending(k[:len(k):len(k)], s)
+	}
+	checkKey := func(t *testing.T, s string, exp int64) {
+		got, err := db.Get(ctx, mkKey(s))
+		require.NoError(t, err)
+		require.Equal(t, exp, got.ValueInt())
+	}
+	var i int
+	require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		{
+			// Verify 'a' is not written yet.
+			got, err := txn.Get(ctx, mkKey("a"))
+			require.NoError(t, err)
+			require.False(t, got.Exists())
+		}
+		require.NoError(t, txn.Put(ctx, mkKey("a"), 1))
+		// Retry exactly once by propagating a retry error.
+		if i++; i == 1 {
+			return txn.GenerateForcedRetryableErr(ctx, "force retry")
+		}
+		require.NoError(t, txn.Put(ctx, mkKey("b"), 2))
+		return nil
+	}))
+	checkKey(t, "a", 1)
+	checkKey(t, "b", 2)
+}
+
+// TestGenerateForcedRetryableErrorByPoisoning does the same as
+// TestGenerateForcedRetryableErrorSimple above, but doesn't return the error
+// from the retryable func, instead, this test verifies that the txn object is
+// "poisoned" (in a state where the txn object cannot be used until the error is
+// cleared) and it will be reset automatically and succeed on the second try.
+func TestGenerateForcedRetryableErrorByPoisoning(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, testGenerateForcedRetryableErrorByPoisoning)
+}
+
+func testGenerateForcedRetryableErrorByPoisoning(t *testing.T, isoLevel isolation.Level) {
+	ctx := context.Background()
+	ts, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(ctx)
+	k, err := ts.ScratchRange()
+	require.NoError(t, err)
+	mkKey := func(s string) roachpb.Key {
+		return encoding.EncodeStringAscending(k[:len(k):len(k)], s)
+	}
+	checkKey := func(t *testing.T, s string, exp int64) {
+		got, err := db.Get(ctx, mkKey(s))
+		require.NoError(t, err)
+		require.Equal(t, exp, got.ValueInt())
+	}
+	var i int
+	require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		{
+			// Verify 'a' is not written yet.
+			got, err := txn.Get(ctx, mkKey("a"))
+			require.NoError(t, err, got.ValueInt())
+			require.False(t, got.Exists(), got.ValueInt())
+		}
+		require.NoError(t, txn.Put(ctx, mkKey("a"), 1))
+		// Retry exactly once by propagating a retry error.
+		if i++; i == 1 {
+			// Generate an error and then return nil (not the ideal implementation but
+			// should work).
+			_ = txn.GenerateForcedRetryableErr(ctx, "force retry")
+			return nil
+		}
+		require.NoError(t, txn.Put(ctx, mkKey("b"), 2))
+		return nil
+	}))
+	checkKey(t, "a", 1)
+	checkKey(t, "b", 2)
+}
+
+// TestPrepareForRetry tests that PrepareForRetry must be called after a
+// retryable error is thrown by a transaction and before that transaction is
+// retried. It also tests that even if a Read Committed transaction throws a
+// retryable error which does not require it to start from the beginning with
+// all prior writes discarded, it can choose to call PrepareForRetry and do so.
+func TestPrepareForRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, testPrepareForRetry)
+}
+
+func testPrepareForRetry(t *testing.T, isoLevel isolation.Level) {
+	ctx := context.Background()
+	ts, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(ctx)
+	k, err := ts.ScratchRange()
+	require.NoError(t, err)
+	mkKey := func(s string) roachpb.Key {
+		return encoding.EncodeStringAscending(k[:len(k):len(k)], s)
+	}
+	keyA, keyB := mkKey("a"), mkKey("b")
+	// Create a transaction that writes to keys "a" in its first epoch before
+	// hitting a retryable error. Restart the transaction from the beginning and
+	// verify that it its write was discarded. Then commit.
+	txn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+	// Enable stepping so that Read Committed transactions can be tested.
+	txn.ConfigureStepping(ctx, kv.SteppingEnabled)
+	require.NoError(t, txn.SetIsoLevel(isoLevel))
+	// Write to "a" in the first epoch.
+	require.NoError(t, txn.Put(ctx, keyA, 1))
+	require.NoError(t, txn.Step(ctx, true /* allowReadTimestampStep */))
+	// Read from "b" to establish a refresh span.
+	res, err := txn.Get(ctx, keyB)
+	require.NoError(t, err)
+	require.False(t, res.Exists())
+	// Write to "b" outside the transaction to create a write-write conflict.
+	require.NoError(t, db.Put(ctx, keyB, 2))
+	// Write to "b" in the transaction to hit the write-write conflict, which
+	// causes the transaction to retry.
+	err = txn.Put(ctx, keyB, 3)
+	require.Error(t, err)
+	var retryErr *kvpb.TransactionRetryWithProtoRefreshError
+	require.ErrorAs(t, err, &retryErr)
+	require.Contains(t, retryErr.Error(), "WriteTooOldError")
+	require.Equal(t, isoLevel != isolation.ReadCommitted, retryErr.TxnMustRestartFromBeginning())
+	// Attempts to use the transaction again before calling PrepareForRetry are
+	// rejected with the same retry error.
+	_, err = txn.Get(ctx, keyB)
+	require.Error(t, err)
+	require.ErrorAs(t, err, &retryErr)
+	require.Contains(t, retryErr.Error(), "WriteTooOldError")
+	// PrepareForRetry resets the transaction and allows it to be used again.
+	require.NoError(t, txn.PrepareForRetry(ctx))
+	// PrepareForRetry is idempotent.
+	require.NoError(t, txn.PrepareForRetry(ctx))
+	// The transaction's epoch was advanced.
+	require.Equal(t, enginepb.TxnEpoch(1), txn.Epoch())
+	// The transaction's own write on "a" was discarded.
+	res, err = txn.Get(ctx, keyA)
+	require.NoError(t, err)
+	require.False(t, res.Exists())
+	// The non-transactional write on "b" is now visible.
+	res, err = txn.Get(ctx, keyB)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), res.ValueInt())
+	// The transaction can be committed.
+	require.NoError(t, txn.Commit(ctx))
+	// Validate the final state.
+	checkKey := func(t *testing.T, k roachpb.Key, exp int64) {
+		got, err := db.Get(ctx, k)
+		require.NoError(t, err)
+		require.Equal(t, exp, got.ValueInt())
+	}
+	checkKey(t, keyA, 0)
+	checkKey(t, keyB, 2)
+}
+
+// TestPrepareForPartialRetry tests that PrepareForPartialRetry must be called
+// after a retryable error is thrown by a Read Committed transaction and before
+// that transaction is retried. It also tests that in these cases of "partial
+// retries" in Read Committed transactions, the caller is in control of which
+// writes are discarded during the retry through the use of savepoints.
+func TestPrepareForPartialRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	ts, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(ctx)
+	k, err := ts.ScratchRange()
+	require.NoError(t, err)
+	mkKey := func(s string) roachpb.Key {
+		return encoding.EncodeStringAscending(k[:len(k):len(k)], s)
+	}
+	keyA, keyB, keyC, keyD := mkKey("a"), mkKey("b"), mkKey("c"), mkKey("d")
+	// Create a read committed transaction that writes to keys "a" in its first
+	// statement before hitting a retryable error during the second statement.
+	// Roll back the operations performed on behalf of just the second statement
+	// and retry it.
+	txn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+	// Enable stepping so that we can control statement boudaries.
+	txn.ConfigureStepping(ctx, kv.SteppingEnabled)
+	require.NoError(t, txn.SetIsoLevel(isolation.ReadCommitted))
+	// Write to "a" in the first "statement".
+	stmt1, err := txn.CreateSavepoint(ctx)
+	require.NoError(t, err)
+	require.NoError(t, txn.Put(ctx, keyA, 1))
+	require.NoError(t, txn.ReleaseSavepoint(ctx, stmt1))
+	require.NoError(t, txn.Step(ctx, true /* allowReadTimestampStep */))
+	// Perform a series of reads and writes in the second "statement".
+	stmt2, err := txn.CreateSavepoint(ctx)
+	require.NoError(t, err)
+	// Read from "b" and "c" to establish refresh spans.
+	res, err := txn.Get(ctx, keyB)
+	require.NoError(t, err)
+	require.False(t, res.Exists())
+	res, err = txn.Get(ctx, keyC)
+	require.NoError(t, err)
+	require.False(t, res.Exists())
+	// Write to "c" outside the transaction to create a write-write conflict.
+	require.NoError(t, db.Put(ctx, keyC, 2))
+	// Write to "b" in the transaction, without issue.
+	require.NoError(t, txn.Put(ctx, keyB, 3))
+	// Write to "c" in the transaction to hit the write-write conflict, which
+	// causes the statement to need to retry.
+	err = txn.Put(ctx, keyC, 4)
+	require.Error(t, err)
+	var retryErr *kvpb.TransactionRetryWithProtoRefreshError
+	require.ErrorAs(t, err, &retryErr)
+	require.Contains(t, retryErr.Error(), "WriteTooOldError")
+	require.False(t, retryErr.TxnMustRestartFromBeginning())
+	// Attempts to use the transaction again before calling
+	// TestPrepareForPartialRetry are rejected with the same retry error.
+	_, err = txn.Get(ctx, keyB)
+	require.Error(t, err)
+	require.ErrorAs(t, err, &retryErr)
+	require.Contains(t, retryErr.Error(), "WriteTooOldError")
+	// Roll back the second statement's writes and prepare to retry it.
+	require.NoError(t, txn.RollbackToSavepoint(ctx, stmt2))
+	// PrepareForPartialRetry resets the transaction and allows it to be used
+	// again.
+	require.NoError(t, txn.PrepareForPartialRetry(ctx))
+	// PrepareForPartialRetry is idempotent.
+	require.NoError(t, txn.PrepareForPartialRetry(ctx))
+	// The transaction's own write on "a" from statement 1 was not discarded.
+	res, err = txn.Get(ctx, keyA)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.ValueInt())
+	// The transaction's own write on "b" from statement 2 was discarded.
+	res, err = txn.Get(ctx, keyB)
+	require.NoError(t, err)
+	require.False(t, res.Exists())
+	// The non-transactional write on "c" is now visible.
+	res, err = txn.Get(ctx, keyC)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), res.ValueInt())
+	// Write to "d" in the transaction during the retry.
+	require.NoError(t, txn.Put(ctx, keyD, 5))
+	// Commit.
+	require.NoError(t, txn.ReleaseSavepoint(ctx, stmt2))
+	require.NoError(t, txn.Commit(ctx))
+	// Validate the final state.
+	checkKey := func(t *testing.T, k roachpb.Key, exp int64) {
+		got, err := db.Get(ctx, k)
+		require.NoError(t, err)
+		require.Equal(t, exp, got.ValueInt())
+	}
+	checkKey(t, keyA, 1)
+	checkKey(t, keyB, 0)
+	checkKey(t, keyC, 2)
+	checkKey(t, keyD, 5)
+}
+
+// TestUpdateStateOnRemoteRetryableErr ensures transaction state is updated and
+// a TransactionRetryWithProtoRefreshError is correctly constructed by
+// UpdateStateOnRemoteRetryableError.
+func TestUpdateStateOnRemoteRetryableErr(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	testCases := []struct {
+		err         *kvpb.Error
+		epochBumped bool // if we expect the epoch to be bumped
+		newTxn      bool // if we expect a new transaction in the returned error; implies to an ABORT
+	}{
+		{
+			err:         kvpb.NewError(&kvpb.ReadWithinUncertaintyIntervalError{}),
+			epochBumped: true,
+			newTxn:      false,
+		},
+		{
+			err:         kvpb.NewError(&kvpb.TransactionAbortedError{}),
+			epochBumped: false,
+			newTxn:      true,
+		},
+		{
+			err:         kvpb.NewError(&kvpb.TransactionPushError{}),
+			epochBumped: true,
+			newTxn:      false,
+		},
+		{
+			err:         kvpb.NewError(&kvpb.TransactionRetryError{}),
+			epochBumped: true,
+			newTxn:      false,
+		},
+		{
+			err:         kvpb.NewError(&kvpb.WriteTooOldError{}),
+			epochBumped: true,
+			newTxn:      false,
+		},
+	}
+
+	for _, tc := range testCases {
+		txn := db.NewTxn(ctx, "test")
+		pErr := tc.err
+		pErr.SetTxn(txn.Sender().TestingCloneTxn())
+		epochBefore := txn.Epoch()
+		txnIDBefore := txn.ID()
+		err := txn.UpdateStateOnRemoteRetryableErr(ctx, pErr)
+		// Ensure what we got back is a TransactionRetryWithProtoRefreshError.
+		require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+		// Ensure the same thing is stored on the TxnCoordSender as well.
+		retErr := txn.Sender().GetRetryableErr(ctx)
+		require.Equal(t, retErr, err)
+		if tc.epochBumped {
+			require.Greater(t, txn.Epoch(), epochBefore)
+			require.Equal(t, retErr.PrevTxnID, txnIDBefore) // transaction IDs should not have changed on us
+		}
+		if tc.newTxn {
+			require.NotEqual(t, retErr.NextTransaction.ID, txnIDBefore)
+			require.Equal(t, txn.Sender().TxnStatus(), roachpb.ABORTED)
+		}
+		// Lastly, ensure the TxnCoordSender was not swapped out, even if the
+		// transaction was aborted.
+		require.Equal(t, txn.Sender().TestingCloneTxn().ID, txnIDBefore)
+	}
+}
+
+// TestUpdateStateOnRemoteRetryableErrErrorRanking tests that when multiple
+// errors are provided to UpdateStateOnRemoteRetryableError, the error with the
+// highest priority is used to update the transaction state and errors with
+// lower priority are unable to change the transaction state.
+func TestUpdateStateOnRemoteRetryableErrErrorRanking(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	orderedErrs := []struct {
+		err         *kvpb.Error
+		expNewError bool // if we expect the txn's retryable error to change
+		expNewEpoch bool // if we expect the epoch to be bumped
+		expAborted  bool // if we expect the txn to be aborted
+	}{
+		// Step 1. The txn starts out with no retryable error and restarts when
+		// it hits an uncertainty error.
+		{
+			err:         kvpb.NewError(&kvpb.ReadWithinUncertaintyIntervalError{}),
+			expNewError: true,
+			expNewEpoch: true,
+			expAborted:  false,
+		},
+		// Step 2. The txn ignores any further retryable errors from the same
+		// epoch.
+		{
+			err:         kvpb.NewError(&kvpb.WriteTooOldError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  false,
+		},
+		// Step 3. The txn moves to an aborted state when it hits a txn aborted
+		// error.
+		{
+			err:         kvpb.NewError(&kvpb.TransactionAbortedError{}),
+			expNewError: true,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+		// Step 4. The txn ignores any further retryable errors.
+		{
+			err:         kvpb.NewError(&kvpb.ReadWithinUncertaintyIntervalError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+		// Step 5. The txn ignores any further txn aborted errors.
+		{
+			err:         kvpb.NewError(&kvpb.TransactionAbortedError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+	}
+
+	// Unlike TestUpdateStateOnRemoteRetryableErr, use the same txn for all
+	// errors and observe how it changes as each error is consumed.
+	txn := db.NewTxn(ctx, "test")
+	tcs := txn.Sender()
+	txnProto := tcs.TestingCloneTxn()
+	for _, tc := range orderedErrs {
+		retryErrBefore := tcs.GetRetryableErr(ctx)
+		epochBefore := tcs.Epoch()
+
+		pErr := tc.err
+		pErr.SetTxn(txnProto)
+		err := txn.UpdateStateOnRemoteRetryableErr(ctx, pErr)
+		// Ensure what we got back is a TransactionRetryWithProtoRefreshError.
+		require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+		// Ensure the same thing is stored on the TxnCoordSender as well.
+		retErr := tcs.GetRetryableErr(ctx)
+		require.Equal(t, retErr, err)
+		require.Equal(t, retErr.PrevTxnID, txnProto.ID)
+		require.True(t, retErr.TxnMustRestartFromBeginning())
+
+		// Assert that the transaction's state has changed as expected.
+		if tc.expNewError {
+			require.NotEqual(t, retErr, retryErrBefore)
+		} else {
+			require.Equal(t, retErr, retryErrBefore)
+		}
+		if tc.expNewEpoch {
+			require.Equal(t, epochBefore+1, tcs.Epoch())
+		} else {
+			require.Equal(t, epochBefore, tcs.Epoch())
+		}
+		if tc.expAborted {
+			require.Equal(t, roachpb.ABORTED, tcs.TxnStatus())
+			require.True(t, retErr.PrevTxnAborted())
+		} else {
+			require.Equal(t, roachpb.PENDING, tcs.TxnStatus())
+			require.False(t, retErr.PrevTxnAborted())
+		}
+	}
+}
+
+// TestUpdateRootWithLeafStateReadsBelowRefreshTimestamp ensures that if a leaf
+// transaction has performed reads below the root transaction's refreshed
+// timestamp an assertion error is returned. Note that the construction here
+// involves concurrent use of a root and leaf txn, which is not allowed by the
+// Txn API.
+//
+// This test codifies the desired behavior described in
+// https://github.com/cockroachdb/cockroach/issues/99255.
+func TestUpdateRootWithLeafFinalStateReadsBelowRefreshTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	keyA := roachpb.Key("a")
+	keyB := roachpb.Key("b")
+
+	performConflictingWrite := func(ctx context.Context, key roachpb.Key) (hlc.Timestamp, error) {
+		conflictTxn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+		if err := conflictTxn.Put(ctx, key, "conflict"); err != nil {
+			return hlc.Timestamp{}, err
+		}
+		if err := conflictTxn.Commit(ctx); err != nil {
+			return hlc.Timestamp{}, err
+		}
+		return conflictTxn.CommitTimestamp()
+	}
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Perform a read to set the timestamp.
+		_, err := txn.Get(ctx, keyA)
+		require.NoError(t, err)
+		// Fork off a leaf transaction before the root is refreshed.
+		leafInputState, err := txn.GetLeafTxnInputState(ctx)
+		require.NoError(t, err)
+		leafTxn := kv.NewLeafTxn(ctx, db, 0, leafInputState)
+
+		writeTS, err := performConflictingWrite(ctx, keyB)
+		require.NoError(t, err)
+		require.True(t, leafTxn.TestingCloneTxn().ReadTimestamp.Less(writeTS))
+
+		// Write to keyB using the root transaction. This should hit a write-write
+		// conflict and cause the root transaction to be immediately refreshed.
+		err = txn.Put(ctx, keyB, "garbage")
+		require.NoError(t, err)
+
+		// Finally, try and update the root with the leaf transaction's state.
+		finalState, err := leafTxn.GetLeafTxnFinalState(ctx)
+		require.NoError(t, err)
+		err = txn.UpdateRootWithLeafFinalState(ctx, finalState)
+		require.Error(t, err)
+		require.True(t, errors.IsAssertionFailure(err), "%+v", err)
+		require.Regexp(
+			t, "attempting to append refresh spans after the tracked timestamp has moved forward", err,
+		)
+		return nil
+	})
+	require.NoError(t, err)
 }

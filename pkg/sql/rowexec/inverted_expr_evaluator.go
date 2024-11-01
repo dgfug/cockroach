@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -304,15 +299,17 @@ type batchedInvertedExprEvaluator struct {
 //
 // Example 1:
 // pendingSpans contains
-//    c---g
-//    c-----i
-//    c--e
+//
+//	c---g
+//	c-----i
+//	c--e
 //
 // And fragmentUntil = i. Since end keys are exclusive we can fragment and
 // remove all spans in pendingSpans. These will be:
-//    c-e-g
-//    c-e-g-i
-//    c-e
+//
+//	c-e-g
+//	c-e-g-i
+//	c-e
 //
 // For the c-e span, all the exprAndSetIndexList slices for these spans are
 // appended since any row in that span needs to be routed to all these
@@ -324,10 +321,10 @@ type batchedInvertedExprEvaluator struct {
 // Same pendingSpans, and fragmentUntil = f. The fragments that are generated
 // for fragmentedSpans and the remaining spans in pendingSpans are:
 //
-//    fragments        remaining
-//    c-e-f            f-g
-//    c-e-f            f-i
-//    c-e
+//	fragments        remaining
+//	c-e-f            f-g
+//	c-e-f            f-i
+//	c-e
 func (b *batchedInvertedExprEvaluator) fragmentPendingSpans(
 	pendingSpans []invertedSpanRoutingInfo, fragmentUntil inverted.EncVal,
 ) []invertedSpanRoutingInfo {
@@ -607,6 +604,18 @@ func (b *batchedInvertedExprEvaluator) reset() {
 	b.routingSpans = b.routingSpans[:0]
 	b.coveringSpans = b.coveringSpans[:0]
 	b.nonInvertedPrefixes = b.nonInvertedPrefixes[:0]
+}
+
+// appendNonInvertedPrefix appends a copy of prefixKey to nonInvertedPrefixes.
+func (b *batchedInvertedExprEvaluator) appendNonInvertedPrefix(prefixKey roachpb.Key) {
+	// Optimization: if the key is the same as the last one, reuse the copy.
+	if l := len(b.nonInvertedPrefixes); l > 0 {
+		if last := b.nonInvertedPrefixes[l-1]; last.Equal(prefixKey) {
+			b.nonInvertedPrefixes = append(b.nonInvertedPrefixes, last)
+			return
+		}
+	}
+	b.nonInvertedPrefixes = append(b.nonInvertedPrefixes, prefixKey.Clone())
 }
 
 // prefixInvertedSpan returns a new invertedSpan with prefix prepended to the

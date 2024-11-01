@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descpb
 
@@ -57,7 +52,7 @@ func (wp ScanLockingWaitPolicy) PrettyString() string {
 	switch wp {
 	case ScanLockingWaitPolicy_BLOCK:
 		return "block"
-	case ScanLockingWaitPolicy_SKIP:
+	case ScanLockingWaitPolicy_SKIP_LOCKED:
 		return "skip locked"
 	case ScanLockingWaitPolicy_ERROR:
 		return "nowait"
@@ -72,11 +67,36 @@ func ToScanLockingWaitPolicy(wp tree.LockingWaitPolicy) ScanLockingWaitPolicy {
 	switch wp {
 	case tree.LockWaitBlock:
 		return ScanLockingWaitPolicy_BLOCK
-	case tree.LockWaitSkip:
-		return ScanLockingWaitPolicy_SKIP
+	case tree.LockWaitSkipLocked:
+		return ScanLockingWaitPolicy_SKIP_LOCKED
 	case tree.LockWaitError:
 		return ScanLockingWaitPolicy_ERROR
 	default:
 		panic(errors.AssertionFailedf("unknown locking wait policy %s", wp))
+	}
+}
+
+// PrettyString returns the locking durability as a user-readable string.
+func (s ScanLockingDurability) PrettyString() string {
+	switch s {
+	case ScanLockingDurability_BEST_EFFORT:
+		return "best effort"
+	case ScanLockingDurability_GUARANTEED:
+		return "guaranteed"
+	default:
+		panic(errors.AssertionFailedf("unexpected durability %s", s))
+	}
+}
+
+// ToScanLockingDurability converts a tree.LockingDurability to its
+// corresponding ScanLockingDurability.
+func ToScanLockingDurability(s tree.LockingDurability) ScanLockingDurability {
+	switch s {
+	case tree.LockDurabilityBestEffort:
+		return ScanLockingDurability_BEST_EFFORT
+	case tree.LockDurabilityGuaranteed:
+		return ScanLockingDurability_GUARANTEED
+	default:
+		panic(errors.AssertionFailedf("unknown locking durability %d", s))
 	}
 }

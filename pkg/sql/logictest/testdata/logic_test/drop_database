@@ -7,14 +7,14 @@ SET CLUSTER SETTING sql.cross_db_sequence_references.enabled = TRUE
 statement ok
 CREATE DATABASE "foo-bar"
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-defaultdb  root  NULL  {}  NULL
-foo-bar    root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+foo-bar    root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 statement ok
 CREATE TABLE "foo-bar".t(x INT)
@@ -28,46 +28,48 @@ DROP DATABASE "foo-bar" CASCADE
 query TTT
 SELECT name, database_name, state FROM crdb_internal.tables WHERE name = 't'
 ----
-t  [53]  DROP
+t  [106]  DROP
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
+skipif config local-legacy-schema-changer
 query TT
-SELECT job_type, status FROM [SHOW JOBS] WHERE user_name = 'root'
+  SELECT job_type, status
+    FROM [SHOW JOBS]
+   WHERE user_name = 'root' AND job_type != 'MIGRATION'
+   AND description NOT LIKE 'updating version%'
+ORDER BY job_type DESC
 ----
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE     succeeded
-SCHEMA CHANGE GC  running
+NEW SCHEMA CHANGE  succeeded
 
 statement ok
 CREATE DATABASE "foo bar"
 
-query TTTTT
-SHOW DATABASES
+query TTTTTT
+SELECT * FROM [SHOW DATABASES] ORDER BY database_name
 ----
-defaultdb  root  NULL  {}  NULL
-foo bar    root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+foo bar    root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 statement ok
 DROP DATABASE "foo bar" CASCADE
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 statement ok
 CREATE DATABASE d1
@@ -145,27 +147,27 @@ SELECT * FROM d2.v4
 ----
 0
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-d1         root  NULL  {}  NULL
-d2         root  NULL  {}  NULL
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+d1         root  NULL  NULL  {}  NULL
+d2         root  NULL  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 statement ok
 DROP DATABASE d1 CASCADE
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-d2         root  NULL  {}  NULL
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+d2         root  NULL  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 query error pgcode 42P01 relation "d1.v2" does not exist
 SELECT * FROM d1.v2
@@ -186,13 +188,13 @@ SELECT * FROM d2.v1
 statement ok
 DROP DATABASE d2 CASCADE
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 query error pgcode 42P01 relation "d2.v1" does not exist
 SELECT * FROM d2.v1
@@ -219,27 +221,29 @@ CREATE TABLE constraint_db.t2 (
 statement ok
 DROP DATABASE constraint_db CASCADE
 
-query TTT
+skipif config local-legacy-schema-changer
+query TT
 WITH cte AS (
-  SELECT job_type, description, status
+  SELECT job_type, description
   FROM crdb_internal.jobs
-  WHERE job_type = 'SCHEMA CHANGE' OR job_type = 'SCHEMA CHANGE GC'
+  WHERE (job_type = 'SCHEMA CHANGE' OR job_type = 'SCHEMA CHANGE GC')
+  AND (status = 'succeeded' OR status = 'running')
   ORDER BY created DESC
   LIMIT 4
 ) SELECT * FROM cte ORDER BY job_type, description
 ----
-SCHEMA CHANGE     DROP DATABASE constraint_db CASCADE                                                             succeeded
-SCHEMA CHANGE     updating table "t2" after removing constraint "fk" from table "constraint_db.public.t1"         succeeded
-SCHEMA CHANGE GC  GC for DROP DATABASE constraint_db CASCADE                                                      running
-SCHEMA CHANGE GC  GC for updating table "t2" after removing constraint "fk" from table "constraint_db.public.t1"  running
+SCHEMA CHANGE     CREATE TABLE constraint_db.public.t2 (t1_id INT8, CONSTRAINT fk FOREIGN KEY (t1_id) REFERENCES constraint_db.public.t1 (a), INDEX (t1_id))
+SCHEMA CHANGE     updating referenced FK table t1(125) for table t2(126)
+SCHEMA CHANGE GC  GC for DROP DATABASE constraint_db CASCADE
+SCHEMA CHANGE GC  GC for DROP DATABASE d2 CASCADE
 
-query TTTTT
+query TTTTTT rowsort
 SHOW DATABASES
 ----
-defaultdb  root  NULL  {}  NULL
-postgres   root  NULL  {}  NULL
-system     node  NULL  {}  NULL
-test       root  NULL  {}  NULL
+defaultdb  root  NULL  NULL  {}  NULL
+postgres   root  NULL  NULL  {}  NULL
+system     node  NULL  NULL  {}  NULL
+test       root  NULL  NULL  {}  NULL
 
 query error pgcode 42P01 relation "constraint_db.t1" does not exist
 SELECT * FROM constraint_db.t1
@@ -259,14 +263,23 @@ statement error DROP DATABASE on non-empty database without explicit CASCADE
 DROP DATABASE foo
 
 statement ok
-SET sql_safe_updates = FALSE; DROP DATABASE foo
+SET sql_safe_updates = FALSE
+
+statement ok
+DROP DATABASE foo
 
 # Check that the default databases can be dropped and re-created like any other.
 statement OK
-DROP DATABASE defaultdb; DROP DATABASE postgres
+DROP DATABASE defaultdb;
+
+statement OK
+DROP DATABASE postgres
 
 statement ok
-CREATE DATABASE defaultdb; CREATE DATABASE postgres
+CREATE DATABASE defaultdb;
+
+statement OK
+CREATE DATABASE postgres
 
 # Test that an empty database doesn't get a GC job.
 statement ok
@@ -276,7 +289,11 @@ statement ok
 DROP DATABASE empty
 
 query TT
-SELECT job_type, status FROM [SHOW JOBS] WHERE description LIKE '%empty%'
+SELECT replace(job_type, 'NEW SCHEMA CHANGE', 'SCHEMA CHANGE'), status
+  FROM [SHOW JOBS]
+ WHERE description LIKE '%empty%'
+    OR job_type = 'NEW SCHEMA CHANGE'
+ LIMIT 1
 ----
 SCHEMA CHANGE       succeeded
 
@@ -331,6 +348,14 @@ SELECT count(*) FROM system.namespace WHERE name LIKE 'seq50997'
 ----
 1
 
+subtest regression_73323
+
+statement ok
+CREATE DATABASE db_73323
+
+statement ok
+DROP DATABASE db_73323 RESTRICT
+
 subtest regression_51782
 
 statement ok
@@ -357,3 +382,25 @@ query I
 SELECT count(*) FROM system.namespace WHERE name LIKE 'w_51782'
 ----
 0
+
+subtest end
+
+# Regression test to make sure a database owner can drop the database.
+subtest regression_121808
+
+statement ok
+CREATE USER db_owner WITH CREATEDB
+
+statement ok
+SET ROLE db_owner
+
+statement ok
+CREATE DATABASE db_121808
+
+statement ok
+DROP DATABASE db_121808 RESTRICT
+
+statement ok
+RESET role
+
+subtest end

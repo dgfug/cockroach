@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,12 +9,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,7 +29,7 @@ type cteSource struct {
 	ordering     opt.Ordering
 	originalExpr tree.Statement
 	expr         memo.RelExpr
-	mtr          tree.MaterializeClause
+	mtr          tree.CTEMaterializeClause
 	// If set, this function is called when a CTE is referenced. It can throw an
 	// error.
 	onRef func()
@@ -93,8 +90,7 @@ func (b *Builder) buildWiths(expr memo.RelExpr, ctes cteSources) memo.RelExpr {
 			OriginalExpr: ctes[i].originalExpr,
 		}
 		if len(ctes[i].ordering) > 0 {
-			private.Mtr.Set = true
-			private.Mtr.Materialize = true
+			private.Mtr = tree.CTEMaterializeAlways
 			private.BindingOrdering.FromOrdering(ctes[i].ordering)
 		}
 		expr = b.factory.ConstructWith(ctes[i].expr, expr, private)
@@ -127,6 +123,9 @@ func (b *Builder) buildCTEs(
 ) (outScope *scope, correlatedCTEs cteSources) {
 	if with == nil {
 		return inScope, nil
+	}
+	if b.insideFuncDef {
+		panic(unimplemented.New("user-defined functions", "CTE usage inside a function definition"))
 	}
 
 	outScope = inScope.push()
@@ -282,22 +281,14 @@ func (b *Builder) buildCTE(
 	// The properties of the binding are tricky: the recursive expression is
 	// invoked repeatedly and these must hold each time. We can't use the initial
 	// expression's properties directly, as those only hold the first time the
-	// recursive query is executed. We can't really say too much about what the
-	// working table contains, except that it has at least one row (the recursive
-	// query is never invoked with an empty working table).
-	bindingProps := &props.Relational{}
-	bindingProps.OutputCols = outScope.colSet()
-	bindingProps.Cardinality = props.AnyCardinality.AtLeast(props.OneCardinality)
-	// We don't really know the input row count, except for the first time we run
-	// the recursive query. We don't have anything better though.
-	bindingProps.Stats.RowCount = initialScope.expr.Relational().Stats.RowCount
-	// Row count must be greater than 0 or the stats code will throw an error.
-	// Set it to 1 to match the cardinality.
-	if bindingProps.Stats.RowCount < 1 {
-		bindingProps.Stats.RowCount = 1
-	}
+	// recursive query is executed. We don't really know the input row count,
+	// except for the first time we run the recursive query. We don't have
+	// anything better though.
+	initialRowCount := initialScope.expr.Relational().Statistics().RowCount
 	cteSrc.expr = b.factory.ConstructFakeRel(&memo.FakeRelPrivate{
-		Props: bindingProps,
+		Props: norm.MakeBindingPropsForRecursiveCTE(
+			props.AnyCardinality, outScope.colSet(), initialRowCount,
+		),
 	})
 	b.factory.Metadata().AddWithBinding(withID, cteSrc.expr)
 
@@ -311,7 +302,7 @@ func (b *Builder) buildCTE(
 	recursiveScope := b.buildStmt(recursive, initialTypes /* desiredTypes */, cteScope)
 	if numRefs == 0 {
 		// Build this as a non-recursive CTE.
-		cteScope := b.buildSetOp(tree.UnionOp, false /* all */, inScope, initialScope, recursiveScope)
+		cteScope := b.buildSetOp(tree.UnionOp, isUnionAll, inScope, initialScope, recursiveScope)
 		return cteScope.expr, b.getCTECols(cteScope, cte.Name), nil
 	}
 
@@ -336,7 +327,16 @@ func (b *Builder) buildCTE(
 	// query.
 	outTypes, leftCastsNeeded, rightCastsNeeded := b.typeCheckSetOp(initialScope, recursiveScope, "UNION")
 	if leftCastsNeeded {
-		initialScope = b.addCasts(initialScope, outTypes)
+		// We don't support casts on the initial expression; error out.
+		for i := range outTypes {
+			if !outTypes[i].Identical(initialScope.cols[i].typ) {
+				panic(pgerror.Newf(
+					pgcode.DatatypeMismatch,
+					`recursive query "%s" column %d has type %s in non-recursive term but type %s overall`,
+					cte.Name.Alias, i+1, initialScope.cols[i].typ, outTypes[i],
+				))
+			}
+		}
 	}
 	if rightCastsNeeded {
 		recursiveScope = b.addCasts(recursiveScope, outTypes)
@@ -382,13 +382,15 @@ func (b *Builder) getCTECols(cteScope *scope, name tree.AliasClause) physical.Pr
 		))
 	}
 	for i := range presentation {
-		presentation[i].Alias = string(name.Cols[i])
+		presentation[i].Alias = string(name.Cols[i].Name)
 	}
 	return presentation
 }
 
 // splitRecursiveCTE splits a CTE statement of the form
-//   initial_query UNION [ALL] recursive_query
+//
+//	initial_query UNION [ALL] recursive_query
+//
 // into the initial and recursive parts.
 // If the statement is not of this form, returns ok=false.
 func (b *Builder) splitRecursiveCTE(

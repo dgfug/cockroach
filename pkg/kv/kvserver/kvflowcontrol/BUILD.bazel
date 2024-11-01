@@ -1,0 +1,24 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "kvflowcontrol",
+    srcs = [
+        "doc.go",
+        "kvflowcontrol.go",
+        "testing_knobs.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/base",
+        "//pkg/clusterversion",
+        "//pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb",
+        "//pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb",
+        "//pkg/roachpb",
+        "//pkg/settings",
+        "//pkg/settings/cluster",
+        "//pkg/util/admission/admissionpb",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_dustin_go_humanize//:go-humanize",
+    ],
+)

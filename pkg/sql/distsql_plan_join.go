@@ -1,17 +1,14 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -134,7 +131,7 @@ func (h *joinPlanningHelper) joinOutColumns(
 // join columns as described above) to values that make sense in the joiner (0
 // to N-1 for the left input columns, N to N+M-1 for the right input columns).
 func (h *joinPlanningHelper) remapOnExpr(
-	planCtx *PlanningCtx, onCond tree.TypedExpr,
+	ctx context.Context, planCtx *PlanningCtx, onCond tree.TypedExpr,
 ) (execinfrapb.Expression, error) {
 	if onCond == nil {
 		return execinfrapb.Expression{}, nil
@@ -155,7 +152,7 @@ func (h *joinPlanningHelper) remapOnExpr(
 		idx++
 	}
 
-	return physicalplan.MakeExpression(onCond, planCtx, joinColMap)
+	return physicalplan.MakeExpression(ctx, onCond, planCtx, joinColMap)
 }
 
 // eqCols produces a slice of ordinal references for the plan columns specified
@@ -202,25 +199,25 @@ func distsqlSetOpJoinType(setOpType tree.UnionType) descpb.JoinType {
 	}
 }
 
-// getNodesOfRouters returns all nodes that routers are put on.
-func getNodesOfRouters(
+// getSQLInstanceIDsOfRouters returns all nodes that routers are put on.
+func getSQLInstanceIDsOfRouters(
 	routers []physicalplan.ProcessorIdx, processors []physicalplan.Processor,
-) (nodes []roachpb.NodeID) {
-	seen := make(map[roachpb.NodeID]struct{})
+) (sqlInstanceIDs []base.SQLInstanceID) {
+	seen := make(map[base.SQLInstanceID]struct{})
 	for _, pIdx := range routers {
-		n := processors[pIdx].Node
+		n := processors[pIdx].SQLInstanceID
 		if _, ok := seen[n]; !ok {
 			seen[n] = struct{}{}
-			nodes = append(nodes, n)
+			sqlInstanceIDs = append(sqlInstanceIDs, n)
 		}
 	}
-	return nodes
+	return sqlInstanceIDs
 }
 
 func findJoinProcessorNodes(
 	leftRouters, rightRouters []physicalplan.ProcessorIdx, processors []physicalplan.Processor,
-) (nodes []roachpb.NodeID) {
+) (instances []base.SQLInstanceID) {
 	// TODO(radu): for now we run a join processor on every node that produces
 	// data for either source. In the future we should be smarter here.
-	return getNodesOfRouters(append(leftRouters, rightRouters...), processors)
+	return getSQLInstanceIDsOfRouters(append(leftRouters, rightRouters...), processors)
 }

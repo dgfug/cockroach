@@ -12,9 +12,12 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/readsummary/rspb",
+        "//pkg/roachpb",
         "//pkg/util",
         "//pkg/util/cache",
+        "//pkg/util/container/list",
+        "//pkg/util/encoding",
         "//pkg/util/envutil",
         "//pkg/util/hlc",
         "//pkg/util/interval",
@@ -24,6 +27,7 @@ go_library(
         "//pkg/util/uuid",
         "@com_github_andy_kimball_arenaskl//:arenaskl",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -37,12 +41,14 @@ go_test(
     ],
     embed = [":tscache"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/readsummary/rspb",
+        "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/timeutil",
+        "//pkg/util/uint128",
         "//pkg/util/uuid",
         "@com_github_andy_kimball_arenaskl//:arenaskl",
         "@com_github_cockroachdb_errors//:errors",

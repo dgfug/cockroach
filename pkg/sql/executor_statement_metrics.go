@@ -1,26 +1,21 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // EngineMetrics groups a set of SQL metrics.
@@ -33,12 +28,14 @@ type EngineMetrics struct {
 	SQLOptPlanCacheHits   *metric.Counter
 	SQLOptPlanCacheMisses *metric.Counter
 
-	DistSQLExecLatency    *metric.Histogram
-	SQLExecLatency        *metric.Histogram
-	DistSQLServiceLatency *metric.Histogram
-	SQLServiceLatency     *metric.Histogram
-	SQLTxnLatency         *metric.Histogram
+	DistSQLExecLatency    metric.IHistogram
+	SQLExecLatency        metric.IHistogram
+	DistSQLServiceLatency metric.IHistogram
+	SQLServiceLatency     metric.IHistogram
+	SQLTxnLatency         metric.IHistogram
 	SQLTxnsOpen           *metric.Gauge
+	SQLActiveStatements   *metric.Gauge
+	SQLContendedTxns      *metric.Counter
 
 	// TxnAbortCount counts transactions that were aborted, either due
 	// to non-retriable errors, or retriable errors when the client-side
@@ -64,18 +61,22 @@ func (EngineMetrics) MetricStruct() {}
 
 // StatsMetrics groups metrics related to SQL Stats collection.
 type StatsMetrics struct {
-	SQLStatsMemoryMaxBytesHist  *metric.Histogram
+	SQLStatsMemoryMaxBytesHist  metric.IHistogram
 	SQLStatsMemoryCurBytesCount *metric.Gauge
 
-	ReportedSQLStatsMemoryMaxBytesHist  *metric.Histogram
+	ReportedSQLStatsMemoryMaxBytesHist  metric.IHistogram
 	ReportedSQLStatsMemoryCurBytesCount *metric.Gauge
 
 	DiscardedStatsCount *metric.Counter
 
-	SQLStatsFlushStarted  *metric.Counter
-	SQLStatsFlushFailure  *metric.Counter
-	SQLStatsFlushDuration *metric.Histogram
-	SQLStatsRemovedRows   *metric.Counter
+	SQLStatsFlushesSuccessful       *metric.Counter
+	SQLStatsFlushDoneSignalsIgnored *metric.Counter
+	SQLStatsFlushFingerprintCount   *metric.Counter
+	SQLStatsFlushesFailed           *metric.Counter
+	SQLStatsFlushLatency            metric.IHistogram
+	SQLStatsRemovedRows             *metric.Counter
+
+	SQLTxnStatsCollectionOverhead metric.IHistogram
 }
 
 // StatsMetrics is part of the metric.Struct interface.
@@ -98,14 +99,14 @@ var _ metric.Struct = GuardrailMetrics{}
 // MetricStruct is part of the metric.Struct interface.
 func (GuardrailMetrics) MetricStruct() {}
 
-// recordStatementSummery gathers various details pertaining to the
+// recordStatementSummary gathers various details pertaining to the
 // last executed statement/query and performs the associated
 // accounting in the passed-in EngineMetrics.
-// - distSQLUsed reports whether the query was distributed.
-// - automaticRetryCount is the count of implicit txn retries
-//   so far.
-// - result is the result set computed by the query/statement.
-// - err is the error encountered, if any.
+//   - distSQLUsed reports whether the query was distributed.
+//   - automaticRetryCount is the count of implicit txn retries
+//     so far.
+//   - result is the result set computed by the query/statement.
+//   - err is the error encountered, if any.
 func (ex *connExecutor) recordStatementSummary(
 	ctx context.Context,
 	planner *planner,
@@ -113,23 +114,25 @@ func (ex *connExecutor) recordStatementSummary(
 	rowsAffected int,
 	stmtErr error,
 	stats topLevelQueryStats,
-) {
+) appstatspb.StmtFingerprintID {
 	phaseTimes := ex.statsCollector.PhaseTimes()
 
 	// Collect the statistics.
+	idleLatRaw := phaseTimes.GetIdleLatency(ex.statsCollector.PreviousPhaseTimes())
+	idleLatSec := idleLatRaw.Seconds()
 	runLatRaw := phaseTimes.GetRunLatency()
-	runLat := runLatRaw.Seconds()
-	parseLat := phaseTimes.GetParsingLatency().Seconds()
-	planLat := phaseTimes.GetPlanningLatency().Seconds()
+	runLatSec := runLatRaw.Seconds()
+	parseLatSec := phaseTimes.GetParsingLatency().Seconds()
+	planLatSec := phaseTimes.GetPlanningLatency().Seconds()
 	// We want to exclude any overhead to reduce possible confusion.
 	svcLatRaw := phaseTimes.GetServiceLatencyNoOverhead()
-	svcLat := svcLatRaw.Seconds()
+	svcLatSec := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
-	processingLat := parseLat + planLat + runLat
+	processingLatSec := parseLatSec + planLatSec + runLatSec
 
 	// overhead latency: txn/retry management, error checking, etc
-	execOverhead := svcLat - processingLat
+	execOverheadSec := svcLatSec - processingLatSec
 
 	stmt := &planner.stmt
 	shouldIncludeInLatencyMetrics := shouldIncludeStmtInLatencyMetrics(stmt)
@@ -152,67 +155,109 @@ func (ex *connExecutor) recordStatementSummary(
 		}
 	}
 
-	recordedStmtStatsKey := roachpb.StatementStatisticsKey{
+	fullScan := flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)
+	recordedStmtStatsKey := appstatspb.StatementStatisticsKey{
 		Query:        stmt.StmtNoConstants,
 		QuerySummary: stmt.StmtSummary,
 		DistSQL:      flags.IsDistributed(),
 		Vec:          flags.IsSet(planFlagVectorized),
 		ImplicitTxn:  flags.IsSet(planFlagImplicitTxn),
-		FullScan:     flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan),
-		Failed:       stmtErr != nil,
+		FullScan:     fullScan,
 		Database:     planner.SessionData().Database,
+		PlanHash:     planner.instrumentation.planGist.Hash(),
 	}
 
-	// We only populate the transaction fingerprint ID field if we are in an
-	// implicit transaction.
-	//
-	// TODO(azhng): This will require some big refactoring later, we already
-	//  compute statement's fingerprintID in RecordStatement().
-	//  However, we need to recompute the Fingerprint() here because this
-	//  is required to populate the transaction fingerprint ID field.
-	//
-	//  The reason behind it is that: for explicit transactions, we have a final
-	//  callback that will eventually invoke
-	//  statsCollector.EndExplicitTransaction() which will use the extraTxnState
-	//  stored in the connExecutor to compute the transaction fingerprintID.
-	//  Unfortunately, that callback is not invoked for implicit transactions,
-	//  because we don't create temporary stats container for the implicit
-	//  transactions. (The statement stats directly gets written to the actual
-	//  stats container). This means that, unless we populate the transaction
-	//  fingerprintID here, we will not have another chance to do so later.
-	if ex.implicitTxn() {
-		stmtFingerprintID := recordedStmtStatsKey.FingerprintID()
-		txnFingerprintHash := util.MakeFNV64()
-		txnFingerprintHash.Add(uint64(stmtFingerprintID))
-		recordedStmtStatsKey.TransactionFingerprintID =
-			roachpb.TransactionFingerprintID(txnFingerprintHash.Sum())
+	idxRecommendations := idxrecommendations.FormatIdxRecommendations(planner.instrumentation.indexRecs)
+	queryLevelStats, queryLevelStatsOk := planner.instrumentation.GetQueryLevelStats()
+
+	var sqlInstanceIDs []int64
+	var kvNodeIDs []int32
+	if queryLevelStatsOk {
+		sqlInstanceIDs = make([]int64, 0, len(queryLevelStats.SQLInstanceIDs))
+		for _, sqlInstanceID := range queryLevelStats.SQLInstanceIDs {
+			sqlInstanceIDs = append(sqlInstanceIDs, int64(sqlInstanceID))
+		}
+		kvNodeIDs = queryLevelStats.KVNodeIDs
 	}
 
 	recordedStmtStats := sqlstats.RecordedStmtStats{
-		AutoRetryCount:  automaticRetryCount,
-		RowsAffected:    rowsAffected,
-		ParseLatency:    parseLat,
-		PlanLatency:     planLat,
-		RunLatency:      runLat,
-		ServiceLatency:  svcLat,
-		OverheadLatency: execOverhead,
-		BytesRead:       stats.bytesRead,
-		RowsRead:        stats.rowsRead,
-		RowsWritten:     stats.rowsWritten,
-		Nodes:           getNodesFromPlanner(planner),
-		StatementType:   stmt.AST.StatementType(),
-		Plan:            planner.instrumentation.PlanForStats(ctx),
-		StatementError:  stmtErr,
+		SessionID:            ex.planner.extendedEvalCtx.SessionID,
+		StatementID:          stmt.QueryID,
+		AutoRetryCount:       automaticRetryCount,
+		Failed:               stmtErr != nil,
+		AutoRetryReason:      ex.state.mu.autoRetryReason,
+		RowsAffected:         rowsAffected,
+		IdleLatencySec:       idleLatSec,
+		ParseLatencySec:      parseLatSec,
+		PlanLatencySec:       planLatSec,
+		RunLatencySec:        runLatSec,
+		ServiceLatencySec:    svcLatSec,
+		OverheadLatencySec:   execOverheadSec,
+		BytesRead:            stats.bytesRead,
+		RowsRead:             stats.rowsRead,
+		RowsWritten:          stats.rowsWritten,
+		Nodes:                sqlInstanceIDs,
+		KVNodeIDs:            kvNodeIDs,
+		StatementType:        stmt.AST.StatementType(),
+		Plan:                 planner.instrumentation.PlanForStats(ctx),
+		PlanGist:             planner.instrumentation.planGist.String(),
+		StatementError:       stmtErr,
+		IndexRecommendations: idxRecommendations,
+		Query:                stmt.StmtNoConstants,
+		StartTime:            phaseTimes.GetSessionPhaseTime(sessionphase.PlannerStartExecStmt),
+		EndTime:              phaseTimes.GetSessionPhaseTime(sessionphase.PlannerStartExecStmt).Add(svcLatRaw),
+		FullScan:             fullScan,
+		ExecStats:            queryLevelStats,
+		// TODO(mgartner): Use a slice of struct{uint64, uint64} instead of
+		// converting to strings.
+		Indexes:  planner.instrumentation.indexesUsed.Strings(),
+		Database: planner.SessionData().Database,
 	}
 
 	stmtFingerprintID, err :=
 		ex.statsCollector.RecordStatement(ctx, recordedStmtStatsKey, recordedStmtStats)
+
+	// TODO(xinhaoz): This can be set directly within statsCollector once
+	// https://github.com/cockroachdb/cockroach/pull/123698 is merged.
+	ex.statsCollector.SetStatementFingerprintID(stmtFingerprintID)
 
 	if err != nil {
 		if log.V(1) {
 			log.Warningf(ctx, "failed to record statement: %s", err)
 		}
 		ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
+	}
+
+	// Record statement execution statistics if span is recorded and no error was
+	// encountered while collecting query-level statistics.
+	if queryLevelStatsOk {
+		for _, ev := range queryLevelStats.ContentionEvents {
+			contentionEvent := contentionpb.ExtendedContentionEvent{
+				BlockingEvent:            ev,
+				WaitingTxnID:             planner.txn.ID(),
+				WaitingStmtFingerprintID: stmtFingerprintID,
+				WaitingStmtID:            stmt.QueryID,
+				ContentionType:           contentionpb.ContentionType_LOCK_WAIT,
+			}
+
+			ex.server.cfg.ContentionRegistry.AddContentionEvent(contentionEvent)
+		}
+
+		if queryLevelStats.ContentionTime > 0 {
+			ex.planner.DistSQLPlanner().distSQLSrv.Metrics.ContendedQueriesCount.Inc(1)
+			ex.planner.DistSQLPlanner().distSQLSrv.Metrics.CumulativeContentionNanos.Inc(queryLevelStats.ContentionTime.Nanoseconds())
+		}
+
+		err = ex.statsCollector.RecordStatementExecStats(recordedStmtStatsKey, *queryLevelStats)
+		if err != nil {
+			if log.V(2 /* level */) {
+				log.Warningf(ctx, "unable to record statement exec stats: %s", err)
+			}
+		}
+	}
+
+	if stmtFingerprintID != 0 {
+		ex.statsCollector.ObserveStatement(stmtFingerprintID, recordedStmtStats)
 	}
 
 	// Do some transaction level accounting for the transaction this statement is
@@ -233,6 +278,7 @@ func (ex *connExecutor) recordStatementSummary(
 		ex.extraTxnState.transactionStatementsHash.Add(uint64(stmtFingerprintID))
 	}
 	ex.extraTxnState.numRows += rowsAffected
+	ex.extraTxnState.idleLatency += idleLatRaw
 
 	if log.V(2) {
 		// ages since significant epochs
@@ -246,13 +292,15 @@ func (ex *connExecutor) recordStatementSummary(
 				"overhead %.2fµs (%.1f%%), "+
 				"session age %.4fs",
 			rowsAffected, automaticRetryCount,
-			parseLat*1e6, 100*parseLat/svcLat,
-			planLat*1e6, 100*planLat/svcLat,
-			runLat*1e6, 100*runLat/svcLat,
-			execOverhead*1e6, 100*execOverhead/svcLat,
+			parseLatSec*1e6, 100*parseLatSec/svcLatSec,
+			planLatSec*1e6, 100*planLatSec/svcLatSec,
+			runLatSec*1e6, 100*runLatSec/svcLatSec,
+			execOverheadSec*1e6, 100*execOverheadSec/svcLatSec,
 			sessionAge,
 		)
 	}
+
+	return stmtFingerprintID
 }
 
 func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
@@ -268,18 +316,4 @@ func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
 // We only want to keep track of DML (Data Manipulation Language) statements in our latency metrics.
 func shouldIncludeStmtInLatencyMetrics(stmt *Statement) bool {
 	return stmt.AST.StatementType() == tree.TypeDML
-}
-
-func getNodesFromPlanner(planner *planner) []int64 {
-	// Retrieve the list of all nodes which the statement was executed on.
-	var nodes []int64
-	if planner.instrumentation.sp != nil {
-		trace := planner.instrumentation.sp.GetRecording(tracing.RecordingStructured)
-		// ForEach returns nodes in order.
-		execinfrapb.ExtractNodesFromSpans(planner.EvalContext().Context, trace).ForEach(func(i int) {
-			nodes = append(nodes, int64(i))
-		})
-	}
-
-	return nodes
 }

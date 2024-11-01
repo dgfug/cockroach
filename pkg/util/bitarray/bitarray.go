@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package bitarray
 
@@ -615,4 +610,19 @@ func (d BitArray) SetBitAtIndex(index, toSet int) (BitArray, error) {
 	// Updating value at the index to toSet.
 	res.words[index/numBitsPerWord] |= word(toSet) << (numBitsPerWord - 1 - uint(index)%numBitsPerWord)
 	return res, nil
+}
+
+// AsUInt64 returns the uint64 constituted from the rightmost bits in the
+// bit array.
+func (d *BitArray) AsUInt64() uint64 {
+	if len(d.words) == 0 {
+		return 0
+	}
+
+	lowPart := d.words[len(d.words)-1] >> (numBitsPerWord - d.lastBitsUsed)
+	highPart := word(0)
+	if len(d.words) > 1 {
+		highPart = d.words[len(d.words)-2] << d.lastBitsUsed
+	}
+	return lowPart | highPart
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colcontainer_test
 
@@ -19,16 +14,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/marusama/semaphore"
 	"github.com/stretchr/testify/require"
 )
 
 type fdCountingFSFile struct {
-	fs.File
+	vfs.File
 	onCloseCb func()
 }
 
@@ -41,7 +36,7 @@ func (f *fdCountingFSFile) Close() error {
 }
 
 type fdCountingFS struct {
-	fs.FS
+	vfs.FS
 	writeFDs int
 	readFDs  int
 }
@@ -58,8 +53,8 @@ func (f *fdCountingFS) assertOpenFDs(
 	require.Equal(t, expectedReadFDs, f.readFDs)
 }
 
-func (f *fdCountingFS) Create(name string) (fs.File, error) {
-	file, err := f.FS.Create(name)
+func (f *fdCountingFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	file, err := f.FS.Create(name, category)
 	if err != nil {
 		return nil, err
 	}
@@ -67,16 +62,7 @@ func (f *fdCountingFS) Create(name string) (fs.File, error) {
 	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
 }
 
-func (f *fdCountingFS) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
-	file, err := f.FS.CreateWithSync(name, bytesPerSync)
-	if err != nil {
-		return nil, err
-	}
-	f.writeFDs++
-	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
-}
-
-func (f *fdCountingFS) Open(name string) (fs.File, error) {
+func (f *fdCountingFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	file, err := f.FS.Open(name)
 	if err != nil {
 		return nil, err
@@ -97,7 +83,14 @@ func TestPartitionedDiskQueue(t *testing.T) {
 		batch = testAllocator.NewMemBatchWithMaxCapacity(typs)
 		sem   = &colexecop.TestingSemaphore{}
 	)
-	batch.SetLength(coldata.BatchSize())
+	batchSize := coldata.BatchSize()
+	if batchSize > 1024 {
+		// Use batch size not larger than the default production value (with
+		// larger batch sizes different enqueues below will be written into
+		// separate files).
+		batchSize = 1024
+	}
+	batch.SetLength(batchSize)
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
@@ -106,7 +99,7 @@ func TestPartitionedDiskQueue(t *testing.T) {
 	queueCfg.FS = countingFS
 
 	t.Run("ReopenReadPartition", func(t *testing.T) {
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc, testMemAcc)
 
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 		require.NoError(t, p.Enqueue(ctx, 0, batch))
@@ -164,14 +157,13 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 
 	// Sort simulates the use of a PartitionedDiskQueue during an external sort.
 	t.Run(fmt.Sprintf("Sort/maxPartitions=%d/numRepartitions=%d", maxPartitions, numRepartitions), func(t *testing.T) {
-		queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-		queueCfg.SetDefaultBufferSizeBytesForCacheMode()
+		queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeReuseCache)
 		// Creating a new testing semaphore will assert that no more than
 		// maxPartitions+1 are created. The +1 is the file descriptor of the
 		// new partition being written to when closedForWrites from maxPartitions
 		// and writing the merged result to a single new partition.
 		sem := colexecop.NewTestingSemaphore(maxPartitions + 1)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition, testDiskAcc, testMemAcc)
 
 		// Define sortRepartition to be able to call this helper function
 		// recursively.
@@ -240,8 +232,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 	})
 
 	t.Run(fmt.Sprintf("HashJoin/maxPartitions=%d/numRepartitions=%d", maxPartitions, numRepartitions), func(t *testing.T) {
-		queueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-		queueCfg.SetDefaultBufferSizeBytesForCacheMode()
+		queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
 		// Double maxPartitions to get an even number, half for the left input, half
 		// for the right input. We'll consider the even index the left side and the
 		// next partition index the right side.
@@ -251,7 +242,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		// number of partitions partitioned to and 2 represents the file descriptors
 		// for the left and right side in the case of a repartition.
 		sem := colexecop.NewTestingSemaphore(maxPartitions + 2)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc, testMemAcc)
 
 		// joinRepartition will perform the partitioning that happens during a hash
 		// join. expectedRepartitionReadFDs are the read file descriptors that are
@@ -314,5 +305,8 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		}
 
 		joinRepartition(0, 0, numRepartitions, 0)
+
+		require.NoError(t, p.Close(ctx))
+		countingFS.assertOpenFDs(t, sem, 0, 0)
 	})
 }

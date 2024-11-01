@@ -69,10 +69,25 @@ SELECT * FROM i WHERE f = 0
 0
 
 statement ok
-CREATE INDEX ON i (f)
+CREATE INDEX i_f_asc ON i (f)
 
 query R rowsort
 SELECT * FROM i WHERE f = 0
+----
+-0
+0
+
+statement ok
+CREATE INDEX i_f_desc ON i (f DESC)
+
+query R rowsort
+SELECT * FROM i@i_f_asc;
+----
+-0
+0
+
+query R rowsort
+SELECT * FROM i@i_f_desc;
 ----
 -0
 0
@@ -89,10 +104,10 @@ CREATE TABLE vals(f FLOAT);
 query RT rowsort
 SELECT f, f::string FROM vals
 ----
-0                     0
-123.456789012346      123.456789012346
-1.23456789012346e+22  1.23456789012346e+22
-0.000123456789012346  0.000123456789012346
+0                       0
+123.45678901234568      123.45678901234568
+1.2345678901234568e+22  1.2345678901234568e+22
+0.00012345678901234567  0.00012345678901234567
 
 statement ok
 SET extra_float_digits = 3
@@ -139,3 +154,58 @@ query FFF
 SELECT -0.1234567890123456, 123456789012345.6, 1234567.890123456
 ----
 -0.1234567890123457 123456789012345.7 1234567.890123457
+
+# Regression test to make sure `IS NAN` does not coerce NaN to a string.
+statement error unsupported comparison operator: <tuple> = <decimal>
+SELECT ROW() IS NAN
+
+statement error unsupported comparison operator: <tuple> != <decimal>
+SELECT ROW() IS NOT NAN
+
+statement error unsupported comparison operator: <string> = <decimal>
+SELECT 'NaN'::string IS NAN
+
+query BB
+SELECT 'nan'::float IS NAN, 'nan'::float IS NOT NAN
+----
+true  false
+
+query BB
+SELECT 'nan'::decimal IS NAN, 'nan'::decimal IS NOT NAN
+----
+true  false
+
+statement ok
+CREATE TABLE t87605 (col2 FLOAT8 NULL)
+
+statement ok
+insert into t87605 values (1.234567890123456e+13), (1.234567890123456e+6)
+
+# Regression test for issue #87605.
+# The floor division operator `//` should not be folded away.
+query F
+SELECT ((col2::FLOAT8 // 1.0:::FLOAT8::FLOAT8)::FLOAT8) FROM t87605@[0] ORDER BY 1
+----
+1.234567e+06
+1.2345678901234e+13
+
+# Regression test for issue #89961.
+
+statement ok
+CREATE TABLE t89961 (a float PRIMARY KEY, INDEX (a DESC))
+
+statement ok
+INSERT INTO t89961 VALUES ('NaN')
+
+# We use st_makepointm because it is sensitive to different NaN encodings. The
+# following two queries should have the same result.
+
+query T
+SELECT st_makepointm(a, 1.234567890123456e+07, -0.6571774097533073)::string FROM t89961@t89961_pkey
+----
+0101000040010000000000F87FDCE9D6DC298C67412DEF51EB9807E5BF
+
+query T
+SELECT st_makepointm(a, 1.234567890123456e+07, -0.6571774097533073)::string FROM t89961@t89961_a_idx;
+----
+0101000040010000000000F87FDCE9D6DC298C67412DEF51EB9807E5BF

@@ -1,0 +1,29 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "kvadmission",
+    srcs = ["kvadmission.go"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/base",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/kvflowcontrol",
+        "//pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb",
+        "//pkg/kv/kvserver/kvflowcontrol/replica_rac2",
+        "//pkg/kv/kvserver/raftlog",
+        "//pkg/raft/raftpb",
+        "//pkg/roachpb",
+        "//pkg/settings",
+        "//pkg/settings/cluster",
+        "//pkg/util/admission",
+        "//pkg/util/admission/admissionpb",
+        "//pkg/util/buildutil",
+        "//pkg/util/grunning",
+        "//pkg/util/log",
+        "//pkg/util/stop",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//:pebble",
+    ],
+)

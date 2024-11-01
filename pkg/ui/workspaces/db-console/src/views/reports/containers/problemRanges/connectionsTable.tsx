@@ -1,15 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
 import classNames from "classnames";
+import flow from "lodash/flow";
+import isEmpty from "lodash/isEmpty";
+import isNil from "lodash/isNil";
+import keys from "lodash/keys";
+import map from "lodash/map";
+import sortBy from "lodash/sortBy";
 import React from "react";
 import { Link } from "react-router-dom";
 
@@ -25,9 +25,7 @@ interface ConnectionTableColumn {
 }
 
 interface ConnectionsTableProps {
-  problemRanges: CachedDataReducerState<
-    protos.cockroach.server.serverpb.ProblemRangesResponse
-  >;
+  problemRanges: CachedDataReducerState<protos.cockroach.server.serverpb.ProblemRangesResponse>;
 }
 
 const connectionTableColumns: ConnectionTableColumn[] = [
@@ -48,7 +46,7 @@ const connectionTableColumns: ConnectionTableColumn[] = [
     extract: problem => problem.no_raft_leader_range_ids.length,
   },
   {
-    title: "Invalid Lease",
+    title: "Expired Lease",
     extract: problem => problem.no_lease_range_ids.length,
   },
   {
@@ -72,6 +70,18 @@ const connectionTableColumns: ConnectionTableColumn[] = [
     extract: problem => problem.raft_log_too_large_range_ids.length,
   },
   {
+    title: "Circuit breaker error",
+    extract: problem => problem.circuit_breaker_error_range_ids.length,
+  },
+  {
+    title: "Paused Replicas",
+    extract: problem => problem.paused_replica_ids.length,
+  },
+  {
+    title: "Range Too Large",
+    extract: problem => problem.too_large_range_ids.length,
+  },
+  {
     title: "Total",
     extract: problem => {
       return (
@@ -82,7 +92,10 @@ const connectionTableColumns: ConnectionTableColumn[] = [
         problem.underreplicated_range_ids.length +
         problem.overreplicated_range_ids.length +
         problem.quiescent_equals_ticking_range_ids.length +
-        problem.raft_log_too_large_range_ids.length
+        problem.raft_log_too_large_range_ids.length +
+        problem.circuit_breaker_error_range_ids.length +
+        problem.paused_replica_ids.length +
+        problem.too_large_range_ids.length
       );
     },
   },
@@ -93,24 +106,26 @@ export default function ConnectionsTable(props: ConnectionsTableProps) {
   const { problemRanges } = props;
   // lastError is already handled by ProblemRanges component.
   if (
-    _.isNil(problemRanges) ||
-    _.isNil(problemRanges.data) ||
-    !_.isNil(problemRanges.lastError)
+    isNil(problemRanges) ||
+    isNil(problemRanges.data) ||
+    !isNil(problemRanges.lastError)
   ) {
     return null;
   }
   const { data } = problemRanges;
-  const ids = _.chain(_.keys(data.problems_by_node_id))
-    .map(id => parseInt(id, 10))
-    .sortBy(id => id)
-    .value();
+  const ids = flow(
+    keys,
+    nodeIds => map(nodeIds, id => parseInt(id, 10)),
+    nodeIds => sortBy(nodeIds, id => id),
+  )(data.problems_by_node_id);
+
   return (
     <div>
       <h2 className="base-heading">Connections (via Node {data.node_id})</h2>
       <table className="connections-table">
         <tbody>
           <tr className="connections-table__row connections-table__row--header">
-            {_.map(connectionTableColumns, (col, key) => (
+            {map(connectionTableColumns, (col, key) => (
               <th
                 key={key}
                 className="connections-table__cell connections-table__cell--header"
@@ -119,17 +134,17 @@ export default function ConnectionsTable(props: ConnectionsTableProps) {
               </th>
             ))}
           </tr>
-          {_.map(ids, id => {
+          {map(ids, id => {
             const rowProblems = data.problems_by_node_id[id];
             const rowClassName = classNames({
               "connections-table__row": true,
-              "connections-table__row--warning": !_.isEmpty(
+              "connections-table__row--warning": !isEmpty(
                 rowProblems.error_message,
               ),
             });
             return (
               <tr key={id} className={rowClassName}>
-                {_.map(connectionTableColumns, (col, key) => (
+                {map(connectionTableColumns, (col, key) => (
                   <td key={key} className="connections-table__cell">
                     {col.extract(rowProblems, id)}
                   </td>

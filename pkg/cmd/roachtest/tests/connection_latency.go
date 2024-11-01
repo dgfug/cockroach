@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,65 +29,54 @@ const (
 func runConnectionLatencyTest(
 	ctx context.Context, t test.Test, c cluster.Cluster, numNodes int, numZones int, password bool,
 ) {
-	err := c.PutE(ctx, t.L(), t.Cockroach(), "./cockroach")
+	// The connection latency workload is not available in the cockroach binary,
+	// so we must use the deprecated workload.
+	err := c.PutE(ctx, t.L(), t.DeprecatedWorkload(), "./workload")
 	require.NoError(t, err)
 
-	err = c.PutE(ctx, t.L(), t.DeprecatedWorkload(), "./workload")
+	settings := install.MakeClusterSettings()
+	// Don't start a backup schedule as this roachtest reports roachperf results.
+	err = c.StartE(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), settings)
 	require.NoError(t, err)
 
-	err = c.StartE(ctx, option.StartArgs("--secure"))
-	require.NoError(t, err)
+	urlTemplate := func(host string) string {
+		if password {
+			return fmt.Sprintf("postgres://%s:%s@%s:{pgport:1}?sslmode=require&sslrootcert=%s/ca.crt", install.DefaultUser, install.DefaultPassword, host, install.CockroachNodeCertsDir)
+		}
 
-	var passwordFlag string
+		return fmt.Sprintf("postgres://%[1]s@%[2]s:{pgport:1}?sslcert=%[3]s/client.%[1]s.crt&sslkey=%[3]s/client.%[1]s.key&sslrootcert=%[3]s/ca.crt&sslmode=require", install.DefaultUser, host, install.CockroachNodeCertsDir)
+	}
+
 	// Only create the user once.
-	t.L().Printf("creating testuser")
 	if password {
-		err = c.RunE(ctx, c.Node(1), `./cockroach sql --certs-dir certs -e "CREATE USER testuser WITH PASSWORD '123' CREATEDB"`)
+		err = c.RunE(ctx, option.WithNodes(c.Node(1)), fmt.Sprintf("./workload init connectionlatency --secure '%s'", urlTemplate("localhost")))
 		require.NoError(t, err)
-		err = c.RunE(ctx, c.Node(1), "./workload init connectionlatency --user testuser --password '123' --secure")
-		require.NoError(t, err)
-		passwordFlag = "--password 123 "
 	} else {
-		// NB: certs for `testuser` are created by `roachprod start --secure`.
-		err = c.RunE(ctx, c.Node(1), `./cockroach sql --certs-dir certs -e "CREATE USER testuser CREATEDB"`)
-		require.NoError(t, err)
-		require.NoError(t, err)
-		err = c.RunE(ctx, c.Node(1), "./workload init connectionlatency --user testuser --secure")
+		err = c.RunE(ctx, option.WithNodes(c.Node(1)), fmt.Sprintf("./workload init connectionlatency --secure '%s'", urlTemplate("localhost")))
 		require.NoError(t, err)
 	}
 
 	runWorkload := func(roachNodes, loadNode option.NodeListOption, locality string) {
 		var urlString string
 		var urls []string
-		externalIps, err := c.ExternalIP(ctx, roachNodes)
+		externalIps, err := c.ExternalIP(ctx, t.L(), roachNodes)
 		require.NoError(t, err)
 
-		if password {
-			urlTemplate := "postgres://testuser:123@%s:26257?sslmode=require&sslrootcert=certs/ca.crt"
-			for _, u := range externalIps {
-				url := fmt.Sprintf(urlTemplate, u)
-				urls = append(urls, fmt.Sprintf("'%s'", url))
-			}
-			urlString = strings.Join(urls, " ")
-		} else {
-			urlTemplate := "postgres://testuser@%s:26257?sslcert=certs/client.testuser.crt&sslkey=certs/client.testuser.key&sslrootcert=certs/ca.crt&sslmode=require"
-			for _, u := range externalIps {
-				url := fmt.Sprintf(urlTemplate, u)
-				urls = append(urls, fmt.Sprintf("'%s'", url))
-			}
-			urlString = strings.Join(urls, " ")
+		for _, u := range externalIps {
+			url := urlTemplate(u)
+			urls = append(urls, fmt.Sprintf("'%s'", url))
 		}
+		urlString = strings.Join(urls, " ")
 
 		t.L().Printf("running workload in %q against urls:\n%s", locality, strings.Join(urls, "\n"))
 
 		workloadCmd := fmt.Sprintf(
-			`./workload run connectionlatency %s --user testuser --secure %s --duration 30s --histograms=%s/stats.json --locality %s`,
+			`./workload run connectionlatency %s --secure --duration 30s --histograms=%s/stats.json --locality %s`,
 			urlString,
-			passwordFlag,
 			t.PerfArtifactsDir(),
 			locality,
 		)
-		err = c.RunE(ctx, loadNode, workloadCmd)
+		err = c.RunE(ctx, option.WithNodes(loadNode), workloadCmd)
 		require.NoError(t, err)
 	}
 
@@ -115,10 +100,14 @@ func registerConnectionLatencyTest(r registry.Registry) {
 	// Single region test.
 	numNodes := 3
 	r.Add(registry.TestSpec{
-		Name:  fmt.Sprintf("connection_latency/nodes=%d/certs", numNodes),
-		Owner: registry.OwnerSQLExperience,
+		Name:      fmt.Sprintf("connection_latency/nodes=%d/certs", numNodes),
+		Owner:     registry.OwnerSQLFoundations,
+		Benchmark: true,
 		// Add one more node for load node.
-		Cluster: r.MakeClusterSpec(numNodes+1, spec.Zones(regionUsCentral)),
+		Cluster:                    r.MakeClusterSpec(numNodes+1, spec.WorkloadNode(), spec.GCEZones(regionUsCentral)),
+		CompatibleClouds:           registry.OnlyGCE,
+		Suites:                     registry.Suites(registry.Nightly),
+		RequiresDeprecatedWorkload: true, // uses connectionlatency
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runConnectionLatencyTest(ctx, t, c, numNodes, 1, false /*password*/)
 		},
@@ -131,18 +120,26 @@ func registerConnectionLatencyTest(r registry.Registry) {
 	loadNodes := numZones
 
 	r.Add(registry.TestSpec{
-		Name:    fmt.Sprintf("connection_latency/nodes=%d/multiregion/certs", numMultiRegionNodes),
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(numMultiRegionNodes+loadNodes, spec.Geo(), spec.Zones(geoZonesStr)),
+		Name:                       fmt.Sprintf("connection_latency/nodes=%d/multiregion/certs", numMultiRegionNodes),
+		Owner:                      registry.OwnerSQLFoundations,
+		Benchmark:                  true,
+		Cluster:                    r.MakeClusterSpec(numMultiRegionNodes+loadNodes, spec.Geo(), spec.GCEZones(geoZonesStr)),
+		CompatibleClouds:           registry.OnlyGCE,
+		Suites:                     registry.Suites(registry.Nightly),
+		RequiresDeprecatedWorkload: true, // uses connectionlatency
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runConnectionLatencyTest(ctx, t, c, numMultiRegionNodes, numZones, false /*password*/)
 		},
 	})
 
 	r.Add(registry.TestSpec{
-		Name:    fmt.Sprintf("connection_latency/nodes=%d/multiregion/password", numMultiRegionNodes),
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(numMultiRegionNodes+loadNodes, spec.Geo(), spec.Zones(geoZonesStr)),
+		Name:                       fmt.Sprintf("connection_latency/nodes=%d/multiregion/password", numMultiRegionNodes),
+		Owner:                      registry.OwnerSQLFoundations,
+		Benchmark:                  true,
+		Cluster:                    r.MakeClusterSpec(numMultiRegionNodes+loadNodes, spec.Geo(), spec.GCEZones(geoZonesStr)),
+		CompatibleClouds:           registry.OnlyGCE,
+		Suites:                     registry.Suites(registry.Nightly),
+		RequiresDeprecatedWorkload: true, // uses connectionlatency
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runConnectionLatencyTest(ctx, t, c, numMultiRegionNodes, numZones, true /*password*/)
 		},

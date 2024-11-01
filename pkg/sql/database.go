@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,12 +10,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
+	"github.com/cockroachdb/errors"
 )
 
 //
@@ -42,7 +38,7 @@ func (p *planner) renameDatabase(
 	}
 
 	// Check that the new name is available.
-	if exists, _, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, newName); err == nil && exists {
+	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, newName); err == nil && dbID != descpb.InvalidID {
 		return pgerror.Newf(pgcode.DuplicateDatabase,
 			"the new database name %q already exists", newName)
 	} else if err != nil {
@@ -54,7 +50,9 @@ func (p *planner) renameDatabase(
 
 	// Populate the namespace update batch.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, desc); err != nil {
+		return err
+	}
 
 	// Write the updated database descriptor.
 	if err := p.writeNonDropDatabaseChange(ctx, desc, stmt); err != nil {
@@ -71,6 +69,11 @@ func (p *planner) renameDatabase(
 func (p *planner) writeNonDropDatabaseChange(
 	ctx context.Context, desc *dbdesc.Mutable, jobDesc string,
 ) error {
+	// Exit early with an error if the table is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(desc) {
+		return scerrors.ConcurrentSchemaChangeError(desc)
+	}
 	if err := p.createNonDropDatabaseChangeJob(ctx, desc.ID, jobDesc); err != nil {
 		return err
 	}
@@ -103,19 +106,35 @@ func (p *planner) forEachMutableTableInDatabase(
 	dbDesc catalog.DatabaseDescriptor,
 	fn func(ctx context.Context, scName string, tbDesc *tabledesc.Mutable) error,
 ) error {
-	allDescs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
+	all, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
 
-	lCtx := newInternalLookupCtx(ctx, allDescs, dbDesc, nil /* fallback */)
+	// TODO(ajwerner): Rewrite this to not use the internalLookupCtx.
+	lCtx := newInternalLookupCtx(all.OrderedDescriptors(), dbDesc)
+	var droppedRemoved []descpb.ID
 	for _, tbID := range lCtx.tbIDs {
 		desc := lCtx.tbDescs[tbID]
 		if desc.Dropped() {
 			continue
 		}
-		mutable := tabledesc.NewBuilder(desc.TableDesc()).BuildExistingMutableTable()
-		if err := fn(ctx, lCtx.schemaNames[desc.GetParentSchemaID()], mutable); err != nil {
+		droppedRemoved = append(droppedRemoved, tbID)
+	}
+	descs, err := p.Descriptors().MutableByID(p.Txn()).Descs(ctx, droppedRemoved)
+	if err != nil {
+		return err
+	}
+	for _, d := range descs {
+		mutable := d.(*tabledesc.Mutable)
+		schemaName, found, err := lCtx.GetSchemaName(ctx, d.GetParentSchemaID(), d.GetParentID(), p.ExecCfg().Settings.Version)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return errors.AssertionFailedf("schema id %d not found", d.GetParentSchemaID())
+		}
+		if err := fn(ctx, schemaName, mutable); err != nil {
 			return err
 		}
 	}

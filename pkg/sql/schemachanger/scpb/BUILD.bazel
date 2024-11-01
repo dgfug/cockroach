@@ -1,17 +1,29 @@
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "scpb",
     srcs = [
-        "node.go",
+        "constants.go",
+        "element_collection.go",
+        "migration.go",
+        "name_mappings.go",
+        "state.go",
+        "transient.go",
         ":gen-elements-interface",  # keep
     ],
     embed = [":scpb_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
+        "//pkg/security/username",  # keep
+        "//pkg/sql/catalog/catpb",  # keep
+        "//pkg/sql/privilege",  # keep
+        "//pkg/sql/sem/catid",  # keep
+        "//pkg/sql/sem/tree",  # keep
+        "//pkg/util/debugutil",
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
     ],
@@ -24,39 +36,79 @@ go_proto_library(
     proto = ":scpb_proto",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/sql/catalog/descpb",
+        "//pkg/config/zonepb",
+        "//pkg/geo/geopb",
+        "//pkg/sql/catalog/catenumpb",
+        "//pkg/sql/catalog/catpb",
+        "//pkg/sql/sem/catid",  # keep
+        "//pkg/sql/sem/semenumpb",
+        "//pkg/sql/types",
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
 
 proto_library(
     name = "scpb_proto",
-    srcs = ["scpb.proto"],
+    srcs = [
+        "elements.proto",
+        "scpb.proto",
+    ],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/sql/catalog/descpb:descpb_proto",
+        "//pkg/config/zonepb:zonepb_proto",
+        "//pkg/geo/geopb:geopb_proto",
+        "//pkg/sql/catalog/catenumpb:catenumpb_proto",
+        "//pkg/sql/catalog/catpb:catpb_proto",
+        "//pkg/sql/sem/semenumpb:semenumpb_proto",
+        "//pkg/sql/types:types_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
     ],
-)
-
-go_binary(
-    name = "element-generator",
-    srcs = ["element_generator.go"],
-    gotags = ["generator"],
-    deps = ["//pkg/cli/exit"],
 )
 
 genrule(
     name = "gen-elements-interface",
     srcs = [
-        "scpb.proto",
+        "elements.proto",
     ],
     outs = ["elements_generated.go"],
     cmd = """
-        $(location :element-generator) --in $< --out $(location elements_generated.go)
+        $(location //pkg/sql/schemachanger/scpb/element-generator) --in $< --out $(location elements_generated.go)
        """,
-    exec_tools = [
-        ":element-generator",
+    tools = [
+        "//pkg/sql/schemachanger/scpb/element-generator",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
+)
+
+genrule(
+    name = "gen-elements-uml",
+    outs = ["uml/table.puml"],
+    cmd = """
+        $(location //pkg/sql/schemachanger/scpb/element-uml-generator) --out $(location uml/table.puml)
+       """,
+    tools = [
+        "//pkg/sql/schemachanger/scpb/element-uml-generator",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
+)
+
+go_test(
+    name = "scpb_test",
+    srcs = [
+        "element_collection_test.go",
+        "migration_test.go",
+    ],
+    embed = [":scpb"],
+    deps = [
+        "//pkg/clusterversion",
+        "//pkg/sql/catalog/catpb",
+        "@com_github_stretchr_testify//require",
     ],
 )

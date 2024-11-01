@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -69,6 +64,11 @@ var (
 	// indexes counted in InvertedIndexCounter.
 	GeometryInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geometry_inverted_index")
 
+	// TrigramInvertedIndexCounter is to be incremented every time a
+	// trigram inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	TrigramInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.trigram_inverted_index")
+
 	// PartialIndexCounter is to be incremented every time a partial index is
 	// created. This includes both regular and inverted partial indexes.
 	PartialIndexCounter = telemetry.GetCounterOnce("sql.schema.partial_index")
@@ -87,10 +87,21 @@ var (
 	ExpressionIndexCounter = telemetry.GetCounterOnce("sql.schema.expression_index")
 )
 
+// SchemaChangeIndexCounter is to be incremented for certain CREATE
+// index operations.
+func SchemaChangeIndexCounter(typ string) telemetry.Counter {
+	return telemetry.GetCounter(fmt.Sprintf("sql.schema.%s_index", typ))
+}
+
 var (
 	// TempObjectCleanerDeletionCounter is to be incremented every time a temporary schema
 	// has been deleted by the temporary object cleaner.
 	TempObjectCleanerDeletionCounter = telemetry.GetCounterOnce("sql.schema.temp_object_cleaner.num_cleaned")
+)
+
+var (
+	// SchemaTelemetryExecuted is incremented when a schema telemetry job has executed.
+	SchemaTelemetryExecuted = telemetry.GetCounterOnce("sql.schema.telemetry.job_executed")
 )
 
 // SchemaNewColumnTypeQualificationCounter is to be incremented every time
@@ -167,3 +178,39 @@ var SchemaRefreshMaterializedView = telemetry.GetCounterOnce("sql.schema.refresh
 func SchemaChangeErrorCounter(typ string) telemetry.Counter {
 	return telemetry.GetCounter(fmt.Sprintf("sql.schema_changer.errors.%s", typ))
 }
+
+// SetTableStorageParameter is to be incremented every time a table storage
+// parameter has been SET (through CREATE TABLE or ALTER TABLE).
+func SetTableStorageParameter(param string) telemetry.Counter {
+	return telemetry.GetCounter("sql.schema.table_storage_parameter." + param + ".set")
+}
+
+// ResetTableStorageParameter is to be incremented every time a table storage
+// parameter has been RESET.
+func ResetTableStorageParameter(param string) telemetry.Counter {
+	return telemetry.GetCounter("sql.schema.table_storage_parameter." + param + ".reset")
+}
+
+// DeclarativeSchemaChangerCounter is incremented whenever the declarative
+// schema changer is used.
+var DeclarativeSchemaChangerCounter = telemetry.GetCounterOnce("sql.schema.schema_changer_mode.declarative")
+
+// LegacySchemaChangerCounter is incremented whenever the legacy schema changer
+// is used.
+var LegacySchemaChangerCounter = telemetry.GetCounterOnce("sql.schema.schema_changer_mode.legacy")
+
+// MixedDDLDMLTransactionSuccessCounter is incremented whenever an explicit
+// transaction that has both DDL and DML statements succeeds.
+var MixedDDLDMLTransactionSuccessCounter = telemetry.GetCounterOnce("sql.schema.transaction.mixed_ddl_dml.success")
+
+// MixedDDLDMLTransactionFailureCounter is incremented whenever an explicit
+// transaction that has both DDL and DML statements fails.
+var MixedDDLDMLTransactionFailureCounter = telemetry.GetCounterOnce("sql.schema.transaction.mixed_ddl_dml.failure")
+
+// DDLOnlyTransactionSuccessCounter is incremented whenever an explicit
+// transaction that has only DDL statements succeeds.
+var DDLOnlyTransactionSuccessCounter = telemetry.GetCounterOnce("sql.schema.transaction.ddl_only.success")
+
+// DDLOnlyTransactionFailureCounter is incremented whenever an explicit
+// transaction that has only DDL statements fails.
+var DDLOnlyTransactionFailureCounter = telemetry.GetCounterOnce("sql.schema.transaction.ddl_only.failure")

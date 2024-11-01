@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,11 +10,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
@@ -29,19 +24,20 @@ import (
 // TODO(sqlexec): make this work for any arbitrary schema.
 // This currently only works for public schemas and databases.
 func (p *planner) LookupNamespaceID(
-	ctx context.Context, parentID int64, name string,
+	ctx context.Context, parentID int64, parentSchemaID int64, name string,
 ) (tree.DInt, bool, error) {
 	query := fmt.Sprintf(
-		`SELECT id FROM [%d AS namespace] WHERE "parentID" = $1 AND "parentSchemaID" IN (0, 29) AND name = $2`,
+		`SELECT id FROM [%d AS namespace] WHERE "parentID" = $1 AND "parentSchemaID" = $2 AND name = $3`,
 		keys.NamespaceTableID,
 	)
-	r, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
+	r, err := p.InternalSQLTxn().QueryRowEx(
 		ctx,
 		"crdb-internal-get-descriptor-id",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		query,
 		parentID,
+		parentSchemaID,
 		name,
 	)
 	if err != nil {
@@ -65,38 +61,31 @@ func (p *planner) LookupZoneConfigByNamespaceID(
 		return "", false, err
 	}
 
-	const query = `SELECT config FROM system.zones WHERE id = $1`
-	r, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
-		ctx,
-		"crdb-internal-get-zone",
-		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-		query,
-		id,
-	)
+	zc, err := p.Descriptors().GetZoneConfig(ctx, p.Txn(), descpb.ID(id))
 	if err != nil {
 		return "", false, err
 	}
-	if r == nil {
+	if zc == nil {
 		return "", false, nil
 	}
-	return tree.MustBeDBytes(r[0]), true, nil
+
+	return tree.DBytes(zc.GetRawBytesInStorage()), true, nil
+}
+
+// IsSystemTable implements tree.PrivilegedAccessor.
+func (p *planner) IsSystemTable(ctx context.Context, id int64) (bool, error) {
+	tbl, err := p.Descriptors().ByIDWithoutLeased(p.Txn()).Get().Table(ctx, catid.DescID(id))
+	if err != nil {
+		return false, err
+	}
+	return catalog.IsSystemDescriptor(tbl), nil
 }
 
 // checkDescriptorPermissions returns nil if the executing user has permissions
 // to check the permissions of a descriptor given its ID, or the id given
 // is not a descriptor of a table or database.
 func (p *planner) checkDescriptorPermissions(ctx context.Context, id descpb.ID) error {
-	desc, err := p.Descriptors().GetImmutableDescriptorByID(
-		ctx, p.txn, id,
-		tree.CommonLookupFlags{
-			IncludeDropped: true,
-			IncludeOffline: true,
-			// Note that currently the ByID API implies required regardless of whether it
-			// is set. Set it just to be explicit.
-			Required: true,
-		},
-	)
+	desc, err := p.Descriptors().ByIDWithLeased(p.txn).Get().Desc(ctx, id)
 	if err != nil {
 		// Filter the error due to the descriptor not existing.
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
@@ -105,7 +94,7 @@ func (p *planner) checkDescriptorPermissions(ctx context.Context, id descpb.ID) 
 		return err
 	}
 	if err := p.CheckAnyPrivilege(ctx, desc); err != nil {
-		return pgerror.New(pgcode.InsufficientPrivilege, "insufficient privilege")
+		return pgerror.Wrapf(err, pgcode.InsufficientPrivilege, "insufficient privilege")
 	}
 	return nil
 }

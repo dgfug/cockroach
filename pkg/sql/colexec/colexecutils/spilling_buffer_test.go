@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -90,7 +85,7 @@ func TestSpillingBuffer(t *testing.T) {
 		// window into them.
 		var tuples *AppendOnlyBufferedBatch
 		// Create random input.
-		op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
+		op, _ := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 			NumBatches:        numBatches,
 			BatchSize:         inputBatchSize,
 			Nulls:             true,
@@ -107,8 +102,7 @@ func TestSpillingBuffer(t *testing.T) {
 		})
 		op.Init(ctx)
 
-		queueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-		queueCfg.SetDefaultBufferSizeBytesForCacheMode()
+		queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
 		queueCfg.TestingKnobs.AlwaysCompress = alwaysCompress
 
 		// We need to create a separate unlimited allocator for the spilling
@@ -121,8 +115,9 @@ func TestSpillingBuffer(t *testing.T) {
 		// Create buffer.
 		buf := NewSpillingBuffer(
 			spillingQueueUnlimitedAllocator, memoryLimit, queueCfg,
-			colexecop.NewTestingSemaphore(2), typs, testDiskAcc, colsToStore...,
+			colexecop.NewTestingSemaphore(2), typs, testDiskAcc, testMemAcc, colsToStore...,
 		)
+		defer buf.Close(ctx)
 		if setInMemTuplesLimit {
 			buf.testingKnobs.maxTuplesStoredInMemory = numBatches * inputBatchSize / 2
 		}
@@ -131,7 +126,7 @@ func TestSpillingBuffer(t *testing.T) {
 		testBatch := coldata.NewMemBatchNoCols(typesToStore, 0 /* capacity */)
 		oracleBatch := coldata.NewMemBatchNoCols(typesToStore, 0 /* capacity */)
 		checkWindowAtIndex := func(startIdx int) (nextIdx int) {
-			var vec coldata.Vec
+			var vec *coldata.Vec
 			var idx, length int
 			for i, colIdx := range colsToStore {
 				vec, idx, length = buf.GetVecWithTuple(ctx, i, startIdx)

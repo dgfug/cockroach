@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -17,9 +12,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/gorhill/cronexpr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +36,7 @@ func TestInlineExecutorFailedJobsHandling(t *testing.T) {
 	}{
 		{
 			onError:         jobspb.ScheduleDetails_RETRY_SCHED,
-			expectedNextRun: cronexpr.MustParse("@daily").Next(h.env.Now()).Round(time.Microsecond),
+			expectedNextRun: cronMustParse(t, "@daily").Next(h.env.Now()).Round(time.Microsecond),
 		},
 		{
 			onError:         jobspb.ScheduleDetails_RETRY_SOON,
@@ -58,15 +54,15 @@ func TestInlineExecutorFailedJobsHandling(t *testing.T) {
 			j.rec.ExecutorType = InlineExecutorName
 
 			require.NoError(t, j.SetSchedule("@daily"))
-			j.SetScheduleDetails(jobspb.ScheduleDetails{OnError: test.onError})
+			j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{OnError: test.onError}))
 
 			ctx := context.Background()
-			require.NoError(t, j.Create(ctx, h.cfg.InternalExecutor, nil))
+			require.NoError(t, ScheduledJobDB(h.cfg.DB).Create(ctx, j))
 
 			// Pretend we failed running; we expect job to be rescheduled.
-			require.NoError(t, NotifyJobTermination(
-				ctx, h.env, 123, StatusFailed, nil, j.ScheduleID(), h.cfg.InternalExecutor, nil))
-
+			require.NoError(t, h.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				return NotifyJobTermination(ctx, txn, h.env, 123, StatusFailed, nil, j.ScheduleID())
+			}))
 			// Verify nextRun updated
 			loaded := h.loadSchedule(t, j.ScheduleID())
 			require.Equal(t, test.expectedNextRun, loaded.NextRun())

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,7 +10,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
@@ -35,7 +29,7 @@ type unsplitRun struct {
 	lastUnsplitKey []byte
 }
 
-func (n *unsplitNode) startExec(params runParams) error {
+func (n *unsplitNode) startExec(runParams) error {
 	return nil
 }
 
@@ -88,30 +82,21 @@ type unsplitAllRun struct {
 
 func (n *unsplitAllNode) startExec(params runParams) error {
 	// Use the internal executor to retrieve the split keys.
-	statement := `
-		SELECT
-			start_key
-		FROM
-			crdb_internal.ranges_no_leases
-		WHERE
-			database_name=$1 AND table_name=$2 AND index_name=$3 AND split_enforced_until IS NOT NULL
-	`
-	dbDesc, err := catalogkv.MustGetDatabaseDescByID(
-		params.ctx, params.p.txn, params.ExecCfg().Codec, n.tableDesc.GetParentID(),
-	)
-	if err != nil {
-		return err
-	}
-	indexName := ""
-	if n.index.GetID() != n.tableDesc.GetPrimaryIndexID() {
-		indexName = n.index.GetName()
-	}
-	it, err := params.p.ExtendedEvalContext().InternalExecutor.(*InternalExecutor).QueryIteratorEx(
-		params.ctx, "split points query", params.p.txn, sessiondata.InternalExecutorOverride{},
+	const statement = `SELECT r.start_key
+FROM crdb_internal.ranges_no_leases r,
+     crdb_internal.index_spans s
+WHERE s.descriptor_id = $1
+  AND s.index_id = $2
+  AND s.start_key < r.end_key
+  AND s.end_key > r.start_key
+  AND r.start_key >= s.start_key -- only consider split points inside the table keyspace.
+  AND split_enforced_until IS NOT NULL`
+
+	it, err := params.p.InternalSQLTxn().QueryIteratorEx(
+		params.ctx, "split points query", params.p.txn, sessiondata.NoSessionDataOverride,
 		statement,
-		dbDesc.GetName(),
-		n.tableDesc.GetName(),
-		indexName,
+		n.tableDesc.GetID(),
+		n.index.GetID(),
 	)
 	if err != nil {
 		return err

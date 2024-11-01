@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -35,7 +31,7 @@ type streamGroupAccumulator struct {
 
 	// curGroup maintains the rows accumulated in the current group.
 	curGroup   []rowenc.EncDatumRow
-	datumAlloc rowenc.DatumAlloc
+	datumAlloc tree.DatumAlloc
 
 	// leftoverRow is the first row of the next group. It's saved in the
 	// accumulator after the current group is returned, so the accumulator can
@@ -65,7 +61,7 @@ func (s *streamGroupAccumulator) start(ctx context.Context) {
 // nextGroup returns the next group from the inputs. The returned slice is not safe
 // to use after the next call to nextGroup.
 func (s *streamGroupAccumulator) nextGroup(
-	ctx context.Context, evalCtx *tree.EvalContext,
+	ctx context.Context, evalCtx *eval.Context,
 ) ([]rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if s.srcConsumed {
 		// If src has been exhausted, then we also must have advanced away from the
@@ -101,7 +97,7 @@ func (s *streamGroupAccumulator) nextGroup(
 			continue
 		}
 
-		cmp, err := s.curGroup[0].Compare(s.types, &s.datumAlloc, s.ordering, evalCtx, row)
+		cmp, err := s.curGroup[0].Compare(ctx, s.types, &s.datumAlloc, s.ordering, evalCtx, row)
 		if err != nil {
 			return nil, &execinfrapb.ProducerMetadata{Err: err}
 		}

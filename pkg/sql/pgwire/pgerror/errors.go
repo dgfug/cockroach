@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgerror
 
@@ -37,6 +32,9 @@ func (pg *Error) ErrorDetail() string { return pg.Detail }
 // FullError can be used when the hint and/or detail are to be tested.
 func FullError(err error) string {
 	var errString string
+	if err == nil {
+		panic("FullError should not be called with nil input")
+	}
 	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
 		errString = formatMsgHintDetail("pq", pqErr.Message, pqErr.Hint, pqErr.Detail)
 	} else {
@@ -162,7 +160,7 @@ func IsSQLRetryableError(err error) bool {
 	// here.
 	errString := FullError(err)
 	matched, merr := regexp.MatchString(
-		"(no inbound stream connection|connection reset by peer|connection refused|failed to send RPC|rpc error: code = Unavailable|EOF|result is ambiguous)",
+		"(no inbound stream connection|connection reset by peer|connection refused|failed to send RPC|rpc error: code = Unavailable|(^|\\s)EOF|result is ambiguous)",
 		errString)
 	if merr != nil {
 		return false

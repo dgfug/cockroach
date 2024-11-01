@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func intToEncodedInvertedVal(v int64) []byte {
@@ -38,6 +34,7 @@ func intSpanToEncodedSpan(start, end int64) inverted.SpanExpressionProto_Span {
 
 func TestInvertedFilterer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Tests do simple intersection and reordering of columns, to exercise the
 	// plumbing in invertedFilterer -- all the heavy lifting for filtering is
@@ -123,7 +120,7 @@ func TestInvertedFilterer(t *testing.T) {
 	}
 	// Setup test environment.
 	ctx := context.Background()
-	server, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer server.Stopper().Stop(ctx)
 	testConfig := DefaultProcessorTestConfig()
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, testConfig.FlowCtx.Cfg.Settings)
@@ -131,8 +128,8 @@ func TestInvertedFilterer(t *testing.T) {
 	testConfig.FlowCtx.DiskMonitor = diskMonitor
 	testConfig.FlowCtx.Txn = kv.NewTxn(ctx, server.DB(), server.NodeID())
 	test := MakeProcessorTest(testConfig)
+	defer test.Close(ctx)
 
 	// Run test.
 	test.RunTestCases(ctx, t, testCases)
-	test.Close(ctx)
 }

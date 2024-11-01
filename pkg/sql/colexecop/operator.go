@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecop
 
@@ -16,9 +11,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/errors"
 )
 
@@ -49,13 +44,13 @@ type Operator interface {
 	// component that will catch that panic.
 	Next() coldata.Batch
 
-	execinfra.OpNode
+	execopnode.OpNode
 }
 
-// DrainableOperator is an operator that also implements DrainMeta. Next and
-// DrainMeta may not be called concurrently.
-type DrainableOperator interface {
-	Operator
+// DrainableClosableOperator is a ClosableOperator that also implements
+// DrainMeta. Next, DrainMeta, and Close may not be called concurrently.
+type DrainableClosableOperator interface {
+	ClosableOperator
 	MetadataSource
 }
 
@@ -66,49 +61,64 @@ type KVReader interface {
 	// GetBytesRead returns the number of bytes read from KV by this operator.
 	// It must be safe for concurrent use.
 	GetBytesRead() int64
+	// GetKVPairsRead returns the number of key-values pairs read from KV by
+	// this operator. It must be safe for concurrent use.
+	GetKVPairsRead() int64
 	// GetRowsRead returns the number of rows read from KV by this operator.
 	// It must be safe for concurrent use.
 	GetRowsRead() int64
-	// GetCumulativeContentionTime returns the amount of time KV reads spent
+	// GetBatchRequestsIssued returns the number of BatchRequests issued to KV
+	// by this operator. It must be safe for concurrent use.
+	GetBatchRequestsIssued() int64
+	// GetContentionTime returns the amount of time KV reads spent
 	// contending. It must be safe for concurrent use.
-	GetCumulativeContentionTime() time.Duration
+	GetContentionTime() time.Duration
 	// GetScanStats returns statistics about the scan that happened during the
 	// KV reads. It must be safe for concurrent use.
-	GetScanStats() execinfra.ScanStats
+	GetScanStats() execstats.ScanStats
+	// GetConsumedRU returns the number of RUs that were consumed during the
+	// KV reads.
+	GetConsumedRU() uint64
+	// GetKVCPUTime returns the CPU time consumed *on the current goroutine* by
+	// KV requests. It must be safe for concurrent use. It is used to calculate
+	// the SQL CPU time.
+	GetKVCPUTime() time.Duration
+	// UsedStreamer returns whether the Streamer API was used by the KVReader.
+	UsedStreamer() bool
 }
 
-// ZeroInputNode is an execinfra.OpNode with no inputs.
+// ZeroInputNode is an execopnode.OpNode with no inputs.
 type ZeroInputNode struct{}
 
-// ChildCount implements the execinfra.OpNode interface.
+// ChildCount implements the execopnode.OpNode interface.
 func (ZeroInputNode) ChildCount(verbose bool) int {
 	return 0
 }
 
-// Child implements the execinfra.OpNode interface.
-func (ZeroInputNode) Child(nth int, verbose bool) execinfra.OpNode {
+// Child implements the execopnode.OpNode interface.
+func (ZeroInputNode) Child(nth int, verbose bool) execopnode.OpNode {
 	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
 
-// NewOneInputNode returns an execinfra.OpNode with a single Operator input.
+// NewOneInputNode returns an execopnode.OpNode with a single Operator input.
 func NewOneInputNode(input Operator) OneInputNode {
 	return OneInputNode{Input: input}
 }
 
-// OneInputNode is an execinfra.OpNode with a single Operator input.
+// OneInputNode is an execopnode.OpNode with a single Operator input.
 type OneInputNode struct {
 	Input Operator
 }
 
-// ChildCount implements the execinfra.OpNode interface.
+// ChildCount implements the execopnode.OpNode interface.
 func (OneInputNode) ChildCount(verbose bool) int {
 	return 1
 }
 
-// Child implements the execinfra.OpNode interface.
-func (n OneInputNode) Child(nth int, verbose bool) execinfra.OpNode {
+// Child implements the execopnode.OpNode interface.
+func (n OneInputNode) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return n.Input
 	}
@@ -117,14 +127,29 @@ func (n OneInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	return nil
 }
 
+// BufferingOpReuseMode determines whether the BufferingInMemoryOperator can be
+// reused after ExportBuffered call (after being Reset).
+type BufferingOpReuseMode int
+
+const (
+	// BufferingOpNoReuse indicates that the BufferingInMemoryOperator will
+	// **not** be reused after ExportBuffered call, so any memory resources
+	// could be fully released.
+	BufferingOpNoReuse BufferingOpReuseMode = iota
+	// BufferingOpCanReuse indicates that the BufferingInMemoryOperator _might_
+	// be reused after ExportBuffered call, so all memory resources should be
+	// preserved.
+	BufferingOpCanReuse
+)
+
 // BufferingInMemoryOperator is an Operator that buffers up intermediate tuples
 // in memory and knows how to export them once the memory limit has been
 // reached.
 type BufferingInMemoryOperator interface {
 	Operator
 
-	// ExportBuffered returns all the batches that have been buffered up from the
-	// input and have not yet been processed by the operator. It needs to be
+	// ExportBuffered returns all the batches that have been buffered up from
+	// the input and have not yet been processed by the operator. It needs to be
 	// called once the memory limit has been reached in order to "dump" the
 	// buffered tuples into a disk-backed operator. It will return a zero-length
 	// batch once the buffer has been emptied.
@@ -132,6 +157,23 @@ type BufferingInMemoryOperator interface {
 	// Calling ExportBuffered may invalidate the contents of the last batch
 	// returned by ExportBuffered.
 	ExportBuffered(input Operator) coldata.Batch
+	// ReleaseBeforeExport allows to operators to free up the in-memory
+	// resources that they no longer need, except for those that are needed for
+	// exporting the buffered tuples.
+	//
+	// It will only be called when the operator is used in the
+	// BufferingOpNoReuse mode. All calls except for the first one should be a
+	// noop.
+	ReleaseBeforeExport()
+	// ReleaseAfterExport allows to operators to free up the in-memory resources
+	// that they used for exporting the buffered tuples (and don't need
+	// anymore).
+	//
+	// It will only be called when the operator is used in the
+	// BufferingOpNoReuse mode. All calls except for the first one should be a
+	// noop. Calling this method may invalidate the contents of the last batch
+	// returned by ExportBuffered. ExportBuffered won't be called after this.
+	ReleaseAfterExport(input Operator)
 }
 
 // Closer is an object that releases resources when Close is called. Note that
@@ -143,39 +185,26 @@ type BufferingInMemoryOperator interface {
 type Closer interface {
 	// Close releases the resources associated with this Closer. If this Closer
 	// is an Operator, the implementation of Close must be safe to execute even
-	// if Operator.Init wasn't called.
+	// if Operator.Init wasn't called. Multiple calls to Close() are allowed,
+	// and most of the implementations should make all calls except for the
+	// first one no-ops.
 	//
-	// If this Closer is an execinfra.Releasable, the implementation must be
-	// safe to execute even after Release() was called.
-	// TODO(yuzefovich): refactor this because the Release()'d objects should
-	// not be used anymore.
-	Close() error
+	// Unless the Closer derives its own context with a separate tracing span,
+	// the argument context rather than the one from Init() must be used
+	// (wherever necessary) by the implementation. This is so since the span in
+	// the context from Init() might be already finished when Close() is called
+	// whereas the argument context will contain an unfinished span.
+	Close(context.Context) error
 }
 
 // Closers is a slice of Closers.
 type Closers []Closer
 
-// CloseAndLogOnErr closes all Closers and logs the error if the log verbosity
-// is 1 or higher. The given prefix is prepended to the log message.
-// Note: this method should *only* be used when returning an error doesn't make
-// sense.
-func (c Closers) CloseAndLogOnErr(ctx context.Context, prefix string) {
-	if err := colexecerror.CatchVectorizedRuntimeError(func() {
-		for _, closer := range c {
-			if err := closer.Close(); err != nil && log.V(1) {
-				log.Infof(ctx, "%s: error closing Closer: %v", prefix, err)
-			}
-		}
-	}); err != nil && log.V(1) {
-		log.Infof(ctx, "%s: runtime error closing the closers: %v", prefix, err)
-	}
-}
-
 // Close closes all Closers and returns the last error (if any occurs).
-func (c Closers) Close() error {
+func (c Closers) Close(ctx context.Context) error {
 	var lastErr error
 	for _, closer := range c {
-		if err := closer.Close(); err != nil {
+		if err := closer.Close(ctx); err != nil {
 			lastErr = err
 		}
 	}
@@ -269,7 +298,7 @@ func MakeOneInputHelper(input Operator) OneInputHelper {
 	}
 }
 
-// OneInputHelper is an execinfra.OpNode which only needs to initialize its
+// OneInputHelper is an execopnode.OpNode which only needs to initialize its
 // single Operator input in Init().
 type OneInputHelper struct {
 	OneInputNode
@@ -321,7 +350,7 @@ func MakeOneInputCloserHelper(input Operator) OneInputCloserHelper {
 	}
 }
 
-// OneInputCloserHelper is an execinfra.OpNode with a single Operator input
+// OneInputCloserHelper is an execopnode.OpNode with a single Operator input
 // that might need to be Close()'d.
 type OneInputCloserHelper struct {
 	OneInputNode
@@ -331,12 +360,12 @@ type OneInputCloserHelper struct {
 var _ Closer = &OneInputCloserHelper{}
 
 // Close implements the Closer interface.
-func (c *OneInputCloserHelper) Close() error {
+func (c *OneInputCloserHelper) Close(ctx context.Context) error {
 	if !c.CloserHelper.Close() {
 		return nil
 	}
 	if closer, ok := c.Input.(Closer); ok {
-		return closer.Close()
+		return closer.Close(ctx)
 	}
 	return nil
 }
@@ -348,7 +377,7 @@ func MakeOneInputInitCloserHelper(input Operator) OneInputInitCloserHelper {
 	}
 }
 
-// OneInputInitCloserHelper is an execinfra.OpNode that only needs to initialize
+// OneInputInitCloserHelper is an execopnode.OpNode that only needs to initialize
 // its single Operator input in Init() and might need to Close() it too.
 type OneInputInitCloserHelper struct {
 	InitHelper
@@ -361,6 +390,55 @@ func (h *OneInputInitCloserHelper) Init(ctx context.Context) {
 		return
 	}
 	h.Input.Init(h.Ctx)
+}
+
+// MakeTwoInputInitHelper returns a new TwoInputInitHelper.
+func MakeTwoInputInitHelper(inputOne, inputTwo Operator) TwoInputInitHelper {
+	return TwoInputInitHelper{InputOne: inputOne, InputTwo: inputTwo}
+}
+
+// TwoInputInitHelper is an extension of InitHelper that additionally also is an
+// execopnode.OpNode with two Operator inputs and provides a reset helper.
+type TwoInputInitHelper struct {
+	InitHelper
+	InputOne Operator
+	InputTwo Operator
+}
+
+// Init initializes both inputs and returns true if this is the first time Init
+// was called.
+func (h *TwoInputInitHelper) Init(ctx context.Context) bool {
+	if !h.InitHelper.Init(ctx) {
+		return false
+	}
+	h.InputOne.Init(h.Ctx)
+	h.InputTwo.Init(h.Ctx)
+	return true
+}
+
+func (h *TwoInputInitHelper) ChildCount(verbose bool) int {
+	return 2
+}
+
+func (h *TwoInputInitHelper) Child(nth int, verbose bool) execopnode.OpNode {
+	switch nth {
+	case 0:
+		return h.InputOne
+	case 1:
+		return h.InputTwo
+	}
+	colexecerror.InternalError(errors.AssertionFailedf("invalid idx %d", nth))
+	// This code is unreachable, but the compiler cannot infer that.
+	return nil
+}
+
+func (h *TwoInputInitHelper) Reset(ctx context.Context) {
+	if r, ok := h.InputOne.(Resetter); ok {
+		r.Reset(ctx)
+	}
+	if r, ok := h.InputTwo.(Resetter); ok {
+		r.Reset(ctx)
+	}
 }
 
 type noopOperator struct {

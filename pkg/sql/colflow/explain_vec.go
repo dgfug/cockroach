@@ -1,31 +1,24 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow
 
 import (
 	"context"
-	"math"
 	"reflect"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 )
@@ -33,51 +26,55 @@ import (
 // convertToVecTree converts the flow to a tree of vectorized operators
 // returning a list of the leap operators or an error if the flow vectorization
 // is not supported. Note that it does so by setting up the full flow without
-// running the components asynchronously, so it is pretty expensive.
-// It also returns a non-nil cleanup function that releases all
-// execinfra.Releasable objects which can *only* be performed once opChains are
-// no longer needed.
+// running the components asynchronously, so it is pretty expensive. It also
+// returns a non-nil cleanup function that closes all the closers as well as
+// releases all execreleasable.Releasable objects which can *only* be performed
+// once opChains are no longer needed.
 func convertToVecTree(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	flow *execinfrapb.FlowSpec,
 	localProcessors []execinfra.LocalProcessor,
-	isPlanLocal bool,
-) (opChains execinfra.OpChains, cleanup func(), err error) {
-	if !isPlanLocal && len(localProcessors) > 0 {
+	recordingStats bool,
+) (opChains execopnode.OpChains, cleanup func(), err error) {
+	if !flowCtx.Local && len(localProcessors) > 0 {
 		return nil, func() {}, errors.AssertionFailedf("unexpectedly non-empty LocalProcessors when plan is not local")
 	}
+	flowBase := flowinfra.NewFlowBase(
+		*flowCtx,
+		nil,                     /* sp */
+		nil,                     /* flowReg */
+		&execinfra.RowChannel{}, /* rowSyncFlowConsumer */
+		// We optimistically assume that sql.DistSQLReceiver can be used as an
+		// execinfra.BatchReceiver, so we always pass in a fakeBatchReceiver to
+		// the creator.
+		&fakeBatchReceiver{},
+		localProcessors,
+		nil,       /* localVectorSources */
+		func() {}, /* onFlowCleanupEnd */
+		"",        /* statementSQL */
+	)
+	creator := newVectorizedFlowCreator(
+		flowBase, nil /* componentCreator */, recordingStats,
+		colcontainer.DiskQueueCfg{}, flowCtx.Cfg.VecFDSemaphore,
+	)
 	fuseOpt := flowinfra.FuseNormally
-	if isPlanLocal && !execinfra.HasParallelProcessors(flow) {
+	if flowCtx.Local && !execinfra.HasParallelProcessors(flow) {
+		// TODO(yuzefovich): this check doesn't exactly match what we have on
+		// the main code path where we use !LocalState.MustUseLeafTxn() in the
+		// conditional. Concretely, it means that if we choose to use the
+		// Streamer at the execution time, we will use FuseNormally, yet here
+		// we'd pick FuseAggressively. The issue is minor though since we do
+		// capture the correct vectorized plan in the stmt bundle, so only
+		// explicit EXPLAIN (VEC) is affected.
 		fuseOpt = flowinfra.FuseAggressively
 	}
-	// We optimistically assume that sql.DistSQLReceiver can be used as an
-	// execinfra.BatchReceiver, so we always pass in a fakeBatchReceiver to the
-	// creator.
-	creator := newVectorizedFlowCreator(
-		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false, false,
-		nil, &execinfra.RowChannel{}, &fakeBatchReceiver{}, flowCtx.Cfg.NodeDialer, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-		flowCtx.Cfg.VecFDSemaphore, flowCtx.TypeResolverFactory.NewTypeResolver(flowCtx.EvalCtx.Txn),
-		admission.WorkInfo{},
-	)
-	// We create an unlimited memory account because we're interested whether the
-	// flow is supported via the vectorized engine in general (without paying
-	// attention to the memory since it is node-dependent in the distributed
-	// case).
-	memoryMonitor := mon.NewMonitor(
-		"convert-to-vec-tree",
-		mon.MemoryResource,
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		-1,            /* increment */
-		math.MaxInt64, /* noteworthy */
-		flowCtx.Cfg.Settings,
-	)
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
-	defer memoryMonitor.Stop(ctx)
-	defer creator.cleanup(ctx)
-	opChains, _, err = creator.setupFlow(ctx, flowCtx, flow.Processors, localProcessors, fuseOpt)
-	return opChains, creator.Release, err
+	opChains, _, err = creator.setupFlow(ctx, flow.Processors, fuseOpt)
+	cleanup = func() {
+		creator.cleanup(ctx)
+		creator.Release()
+	}
+	return opChains, cleanup, err
 }
 
 // fakeBatchReceiver exists for the sole purpose of convertToVecTree method. In
@@ -95,8 +92,8 @@ func (f fakeBatchReceiver) PushBatch(
 }
 
 type flowWithNode struct {
-	nodeID roachpb.NodeID
-	flow   *execinfrapb.FlowSpec
+	sqlInstanceID base.SQLInstanceID
+	flow          *execinfrapb.FlowSpec
 }
 
 // ExplainVec converts the flows (that are assumed to be vectorizable) into the
@@ -105,83 +102,74 @@ type flowWithNode struct {
 // It also supports printing of already constructed operator chains which takes
 // priority if non-nil (flows are ignored). All operators in opChains are
 // assumed to be planned on the gateway.
-//
-// As the second return parameter it returns a non-nil cleanup function which
-// can be called only **after** closing the planNode tree containing the
-// explainVecNode (if ExplainVec is used by another caller, then it can be
-// called at any time).
 func ExplainVec(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
-	flows map[roachpb.NodeID]*execinfrapb.FlowSpec,
+	flows map[base.SQLInstanceID]*execinfrapb.FlowSpec,
 	localProcessors []execinfra.LocalProcessor,
-	opChains execinfra.OpChains,
-	gatewayNodeID roachpb.NodeID,
+	opChains execopnode.OpChains,
+	gatewaySQLInstanceID base.SQLInstanceID,
 	verbose bool,
-	distributed bool,
-) (_ []string, cleanup func(), _ error) {
+	recordingStats bool,
+) ([]string, error) {
 	tp := treeprinter.NewWithStyle(treeprinter.CompactStyle)
 	root := tp.Child("│")
-	var (
-		cleanups      []func()
-		err           error
-		conversionErr error
-	)
-	defer func() {
-		cleanup = func() {
-			for _, c := range cleanups {
-				c()
-			}
-		}
-	}()
-	// It is possible that when iterating over execinfra.OpNodes we will hit a
+	var err error
+	var conversionErr error
+	// It is possible that when iterating over execopnode.OpNodes we will hit a
 	// panic (an input that doesn't implement OpNode interface), so we're
 	// catching such errors.
 	if err = colexecerror.CatchVectorizedRuntimeError(func() {
 		if opChains != nil {
-			formatChains(root, gatewayNodeID, opChains, verbose)
+			formatChains(root, gatewaySQLInstanceID, opChains, verbose)
 		} else {
 			sortedFlows := make([]flowWithNode, 0, len(flows))
 			for nodeID, flow := range flows {
-				sortedFlows = append(sortedFlows, flowWithNode{nodeID: nodeID, flow: flow})
+				sortedFlows = append(sortedFlows, flowWithNode{sqlInstanceID: nodeID, flow: flow})
 			}
 			// Sort backward, since the first thing you add to a treeprinter will come
 			// last.
-			sort.Slice(sortedFlows, func(i, j int) bool { return sortedFlows[i].nodeID < sortedFlows[j].nodeID })
+			sort.Slice(sortedFlows, func(i, j int) bool { return sortedFlows[i].sqlInstanceID < sortedFlows[j].sqlInstanceID })
 			for _, flow := range sortedFlows {
-				opChains, cleanup, err = convertToVecTree(ctx, flowCtx, flow.flow, localProcessors, !distributed)
-				cleanups = append(cleanups, cleanup)
+				var cleanup func()
+				opChains, cleanup, err = convertToVecTree(ctx, flowCtx, flow.flow, localProcessors, recordingStats)
+				// We need to delay the cleanup until after the tree has been
+				// formatted.
+				defer cleanup()
 				if err != nil {
 					conversionErr = err
 					return
 				}
-				formatChains(root, flow.nodeID, opChains, verbose)
+				formatChains(root, flow.sqlInstanceID, opChains, verbose)
 			}
 		}
 	}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if conversionErr != nil {
-		return nil, nil, conversionErr
+		return nil, conversionErr
 	}
-	return tp.FormattedRows(), nil, nil
+	return tp.FormattedRows(), nil
 }
 
 func formatChains(
-	root treeprinter.Node, nodeID roachpb.NodeID, opChains execinfra.OpChains, verbose bool,
+	root treeprinter.Node,
+	sqlInstanceID base.SQLInstanceID,
+	opChains execopnode.OpChains,
+	verbose bool,
 ) {
-	node := root.Childf("Node %d", nodeID)
+	node := root.Childf("Node %d", sqlInstanceID)
 	for _, op := range opChains {
 		formatOpChain(op, node, verbose)
 	}
 }
 
-func shouldOutput(operator execinfra.OpNode, verbose bool) bool {
+func shouldOutput(operator execopnode.OpNode, verbose bool) bool {
 	_, nonExplainable := operator.(colexecop.NonExplainable)
 	return !nonExplainable || verbose
 }
 
-func formatOpChain(operator execinfra.OpNode, node treeprinter.Node, verbose bool) {
+func formatOpChain(operator execopnode.OpNode, node treeprinter.Node, verbose bool) {
 	seenOps := make(map[reflect.Value]struct{})
 	if shouldOutput(operator, verbose) {
 		doFormatOpChain(operator, node.Child(reflect.TypeOf(operator).String()), verbose, seenOps)
@@ -190,7 +178,7 @@ func formatOpChain(operator execinfra.OpNode, node treeprinter.Node, verbose boo
 	}
 }
 func doFormatOpChain(
-	operator execinfra.OpNode,
+	operator execopnode.OpNode,
 	node treeprinter.Node,
 	verbose bool,
 	seenOps map[reflect.Value]struct{},

@@ -1,485 +1,326 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
-	"net/url"
-	"strconv"
+	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/mixedversion"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
-	"github.com/stretchr/testify/require"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/errors"
 )
 
 func registerMultiTenantUpgrade(r registry.Registry) {
 	r.Add(registry.TestSpec{
-		Name:              "multitenant-upgrade",
-		Cluster:           r.MakeClusterSpec(2),
-		Owner:             registry.OwnerKV,
-		NonReleaseBlocker: false,
+		Name:             "multitenant-upgrade",
+		Timeout:          5 * time.Hour,
+		Cluster:          r.MakeClusterSpec(7),
+		CompatibleClouds: registry.CloudsWithServiceRegistration,
+		Suites:           registry.Suites(registry.Nightly),
+		Owner:            registry.OwnerDisasterRecovery,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runMultiTenantUpgrade(ctx, t, c, *t.BuildVersion())
+			runMultitenantUpgrade(ctx, t, c)
 		},
 	})
 }
 
-// tenantNode corresponds to a running tenant.
-type tenantNode struct {
-	tenantID          int
-	httpPort, sqlPort int
-	kvAddrs           []string
-	pgURL             string
-
-	binary string // the binary last passed to start()
-	errCh  chan error
-	node   int
-
-	// When starting a <=21.1 tenant, this needs to be set
-	// to avoid passing unsupported flags during start().
-	doesNotSupportStoreFlag bool
+// tenantUpgradeStatus encapsulates data about each tenant created
+// during `multitenant-upgrade`.
+type tenantUpgradeStatus struct {
+	name    string
+	nodes   option.NodeListOption
+	running bool
 }
 
-func createTenantNode(kvAddrs []string, tenantID, node, httpPort, sqlPort int) *tenantNode {
-	tn := &tenantNode{
-		tenantID: tenantID,
-		httpPort: httpPort,
-		kvAddrs:  kvAddrs,
-		node:     node,
-		sqlPort:  sqlPort,
+func (tus tenantUpgradeStatus) pgurl() string {
+	return fmt.Sprintf("{pgurl%s:%s}", tus.nodes, tus.name)
+}
+
+type tenantUpgradeStatuses []*tenantUpgradeStatus
+
+func (ts tenantUpgradeStatuses) String() string {
+	var tenantLines []string
+	for _, t := range ts {
+		tenantLines = append(tenantLines, fmt.Sprintf("- %s, deployed on nodes %v", t.name, t.nodes))
 	}
-	return tn
+
+	return fmt.Sprintf("%d tenants:\n%s", len(ts), strings.Join(tenantLines, "\n"))
 }
 
-func (tn *tenantNode) stop(ctx context.Context, t test.Test, c cluster.Cluster) {
-	if tn.errCh == nil {
-		return
-	}
-	// Must use pkill because the context cancellation doesn't wait for the
-	// process to exit.
-	c.Run(ctx, c.Node(tn.node),
-		fmt.Sprintf("pkill -o -f '^%s mt start.*tenant-id=%d'", tn.binary, tn.tenantID))
-	t.L().Printf("mt cluster exited: %v", <-tn.errCh)
-	tn.errCh = nil
-}
-
-func (tn *tenantNode) logDir() string {
-	return fmt.Sprintf("logs/mt-%d", tn.tenantID)
-}
-
-func (tn *tenantNode) storeDir() string {
-	return fmt.Sprintf("cockroach-data-mt-%d", tn.tenantID)
-}
-
-func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster, binary string) {
-	tn.binary = binary
-	extraArgs := []string{"--log-dir=" + tn.logDir()}
-	if !tn.doesNotSupportStoreFlag {
-		extraArgs = append(extraArgs, "--store="+tn.storeDir())
-	}
-	tn.errCh = startTenantServer(
-		ctx, c, c.Node(tn.node), binary, tn.kvAddrs, tn.tenantID,
-		tn.httpPort, tn.sqlPort,
-		extraArgs...,
+// runMultitenantUpgrade exercises upgrades when there are multiple
+// separate-process tenants being upgraded at the same time. We start
+// a random number of tenants when the storage cluster may be in
+// mixed-version then, once the storage cluster finalizes the
+// uprgade, we upgrade every tenant in parallel. The test also runs
+// TPCC on the tenants for some time to make sure they continue to
+// serve traffic without problems.
+func runMultitenantUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
+	const (
+		numStorageNodes           = 4
+		numWarehouses             = 10
+		minTenants, maxTenants    = 3, 5
+		startOnStartupProbability = 0.5
 	)
-	externalUrls, err := c.ExternalPGUrl(ctx, c.Node(tn.node))
-	require.NoError(t, err)
-	u, err := url.Parse(externalUrls[0])
-	require.NoError(t, err)
-	internalUrls, err := c.ExternalIP(ctx, c.Node(tn.node))
-	require.NoError(t, err)
-	u.Host = internalUrls[0] + ":" + strconv.Itoa(tn.sqlPort)
-	tn.pgURL = u.String()
 
-	// The tenant is usually responsive ~right away, but it
-	// has on occasions taken more than 3s for it to connect
-	// to the KV layer, and it won't open the SQL port until
-	// it has.
-	if err := retry.ForDuration(45*time.Second, func() error {
-		select {
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		case err := <-tn.errCh:
-			t.Fatal(err)
-		default:
+	var (
+		storageNodes = c.Range(1, numStorageNodes)
+		tenantNodes  = c.Range(numStorageNodes+1, len(c.CRDBNodes()))
+		tpccDuration = 5 * time.Minute
+	)
+
+	mvt := mixedversion.NewTest(ctx, t, t.L(), c, storageNodes,
+		// 23.1 releases have a frequent "use of Span after finish" bug
+		// in separate-process tenants. Avoid hitting that.
+		mixedversion.MinimumSupportedVersion("v23.2.0"),
+		// We only upgrade the system. Creation and upgrades of tenants is
+		// managed by the test.
+		mixedversion.EnabledDeploymentModes(mixedversion.SystemOnlyDeployment),
+		// Closer to a Serverless deployment.
+		mixedversion.AlwaysUseLatestPredecessors,
+	)
+
+	tenants := makeTenants(mvt.RNG(), minTenants, maxTenants, tenantNodes)
+	t.L().Printf("%s", tenants)
+
+	// startTenant starts the SQL server process for the given `tenant`
+	// on the passed version. If `initWorkload` is true, we also
+	// initialize the `tpcc` workload on the tenant.
+	startTenant := func(
+		ctx context.Context, l *logger.Logger, tenant *tenantUpgradeStatus, v *clusterupgrade.Version, initWorkload bool,
+	) error {
+		l.Printf("starting %s on version %s", tenant.name, v)
+		startOpts := option.StartVirtualClusterOpts(
+			tenant.name, tenant.nodes, option.NoBackupSchedule,
+		)
+		binaryPath, err := clusterupgrade.UploadCockroach(ctx, t, l, c, tenant.nodes, v)
+		if err != nil {
+			return errors.Wrapf(err, "uploading cockroach %s", v)
 		}
 
-		db, err := gosql.Open("postgres", tn.pgURL)
-		if err != nil {
+		if err := c.StartServiceForVirtualClusterE(
+			ctx, l, startOpts, install.MakeClusterSettings(install.BinaryOption(binaryPath)),
+		); err != nil {
 			return err
 		}
-		defer db.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer cancel()
-		_, err = db.ExecContext(ctx, `SELECT 1`)
-		return err
-	}); err != nil {
-		t.Fatal(err)
+
+		tenant.running = true
+
+		if initWorkload {
+			l.Printf("initializing tpcc on %s", tenant.name)
+			cmd := fmt.Sprintf(
+				"%s workload init tpcc --warehouses %d %s",
+				binaryPath, numWarehouses, tenant.pgurl(),
+			)
+			return c.RunE(ctx, option.WithNodes(c.Node(tenant.nodes[0])), cmd)
+		}
+
+		return nil
 	}
 
-	t.L().Printf("sql server for tenant %d running at %s", tn.tenantID, tn.pgURL)
-}
-
-// runMultiTenantUpgrade exercises upgrading tenants and their host cluster.
-//
-// Sketch of the test:
-//
-//  * Host{Binary: Prev, Cluster: Prev}: Start host cluster.
-//  * Tenant11{Binary: Prev, Cluster: Prev}: Create tenant 11 and verify it works.
-//  * Host{Binary: Cur, Cluster: Prev}: Upgrade host cluster (don't finalize).
-//  * Tenant11{Binary: Prev, Cluster: Prev}: Verify tenant 11 still works.
-//  * Tenant12{Binary: Prev, Cluster: Prev}: Create tenant 12 and verify it works.
-//  * Tenant13{Binary: Cur, Cluster: Prev}: Create tenant 13 and verify it works.
-//  * Tenant11{Binary: Cur, Cluster: Prev}: Upgrade tenant 11 binary and verify it works.
-//  * Tenant11{Binary: Cur, Cluster: Cur}: Run the version upgrade for the tenant 11.
-//     * This is supported but not necessarily desirable. Exercise it just to
-//       show that it doesn't explode. This will verify new guard-rails when
-//       and if they are added.
-//  * Host{Binary: Cur, Cluster: Cur}: Finalize the upgrade on the host.
-//  * Tenant12{Binary: Cur, Cluster: Prev}: Upgrade the tenant 12 binary.
-//  * Tenant12{Binary: Cur, Cluster: Cur}: Run the version upgrade for tenant 12.
-//  * Tenant12{Binary: Cur, Cluster: Cur}: Restart tenant 12 and make sure it still works.
-//  * Tenant13{Binary: Cur, Cluster: Cur}: Run the version upgrade for tenant 13.
-//  * Tenant12{Binary: Cur, Cluster: Cur}: Restart tenant 13 and make sure it still works.
-//  * Tenant14{Binary: Cur, Cluster: Cur}: Create tenant 14 and verify it works.
-//  * Tenant12{Binary: Cur, Cluster: Cur}: Restart tenant 14 and make sure it still works.
-func runMultiTenantUpgrade(ctx context.Context, t test.Test, c cluster.Cluster, v version.Version) {
-	predecessor, err := PredecessorVersion(v)
-	require.NoError(t, err)
-
-	currentBinary := uploadVersion(ctx, t, c, c.All(), "")
-	predecessorBinary := uploadVersion(ctx, t, c, c.All(), predecessor)
-
-	kvNodes := c.Node(1)
-
-	c.Start(ctx, kvNodes, option.StartArgs("--binary="+predecessorBinary))
-
-	kvAddrs, err := c.ExternalAddr(ctx, kvNodes)
-	require.NoError(t, err)
-
-	const tenant11HTTPPort, tenant11SQLPort = 8011, 20011
-	const tenant11ID = 11
-	runner := sqlutils.MakeSQLRunner(c.Conn(ctx, 1))
-	// We'll sometimes have to wait out the backoff of the host cluster
-	// auto-update loop (at the time of writing 30s), plus some migrations may be
-	// genuinely long-running.
-	runner.SucceedsSoonDuration = 5 * time.Minute
-	runner.Exec(t, `SELECT crdb_internal.create_tenant($1)`, tenant11ID)
-
-	var initialVersion string
-	runner.QueryRow(t, "SHOW CLUSTER SETTING version").Scan(&initialVersion)
-
-	const tenantNode = 2
-	tenant11 := createTenantNode(kvAddrs, tenant11ID, tenantNode, tenant11HTTPPort, tenant11SQLPort)
-	tenant11.doesNotSupportStoreFlag = true // can be removed when predecessorBinary is 21.2
-	tenant11.start(ctx, t, c, predecessorBinary)
-	defer tenant11.stop(ctx, t, c)
-
-	t.Status("checking that a client can connect to the tenant 11 server")
-	verifySQL(t, tenant11.pgURL,
-		mkStmt(`CREATE TABLE foo (id INT PRIMARY KEY, v STRING)`),
-		mkStmt(`INSERT INTO foo VALUES($1, $2)`, 1, "bar"),
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}))
-
-	var needsWorkaround bool
-	if v, err := version.Parse("v" + predecessor); err != nil {
-		t.Fatal(err)
-	} else if !v.AtLeast(version.MustParse("v21.1.2")) {
-		// Tenant upgrades are only fully functional when starting out at version
-		// v21.1.2, which includes #64488. That PR is responsible for giving tenants
-		// the initial cluster version, which is thus absent here.
-		//
-		// Without this workaround, the tenant would report a cluster version of
-		// 20.2 which is going to trip up the test by making the read/write of the
-		// cluster setting fail (after a time out), and also leading to an
-		// ill-advised 20.2 cluster version reported for the tenant (once we run the
-		// current binary). We won't actually upgrade tenants in production in
-		// scenarios in which this branch is active (the host cluster will be at the
-		// latest patch release before attempting an upgrade, which is going to be
-		// at least 21.1.2).
-		//
-		// This can be deleted once PredecessorVersion(21.2) is >= 21.1.2.
-		needsWorkaround = true
+	// stopTenant performs a graceful stop of the SQL server process of
+	// every node where it is running.
+	stopTenant := func(
+		ctx context.Context, l *logger.Logger, tenant *tenantUpgradeStatus,
+	) error {
+		l.Printf("stopping %s", tenant.name)
+		stopOpts := option.StopVirtualClusterOpts(
+			tenant.name, tenant.nodes, option.Graceful(shutdownGracePeriod),
+		)
+		return c.StopServiceForVirtualClusterE(ctx, l, stopOpts)
 	}
 
-	if !needsWorkaround {
-		verifySQL(t, tenant11.pgURL,
-			mkStmt("SHOW CLUSTER SETTING version").
-				withResults([][]string{{initialVersion}}),
+	// forEachTenant is a helper function that runs the function `fn` in
+	// parallel for every tenant created for this test. Returns a
+	// channel that is closed once `fn` finishes on every tenant.
+	forEachTenant := func(
+		desc string,
+		ctx context.Context,
+		h *mixedversion.Helper,
+		fn func(context.Context, *logger.Logger, *tenantUpgradeStatus) error,
+	) chan struct{} {
+		var wg sync.WaitGroup
+		wg.Add(len(tenants))
+
+		for _, tenant := range tenants {
+			h.Background(
+				fmt.Sprintf("%s: %s", desc, tenant.name),
+				func(ctx context.Context, l *logger.Logger) error {
+					defer wg.Done()
+					return fn(ctx, l, tenant)
+				},
+			)
+		}
+
+		returnCh := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(returnCh)
+		}()
+
+		return returnCh
+	}
+
+	// runTPCC runs a light TPCC workload on every tenant in
+	// parallel. The returned channel is closed once the workload
+	// finishes running on every tenant.
+	runTPCC := func(
+		ctx context.Context, c cluster.Cluster, binaryPath string, h *mixedversion.Helper,
+	) chan struct{} {
+		return forEachTenant(
+			"run tpcc",
+			ctx,
+			h,
+			func(ctx context.Context, l *logger.Logger, tenant *tenantUpgradeStatus) error {
+				cmd := fmt.Sprintf(
+					"%s workload run tpcc --warehouses %d --duration %s %s",
+					binaryPath, numWarehouses, tpccDuration, tenant.pgurl(),
+				)
+
+				return c.RunE(ctx, option.WithNodes(c.Node(tenant.nodes[0])), cmd)
+			},
 		)
 	}
 
-	t.Status("preserving downgrade option on host server")
-	{
-		s := runner.QueryStr(t, `SHOW CLUSTER SETTING version`)
-		runner.Exec(
-			t,
-			`SET CLUSTER SETTING cluster.preserve_downgrade_option = $1`, s[0][0],
-		)
-	}
+	// After the cluster starts up, we start *some* of the tenants we
+	// will create for this test. The remaining tenants will be started
+	// in mixed version.
+	mvt.OnStartup(
+		"maybe create some tenants",
+		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
+			for _, tenant := range tenants {
+				if rng.Float64() < startOnStartupProbability {
+					t.L().Printf("starting %s", tenant.name)
+					if err := startTenant(ctx, l, tenant, h.Context().FromVersion, true); err != nil {
+						return err
+					}
+				}
+			}
 
-	t.Status("upgrading host server")
-	c.Stop(ctx, kvNodes)
-	c.Start(ctx, kvNodes, option.StartArgs("--binary="+currentBinary))
-	time.Sleep(time.Second)
-
-	t.Status("checking the pre-upgrade sql server still works after the KV binary upgrade")
-
-	verifySQL(t, tenant11.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}))
-
-	t.Status("creating a new tenant 12")
-
-	const tenant12HTTPPort, tenant12SQLPort = 8012, 20012
-	const tenant12ID = 12
-	runner.Exec(t, `SELECT crdb_internal.create_tenant($1)`, tenant12ID)
-
-	t.Status("starting tenant 12 server with older binary")
-	tenant12 := createTenantNode(kvAddrs, tenant12ID, tenantNode, tenant12HTTPPort, tenant12SQLPort)
-	tenant12.doesNotSupportStoreFlag = true // can be removed when predecessorBinary is 21.2
-	tenant12.start(ctx, t, c, predecessorBinary)
-	defer tenant12.stop(ctx, t, c)
-
-	t.Status("verifying that the tenant 12 server works and is at the earlier version")
-
-	verifySQL(t, tenant12.pgURL,
-		mkStmt(`CREATE TABLE foo (id INT PRIMARY KEY, v STRING)`),
-		mkStmt(`INSERT INTO foo VALUES($1, $2)`, 1, "bar"),
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SHOW CLUSTER SETTING version").
-			withResults([][]string{{initialVersion}}),
+			return nil
+		},
 	)
 
-	t.Status("creating a new tenant 13")
+	// When the storage cluster is in mixed-version, we start the
+	// tenants for which we didn't create a SQL server yet, and then run
+	// a TPCC workload on them.
+	mvt.InMixedVersion(
+		"run workload on tenants",
+		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
+			for _, tenant := range tenants {
+				if !tenant.running {
+					if err := startTenant(ctx, l, tenant, h.Context().FromVersion, true); err != nil {
+						return err
+					}
+				}
+			}
 
-	const tenant13HTTPPort, tenant13SQLPort = 8013, 20013
-	const tenant13ID = 13
-	runner.Exec(t, `SELECT crdb_internal.create_tenant($1)`, tenant13ID)
-
-	t.Status("starting tenant 13 server with new binary")
-	tenant13 := createTenantNode(kvAddrs, tenant13ID, tenantNode, tenant13HTTPPort, tenant13SQLPort)
-	tenant13.start(ctx, t, c, currentBinary)
-	defer tenant13.stop(ctx, t, c)
-
-	t.Status("verifying that the tenant 13 server works and is at the earlier version")
-
-	verifySQL(t, tenant13.pgURL,
-		mkStmt(`CREATE TABLE foo (id INT PRIMARY KEY, v STRING)`),
-		mkStmt(`INSERT INTO foo VALUES($1, $2)`, 1, "bar"),
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SHOW CLUSTER SETTING version").
-			withResults([][]string{{initialVersion}}),
+			binaryPath := clusterupgrade.BinaryPathForVersion(t, h.Context().FromVersion, "cockroach")
+			l.Printf("waiting for tpcc to run on tenants...")
+			<-runTPCC(ctx, c, binaryPath, h)
+			return nil
+		},
 	)
 
-	t.Status("stopping the tenant 11 server ahead of upgrading")
-	tenant11.stop(ctx, t, c)
+	// Finally, once the storage cluster is upgraded, we perform a
+	// rolling upgrade on every tenant, and run a TPCC workload while
+	// the migrations are running on the tenant.
+	mvt.AfterUpgradeFinalized(
+		"upgrade tenants",
+		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
+			for _, tenant := range tenants {
+				if err := stopTenant(ctx, l, tenant); err != nil {
+					return err
+				}
 
-	t.Status("starting the tenant 11 server with the current binary")
-	tenant11.doesNotSupportStoreFlag = false
-	tenant11.start(ctx, t, c, currentBinary)
+				if err := startTenant(ctx, l, tenant, h.Context().ToVersion, false); err != nil {
+					return err
+				}
+			}
 
-	if needsWorkaround {
-		// NB: we can't do this earlier, as the tenant would not be able to write
-		// its cluster version under the binary that needed the workaround.
-		verifySQL(t, tenant11.pgURL, mkStmt(`SET CLUSTER SETTING version = $1`, initialVersion))
-	}
+			binaryPath := clusterupgrade.BinaryPathForVersion(t, h.Context().ToVersion, "cockroach")
+			tpccFinished := runTPCC(ctx, c, binaryPath, h)
 
-	t.Status("verify tenant 11 server works with the new binary")
-	{
-		verifySQL(t, tenant11.pgURL,
-			mkStmt(`SELECT * FROM foo LIMIT 1`).
-				withResults([][]string{{"1", "bar"}}),
-			mkStmt("SHOW CLUSTER SETTING version").
-				withResults([][]string{{initialVersion}}))
-	}
+			upgradeFinished := forEachTenant(
+				"finalize upgrade",
+				ctx,
+				h,
+				func(ctx context.Context, l *logger.Logger, tenant *tenantUpgradeStatus) error {
+					n := tenant.nodes[0]
+					tenantDB, err := c.ConnE(ctx, l, n, option.VirtualClusterName(tenant.name))
+					if err != nil {
+						return errors.Wrapf(err, "failed to connect to %s on n%d", tenant.name, n)
+					}
+					defer tenantDB.Close()
 
-	// Note that this is exercising a path we likely want to eliminate in the
-	// future where the tenant is upgraded before the KV nodes.
-	t.Status("migrating the tenant 11 to the current version before kv is finalized")
+					binaryVersion, err := clusterupgrade.BinaryVersion(ctx, tenantDB)
+					if err != nil {
+						return errors.Wrapf(err, "failed to query binary version for %s on n%d", tenant.name, n)
+					}
 
-	verifySQL(t, tenant11.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SHOW CLUSTER SETTING version").
-			withResults([][]string{{initialVersion}}),
-		mkStmt("SET CLUSTER SETTING version = crdb_internal.node_executable_version()"),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}),
+					l.Printf("finalizing upgrade to '%s'", binaryVersion)
+					_, err = tenantDB.Exec("SET CLUSTER SETTING version = $1", binaryVersion.String())
+
+					l.Printf("upgrade finalized on %s", tenant.name)
+					return err
+				},
+			)
+
+			var wg sync.WaitGroup
+			wg.Add(2) // tpcc worklaod and upgrade finalization
+
+			go func() {
+				defer wg.Done()
+				<-tpccFinished
+				l.Printf("tpcc workload finished running on tenants")
+			}()
+			go func() {
+				defer wg.Done()
+				<-upgradeFinished
+				l.Printf("tenant upgrades finished")
+			}()
+
+			wg.Wait()
+			return nil
+		},
 	)
 
-	t.Status("finalizing the kv server")
-	runner.Exec(t, `SET CLUSTER SETTING cluster.preserve_downgrade_option = DEFAULT`)
-	runner.CheckQueryResultsRetry(t,
-		"SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]",
-		[][]string{{"true"}})
-
-	t.Status("stopping the tenant 12 server ahead of upgrading")
-	tenant12.stop(ctx, t, c)
-
-	t.Status("starting the tenant 12 server with the current binary")
-	tenant12.doesNotSupportStoreFlag = false
-	tenant12.start(ctx, t, c, currentBinary)
-
-	t.Status("verify tenant 12 server works with the new binary")
-	verifySQL(t, tenant12.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SHOW CLUSTER SETTING version").
-			withResults([][]string{{initialVersion}}))
-
-	// Upgrade the tenant created in the mixed version state to the final version.
-	t.Status("migrating tenant 12 to the current version")
-	verifySQL(t, tenant12.pgURL,
-		mkStmt("SET CLUSTER SETTING version = crdb_internal.node_executable_version()"),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}))
-
-	t.Status("restarting the tenant 12 server to check it works after a restart")
-	tenant12.stop(ctx, t, c)
-	tenant12.start(ctx, t, c, currentBinary)
-
-	t.Status("verify tenant 12 server works with the new binary after restart")
-	verifySQL(t, tenant12.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}))
-
-	// Upgrade the tenant created in the mixed version state to the final version.
-	t.Status("migrating tenant 13 to the current version")
-	verifySQL(t, tenant13.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SET CLUSTER SETTING version = crdb_internal.node_executable_version()"),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}),
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}))
-
-	t.Status("restarting the tenant 13 server to check it works after a restart")
-	tenant13.stop(ctx, t, c)
-	tenant13.start(ctx, t, c, currentBinary)
-
-	t.Status("verify tenant 13 server works with the new binary after restart")
-	verifySQL(t, tenant13.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}))
-
-	t.Status("creating tenant 14 at the new version")
-
-	const tenant14HTTPPort, tenant14SQLPort = 8014, 20014
-	const tenant14ID = 14
-	runner.Exec(t, `SELECT crdb_internal.create_tenant($1)`, tenant14ID)
-
-	t.Status("verifying the tenant 14 works and has the proper version")
-	tenant14 := createTenantNode(kvAddrs, tenant14ID, tenantNode, tenant14HTTPPort, tenant14SQLPort)
-	tenant14.start(ctx, t, c, currentBinary)
-	defer tenant14.stop(ctx, t, c)
-	verifySQL(t, tenant14.pgURL,
-		mkStmt(`CREATE TABLE foo (id INT PRIMARY KEY, v STRING)`),
-		mkStmt(`INSERT INTO foo VALUES($1, $2)`, 1, "bar"),
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}))
-
-	t.Status("restarting the tenant 14 server to check it works after a restart")
-	tenant13.stop(ctx, t, c)
-	tenant13.start(ctx, t, c, currentBinary)
-
-	t.Status("verifying the post-upgrade tenant works and has the proper version")
-	verifySQL(t, tenant14.pgURL,
-		mkStmt(`SELECT * FROM foo LIMIT 1`).
-			withResults([][]string{{"1", "bar"}}),
-		mkStmt("SELECT version = crdb_internal.node_executable_version() FROM [SHOW CLUSTER SETTING version]").
-			withResults([][]string{{"true"}}))
+	mvt.Run()
 }
 
-func startTenantServer(
-	tenantCtx context.Context,
-	c cluster.Cluster,
-	node option.NodeListOption,
-	binary string,
-	kvAddrs []string,
-	tenantID int,
-	httpPort int,
-	sqlPort int,
-	extraFlags ...string,
-) chan error {
+// makeTenants creates a list of tenants to run on the given
+// `tenantNodes`. The number of tenants to be created, and the number
+// of SQL servers to create for each are randomized.
+func makeTenants(
+	rng *rand.Rand, minTenants, maxTenants int, tenantNodes option.NodeListOption,
+) tenantUpgradeStatuses {
+	numTenants := rng.Intn(maxTenants-minTenants+1) + minTenants
+	tenants := make(tenantUpgradeStatuses, numTenants)
 
-	args := []string{
-		// TODO(tbg): make this test secure.
-		// "--certs-dir", "certs",
-		"--insecure",
-		"--tenant-id=" + strconv.Itoa(tenantID),
-		"--http-addr", ifLocal(c, "127.0.0.1", "0.0.0.0") + ":" + strconv.Itoa(httpPort),
-		"--kv-addrs", strings.Join(kvAddrs, ","),
-		// Don't bind to external interfaces when running locally.
-		"--sql-addr", ifLocal(c, "127.0.0.1", "0.0.0.0") + ":" + strconv.Itoa(sqlPort),
-	}
-	args = append(args, extraFlags...)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.RunE(tenantCtx, node,
-			append([]string{binary, "mt", "start-sql"}, args...)...,
-		)
-		close(errCh)
-	}()
-	return errCh
-}
+	for j := 0; j < numTenants; j++ {
+		numNodes := rng.Intn(len(tenantNodes)) + 1
+		rng.Shuffle(len(tenantNodes), func(i, j int) {
+			tenantNodes[i], tenantNodes[j] = tenantNodes[j], tenantNodes[i]
+		})
 
-type sqlVerificationStmt struct {
-	stmt            string
-	args            []interface{}
-	optionalResults [][]string
-}
-
-func (s sqlVerificationStmt) withResults(res [][]string) sqlVerificationStmt {
-	s.optionalResults = res
-	return s
-}
-
-func mkStmt(stmt string, args ...interface{}) sqlVerificationStmt {
-	return sqlVerificationStmt{stmt: stmt, args: args}
-}
-
-func verifySQL(t test.Test, url string, stmts ...sqlVerificationStmt) {
-	db, err := gosql.Open("postgres", url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = db.Close() }()
-	tdb := sqlutils.MakeSQLRunner(db)
-
-	for _, stmt := range stmts {
-		if stmt.optionalResults == nil {
-			tdb.Exec(t, stmt.stmt, stmt.args...)
-		} else {
-			res := tdb.QueryStr(t, stmt.stmt, stmt.args...)
-			require.Equal(t, stmt.optionalResults, res)
+		tenants[j] = &tenantUpgradeStatus{
+			name:  fmt.Sprintf("tenant-%s", string('a'+rune(j))),
+			nodes: append(option.NodeListOption{}, tenantNodes[:numNodes]...),
 		}
 	}
+
+	return tenants
 }

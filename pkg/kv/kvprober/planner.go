@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvprober
 
@@ -19,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -35,8 +30,6 @@ type Step struct {
 
 // planner abstracts deciding on ranges to probe. It is public to integration
 // test from kvprober_test.
-//
-// planner is NOT thread-safe.
 type planner interface {
 	// Next returns a Step for the prober to execute on. A Step is a decision on
 	// on what range to probe next. Executing on a series of Steps returned by
@@ -55,6 +48,14 @@ type planner interface {
 type meta2Planner struct {
 	db       *kv.DB
 	settings *cluster.Settings
+
+	// The production kvprober as of Sep 7th 2023 does not need this mutex, as
+	// there is one planner per probe loop we run. At the same time, making the
+	// planner thread-safe makes for easier testing in kvprober_integration_test.go.
+	// Given that in this context there is no meaningful performance cost to
+	// synchronizing with a mutex, it makes sense to do it for the test use case
+	// specifically.
+	mu syncutil.Mutex
 	// cursor points to a key in meta2 at which scanning should resume when new
 	// plans are needed.
 	cursor roachpb.Key
@@ -110,10 +111,10 @@ func newMeta2Planner(
 // two design goals for our approach to probabilistically selecting a place in
 // the keyspace to probe:
 //
-// 1. That the approach is efficient enough. Resource requirements shouldn't
-//    scale with the number of ranges in the cluster, for example.
-// 2. That the approach is available enough in times of outage that the
-//    prober is able to generate useful signal when we need it most.
+//  1. That the approach is efficient enough. Resource requirements shouldn't
+//     scale with the number of ranges in the cluster, for example.
+//  2. That the approach is available enough in times of outage that the
+//     prober is able to generate useful signal when we need it most.
 //
 // How do we do it? The first option we considered was to probe
 // crdb_internal.ranges_no_leases. We reject that approach in favor of making a
@@ -135,20 +136,24 @@ func newMeta2Planner(
 // should not scale up as the number of ranges in the cluster grows.
 //
 // Memory:
-// - The meta2Planner struct's mem usage scales with
-//   size(the Plan struct) * the kv.prober.planner.n_probes_at_a_time cluster
-//   setting.
-// - The Plan function's mem usage scales with
-//   size(KV pairs holding range descriptors) * the
-//   kv.prober.planner.n_probes_at_a_time cluster setting.
+//   - The meta2Planner struct's mem usage scales with
+//     size(the Plan struct) * the kv.prober.planner.n_probes_at_a_time cluster
+//     setting.
+//   - The Plan function's mem usage scales with
+//     size(KV pairs holding range descriptors) * the
+//     kv.prober.planner.n_probes_at_a_time cluster setting.
 //
 // CPU:
-// - Again scales with the kv.prober.planner.n_probes_at_a_time cluster
-//   setting. Note the proto unmarshalling. We also shuffle a slice of size
-//   kv.prober.planner.n_probes_at_a_time. If the setting is set to a high
-//   number, we pay a higher CPU cost less often; if it's set to a low number,
-//   we pay a smaller CPU cost more often.
+//   - Again scales with the kv.prober.planner.n_probes_at_a_time cluster
+//     setting. Note the proto unmarshalling. We also shuffle a slice of size
+//     kv.prober.planner.n_probes_at_a_time. If the setting is set to a high
+//     number, we pay a higher CPU cost less often; if it's set to a low number,
+//     we pay a smaller CPU cost more often.
 func (p *meta2Planner) next(ctx context.Context) (Step, error) {
+	// See comment where mu is defined.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if len(p.plan) == 0 {
 		// Protect CRDB from planning executing too often, due to either issues
 		// with CRDB (meta2 unavailability) or bugs in kvprober.
@@ -215,9 +220,19 @@ func getNMeta2KVsImpl(
 
 	for n > 0 {
 		var newkvs []kv.KeyValue
-		if err := contextutil.RunWithTimeout(ctx, "db.Scan", timeout, func(ctx context.Context) error {
+		if err := timeutil.RunWithTimeout(ctx, "db.Scan", timeout, func(ctx context.Context) error {
 			// NB: keys.Meta2KeyMax stores a descriptor, so we want to include it.
 			var err error
+			// Queries from the planner bypass admission control, regardless of
+			// what kv.prober.bypass_admission_control.enabled is set to.
+			// Operators would like to get paged due to probes failing in an
+			// overload situation, not the planner failing. The planner is an
+			// implementation detail of kvprober, and tho it being broken is not
+			// desired as (i) it hurts alerting coverage & (i) it prob does
+			// indicate an issue with the cluster, the signal of cluster health
+			// that is most useful to operators is failing probes, as this
+			// signal reflects the "size" of the outage, by taking measurements
+			// across the keyspace.
 			newkvs, err = db.Scan(ctx, cursor, keys.Meta2KeyMax.Next(), n /*maxRows*/)
 			return err
 		}); err != nil {
@@ -244,24 +259,28 @@ func getNMeta2KVsImpl(
 func meta2KVsToPlanImpl(kvs []kv.KeyValue) ([]Step, error) {
 	plans := make([]Step, len(kvs))
 
-	var rangeDesc roachpb.RangeDescriptor
+	var desc roachpb.RangeDescriptor
 	for i, kv := range kvs {
-		if err := kv.ValueProto(&rangeDesc); err != nil {
+		if err := kv.ValueProto(&desc); err != nil {
 			return nil, err
 		}
 		plans[i] = Step{
-			RangeID: rangeDesc.RangeID,
-		}
-		// r1's start key (/Min) can't be queried. kvprober gets back this
-		// error if it's attempted: "attempted access to empty key". LocalMax
-		// is the first key that doesn't have special casing associated
-		// with it, and it lives in r1.
-		if rangeDesc.RangeID == 1 {
-			plans[i].Key = keys.RangeProbeKey(keys.MustAddr(keys.LocalMax))
-		} else {
-			plans[i].Key = keys.RangeProbeKey(rangeDesc.StartKey)
+			RangeID: desc.RangeID,
+			Key:     ProbeKeyForRange(&desc),
 		}
 	}
 
 	return plans, nil
+}
+
+// ProbeKeyForRange return the key to probe for a given range.
+func ProbeKeyForRange(desc *roachpb.RangeDescriptor) roachpb.Key {
+	// r1's start key (/Min) can't be queried. kvprober gets back this
+	// error if it's attempted: "attempted access to empty key". LocalMax
+	// is the first key that doesn't have special casing associated
+	// with it, and it lives in r1.
+	if desc.RangeID == 1 {
+		return keys.RangeProbeKey(keys.MustAddr(keys.LocalMax))
+	}
+	return keys.RangeProbeKey(desc.StartKey)
 }

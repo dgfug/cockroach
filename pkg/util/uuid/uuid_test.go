@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
@@ -165,7 +160,7 @@ func TestTimestampFromV1(t *testing.T) {
 		want    Timestamp
 		wanterr bool
 	}{
-		{u: Must(NewV4()), wanterr: true},
+		{u: NewV4(), wanterr: true},
 		{u: Must(FromString("00000000-0000-1000-0000-000000000000")), want: 0},
 		{u: Must(FromString("424f137e-a2aa-11e8-98d0-529269fb1459")), want: 137538640775418750},
 		{u: Must(FromString("ffffffff-ffff-1fff-ffff-ffffffffffff")), want: Timestamp(1<<60 - 1)},

@@ -1,18 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package explain
 
 import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 
-// Flags are modifiers for EXPLAIN (PLAN).
+// Flags are modifiers for EXPLAIN.
 type Flags struct {
 	// Verbose indicates that more metadata is shown, and plan columns and
 	// ordering are shown.
@@ -26,42 +21,45 @@ type Flags struct {
 	HideValues bool
 	// If OnlyShape is true, we hide fields that could be different between 2
 	// plans that otherwise have exactly the same shape, like estimated row count.
-	// This is used for EXPLAIN(SHAPE), which is used for the statement-bundle
+	// This is used for EXPLAIN (SHAPE), which is used for the statement-bundle
 	// debug tool.
 	OnlyShape bool
+	// RedactValues is similar to HideValues but indicates that we should use
+	// redaction markers instead of underscores. Used by EXPLAIN (REDACT).
+	RedactValues bool
 
-	// Redaction control (for testing purposes).
-	Redact RedactFlags
+	// Flags to hide various fields for testing purposes.
+	Deflake DeflakeFlags
 }
 
-// RedactFlags control the redacting of various field values. They are used to
+// DeflakeFlags control hiding of various field values. They are used to
 // guarantee deterministic results for testing purposes.
-type RedactFlags uint8
+type DeflakeFlags uint8
 
 const (
-	// RedactDistribution hides the value of the "distribution" field.
-	RedactDistribution RedactFlags = (1 << iota)
+	// DeflakeDistribution hides the value of the "distribution" field.
+	DeflakeDistribution DeflakeFlags = (1 << iota)
 
-	// RedactVectorized hides the value of the "vectorized" field.
-	RedactVectorized
+	// DeflakeVectorized hides the value of the "vectorized" field.
+	DeflakeVectorized
 
-	// RedactNodes hides cluster nodes involved.
-	RedactNodes
+	// DeflakeNodes hides cluster nodes involved.
+	DeflakeNodes
 
-	// RedactVolatile hides any values that can vary from one query run to the
+	// DeflakeVolatile hides any values that can vary from one query run to the
 	// other, even without changes to the configuration or data distribution (e.g.
 	// timings).
-	RedactVolatile
+	DeflakeVolatile
 )
 
 const (
-	// RedactAll has all redact flags set.
-	RedactAll RedactFlags = RedactDistribution | RedactVectorized | RedactNodes | RedactVolatile
+	// DeflakeAll has all redact flags set.
+	DeflakeAll DeflakeFlags = DeflakeDistribution | DeflakeVectorized | DeflakeNodes | DeflakeVolatile
 )
 
-// Has returns true if the receiver has the given flag set.
-func (f RedactFlags) Has(flag RedactFlags) bool {
-	return (f & flag) != 0
+// HasAny returns true if the receiver has any of the given deflake flags set.
+func (f DeflakeFlags) HasAny(flags DeflakeFlags) bool {
+	return (f & flags) != 0
 }
 
 // MakeFlags crates Flags from ExplainOptions.
@@ -77,7 +75,10 @@ func MakeFlags(options *tree.ExplainOptions) Flags {
 	if options.Flags[tree.ExplainFlagShape] {
 		f.HideValues = true
 		f.OnlyShape = true
-		f.Redact = RedactAll
+		f.Deflake = DeflakeAll
+	}
+	if options.Flags[tree.ExplainFlagRedact] {
+		f.RedactValues = true
 	}
 	return f
 }

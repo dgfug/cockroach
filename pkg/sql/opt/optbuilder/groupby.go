@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -108,12 +103,11 @@ type groupby struct {
 // expression in the SELECT list must be a GROUP BY expression or be composed
 // of GROUP BY expressions. For example, this query is legal:
 //
-//   SELECT COUNT(*), k + v FROM kv GROUP by k, v
+//	SELECT COUNT(*), k + v FROM kv GROUP by k, v
 //
 // but this query is not:
 //
-//   SELECT COUNT(*), k + v FROM kv GROUP BY k - v
-//
+//	SELECT COUNT(*), k + v FROM kv GROUP BY k - v
 type groupByStrSet map[string]*scopeColumn
 
 // hasNonCommutativeAggregates checks whether any of the aggregates are
@@ -252,8 +246,9 @@ func (a aggregateInfo) isOrderingSensitive() bool {
 		return true
 	}
 	switch a.def.Name {
-	case "array_agg", "concat_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
-		"st_makeline", "st_collect", "st_memcollect":
+	case "array_agg", "array_cat_agg", "concat_agg", "string_agg", "json_agg",
+		"jsonb_agg", "json_object_agg", "jsonb_object_agg", "st_makeline",
+		"st_collect", "st_memcollect":
 		return true
 	default:
 		return false
@@ -267,7 +262,7 @@ func (a aggregateInfo) isCommutative() bool {
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (a *aggregateInfo) Eval(_ *tree.EvalContext) (tree.Datum, error) {
+func (a *aggregateInfo) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("aggregateInfo must be replaced before evaluation"))
 }
 
@@ -431,7 +426,7 @@ func (b *Builder) buildAggregation(having opt.ScalarExpr, fromScope *scope) (out
 	b.constructProjectForScope(fromScope, g.aggInScope)
 
 	g.aggOutScope.expr = b.constructGroupBy(
-		g.aggInScope.expr.(memo.RelExpr),
+		g.aggInScope.expr,
 		groupingColSet,
 		aggCols,
 		g.aggInScope.ordering,
@@ -439,7 +434,7 @@ func (b *Builder) buildAggregation(having opt.ScalarExpr, fromScope *scope) (out
 
 	// Wrap with having filter if it exists.
 	if having != nil {
-		input := g.aggOutScope.expr.(memo.RelExpr)
+		input := g.aggOutScope.expr
 		filters := memo.FiltersExpr{b.factory.ConstructFiltersItem(having)}
 		g.aggOutScope.expr = b.factory.ConstructSelect(input, filters)
 	}
@@ -459,7 +454,8 @@ func (b *Builder) analyzeHaving(having *tree.Where, fromScope *scope) tree.Typed
 	// in case we are recursively called within a subquery context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 	b.semaCtx.Properties.Require(
-		exprKindHaving.String(), tree.RejectWindowApplications|tree.RejectGenerators,
+		exprKindHaving.String(),
+		tree.RejectWindowApplications|tree.RejectGenerators|tree.RejectProcedures,
 	)
 	fromScope.context = exprKindHaving
 	return fromScope.resolveAndRequireType(having.Expr, types.Bool)
@@ -485,9 +481,11 @@ func (b *Builder) buildHaving(having tree.TypedExpr, fromScope *scope) opt.Scala
 //
 // groupBy   The given GROUP BY expressions.
 // selects   The select expressions are needed in case one of the GROUP BY
-//           expressions is an index into to the select list. For example,
-//               SELECT count(*), k FROM t GROUP BY 2
-//           indicates that the grouping is on the second select expression, k.
+//
+//	expressions is an index into to the select list. For example,
+//	    SELECT count(*), k FROM t GROUP BY 2
+//	indicates that the grouping is on the second select expression, k.
+//
 // fromScope The scope for the input to the aggregation (the FROM clause).
 func (b *Builder) buildGroupingList(
 	groupBy tree.GroupBy, selects tree.SelectExprs, projectionsScope *scope, fromScope *scope,
@@ -517,16 +515,22 @@ func (b *Builder) buildGroupingList(
 // expression. The expression (or expressions, if we have a star) is added to
 // groupStrs and to the aggInScope.
 //
-//
 // groupBy          The given GROUP BY expression.
 // selects          The select expressions are needed in case the GROUP BY
-//                  expression is an index into to the select list.
+//
+//	expression is an index into to the select list.
+//
 // projectionsScope The scope that contains the columns for the SELECT targets
-//                  (used when GROUP BY refers to a target by alias).
+//
+//	(used when GROUP BY refers to a target by alias).
+//
 // fromScope        The scope for the input to the aggregation (the FROM
-//                  clause).
+//
+//	clause).
+//
 // aggInScope       The scope that will contain the grouping expressions as well
-//                  as the aggregate function arguments.
+//
+//	as the aggregate function arguments.
 func (b *Builder) buildGrouping(
 	groupBy tree.Expr, selects tree.SelectExprs, projectionsScope, fromScope, aggInScope *scope,
 ) {
@@ -674,10 +678,10 @@ func translateAggName(name string) string {
 // aggregate function are extracted and added to aggInScope. The aggregate
 // function expression itself is added to aggOutScope. For example:
 //
-//   SELECT SUM(x+1) FROM xy
-//   =>
-//   aggInScope : x+1 AS column1
-//   aggOutScope: SUM(column1)
+//	SELECT SUM(x+1) FROM xy
+//	=>
+//	aggInScope : x+1 AS column1
+//	aggOutScope: SUM(column1)
 //
 // buildAggregateFunction returns a pointer to the aggregateInfo containing
 // the function definition, fully built arguments, and the aggregate output
@@ -716,7 +720,18 @@ func (b *Builder) buildAggregateFunction(
 	// If we have ORDER BY, add the ordering columns to the tempScope.
 	if f.OrderBy != nil {
 		for _, o := range f.OrderBy {
-			b.buildAggArg(o.Expr.(tree.TypedExpr), &info, tempScope, fromScope)
+			// ORDER BY (a, b) => ORDER BY a, b.
+			te := fromScope.resolveType(o.Expr, types.Any)
+			cols := flattenTuples([]tree.TypedExpr{te})
+
+			nullsDefaultOrder := b.hasDefaultNullsOrder(o)
+			for _, e := range cols {
+				if !nullsDefaultOrder {
+					expr := tree.NewTypedIsNullExpr(e)
+					b.buildAggArg(expr, &info, tempScope, fromScope)
+				}
+				b.buildAggArg(e, &info, tempScope, fromScope)
+			}
 		}
 	}
 
@@ -788,6 +803,8 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 	switch name {
 	case "array_agg":
 		return b.factory.ConstructArrayAgg(args[0])
+	case "array_cat_agg":
+		return b.factory.ConstructArrayCatAgg(args[0])
 	case "avg":
 		return b.factory.ConstructAvg(args[0])
 	case "bit_and":
@@ -870,25 +887,37 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructJsonObjectAgg(args[0], args[1])
 	case "jsonb_object_agg":
 		return b.factory.ConstructJsonbObjectAgg(args[0], args[1])
+	case "merge_stats_metadata":
+		return b.factory.ConstructMergeStatsMetadata(args[0])
+	case "merge_statement_stats":
+		return b.factory.ConstructMergeStatementStats(args[0])
+	case "merge_transaction_stats":
+		return b.factory.ConstructMergeTransactionStats(args[0])
+	case "merge_aggregated_stmt_metadata":
+		return b.factory.ConstructMergeAggregatedStmtMetadata(args[0])
 	}
 
 	panic(errors.AssertionFailedf("unhandled aggregate: %s", name))
 }
 
-func isAggregate(def *tree.FunctionDefinition) bool {
-	return def.Class == tree.AggregateClass
+func isAggregate(def *tree.ResolvedFunctionDefinition) bool {
+	return isClass(def, tree.AggregateClass)
 }
 
-func isWindow(def *tree.FunctionDefinition) bool {
-	return def.Class == tree.WindowClass
+func isGenerator(def *tree.ResolvedFunctionDefinition) bool {
+	return isClass(def, tree.GeneratorClass)
 }
 
-func isGenerator(def *tree.FunctionDefinition) bool {
-	return def.Class == tree.GeneratorClass
+func isSQLFn(def *tree.ResolvedFunctionDefinition) bool {
+	return isClass(def, tree.SQLClass)
 }
 
-func isSQLFn(def *tree.FunctionDefinition) bool {
-	return def.Class == tree.SQLClass
+func isClass(def *tree.ResolvedFunctionDefinition, want tree.FunctionClass) bool {
+	cls, err := def.GetClass()
+	if err != nil {
+		panic(err)
+	}
+	return cls == want
 }
 
 func newGroupingError(name tree.Name) error {
@@ -899,9 +928,12 @@ func newGroupingError(name tree.Name) error {
 }
 
 // allowImplicitGroupingColumn returns true if col is part of a table and the
-// the groupby metadata indicates that we are grouping on the entire PK of that
-// table. In that case, we can allow col as an "implicit" grouping column, even
-// if it is not specified in the query.
+// groupby metadata indicates that we are grouping on the entire PK, an entire
+// unique index key, or an entire unique without index key of that table. In
+// that case, we can allow col as an "implicit" grouping column, even if it is
+// not specified in the query.
+// In the unique index or unique without index cases, all key columns must be
+// marked as NOT NULL to allow the implicit grouping.
 func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bool {
 	md := b.factory.Metadata()
 	colMeta := md.ColumnMeta(colID)
@@ -910,6 +942,7 @@ func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bo
 	}
 	// Get all the PK columns.
 	tab := md.Table(colMeta.Table)
+	tabMeta := md.TableMeta(colMeta.Table)
 	var pkCols opt.ColSet
 	if tab.IndexCount() == 0 {
 		// Virtual tables have no indexes.
@@ -924,5 +957,51 @@ func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bo
 	for i := range groupingCols {
 		pkCols.Remove(groupingCols[i].id)
 	}
-	return pkCols.Empty()
+	if pkCols.Empty() {
+		return true
+	}
+	// Check UNIQUE WITHOUT INDEX constraints.
+	for i := 0; i < tab.UniqueCount(); i++ {
+		uniqueConstraint := tab.Unique(i)
+		var uniqueCols opt.ColSet
+		nullable := false
+		for j := 0; j < uniqueConstraint.ColumnCount(); j++ {
+			column := tab.Column(uniqueConstraint.ColumnOrdinal(tab, j))
+			if column.IsNullable() {
+				nullable = true
+			}
+			columnID := tabMeta.MetaID.ColumnID(uniqueConstraint.ColumnOrdinal(tab, j))
+			uniqueCols.Add(columnID)
+		}
+		if nullable {
+			// There may be duplicate rows with nulls in unique constraint columns, so
+			// we cannot treat the constraint as truly unique if any of its columns is
+			// nullable.
+			continue
+		}
+		for k := range groupingCols {
+			uniqueCols.Remove(groupingCols[k].id)
+		}
+		if uniqueCols.Empty() {
+			return true
+		}
+	}
+	// Check UNIQUE INDEX constraints.
+	for i := 1; i < tab.IndexCount(); i++ {
+		index := tab.Index(i)
+		if !index.IsUnique() || index.IsInverted() {
+			continue
+		}
+		// If any of the key columns is nullable, uniqueCols is suffixed with the
+		// primary key columns, so we don't have to explicitly check for nullable
+		// columns here.
+		uniqueCols := tabMeta.IndexKeyColumns(i)
+		for j := range groupingCols {
+			uniqueCols.Remove(groupingCols[j].id)
+		}
+		if uniqueCols.Empty() {
+			return true
+		}
+	}
+	return false
 }

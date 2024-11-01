@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // This file provides generic interfaces that allow tests to set up test tenants
 // without importing the server package (avoiding circular dependencies). This
@@ -14,51 +9,57 @@
 package serverutils
 
 import (
-	"context"
+	"net/url"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/errors"
 )
 
-// TestTenantInterface defines SQL-only tenant functionality that tests need; it
-// is implemented by server.TestTenant.
-type TestTenantInterface interface {
-	// SQLInstanceID is the ephemeral ID assigned to a running instance of the
-	// SQLServer. Each tenant can have zero or more running SQLServer instances.
-	SQLInstanceID() base.SQLInstanceID
+type SessionType int
 
-	// SQLAddr returns the tenant's SQL address.
-	SQLAddr() string
+const (
+	UnknownSession SessionType = iota
+	SingleTenantSession
+	MultiTenantSession
+)
 
-	// HTTPAddr returns the tenant's http address.
-	HTTPAddr() string
+// PreventDisableSQLForTenantError is thrown by tests that attempt to set
+// DisableSQLServer but run with cluster virtualization. These modes are
+// incompatible since tenant operations require SQL during initialization.
+func PreventDisableSQLForTenantError() error {
+	return errors.New("programming error: DisableSQLServer is incompatible with cluster virtualization\n" +
+		"Consider using TestServerArgs{DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant}")
+}
 
-	// PGServer returns the tenant's *pgwire.Server as an interface{}.
-	PGServer() interface{}
+type TestURL struct {
+	*url.URL
+}
 
-	// DiagnosticsReporter returns the tenant's *diagnostics.Reporter as an
-	// interface{}. The DiagnosticsReporter periodically phones home to report
-	// diagnostics and usage.
-	DiagnosticsReporter() interface{}
+func NewTestURL(path string) TestURL {
+	u, err := url.Parse(path)
+	if err != nil {
+		panic(err)
+	}
+	return TestURL{u}
+}
 
-	// StatusServer returns the tenant's *server.SQLStatusServer as an
-	// interface{}.
-	StatusServer() interface{}
-
-	// DistSQLServer returns the *distsql.ServerImpl as an
-	// interface{}.
-	DistSQLServer() interface{}
-
-	// JobRegistry returns the *jobs.Registry as an interface{}.
-	JobRegistry() interface{}
-
-	// TestingKnobs returns the TestingKnobs in use by the test
-	// tenant.
-	TestingKnobs() *base.TestingKnobs
-
-	// RPCContext returns the *rpc.Context
-	RPCContext() *rpc.Context
-
-	// AnnotateCtx annotates a context.
-	AnnotateCtx(context.Context) context.Context
+// WithPath is a helper that allows the user of the `TestURL` to easily append
+// paths to use for testing. Any queries in the given path will be added to the
+// returned URL. Please be aware that your path will automatically be escaped
+// for you, but if it includes any invalid hex escapes (eg: `%s`) it will fail
+// silently, and you'll get back a blank URL.
+func (t *TestURL) WithPath(path string) *TestURL {
+	parsedPath, err := url.Parse(path)
+	if err != nil {
+		panic(err)
+	}
+	// Append the path to the existing path (The paths used here do not contain any
+	// query parameters). To prevent double escaping, we use the `JoinPath` method.
+	t.URL = t.JoinPath(parsedPath.EscapedPath())
+	// Append the query parameters to the existing query parameters.
+	query := t.Query()
+	for k, v := range parsedPath.Query() {
+		query[k] = v
+	}
+	t.RawQuery = query.Encode()
+	return t
 }

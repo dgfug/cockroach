@@ -21,7 +21,7 @@ two four
 statement ok
 CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 
-query error at or near "from": syntax error
+statement ok
 SELECT FROM abc
 
 query error could not parse "hello" as type bool
@@ -447,7 +447,7 @@ SELECT (1, NULL) IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 ----
 NULL
 
-query error unsupported comparison operator: <unknown> IN <tuple{tuple{int AS a, int AS b}}>
+query error subquery has too many columns
 SELECT NULL IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b));
 
 query error unsupported comparison operator: <tuple> IN <tuple{int}>
@@ -459,7 +459,7 @@ SELECT () IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 query error unsupported comparison operator: <tuple{string, unknown}> IN <tuple{tuple{int AS a, int AS b}}>
 SELECT ('string', NULL) IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 
-query error unsupported comparison operator: <tuple{int, string, unknown}> IN <tuple{tuple{int AS a, int AS b}}>
+query error subquery has too few columns
 SELECT (2, 'string', NULL) IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 
 query B
@@ -487,7 +487,7 @@ SELECT NULL NOT IN (SELECT * FROM (VALUES (1)) AS t(a))
 ----
 NULL
 
-query error unsupported comparison operator: <unknown> IN <tuple{tuple{int AS a, int AS b}}>
+query error subquery has too many columns
 SELECT NULL NOT IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 
 query error unsupported comparison operator: <tuple> IN <tuple{int}>
@@ -499,7 +499,7 @@ SELECT () NOT IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 query error unsupported comparison operator: <tuple{string, unknown}> IN <tuple{tuple{int AS a, int AS b}}>
 SELECT ('string', NULL) NOT IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 
-query error unsupported comparison operator: <tuple{int, string, unknown}> IN <tuple{tuple{int AS a, int AS b}}>
+query error subquery has too few columns
 SELECT (2, 'string', NULL) NOT IN (SELECT * FROM (VALUES (1, 1)) AS t(a, b))
 
 query B
@@ -652,6 +652,13 @@ SELECT x FROM b WHERE rowid > 0
 2
 3
 
+query I rowsort
+SELECT x FROM b WHERE b.rowid > 0
+----
+1
+2
+3
+
 # ------------------------------------------------------------------------------
 # String inequality filter.
 # ------------------------------------------------------------------------------
@@ -724,9 +731,6 @@ SELECT * FROM t44132 WHERE c0
 true NULL
 
 # Tests for `disallow_full_table_scans`
-statement ok
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
-
 statement ok
 CREATE TABLE t_disallow_scans(a INT, b INT, INDEX b_idx(b), INDEX b_partial(b) WHERE a > 0);
 
@@ -803,7 +807,7 @@ SELECT * FROM t_disallow_scans
 statement error pq: index "b_idx" cannot be used for this query\nHINT: try overriding the `disallow_full_table_scans`
 SELECT * FROM t_disallow_scans@b_idx
 
-# Internal statements should still be allowed with this setting.
+# Full scans of virtual tables are still allowed with this setting (#123783).
 statement ok
 SELECT * FROM pg_class
 
@@ -835,8 +839,113 @@ SELECT * FROM t_disallow_scans@b_idx
 statement ok
 SET disallow_full_table_scans = false;
 RESET large_full_scan_rows;
-RESET CLUSTER SETTING sql.stats.automatic_collection.enabled;
 
 # Regression test for #58104.
 statement ok
 SELECT * FROM pg_catalog.pg_attrdef WHERE (adnum = 1 AND adrelid = 1) OR (adbin = 'foo' AND adrelid = 2)
+
+# Tests with SELECT AS clause.
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t values(10, 20);
+
+query I colnames
+SELECT -488 AS OF FROM t;
+----
+of
+-488
+
+query I colnames
+SELECT -488 OF FROM t;
+----
+of
+-488
+
+subtest push_ordinality_into_select
+
+statement ok
+CREATE TABLE trm (
+    id UUID NOT NULL,
+    trid UUID NOT NULL,
+    ts12 TIMESTAMP NOT NULL
+);
+INSERT INTO trm VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9882',
+                       '5ebfedee-0dcf-41e6-a315-5fa0b51b9882',
+                       '1999-12-31 23:59:59');
+INSERT INTO trm VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9883',
+                       '5ebfedee-0dcf-41e6-a315-5fa0b51b9883',
+                       '1999-12-31 23:59:58');
+INSERT INTO trm VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9882',
+                       '5ebfedee-0dcf-41e6-a315-5fa0b51b9882',
+                       '1999-11-30 23:59:59');
+INSERT INTO trm VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9883',
+                       '5ebfedee-0dcf-41e6-a315-5fa0b51b9883',
+                       '1999-11-30 23:59:58');
+INSERT INTO trm VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9884',
+                       '5ebfedee-0dcf-41e6-a315-5fa0b51b9884',
+                       '1999-11-30 23:59:57');
+
+statement ok
+CREATE TABLE trrec (
+    id UUID NOT NULL,
+    trid STRING NOT NULL,
+    ts12 TIMESTAMP NOT NULL,
+    str16 STRING NULL,
+    INDEX trrec_idx5 (str16 ASC)
+);
+INSERT INTO trrec VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9882', '1', '1999-12-31 23:59:59', '12345');
+INSERT INTO trrec VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9883', '2', '1999-12-31 23:59:58', '12345');
+INSERT INTO trrec VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9884', '3', '1999-12-31 23:59:57', '123456');
+
+statement ok
+CREATE TABLE trtab4 (
+    id UUID NOT NULL,
+    trid UUID NOT NULL,
+    dec1 DECIMAL(19,2) NOT NULL
+);
+INSERT INTO trtab4 VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9882', '5ebfedee-0dcf-41e6-a315-5fa0b51b9882', 1.0);
+INSERT INTO trtab4 VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9883', '5ebfedee-0dcf-41e6-a315-5fa0b51b9883', 2.0);
+INSERT INTO trtab4 VALUES('5ebfedee-0dcf-41e6-a315-5fa0b51b9884', '5ebfedee-0dcf-41e6-a315-5fa0b51b9884', 3.0);
+
+query TTT
+WITH
+  with2
+    AS (
+      SELECT
+        tq.trid, tq.dec1
+      FROM
+        trrec AS r INNER JOIN trtab4 AS tq ON r.id = tq.trid AND r.str16 = '12345'
+    )
+SELECT tr.id, tr.trid, val3.ts12
+FROM
+  trrec AS tr
+  INNER JOIN LATERAL (
+      SELECT  q.dec1 FROM with2 AS q WHERE tr.id = q.trid
+    ) AS q ON true
+  INNER JOIN LATERAL (
+      SELECT
+        m.ts12
+      FROM trm AS m WHERE tr.id = m.trid
+      ORDER BY m.ts12 ASC
+      LIMIT 1
+    ) AS val3 ON true
+WHERE
+  tr.str16 = '12345'
+ORDER BY 1 DESC
+;
+----
+5ebfedee-0dcf-41e6-a315-5fa0b51b9883  2  1999-11-30 23:59:58 +0000 +0000
+5ebfedee-0dcf-41e6-a315-5fa0b51b9882  1  1999-11-30 23:59:59 +0000 +0000
+
+# Regression test for incorrect evaluation of the IN filter due to integer
+# overflow when working with INT4 type (#102864).
+statement ok
+CREATE TABLE t102864 (c INT4);
+INSERT INTO t102864 (c) VALUES (0);
+
+query I
+SELECT c FROM t102864 WHERE c IN (0, 862827606027206657::INT8);
+----
+0

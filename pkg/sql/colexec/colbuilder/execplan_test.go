@@ -1,30 +1,30 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colbuilder
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -42,8 +42,9 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// We will set up the following chain:
 	//
@@ -67,11 +68,12 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	)
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	txn := kv.NewTxn(ctx, s.DB(), s.NodeID())
+	txn := kv.NewTxn(ctx, s.DB(), s.DistSQLPlanningNodeID())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -79,21 +81,28 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		NodeID: evalCtx.NodeID,
 	}
 
-	streamingMemAcc := evalCtx.Mon.MakeBoundAccount()
+	streamingMemAcc := evalCtx.TestingMon.MakeBoundAccount()
 	defer streamingMemAcc.Close(ctx)
 
-	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
+	var spec fetchpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(
+		&spec, s.Codec(),
+		desc, desc.GetPrimaryIndex(),
+		[]descpb.ColumnID{desc.PublicColumns()[0].GetID()},
+	); err != nil {
+		t.Fatal(err)
+	}
 	tr := execinfrapb.TableReaderSpec{
-		Table:         *desc.TableDesc(),
-		Spans:         make([]roachpb.Span, 1),
-		NeededColumns: []uint32{0},
+		FetchSpec: spec,
+		Spans:     make([]roachpb.Span, 1),
 	}
 	var err error
-	tr.Spans[0].Key, err = randgen.TestingMakePrimaryIndexKey(desc, 0)
+	tr.Spans[0].Key, err = randgen.TestingMakePrimaryIndexKeyForTenant(desc, s.Codec(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr.Spans[0].EndKey, err = randgen.TestingMakePrimaryIndexKey(desc, numRows+1)
+	tr.Spans[0].EndKey, err = randgen.TestingMakePrimaryIndexKeyForTenant(desc, s.Codec(), numRows+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +136,7 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	defer r.TestCleanupNoError(t)
 
 	m := colexec.NewMaterializer(
+		nil, /* streamingMemAcc */
 		flowCtx,
 		0, /* processorID */
 		r.OpWithMetaInfo,
@@ -143,8 +153,82 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		}
 		require.Equal(t, 1, len(row))
 		expected := tree.DInt(rowIdx)
-		require.True(t, row[0].Datum.Compare(&evalCtx, &expected) == 0)
+		cmp, err := row[0].Datum.Compare(ctx, &evalCtx, &expected)
+		require.NoError(t, err)
+		require.True(t, cmp == 0)
 		rowIdx++
 	}
 	require.Equal(t, numRows, rowIdx)
+}
+
+// BenchmarkRenderPlanning benchmarks how long it takes to run a query with many
+// render expressions inside. With small number of rows to read, the overhead of
+// allocating the initial vectors for the projection operators dominates.
+func BenchmarkRenderPlanning(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{SQLMemoryPoolSize: 10 << 30})
+	defer s.Stopper().Stop(ctx)
+
+	jsonValue := `'{"string": "string", "int": 123, "null": null, "nested": {"string": "string", "int": 123, "null": null, "nested": {"string": "string", "int": 123, "null": null}}}'`
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	for _, numRows := range []int{1, 1 << 3, 1 << 6, 1 << 9} {
+		sqlDB.Exec(b, "DROP TABLE IF EXISTS bench")
+		sqlDB.Exec(b, "CREATE TABLE bench (id INT PRIMARY KEY, state JSONB)")
+		sqlDB.Exec(b, fmt.Sprintf(`INSERT INTO bench SELECT i, %s FROM generate_series(1, %d) AS g(i)`, jsonValue, numRows))
+		sqlDB.Exec(b, "ANALYZE bench")
+		for _, numRenders := range []int{1, 1 << 4, 1 << 8, 1 << 12} {
+			var sb strings.Builder
+			sb.WriteString("SELECT ")
+			for i := 0; i < numRenders; i++ {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(fmt.Sprintf("state->'nested'->>'nested' AS test%d", i+1))
+			}
+			sb.WriteString(" FROM bench")
+			query := sb.String()
+			b.Run(fmt.Sprintf("rows=%d/renders=%d", numRows, numRenders), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					sqlDB.Exec(b, query)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkNestedAndPlanning benchmarks how long it takes to run a query with
+// many expressions logically AND'ed in a single output column.
+func BenchmarkNestedAndPlanning(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{SQLMemoryPoolSize: 10 << 30})
+	defer s.Stopper().Stop(ctx)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	// Disable fallback to the row-by-row processing wrapping.
+	sqlDB.Exec(b, "SET CLUSTER SETTING sql.distsql.vectorize_render_wrapping.min_render_count = 9999999")
+	sqlDB.Exec(b, "CREATE TABLE bench (i INT)")
+	for _, numRenders := range []int{1 << 4, 1 << 8, 1 << 12} {
+		var sb strings.Builder
+		sb.WriteString("SELECT ")
+		for i := 0; i < numRenders; i++ {
+			if i > 0 {
+				sb.WriteString(" AND ")
+			}
+			sb.WriteString(fmt.Sprintf("i < %d", i+1))
+		}
+		sb.WriteString(" FROM bench")
+		query := sb.String()
+		b.Run(fmt.Sprintf("renders=%d", numRenders), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sqlDB.Exec(b, query)
+			}
+		})
+	}
 }

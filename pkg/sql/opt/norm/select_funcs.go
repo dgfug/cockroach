@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -20,7 +16,7 @@ import (
 // CanMapOnSetOp determines whether the filter can be mapped to either
 // side of a set operator.
 func (c *CustomFuncs) CanMapOnSetOp(filter *memo.FiltersItem) bool {
-	if memo.CanBeCompositeSensitive(c.mem.Metadata(), filter) {
+	if memo.CanBeCompositeSensitive(filter) {
 		// In general, it is not safe to remap a composite-sensitive filter.
 		// For example:
 		//  - the set operation is Except
@@ -53,7 +49,7 @@ func (c *CustomFuncs) MapSetOpFilterLeft(
 	filter *memo.FiltersItem, set *memo.SetPrivate,
 ) opt.ScalarExpr {
 	colMap := makeMapFromColLists(set.OutCols, set.LeftCols)
-	return c.RemapCols(filter.Condition, colMap)
+	return c.f.RemapCols(filter.Condition, colMap)
 }
 
 // MapSetOpFilterRight maps the filter onto the right expression by replacing
@@ -64,7 +60,7 @@ func (c *CustomFuncs) MapSetOpFilterRight(
 	filter *memo.FiltersItem, set *memo.SetPrivate,
 ) opt.ScalarExpr {
 	colMap := makeMapFromColLists(set.OutCols, set.RightCols)
-	return c.RemapCols(filter.Condition, colMap)
+	return c.f.RemapCols(filter.Condition, colMap)
 }
 
 // makeMapFromColLists maps each column ID in src to a column ID in dst. The
@@ -296,9 +292,9 @@ func (c *CustomFuncs) SortFilters(f memo.FiltersExpr) memo.FiltersExpr {
 }
 
 // SimplifyFilters removes True operands from a FiltersExpr, and normalizes any
-// False or Null condition to a single False condition. Null values map to False
-// because FiltersExpr are only used by Select and Join, both of which treat a
-// Null filter conjunct exactly as if it were false.
+// False, Null, or contradictory conditions to a single False condition. Null
+// values map to False because FiltersExpr are only used by Select and Join,
+// both of which treat a Null filter conjunct exactly as if it were false.
 //
 // SimplifyFilters also "flattens" any And operator child by merging its
 // conditions into a new FiltersExpr list. If, after simplification, no operands
@@ -324,6 +320,9 @@ func (c *CustomFuncs) SimplifyFilters(filters memo.FiltersExpr) memo.FiltersExpr
 	newFilters := make(memo.FiltersExpr, 0, cnt)
 	for _, item := range filters {
 		var ok bool
+		if item.ScalarProps().Constraints == constraint.Contradiction {
+			return memo.FiltersExpr{c.f.ConstructFiltersItem(memo.FalseSingleton)}
+		}
 		if newFilters, ok = c.addConjuncts(item.Condition, newFilters); !ok {
 			return memo.FiltersExpr{c.f.ConstructFiltersItem(memo.FalseSingleton)}
 		}
@@ -412,4 +411,11 @@ func (c *CustomFuncs) addConjuncts(
 		filters = append(filters, c.f.ConstructFiltersItem(t))
 	}
 	return filters, true
+}
+
+// ForDuplicateRemoval returns true if the Ordinality expression was constructed
+// for the purposes of duplicate removal, and the actual values returned does
+// not matter.
+func (c *CustomFuncs) ForDuplicateRemoval(private *memo.OrdinalityPrivate) (ok bool) {
+	return private.ForDuplicateRemoval
 }

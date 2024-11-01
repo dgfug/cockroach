@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -17,12 +12,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -55,9 +54,6 @@ type Materializer struct {
 	// outputRow stores the returned results of next() to be passed through an
 	// adapter.
 	outputRow rowenc.EncDatumRow
-
-	// closers is a slice of Closers that should be Closed on termination.
-	closers colexecop.Closers
 }
 
 // drainHelper is a utility struct that wraps MetadataSources in a RowSource
@@ -70,10 +66,15 @@ type drainHelper struct {
 	// are noops.
 	ctx context.Context
 
+	// streamingMemAcc can be nil in tests.
+	streamingMemAcc      *mon.BoundAccount
+	metadataAccountedFor int64
+
 	statsCollectors []colexecop.VectorizedStatsCollector
 	sources         colexecop.MetadataSources
 
-	bufferedMeta []execinfrapb.ProducerMetadata
+	drained bool
+	meta    []execinfrapb.ProducerMetadata
 }
 
 var _ execinfra.RowSource = &drainHelper{}
@@ -110,18 +111,26 @@ func (d *drainHelper) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
 		}
 		d.statsCollectors = nil
 	}
-	if d.bufferedMeta == nil {
-		d.bufferedMeta = d.sources.DrainMeta()
-		if d.bufferedMeta == nil {
-			// Still nil, avoid more calls to DrainMeta.
-			d.bufferedMeta = []execinfrapb.ProducerMetadata{}
+	if !d.drained {
+		d.meta = d.sources.DrainMeta()
+		d.drained = true
+		if d.streamingMemAcc != nil {
+			d.metadataAccountedFor = colexecutils.AccountForMetadata(d.ctx, d.streamingMemAcc, d.meta)
 		}
 	}
-	if len(d.bufferedMeta) == 0 {
+	if len(d.meta) == 0 {
+		// Eagerly lose the reference to the slice.
+		d.meta = nil
+		if d.streamingMemAcc != nil {
+			// At this point, the caller took over the metadata, so we can
+			// release the allocations.
+			d.streamingMemAcc.Shrink(d.ctx, d.metadataAccountedFor)
+			d.metadataAccountedFor = 0
+		}
 		return nil, nil
 	}
-	meta := d.bufferedMeta[0]
-	d.bufferedMeta = d.bufferedMeta[1:]
+	meta := d.meta[0]
+	d.meta = d.meta[1:]
 	return nil, &meta
 }
 
@@ -140,13 +149,16 @@ var materializerPool = sync.Pool{
 // NewMaterializer creates a new Materializer processor which processes the
 // columnar data coming from input to return it as rows.
 // Arguments:
+// - streamingMemAcc can be nil in tests.
 // - typs is the output types schema. Typs are assumed to have been hydrated.
-// - getStats (when tracing is enabled) returns all of the execution statistics
-// of operators which the materializer is responsible for.
 // NOTE: the constructor does *not* take in an execinfrapb.PostProcessSpec
 // because we expect input to handle that for us.
 func NewMaterializer(
-	flowCtx *execinfra.FlowCtx, processorID int32, input colexecargs.OpWithMetaInfo, typs []*types.T,
+	streamingMemAcc *mon.BoundAccount,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input colexecargs.OpWithMetaInfo,
+	typs []*types.T,
 ) *Materializer {
 	m := materializerPool.Get().(*Materializer)
 	*m = Materializer{
@@ -154,51 +166,45 @@ func NewMaterializer(
 		input:                 input.Root,
 		typs:                  typs,
 		converter:             colconv.NewAllVecToDatumConverter(len(typs)),
-		row:                   make(rowenc.EncDatumRow, len(typs)),
-		// We have to perform a deep copy of closers because the input object
-		// might be released before the materializer is closed.
-		// TODO(yuzefovich): improve this. It will require untangling of
-		// planTop.close and the row sources pointed to by the plan via
-		// rowSourceToPlanNode wrappers.
-		closers: append(m.closers[:0], input.ToClose...),
+		row:                   m.row,
 	}
+	if cap(m.row) >= len(typs) && cap(m.row) > 0 {
+		// The latter part of the condition is needed in order to distinguish
+		// between a row with no columns and no rows.
+		m.row = m.row[:len(typs)]
+	} else {
+		m.row = make(rowenc.EncDatumRow, len(typs))
+	}
+	m.drainHelper.streamingMemAcc = streamingMemAcc
 	m.drainHelper.statsCollectors = input.StatsCollectors
 	m.drainHelper.sources = input.MetadataSources
 
 	m.Init(
 		m,
 		flowCtx,
-		// Materializer doesn't modify the eval context, so it is safe to reuse
-		// the one from the flow context.
-		flowCtx.EvalCtx,
 		processorID,
-		nil, /* output */
 		execinfra.ProcStateOpts{
 			// We append drainHelper to inputs to drain below in order to reuse
-			// the same underlying slice from the pooled materializer.
-			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
-				// Note that we delegate draining all of the metadata sources
-				// to drainHelper which is added as an input to drain below.
-				m.close()
-				return nil
-			},
+			// the same underlying slice from the pooled materializer. The
+			// drainHelper is responsible for draining the metadata from the
+			// input tree.
 		},
 	)
 	m.AddInputToDrain(&m.drainHelper)
 	return m
 }
 
-var _ execinfra.OpNode = &Materializer{}
+var _ execopnode.OpNode = &Materializer{}
 var _ execinfra.Processor = &Materializer{}
-var _ execinfra.Releasable = &Materializer{}
+var _ execreleasable.Releasable = &Materializer{}
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (m *Materializer) ChildCount(verbose bool) int {
 	return 1
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (m *Materializer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (m *Materializer) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return m.input
 	}
@@ -214,7 +220,7 @@ func (m *Materializer) OutputTypes() []*types.T {
 
 // Start is part of the execinfra.RowSource interface.
 func (m *Materializer) Start(ctx context.Context) {
-	ctx = m.StartInternalNoSpan(ctx)
+	ctx = m.StartInternal(ctx, "materializer" /* name */)
 	// We can encounter an expected error during Init (e.g. an operator
 	// attempts to allocate a batch, but the memory budget limit has been
 	// reached), so we need to wrap it with a catcher.
@@ -283,37 +289,18 @@ func (m *Materializer) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 	return nil, m.DrainHelper()
 }
 
-func (m *Materializer) close() {
-	if m.InternalClose() {
-		if m.Ctx == nil {
-			// In some edge cases (like when Init of an operator above this
-			// materializer encounters a panic), the materializer might never be
-			// started, yet it still will attempt to close its Closers. This
-			// context is only used for logging purposes, so it is ok to grab
-			// the background context in order to prevent a NPE below.
-			m.Ctx = context.Background()
-		}
-		m.closers.CloseAndLogOnErr(m.Ctx, "materializer")
-	}
-}
-
-// ConsumerClosed is part of the execinfra.RowSource interface.
-func (m *Materializer) ConsumerClosed() {
-	m.close()
-}
-
 // Release implements the execinfra.Releasable interface.
 func (m *Materializer) Release() {
 	m.ProcessorBaseNoHelper.Reset()
 	m.converter.Release()
-	for i := range m.closers {
-		m.closers[i] = nil
+	for i := range m.row {
+		m.row[i] = rowenc.EncDatum{}
 	}
 	*m = Materializer{
 		// We're keeping the reference to the same ProcessorBaseNoHelper since
 		// it allows us to reuse some of the slices.
 		ProcessorBaseNoHelper: m.ProcessorBaseNoHelper,
-		closers:               m.closers[:0],
+		row:                   m.row[:0],
 	}
 	materializerPool.Put(m)
 }

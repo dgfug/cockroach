@@ -2413,7 +2413,7 @@ error (42804): argument of ON must be type bool, not type float
 build
 SELECT * FROM foo JOIN bar ON generate_series(0, 1) < 2
 ----
-error (0A000): generate_series(): generator functions are not allowed in ON
+error (0A000): generate_series(): set-returning functions are not allowed in ON
 
 build
 SELECT * FROM foo JOIN bar ON max(foo.c) < 2
@@ -2429,6 +2429,21 @@ project
  └── inner-join (hash)
       ├── columns: x:1!null a.rowid:2!null a.crdb_internal_mvcc_timestamp:3 a.tableoid:4 y:5!null b.rowid:6!null b.crdb_internal_mvcc_timestamp:7 b.tableoid:8
       ├── flags: force merge join
+      ├── scan onecolumn [as=a]
+      │    └── columns: x:1 a.rowid:2!null a.crdb_internal_mvcc_timestamp:3 a.tableoid:4
+      ├── scan onecolumn [as=b]
+      │    └── columns: y:5 b.rowid:6!null b.crdb_internal_mvcc_timestamp:7 b.tableoid:8
+      └── filters
+           └── x:1 = y:5
+
+build
+SELECT * FROM onecolumn AS a(x) INNER STRAIGHT JOIN onecolumn AS b(y) ON a.x = b.y
+----
+project
+ ├── columns: x:1!null y:5!null
+ └── inner-join (hash)
+      ├── columns: x:1!null a.rowid:2!null a.crdb_internal_mvcc_timestamp:3 a.tableoid:4 y:5!null b.rowid:6!null b.crdb_internal_mvcc_timestamp:7 b.tableoid:8
+      ├── flags: disallow hash join (store left side) and lookup join (into left side) and inverted join (into left side)
       ├── scan onecolumn [as=a]
       │    └── columns: x:1 a.rowid:2!null a.crdb_internal_mvcc_timestamp:3 a.tableoid:4
       ├── scan onecolumn [as=b]

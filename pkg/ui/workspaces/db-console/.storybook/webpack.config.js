@@ -1,14 +1,10 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-const custom = require("../webpack.app.js");
+const custom = require("../webpack.config");
+const path = require("path");
 
 const appConfig = custom({dist: "ccl"}, {mode: "development"});
 
@@ -17,8 +13,13 @@ module.exports = async ({ config, mode }) => {
     ...config,
     resolve: {
       ...config.resolve,
-      modules: appConfig.resolve.modules,
+      modules: [
+        path.resolve(__dirname, "..", "ccl"),
+        path.resolve(__dirname, ".."),
+        "node_modules",
+      ],
       extensions: appConfig.resolve.extensions,
+      alias: appConfig.resolve.alias,
     },
     module: {
       rules: [

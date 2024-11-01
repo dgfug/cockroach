@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -14,14 +9,16 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/workload/querybench"
 )
@@ -33,9 +30,6 @@ type tpchBenchSpec struct {
 	benchType       string
 	url             string
 	numRunsPerQuery int
-	// minVersion specifies the minimum version of CRDB nodes. If omitted, it
-	// will default to v19.1.0.
-	minVersion string
 	// maxLatency is the expected maximum time that a query will take to execute
 	// needed to correctly initialize histograms.
 	maxLatency time.Duration
@@ -52,26 +46,24 @@ type tpchBenchSpec struct {
 // This benchmark runs with a single load generator node running a single
 // worker.
 func runTPCHBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpchBenchSpec) {
-	roachNodes := c.Range(1, c.Spec().NodeCount-1)
-	loadNode := c.Node(c.Spec().NodeCount)
-
-	t.Status("copying binaries")
-	c.Put(ctx, t.Cockroach(), "./cockroach", roachNodes)
-	c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
-
 	filename := b.benchType
 	t.Status(fmt.Sprintf("downloading %s query file from %s", filename, b.url))
-	if err := c.RunE(ctx, loadNode, fmt.Sprintf("curl %s > %s", b.url, filename)); err != nil {
+	if err := c.RunE(ctx, option.WithNodes(c.WorkloadNode()), fmt.Sprintf("curl %s > %s", b.url, filename)); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Status("starting nodes")
-	c.Start(ctx, roachNodes)
+	c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings(), c.CRDBNodes())
 
-	m := c.NewMonitor(ctx, roachNodes)
+	m := c.NewMonitor(ctx, c.CRDBNodes())
 	m.Go(func(ctx context.Context) error {
+		conn := c.Conn(ctx, t.L(), 1)
+		defer conn.Close()
+
 		t.Status("setting up dataset")
-		err := loadTPCHDataset(ctx, t, c, b.ScaleFactor, m, roachNodes)
+		err := loadTPCHDataset(
+			ctx, t, c, conn, b.ScaleFactor, m, c.CRDBNodes(), true, /* disableMergeQueue */
+		)
 		if err != nil {
 			return err
 		}
@@ -94,10 +86,10 @@ func runTPCHBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpchBen
 			filename,
 			b.numRunsPerQuery,
 			maxOps,
-			roachNodes,
+			c.CRDBNodes(),
 			b.maxLatency.String(),
 		)
-		if err := c.RunE(ctx, loadNode, cmd); err != nil {
+		if err := c.RunE(ctx, option.WithNodes(c.WorkloadNode()), cmd); err != nil {
 			t.Fatal(err)
 		}
 		return nil
@@ -118,7 +110,7 @@ func getNumQueriesInFile(filename, url string) (int, error) {
 		_ = os.Remove(tempFile.Name())
 	}()
 
-	queries, err := querybench.GetQueries(tempFile.Name())
+	queries, err := querybench.GetQueries(tempFile.Name(), "")
 	if err != nil {
 		return 0, err
 	}
@@ -138,7 +130,7 @@ func downloadFile(filename string, url string) (*os.File, error) {
 	defer resp.Body.Close()
 
 	// Create the file.
-	out, err := ioutil.TempFile(`` /* dir */, filename)
+	out, err := os.CreateTemp(`` /* dir */, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -160,15 +152,17 @@ func registerTPCHBenchSpec(r registry.Registry, b tpchBenchSpec) {
 
 	// Add a load generator node.
 	numNodes := b.Nodes + 1
-	minVersion := b.minVersion
-	if minVersion == `` {
-		minVersion = "v19.1.0" // needed for import
-	}
 
 	r.Add(registry.TestSpec{
-		Name:    strings.Join(nameParts, "/"),
-		Owner:   registry.OwnerSQLQueries,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Name:      strings.Join(nameParts, "/"),
+		Owner:     registry.OwnerSQLQueries,
+		Benchmark: true,
+		Cluster:   r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds:           registry.Clouds(spec.GCE, spec.Local),
+		Suites:                     registry.Suites(registry.Nightly),
+		RequiresDeprecatedWorkload: true, // uses querybench
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHBench(ctx, t, c, b)
 		},
@@ -193,7 +187,6 @@ func registerTPCHBench(r registry.Registry) {
 			benchType:       `tpch`,
 			url:             `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/workload/querybench/tpch-queries`,
 			numRunsPerQuery: 3,
-			minVersion:      `v19.2.0`,
 			maxLatency:      500 * time.Second,
 		},
 	}

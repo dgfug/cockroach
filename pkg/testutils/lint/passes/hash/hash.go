@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package hash defines an Analyzer that detects correct use of hash.Hash.
 package hash
@@ -34,7 +29,7 @@ var Analyzer = &analysis.Analyzer{
 // mistake is to assume that the Sum function returns the hash of its input,
 // like so:
 //
-//     hashedBytes := sha256.New().Sum(inputBytes)
+//	hashedBytes := sha256.New().Sum(inputBytes)
 //
 // In fact, the parameter to Sum is not the bytes to be hashed, but a slice that
 // will be used as output in case the caller wants to avoid an allocation. In
@@ -43,14 +38,14 @@ var Analyzer = &analysis.Analyzer{
 //
 // Correct uses of the hash.Hash interface are as follows:
 //
-//     h := sha256.New()
-//     h.Write(inputBytes)
-//     hashedBytes := h.Sum(nil)
+//	h := sha256.New()
+//	h.Write(inputBytes)
+//	hashedBytes := h.Sum(nil)
 //
-//     h := sha256.New()
-//     h.Write(inputBytes)
-//     var hashedBytes [sha256.Size]byte
-//     h.Sum(hashedBytes[:0])
+//	h := sha256.New()
+//	h.Write(inputBytes)
+//	var hashedBytes [sha256.Size]byte
+//	h.Sum(hashedBytes[:0])
 //
 // To differentiate between correct and incorrect usages, hashChecker applies a
 // simple heuristic: it flags calls to Sum where a) the parameter is non-nil and

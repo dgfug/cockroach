@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -23,6 +19,10 @@ import (
 type RemoveOptions struct {
 	// If true, the replica's destroyStatus must be marked as removed.
 	DestroyData bool
+	// InsertPlaceholder can be specified when removing an initialized Replica
+	// and will result in the insertion of a ReplicaPlaceholder covering the
+	// keyspace previously occupied by the (now deleted) Replica.
+	InsertPlaceholder bool
 }
 
 // RemoveReplica removes the replica from the store's replica map and from the
@@ -40,7 +40,11 @@ func (s *Store) RemoveReplica(
 ) error {
 	rep.raftMu.Lock()
 	defer rep.raftMu.Unlock()
-	return s.removeInitializedReplicaRaftMuLocked(ctx, rep, nextReplicaID, opts)
+	if opts.InsertPlaceholder {
+		return errors.Errorf("InsertPlaceholder not supported in RemoveReplica")
+	}
+	_, err := s.removeInitializedReplicaRaftMuLocked(ctx, rep, nextReplicaID, opts)
+	return err
 }
 
 // removeReplicaRaftMuLocked removes the passed replica. If the replica is
@@ -50,7 +54,11 @@ func (s *Store) removeReplicaRaftMuLocked(
 ) error {
 	rep.raftMu.AssertHeld()
 	if rep.IsInitialized() {
-		return errors.Wrap(s.removeInitializedReplicaRaftMuLocked(ctx, rep, nextReplicaID, opts),
+		if opts.InsertPlaceholder {
+			return errors.Errorf("InsertPlaceholder unsupported in removeReplicaRaftMuLocked")
+		}
+		_, err := s.removeInitializedReplicaRaftMuLocked(ctx, rep, nextReplicaID, opts)
+		return errors.Wrap(err,
 			"failed to remove replica")
 	}
 	s.removeUninitializedReplicaRaftMuLocked(ctx, rep, nextReplicaID)
@@ -62,75 +70,86 @@ func (s *Store) removeReplicaRaftMuLocked(
 // It requires that Replica.raftMu is held and that s.mu is not held.
 func (s *Store) removeInitializedReplicaRaftMuLocked(
 	ctx context.Context, rep *Replica, nextReplicaID roachpb.ReplicaID, opts RemoveOptions,
-) error {
+) (*ReplicaPlaceholder, error) {
 	rep.raftMu.AssertHeld()
+	if !rep.IsInitialized() {
+		return nil, errors.AssertionFailedf("cannot remove uninitialized replica %s", rep)
+	}
 
-	// Sanity checks before committing to the removal by setting the
-	// destroy status.
-	var desc *roachpb.RangeDescriptor
-	var replicaID roachpb.ReplicaID
-	var tenantID roachpb.TenantID
-	{
+	if opts.InsertPlaceholder {
+		if opts.DestroyData {
+			return nil, errors.AssertionFailedf("cannot specify both InsertPlaceholder and DestroyData")
+		}
+
+	}
+
+	// Run sanity checks and on success commit to the removal by setting the
+	// destroy status. If (nil, nil) is returned, there's nothing to do.
+	desc, err := func() (*roachpb.RangeDescriptor, error) {
 		rep.readOnlyCmdMu.Lock()
+		defer rep.readOnlyCmdMu.Unlock()
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		rep.mu.Lock()
+		defer rep.mu.Unlock()
 
 		if opts.DestroyData {
 			// Detect if we were already removed.
 			if rep.mu.destroyStatus.Removed() {
-				rep.mu.Unlock()
-				rep.readOnlyCmdMu.Unlock()
-				return nil // already removed, noop
+				return nil, nil // already removed, noop
 			}
 		} else {
 			// If the caller doesn't want to destroy the data because it already
 			// has done so, then it must have already also set the destroyStatus.
 			if !rep.mu.destroyStatus.Removed() {
-				rep.mu.Unlock()
-				rep.readOnlyCmdMu.Unlock()
-				log.Fatalf(ctx, "replica not marked as destroyed but data already destroyed: %v", rep)
+				return nil, errors.AssertionFailedf("replica not marked as destroyed but data already destroyed: %v", rep)
 			}
 		}
 
-		desc = rep.mu.state.Desc
+		// Check if Replica is in the Store.
+		//
+		// There is a certain amount of idempotency in this method (repeat attempts
+		// to destroy an already destroyed replica are allowed when DestroyData is
+		// set, see the early return above), but if we get here then the Replica
+		// better be in the Store (since the Store enforces ownership over the
+		// keyspace, so deleting data for a Replica that's not in the Store can
+		// delete random active data). Note that if the caller has !DestroyData,
+		// this means it needs to already know that the Replica is still in the
+		// Store.
+		if existing, ok := s.mu.replicasByRangeID.Load(rep.RangeID); !ok {
+			return nil, errors.AssertionFailedf("cannot remove replica which does not exist in Store")
+		} else if existing != rep {
+			return nil, errors.AssertionFailedf("replica %v replaced by %v before being removed",
+				rep, existing)
+		}
+
+		// Now we know that the Store's Replica is identical to the passed-in
+		// Replica.
+		desc := rep.shMu.state.Desc
 		if repDesc, ok := desc.GetReplicaDescriptor(s.StoreID()); ok && repDesc.ReplicaID >= nextReplicaID {
-			rep.mu.Unlock()
-			rep.readOnlyCmdMu.Unlock()
-			// NB: This should not in any way be possible starting in 20.1.
-			log.Fatalf(ctx, "replica descriptor's ID has changed (%s >= %s)",
+			// The ReplicaID of a Replica is immutable.
+			return nil, errors.AssertionFailedf("replica descriptor's ID has changed (%s >= %s)",
 				repDesc.ReplicaID, nextReplicaID)
 		}
 
-		// This is a fatal error as an initialized replica can never become
-		/// uninitialized.
-		if !rep.isInitializedRLocked() {
-			rep.mu.Unlock()
-			rep.readOnlyCmdMu.Unlock()
-			log.Fatalf(ctx, "uninitialized replica cannot be removed with removeInitializedReplica: %v", rep)
-		}
-
-		// Mark the replica as removed before deleting data.
-		rep.mu.destroyStatus.Set(roachpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
+		// Sanity checks passed. Mark the replica as removed before deleting data.
+		rep.mu.destroyStatus.Set(kvpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
 			destroyReasonRemoved)
-		replicaID = rep.mu.replicaID
-		tenantID = rep.mu.tenantID
-		rep.mu.Unlock()
-		rep.readOnlyCmdMu.Unlock()
+		return desc, nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if desc == nil {
+		// Already removed/removing, no-op.
+		return nil, nil
 	}
 
 	// Proceed with the removal, all errors encountered from here down are fatal.
 
-	// Another sanity check that this replica is a part of this store.
-	existing, err := s.GetReplica(rep.RangeID)
-	if err != nil {
-		log.Fatalf(ctx, "cannot remove replica which does not exist: %v", err)
-	} else if existing != rep {
-		log.Fatalf(ctx, "replica %v replaced by %v before being removed",
-			rep, existing)
-	}
-
 	// During merges, the context might have the subsuming range, so we explicitly
 	// log the replica to be removed.
-	log.Infof(ctx, "removing replica r%d/%d", rep.RangeID, replicaID)
+	log.Infof(ctx, "removing replica r%d/%d", rep.RangeID, rep.replicaID)
 
 	s.mu.Lock()
 	if it := s.getOverlappingKeyRangeLocked(desc); it.repl != rep {
@@ -144,13 +163,13 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 	// Destroy, but this configuration helps avoid races in stat verification
 	// tests.
 
-	s.metrics.subtractMVCCStats(ctx, tenantID, rep.GetMVCCStats())
+	s.metrics.subtractMVCCStats(ctx, rep.tenantMetricsRef, rep.GetMVCCStats())
 	s.metrics.ReplicaCount.Dec(1)
 	s.mu.Unlock()
 
 	// The replica will no longer exist, so cancel any rangefeed registrations.
 	rep.disconnectRangefeedWithReason(
-		roachpb.RangeFeedRetryError_REASON_REPLICA_REMOVED,
+		kvpb.RangeFeedRetryError_REASON_REPLICA_REMOVED,
 	)
 
 	// Mark the replica as destroyed and (optionally) destroy the on-disk data
@@ -160,11 +179,11 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 	rep.disconnectReplicationRaftMuLocked(ctx)
 	if opts.DestroyData {
 		if err := rep.destroyRaftMuLocked(ctx, nextReplicaID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	func() {
+	ph := func() *ReplicaPlaceholder {
 		s.mu.Lock()
 		defer s.mu.Unlock() // must unlock before s.scanner.RemoveReplica(), to avoid deadlock
 
@@ -175,19 +194,39 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 		if ph, ok := s.mu.replicaPlaceholders[rep.RangeID]; ok {
 			log.Fatalf(ctx, "initialized replica %s unexpectedly had a placeholder: %+v", rep, ph)
 		}
-		if it := s.mu.replicasByKey.DeleteReplica(ctx, rep); it.repl != rep {
+		desc := rep.Desc()
+		ph := &ReplicaPlaceholder{
+			rangeDesc: *roachpb.NewRangeDescriptor(desc.RangeID, desc.StartKey, desc.EndKey, desc.Replicas()),
+		}
+
+		if it := s.mu.replicasByKey.ReplaceOrInsertPlaceholder(ctx, ph); it.repl != rep {
 			// We already checked that our replica was present in replicasByKey
 			// above. Nothing should have been able to change that.
 			log.Fatalf(ctx, "replica %+v unexpectedly overlapped by %+v", rep, it.item)
 		}
-		if it := s.getOverlappingKeyRangeLocked(desc); it.item != nil {
+		if exPH, ok := s.mu.replicaPlaceholders[desc.RangeID]; ok {
+			log.Fatalf(ctx, "cannot insert placeholder %s, already have %s", ph, exPH)
+		}
+		s.mu.replicaPlaceholders[desc.RangeID] = ph
+
+		if opts.InsertPlaceholder {
+			return ph
+		}
+		// If placeholder not desired, remove it now, otherwise, that's the caller's
+		// job. We could elide the placeholder altogether but wish to instead
+		// minimize the divergence between the two code paths.
+
+		s.mu.replicasByKey.DeletePlaceholder(ctx, ph)
+		delete(s.mu.replicaPlaceholders, desc.RangeID)
+		if it := s.getOverlappingKeyRangeLocked(desc); it.item != nil && it.item != ph {
 			log.Fatalf(ctx, "corrupted replicasByKey map: %s and %s overlapped", rep, it.item)
 		}
+		return nil
 	}()
 
-	s.maybeGossipOnCapacityChange(ctx, rangeRemoveEvent)
+	s.storeGossip.MaybeGossipOnCapacityChange(ctx, RangeRemoveEvent)
 	s.scanner.RemoveReplica(rep)
-	return nil
+	return ph, nil
 }
 
 // removeUninitializedReplicaRaftMuLocked removes an uninitialized replica.
@@ -213,14 +252,14 @@ func (s *Store) removeUninitializedReplicaRaftMuLocked(
 			log.Fatalf(ctx, "uninitialized replica unexpectedly already removed")
 		}
 
-		if rep.isInitializedRLocked() {
+		if rep.IsInitialized() {
 			rep.mu.Unlock()
 			rep.readOnlyCmdMu.Unlock()
 			log.Fatalf(ctx, "cannot remove initialized replica in removeUninitializedReplica: %v", rep)
 		}
 
 		// Mark the replica as removed before deleting data.
-		rep.mu.destroyStatus.Set(roachpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
+		rep.mu.destroyStatus.Set(kvpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
 			destroyReasonRemoved)
 
 		rep.mu.Unlock()
@@ -262,9 +301,10 @@ func (s *Store) unlinkReplicaByRangeIDLocked(ctx context.Context, rangeID roachp
 	delete(s.unquiescedReplicas.m, rangeID)
 	s.unquiescedReplicas.Unlock()
 	delete(s.mu.uninitReplicas, rangeID)
-	s.replicaQueues.Delete(int64(rangeID))
 	s.mu.replicasByRangeID.Delete(rangeID)
 	s.unregisterLeaseholderByID(ctx, rangeID)
+	s.raftRecvQueues.Delete(rangeID)
+	s.scheduler.RemovePriorityID(rangeID)
 }
 
 // removePlaceholder removes a placeholder for the specified range.

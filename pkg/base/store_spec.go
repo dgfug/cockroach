@@ -1,20 +1,15 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -43,10 +38,10 @@ import (
 // hard coded to 640MiB.
 const MinimumStoreSize = 10 * 64 << 20
 
-// GetAbsoluteStorePath takes a (possibly relative) and returns the absolute path.
+// GetAbsoluteFSPath takes a (possibly relative) and returns the absolute path.
 // Returns an error if the path begins with '~' or Abs fails.
 // 'fieldName' is used in error strings.
-func GetAbsoluteStorePath(fieldName string, p string) (string, error) {
+func GetAbsoluteFSPath(fieldName string, p string) (string, error) {
 	if p[0] == '~' {
 		return "", fmt.Errorf("%s cannot start with '~': %s", fieldName, p)
 	}
@@ -161,6 +156,45 @@ func (ss *SizeSpec) Set(value string) error {
 	return nil
 }
 
+// ProvisionedRateSpec is an optional part of the StoreSpec.
+type ProvisionedRateSpec struct {
+	// ProvisionedBandwidth is the bandwidth provisioned for this store in bytes/s.
+	ProvisionedBandwidth int64
+}
+
+func newStoreProvisionedRateSpec(
+	field redact.SafeString, value string,
+) (ProvisionedRateSpec, error) {
+	split := strings.Split(value, "=")
+	if len(split) != 2 {
+		return ProvisionedRateSpec{}, errors.Errorf("%s field has invalid value %s", field, value)
+	}
+	subField := split[0]
+	subValue := split[1]
+	if subField != "bandwidth" {
+		return ProvisionedRateSpec{}, errors.Errorf("%s field does not have bandwidth sub-field", field)
+	}
+	if len(subValue) == 0 {
+		return ProvisionedRateSpec{}, errors.Errorf("%s field has no value specified for bandwidth", field)
+	}
+	if len(subValue) <= 2 || subValue[len(subValue)-2:] != "/s" {
+		return ProvisionedRateSpec{},
+			errors.Errorf("%s field does not have bandwidth sub-field %s ending in /s",
+				field, subValue)
+	}
+	bandwidthString := subValue[:len(subValue)-2]
+	bandwidth, err := humanizeutil.ParseBytes(bandwidthString)
+	if err != nil {
+		return ProvisionedRateSpec{},
+			errors.Wrapf(err, "could not parse bandwidth in field %s", field)
+	}
+	if bandwidth == 0 {
+		return ProvisionedRateSpec{},
+			errors.Errorf("%s field is trying to set bandwidth to 0", field)
+	}
+	return ProvisionedRateSpec{ProvisionedBandwidth: bandwidth}, nil
+}
+
 // StoreSpec contains the details that can be specified in the cli pertaining
 // to the --store flag.
 type StoreSpec struct {
@@ -169,26 +203,26 @@ type StoreSpec struct {
 	BallastSize *SizeSpec
 	InMemory    bool
 	Attributes  roachpb.Attributes
-	// StickyInMemoryEngineID is a unique identifier associated with a given
-	// store which will remain in memory even after the default Engine close
-	// until it has been explicitly cleaned up by CleanupStickyInMemEngine[s]
-	// or the process has been terminated.
-	// This only applies to in-memory storage engine.
-	StickyInMemoryEngineID string
-	// UseFileRegistry is true if the "file registry" store version is desired.
-	// This is set by CCL code when encryption-at-rest is in use.
-	UseFileRegistry bool
+	// StickyVFSID is a unique identifier associated with a given store which
+	// will preserve the in-memory virtual file system (VFS) even after the
+	// storage engine has been closed. This only applies to in-memory storage
+	// engine.
+	StickyVFSID string
 	// RocksDBOptions contains RocksDB specific options using a semicolon
 	// separated key-value syntax ("key1=value1; key2=value2").
 	RocksDBOptions string
 	// PebbleOptions contains Pebble-specific options in the same format as a
-	// Pebble OPTIONS file but treating any whitespace as a newline:
-	// (Eg, "[Options] delete_range_flush_delay=2s flush_split_bytes=4096")
+	// Pebble OPTIONS file. For example:
+	// [Options]
+	// delete_range_flush_delay=2s
+	// flush_split_bytes=4096
 	PebbleOptions string
 	// EncryptionOptions is a serialized protobuf set by Go CCL code and passed
 	// through to C CCL code to set up encryption-at-rest.  Must be set if and
 	// only if encryption is enabled, otherwise left empty.
 	EncryptionOptions []byte
+	// ProvisionedRateSpec is optional.
+	ProvisionedRateSpec ProvisionedRateSpec
 }
 
 // String returns a fully parsable version of the store spec.
@@ -231,6 +265,10 @@ func (ss StoreSpec) String() string {
 		fmt.Fprint(&buffer, optsStr)
 		fmt.Fprint(&buffer, ",")
 	}
+	if ss.ProvisionedRateSpec.ProvisionedBandwidth > 0 {
+		fmt.Fprintf(&buffer, "provisioned-rate=bandwidth=%s/s,",
+			humanizeutil.IBytes(ss.ProvisionedRateSpec.ProvisionedBandwidth))
+	}
 	// Trim the extra comma from the end if it exists.
 	if l := buffer.Len(); l > 0 {
 		buffer.Truncate(l - 1)
@@ -259,20 +297,24 @@ var fractionRegex = regexp.MustCompile(`^([-]?([0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-
 
 // NewStoreSpec parses the string passed into a --store flag and returns a
 // StoreSpec if it is correctly parsed.
-// There are four possible fields that can be passed in, comma separated:
-// - path=xxx The directory in which to the rocks db instance should be
-//   located, required unless using a in memory storage.
-// - type=mem This specifies that the store is an in memory storage instead of
-//   an on disk one. mem is currently the only other type available.
-// - size=xxx The optional maximum size of the storage. This can be in one of a
-//   few different formats.
+// There are five possible fields that can be passed in, comma separated:
+//   - path=xxx The directory in which the rocks db instance should be
+//     located, required unless using an in memory storage.
+//   - type=mem This specifies that the store is an in memory storage instead of
+//     an on disk one. mem is currently the only other type available.
+//   - size=xxx The optional maximum size of the storage. This can be in one of a
+//     few different formats.
 //   - 10000000000     -> 10000000000 bytes
 //   - 20GB            -> 20000000000 bytes
 //   - 20GiB           -> 21474836480 bytes
 //   - 0.02TiB         -> 21474836480 bytes
 //   - 20%             -> 20% of the available space
 //   - 0.2             -> 20% of the available space
-// - attrs=xxx:yyy:zzz A colon separated list of optional attributes.
+//   - attrs=xxx:yyy:zzz A colon separated list of optional attributes.
+//   - provisioned-rate=bandwidth=<bandwidth-bytes/s> The provisioned-rate can be
+//     used for admission control for operations on the store and if unspecified,
+//     a cluster setting (kvadmission.store.provisioned_bandwidth) will be used.
+//
 // Note that commas are forbidden within any field name or value.
 func NewStoreSpec(value string) (StoreSpec, error) {
 	const pathField = "path"
@@ -309,11 +351,7 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 
 		switch field {
 		case pathField:
-			var err error
-			ss.Path, err = GetAbsoluteStorePath(pathField, value)
-			if err != nil {
-				return StoreSpec{}, err
-			}
+			ss.Path = value
 		case "size":
 			var err error
 			var minBytesAllowed int64 = MinimumStoreSize
@@ -399,6 +437,13 @@ func NewStoreSpec(value string) (StoreSpec, error) {
 				return StoreSpec{}, err
 			}
 			ss.PebbleOptions = buf.String()
+		case "provisioned-rate":
+			rateSpec, err := newStoreProvisionedRateSpec("provisioned-rate", value)
+			if err != nil {
+				return StoreSpec{}, err
+			}
+			ss.ProvisionedRateSpec = rateSpec
+
 		default:
 			return StoreSpec{}, fmt.Errorf("%s is not a valid store field", field)
 		}
@@ -483,7 +528,7 @@ func (ssl StoreSpecList) PriorCriticalAlertError() (err error) {
 		if path == "" {
 			continue
 		}
-		b, err := ioutil.ReadFile(path)
+		b, err := os.ReadFile(path)
 		if err != nil {
 			if !oserror.IsNotExist(err) {
 				addError(errors.Wrapf(err, "%s", path))

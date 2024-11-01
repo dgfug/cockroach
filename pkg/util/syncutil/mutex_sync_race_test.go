@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build !deadlock && race
 // +build !deadlock,race
@@ -22,6 +17,7 @@ import (
 func TestAssertHeld(t *testing.T) {
 	type mutex interface {
 		Lock()
+		TryLock() bool
 		Unlock()
 		AssertHeld()
 	}
@@ -35,6 +31,11 @@ func TestAssertHeld(t *testing.T) {
 	for _, c := range testCases {
 		// The normal, successful case.
 		c.m.Lock()
+		c.m.AssertHeld()
+		c.m.Unlock()
+
+		// The successful case with TryLock.
+		require.True(t, c.m.TryLock())
 		c.m.AssertHeld()
 		c.m.Unlock()
 
@@ -60,6 +61,23 @@ func TestAssertRHeld(t *testing.T) {
 
 	// The case where a write lock is held.
 	m.Lock()
+	m.AssertRHeld()
+	m.Unlock()
+
+	// The successful case with TryRLock.
+	require.True(t, m.TryRLock())
+	m.AssertRHeld()
+	m.RUnlock()
+
+	// The normal case with two readers and TryRLock.
+	require.True(t, m.TryRLock())
+	require.True(t, m.TryRLock())
+	m.AssertRHeld()
+	m.RUnlock()
+	m.RUnlock()
+
+	// The case where a write lock is held with TryLock.
+	require.True(t, m.TryLock())
 	m.AssertRHeld()
 	m.Unlock()
 

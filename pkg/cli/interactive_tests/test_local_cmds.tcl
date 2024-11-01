@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 
 start_test "Check that times are displayed by default on interactive terminals."
@@ -30,14 +30,14 @@ end_test
 start_test "Check that \\q terminates the client."
 send "\\q\r"
 eexpect eof
-spawn $argv sql --format=tsv
+spawn $argv sql --no-line-editor --format=tsv
 eexpect root@
 end_test
 
 start_test "Check that quit terminates the client."
 send "quit\r"
 eexpect eof
-spawn $argv sql --format=tsv
+spawn $argv sql --no-line-editor --format=tsv
 eexpect root@
 end_test
 
@@ -50,8 +50,16 @@ end_test
 start_test "Check that exit terminates the client."
 send "exit\r"
 eexpect eof
-spawn $argv sql --format=tsv
+spawn $argv sql --no-line-editor --format=tsv
 eexpect root@
+end_test
+
+start_test "Check that the conn details can be printed."
+send "\\info\r"
+eexpect "Server version:"
+eexpect "Cluster ID:"
+eexpect "Connection string:"
+eexpect "You are connected"
 end_test
 
 start_test "Check that \\| reads statements."
@@ -89,9 +97,13 @@ end_test
 
 start_test "Check that \\set display_format properly errors out"
 send "\\set display_format blabla\r"
+eexpect "ERROR"
 eexpect "invalid table display format"
-# check we don't see a stray "cannot change option during multi-line editing" tacked at the end
-eexpect "html, raw)\r\n"
+eexpect "HINT"
+eexpect tsv
+eexpect ndjson
+eexpect html
+eexpect raw
 eexpect root@
 end_test
 
@@ -266,8 +278,38 @@ eexpect Description
 eexpect root@
 end_test
 
-# Finally terminate with Ctrl+C.
-interrupt
+start_test "Check that the output of queries can be redirected to a file."
+send "\\o logs/query-output.txt\r"
+eexpect root@
+send "select 'hello world';\r"
+eexpect root@
+# Check the output is flushed immediately.
+system "grep -q world logs/query-output.txt"
+send "\\qecho universe\r"
+eexpect root@
+# Check qecho works.
+system "grep -q universe logs/query-output.txt"
+# Check the previous output was not erased by subsequent command.
+system "grep -q world logs/query-output.txt"
+end_test
+
+start_test "Check that errors are not redirected."
+send "select planet;\r"
+# Check the output is not redirected.
+eexpect "column \"planet\" does not exist"
+system "grep -vq planet logs/query-output.txt"
+end_test
+
+start_test "Check that the query output can be reset to stdout."
+send "\\o\r"
+eexpect root@
+send "select 'hel'||'lo';\r"
+eexpect "hello"
+eexpect root@
+end_test
+
+# Finally terminate with Ctrl+D.
+send_eof
 eexpect eof
 
 spawn /bin/bash
@@ -290,7 +332,7 @@ stop_server $argv
 start_test "Check that client-side options can be overridden with set"
 
 # First establish a baseline with all the defaults.
-send "$argv demo --no-example-database\r"
+send "$argv demo --no-line-editor --no-example-database --log-dir=logs \r"
 eexpect root@
 send "\\set display_format csv\r"
 send "\\set\r"
@@ -301,11 +343,11 @@ eexpect "errexit,false"
 eexpect "prompt1,%n@"
 eexpect "show_times,true"
 eexpect root@
-interrupt
+send_eof
 eexpect ":/# "
 
 # Then verify that the defaults can be overridden.
-send "$argv demo --no-example-database --set=auto_trace=on --set=check_syntax=false --set=echo=true --set=errexit=true --set=prompt1=%n@haa --set=show_times=false\r"
+send "$argv demo --no-line-editor --no-example-database --set=auto_trace=on --set=check_syntax=false --set=echo=true --set=errexit=true --set=prompt1=%n@haa --set=show_times=false --log-dir=logs \r"
 eexpect root@
 send "\\set display_format csv\r"
 send "\\set\r"
@@ -316,7 +358,7 @@ eexpect "errexit,true"
 eexpect "prompt1,%n@haa"
 eexpect "show_times,false"
 eexpect root@
-interrupt
+send_eof
 eexpect ":/# "
 
 end_test

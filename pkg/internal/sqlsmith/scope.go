@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
@@ -44,6 +39,26 @@ func (t colRefs) stripTableName() {
 // a function that creates new nodes.
 func (s *Smither) canRecurse() bool {
 	return s.complexity > s.rnd.Float64()
+}
+
+// canRecurseScalar returns whether the current scalar expression generator
+// function should possibly invoke a function that creates new scalar expression
+// nodes.
+func (s *Smither) canRecurseScalar(isPredicate bool, typ *types.T) bool {
+	if s.avoidConstantBooleanExpressions(isPredicate, typ) {
+		return true
+	}
+	return s.scalarComplexity > s.rnd.Float64()
+}
+
+// avoidConstantBooleanExpressions returns true if the unlikelyConstantPredicate
+// Smither option is `true`, the desired expression type is boolean, and the
+// expression is being generated for use in a query predicate.
+func (s *Smither) avoidConstantBooleanExpressions(isPredicate bool, typ *types.T) bool {
+	if isPredicate && s.unlikelyConstantPredicate && typ.Identical(types.Bool) {
+		return true
+	}
+	return false
 }
 
 // Context holds information about what kinds of expressions are legal at

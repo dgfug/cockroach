@@ -1,0 +1,31 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "externalconn",
+    srcs = [
+        "connection.go",
+        "connection_kms.go",
+        "connection_storage.go",
+        "impl_registry.go",
+        "record.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/cloud/externalconn",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/base",
+        "//pkg/cloud",
+        "//pkg/cloud/cloudpb",
+        "//pkg/cloud/externalconn/connectionpb",
+        "//pkg/security/username",
+        "//pkg/settings/cluster",
+        "//pkg/sql/catalog/colinfo",
+        "//pkg/sql/isql",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/sem/tree",
+        "//pkg/sql/sessiondata",
+        "//pkg/util/protoutil",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_lib_pq//oid",
+    ],
+)

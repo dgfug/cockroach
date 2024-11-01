@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types_test
 
@@ -14,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/stretchr/testify/require"
 )
@@ -23,7 +18,7 @@ import (
 // marshal a protobuf struct has child field of type EnumMetadata
 func TestDescriptorProtoString(t *testing.T) {
 	enumMembers := []string{"hi", "hello"}
-	enumType := types.MakeEnum(typedesc.TypeIDToOID(500), typedesc.TypeIDToOID(100500))
+	enumType := types.MakeEnum(catid.TypeIDToOID(500), catid.TypeIDToOID(100500))
 	enumType.TypeMeta = types.UserDefinedTypeMetadata{
 		Name: &types.UserDefinedTypeName{
 			Schema: "test",

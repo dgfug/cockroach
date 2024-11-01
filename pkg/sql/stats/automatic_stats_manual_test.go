@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats_test
 
@@ -37,21 +32,21 @@ var runManual = flag.Bool(
 // varying load on the system and prints out the times. It should be run on a
 // lightly loaded system using:
 //
-//   make test PKG=./pkg/sql/stats TESTS=AdaptiveThrottling TESTFLAGS='-v --run-manual -logtostderr NONE'
+//	make test PKG=./pkg/sql/stats TESTS=AdaptiveThrottling TESTFLAGS='-v --run-manual -logtostderr NONE'
 //
 // Sample output:
 //
 // --- PASS: TestAdaptiveThrottling (114.51s)
-//     automatic_stats_manual_test.go:72: Populate table took 7.639067726s
-//     automatic_stats_manual_test.go:72: --- Load 0% ---
-//     automatic_stats_manual_test.go:72: Create stats took 1.198634729s
-//     automatic_stats_manual_test.go:72: --- Load 30% ---
-//     automatic_stats_manual_test.go:72: Create stats took 2.270165784s
-//     automatic_stats_manual_test.go:72: --- Load 50% ---
-//     automatic_stats_manual_test.go:72: Create stats took 7.324599981s
-//     automatic_stats_manual_test.go:72: --- Load 70% ---
-//     automatic_stats_manual_test.go:72: Create stats took 15.886412857s
 //
+//	automatic_stats_manual_test.go:72: Populate table took 7.639067726s
+//	automatic_stats_manual_test.go:72: --- Load 0% ---
+//	automatic_stats_manual_test.go:72: Create stats took 1.198634729s
+//	automatic_stats_manual_test.go:72: --- Load 30% ---
+//	automatic_stats_manual_test.go:72: Create stats took 2.270165784s
+//	automatic_stats_manual_test.go:72: --- Load 50% ---
+//	automatic_stats_manual_test.go:72: Create stats took 7.324599981s
+//	automatic_stats_manual_test.go:72: --- Load 70% ---
+//	automatic_stats_manual_test.go:72: Create stats took 15.886412857s
 func TestAdaptiveThrottling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -92,10 +87,10 @@ func TestAdaptiveThrottling(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < runtime.GOMAXPROCS(0); i++ {
 			wg.Add(1)
-			go func() {
+			go func(load int) {
 				runLoad(load, cancel)
 				wg.Done()
-			}()
+			}(load)
 		}
 
 		// Sleep for 2 * DefaultMetricsSampleInterval, to make sure the runtime

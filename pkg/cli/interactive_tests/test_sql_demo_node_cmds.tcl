@@ -8,7 +8,7 @@ start_test "Ensure demo commands are not available in the sql shell"
 start_server $argv
 
 # Spawn a sql shell.
-spawn $argv sql
+spawn $argv sql --no-line-editor
 set client_spawn_id $spawn_id
 eexpect root@
 
@@ -17,7 +17,7 @@ send "\\demo shutdown 2\n"
 eexpect "\\demo can only be run with cockroach demo"
 
 # Exit the shell.
-interrupt
+send_eof
 eexpect eof
 
 # Have good manners and clean up.

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -200,7 +196,7 @@ func TestResetQuorum(t *testing.T) {
 		checkUnavailable(srv, k)
 
 		// Call ResetQuorum to reset quorum on the unhealthy range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(id),
 		})
 		require.NoError(t, err)
@@ -224,7 +220,7 @@ func TestResetQuorum(t *testing.T) {
 		checkUnavailable(srv, k)
 
 		// Call ResetQuorum to reset quorum on the unhealthy range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(id),
 		})
 		require.NoError(t, err)
@@ -247,7 +243,7 @@ func TestResetQuorum(t *testing.T) {
 		checkUnavailable(srv, k)
 
 		// Call ResetQuorum to reset quorum on the unhealthy range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(id),
 		})
 		require.NoError(t, err)
@@ -279,7 +275,7 @@ func TestResetQuorum(t *testing.T) {
 		checkUnavailable(srv, k)
 
 		// Call ResetQuorum to reset quorum on the unhealthy range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(id),
 		})
 		require.NoError(t, err)
@@ -305,7 +301,7 @@ func TestResetQuorum(t *testing.T) {
 		srv := tc.Server(0)
 
 		// Call ResetQuorum to attempt to reset quorum on a healthy range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(id),
 		})
 		testutils.IsError(err, "targeted range to recover has not lost quorum.")
@@ -317,7 +313,7 @@ func TestResetQuorum(t *testing.T) {
 		srv := tc.Server(0)
 
 		// Call ResetQuorum to attempt to reset quorum on a meta range.
-		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+		_, err := srv.Node().(*server.Node).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 			RangeID: int32(keys.MetaRangesID),
 		})
 		testutils.IsError(err, "targeted range to recover is a meta1 or meta2 range.")

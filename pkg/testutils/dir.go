@@ -1,19 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
 import (
-	"io/ioutil"
 	"os"
-	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
@@ -21,7 +14,7 @@ import (
 
 // TempDir creates a directory and a function to clean it up at the end of the
 // test.
-func TempDir(t testing.TB) (string, func()) {
+func TempDir(t TestNamedFatalerLogger) (string, func()) {
 	tmpDir := ""
 	if bazel.BuiltWithBazel() {
 		// Bazel sets up private temp directories for each test.
@@ -33,13 +26,16 @@ func TempDir(t testing.TB) (string, func()) {
 		tmpDir = bazel.TestTmpDir()
 	}
 
-	dir, err := ioutil.TempDir(tmpDir, fileutil.EscapeFilename(t.Name()))
+	dir, err := os.MkdirTemp(tmpDir, fileutil.EscapeFilename(t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cleanup := func() {
 		if err := os.RemoveAll(dir); err != nil {
-			t.Error(err)
+			// Temp dir cleanup may race with process shutdown, where
+			// some process is writing to dir, just as we try to shut down.
+			// This should not fail the test.
+			t.Logf("encountered error %s while removing temp dir %s", err, dir)
 		}
 	}
 	return dir, cleanup

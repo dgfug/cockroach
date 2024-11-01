@@ -1,37 +1,32 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/stretchr/testify/require"
 )
 
 func TestVolatilitySet(t *testing.T) {
 	var v VolatilitySet
 
-	check := func(str string, isLeakProof, hasStable, hasVolatile bool) {
+	check := func(str string, isLeakproof, hasStable, hasVolatile bool) {
 		t.Helper()
 
 		require.Equal(t, v.String(), str)
-		require.Equal(t, v.IsLeakProof(), isLeakProof)
+		require.Equal(t, v.IsLeakproof(), isLeakproof)
 		require.Equal(t, v.HasStable(), hasStable)
 		require.Equal(t, v.HasVolatile(), hasVolatile)
 	}
-	check("leak-proof", true, false, false)
+	check("leakproof", true, false, false)
 
-	v.Add(tree.VolatilityLeakProof)
-	check("leak-proof", true, false, false)
+	v.Add(volatility.Leakproof)
+	check("leakproof", true, false, false)
 
 	v.AddImmutable()
 	check("immutable", false, false, false)

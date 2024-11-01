@@ -130,29 +130,25 @@ ORDER BY
 distribution: local
 vectorized: true
 ·
-• sort
-│ order: +conname
+• render
 │
-└── • render
+└── • virtual table lookup join
+    │ table: pg_namespace@pg_namespace_oid_idx
+    │ equality: (connamespace) = (oid)
+    │ pred: nspname = 'public'
     │
-    └── • hash join
-        │ equality: (oid) = (connamespace)
-        │
-        ├── • filter
-        │   │ filter: nspname = 'public'
-        │   │
-        │   └── • virtual table
-        │         table: pg_namespace@primary
+    └── • sort
+        │ order: +conname
         │
         └── • virtual table lookup join
             │ table: pg_attribute@pg_attribute_attrelid_idx
             │ equality: (oid) = (attrelid)
-            │ pred: column156 = attnum
+            │ pred: column158 = attnum
             │
             └── • render
                 │
                 └── • hash join
-                    │ equality: (attrelid, attnum) = (oid, column129)
+                    │ equality: (attrelid, attnum) = (oid, column130)
                     │
                     ├── • filter
                     │   │ filter: attrelid = 'b'::REGCLASS
@@ -193,3 +189,355 @@ vectorized: true
   table: pg_class@pg_class_oid_idx
   spans: [/50 - /50]
   limit: 1
+
+# Test that the virtual index is used when looking up database grants
+
+statement ok
+CREATE DATABASE t
+
+query T
+EXPLAIN SHOW GRANTS ON DATABASE t
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • sort
+│   │ order: +database_name,+grantee,+privilege_type,+is_grantable
+│   │
+│   └── • distinct
+│       │ distinct on: database_name, grantee, privilege_type, is_grantable
+│       │
+│       └── • render
+│           │
+│           └── • union all
+│               │
+│               ├── • hash join
+│               │   │ equality: (role) = (grantee)
+│               │   │
+│               │   ├── • virtual table
+│               │   │     table: kv_inherited_role_members@primary
+│               │   │
+│               │   └── • scan buffer
+│               │         label: buffer 1 (r)
+│               │
+│               └── • scan buffer
+│                     label: buffer 1 (r)
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: SELECT * FROM (SELECT database_name, 'database' AS object_type, grantee, privilege_type, is_grantable::BOOL FROM "".crdb_internal.cluster_database_privileges) WHERE database_name IN ('t',)
+    │ exec mode: all rows
+    │
+    └── • buffer
+        │ label: buffer 1 (r)
+        │
+        └── • render
+            │
+            └── • virtual table
+                  table: cluster_database_privileges@cluster_database_privileges_database_name_idx
+                  spans: [/'t' - /'t']
+
+# Test that the partial indexes in crdb_internal.tables are used only when the
+# partial predicate constraints are satisfied.
+
+query T
+EXPLAIN SELECT * FROM crdb_internal.tables WHERE database_name = 'foo';
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ filter: database_name = 'foo'
+│
+└── • virtual table
+      table: tables@primary
+
+query T
+EXPLAIN SELECT * FROM crdb_internal.tables WHERE parent_id = 1;
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ filter: parent_id = 1
+│
+└── • virtual table
+      table: tables@primary
+
+
+query T
+EXPLAIN SELECT * FROM crdb_internal.tables WHERE database_name = 'foo' AND drop_time IS NULL;
+----
+distribution: local
+vectorized: true
+·
+• virtual table
+  table: tables@tables_database_name_idx (partial index)
+  spans: [/'foo' - /'foo']
+
+query T
+EXPLAIN SELECT * FROM crdb_internal.tables WHERE parent_id = 1 AND drop_time IS NULL;
+----
+distribution: local
+vectorized: true
+·
+• virtual table
+  table: tables@tables_parent_id_idx (partial index)
+  spans: [/1 - /1]
+
+# Validate that the virtual index on 'status' works.
+# Vectorized execution may be on or off during tests, so exclude it from the output.
+query T
+SELECT info FROM [EXPLAIN SELECT count(*) FROM crdb_internal.jobs WHERE status = 'paused'] WHERE info NOT LIKE 'vectorized%'
+----
+    distribution: local
+    ·
+    • group (scalar)
+    │
+    └── • virtual table
+          table: jobs@jobs_status_idx
+          spans: [/'paused' - /'paused']
+
+# Validate that the virtual index on 'job_type' works.
+# Vectorized execution may be on or off during tests, so exclude it from the output.
+query T
+SELECT info FROM [EXPLAIN SELECT count(*) FROM crdb_internal.jobs WHERE job_type = 'CHANGEFEED'] WHERE info NOT LIKE 'vectorized%'
+----
+    distribution: local
+    ·
+    • group (scalar)
+    │
+    └── • virtual table
+          table: jobs@jobs_job_type_idx
+          spans: [/'CHANGEFEED' - /'CHANGEFEED']
+
+# Regression test for not projecting away looked up columns by the left semi
+# virtual lookup join (#91012).
+statement ok
+CREATE TABLE t91012 (id INT, a_id INT);
+
+query T
+EXPLAIN SELECT
+    *
+FROM
+    pg_class AS t INNER JOIN pg_attribute AS a ON t.oid = a.attrelid
+WHERE
+    a.attnotnull = 'f'
+    AND a.attname = 'a_id'
+    AND t.relname = 't91012'
+    AND a.atttypid IN (SELECT oid FROM pg_type WHERE typname = ANY (ARRAY['int8']));
+----
+distribution: local
+vectorized: true
+·
+• virtual table lookup join
+│ table: pg_class@pg_class_oid_idx
+│ equality: (attrelid) = (oid)
+│ pred: relname = 't91012'
+│
+└── • virtual table lookup join (semi)
+    │ table: pg_type@pg_type_oid_idx
+    │ equality: (atttypid) = (oid)
+    │ pred: typname = 'int8'
+    │
+    └── • filter
+        │ filter: (NOT attnotnull) AND (attname = 'a_id')
+        │
+        └── • virtual table
+              table: pg_attribute@primary
+
+# Same query, but with left anti join instead.
+query T
+EXPLAIN SELECT
+    *
+FROM
+    pg_class AS t INNER JOIN pg_attribute AS a ON t.oid = a.attrelid
+WHERE
+    a.attnotnull = 'f'
+    AND a.attname = 'a_id'
+    AND t.relname = 't91012'
+    AND NOT EXISTS(SELECT 1 FROM pg_type WHERE typname = ANY (ARRAY['typefoo']) AND a.atttypid = oid);
+----
+distribution: local
+vectorized: true
+·
+• virtual table lookup join
+│ table: pg_class@pg_class_oid_idx
+│ equality: (attrelid) = (oid)
+│ pred: relname = 't91012'
+│
+└── • virtual table lookup join (anti)
+    │ table: pg_type@pg_type_oid_idx
+    │ equality: (atttypid) = (oid)
+    │ pred: typname = 'typefoo'
+    │
+    └── • filter
+        │ filter: (NOT attnotnull) AND (attname = 'a_id')
+        │
+        └── • virtual table
+              table: pg_attribute@primary
+
+# Regression test for incorrectly handling left anti virtual lookup joins
+# (#88096).
+statement ok
+CREATE TYPE mytype AS enum('hello')
+
+query T
+EXPLAIN SELECT
+    *
+FROM
+    pg_type AS t
+WHERE
+    t.typrelid = 0
+    AND NOT EXISTS(SELECT 1 FROM pg_type AS el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+    AND t.typname LIKE 'myt%';
+----
+distribution: local
+vectorized: true
+·
+• virtual table lookup join (anti)
+│ table: pg_type@pg_type_oid_idx
+│ equality: (typelem) = (oid)
+│ pred: typarray = oid
+│
+└── • filter
+    │ filter: (typrelid = 0) AND (typname LIKE 'myt%')
+    │
+    └── • virtual table
+          table: pg_type@primary
+
+# Same query, but with left semi join instead.
+query T
+EXPLAIN SELECT
+    *
+FROM
+    pg_type AS t
+WHERE
+    t.typrelid = 0
+    AND EXISTS(SELECT 1 FROM pg_type AS el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+    AND t.typname LIKE 'myt%';
+----
+distribution: local
+vectorized: true
+·
+• virtual table lookup join (semi)
+│ table: pg_type@pg_type_oid_idx
+│ equality: (typelem) = (oid)
+│ pred: typarray = oid
+│
+└── • filter
+    │ filter: (typrelid = 0) AND (typname LIKE 'myt%')
+    │
+    └── • virtual table
+          table: pg_type@primary
+
+# Validate that the virtual index on 'status' works.
+# Vectorized execution may be on or off during tests, so exclude it from the output.
+query T
+SELECT info FROM [EXPLAIN SELECT count(*) FROM crdb_internal.system_jobs WHERE status = 'paused'] WHERE info NOT LIKE 'vectorized%'
+----
+    distribution: local
+    ·
+    • group (scalar)
+    │
+    └── • virtual table
+          table: system_jobs@system_jobs_status_idx
+          spans: [/'paused' - /'paused']
+
+# Validate that the virtual index on 'status' works.
+# Vectorized execution may be on or off during tests, so exclude it from the output.
+query T
+SELECT info FROM [EXPLAIN SELECT count(*) FROM crdb_internal.system_jobs WHERE job_type = 'changefeed'] WHERE info NOT LIKE 'vectorized%'
+----
+    distribution: local
+    ·
+    • group (scalar)
+    │
+    └── • virtual table
+          table: system_jobs@system_jobs_job_type_idx
+          spans: [/'changefeed' - /'changefeed']
+
+# Validate that the virtual index on 'status' works.
+# Vectorized execution may be on or off during tests, so exclude it from the output.
+query T
+SELECT info FROM [EXPLAIN SELECT count(*) FROM crdb_internal.system_jobs WHERE id = 1] WHERE info NOT LIKE 'vectorized%'
+----
+    distribution: local
+    ·
+    • group (scalar)
+    │
+    └── • virtual table
+          table: system_jobs@system_jobs_id_idx
+          spans: [/1 - /1]
+
+# Regression test for PruneCols fix (#94890)
+statement ok
+SET testing_optimizer_disable_rule_probability = 1.0;
+
+query T
+EXPLAIN SELECT
+  datname AS database_name
+FROM
+  pg_catalog.pg_database d
+ORDER BY
+	database_name
+----
+distribution: local
+vectorized: true
+·
+• sort
+│ order: +datname
+│
+└── • virtual table
+      table: pg_database@primary
+
+statement ok
+RESET testing_optimizer_disable_rule_probability
+
+# Regression test for applying cost penalty for each full scan of a virtual
+# table when disallow_full_table_scans is set (#122708).
+statement ok
+SET disallow_full_table_scans = true;
+
+# Don't penalize for each full scan, so we use hash joins.
+query T
+EXPLAIN SELECT i.relname, ix.indisprimary FROM pg_class AS t, pg_class AS i, pg_index AS ix
+        WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND t.relkind = 'r';
+----
+distribution: local
+vectorized: true
+·
+• hash join
+│ equality: (oid) = (indexrelid)
+│
+├── • virtual table
+│     table: pg_class@primary
+│
+└── • hash join
+    │ equality: (indrelid) = (oid)
+    │
+    ├── • virtual table
+    │     table: pg_index@primary
+    │
+    └── • filter
+        │ filter: relkind = 'r'
+        │
+        └── • virtual table
+              table: pg_class@primary
+
+statement ok
+RESET disallow_full_table_scans;
+
+# Verify that we're not fooling ourselves by showing that we can use a virtual
+# index when we actually can't (#108317).
+query T
+EXPLAIN SELECT * FROM crdb_internal.system_jobs WHERE id > 100;
+----
+distribution: local
+vectorized: true
+·
+• virtual table
+  table: system_jobs@primary
+  virtual table filter

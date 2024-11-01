@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package certmgr
 
@@ -15,7 +10,7 @@ import (
 	"crypto/tls"
 )
 
-//go:generate mockgen -package=certmgr -destination=mocks_generated.go -source=cert.go . Cert
+//go:generate mockgen -package=certmgr -destination=mocks_generated_test.go . Cert
 
 // Cert is a generic presentation on managed certificate that can be reloaded.
 // A managed certificate allows the certificates to be rotated by a cert manager.

@@ -10,20 +10,42 @@
 #
 # Note: EliminateJoinUnderProjectLeft should stay above EliminateProject so that
 # it has a chance to fire before the Project can be removed.
+#
+# It is possible for references to the right input of the join to be replaced by
+# equivalent columns from the left input. This is handled by adding projections
+# that map the left column to the equivalent right column (leftCol AS rightCol).
+#
+# It is ok to call MergeProjections without checking CanMergeProjections because
+# RemapProjectionCols returns projections that only reference columns from the
+# left input, and ProjectRemappedCols only projects columns from the right side
+# of the join.
 [EliminateJoinUnderProjectLeft, Normalize]
 (Project
     $join:(InnerJoin | LeftJoin $left:* $right:*) &
         (JoinDoesNotDuplicateLeftRows $join) &
         (JoinPreservesLeftRows $join)
-    $projections:* &
-        ^(AreProjectionsCorrelated
-            $projections
-            $rightCols:(OutputCols $right)
-        )
-    $passthrough:* & ^(ColsIntersect $passthrough $rightCols)
+    $projections:*
+    $passthrough:* &
+        (CanRemapCols
+            $fromCols:(UnionCols
+                $passthrough
+                (ProjectionOuterCols $projections)
+            )
+            $leftCols:(OutputCols $left)
+            $fds:(FuncDeps $join)
+        ) &
+        (CanUseImprovedJoinElimination $fromCols $leftCols)
 )
 =>
-(Project $left $projections $passthrough)
+(Project
+    $left
+    (MergeProjections
+        (RemapProjectionCols $projections $leftCols $fds)
+        (ProjectRemappedCols $passthrough $leftCols $fds)
+        $passthrough
+    )
+    (DifferenceCols $passthrough (OutputCols $right))
+)
 
 # EliminateJoinUnderProjectRight mirrors EliminateJoinUnderProjectLeft, except
 # that it only matches InnerJoins.
@@ -32,15 +54,28 @@
     $join:(InnerJoin $left:* $right:*) &
         (JoinDoesNotDuplicateRightRows $join) &
         (JoinPreservesRightRows $join)
-    $projections:* &
-        ^(AreProjectionsCorrelated
-            $projections
-            $leftCols:(OutputCols $left)
-        )
-    $passthrough:* & ^(ColsIntersect $passthrough $leftCols)
+    $projections:*
+    $passthrough:* &
+        (CanRemapCols
+            $fromCols:(UnionCols
+                $passthrough
+                (ProjectionOuterCols $projections)
+            )
+            $rightCols:(OutputCols $right)
+            $fds:(FuncDeps $join)
+        ) &
+        (CanUseImprovedJoinElimination $fromCols $rightCols)
 )
 =>
-(Project $right $projections $passthrough)
+(Project
+    $right
+    (MergeProjections
+        (RemapProjectionCols $projections $rightCols $fds)
+        (ProjectRemappedCols $passthrough $rightCols $fds)
+        $passthrough
+    )
+    (DifferenceCols $passthrough (OutputCols $left))
+)
 
 # EliminateProject discards a Project operator which is not adding or removing
 # columns.
@@ -143,6 +178,68 @@ $input
 =>
 (PushColumnRemappingIntoValues $input $projections $passthrough)
 
+# PushAssignmentCastsIntoValues pushes assignment cast projections into Values
+# rows.
+#
+# Example:
+#
+# project
+#  ├── columns: x:2 y:3
+#  ├── values
+#  │    ├── columns: column1:1
+#  │    ├── cardinality: [2 - 2]
+#  │    ├── (1,)
+#  │    └── (2,)
+#  └── projections
+#       ├── assignment-cast: STRING [as=x:2]
+#       │    └── column1:1
+#       └── 'foo' [as=y:3]
+# =>
+# project
+#  ├── columns: x:2 y:3
+#  ├── values
+#  │    ├── columns: x:2
+#  │    ├── cardinality: [2 - 2]
+#  │    ├── tuple
+#  │    │    └── assignment-cast: STRING
+#  │    │        └── 1
+#  │    └── tuple
+#  │         └── assignment-cast: STRING
+#  │             └── 2
+#  └── projections
+#       └── 'foo' [as=y:3]
+#
+# This allows other rules to fire, with the ultimate goal of eliminating the
+# project so that the insert fast-path optimization is used in more cases and
+# uniqueness checks for gen_random_uuid() values are eliminated in more cases.
+#
+# Assignment casts in projections cannot be pushed into values expressions if
+# the casted column is referenced in another projection expression
+# (AssignmentCastCols ensures this) or if the casted column also a passthrough
+# column (notice the DifferenceCols function).
+[PushAssignmentCastsIntoValues, Normalize]
+(Project
+    $input:(Values)
+    $projections:*
+    $passthrough:* &
+        ^(ColsAreEmpty
+            $castCols:(IntersectionCols
+                (DifferenceCols
+                    (AssignmentCastCols $projections)
+                    $passthrough
+                )
+                (OutputCols $input)
+            )
+        )
+)
+=>
+(PushAssignmentCastsIntoValues
+    $input
+    $projections
+    $passthrough
+    $castCols
+)
+
 # FoldTupleAccessIntoValues replaces a Values that has a single tuple column and
 # at least one row with a new Values that has a column for each tuple index.
 # This works as long as the surrounding Project does not reference the original
@@ -231,5 +328,26 @@ $input
         $jsonCols:(MakeColsForUnnestJSON $input $col)
     )
     (FoldJSONFieldAccess $projections $jsonCols $col $input)
+    $passthrough
+)
+
+# FoldIsNullProject folds "x IS NULL" projections to false if "x" is not null in
+# the Project's input. It matches if there is at least one projection that can
+# be folded, and it replaces all projections that can be folded.
+[FoldIsNullProject, Normalize]
+(Project
+    $input:*
+    $projections:[
+            ...
+            $item:(ProjectionsItem (Is (Variable $col:*) (Null)))
+            ...
+        ] &
+        (IsColNotNull $col $input)
+    $passthrough:*
+)
+=>
+(Project
+    $input
+    (FoldIsNullProjectionsItems $projections $input)
     $passthrough
 )

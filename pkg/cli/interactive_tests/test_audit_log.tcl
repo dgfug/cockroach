@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 
 set logfile logs/db/logs/cockroach-sql-audit.log
@@ -58,7 +58,7 @@ eexpect root@
 system "grep -q 'sensitive_table_access.*ALTER TABLE.*helloworld.*SET OFF.*AccessMode\":\"rw\"' $logfile"
 end_test
 
-interrupt
+send_eof
 eexpect eof
 
 stop_server $argv
@@ -71,7 +71,7 @@ system "$argv start-single-node --insecure --pid-file=server_pid --background -s
 set logfile logs/db/audit-new/cockroach-sql-audit.log
 
 # Start a client and make a simple audit test.
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 send "create database d; create table d.helloworld(x INT);\r"
 eexpect CREATE
@@ -81,7 +81,7 @@ eexpect "ALTER TABLE"
 eexpect root@
 send "select x from d.helloworld;\r"
 eexpect root@
-interrupt
+send_eof
 eexpect eof
 
 # Check the file was created and populated properly.

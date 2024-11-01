@@ -55,7 +55,7 @@ SELECT * FROM ab WHERE b=1
 ----
 ================================================================================
 Initial expression
-  Cost: 1094.77
+  Cost: 1098.77
 ================================================================================
   project
    ├── columns: a:1(int!null) b:2(int!null)
@@ -75,7 +75,7 @@ Initial expression
                   └── const: 1 [type=int]
 ================================================================================
 PruneSelectCols
-  Cost: 1074.57
+  Cost: 1078.57
 ================================================================================
    project
     ├── columns: a:1(int!null) b:2(int!null)
@@ -99,7 +99,7 @@ PruneSelectCols
                    └── const: 1 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 1074.45
+  Cost: 1078.45
 ================================================================================
   -project
   +select
@@ -147,7 +147,7 @@ GeneratePartialIndexScans (no changes)
 --------------------------------------------------------------------------------
 ================================================================================
 GenerateConstrainedScans
-  Cost: 24.42
+  Cost: 28.42
 ================================================================================
   -select
   +scan ab@ab_b_idx
@@ -169,13 +169,106 @@ GenerateZigzagJoins (no changes)
 --------------------------------------------------------------------------------
 ================================================================================
 Final best expression
-  Cost: 24.42
+  Cost: 28.42
 ================================================================================
   scan ab@ab_b_idx
    ├── columns: a:1(int!null) b:2(int!null)
    ├── constraint: /2/1: [/1 - /1]
    ├── key: (1)
    └── fd: ()-->(2)
+
+normsteps
+SELECT * FROM ab WHERE b=1
+----
+================================================================================
+Initial expression
+  Cost: 1098.77
+================================================================================
+  project
+   ├── columns: a:1(int!null) b:2(int!null)
+   ├── key: (1)
+   ├── fd: ()-->(2)
+   └── select
+        ├── columns: a:1(int!null) b:2(int!null) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+        ├── key: (1)
+        ├── fd: ()-->(2), (1)-->(3,4)
+        ├── scan ab
+        │    ├── columns: a:1(int!null) b:2(int) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+        │    ├── key: (1)
+        │    └── fd: (1)-->(2-4)
+        └── filters
+             └── eq [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+                  ├── variable: b:2 [type=int]
+                  └── const: 1 [type=int]
+================================================================================
+PruneSelectCols
+  Cost: 1078.57
+================================================================================
+   project
+    ├── columns: a:1(int!null) b:2(int!null)
+    ├── key: (1)
+    ├── fd: ()-->(2)
+    └── select
+  -      ├── columns: a:1(int!null) b:2(int!null) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+  +      ├── columns: a:1(int!null) b:2(int!null)
+         ├── key: (1)
+  -      ├── fd: ()-->(2), (1)-->(3,4)
+  +      ├── fd: ()-->(2)
+         ├── scan ab
+  -      │    ├── columns: a:1(int!null) b:2(int) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+  +      │    ├── columns: a:1(int!null) b:2(int)
+         │    ├── key: (1)
+  -      │    └── fd: (1)-->(2-4)
+  +      │    └── fd: (1)-->(2)
+         └── filters
+              └── eq [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+                   ├── variable: b:2 [type=int]
+                   └── const: 1 [type=int]
+================================================================================
+EliminateProject
+  Cost: 1078.45
+================================================================================
+  -project
+  +select
+    ├── columns: a:1(int!null) b:2(int!null)
+    ├── key: (1)
+    ├── fd: ()-->(2)
+  - └── select
+  -      ├── columns: a:1(int!null) b:2(int!null)
+  -      ├── key: (1)
+  -      ├── fd: ()-->(2)
+  -      ├── scan ab
+  -      │    ├── columns: a:1(int!null) b:2(int)
+  -      │    ├── key: (1)
+  -      │    └── fd: (1)-->(2)
+  -      └── filters
+  -           └── eq [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+  -                ├── variable: b:2 [type=int]
+  -                └── const: 1 [type=int]
+  + ├── scan ab
+  + │    ├── columns: a:1(int!null) b:2(int)
+  + │    ├── key: (1)
+  + │    └── fd: (1)-->(2)
+  + └── filters
+  +      └── eq [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+  +           ├── variable: b:2 [type=int]
+  +           └── const: 1 [type=int]
+================================================================================
+Final best expression
+  Cost: 1078.45
+================================================================================
+  select
+   ├── columns: a:1(int!null) b:2(int!null)
+   ├── key: (1)
+   ├── fd: ()-->(2)
+   ├── scan ab@ab_b_idx
+   │    ├── columns: a:1(int!null) b:2(int)
+   │    ├── key: (1)
+   │    └── fd: (1)-->(2)
+   └── filters
+        └── eq [type=bool, outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+             ├── variable: b:2 [type=int]
+             └── const: 1 [type=int]
 
 exec-ddl
 CREATE TABLE customers (
@@ -208,7 +301,7 @@ SELECT * FROM orders LEFT JOIN customers ON customer_id = customers.id
 ----
 ================================================================================
 Initial expression
-  Cost: 2259.83
+  Cost: 2267.83
 ================================================================================
   project
    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:6(int) name:7(string) address:8(string)
@@ -240,7 +333,7 @@ Initial expression
                   └── variable: customers.id:6 [type=int]
 ================================================================================
 NormalizeInConst
-  Cost: 2259.83
+  Cost: 2267.83
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:6(int) name:7(string) address:8(string)
@@ -274,7 +367,7 @@ NormalizeInConst
                    └── variable: customers.id:6 [type=int]
 ================================================================================
 PruneJoinLeftCols
-  Cost: 2239.63
+  Cost: 2247.63
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:6(int) name:7(string) address:8(string)
@@ -310,7 +403,7 @@ PruneJoinLeftCols
                    └── variable: customers.id:6 [type=int]
 ================================================================================
 PruneJoinRightCols
-  Cost: 2219.43
+  Cost: 2227.43
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:6(int) name:7(string) address:8(string)
@@ -346,7 +439,7 @@ PruneJoinRightCols
                    └── variable: customers.id:6 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 2209.41
+  Cost: 2217.41
 ================================================================================
   -project
   +left-join (hash)
@@ -517,7 +610,7 @@ GenerateMergeJoins (higher cost)
     └── filters (true)
 ================================================================================
 Final best expression
-  Cost: 2209.41
+  Cost: 2217.41
 ================================================================================
   left-join (hash)
    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:6(int) name:7(string) address:8(string)
@@ -560,7 +653,7 @@ SELECT * FROM comp WHERE k=1
 ----
 ================================================================================
 Initial expression
-  Cost: 1114.97
+  Cost: 1118.97
 ================================================================================
   project
    ├── columns: k:1(int!null) c:2(bool)
@@ -587,7 +680,7 @@ Initial expression
                   └── const: 1 [type=int]
 ================================================================================
 NormalizeInConst
-  Cost: 1114.97
+  Cost: 1118.97
 ================================================================================
    project
     ├── columns: k:1(int!null) c:2(bool)
@@ -616,7 +709,7 @@ NormalizeInConst
                    └── const: 1 [type=int]
 ================================================================================
 PruneSelectCols
-  Cost: 1084.67
+  Cost: 1088.67
 ================================================================================
    project
     ├── columns: k:1(int!null) c:2(bool)
@@ -647,7 +740,7 @@ PruneSelectCols
                    └── const: 1 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 1084.55
+  Cost: 1088.55
 ================================================================================
   -project
   +select
@@ -716,7 +809,7 @@ GenerateConstrainedScans (no changes)
 --------------------------------------------------------------------------------
 ================================================================================
 FoldComparison
-  Cost: 24.52
+  Cost: 28.52
 ================================================================================
   -select
   +scan comp@comp_c_k_idx
@@ -740,11 +833,14 @@ FoldComparison
   + ├── constraint: /2/1/3: [/true/1 - /true/1]
   + └── fd: ()-->(1,2)
 --------------------------------------------------------------------------------
+FoldComparison (normalization of expression outside of memo)
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 GenerateZigzagJoins (no changes)
 --------------------------------------------------------------------------------
 ================================================================================
 Final best expression
-  Cost: 24.52
+  Cost: 28.52
 ================================================================================
   scan comp@comp_c_k_idx
    ├── columns: k:1(int!null) c:2(bool)
@@ -764,7 +860,7 @@ SELECT i FROM (SELECT i FROM t WHERE i > 10 AND i < 20) AS t2 WHERE i = 5
 ----
 ================================================================================
 Initial expression
-  Cost: 1096.50
+  Cost: 1100.50
 ================================================================================
   select
    ├── columns: i:1(int!null)
@@ -793,7 +889,7 @@ Initial expression
              └── const: 5 [type=int]
 ================================================================================
 SimplifySelectFilters
-  Cost: 1101.38
+  Cost: 1105.38
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -828,7 +924,7 @@ SimplifySelectFilters
               └── const: 5 [type=int]
 ================================================================================
 ConsolidateSelectFilters
-  Cost: 1096.50
+  Cost: 1100.50
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -864,7 +960,7 @@ ConsolidateSelectFilters
               └── const: 5 [type=int]
 ================================================================================
 PruneSelectCols
-  Cost: 1066.20
+  Cost: 1070.20
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -896,7 +992,7 @@ PruneSelectCols
               └── const: 5 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 1065.28
+  Cost: 1069.28
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -934,7 +1030,7 @@ EliminateProject
               └── const: 5 [type=int]
 ================================================================================
 MergeSelects
-  Cost: 1064.36
+  Cost: 1068.36
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -968,7 +1064,7 @@ MergeSelects
               └── const: 5 [type=int]
 ================================================================================
 InlineConstVar
-  Cost: 1064.36
+  Cost: 1068.36
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -992,7 +1088,7 @@ InlineConstVar
               └── const: 5 [type=int]
 ================================================================================
 FoldComparison
-  Cost: 1064.35
+  Cost: 1068.35
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -1016,7 +1112,7 @@ FoldComparison
               └── const: 5 [type=int]
 ================================================================================
 FoldComparison
-  Cost: 1064.35
+  Cost: 1068.35
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -1037,7 +1133,7 @@ FoldComparison
               └── const: 5 [type=int]
 ================================================================================
 SimplifyAndTrue
-  Cost: 1064.35
+  Cost: 1068.35
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -1056,7 +1152,7 @@ SimplifyAndTrue
               └── const: 5 [type=int]
 ================================================================================
 SimplifyRange
-  Cost: 1064.35
+  Cost: 1068.35
 ================================================================================
    select
     ├── columns: i:1(int!null)
@@ -1073,7 +1169,7 @@ SimplifyRange
               └── const: 5 [type=int]
 ================================================================================
 SimplifySelectFilters
-  Cost: 1064.34
+  Cost: 1068.34
 ================================================================================
    select
   - ├── columns: i:1(int!null)
@@ -1167,3 +1263,70 @@ Final best expression
    ├── fd: ()-->(1)
    └── tuple [type=tuple{int}]
         └── const: 1 [type=int]
+
+exec-ddl
+CREATE TABLE chk (
+	id INT PRIMARY KEY,
+	a INT,
+	CHECK (a > 1+1)
+)
+----
+
+# Verify that we don't crash when a normalization rule runs on a constraint
+# expression that is never attached to the TableMeta.
+# In this example, the rule is FoldBinary and the check constraint is not
+# attached to the TableMeta because it may evaluate to NULL, which is considered
+# a passing CHECK constraint and therefore the expression is not a universal
+# truth about the contents of the table.
+optsteps
+SELECT id FROM chk
+----
+================================================================================
+Initial expression
+  Cost: 1098.64
+================================================================================
+  project
+   ├── columns: id:1(int!null)
+   ├── key: (1)
+   └── scan chk
+        ├── columns: id:1(int!null) a:2(int) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+        ├── key: (1)
+        └── fd: (1)-->(2-4)
+--------------------------------------------------------------------------------
+FoldBinary (normalization of expression outside of memo)
+--------------------------------------------------------------------------------
+================================================================================
+PruneScanCols
+  Cost: 1068.34
+================================================================================
+   project
+    ├── columns: id:1(int!null)
+    ├── key: (1)
+    └── scan chk
+  -      ├── columns: id:1(int!null) a:2(int) crdb_internal_mvcc_timestamp:3(decimal) tableoid:4(oid)
+  -      ├── key: (1)
+  -      └── fd: (1)-->(2-4)
+  +      ├── columns: id:1(int!null)
+  +      └── key: (1)
+================================================================================
+EliminateProject
+  Cost: 1058.32
+================================================================================
+  -project
+  +scan chk
+    ├── columns: id:1(int!null)
+  - ├── key: (1)
+  - └── scan chk
+  -      ├── columns: id:1(int!null)
+  -      └── key: (1)
+  + └── key: (1)
+--------------------------------------------------------------------------------
+GenerateIndexScans (no changes)
+--------------------------------------------------------------------------------
+================================================================================
+Final best expression
+  Cost: 1058.32
+================================================================================
+  scan chk
+   ├── columns: id:1(int!null)
+   └── key: (1)

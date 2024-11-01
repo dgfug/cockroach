@@ -1,3 +1,5 @@
+# LogicTest: default-configs
+
 statement ok
 CREATE TABLE t (
   k INT PRIMARY KEY,
@@ -8,6 +10,7 @@ CREATE TABLE t (
   comp INT AS (a + 10) VIRTUAL,
   INDEX t_a_plus_b_idx ((a + b)),
   INDEX t_lower_c_a_plus_b_idx (lower(c), (a + b)),
+  INVERTED INDEX t_b_j_a_asc (b DESC, (j->'a') ASC),
   FAMILY (k, a, b, c, j)
 )
 
@@ -15,17 +18,46 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE t]
 ----
 CREATE TABLE public.t (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   c STRING NULL,
-   j JSONB NULL,
-   comp INT8 NULL AS (a + 10:::INT8) VIRTUAL,
-   CONSTRAINT t_pkey PRIMARY KEY (k ASC),
-   INDEX t_a_plus_b_idx ((a + b) ASC),
-   INDEX t_lower_c_a_plus_b_idx (lower(c) ASC, (a + b) ASC),
-   FAMILY fam_0_k_a_b_c_j (k, a, b, c, j)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  c STRING NULL,
+  j JSONB NULL,
+  comp INT8 NULL AS (a + 10:::INT8) VIRTUAL,
+  CONSTRAINT t_pkey PRIMARY KEY (k ASC),
+  INDEX t_a_plus_b_idx ((a + b) ASC),
+  INDEX t_lower_c_a_plus_b_idx (lower(c) ASC, (a + b) ASC),
+  INVERTED INDEX t_b_j_a_asc (b DESC, (j->'a':::STRING)),
+  FAMILY fam_0_k_a_b_c_j (k, a, b, c, j)
 )
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE t WITH REDACT]
+----
+CREATE TABLE public.t (
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  c STRING NULL,
+  j JSONB NULL,
+  comp INT8 NULL AS (a + ‹×›:::INT8) VIRTUAL,
+  CONSTRAINT t_pkey PRIMARY KEY (k ASC),
+  INDEX t_a_plus_b_idx ((a + b) ASC),
+  INDEX t_lower_c_a_plus_b_idx (lower(c) ASC, (a + b) ASC),
+  INVERTED INDEX t_b_j_a_asc (b DESC, (j->‹×›:::STRING)),
+  FAMILY fam_0_k_a_b_c_j (k, a, b, c, j)
+)
+
+query TTBTTTB colnames
+SELECT * FROM [SHOW COLUMNS FROM t] ORDER BY column_name
+----
+column_name  data_type  is_nullable  column_default  generation_expression  indices                                                     is_hidden
+a            INT8       true         NULL            ·                      {t_pkey}                                                    false
+b            INT8       true         NULL            ·                      {t_b_j_a_asc,t_pkey}                                        false
+c            STRING     true         NULL            ·                      {t_pkey}                                                    false
+comp         INT8       true         NULL            a + 10                 {}                                                          false
+j            JSONB      true         NULL            ·                      {t_pkey}                                                    false
+k            INT8       false        NULL            ·                      {t_a_plus_b_idx,t_b_j_a_asc,t_lower_c_a_plus_b_idx,t_pkey}  false
 
 # Referencing an inaccessible column in a CHECK constraint is not allowed.
 statement error column \"crdb_internal_idx_expr\" is inaccessible and cannot be referenced
@@ -66,13 +98,13 @@ SELECT * FROM (
 ----
 {"computeExpr": "a + 10:::INT8", "id": 3, "inaccessible": true, "name": "crdb_internal_idx_expr_1", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
 
-statement error volatile functions are not allowed in index element
+statement error random\(\): volatile functions are not allowed in EXPRESSION INDEX ELEMENT
 CREATE TABLE err (a INT, INDEX ((a + random()::INT)))
 
 statement error column \"z\" does not exist
 CREATE TABLE err (a INT, INDEX ((a + z)))
 
-statement error index element expression cannot reference computed columns
+statement error EXPRESSION INDEX ELEMENT expression cannot reference computed columns
 CREATE TABLE err (a INT, comp INT AS (a + 10) STORED, INDEX ((comp + 100)))
 
 statement error type of index element NULL is ambiguous.*\nHINT: consider adding a type cast to the expression
@@ -81,14 +113,8 @@ CREATE TABLE err (a INT, INDEX (a, (NULL)))
 statement ok
 CREATE TABLE t_null_cast (a INT, INDEX (a, (NULL::TEXT)))
 
-statement error index element j->'a' of type jsonb is not indexable
-CREATE TABLE err (a INT, j JSON, INDEX (a, (j->'a')))
-
 statement error index element \(a, b\) of type record is not indexable
 CREATE TABLE err (a INT, b INT, INDEX (a, (row(a, b))))
-
-statement error index element j->'a' of type jsonb is not allowed as a prefix column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
-CREATE TABLE err (a INT, j JSON, INVERTED INDEX ((j->'a'), j))
 
 statement error index element a \+ b of type int is not allowed as the last column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
 CREATE TABLE err (a INT, b INT, INVERTED INDEX (a, (a + b)))
@@ -96,13 +122,16 @@ CREATE TABLE err (a INT, b INT, INVERTED INDEX (a, (a + b)))
 statement error index element \(a, b\) of type record is not allowed as the last column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
 CREATE TABLE err (a INT, b INT, INVERTED INDEX (a, (row(a, b))))
 
-statement error volatile functions are not allowed in index element
+statement error the last column in an inverted index cannot have the DESC option
+CREATE TABLE err (a INT, j JSON, INVERTED INDEX (a, (j->'a') DESC))
+
+statement error random\(\): volatile functions are not allowed in EXPRESSION INDEX ELEMENT
 CREATE TABLE err (a INT, INDEX ((a + random()::INT)))
 
 statement error column \"z\" does not exist
 CREATE TABLE err (a INT, INDEX ((a + z)))
 
-statement error index element expression cannot reference computed columns
+statement error EXPRESSION INDEX ELEMENT expression cannot reference computed columns
 CREATE TABLE err (a INT, comp INT AS (a + 10) STORED, INDEX ((comp + 10)))
 
 # TODO(mgartner): Postgres does not allow unique constraints with expressions,
@@ -143,135 +172,162 @@ CREATE INDEX t_lower_c_a_plus_b_idx ON t (lower(c), (a + b))
 statement ok
 CREATE INDEX t_a_plus_ten_idx ON t ((a + 10))
 
-statement ok
-CREATE INDEX t_a_plus_ten_a_plus_ten_idx ON t ((a + 10), (a + 10))
+statement error index \"err\" contains duplicate expression
+CREATE INDEX err ON t ((a + 10), (a + 10))
 
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE t]
 ----
 CREATE TABLE public.t (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   c STRING NULL,
-   j JSONB NULL,
-   comp INT8 NULL AS (a + 10:::INT8) VIRTUAL,
-   CONSTRAINT t_pkey PRIMARY KEY (k ASC),
-   INDEX t_a_plus_b_idx ((a + b) ASC),
-   INDEX t_lower_c_idx (lower(c) ASC),
-   INDEX t_lower_c_a_plus_b_idx (lower(c) ASC, (a + b) ASC),
-   INDEX t_a_plus_ten_idx ((a + 10:::INT8) ASC),
-   INDEX t_a_plus_ten_a_plus_ten_idx ((a + 10:::INT8) ASC, (a + 10:::INT8) ASC),
-   FAMILY fam_0_k_a_b_c_j (k, a, b, c, j)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  c STRING NULL,
+  j JSONB NULL,
+  comp INT8 NULL AS (a + 10:::INT8) VIRTUAL,
+  CONSTRAINT t_pkey PRIMARY KEY (k ASC),
+  INDEX t_a_plus_b_idx ((a + b) ASC),
+  INDEX t_lower_c_idx (lower(c) ASC),
+  INDEX t_lower_c_a_plus_b_idx (lower(c) ASC, (a + b) ASC),
+  INDEX t_a_plus_ten_idx ((a + 10:::INT8) ASC),
+  FAMILY fam_0_k_a_b_c_j (k, a, b, c, j)
 )
 
 # Referencing an inaccessible column in a CHECK constraint is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced
-ALTER TABLE t ADD CONSTRAINT err CHECK (crdb_internal_idx_expr_4 > 0)
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced
+ALTER TABLE t ADD CONSTRAINT err CHECK (crdb_internal_idx_expr_2 > 0)
 
 # Referencing an inaccessible column in a NOT NULL constraint is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced
-ALTER TABLE t ALTER COLUMN crdb_internal_idx_expr_4 SET NOT NULL
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced
+ALTER TABLE t ALTER COLUMN crdb_internal_idx_expr_2 SET NOT NULL
 
 # Referencing an inaccessible column in a UNIQUE constraint is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced
-ALTER TABLE t ADD CONSTRAINT err UNIQUE (crdb_internal_idx_expr_4)
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced
+ALTER TABLE t ADD CONSTRAINT err UNIQUE (crdb_internal_idx_expr_2)
 
 # Referencing an inaccessible column in a computed column expression is not
 # allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced in a computed column expression
-ALTER TABLE t ADD COLUMN err INT AS (crdb_internal_idx_expr_4 + 10) STORED
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced in a computed column expression
+ALTER TABLE t ADD COLUMN err INT AS (crdb_internal_idx_expr_2 + 10) STORED
 
 # Referencing an inaccessible column in an index is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced
-CREATE INDEX err ON t (crdb_internal_idx_expr_4)
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced
+CREATE INDEX err ON t (crdb_internal_idx_expr_2)
 
 # Referencing an inaccessible column in a partial index predicate expression is
 # not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced
-CREATE INDEX err ON t (a) WHERE crdb_internal_idx_expr_4 > 0
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced
+CREATE INDEX err ON t (a) WHERE crdb_internal_idx_expr_2 > 0
 
 # Referencing an inaccessible column in a FK is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced by a foreign key
-CREATE TABLE child (a INT REFERENCES t(crdb_internal_idx_expr_4))
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced by a foreign key
+CREATE TABLE child (a INT REFERENCES t(crdb_internal_idx_expr_2))
 
 statement ok
 CREATE TABLE child (a INT)
 
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be referenced by a foreign key
-ALTER TABLE child ADD CONSTRAINT err FOREIGN KEY (a) REFERENCES t(crdb_internal_idx_expr_4)
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be referenced by a foreign key
+ALTER TABLE child ADD CONSTRAINT err FOREIGN KEY (a) REFERENCES t(crdb_internal_idx_expr_2)
 
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot reference a foreign key
-ALTER TABLE t ADD CONSTRAINT err FOREIGN KEY (crdb_internal_idx_expr_4) REFERENCES child(a)
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot reference a foreign key
+ALTER TABLE t ADD CONSTRAINT err FOREIGN KEY (crdb_internal_idx_expr_2) REFERENCES child(a)
 
 # Dropping an inaccessible column is not allowed.
-statement error cannot drop inaccessible column \"crdb_internal_idx_expr_4\"
-ALTER TABLE t DROP COLUMN crdb_internal_idx_expr_4
+statement error cannot drop inaccessible column \"crdb_internal_idx_expr_2\"
+ALTER TABLE t DROP COLUMN crdb_internal_idx_expr_2
 
 # Renaming a column to the same name as one of the inaccessible expression index
 # columns is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" of relation \"t\" already exists
-ALTER TABLE t RENAME COLUMN a TO crdb_internal_idx_expr_4
+statement error column \"crdb_internal_idx_expr_2\" of relation \"t\" already exists
+ALTER TABLE t RENAME COLUMN a TO crdb_internal_idx_expr_2
 
 # Renaming an inaccessible expression index column is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" is inaccessible and cannot be renamed
-ALTER TABLE t RENAME COLUMN crdb_internal_idx_expr_4 TO err
+statement error column \"crdb_internal_idx_expr_2\" is inaccessible and cannot be renamed
+ALTER TABLE t RENAME COLUMN crdb_internal_idx_expr_2 TO err
 
 # Adding a column with the same name as one of the inaccessible columns created
 # for an expression index is not allowed.
-statement error column \"crdb_internal_idx_expr_4\" of relation \"t\" already exists
-ALTER TABLE t ADD COLUMN crdb_internal_idx_expr_4 INT
+statement error column \"crdb_internal_idx_expr_2\" of relation \"t\" already exists
+ALTER TABLE t ADD COLUMN crdb_internal_idx_expr_2 INT
 
+onlyif config local-legacy-schema-changer
 query T
 SELECT * FROM (
   SELECT json_array_elements(
     crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
   ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
-) AS cols WHERE cols.desc->'name' = '"crdb_internal_idx_expr_4"'
+) AS cols WHERE cols.desc->'name' = '"crdb_internal_idx_expr_2"'
 ----
-{"computeExpr": "a + 10:::INT8", "id": 11, "inaccessible": true, "name": "crdb_internal_idx_expr_4", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
+{"computeExpr": "a + 10:::INT8", "id": 9, "inaccessible": true, "name": "crdb_internal_idx_expr_2", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
+
+skipif config local-legacy-schema-changer
+query T
+SELECT * FROM (
+  SELECT json_array_elements(
+    crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
+  ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
+) AS cols WHERE cols.desc->'name' = '"crdb_internal_idx_expr_2"'
+----
+{"computeExpr": "a + 10:::INT8", "id": 9, "inaccessible": true, "name": "crdb_internal_idx_expr_2", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
 
 statement ok
-DROP INDEX t_a_plus_ten_idx
+DROP INDEX t_lower_c_a_plus_b_idx
 
-# Verify that the inaccessible column created for t_a_plus_ten_idx no longer
+# Verify that the inaccessible columns in t_lower_c_a_plus_b_idx are not dropped
+# because other indexes contain them.
+# exists in the descriptor.
+skipif config local-legacy-schema-changer
+query T
+SELECT cols.desc FROM (
+  SELECT id, json_array_elements(
+    crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
+  ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
+) AS cols WHERE cols.desc->>'name' IN ('crdb_internal_idx_expr', 'crdb_internal_idx_expr_1')
+ORDER BY id
+----
+{"computeExpr": "a + b", "id": 7, "inaccessible": true, "name": "crdb_internal_idx_expr", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
+{"computeExpr": "lower(c)", "id": 8, "inaccessible": true, "name": "crdb_internal_idx_expr_1", "nullable": true, "type": {"family": "StringFamily", "oid": 25}, "virtual": true}
+
+onlyif config local-legacy-schema-changer
+query T
+SELECT cols.desc FROM (
+  SELECT id, json_array_elements(
+    crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
+  ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
+) AS cols WHERE cols.desc->>'name' IN ('crdb_internal_idx_expr', 'crdb_internal_idx_expr_1')
+ORDER BY id
+----
+{"computeExpr": "a + b", "id": 7, "inaccessible": true, "name": "crdb_internal_idx_expr", "nullable": true, "type": {"family": "IntFamily", "oid": 20, "width": 64}, "virtual": true}
+{"computeExpr": "lower(c)", "id": 8, "inaccessible": true, "name": "crdb_internal_idx_expr_1", "nullable": true, "type": {"family": "StringFamily", "oid": 25}, "virtual": true}
+
+statement ok
+DROP INDEX t_a_plus_b_idx
+
+# Verify that the inaccessible column created for t_a_plus_b_idx no longer
 # exists in the descriptor.
 query T
 SELECT * FROM (
   SELECT json_array_elements(
     crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
   ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
-) AS cols WHERE cols.desc->'name' = '"crdb_internal_idx_expr_4"'
-----
-
-statement ok
-DROP INDEX t_a_plus_ten_a_plus_ten_idx
-
-# Verify that the inaccessible columns created for t_a_plus_ten_a_plus_b_idx no
-# longer exists in the descriptor.
-query T
-SELECT * FROM (
-  SELECT json_array_elements(
-    crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false)->'table'->'columns'
-  ) AS desc FROM system.descriptor WHERE id = 't'::REGCLASS
-) AS cols WHERE cols.desc->'name' IN ('"crdb_internal_idx_expr_5"', '"crdb_internal_idx_expr_6"')
+) AS cols WHERE cols.desc->>'name' = 'crdb_internal_idx_expr'
 ----
 
 # Adding a column with the same name as one of the inaccessible columns created
 # for an expression index is allowed after the index has been dropped.
 statement ok
-ALTER TABLE t ADD COLUMN crdb_internal_idx_expr_4 INT
+ALTER TABLE t ADD COLUMN crdb_internal_idx_expr INT
 
 statement ok
-ALTER TABLE t DROP COLUMN crdb_internal_idx_expr_4
+ALTER TABLE t DROP COLUMN crdb_internal_idx_expr
 
-statement error volatile functions are not allowed in index element
+statement error random\(\): volatile functions are not allowed in EXPRESSION INDEX ELEMENT
 CREATE INDEX err ON t ((a + random()::INT))
 
 statement error column \"z\" does not exist
 CREATE INDEX err ON t ((a + z))
 
-statement error index element expression cannot reference computed columns
+statement error EXPRESSION INDEX ELEMENT expression cannot reference computed columns
 CREATE INDEX err ON t ((comp + 10))
 
 statement error type of index element NULL is ambiguous.*\nHINT: consider adding a type cast to the expression
@@ -280,20 +336,32 @@ CREATE INDEX err ON t (a, (NULL), b)
 statement ok
 CREATE INDEX t_cast_idx ON t (a, (NULL::TEXT), b)
 
-statement error index element j->'a' of type jsonb is not indexable
+statement ok
 CREATE INDEX err ON t (a, (j->'a'));
+
+statement ok
+DROP INDEX err
 
 statement error index element \(a, b\) of type record is not indexable
 CREATE INDEX err ON t (a, (row(a, b)));
 
-statement error index element j->'a' of type jsonb is not allowed as a prefix column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
+statement ok
 CREATE INVERTED INDEX err ON t ((j->'a'), j);
+
+statement ok
+DROP INDEX err
 
 statement error index element a \+ b of type int is not allowed as the last column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
 CREATE INVERTED INDEX err ON t (a, (a + b));
 
 statement error index element \(a, b\) of type record is not allowed as the last column in an inverted index.*\nHINT: see the documentation for more information about inverted indexes: https://www.cockroachlabs.com/docs/.*/inverted-indexes.html
 CREATE INVERTED INDEX err ON t (a, (row(a, b)));
+
+statement error the last column in an inverted index cannot have the DESC option
+CREATE INVERTED INDEX err ON t (a, (j->'a') DESC);
+
+statement ok
+CREATE INVERTED INDEX ON t (a, (j->'a') ASC);
 
 statement ok
 CREATE TABLE other (
@@ -307,7 +375,16 @@ CREATE INDEX err ON other ((t.a + 10))
 # An inaccessible column used in an expression index cannot be referenced in
 # queries.
 statement error column \"crdb_internal_idx_expr\" does not exist
+SELECT crdb_internal_idx_expr FROM t
+
+statement error column \"crdb_internal_idx_expr\" does not exist
 SELECT * FROM t WHERE crdb_internal_idx_expr > 0
+
+statement error column \"t.crdb_internal_idx_expr\" does not exist
+SELECT t.crdb_internal_idx_expr FROM t
+
+statement error column \"t.crdb_internal_idx_expr\" does not exist
+SELECT * FROM t WHERE t.crdb_internal_idx_expr > 0
 
 # An inaccessible column cannot be used in a view.
 statement error column \"crdb_internal_idx_expr\" does not exist
@@ -345,14 +422,13 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE copy]
 ----
 CREATE TABLE public.copy (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   j JSONB NULL,
-   comp INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT copy_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (k, a, b, j, comp, rowid)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  j JSONB NULL,
+  comp INT8 NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT copy_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Inaccessible expression index columns should not be copied if the indexes are
@@ -370,14 +446,13 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE copy_generated]
 ----
 CREATE TABLE public.copy_generated (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   j JSONB NULL,
-   comp INT8 NULL AS (1:::INT8 + 10:::INT8) VIRTUAL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT copy_generated_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (k, a, b, j, rowid)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  j JSONB NULL,
+  comp INT8 NULL AS (1:::INT8 + 10:::INT8) VIRTUAL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT copy_generated_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Inaccessible expression index columns should not be copied if the indexes are
@@ -395,17 +470,16 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE copy_indexes]
 ----
 CREATE TABLE public.copy_indexes (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   j JSONB NULL,
-   comp INT8 NULL,
-   CONSTRAINT src_pkey PRIMARY KEY (k ASC),
-   INDEX src_expr_idx ((a + b) ASC),
-   INDEX named_idx ((a + 1:::INT8) ASC),
-   UNIQUE INDEX src_expr_key ((a + 10:::INT8) ASC),
-   INVERTED INDEX src_expr_expr1_idx ((a + b), (j->'a':::STRING)),
-   FAMILY "primary" (k, a, b, j, comp)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  j JSONB NULL,
+  comp INT8 NULL,
+  CONSTRAINT src_pkey PRIMARY KEY (k ASC),
+  INDEX src_expr_idx ((a + b) ASC),
+  INDEX named_idx ((a + 1:::INT8) ASC),
+  UNIQUE INDEX src_expr_key ((a + 10:::INT8) ASC),
+  INVERTED INDEX src_expr_expr1_idx ((a + b) ASC, (j->'a':::STRING))
 )
 
 # Inaccessible expression index columns should be copied if the indexes are
@@ -417,23 +491,22 @@ SELECT count(*) FROM (
   ) AS desc FROM system.descriptor WHERE id = 'copy_indexes'::REGCLASS
 ) AS cols WHERE cols.desc->>'name' LIKE 'crdb_internal_idx_expr%'
 ----
-5
+4
 
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE copy_all]
 ----
 CREATE TABLE public.copy_all (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   j JSONB NULL,
-   comp INT8 NULL AS (1:::INT8 + 10:::INT8) VIRTUAL,
-   CONSTRAINT src_pkey PRIMARY KEY (k ASC),
-   INDEX src_expr_idx ((a + b) ASC),
-   INDEX named_idx ((a + 1:::INT8) ASC),
-   UNIQUE INDEX src_expr_key ((a + 10:::INT8) ASC),
-   INVERTED INDEX src_expr_expr1_idx ((a + b), (j->'a':::STRING)),
-   FAMILY "primary" (k, a, b, j)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  j JSONB NULL,
+  comp INT8 NULL AS (1:::INT8 + 10:::INT8) VIRTUAL,
+  CONSTRAINT src_pkey PRIMARY KEY (k ASC),
+  INDEX src_expr_idx ((a + b) ASC),
+  INDEX named_idx ((a + 1:::INT8) ASC),
+  UNIQUE INDEX src_expr_key ((a + 10:::INT8) ASC),
+  INVERTED INDEX src_expr_expr1_idx ((a + b) ASC, (j->'a':::STRING))
 )
 
 # Inaccessible expression index columns should be copied if the indexes are
@@ -445,7 +518,7 @@ SELECT count(*) FROM (
   ) AS desc FROM system.descriptor WHERE id = 'copy_all'::REGCLASS
 ) AS cols WHERE cols.desc->>'name' LIKE 'crdb_internal_idx_expr%'
 ----
-5
+4
 
 # Test anonymous index name generation.
 
@@ -467,21 +540,23 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE anon]
 ----
 CREATE TABLE public.anon (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   c STRING NULL,
-   CONSTRAINT anon_pkey PRIMARY KEY (k ASC),
-   INDEX anon_expr_idx ((a + b) ASC),
-   INDEX anon_expr_b_idx ((a + 10:::INT8) ASC, b ASC),
-   UNIQUE INDEX anon_expr_b_key (lower(c) ASC, b ASC),
-   INDEX anon_expr_b_expr1_idx ((a + 10:::INT8) ASC, b ASC, lower(c) ASC),
-   INDEX anon_expr_expr1_expr2_idx ((a + 10:::INT8) ASC, (b + 100:::INT8) ASC, lower(c) ASC),
-   FAMILY fam_0_k_a_b_c (k, a, b, c)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  c STRING NULL,
+  CONSTRAINT anon_pkey PRIMARY KEY (k ASC),
+  INDEX anon_expr_idx ((a + b) ASC),
+  INDEX anon_expr_b_idx ((a + 10:::INT8) ASC, b ASC),
+  UNIQUE INDEX anon_expr_b_key (lower(c) ASC, b ASC),
+  INDEX anon_expr_b_expr1_idx ((a + 10:::INT8) ASC, b ASC, lower(c) ASC),
+  INDEX anon_expr_expr1_expr2_idx ((a + 10:::INT8) ASC, (b + 100:::INT8) ASC, lower(c) ASC),
+  FAMILY fam_0_k_a_b_c (k, a, b, c)
 )
 
 statement ok
 DROP TABLE anon;
+
+statement ok
 CREATE TABLE anon (
   k INT PRIMARY KEY,
   a INT,
@@ -499,20 +574,26 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE anon]
 ----
 CREATE TABLE public.anon (
-   k INT8 NOT NULL,
-   a INT8 NULL,
-   b INT8 NULL,
-   c STRING NULL,
-   CONSTRAINT anon_pkey PRIMARY KEY (k ASC),
-   INDEX anon_expr_idx ((a + b) ASC),
-   INDEX anon_expr_b_idx ((a + 10:::INT8) ASC, b ASC),
-   UNIQUE INDEX anon_expr_b_key (lower(c) ASC, b ASC),
-   INDEX anon_expr_b_expr1_idx ((a + 10:::INT8) ASC, b ASC, lower(c) ASC),
-   INDEX anon_expr_expr1_expr2_idx ((a + 10:::INT8) ASC, (b + 100:::INT8) ASC, lower(c) ASC),
-   FAMILY fam_0_k_a_b_c (k, a, b, c)
+  k INT8 NOT NULL,
+  a INT8 NULL,
+  b INT8 NULL,
+  c STRING NULL,
+  CONSTRAINT anon_pkey PRIMARY KEY (k ASC),
+  INDEX anon_expr_idx ((a + b) ASC),
+  INDEX anon_expr_b_idx ((a + 10:::INT8) ASC, b ASC),
+  UNIQUE INDEX anon_expr_b_key (lower(c) ASC, b ASC),
+  INDEX anon_expr_b_expr1_idx ((a + 10:::INT8) ASC, b ASC, lower(c) ASC),
+  INDEX anon_expr_expr1_expr2_idx ((a + 10:::INT8) ASC, (b + 100:::INT8) ASC, lower(c) ASC),
+  FAMILY fam_0_k_a_b_c (k, a, b, c)
 )
 
 # Querying expression indexes.
+
+statement ok
+CREATE INDEX t_a_plus_b_idx ON t ((a + b));
+
+statement ok
+CREATE INDEX t_lower_c_a_plus_b_idx ON t (lower(c), (a + b))
 
 statement ok
 INSERT INTO t VALUES
@@ -559,6 +640,68 @@ SELECT k, a, b, c, comp FROM t@t_lower_c_a_plus_b_idx WHERE lower(c) = 'foo' AND
 ----
 k  a   b    c    comp
 2  20  200  FOO  30
+
+statement ok
+CREATE TABLE d (a INT, j JSON);
+CREATE INDEX json_expr_index on d ((j->'a'))
+
+statement ok
+INSERT INTO d VALUES
+        (1, '{"a": "hello"}'),
+        (2, '{"a": "b"}'),
+        (3, '{"a": "bye"}'),
+        (4, '{"a": "json"}')
+
+query IT
+SELECT a, j from d@json_expr_index where j->'a' = '"b"' ORDER BY a
+----
+2  {"a": "b"}
+
+query IT
+SELECT a, j from d@json_expr_index where j->'a' = '"b"' OR j->'a' = '"bye"' ORDER BY a
+----
+2  {"a": "b"}
+3  {"a": "bye"}
+
+query IT
+SELECT a, j from d@json_expr_index where j->'a' > '"a"' ORDER BY a
+----
+1  {"a": "hello"}
+2  {"a": "b"}
+3  {"a": "bye"}
+4  {"a": "json"}
+
+query IT
+SELECT a, j from d@json_expr_index where j->'a' <= '"hello"' ORDER BY a
+----
+1  {"a": "hello"}
+2  {"a": "b"}
+3  {"a": "bye"}
+
+
+statement ok
+INSERT INTO d VALUES
+        (5, '{"a": "forward", "json": "inverted"}'),
+        (6, '{"a": "c", "b": "d"}')
+
+
+statement ok
+CREATE INVERTED INDEX json_inv on d ((j->'a'), j)
+
+query IT
+SELECT a, j from d@json_inv where j->'a' = '"forward"' AND j->'json' = '"inverted"' ORDER BY a
+----
+5  {"a": "forward", "json": "inverted"}
+
+query IT
+SELECT a, j from d@json_inv where j->'a' = '"c"' AND j->'json' = '"inverted"' ORDER BY a
+----
+
+query IT
+SELECT a, j from d@json_inv where j->'a' = '"c"' AND j->'b' = '"d"' ORDER BY a
+----
+6  {"a": "c", "b": "d"}
+
 
 # Backfilling expression indexes.
 
@@ -852,6 +995,97 @@ SELECT i, j FROM inv@i_plus_100_j_a WHERE i+100 = 101 AND j->'a' @> '"x"' ORDER 
 1  {"a": ["x", "y", "z"]}
 1  {"a": [1, "x"]}
 
+# Backfilling JSON expression indexes
+
+statement ok
+CREATE TABLE json_backfill (
+  k INT PRIMARY KEY,
+  j JSON,
+  INDEX forward_expr ((j->'a')),
+  INDEX forward (j)
+)
+
+statement ok
+INSERT INTO json_backfill VALUES
+  (1, '[1, 2, 3]'),
+  (2, '{"a": [1, 2, 3], "b": [4, 5, 6]}'),
+  (3, '{"a": {"a": "b"}, "d": {"e": [1, 2, 3]}}'),
+  (4, '{"a": [4, 5]}')
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' IN ('[1, 2, 3]', '[4,5]') ORDER BY k
+----
+{"a": [1, 2, 3], "b": [4, 5, 6]}
+{"a": [4, 5]}
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' = '{"a": "b"}' ORDER BY k
+----
+{"a": {"a": "b"}, "d": {"e": [1, 2, 3]}}
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' > '{"a": "b"}' ORDER BY k
+----
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' < '{"a": "b"}' ORDER BY k
+----
+{"a": [1, 2, 3], "b": [4, 5, 6]}
+{"a": [4, 5]}
+
+query T
+SELECT j from json_backfill@forward where j = '[1, 2, 3]' ORDER BY k
+----
+[1, 2, 3]
+
+query T
+SELECT j from json_backfill@forward where j = '{"a": [4, 5]}' OR j = '[1, 2, 3]' ORDER BY k
+----
+[1, 2, 3]
+{"a": [4, 5]}
+
+
+statement ok
+DROP INDEX forward_expr;
+DROP INDEX forward;
+
+statement ok
+CREATE INDEX forward_expr on json_backfill ((j->'a'));
+CREATE INDEX forward on json_backfill (j);
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' IN ('[1, 2, 3]', '[4,5]') ORDER BY k
+----
+{"a": [1, 2, 3], "b": [4, 5, 6]}
+{"a": [4, 5]}
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' = '{"a": "b"}' ORDER BY k
+----
+{"a": {"a": "b"}, "d": {"e": [1, 2, 3]}}
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' > '{"a": "b"}' ORDER BY k
+----
+
+query T
+SELECT j from json_backfill@forward_expr where j->'a' < '{"a": "b"}' ORDER BY k
+----
+{"a": [1, 2, 3], "b": [4, 5, 6]}
+{"a": [4, 5]}
+
+query T
+SELECT j from json_backfill@forward where j = '[1, 2, 3]' ORDER BY k
+----
+[1, 2, 3]
+
+query T
+SELECT j from json_backfill@forward where j = '{"a": [4, 5]}' OR j = '[1, 2, 3]' ORDER BY k
+----
+[1, 2, 3]
+{"a": [4, 5]}
+
+
 # Unique expression indexes.
 
 statement ok
@@ -888,23 +1122,59 @@ INSERT INTO uniq VALUES (4, 1, 219) ON CONFLICT ((a + b)) DO UPDATE SET b = 90
 
 statement ok
 CREATE TABLE t72012 (col integer);
+
+statement ok
 CREATE INDEX t72012_idx ON t72012 ((abs(col)));
+
+statement ok
 ALTER TABLE t72012 ALTER COLUMN col SET NOT NULL
 
 query TT
 SHOW CREATE TABLE t72012
 ----
 t72012  CREATE TABLE public.t72012 (
-        col INT8 NOT NULL,
-        rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-        CONSTRAINT t72012_pkey PRIMARY KEY (rowid ASC),
-        INDEX t72012_idx (abs(col) ASC),
-        FAMILY "primary" (col, rowid)
-)
+          col INT8 NOT NULL,
+          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+          CONSTRAINT t72012_pkey PRIMARY KEY (rowid ASC),
+          INDEX t72012_idx (abs(col) ASC)
+        )
 
 statement ok
 ALTER TABLE t72012 ALTER COLUMN col DROP NOT NULL;
+
+statement ok
 INSERT INTO t72012 VALUES (NULL)
 
-statement error validation of NOT NULL constraint failed: validation of CHECK "col IS NOT NULL" failed on row: col=NULL, rowid=\d+
+statement error (.*validation of CHECK "col IS NOT NULL" failed on row: col=NULL, rowid=\d+|pq: validation of column "col" NOT NULL failed on row: col=NULL, rowid=\d+)
 ALTER TABLE t72012 ALTER COLUMN col SET NOT NULL
+
+# Regression test for #74216. Do not allow expressions with mutable casts
+# between string types and reg* types.
+subtest 74216
+
+statement error regtype::string: context-dependent operators are not allowed in EXPRESSION INDEX ELEMENT
+CREATE TABLE t74216 (
+    a REGTYPE,
+    UNIQUE ((a::STRING))
+)
+
+# create index using an expression works even when retried
+statement ok
+BEGIN;
+CREATE INDEX t_a_times_three_idx ON t ((a * 3));
+SELECT crdb_internal.force_retry('10ms');
+COMMIT
+
+# JSON Expression Unique Indexes
+
+statement ok
+CREATE TABLE uniq_json (
+  k INT PRIMARY KEY,
+  j JSON,
+  UNIQUE INDEX ((j->'a'))
+)
+
+statement error duplicate key value violates unique constraint "uniq_json_expr_key"
+INSERT INTO uniq_json VALUES
+  (1, '{"a": "b"}'),
+  (2, '{"a": "b"}')

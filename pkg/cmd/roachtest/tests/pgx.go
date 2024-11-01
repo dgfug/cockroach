@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,12 +11,18 @@ import (
 	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 var pgxReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGXTag = "v4.11.0"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var supportedPGXTag = "v5.3.1"
 
 // This test runs pgx's full test suite against a single cockroach node.
 
@@ -36,15 +37,14 @@ func registerPgx(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, c.All())
+		c.Start(ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB), install.MakeClusterSettings(), c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0])
+		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, t, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 
@@ -73,25 +73,35 @@ func registerPgx(r registry.Registry) {
 
 		t.Status("installing go-junit-report")
 		if err := repeatRunE(
-			ctx, t, c, node, "install go-junit-report", "go get -u github.com/jstemmer/go-junit-report",
+			ctx, t, c, node, "install go-junit-report", "go install github.com/jstemmer/go-junit-report@latest",
 		); err != nil {
 			t.Fatal(err)
 		}
 
-		t.Status("checking blocklist")
-		blocklistName, expectedFailures, ignorelistName, ignorelist := pgxBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No pgx blocklist defined for cockroach version %s", version)
+		for original, replacement := range map[string]string{
+			"create type fruit": "drop type if exists public.fruit; create type fruit",
+			"t.Parallel()":      "", // SAFE FOR TESTING
+		} {
+			if err := repeatRunE(
+				ctx, t, c, node, "patch test to workaround flaky cleanup logic",
+				fmt.Sprintf(`find /mnt/data1/pgx/ -name "query_test.go" | xargs sed -i -e "s/%s/%s/g"`, original, replacement),
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
-		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s", version, blocklistName)
-		if ignorelist != nil {
-			status = fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
-				version, blocklistName, ignorelistName)
-		}
-		t.L().Printf("%s", status)
+
+		// It's safer to clean up dependencies this way than it is to give the cluster
+		// wipe root access.
+		defer func() {
+			c.Run(ctx, option.WithNodes(c.All()), "go clean -modcache")
+		}()
+
+		RunningStatus := fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
+			version, "pgxBlocklist", "pgxIgnorelist")
+		t.L().Printf("%s", RunningStatus)
 
 		t.Status("setting up test db")
-		db, err := c.ConnE(ctx, node[0])
+		db, err := c.ConnE(ctx, t.L(), node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,26 +120,37 @@ func registerPgx(r registry.Registry) {
 
 		t.Status("running pgx test suite")
 		// Running the test suite is expected to error out, so swallow the error.
-		xmlResults, _ := repeatRunWithBuffer(
+		result, err := repeatRunWithDetailsSingleNode(
 			ctx, c, t, node,
 			"run pgx test suite",
-			"cd /mnt/data1/pgx && "+
-				"PGX_TEST_DATABASE='postgresql://root:@localhost:26257/pgx_test' go test -v 2>&1 | "+
-				"`go env GOPATH`/bin/go-junit-report",
+			fmt.Sprintf("cd /mnt/data1/pgx && "+
+				"PGX_TEST_DATABASE='postgresql://%s:%s@localhost:{pgport:1}/pgx_test?sslmode=require' go test -v 2>&1 | "+
+				"`go env GOPATH`/bin/go-junit-report", install.DefaultUser, install.DefaultPassword),
 		)
 
+		// Fatal for a roachprod or transient error. A roachprod error is when result.Err==nil.
+		// Proceed for any other (command) errors
+		if err != nil && (result.Err == nil || rperrors.IsTransient(err)) {
+			t.Fatal(err)
+		}
+
+		// Result error contains stdout, stderr, and any error content returned by exec package.
+		xmlResults := []byte(result.Stdout + result.Stderr)
+
 		results := newORMTestsResults()
-		results.parseJUnitXML(t, expectedFailures, ignorelist, xmlResults)
+		results.parseJUnitXML(t, pgxBlocklist, pgxIgnorelist, xmlResults)
 		results.summarizeAll(
-			t, "pgx", blocklistName, expectedFailures, version, supportedPGXTag,
+			t, "pgx", "pgxBlocklist", pgxBlocklist, version, supportedPGXTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "pgx",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `driver`},
+		Name:             "pgx",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.Driver),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPgx(ctx, t, c)
 		},

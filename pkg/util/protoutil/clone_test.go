@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package protoutil_test
 
@@ -18,8 +13,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -35,7 +33,7 @@ func TestCloneProto(t *testing.T) {
 		{&roachpb.StoreIdent{}, true},
 		{&enginepb.TxnMeta{}, true},
 		{&roachpb.Transaction{}, true},
-		{&roachpb.Error{}, true},
+		{&kvpb.Error{}, true},
 		{&protoutil.RecursiveAndUncloneable{}, true},
 
 		// Cloneable types. This includes all types for which a
@@ -48,7 +46,8 @@ func TestCloneProto(t *testing.T) {
 		{&roachpb.Value{}, false},
 		{&kvserverpb.ReplicaState{}, false},
 		{&roachpb.RangeDescriptor{}, false},
-		{&descpb.PartitioningDescriptor{}, false},
+		{&catpb.PartitioningDescriptor{}, false},
+		{&ptpb.Record{}, false},
 	}
 	for _, tc := range testCases {
 		var clone protoutil.Message

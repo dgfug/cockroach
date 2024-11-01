@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 @import "../core/index.module.scss";
 
-.sessions-details{
-  all: initial;
+.sessions-details {
   font-family: $font-family--base;
+  width: 100%;
+  max-width: 1200px;
 }
 
 .heading-with-controls {
@@ -39,6 +35,7 @@
 }
 
 .details-header {
+  margin-top: 12px;
   margin-bottom: 12px;
 }
 
@@ -48,5 +45,40 @@
   align-items: center;
   &:not(:last-child) {
     box-shadow: 0 1px 0 #dbe1ea;
+  }
+}
+
+.session-details-link a {
+  color: $colors--link;
+}
+
+.session-status-icon {
+  &__active {
+    height: 10px;
+    width: 20px;
+    fill: $colors--primary-green-3;
+  }
+
+  &__idle {
+    height: 10px;
+    width: 20px;
+    fill: $colors--functional-orange-3;
+  }
+
+  &__closed {
+    height: 10px;
+    width: 20px;
+    fill: $colors--neutral-4;
+  }
+}
+
+.session-txn-fingerprints {
+  margin-top: 12px;
+  max-height: 300px;
+  overflow-y: scroll;
+
+  .link-txn-fingerprint-id {
+    display: block;
+    margin-bottom: 8px;
   }
 }

@@ -2,7 +2,7 @@
 
 `roachtest` is a tool for performing large-scale (multi-machine)
 automated tests. It relies on the concurrently-developed (but
-separate) tool `roachprod`.
+separate) library `roachprod`.
 
 # Setup
 
@@ -27,14 +27,22 @@ acceptance/cli/node-status [server]
 [...]
 ```
 
+The list can be filtered by passing a regular expression to the `list` command which will match against the test name.
+Multiple `tag:` prefixed args can be specified to further narrow by which tags are present for a test. The following 
+will list all tests with name containing `admission` where test tags match `(weekly && aws) || my-tag`
+
+```
+roachtest list admission tag:weekly,aws tag:my-tag
+```
+
+
 ## Getting the binaries
 
 To run a test, the `roachtest run` command is used. Since a test typically
 deploys a CockroachDB cluster, `roachtest` needs to know which cockroach binary
-to use. It also needs to know where to find `roachprod`, and also generically
-requires the `workload` binary which is used by many tests to deploy load
-against the cluster. To that effect, `roachtest run` takes the `--cockroach`,
-`--roachprod`, and `--workload` flags. The default values for these are set up
+to use. It also generically requires the `workload` binary which is used by many 
+tests to deploy load against the cluster. To that effect, `roachtest run` takes 
+the `--cockroach`, and `--workload` flags. The default values for these are set up
 so that they do not need to be specified in the common case. Besides, when
 the binaries have nonstandard names, it is often more convenient to move them
 to the location `roachtest` expects (it will tell you) rather than to specify
@@ -54,19 +62,19 @@ As a general rule of thumb, if running against "real" VMs, and the version to
 test is checked out, the following will build the right binaries and put them
 where `roachtest` will find them:
 
-`build/builder.sh mkrelease amd64-linux-gnu build bin/workload`
+`dev build --cross cockroach workload`
 
 `roachtest` will look first in `$PATH`, then (except when `--local` is
 specified) in `bin.docker_amd64` in the repo root, followed by `bin`. This
 is complicated enough to be surprising, which might be another reason to
-pass the `--cockroach`, `--workload`, `--roachprod` flags explicitly.
+pass the `--cockroach` and  `--workload` flags explicitly.
 
 Some roachtests can also be run with the `--local` flag, i.e. will use a
 cluster on the local machine created via `roachprod create local`. In that
 case, the `cockroach` and `workload` binary must target the local architecture,
 which means
 
-`make build bin/workload`
+`dev build cockroach workload`
 
 will do the trick. However, most roachtests don't make a lot of sense in local
 mode or will do outright dangerous things (like trying to install packages on
@@ -80,22 +88,22 @@ Especially for OSX users, building a linux CockroachDB binary is an extremely ti
 ```
 # Make a single-node local cluster.
 roachprod create -n 1 local
-# Tell roachprod to place a CockroachDB 21.1.5 Linux binary onto node 1.
-roachprod stage local release v21.1.5 --os linux
+# Tell roachprod to place a CockroachDB 23.1.12 Linux binary onto node 1.
+# Alternatively you can choose any other recent release from the
+# releases page: https://www.cockroachlabs.com/docs/releases/
+roachprod stage local release v23.1.12 --os linux --arch amd64
 # Copy it from (local) node 1 to the current directory
 mv ~/local/1/cockroach cockroach
 # Can now use roachtest with the `--cockroach=./cockroach` flag.
 ```
 
 This doesn't work for the `workload` binary but this builds a lot faster anyway
-(via `build/builder.sh mkrelease amd64-linux-gnu bin/workload`; note the
-absence of the word `build` which prevents unnecessarily building CockroachDB
-again).  The above strategy also works for recent SHAs from the master/release
-branches, where the incantation is `roachprod stage local cockroach <SHA>`; the
-SHA is optional and defaults to a recent build from the `master` branch, which
-may not be what you want. As a bonus, `roachprod stage local workload <SHA>
---os linux` does allow getting a `workload` binary as well, meaning you can run
-a roachtest without compiling anything yourself.
+(via `dev build --cross workload`).  The above strategy also works for recent
+SHAs from the master/release branches, where the incantation is
+`roachprod stage local cockroach <SHA>`; the SHA is optional and defaults to a
+recent build from the `master` branch, which may not be what you want. As a bonus,
+`roachprod stage local workload <SHA> --os linux` does allow getting a `workload`
+binary as well, meaning you can run a roachtest without compiling anything yourself.
 
 ## Running a test
 
@@ -108,7 +116,7 @@ $ roachtest run acceptance/build-info
 
 If this doesn't work, the output should tell you why. Perhaps the binaries you
 use are not in the canonical locations and need to be specified via the
-`--cockroach`, `--workload`, `--roachprod` flags. Common other errors include
+`--cockroach` and `--workload` flags. Common other errors include
 not having set up roachprod properly (does `roachprod create -n 1 $USER-foo &&
 roachprod destroy $USER-foo` work?), or having the binaries for the wrong
 architecture in place (reminder: `roachtest` and `roachprod` run on your own
@@ -170,7 +178,7 @@ case which is helpful during development), don't forget to rebuild the binaries
 you've touched (i.e. most likely only `roachtest`). For example, the command
 line that you might use while iterating on a new test `foo/garble-wozzler` is
 
-`make bin/roachtest && roachtest run --local foo/garble-wozzler`.
+`dev build roachtest && roachtest run --local foo/garble-wozzler`.
 
 ### Reproducing a test failure
 

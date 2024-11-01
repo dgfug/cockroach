@@ -1,40 +1,48 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package quotapool
 
 import (
 	"context"
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/cockroachdb/tokenbucket"
 )
 
 // Limit defines a rate in terms of quota per second.
 type Limit float64
 
+// Inf returns the infinite rate limit, which allows any rate and bursts.
+func Inf() Limit {
+	return Limit(math.Inf(1))
+}
+
 // RateLimiter implements a token-bucket style rate limiter.
 // It has the added feature that quota acquired from the pool can be returned
 // in the case that they end up not getting used.
 type RateLimiter struct {
-	qp *AbstractPool
+	qp    *AbstractPool
+	isInf atomic.Bool
 }
 
 // NewRateLimiter defines a new RateLimiter. The limiter is implemented as a
 // token bucket which has a maximum capacity of burst. If a request attempts to
 // acquire more than burst, it will block until the bucket is full and then
 // put the token bucket in debt.
+//
+// If rate == Inf() then any bursts are allowed, and acquisition does not block.
 func NewRateLimiter(name string, rate Limit, burst int64, options ...Option) *RateLimiter {
 	rl := &RateLimiter{}
-	tb := &TokenBucket{}
+	tb := &tokenbucket.TokenBucket{}
 	rl.qp = New(name, tb, options...)
-	tb.Init(TokensPerSecond(rate), Tokens(burst), rl.qp.timeSource)
+	tb.InitWithNowFn(tokenbucket.TokensPerSecond(rate), tokenbucket.Tokens(burst), rl.qp.timeSource.Now)
+	rl.isInf.Store(math.IsInf(float64(rate), 1))
 	return rl
 }
 
@@ -54,6 +62,9 @@ func (rl *RateLimiter) WaitN(ctx context.Context, n int64) error {
 		// Special case 0 acquisition.
 		return nil
 	}
+	if rl.isInf.Load() {
+		return nil
+	}
 	r := rl.newRateRequest(n)
 	defer rl.putRateRequest(r)
 	if err := rl.qp.Acquire(ctx, r); err != nil {
@@ -66,6 +77,10 @@ func (rl *RateLimiter) WaitN(ctx context.Context, n int64) error {
 // false and not block if there is currently insufficient quota or the pool is
 // closed.
 func (rl *RateLimiter) AdmitN(n int64) bool {
+	if rl.isInf.Load() {
+		return true
+	}
+
 	r := rl.newRateRequest(n)
 	defer rl.putRateRequest(r)
 	return rl.qp.Acquire(context.Background(), (*rateRequestNoWait)(r)) == nil
@@ -79,8 +94,9 @@ func (rl *RateLimiter) AdmitN(n int64) bool {
 // putting the limiter into debt.
 func (rl *RateLimiter) UpdateLimit(rate Limit, burst int64) {
 	rl.qp.Update(func(res Resource) (shouldNotify bool) {
-		tb := res.(*TokenBucket)
-		tb.UpdateConfig(TokensPerSecond(rate), Tokens(burst))
+		rl.isInf.Store(math.IsInf(float64(rate), 1))
+		tb := res.(*tokenbucket.TokenBucket)
+		tb.UpdateConfig(tokenbucket.TokensPerSecond(rate), tokenbucket.Tokens(burst))
 		return true
 	})
 }
@@ -96,8 +112,8 @@ type RateAlloc struct {
 // methods on the RateAlloc after this call.
 func (ra *RateAlloc) Return() {
 	ra.rl.qp.Update(func(res Resource) (shouldNotify bool) {
-		tb := res.(*TokenBucket)
-		tb.Adjust(Tokens(ra.alloc))
+		tb := res.(*tokenbucket.TokenBucket)
+		tb.Adjust(tokenbucket.Tokens(ra.alloc))
 		return true
 	})
 	ra.rl.putRateAlloc((*rateAlloc)(ra))
@@ -136,8 +152,8 @@ func (rl *RateLimiter) putRateRequest(r *rateRequest) {
 func (i *rateRequest) Acquire(
 	ctx context.Context, res Resource,
 ) (fulfilled bool, tryAgainAfter time.Duration) {
-	tb := res.(*TokenBucket)
-	return tb.TryToFulfill(Tokens(i.want))
+	tb := res.(*tokenbucket.TokenBucket)
+	return tb.TryToFulfill(tokenbucket.Tokens(i.want))
 }
 
 func (i *rateRequest) ShouldWait() bool {

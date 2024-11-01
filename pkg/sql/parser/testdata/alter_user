@@ -1,5 +1,14 @@
-parse
+error
 ALTER USER foo PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+ALTER USER foo PASSWORD bar
+                        ^
+HINT: try \h ALTER ROLE
+
+parse
+ALTER USER foo PASSWORD 'bar'
 ----
 ALTER USER foo WITH PASSWORD '*****' -- normalized!
 ALTER USER foo WITH PASSWORD '*****' -- fully parenthesized
@@ -7,8 +16,35 @@ ALTER USER foo WITH PASSWORD '*****' -- literals removed
 ALTER USER _ WITH PASSWORD '*****' -- identifiers removed
 ALTER USER foo WITH PASSWORD 'bar' -- passwords exposed
 
-parse
+error
 ALTER USER foo WITH PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+ALTER USER foo WITH PASSWORD bar
+                             ^
+HINT: try \h ALTER ROLE
+
+parse
+ALTER USER foo WITH PASSWORD 'bar'
+----
+ALTER USER foo WITH PASSWORD '*****' -- normalized!
+ALTER USER foo WITH PASSWORD '*****' -- fully parenthesized
+ALTER USER foo WITH PASSWORD '*****' -- literals removed
+ALTER USER _ WITH PASSWORD '*****' -- identifiers removed
+ALTER USER foo WITH PASSWORD 'bar' -- passwords exposed
+
+error
+ALTER USER foo WITH ENCRYPTED PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+ALTER USER foo WITH ENCRYPTED PASSWORD bar
+                                       ^
+HINT: try \h ALTER ROLE
+
+parse
+ALTER USER foo WITH ENCRYPTED PASSWORD 'bar'
 ----
 ALTER USER foo WITH PASSWORD '*****' -- normalized!
 ALTER USER foo WITH PASSWORD '*****' -- fully parenthesized
@@ -72,6 +108,14 @@ ALTER ROLE foo WITH NOCREATELOGIN -- normalized!
 ALTER ROLE foo WITH NOCREATELOGIN -- fully parenthesized
 ALTER ROLE foo WITH NOCREATELOGIN -- literals removed
 ALTER ROLE _ WITH NOCREATELOGIN -- identifiers removed
+
+parse
+ALTER ROLE foo SUBJECT 'bar'
+----
+ALTER ROLE foo WITH SUBJECT 'bar' -- normalized!
+ALTER ROLE foo WITH SUBJECT ('bar') -- fully parenthesized
+ALTER ROLE foo WITH SUBJECT '_' -- literals removed
+ALTER ROLE _ WITH SUBJECT 'bar' -- identifiers removed
 
 parse
 ALTER USER foo SET search_path = 'abc'
@@ -312,3 +356,11 @@ ALTER ROLE ALL IN DATABASE d SET application_name = 'app' -- normalized!
 ALTER ROLE ALL IN DATABASE d SET application_name = ('app') -- fully parenthesized
 ALTER ROLE ALL IN DATABASE d SET application_name = '_' -- literals removed
 ALTER ROLE ALL IN DATABASE _ SET application_name = 'app' -- identifiers removed
+
+parse
+ALTER USER foo SET tracing = 'off'
+----
+ALTER USER foo SET tracing = 'off'
+ALTER USER foo SET tracing = ('off') -- fully parenthesized
+ALTER USER foo SET tracing = '_' -- literals removed
+ALTER USER _ SET tracing = 'off' -- identifiers removed

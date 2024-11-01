@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2016 The Oklog Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -407,7 +402,8 @@ func MaxTime() uint64 { return maxTime }
 
 // Now is a convenience function that returns the current
 // UTC time in Unix milliseconds. Equivalent to:
-//   Timestamp(timeutil.Now().UTC())
+//
+//	Timestamp(timeutil.Now().UTC())
 func Now() uint64 { return Timestamp(timeutil.Now().UTC()) }
 
 // Timestamp converts a time.Time to Unix milliseconds.
@@ -488,33 +484,32 @@ func (id *ULID) Scan(src interface{}) error {
 // representation instead, you can create a wrapper type that calls String()
 // instead.
 //
-//    type stringValuer ulid.ULID
+//	type stringValuer ulid.ULID
 //
-//    func (v stringValuer) Value() (driver.Value, error) {
-//        return ulid.ULID(v).String(), nil
-//    }
+//	func (v stringValuer) Value() (driver.Value, error) {
+//	    return ulid.ULID(v).String(), nil
+//	}
 //
-//    // Example usage.
-//    db.Exec("...", stringValuer(id))
+//	// Example usage.
+//	db.Exec("...", stringValuer(id))
 //
 // All valid ULIDs, including zero-value ULIDs, return a valid Value with a nil
 // error. If your use case requires zero-value ULIDs to return a non-nil error,
 // you can create a wrapper type that special-cases this behavior.
 //
-//    var zeroValueULID ulid.ULID
+//	var zeroValueULID ulid.ULID
 //
-//    type invalidZeroValuer ulid.ULID
+//	type invalidZeroValuer ulid.ULID
 //
-//    func (v invalidZeroValuer) Value() (driver.Value, error) {
-//        if ulid.ULID(v).Compare(zeroValueULID) == 0 {
-//            return nil, fmt.Errorf("zero value")
-//        }
-//        return ulid.ULID(v).Value()
-//    }
+//	func (v invalidZeroValuer) Value() (driver.Value, error) {
+//	    if ulid.ULID(v).Compare(zeroValueULID) == 0 {
+//	        return nil, fmt.Errorf("zero value")
+//	    }
+//	    return ulid.ULID(v).Value()
+//	}
 //
-//    // Example usage.
-//    db.Exec("...", invalidZeroValuer(id))
-//
+//	// Example usage.
+//	db.Exec("...", invalidZeroValuer(id))
 func (id ULID) Value() (driver.Value, error) {
 	return id.MarshalBinary()
 }

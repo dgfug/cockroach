@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -39,19 +34,20 @@ func runDebugJobTrace(_ *cobra.Command, args []string) (resErr error) {
 	if err != nil {
 		return err
 	}
-
-	sqlConn, err := makeSQLClient("cockroach debug job-trace", useSystemDb)
+	ctx := context.Background()
+	sqlConn, err := makeSQLClient(ctx, "cockroach debug job-trace", useSystemDb)
 	if err != nil {
 		return errors.Wrap(err, "could not establish connection to cluster")
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, sqlConn.Close()) }()
 
-	return constructJobTraceZipBundle(context.Background(), sqlConn, jobID)
+	return constructJobTraceZipBundle(ctx, sqlConn, jobID)
 }
 
 func getJobTraceID(sqlConn clisqlclient.Conn, jobID int64) (int64, error) {
 	var traceID int64
-	rows, err := sqlConn.Query(`SELECT trace_id FROM crdb_internal.jobs WHERE job_id=$1`, []driver.Value{jobID})
+	rows, err := sqlConn.Query(context.Background(),
+		`SELECT trace_id FROM crdb_internal.jobs WHERE job_id=$1`, jobID)
 	if err != nil {
 		return traceID, err
 	}
@@ -80,17 +76,10 @@ func getJobTraceID(sqlConn clisqlclient.Conn, jobID int64) (int64, error) {
 }
 
 func constructJobTraceZipBundle(ctx context.Context, sqlConn clisqlclient.Conn, jobID int64) error {
-	maybePrint := func(stmt string) string {
-		if debugCtx.verbose {
-			fmt.Println("querying " + stmt)
-		}
-		return stmt
-	}
-
 	// Check if a timeout has been set for this command.
 	if cliCtx.cmdTimeout != 0 {
-		stmt := fmt.Sprintf(`SET statement_timeout = '%s'`, cliCtx.cmdTimeout)
-		if err := sqlConn.Exec(maybePrint(stmt), nil); err != nil {
+		if err := sqlConn.Exec(context.Background(),
+			`SET statement_timeout = $1`, cliCtx.cmdTimeout.String()); err != nil {
 			return err
 		}
 	}
@@ -100,7 +89,7 @@ func constructJobTraceZipBundle(ctx context.Context, sqlConn clisqlclient.Conn, 
 		return err
 	}
 
-	zipper := tracezipper.MakeSQLConnInflightTraceZipper(sqlConn.GetDriverConn().(driver.QueryerContext))
+	zipper := tracezipper.MakeSQLConnInflightTraceZipper(sqlConn.GetDriverConn())
 	zipBytes, err := zipper.Zip(ctx, traceID)
 	if err != nil {
 		return err

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltestutils
 
@@ -15,8 +10,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/stretchr/testify/require"
 )
@@ -35,21 +30,26 @@ type ShowCreateTableTestCase struct {
 }
 
 // ShowCreateTableTest tests the output for SHOW CREATE TABLE matches
-// the expect values. Furthermore, it round trips SHOW CREATE TABLE
-// statements to ensure they produces an identical SHOW CREATE TABLE.
+// the expected values. Furthermore, it round trips SHOW CREATE TABLE
+// statements to ensure they produce an identical SHOW CREATE TABLE.
 func ShowCreateTableTest(
 	t *testing.T, extraQuerySetup string, testCases []ShowCreateTableTestCase,
 ) {
-	params, _ := tests.CreateTestServerParams()
-	params.Locality.Tiers = []roachpb.Tier{
-		{Key: "region", Value: "us-west1"},
-	}
-	s, sqlDB, _ := serverutils.StartServer(t, params)
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Locality: roachpb.Locality{
+			Tiers: []roachpb.Tier{
+				{Key: "region", Value: "us-west1"},
+			},
+		},
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
     SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
-		SET experimental_enable_hash_sharded_indexes = TRUE;
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`
 		CREATE DATABASE d;
 		USE d;
 		-- Create a table we can point FKs to.

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package zipper
 
@@ -18,11 +13,11 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/memzipper"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,7 +35,7 @@ type inflightTraceRow struct {
 // InflightTraceZipper provides a method to generate a trace zip containing
 // per-node traces for all inflight trace spans of a particular traceID.
 type InflightTraceZipper interface {
-	getNodeTraceCollection() *tracing.TraceCollection
+	getNodeTraceCollection() *tracingpb.TraceCollection
 	getTraceStrBuffer() *bytes.Buffer
 	getZipper() *memzipper.Zipper
 	reset()
@@ -52,12 +47,12 @@ type InflightTraceZipper interface {
 // SQL connection to collect cluster wide traces.
 type InternalInflightTraceZipper struct {
 	traceStrBuf         *bytes.Buffer
-	nodeTraceCollection *tracing.TraceCollection
-	ie                  sqlutil.InternalExecutor
+	nodeTraceCollection *tracingpb.TraceCollection
+	ie                  isql.Executor
 	z                   *memzipper.Zipper
 }
 
-func (i *InternalInflightTraceZipper) getNodeTraceCollection() *tracing.TraceCollection {
+func (i *InternalInflightTraceZipper) getNodeTraceCollection() *tracingpb.TraceCollection {
 	return i.nodeTraceCollection
 }
 
@@ -106,18 +101,18 @@ func (i *InternalInflightTraceZipper) Zip(
 			flushAndReset(ctx, prevNodeID, i)
 		}
 
-		// If we are reading another row (tracing.Recording) from the same node as
+		// If we are reading another row (tracingpb.Recording) from the same node as
 		// prevNodeID then we want to stitch the JaegerJSON into the existing
 		// JaegerJSON object for this node. This allows us to output a per node
 		// Jaeger file that can easily be imported into JaegerUI.
 		//
-		// It is safe to do this since the tracing.Recording returned as rows are
+		// It is safe to do this since the tracingpb.Recording returned as rows are
 		// sorted by the StartTime of the root span, and so appending to the
 		// existing JaegerJSON will maintain the chronological order of the traces.
 		//
 		// In practice, it is more useful to view all the Jaeger tracing.Recordings
 		// on a node for a given TraceID in a single view, rather than having to
-		// generate different Jaeger files for each tracing.Recording, and going
+		// generate different Jaeger files for each tracingpb.Recording, and going
 		// through the hassle of importing each one and toggling through the tabs.
 		if i.nodeTraceCollection, err = stitchJaegerJSON(i.nodeTraceCollection, traceRow.jaegerJSON); err != nil {
 			return nil, err
@@ -186,9 +181,7 @@ func (i *InternalInflightTraceZipper) populateInflightTraceRow(
 
 // MakeInternalExecutorInflightTraceZipper returns an instance of
 // InternalInflightTraceZipper.
-func MakeInternalExecutorInflightTraceZipper(
-	ie sqlutil.InternalExecutor,
-) *InternalInflightTraceZipper {
+func MakeInternalExecutorInflightTraceZipper(ie isql.Executor) *InternalInflightTraceZipper {
 	t := &InternalInflightTraceZipper{
 		traceStrBuf:         &bytes.Buffer{},
 		nodeTraceCollection: nil,
@@ -201,16 +194,20 @@ func MakeInternalExecutorInflightTraceZipper(
 
 var _ InflightTraceZipper = &InternalInflightTraceZipper{}
 
+type queryI interface {
+	Query(ctx context.Context, query string, args ...interface{}) (driver.Rows, error)
+}
+
 // SQLConnInflightTraceZipper is the InflightTraceZipper which uses a network
 // backed SQL connection to collect cluster wide traces.
 type SQLConnInflightTraceZipper struct {
 	traceStrBuf         *bytes.Buffer
-	nodeTraceCollection *tracing.TraceCollection
+	nodeTraceCollection *tracingpb.TraceCollection
 	z                   *memzipper.Zipper
-	sqlConn             driver.QueryerContext
+	sqlConn             queryI
 }
 
-func (s *SQLConnInflightTraceZipper) getNodeTraceCollection() *tracing.TraceCollection {
+func (s *SQLConnInflightTraceZipper) getNodeTraceCollection() *tracingpb.TraceCollection {
 	return s.nodeTraceCollection
 }
 
@@ -234,7 +231,7 @@ func (s *SQLConnInflightTraceZipper) reset() {
 // into text, and jaegerJSON formats before creating a zip with per-node trace
 // files.
 func (s *SQLConnInflightTraceZipper) Zip(ctx context.Context, traceID int64) ([]byte, error) {
-	rows, err := s.sqlConn.QueryContext(ctx, fmt.Sprintf(inflightTracesQuery, traceID), nil /* args */)
+	rows, err := s.sqlConn.Query(ctx, fmt.Sprintf(inflightTracesQuery, traceID))
 	if err != nil {
 		return nil, err
 	}
@@ -269,18 +266,18 @@ func (s *SQLConnInflightTraceZipper) Zip(ctx context.Context, traceID int64) ([]
 			flushAndReset(ctx, prevNodeID, s)
 		}
 
-		// If we are reading another row (tracing.Recording) from the same node as
+		// If we are reading another row (tracingpb.Recording) from the same node as
 		// prevNodeID then we want to stitch the JaegerJSON into the existing
 		// JaegerJSON object for this node. This allows us to output a per node
 		// Jaeger file that can easily be imported into JaegerUI.
 		//
-		// It is safe to do this since the tracing.Recording returned as rows are
+		// It is safe to do this since the tracingpb.Recording returned as rows are
 		// sorted by the StartTime of the root span, and so appending to the
 		// existing JaegerJSON will maintain the chronological order of the traces.
 		//
 		// In practice, it is more useful to view all the Jaeger tracing.Recordings
 		// on a node for a given TraceID in a single view, rather than having to
-		// generate different Jaeger files for each tracing.Recording, and going
+		// generate different Jaeger files for each tracingpb.Recording, and going
 		// through the hassle of importing each one and toggling through the tabs.
 		if s.nodeTraceCollection, err = stitchJaegerJSON(s.nodeTraceCollection, row.jaegerJSON); err != nil {
 			return nil, err
@@ -341,7 +338,7 @@ func (s *SQLConnInflightTraceZipper) populateInflightTraceRow(
 
 // MakeSQLConnInflightTraceZipper returns an instance of
 // SQLConnInflightTraceZipper.
-func MakeSQLConnInflightTraceZipper(sqlConn driver.QueryerContext) *SQLConnInflightTraceZipper {
+func MakeSQLConnInflightTraceZipper(sqlConn queryI) *SQLConnInflightTraceZipper {
 	t := &SQLConnInflightTraceZipper{
 		traceStrBuf:         &bytes.Buffer{},
 		nodeTraceCollection: nil,
@@ -380,12 +377,12 @@ func flushAndReset(ctx context.Context, nodeID int64, t InflightTraceZipper) {
 // nodeTraceCollection object, and returns a new cumulative
 // tracing.TraceCollection object.
 func stitchJaegerJSON(
-	nodeTraceCollection *tracing.TraceCollection, jaegerJSON string,
-) (*tracing.TraceCollection, error) {
-	var cumulativeTraceCollection *tracing.TraceCollection
+	nodeTraceCollection *tracingpb.TraceCollection, jaegerJSON string,
+) (*tracingpb.TraceCollection, error) {
+	var cumulativeTraceCollection *tracingpb.TraceCollection
 
 	// Unmarshal the jaegerJSON string to a TraceCollection.
-	var curTraceCollection tracing.TraceCollection
+	var curTraceCollection tracingpb.TraceCollection
 	if err := json.Unmarshal([]byte(jaegerJSON), &curTraceCollection); err != nil {
 		return cumulativeTraceCollection, err
 	}

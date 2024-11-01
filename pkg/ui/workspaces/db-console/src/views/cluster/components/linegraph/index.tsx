@@ -1,34 +1,43 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import d3 from "d3";
+import {
+  calculateXAxisDomain,
+  calculateYAxisDomain,
+  AxisDomain,
+  TimeScale,
+  Visualization,
+  util,
+  WithTimezoneProps,
+  findClosestTimeScale,
+  defaultTimeScaleOptions,
+  TimeWindow,
+  WithTimezone,
+} from "@cockroachlabs/cluster-ui";
+import { Tooltip } from "antd";
+import filter from "lodash/filter";
+import flatMap from "lodash/flatMap";
+import Long from "long";
+import moment from "moment-timezone";
 import React from "react";
-import moment from "moment";
-import * as nvd3 from "nvd3";
 import { createSelector } from "reselect";
+import uPlot from "uplot";
+import "uplot/dist/uPlot.min.css";
 
 import * as protos from "src/js/protos";
 import { hoverOff, hoverOn, HoverState } from "src/redux/hover";
+import { isSecondaryTenant } from "src/redux/tenants";
+import { unique } from "src/util/arrays";
 import { findChildrenOfType } from "src/util/find";
 import {
-  AxisDomain,
-  calculateXAxisDomain,
-  calculateYAxisDomain,
-  CHART_MARGINS,
-  ConfigureLineChart,
-  ConfigureLinkedGuideline,
+  canShowMetric,
   configureUPlotLineChart,
   formatMetricData,
   formattedSeries,
-  InitLineChart,
 } from "src/views/cluster/util/graphs";
+import { MonitoringIcon } from "src/views/shared/components/icons/monitoring";
 import {
   Axis,
   AxisProps,
@@ -37,16 +46,13 @@ import {
   MetricsDataComponentProps,
   QueryTimeInfo,
 } from "src/views/shared/components/metricQuery";
-import Visualization from "src/views/cluster/components/visualization";
-import { MilliToSeconds, NanoToMilli } from "src/util/convert";
-import uPlot from "uplot";
-import "uplot/dist/uPlot.min.css";
-import { findClosestTimeScale, TimeWindow } from "src/redux/timewindow";
-import Long from "long";
+
+import "./linegraph.styl";
 
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 
-export interface LineGraphProps extends MetricsDataComponentProps {
+export interface OwnProps extends MetricsDataComponentProps {
+  isKvGraph?: boolean;
   title?: string;
   subtitle?: string;
   legend?: boolean;
@@ -56,254 +62,10 @@ export interface LineGraphProps extends MetricsDataComponentProps {
   hoverOff?: typeof hoverOff;
   hoverState?: HoverState;
   preCalcGraphSize?: boolean;
+  showMetricsInTooltip?: boolean;
 }
 
-interface LineGraphStateOld {
-  lastData?: TSResponse;
-  lastTimeInfo?: QueryTimeInfo;
-}
-
-/**
- * LineGraph displays queried metrics in a line graph. It currently only
- * supports a single Y-axis, but multiple metrics can be graphed on the same
- * axis.
- */
-export class LineGraphOld extends React.Component<
-  LineGraphProps,
-  LineGraphStateOld
-> {
-  // The SVG Element reference in the DOM used to render the graph.
-  graphEl: React.RefObject<SVGSVGElement> = React.createRef();
-
-  // A configured NVD3 chart used to render the chart.
-  chart: nvd3.LineChart;
-
-  axis = createSelector(
-    (props: { children?: React.ReactNode }) => props.children,
-    children => {
-      const axes: React.ReactElement<AxisProps>[] = findChildrenOfType(
-        children as any,
-        Axis,
-      );
-      if (axes.length === 0) {
-        console.warn(
-          "LineGraph requires the specification of at least one axis.",
-        );
-        return null;
-      }
-      if (axes.length > 1) {
-        console.warn(
-          "LineGraph currently only supports a single axis; ignoring additional axes.",
-        );
-      }
-      return axes[0];
-    },
-  );
-
-  metrics = createSelector(
-    (props: { children?: React.ReactNode }) => props.children,
-    children => {
-      return findChildrenOfType(children as any, Metric) as React.ReactElement<
-        MetricProps
-      >[];
-    },
-  );
-
-  initChart() {
-    const axis = this.axis(this.props);
-    if (!axis) {
-      // TODO: Figure out this error condition.
-      return;
-    }
-
-    this.chart = nvd3.models.lineChart();
-    InitLineChart(this.chart);
-
-    if (axis.props.range) {
-      this.chart.forceY(axis.props.range);
-    }
-  }
-
-  mouseMove = (e: any) => {
-    // TODO(couchand): handle the following cases:
-    //   - first series is missing data points
-    //   - series are missing data points at different timestamps
-    const datapoints = this.props.data.results[0].datapoints;
-    const timeScale = this.chart.xAxis.scale();
-
-    // To get the x-coordinate within the chart we subtract the left side of the SVG
-    // element and the left side margin.
-    const x =
-      e.clientX -
-      this.graphEl.current.getBoundingClientRect().left -
-      CHART_MARGINS.left;
-    // Find the time value of the coordinate by asking the scale to invert the value.
-    const t = Math.floor(timeScale.invert(x));
-
-    // Find which data point is closest to the x-coordinate.
-    let result: moment.Moment;
-    if (datapoints.length) {
-      const series: any = datapoints.map((d: any) =>
-        NanoToMilli(d.timestamp_nanos.toNumber()),
-      );
-
-      const right = d3.bisectRight(series, t);
-      const left = right - 1;
-
-      let index = 0;
-
-      if (right >= series.length) {
-        // We're hovering over the rightmost point.
-        index = left;
-      } else if (left < 0) {
-        // We're hovering over the leftmost point.
-        index = right;
-      } else {
-        // The general case: we're hovering somewhere over the middle.
-        const leftDistance = t - series[left];
-        const rightDistance = series[right] - t;
-
-        index = leftDistance < rightDistance ? left : right;
-      }
-
-      result = moment(new Date(series[index]));
-    }
-
-    if (!this.props.hoverState || !result) {
-      return;
-    }
-
-    // Only dispatch if we have something to change to avoid action spamming.
-    if (
-      this.props.hoverState.hoverChart !== this.props.title ||
-      !result.isSame(this.props.hoverState.hoverTime)
-    ) {
-      this.props.hoverOn({
-        hoverChart: this.props.title,
-        hoverTime: result,
-      });
-    }
-  };
-
-  mouseLeave = () => {
-    this.props.hoverOff();
-  };
-
-  drawChart = () => {
-    // If the document is not visible (e.g. if the window is minimized) we don't
-    // attempt to redraw the chart. Redrawing the chart uses
-    // requestAnimationFrame, which isn't called when the tab is in the
-    // background, and is then apparently queued up and called en masse when the
-    // tab re-enters the foreground. This check prevents the issue in #8896
-    // where switching to a tab with the graphs page open that had been in the
-    // background caused the UI to run out of memory and either lag or crash.
-    // NOTE: This might not work on Android:
-    // http://caniuse.com/#feat=pagevisibility
-    if (!document.hidden) {
-      const metrics = this.metrics(this.props);
-      const axis = this.axis(this.props);
-      if (!axis) {
-        return;
-      }
-
-      ConfigureLineChart(
-        this.chart,
-        this.graphEl.current,
-        metrics,
-        axis,
-        this.props.data,
-        this.props.timeInfo,
-      );
-    }
-  };
-
-  drawLine = () => {
-    if (!document.hidden) {
-      let hoverTime: moment.Moment;
-      if (this.props.hoverState) {
-        const { currentlyHovering, hoverChart } = this.props.hoverState;
-        // Don't draw the linked guideline on the hovered chart, NVD3 does that for us.
-        if (currentlyHovering && hoverChart !== this.props.title) {
-          hoverTime = this.props.hoverState.hoverTime;
-        }
-      }
-
-      const axis = this.axis(this.props);
-      ConfigureLinkedGuideline(
-        this.chart,
-        this.graphEl.current,
-        axis,
-        this.props.data,
-        hoverTime,
-      );
-    }
-  };
-
-  constructor(props: any) {
-    super(props);
-    this.state = {
-      lastData: null,
-      lastTimeInfo: null,
-    };
-  }
-
-  componentDidMount() {
-    this.initChart();
-    this.drawChart();
-    this.drawLine();
-    // NOTE: This might not work on Android:
-    // http://caniuse.com/#feat=pagevisibility
-    // TODO (maxlang): Check if this element is visible based on scroll state.
-    document.addEventListener("visibilitychange", this.drawChart);
-  }
-
-  componentWillUnmount() {
-    document.removeEventListener("visibilitychange", this.drawChart);
-  }
-
-  componentDidUpdate() {
-    if (
-      this.props.data !== this.state.lastData ||
-      this.props.timeInfo !== this.state.lastTimeInfo
-    ) {
-      this.drawChart();
-      this.setState({
-        lastData: this.props.data,
-        lastTimeInfo: this.props.timeInfo,
-      });
-    }
-    this.drawLine();
-  }
-
-  render() {
-    const { title, subtitle, tooltip, data } = this.props;
-
-    let hoverProps: Partial<React.SVGProps<SVGSVGElement>> = {};
-    if (this.props.hoverOn) {
-      hoverProps = {
-        onMouseMove: this.mouseMove,
-        onMouseLeave: this.mouseLeave,
-      };
-    }
-
-    return (
-      <Visualization
-        title={title}
-        subtitle={subtitle}
-        tooltip={tooltip}
-        loading={!data}
-      >
-        <div className="linegraph">
-          <svg
-            className="graph linked-guideline"
-            ref={this.graphEl}
-            {...hoverProps}
-          />
-        </div>
-      </Visualization>
-    );
-  }
-}
+export type LineGraphProps = OwnProps & WithTimezoneProps;
 
 // touPlot formats our timeseries data into the format
 // uPlot expects which is a 2-dimensional array where the
@@ -352,7 +114,7 @@ function touPlot(
     });
   });
 
-  return [xValuesWithGaps.map(ts => NanoToMilli(ts)), ...yValuesComplete];
+  return [xValuesWithGaps.map(ts => util.NanoToMilli(ts)), ...yValuesComplete];
 }
 
 // TODO (koorosh): the same logic can be achieved with uPlot's series.gaps API starting from 1.6.15 version.
@@ -399,12 +161,18 @@ export function fillGaps(
 // and store its ref in a global variable.
 // Once we receive updates to props, we push new data to the
 // uPlot object.
-export class LineGraph extends React.Component<LineGraphProps, {}> {
+// InternalLinegraph is exported for testing.
+export class InternalLineGraph extends React.Component<LineGraphProps, {}> {
   constructor(props: LineGraphProps) {
     super(props);
 
     this.setNewTimeRange = this.setNewTimeRange.bind(this);
   }
+
+  static defaultProps: Partial<LineGraphProps> = {
+    // Marking a graph as not being KV-related is opt-in.
+    isKvGraph: true,
+  };
 
   // axis is copied from the nvd3 LineGraph component above
   axis = createSelector(
@@ -415,12 +183,14 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
         Axis,
       );
       if (axes.length === 0) {
+        // eslint-disable-next-line no-console
         console.warn(
           "LineGraph requires the specification of at least one axis.",
         );
         return null;
       }
       if (axes.length > 1) {
+        // eslint-disable-next-line no-console
         console.warn(
           "LineGraph currently only supports a single axis; ignoring additional axes.",
         );
@@ -433,46 +203,42 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   metrics = createSelector(
     (props: { children?: React.ReactNode }) => props.children,
     children => {
-      return findChildrenOfType(children as any, Metric) as React.ReactElement<
-        MetricProps
-      >[];
+      return findChildrenOfType(
+        children as any,
+        Metric,
+      ) as React.ReactElement<MetricProps>[];
     },
   );
 
-  // setNewTimeRange uses code from the TimeScaleDropdown component
-  // to set new start/end ranges in the query params and force a
+  // setNewTimeRange forces a
   // reload of the rest of the dashboard at new ranges via the props
-  // `setTimeRange` and `setTimeScale`.
+  // `setMetricsFixedWindow` and `setTimeScale`.
   // TODO(davidh): centralize management of query params for time range
   // TODO(davidh): figure out why the timescale doesn't get more granular
   // automatically when a narrower time frame is selected.
   setNewTimeRange(startMillis: number, endMillis: number) {
     if (startMillis === endMillis) return;
-    const start = MilliToSeconds(startMillis);
-    const end = MilliToSeconds(endMillis);
+    const start = util.MilliToSeconds(startMillis);
+    const end = util.MilliToSeconds(endMillis);
     const newTimeWindow: TimeWindow = {
       start: moment.unix(start),
       end: moment.unix(end),
     };
-    let newTimeScale = findClosestTimeScale(end - start, start);
+    const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
+    let newTimeScale: TimeScale = {
+      ...findClosestTimeScale(defaultTimeScaleOptions, seconds),
+      key: "Custom",
+      windowSize: moment.duration(moment.unix(end).diff(moment.unix(start))),
+      fixedWindowEnd: moment.unix(end),
+    };
     if (this.props.adjustTimeScaleOnChange) {
       newTimeScale = this.props.adjustTimeScaleOnChange(
         newTimeScale,
         newTimeWindow,
       );
     }
-    this.props.setTimeRange(newTimeWindow);
+    this.props.setMetricsFixedWindow(newTimeWindow);
     this.props.setTimeScale(newTimeScale);
-    const { pathname, search } = this.props.history.location;
-    const urlParams = new URLSearchParams(search);
-
-    urlParams.set("start", moment.unix(start).format("X"));
-    urlParams.set("end", moment.unix(end).format("X"));
-
-    this.props.history.push({
-      pathname,
-      search: urlParams.toString(),
-    });
   }
 
   u: uPlot;
@@ -494,10 +260,39 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   // to a closure that holds a reference to this value.
   xAxisDomain: AxisDomain;
 
+  newTimeInfo(
+    newTimeInfo: QueryTimeInfo,
+    prevTimeInfo: QueryTimeInfo,
+  ): boolean {
+    if (newTimeInfo.start.compare(prevTimeInfo.start) !== 0) {
+      return true;
+    }
+    if (newTimeInfo.end.compare(prevTimeInfo.end) !== 0) {
+      return true;
+    }
+    if (newTimeInfo.sampleDuration.compare(prevTimeInfo.sampleDuration) !== 0) {
+      return true;
+    }
+
+    return false;
+  }
+
+  hasDataPoints = (data: TSResponse): boolean => {
+    let hasData = false;
+    data?.results?.map(result => {
+      if (result?.datapoints?.length > 0) {
+        hasData = true;
+      }
+    });
+    return hasData;
+  };
+
   componentDidUpdate(prevProps: Readonly<LineGraphProps>) {
     if (
       !this.props.data?.results ||
-      (prevProps.data === this.props.data && this.u !== undefined)
+      (prevProps.data === this.props.data &&
+        this.u !== undefined &&
+        !this.newTimeInfo(this.props.timeInfo, prevProps.timeInfo))
     ) {
       return;
     }
@@ -514,8 +309,15 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     // and are called when recomputing certain axis and
     // series options. This lets us use updated domains
     // when redrawing the uPlot chart on data change.
-    this.yAxisDomain = calculateYAxisDomain(axis.props.units, data);
-    this.xAxisDomain = calculateXAxisDomain(this.props.timeInfo);
+    const resultDatapoints = flatMap(fData, result =>
+      result.values.map(dp => dp.value),
+    );
+    this.yAxisDomain = calculateYAxisDomain(axis.props.units, resultDatapoints);
+    this.xAxisDomain = calculateXAxisDomain(
+      util.NanoToMilli(this.props.timeInfo.start.toNumber()),
+      util.NanoToMilli(this.props.timeInfo.end.toNumber()),
+      this.props.timezone,
+    );
 
     const prevKeys =
       prevProps.data && prevProps.data.results
@@ -568,13 +370,72 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   }
 
   render() {
-    const { title, subtitle, tooltip, data, preCalcGraphSize } = this.props;
+    const {
+      title,
+      subtitle,
+      tooltip,
+      data,
+      tenantSource,
+      preCalcGraphSize,
+      showMetricsInTooltip,
+    } = this.props;
+    let tt = tooltip;
+    const addLines: React.ReactNode = tooltip ? (
+      <>
+        <br />
+        <br />
+      </>
+    ) : null;
+    // Extend tooltip to include metrics names
+    if (showMetricsInTooltip) {
+      const metrics = filter(data?.results, canShowMetric);
+      if (metrics.length === 1) {
+        tt = (
+          <>
+            {tt}
+            {addLines}
+            Metric: {metrics[0].query.name}
+          </>
+        );
+      } else if (metrics.length > 1) {
+        const metricNames = unique(metrics.map(m => m.query.name));
+        tt = (
+          <>
+            {tt}
+            {addLines}
+            Metrics:
+            <ul>
+              {metricNames.map(m => (
+                <li key={m}>{m}</li>
+              ))}
+            </ul>
+          </>
+        );
+      }
+    }
 
+    if (!this.hasDataPoints(data) && isSecondaryTenant(tenantSource)) {
+      return (
+        <div className="linegraph-empty">
+          <div className="header-empty">
+            <Tooltip placement="bottom" title={tooltip}>
+              <span className="title-empty">{title}</span>
+            </Tooltip>
+          </div>
+          <div className="body-empty">
+            <MonitoringIcon />
+            <span className="body-text-empty">
+              {"Metric is not currently available for this tenant."}
+            </span>
+          </div>
+        </div>
+      );
+    }
     return (
       <Visualization
         title={title}
         subtitle={subtitle}
-        tooltip={tooltip}
+        tooltip={tt}
         loading={!data}
         preCalcGraphSize={preCalcGraphSize}
       >
@@ -585,3 +446,5 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     );
   }
 }
+
+export default WithTimezone<OwnProps>(InternalLineGraph);

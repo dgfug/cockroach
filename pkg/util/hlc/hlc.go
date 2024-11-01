@@ -1,24 +1,24 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package hlc
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // TODO(Tobias): Figure out if it would make sense to save some
@@ -35,21 +35,24 @@ import (
 // clock.
 // The data structure is thread safe and thus can safely
 // be shared by multiple goroutines.
-//
-// See NewClock for details.
 type Clock struct {
-	physicalClock func() int64
+	// wallClock is used to read the current clock.
+	wallClock WallClock
 
-	// The maximal offset of the HLC's wall time from the underlying physical
-	// clock. A well-chosen value is large enough to ignore a reasonable amount
-	// of clock skew but will prevent ill-configured nodes from dramatically
-	// skewing the wall time of the clock into the future.
+	// maxOffset is the maximal clock skew between any two nodes in the cluster,
+	// as promised by the operator. See MaxOffset().
 	//
-	// RPC heartbeats compare detected clock skews against this value to protect
-	// data consistency.
-	//
-	// TODO(tamird): make this dynamic in the distant future.
+	// TODO(kv): make this dynamic in the distant future, see
+	// https://github.com/cockroachdb/cockroach/issues/75564
 	maxOffset time.Duration
+
+	// toleratedOffset is the tolerated clock skew with other cluster nodes,
+	// beyond which the node will self-terminate. See ToleratedOffset().
+	toleratedOffset time.Duration
+
+	// logger is used when forward or backwards jumps are
+	// detected.
+	logger Logger
 
 	// lastPhysicalTime reports the last measured physical time. This
 	// is used to detect clock jumps. The field is accessed atomically.
@@ -88,41 +91,45 @@ type Clock struct {
 	}
 }
 
-// ManualClock is a convenience type to facilitate
-// creating a hybrid logical clock whose physical clock
-// is manually controlled. ManualClock is thread safe.
-type ManualClock struct {
-	nanos int64
+// WallClock models a physical clock. This is a sub-interface of
+// timeutil.TimeSource.
+type WallClock interface {
+	// Now returns the current time.
+	Now() time.Time
 }
 
-// NewManualClock returns a new instance, initialized with
-// specified timestamp.
-func NewManualClock(nanos int64) *ManualClock {
-	if nanos == 0 {
-		panic("zero clock is forbidden")
-	}
-	return &ManualClock{nanos: nanos}
+// Logger is used by Clock when clock anamolies are detected.
+type Logger interface {
+	// Warningf is used when the Clock detects non-fatal
+	// conditions.
+	Warningf(ctx context.Context, format string, args ...interface{})
+	// Fatalf is used when forwardClockJump detection is enabled
+	// and the Clock detects a fatal forward clock jump.
+	//
+	// Production implementations of Fatalf should halt the
+	// process in manner appropriate to the caller.
+	Fatalf(ctx context.Context, format string, args ...interface{})
 }
 
-// UnixNano returns the underlying manual clock's timestamp.
-func (m *ManualClock) UnixNano() int64 {
-	return atomic.LoadInt64(&m.nanos)
-}
+// panicFataler is a Logger that panics when Fatal is called.
+type panicLogger struct{}
 
-// Increment atomically increments the manual clock's timestamp.
-func (m *ManualClock) Increment(incr int64) {
-	atomic.AddInt64(&m.nanos, incr)
-}
+var PanicLogger Logger = &panicLogger{}
 
-// Set atomically sets the manual clock's timestamp.
-func (m *ManualClock) Set(nanos int64) {
-	atomic.StoreInt64(&m.nanos, nanos)
+func (*panicLogger) Warningf(context.Context, string, ...interface{}) {}
+func (*panicLogger) Fatalf(_ context.Context, format string, args ...interface{}) {
+	panic(fmt.Sprintf(format, args...))
 }
 
 // HybridManualClock is a convenience type to facilitate
 // creating a hybrid logical clock whose physical clock
 // ticks with the wall clock, but that can be moved arbitrarily
-// into the future or paused. HybridManualClock is thread safe.
+// into the future or paused.
+//
+// ManualClock implements WallClock, so it can be used with
+// NewClock(NewHybridManualClock(),...).
+//
+// HybridManualClock is thread safe.
 type HybridManualClock struct {
 	mu struct {
 		syncutil.RWMutex
@@ -141,6 +148,13 @@ func NewHybridManualClock() *HybridManualClock {
 	return &HybridManualClock{}
 }
 
+var _ WallClock = &HybridManualClock{}
+
+// Now implements the WallClock interface.
+func (m *HybridManualClock) Now() time.Time {
+	return timeutil.Unix(0, m.UnixNano())
+}
+
 // UnixNano returns the underlying hybrid manual clock's timestamp.
 func (m *HybridManualClock) UnixNano() int64 {
 	m.mu.RLock()
@@ -150,7 +164,7 @@ func (m *HybridManualClock) UnixNano() int64 {
 	if nanosAtPause > 0 {
 		return nanos + nanosAtPause
 	}
-	return nanos + UnixNano()
+	return nanos + timeutil.Now().UnixNano()
 }
 
 // Increment increments the hybrid manual clock's timestamp.
@@ -160,11 +174,27 @@ func (m *HybridManualClock) Increment(nanos int64) {
 	m.mu.Unlock()
 }
 
+// Forward sets the wall time to the supplied timestamp if this moves the clock
+// forward in time. Note that this takes an absolute timestamp (i.e. a wall
+// clock timestamp), not a delta.
+func (m *HybridManualClock) Forward(tsNanos int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := timeutil.Now().UnixNano()
+	if tsNanos < now {
+		return
+	}
+	aheadNanos := tsNanos - now
+	if aheadNanos > m.mu.nanos {
+		m.mu.nanos = aheadNanos
+	}
+}
+
 // Pause pauses the hybrid manual clock; the passage of time no longer causes
 // the clock to tick. Increment can still be used, though.
 func (m *HybridManualClock) Pause() {
 	m.mu.Lock()
-	m.mu.nanosAtPause = UnixNano()
+	m.mu.nanosAtPause = timeutil.Now().UnixNano()
 	m.mu.Unlock()
 }
 
@@ -176,26 +206,49 @@ func (m *HybridManualClock) Resume() {
 	m.mu.Unlock()
 }
 
-// UnixNano returns the local machine's physical nanosecond
-// unix epoch timestamp as a convenience to create a HLC via
-// c := hlc.NewClock(hlc.UnixNano, ...).
-func UnixNano() int64 {
-	return timeutil.Now().UnixNano()
+// NewClockWithSystemTimeSource creates a Clock that reads the system time. This
+// is equivalent to NewClock(timeutil.SystemTimeSource, maxOffset, toleratedOffset).
+func NewClockWithSystemTimeSource(maxOffset, toleratedOffset time.Duration, logger Logger) *Clock {
+	return NewClock(timeutil.DefaultTimeSource{}, maxOffset, toleratedOffset, logger)
 }
 
-// NewClock creates a new hybrid logical clock associated with the given
-// physical clock. The logical ts is initialized to zero.
-//
-// The physical clock is typically given by the wall time of the local machine
-// in unix epoch nanoseconds, using hlc.UnixNano. This is not a requirement.
-//
-// A value of 0 for maxOffset means that clock skew checking, if performed on
-// this clock by RemoteClockMonitor, is disabled.
-func NewClock(physicalClock func() int64, maxOffset time.Duration) *Clock {
-	return &Clock{
-		physicalClock: physicalClock,
-		maxOffset:     maxOffset,
+// NewClockForTesting creates a new Clock for tests that don't care about clock
+// offsets, disabling offset checks. A nil wallClock uses the system clock source.
+func NewClockForTesting(wallClock WallClock) *Clock {
+	if wallClock == nil {
+		wallClock = timeutil.DefaultTimeSource{}
 	}
+	return NewClock(wallClock, 0 /* maxOffset */, 0 /* toleratedOffset */, PanicLogger)
+}
+
+// NewClock returns a Clock configured to use a specified time source. Use
+// NewClockWithSystemTimeSource to use the system clock.
+//
+// maxOffset specifies the max clock offset between cluster nodes, used for
+// linearizability and lease guarantees. toleratedOffset specifies the tolerated
+// clock offset between cluster nodes as measured by RPC heartbeats, terminating
+// the node via RemoteClockMonitor if violated. A value of 0 will disable the
+// corresponding check. See Clock.MaxOffset() and Clock.ToleratedOffset() for
+// details.
+func NewClock(wallClock WallClock, maxOffset, toleratedOffset time.Duration, logger Logger) *Clock {
+	return &Clock{
+		wallClock:       wallClock,
+		maxOffset:       maxOffset,
+		toleratedOffset: toleratedOffset,
+		logger:          logger,
+	}
+}
+
+// WallClock returns the c's time source.
+func (c *Clock) WallClock() WallClock {
+	return c.wallClock
+}
+
+// UnixNano returns the local machine's physical nanosecond
+// unix epoch timestamp as a convenience to create a HLC via
+// c := hlc.NewClockWithSystemTimeSource( ... /* maxOffset */).
+func UnixNano() int64 {
+	return timeutil.Now().UnixNano()
 }
 
 // toleratedForwardClockJump is the tolerated forward jump. Jumps greater
@@ -233,7 +286,9 @@ func (c *Clock) StartMonitoringForwardClockJumps(
 		return errors.New("clock jumps are already being monitored")
 	}
 
+	ctx, sp := tracing.ForkSpan(ctx, "clock monitor")
 	go func() {
+		defer sp.Finish()
 		// Create a ticker object which can be used in selects.
 		// This ticker is turned on / off based on forwardClockJumpCheckEnabledCh
 		ticker := tickerFn(time.Hour)
@@ -270,18 +325,39 @@ func (c *Clock) StartMonitoringForwardClockJumps(
 	return nil
 }
 
-// MaxOffset returns the maximal clock offset to any node in the cluster.
+// MaxOffset returns the maximal clock offset to any node in the cluster as
+// specified by the operator. This is used by the cluster to safely hand off
+// leases and enforce single-key linearizability.
 //
-// A value of 0 means offset checking is disabled.
+// A known consequence of clocks drifting apart by more than MaxOffset is the
+// possibility of stale reads. At an architectural level CockroachDB *should*
+// still be serializable in this case, but this has not been conclusively
+// verified and should be taken as conjecture.
 func (c *Clock) MaxOffset() time.Duration {
 	return c.maxOffset
+}
+
+// ToleratedOffset returns the tolerated clock offset with other nodes in the
+// cluster before self-terminating, as measured via RPC heartbeats. A
+// ToleratedOffset of zero disables this mechanism, i.e. behaves like an
+// infinite tolerated offset.
+//
+// Typically, ToleratedOffset is a slightly smaller than MaxOffset (to avoid
+// correctness issues should the actual offset regress further) but it can be
+// configured to be more lenient, instead taking the risk of a correctness
+// issues over a period of unavailability. The latter is appealing in particular
+// when clocks are very tightly synchronized and thus the MaxOffset is
+// configured to a very small value for performance, where RPC latency spikes
+// may cause spurious restarts.
+func (c *Clock) ToleratedOffset() time.Duration {
+	return c.toleratedOffset
 }
 
 // getPhysicalClockAndCheck reads the physical time as nanos since epoch. It
 // also checks for backwards and forwards jumps, as configured.
 func (c *Clock) getPhysicalClockAndCheck(ctx context.Context) int64 {
 	oldTime := atomic.LoadInt64(&c.lastPhysicalTime)
-	newTime := c.physicalClock()
+	newTime := c.wallClock.Now().UnixNano()
 	lastPhysTime := oldTime
 	// Try to update c.lastPhysicalTime. When multiple updaters race, we want the
 	// highest clock reading to win, so keep retrying while we interleave with
@@ -314,17 +390,17 @@ func (c *Clock) checkPhysicalClock(ctx context.Context, oldTime, newTime int64) 
 	interval := oldTime - newTime
 	if interval > int64(c.maxOffset/10) {
 		atomic.AddInt32(&c.monotonicityErrorsCount, 1)
-		log.Warningf(ctx, "backward time jump detected (%f seconds)", float64(-interval)/1e9)
+		c.logger.Warningf(ctx, "backward time jump detected (%f seconds)", float64(-interval)/1e9)
 	}
 
 	if atomic.LoadInt32(&c.forwardClockJumpCheckEnabled) != 0 {
 		toleratedForwardClockJump := c.toleratedForwardClockJump()
 		if int64(toleratedForwardClockJump) <= -interval {
-			log.Fatalf(
+			c.logger.Fatalf(
 				ctx,
 				"detected forward time jump of %f seconds is not allowed with tolerance of %f seconds",
-				log.Safe(float64(-interval)/1e9),
-				log.Safe(float64(toleratedForwardClockJump)/1e9),
+				redact.Safe(float64(-interval)/1e9),
+				redact.Safe(float64(toleratedForwardClockJump)/1e9),
 			)
 		}
 	}
@@ -365,11 +441,11 @@ func (c *Clock) NowAsClockTimestamp() ClockTimestamp {
 func (c *Clock) enforceWallTimeWithinBoundLocked() {
 	// WallTime should not cross the upper bound (if WallTimeUpperBound is set)
 	if c.mu.wallTimeUpperBound != 0 && c.mu.timestamp.WallTime > c.mu.wallTimeUpperBound {
-		log.Fatalf(
+		c.logger.Fatalf(
 			context.TODO(),
 			"wall time %d is not allowed to be greater than upper bound of %d.",
-			log.Safe(c.mu.timestamp.WallTime),
-			log.Safe(c.mu.wallTimeUpperBound),
+			redact.Safe(c.mu.timestamp.WallTime),
+			redact.Safe(c.mu.wallTimeUpperBound),
 		)
 	}
 }
@@ -380,13 +456,11 @@ func (c *Clock) enforceWallTimeWithinBoundLocked() {
 // higher clock signals received through Update(). If you want to take them into
 // consideration, use c.Now().GoTime().
 func (c *Clock) PhysicalNow() int64 {
-	return c.physicalClock()
+	return c.wallClock.Now().UnixNano()
 }
 
 // PhysicalTime returns a time.Time struct using the local wall time.
-func (c *Clock) PhysicalTime() time.Time {
-	return timeutil.Unix(0, c.PhysicalNow())
-}
+func (c *Clock) PhysicalTime() time.Time { return c.wallClock.Now() }
 
 // Update takes a hybrid timestamp, usually originating from an event
 // received from another member of a distributed system. The clock is
@@ -558,4 +632,64 @@ func (c *Clock) SleepUntil(ctx context.Context, t Timestamp) error {
 			}
 		}
 	}
+}
+
+// DecimalToHLC performs the conversion from an inputted DECIMAL datum for an
+// AS OF SYSTEM TIME query to an HLC timestamp.
+func DecimalToHLC(d *apd.Decimal) (Timestamp, error) {
+	if d.Negative {
+		return Timestamp{}, pgerror.Newf(pgcode.Syntax, "cannot be negative")
+	}
+	var integral, fractional apd.Decimal
+	d.Modf(&integral, &fractional)
+	timestamp, err := integral.Int64()
+	if err != nil {
+		return Timestamp{}, pgerror.Wrapf(err, pgcode.Syntax, "converting timestamp to integer") // should never happen
+	}
+	if fractional.IsZero() {
+		// there is no logical portion to this clock
+		return Timestamp{WallTime: timestamp}, nil
+	}
+
+	var logical apd.Decimal
+	multiplier := apd.New(1, 10)
+	condition, err := apd.BaseContext.Mul(&logical, &fractional, multiplier)
+	if err != nil {
+		return Timestamp{}, pgerror.Wrapf(err, pgcode.Syntax, "determining value of logical clock")
+	}
+	if _, err := condition.GoError(apd.DefaultTraps); err != nil {
+		return Timestamp{}, pgerror.Wrapf(err, pgcode.Syntax, "determining value of logical clock")
+	}
+
+	counter, err := logical.Int64()
+	if err != nil {
+		return Timestamp{}, pgerror.Newf(pgcode.Syntax, "logical part has too many digits")
+	}
+	if counter > 1<<31 {
+		return Timestamp{}, pgerror.Newf(pgcode.Syntax, "logical clock too large: %d", counter)
+	}
+	return Timestamp{
+		WallTime: timestamp,
+		Logical:  int32(counter),
+	}, nil
+}
+
+// ParseHLC parses a string representation of an `hlc.Timestamp`.
+// This differs from hlc.ParseTimestamp in that it parses the decimal
+// serialization of an hlc timestamp as opposed to the string serialization
+// performed by hlc.Timestamp.String().
+//
+// This function is used to parse:
+//
+//	1580361670629466905.0000000001
+//
+// hlc.ParseTimestamp() would be used to parse:
+//
+//	1580361670.629466905,1
+func ParseHLC(s string) (Timestamp, error) {
+	dec, _, err := apd.NewFromString(s)
+	if err != nil {
+		return Timestamp{}, err
+	}
+	return DecimalToHLC(dec)
 }

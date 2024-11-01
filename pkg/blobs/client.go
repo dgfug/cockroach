@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package blobs
 
@@ -14,10 +9,12 @@ import (
 	"context"
 	"io"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/metadata"
 )
@@ -29,7 +26,7 @@ type BlobClient interface {
 	// ReadFile fetches the named payload from the requested node,
 	// and stores it in memory. It then returns an io.ReadCloser to
 	// read the contents.
-	ReadFile(ctx context.Context, file string, offset int64) (io.ReadCloser, int64, error)
+	ReadFile(ctx context.Context, file string, offset int64) (ioctx.ReadCloserCtx, int64, error)
 
 	// Writer opens the named payload on the requested node for writing.
 	Writer(ctx context.Context, file string) (io.WriteCloser, error)
@@ -60,7 +57,7 @@ func newRemoteClient(blobClient blobspb.BlobClient) BlobClient {
 
 func (c *remoteClient) ReadFile(
 	ctx context.Context, file string, offset int64,
-) (io.ReadCloser, int64, error) {
+) (ioctx.ReadCloserCtx, int64, error) {
 	// Check that file exists before reading from it and get size to return.
 	st, err := c.Stat(ctx, file)
 	if err != nil {
@@ -155,7 +152,7 @@ func NewLocalClient(externalIODir string) (BlobClient, error) {
 
 func (c *localClient) ReadFile(
 	ctx context.Context, file string, offset int64,
-) (io.ReadCloser, int64, error) {
+) (ioctx.ReadCloserCtx, int64, error) {
 	return c.localStorage.ReadFile(file, offset)
 }
 
@@ -176,19 +173,36 @@ func (c *localClient) Stat(ctx context.Context, file string) (*blobspb.BlobStat,
 }
 
 // BlobClientFactory creates a blob client based on the nodeID we are dialing.
-type BlobClientFactory func(ctx context.Context, dialing roachpb.NodeID) (BlobClient, error)
+type BlobClientFactory func(ctx context.Context, dialTarget roachpb.NodeID) (BlobClient, error)
 
-// NewBlobClientFactory returns a BlobClientFactory
+// NewBlobClientFactory returns a BlobClientFactory.
+//
+// externalIODIr is used to construct a local client when the local
+// node is being targetted and the fast path is allowed.
+//
+// allowLocalFastpath indicates whether the client should create a
+// local client (which doesn't go through the network). The fast path
+// skips client capability checking so should be used with care.
 func NewBlobClientFactory(
-	localNodeID roachpb.NodeID, dialer *nodedialer.Dialer, externalIODir string,
+	localNodeIDContainer *base.SQLIDContainer,
+	dialer *nodedialer.Dialer,
+	externalIODir string,
+	allowLocalFastpath bool,
 ) BlobClientFactory {
-	return func(ctx context.Context, dialing roachpb.NodeID) (BlobClient, error) {
-		if dialing == 0 || localNodeID == dialing {
+	return func(ctx context.Context, dialTarget roachpb.NodeID) (BlobClient, error) {
+		localNodeID, ok := localNodeIDContainer.OptionalNodeID()
+		if ok && dialTarget == 0 {
+			dialTarget = localNodeID
+		} else if dialTarget == 0 {
+			return nil, errors.New("node ID 0 not supported")
+		}
+
+		if localNodeID == dialTarget && allowLocalFastpath {
 			return NewLocalClient(externalIODir)
 		}
-		conn, err := dialer.Dial(ctx, dialing, rpc.DefaultClass)
+		conn, err := dialer.Dial(ctx, dialTarget, rpc.DefaultClass)
 		if err != nil {
-			return nil, errors.Wrapf(err, "connecting to node %d", dialing)
+			return nil, errors.Wrapf(err, "connecting to node %d", dialTarget)
 		}
 		return newRemoteClient(blobspb.NewBlobClient(conn)), nil
 	}

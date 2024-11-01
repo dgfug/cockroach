@@ -1,20 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,12 +23,17 @@ import (
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.RecomputeStats, declareKeysRecomputeStats, RecomputeStats)
+	RegisterReadOnlyCommand(kvpb.RecomputeStats, declareKeysRecomputeStats, RecomputeStats)
 }
 
 func declareKeysRecomputeStats(
-	rs ImmutableRangeState, _ roachpb.Header, _ roachpb.Request, latchSpans, _ *spanset.SpanSet,
-) {
+	rs ImmutableRangeState,
+	_ *kvpb.Header,
+	_ kvpb.Request,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
+	_ time.Duration,
+) error {
 	// We don't declare any user key in the range. This is OK since all we're doing is computing a
 	// stats delta, and applying this delta commutes with other operations on the same key space.
 	//
@@ -48,27 +51,31 @@ func declareKeysRecomputeStats(
 	rdKey := keys.RangeDescriptorKey(rs.GetStartKey())
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: rdKey})
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(rdKey, uuid.Nil)})
+	// Disable the assertions which check that all reads were previously declared.
+	latchSpans.DisableUndeclaredAccessAssertions()
+	return nil
 }
+
+// RecomputeStatsMismatchError indicates that the start key provided in the
+// request arguments doesn't match the start key of the range descriptor. This
+// can happen when a concurrent merge subsumed this range into another one.
+var RecomputeStatsMismatchError = errors.New("descriptor mismatch; range likely merged")
 
 // RecomputeStats recomputes the MVCCStats stored for this range and adjust them accordingly,
 // returning the MVCCStats delta obtained in the process.
 func RecomputeStats(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
 	desc := cArgs.EvalCtx.Desc()
-	args := cArgs.Args.(*roachpb.RecomputeStatsRequest)
+	args := cArgs.Args.(*kvpb.RecomputeStatsRequest)
 	if !desc.StartKey.AsRawKey().Equal(args.Key) {
-		return result.Result{}, errors.New("descriptor mismatch; range likely merged")
+		return result.Result{}, RecomputeStatsMismatchError
 	}
 	dryRun := args.DryRun
 
 	args = nil // avoid accidental use below
 
-	// Disable the assertions which check that all reads were previously declared.
-	// See the comment in `declareKeysRecomputeStats` for details on this.
-	reader = spanset.DisableReaderAssertions(reader)
-
-	actualMS, err := rditer.ComputeStatsForRange(desc, reader, cArgs.Header.Timestamp.WallTime)
+	actualMS, err := rditer.ComputeStatsForRange(ctx, desc, reader, cArgs.Header.Timestamp.WallTime)
 	if err != nil {
 		return result.Result{}, err
 	}
@@ -90,6 +97,6 @@ func RecomputeStats(
 		cArgs.Stats.Add(delta)
 	}
 
-	resp.(*roachpb.RecomputeStatsResponse).AddedDelta = enginepb.MVCCStatsDelta(delta)
+	resp.(*kvpb.RecomputeStatsResponse).AddedDelta = enginepb.MVCCStatsDelta(delta)
 	return result.Result{}, nil
 }

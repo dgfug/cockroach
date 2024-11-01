@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package contention
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -19,11 +15,15 @@ import (
 
 	"github.com/biogo/store/llrb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -54,6 +54,11 @@ type Registry struct {
 	// nonSQLKeysMap is an LRU cache that keeps track of up to
 	// orderedKeyMapMaxSize non-SQL contended keys.
 	nonSQLKeysMap *nonSQLKeysMap
+
+	// eventStore stores the historical contention events and maps the
+	// transactions in the contention events to their corresponding transaction
+	// fingerprint ID.
+	eventStore *eventStore
 }
 
 var (
@@ -66,6 +71,8 @@ var (
 	// maxNumTxns specifies the maximum number of txns that caused contention
 	// events to keep track of.
 	maxNumTxns = 10
+
+	_ eventReader = &Registry{}
 )
 
 var orderedKeyMapCfg = cache.Config{
@@ -112,7 +119,7 @@ type indexMapValue struct {
 
 // newIndexMapValue creates a new indexMapValue for a contention event
 // initialized with that event's data.
-func newIndexMapValue(c roachpb.ContentionEvent) *indexMapValue {
+func newIndexMapValue(c kvpb.ContentionEvent) *indexMapValue {
 	txnCache := cache.NewUnorderedCache(txnCacheCfg)
 	txnCache.Add(c.TxnMeta.ID, uint64(1))
 	keyMap := cache.NewOrderedCache(orderedKeyMapCfg)
@@ -126,7 +133,7 @@ func newIndexMapValue(c roachpb.ContentionEvent) *indexMapValue {
 
 // addContentionEvent adds the given contention event to previously aggregated
 // contention data. It assumes that c.Key is a SQL key.
-func (v *indexMapValue) addContentionEvent(c roachpb.ContentionEvent) {
+func (v *indexMapValue) addContentionEvent(c kvpb.ContentionEvent) {
 	v.numContentionEvents++
 	v.cumulativeContentionTime += c.Duration
 	var numTimesThisTxnWasEncountered uint64
@@ -197,7 +204,7 @@ type nonSQLKeyMapValue struct {
 
 // newNonSQLKeyMapValue creates a new nonSQLKeyMapValue for a contention event
 // initialized with that event's data.
-func newNonSQLKeyMapValue(c roachpb.ContentionEvent) *nonSQLKeyMapValue {
+func newNonSQLKeyMapValue(c kvpb.ContentionEvent) *nonSQLKeyMapValue {
 	txnCache := cache.NewUnorderedCache(txnCacheCfg)
 	txnCache.Add(c.TxnMeta.ID, uint64(1))
 	return &nonSQLKeyMapValue{
@@ -209,7 +216,7 @@ func newNonSQLKeyMapValue(c roachpb.ContentionEvent) *nonSQLKeyMapValue {
 
 // addContentionEvent adds the given contention event to previously aggregated
 // contention data. It assumes that c.Key is a non-SQL key.
-func (v *nonSQLKeyMapValue) addContentionEvent(c roachpb.ContentionEvent) {
+func (v *nonSQLKeyMapValue) addContentionEvent(c kvpb.ContentionEvent) {
 	v.numContentionEvents++
 	v.cumulativeContentionTime += c.Duration
 	var numTimesThisTxnWasEncountered uint64
@@ -232,39 +239,64 @@ func newNonSQLKeysMap() *nonSQLKeysMap {
 }
 
 // NewRegistry creates a new Registry.
-func NewRegistry() *Registry {
+func NewRegistry(st *cluster.Settings, endpoint ResolverEndpoint, metrics *Metrics) *Registry {
 	return &Registry{
 		indexMap:      newIndexMap(),
 		nonSQLKeysMap: newNonSQLKeysMap(),
+		eventStore:    newEventStore(st, endpoint, timeutil.Now, metrics),
 	}
 }
 
+// Start starts the background goroutines for the Registry.
+func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) {
+	r.eventStore.start(ctx, stopper)
+}
+
 // AddContentionEvent adds a new ContentionEvent to the Registry.
-func (r *Registry) AddContentionEvent(c roachpb.ContentionEvent) {
+func (r *Registry) AddContentionEvent(event contentionpb.ExtendedContentionEvent) {
 	r.globalLock.Lock()
 	defer r.globalLock.Unlock()
-	// Remove the tenant ID prefix if there is any.
-	c.Key, _, _ = keys.DecodeTenantPrefix(c.Key)
-	_, rawTableID, rawIndexID, err := keys.DecodeTableIDIndexID(c.Key)
-	if err != nil {
-		// The key is not a valid SQL key, so we store it in a separate cache.
-		if v, ok := r.nonSQLKeysMap.Get(comparableKey(c.Key)); !ok {
-			// This is the first contention event seen for this key.
-			r.nonSQLKeysMap.Add(comparableKey(c.Key), newNonSQLKeyMapValue(c))
-		} else {
-			v.(*nonSQLKeyMapValue).addContentionEvent(c)
+	if event.ContentionType == contentionpb.ContentionType_LOCK_WAIT {
+		// (xinhaoz) We will need to change the indexMap structs if we want to surface
+		// non lock wait related contention to index contention surfaces.
+		c := event.BlockingEvent
+		// Remove the tenant ID prefix if there is any.
+		c.Key, _, _ = keys.DecodeTenantPrefix(c.Key)
+		_, rawTableID, rawIndexID, err := keys.DecodeTableIDIndexID(c.Key)
+		if err != nil {
+			// The key is not a valid SQL key, so we store it in a separate cache.
+			if v, ok := r.nonSQLKeysMap.Get(comparableKey(c.Key)); !ok {
+				// This is the first contention event seen for this key.
+				r.nonSQLKeysMap.Add(comparableKey(c.Key), newNonSQLKeyMapValue(c))
+			} else {
+				v.(*nonSQLKeyMapValue).addContentionEvent(c)
+			}
+			return
 		}
-		return
+		tableID := descpb.ID(rawTableID)
+		indexID := descpb.IndexID(rawIndexID)
+		if v, ok := r.indexMap.get(tableID, indexID); !ok {
+			// This is the first contention event seen for the given tableID/indexID
+			// pair.
+			r.indexMap.add(tableID, indexID, newIndexMapValue(c))
+		} else {
+			v.addContentionEvent(c)
+		}
+
 	}
-	tableID := descpb.ID(rawTableID)
-	indexID := descpb.IndexID(rawIndexID)
-	if v, ok := r.indexMap.get(tableID, indexID); !ok {
-		// This is the first contention event seen for the given tableID/indexID
-		// pair.
-		r.indexMap.add(tableID, indexID, newIndexMapValue(c))
-	} else {
-		v.addContentionEvent(c)
-	}
+
+	r.eventStore.addEvent(event)
+}
+
+// ForEachEvent implements the eventReader interface.
+func (r *Registry) ForEachEvent(op func(event *contentionpb.ExtendedContentionEvent) error) error {
+	return r.eventStore.ForEachEvent(op)
+}
+
+// FlushEventsForTest flushes contention events in the write-buffer into the in-memory
+// store.
+func (r *Registry) FlushEventsForTest(ctx context.Context) error {
+	return r.eventStore.flushAndResolve(ctx)
 }
 
 func serializeTxnCache(txnCache *cache.UnorderedCache) []contentionpb.SingleTxnContention {

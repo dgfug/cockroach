@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metric
 
@@ -26,11 +21,11 @@ func TestPrometheusRuleExporter(t *testing.T) {
 	rules, expectedYAMLText := getRulesAndExpectedYAML(t)
 	registry := NewRuleRegistry()
 	registry.AddRules(rules)
-	ruleExporter := NewPrometheusRuleExporter()
-	ruleExporter.ScrapeRegistry(ctx, registry)
-	yamlText, err := ruleExporter.PrintAsYAMLText()
+	ruleExporter := NewPrometheusRuleExporter(registry)
+	ruleExporter.ScrapeRegistry(ctx)
+	yaml, err := ruleExporter.PrintAsYAML()
 	require.NoError(t, err)
-	require.Equal(t, expectedYAMLText, yamlText)
+	require.Equal(t, expectedYAMLText, string(yaml))
 }
 
 func getRulesAndExpectedYAML(t *testing.T) (rules []Rule, expectedYAML string) {

@@ -1,28 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import Select, { components, OptionsType } from "react-select";
-import React from "react";
+import { Gear } from "@cockroachlabs/icons";
 import classNames from "classnames/bind";
-import styles from "./columnsSelector.module.scss";
+import React from "react";
+import Select, { components, OptionsType, ActionMeta } from "react-select";
+
 import { Button } from "../button";
 import {
   dropdown,
   dropdownContentWrapper,
   hidden,
 } from "../queryFilter/filterClasses";
-import { List } from "@cockroachlabs/icons";
-import {
-  DeselectOptionActionMeta,
-  SelectOptionActionMeta,
-} from "react-select/src/types";
+
+import styles from "./columnsSelector.module.scss";
 
 const cx = classNames.bind(styles);
 
@@ -36,6 +29,7 @@ export interface ColumnsSelectorProps {
   // options provides the list of available columns and their initial selection state
   options: SelectOption[];
   onSubmitColumns: (selectedColumns: string[]) => void;
+  size?: "default" | "small";
 }
 
 export interface ColumnsSelectorState {
@@ -70,7 +64,6 @@ const customStyles = {
   container: (provided: any) => ({
     ...provided,
     border: "none",
-    height: "fit-content",
   }),
   control: (provided: any) => ({
     ...provided,
@@ -81,7 +74,11 @@ const customStyles = {
     position: "relative",
     boxShadow: "none",
   }),
-  option: (provided: any, state: any) => ({
+  menuList: (provided: any) => ({
+    ...provided,
+    maxHeight: "310px",
+  }),
+  option: (provided: any, _state: any) => ({
     ...provided,
     backgroundColor: "white",
     color: "#475872",
@@ -122,10 +119,10 @@ export default class ColumnsSelector extends React.Component<
   }
   dropdownRef: React.RefObject<HTMLDivElement> = React.createRef();
 
-  componentDidMount() {
+  componentDidMount(): void {
     window.addEventListener("click", this.outsideClick, false);
   }
-  componentWillUnmount() {
+  componentWillUnmount(): void {
     window.removeEventListener("click", this.outsideClick, false);
   }
 
@@ -137,18 +134,20 @@ export default class ColumnsSelector extends React.Component<
   outsideClick = () => {
     this.setState({ hide: true });
   };
-  insideClick = (event: any) => {
+  insideClick: React.MouseEventHandler<HTMLDivElement> = event => {
     event.stopPropagation();
   };
 
   handleChange = (
     _selectedOptions: OptionsType<SelectOption>,
     // get actual selection of specific option and action type from "actionMeta"
-    actionMeta:
-      | SelectOptionActionMeta<SelectOption>
-      | DeselectOptionActionMeta<SelectOption>,
-  ) => {
-    const { option, action } = actionMeta;
+    actionMeta: ActionMeta<SelectOption>,
+  ): void => {
+    const { action } = actionMeta;
+    if (action !== "select-option" && action !== "deselect-option") {
+      return;
+    }
+    const option = actionMeta.option;
     const selectionState = new Map(this.state.selectionState);
     // true - if option was selected, false - otherwise
     const isSelectedOption = action === "select-option";
@@ -176,7 +175,7 @@ export default class ColumnsSelector extends React.Component<
     });
   };
 
-  handleSubmit = () => {
+  handleSubmit = (): void => {
     const { selectionState } = this.state;
     const selectedValues = this.props.options
       .filter(o => selectionState.get(o.value))
@@ -216,8 +215,9 @@ export default class ColumnsSelector extends React.Component<
     });
   };
 
-  render() {
+  render(): React.ReactElement {
     const { hide } = this.state;
+    const { size = "default" } = this.props;
     const dropdownArea = hide ? hidden : dropdown;
     const options = this.getOptions();
     const columnsSelected = options.filter(o => o.isSelected);
@@ -226,15 +226,16 @@ export default class ColumnsSelector extends React.Component<
       <div
         onClick={this.insideClick}
         ref={this.dropdownRef}
-        className={cx("float")}
+        className={cx("btn-area")}
       >
-        <Button type="secondary" size="small" onClick={this.toggleOpen}>
-          <List />
+        <Button type="secondary" size={size} onClick={this.toggleOpen}>
+          <Gear className={cx("icon")} />
+          Columns
         </Button>
         <div className={dropdownArea}>
           <div className={dropdownContentWrapper}>
             <div className={cx("label")}>Hide/show columns</div>
-            <Select
+            <Select<SelectOption, true>
               isMulti
               menuIsOpen={true}
               options={options}

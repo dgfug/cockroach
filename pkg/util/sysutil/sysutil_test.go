@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sysutil
 
 import (
+	"net"
 	"os/exec"
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExitStatus(t *testing.T) {
@@ -30,4 +27,13 @@ func TestExitStatus(t *testing.T) {
 	if status := ExitStatus(exitErr); status != 42 {
 		t.Fatalf("expected exit status 42, but got %d", status)
 	}
+}
+
+func TestIsAddrInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	_, err = net.Listen("tcp", ln.Addr().String())
+	require.True(t, IsAddrInUse(err))
 }

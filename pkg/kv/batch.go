@@ -1,18 +1,14 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -47,11 +43,11 @@ type Batch struct {
 	Results []Result
 	// The Header which will be used to send the resulting BatchRequest.
 	// To be modified directly.
-	Header roachpb.Header
+	Header kvpb.Header
 	// The AdmissionHeader which will be used when sending the resulting
 	// BatchRequest. To be modified directly.
-	AdmissionHeader roachpb.AdmissionHeader
-	reqs            []roachpb.RequestUnion
+	AdmissionHeader kvpb.AdmissionHeader
+	reqs            []kvpb.RequestUnion
 
 	// approxMutationReqBytes tracks the approximate size of keys and values in
 	// mutations added to this batch via Put, CPut, InitPut, Del, etc.
@@ -60,15 +56,35 @@ type Batch struct {
 	// operations renders the batch unusable.
 	raw bool
 	// Once received, the response from a successful batch.
-	response *roachpb.BatchResponse
+	response *kvpb.BatchResponse
 	// Once received, any error encountered sending the batch.
-	pErr *roachpb.Error
+	pErr *kvpb.Error
 
 	// We use pre-allocated buffers to avoid dynamic allocations for small batches.
 	resultsBuf    [8]Result
 	rowsBuf       []KeyValue
 	rowsStaticBuf [8]KeyValue
 	rowsStaticIdx int
+}
+
+// GValue is a generic value for use in generic code.
+type GValue interface {
+	[]byte | roachpb.Value
+}
+
+// BulkSource is a generator interface for efficiently adding lots of requests.
+type BulkSource[T GValue] interface {
+	// Len will be called to batch allocate resources, the iterator should return
+	// exactly Len KVs.
+	Len() int
+	// Iter will be called to retrieve KVs and add them to the Batch.
+	Iter() BulkSourceIterator[T]
+}
+
+// BulkSourceIterator is the iterator interface for bulk put operations.
+type BulkSourceIterator[T GValue] interface {
+	// Next returns the next KV, calling this more than Len() times is undefined.
+	Next() (roachpb.Key, T)
 }
 
 // ApproximateMutationBytes returns the approximate byte size of the mutations
@@ -78,15 +94,20 @@ func (b *Batch) ApproximateMutationBytes() int {
 	return b.approxMutationReqBytes
 }
 
+// Requests exposes the requests stashed in the batch thus far.
+func (b *Batch) Requests() []kvpb.RequestUnion {
+	return b.reqs
+}
+
 // RawResponse returns the BatchResponse which was the result of a successful
 // execution of the batch, and nil otherwise.
-func (b *Batch) RawResponse() *roachpb.BatchResponse {
+func (b *Batch) RawResponse() *kvpb.BatchResponse {
 	return b.response
 }
 
 // MustPErr returns the structured error resulting from a failed execution of
 // the batch, asserting that that error is non-nil.
-func (b *Batch) MustPErr() *roachpb.Error {
+func (b *Batch) MustPErr() *kvpb.Error {
 	if b.pErr == nil {
 		panic(errors.Errorf("expected non-nil pErr for batch %+v", b))
 	}
@@ -99,7 +120,7 @@ func (b *Batch) validate() error {
 	if err != nil {
 		// Set pErr just as sendAndFill does, so that higher layers can find it
 		// using MustPErr.
-		b.pErr = roachpb.NewError(err)
+		b.pErr = kvpb.NewError(err)
 	}
 	return err
 }
@@ -160,7 +181,7 @@ func (b *Batch) fillResults(ctx context.Context) {
 		for k := 0; k < result.calls; k++ {
 			args := b.reqs[offset+k].GetInner()
 
-			var reply roachpb.Response
+			var reply kvpb.Response
 			// It's possible that result.Err was populated early, for example
 			// when PutProto is called and the proto marshaling errored out.
 			// In that case, we don't want to mutate this result's error
@@ -173,7 +194,7 @@ func (b *Batch) fillResults(ctx context.Context) {
 					// this pass.
 					if b.response != nil && offset+k < len(b.response.Responses) {
 						reply = b.response.Responses[offset+k].GetInner()
-					} else if args.Method() != roachpb.EndTxn {
+					} else if args.Method() != kvpb.EndTxn {
 						// TODO(tschottdorf): EndTxn is special-cased here
 						// because it may be elided (r/o txns). Might prefer to
 						// simulate an EndTxn response instead; this effectively
@@ -186,41 +207,41 @@ func (b *Batch) fillResults(ctx context.Context) {
 			}
 
 			switch req := args.(type) {
-			case *roachpb.GetRequest:
+			case *kvpb.GetRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.Err == nil {
-					row.Value = reply.(*roachpb.GetResponse).Value
+					row.Value = reply.(*kvpb.GetResponse).Value
 				}
-			case *roachpb.PutRequest:
+			case *kvpb.PutRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.Err == nil {
 					row.Value = &req.Value
 				}
-			case *roachpb.ConditionalPutRequest:
+			case *kvpb.ConditionalPutRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.Err == nil {
 					row.Value = &req.Value
 				}
-			case *roachpb.InitPutRequest:
+			case *kvpb.InitPutRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.Err == nil {
 					row.Value = &req.Value
 				}
-			case *roachpb.IncrementRequest:
+			case *kvpb.IncrementRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.Err == nil {
-					t := reply.(*roachpb.IncrementResponse)
+					t := reply.(*kvpb.IncrementResponse)
 					row.Value = &roachpb.Value{}
 					row.Value.SetInt(t.NewValue)
 				}
-			case *roachpb.ScanRequest:
+			case *kvpb.ScanRequest:
 				if result.Err == nil {
-					t := reply.(*roachpb.ScanResponse)
+					t := reply.(*kvpb.ScanResponse)
 					result.Rows = make([]KeyValue, len(t.Rows))
 					for j := range t.Rows {
 						src := &t.Rows[j]
@@ -229,9 +250,9 @@ func (b *Batch) fillResults(ctx context.Context) {
 						dst.Value = &src.Value
 					}
 				}
-			case *roachpb.ReverseScanRequest:
+			case *kvpb.ReverseScanRequest:
 				if result.Err == nil {
-					t := reply.(*roachpb.ReverseScanResponse)
+					t := reply.(*kvpb.ReverseScanResponse)
 					result.Rows = make([]KeyValue, len(t.Rows))
 					for j := range t.Rows {
 						src := &t.Rows[j]
@@ -240,40 +261,46 @@ func (b *Batch) fillResults(ctx context.Context) {
 						dst.Value = &src.Value
 					}
 				}
-			case *roachpb.DeleteRequest:
-				row := &result.Rows[k]
-				row.Key = []byte(args.(*roachpb.DeleteRequest).Key)
-			case *roachpb.DeleteRangeRequest:
+			case *kvpb.DeleteRequest:
 				if result.Err == nil {
-					result.Keys = reply.(*roachpb.DeleteRangeResponse).Keys
+					resp := reply.(*kvpb.DeleteResponse)
+					if resp.FoundKey {
+						// Accumulate all keys that were deleted as part of a
+						// single Del() operation.
+						result.Keys = append(result.Keys, args.(*kvpb.DeleteRequest).Key)
+					}
+				}
+			case *kvpb.DeleteRangeRequest:
+				if result.Err == nil {
+					result.Keys = reply.(*kvpb.DeleteRangeResponse).Keys
 				}
 			// Nothing to do for all methods below as they do not generate
 			// any rows.
-			case *roachpb.EndTxnRequest:
-			case *roachpb.AdminMergeRequest:
-			case *roachpb.AdminSplitRequest:
-			case *roachpb.AdminUnsplitRequest:
-			case *roachpb.AdminTransferLeaseRequest:
-			case *roachpb.AdminChangeReplicasRequest:
-			case *roachpb.AdminRelocateRangeRequest:
-			case *roachpb.HeartbeatTxnRequest:
-			case *roachpb.GCRequest:
-			case *roachpb.LeaseInfoRequest:
-			case *roachpb.PushTxnRequest:
-			case *roachpb.QueryTxnRequest:
-			case *roachpb.QueryIntentRequest:
-			case *roachpb.ResolveIntentRequest:
-			case *roachpb.ResolveIntentRangeRequest:
-			case *roachpb.MergeRequest:
-			case *roachpb.TruncateLogRequest:
-			case *roachpb.RequestLeaseRequest:
-			case *roachpb.CheckConsistencyRequest:
-			case *roachpb.AdminScatterRequest:
-			case *roachpb.AddSSTableRequest:
-			case *roachpb.MigrateRequest:
-			case *roachpb.QueryResolvedTimestampRequest:
-			case *roachpb.BarrierRequest:
-			case *roachpb.ScanInterleavedIntentsRequest:
+			case *kvpb.EndTxnRequest:
+			case *kvpb.AdminMergeRequest:
+			case *kvpb.AdminSplitRequest:
+			case *kvpb.AdminUnsplitRequest:
+			case *kvpb.AdminTransferLeaseRequest:
+			case *kvpb.AdminChangeReplicasRequest:
+			case *kvpb.AdminRelocateRangeRequest:
+			case *kvpb.HeartbeatTxnRequest:
+			case *kvpb.GCRequest:
+			case *kvpb.LeaseInfoRequest:
+			case *kvpb.PushTxnRequest:
+			case *kvpb.QueryTxnRequest:
+			case *kvpb.QueryIntentRequest:
+			case *kvpb.ResolveIntentRequest:
+			case *kvpb.ResolveIntentRangeRequest:
+			case *kvpb.MergeRequest:
+			case *kvpb.TruncateLogRequest:
+			case *kvpb.RequestLeaseRequest:
+			case *kvpb.CheckConsistencyRequest:
+			case *kvpb.AdminScatterRequest:
+			case *kvpb.AddSSTableRequest:
+			case *kvpb.MigrateRequest:
+			case *kvpb.QueryResolvedTimestampRequest:
+			case *kvpb.BarrierRequest:
+			case *kvpb.LinkExternalSSTableRequest:
 			default:
 				if result.Err == nil {
 					result.Err = errors.Errorf("unsupported reply: %T for %T",
@@ -313,14 +340,14 @@ func (b *Batch) growReqs(n int) {
 		for newSize < len(b.reqs)+n {
 			newSize *= 2
 		}
-		newReqs := make([]roachpb.RequestUnion, len(b.reqs), newSize)
+		newReqs := make([]kvpb.RequestUnion, len(b.reqs), newSize)
 		copy(newReqs, b.reqs)
 		b.reqs = newReqs
 	}
 	b.reqs = b.reqs[:len(b.reqs)+n]
 }
 
-func (b *Batch) appendReqs(args ...roachpb.Request) {
+func (b *Batch) appendReqs(args ...kvpb.Request) {
 	n := len(b.reqs)
 	b.growReqs(len(args))
 	for i := range args {
@@ -331,16 +358,16 @@ func (b *Batch) appendReqs(args ...roachpb.Request) {
 // AddRawRequest adds the specified requests to the batch. No responses will
 // be allocated for them, and using any of the non-raw operations will result
 // in an error when running the batch.
-func (b *Batch) AddRawRequest(reqs ...roachpb.Request) {
+func (b *Batch) AddRawRequest(reqs ...kvpb.Request) {
 	b.raw = true
 	for _, args := range reqs {
 		numRows := 0
 		switch args.(type) {
-		case *roachpb.GetRequest,
-			*roachpb.PutRequest,
-			*roachpb.ConditionalPutRequest,
-			*roachpb.IncrementRequest,
-			*roachpb.DeleteRequest:
+		case *kvpb.GetRequest,
+			*kvpb.PutRequest,
+			*kvpb.ConditionalPutRequest,
+			*kvpb.IncrementRequest,
+			*kvpb.DeleteRequest:
 			numRows = 1
 		}
 		b.appendReqs(args)
@@ -348,37 +375,59 @@ func (b *Batch) AddRawRequest(reqs ...roachpb.Request) {
 	}
 }
 
-func (b *Batch) get(key interface{}, forUpdate bool) {
+func (b *Batch) get(
+	key interface{}, str kvpb.KeyLockingStrengthType, dur kvpb.KeyLockingDurabilityType,
+) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewGet(k, forUpdate))
+	switch str {
+	case kvpb.NonLocking:
+		b.appendReqs(kvpb.NewGet(k))
+	case kvpb.ForShare, kvpb.ForUpdate:
+		b.appendReqs(kvpb.NewLockingGet(k, str, dur))
+	default:
+		panic(errors.AssertionFailedf("unknown str %d", str))
+	}
 	b.initResult(1, 1, notRaw, nil)
 }
 
 // Get retrieves the value for a key. A new result will be appended to the batch
 // which will contain a single row.
 //
-//   r, err := db.Get("a")
-//   // string(r.Rows[0].Key) == "a"
+//	r, err := db.Get("a")
+//	// string(r.Rows[0].Key) == "a"
 //
 // key can be either a byte slice or a string.
 func (b *Batch) Get(key interface{}) {
-	b.get(key, false /* forUpdate */)
+	b.get(key, kvpb.NonLocking, kvpb.Invalid)
 }
 
-// GetForUpdate retrieves the value for a key. An unreplicated, exclusive lock
-// is acquired on the key, if it exists. A new result will be appended to the
-// batch which will contain a single row.
+// GetForUpdate retrieves the value for a key, returning the retrieved key/value
+// or an error. An Exclusive lock with the supplied durability is acquired on
+// the key, if it exists. It is not considered an error for the key not to
+// exist.
 //
-//   r, err := db.GetForUpdate("a")
-//   // string(r.Rows[0].Key) == "a"
+//	r, err := db.GetForUpdate("a")
+//	// string(r.Rows[0].Key) == "a"
 //
 // key can be either a byte slice or a string.
-func (b *Batch) GetForUpdate(key interface{}) {
-	b.get(key, true /* forUpdate */)
+func (b *Batch) GetForUpdate(key interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.get(key, kvpb.ForUpdate, dur)
+}
+
+// GetForShare retrieves the value for a key. A shared lock with the supplied
+// durability is acquired on the key, if it exists. A new result will be
+// appended to the batch which will contain a single row.
+//
+//	r, err := db.GetForShare("a")
+//	// string(r.Rows[0].Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (b *Batch) GetForShare(key interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.get(key, kvpb.ForShare, dur)
 }
 
 func (b *Batch) put(key, value interface{}, inline bool) {
@@ -393,9 +442,9 @@ func (b *Batch) put(key, value interface{}, inline bool) {
 		return
 	}
 	if inline {
-		b.appendReqs(roachpb.NewPutInline(k, v))
+		b.appendReqs(kvpb.NewPutInline(k, v))
 	} else {
-		b.appendReqs(roachpb.NewPut(k, v))
+		b.appendReqs(kvpb.NewPut(k, v))
 	}
 	b.approxMutationReqBytes += len(k) + len(v.RawBytes)
 	b.initResult(1, 1, notRaw, nil)
@@ -415,6 +464,51 @@ func (b *Batch) Put(key, value interface{}) {
 		panic("can't Put an empty Value; did you mean to Del() instead?")
 	}
 	b.put(key, value, false)
+}
+
+// PutBytes allows an arbitrary number of PutRequests to be added to the batch.
+func (b *Batch) PutBytes(bs BulkSource[[]byte]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.PutRequest
+		union kvpb.RequestUnion_Put
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.Put = pr
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value.SetBytes(v)
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
+}
+
+// PutTuples allows multiple tuple value type puts to be added to the batch using
+// BulkSource interface.
+func (b *Batch) PutTuples(bs BulkSource[[]byte]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.PutRequest
+		union kvpb.RequestUnion_Put
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.Put = pr
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value.SetTuple(v)
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
 }
 
 // PutInline sets the value for a key, but does not maintain
@@ -460,6 +554,37 @@ func (b *Batch) CPutAllowingIfNotExists(key, value interface{}, expValue []byte)
 	b.cputInternal(key, value, expValue, true, false)
 }
 
+// CPutWithOriginTimestamp is like CPut except that it also sets the
+// OriginTimestamp and ShouldWinOriginTimestampTie fields.
+//
+// See the comments on kvpb.ConditionalPutRequest related to these
+// fields for a full description of the semantics.
+//
+// This is used by logical data replication and other uses of this API
+// are discouraged since the semantics are subject to change as
+// required by that feature.
+func (b *Batch) CPutWithOriginTimestamp(
+	key, value interface{}, expValue []byte, ts hlc.Timestamp, shouldWinTie bool,
+) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+
+	v, err := marshalValue(value)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+	r := kvpb.NewConditionalPut(k, v, expValue, false)
+	r.(*kvpb.ConditionalPutRequest).OriginTimestamp = ts
+	r.(*kvpb.ConditionalPutRequest).ShouldWinOriginTimestampTie = shouldWinTie
+	b.appendReqs(r)
+	b.approxMutationReqBytes += len(k) + len(v.RawBytes)
+	b.initResult(1, 1, notRaw, nil)
+}
+
 // CPutInline conditionally sets the value for a key if the existing value is
 // equal to expValue, but does not maintain multi-version values. To
 // conditionally set a value only if the key doesn't currently exist, pass an
@@ -492,12 +617,64 @@ func (b *Batch) cputInternal(
 		return
 	}
 	if inline {
-		b.appendReqs(roachpb.NewConditionalPutInline(k, v, expValue, allowNotExist))
+		b.appendReqs(kvpb.NewConditionalPutInline(k, v, expValue, allowNotExist))
 	} else {
-		b.appendReqs(roachpb.NewConditionalPut(k, v, expValue, allowNotExist))
+		b.appendReqs(kvpb.NewConditionalPut(k, v, expValue, allowNotExist))
 	}
 	b.approxMutationReqBytes += len(k) + len(v.RawBytes)
 	b.initResult(1, 1, notRaw, nil)
+}
+
+// CPutTuplesEmpty allows multiple CPut tuple requests to be added to the batch
+// as tuples using the BulkSource interface. The values for these keys are
+// expected to be empty.
+func (b *Batch) CPutTuplesEmpty(bs BulkSource[[]byte]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.ConditionalPutRequest
+		union kvpb.RequestUnion_ConditionalPut
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.ConditionalPut = pr
+		pr.AllowIfDoesNotExist = false
+		pr.ExpBytes = nil
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value.SetTuple(v)
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
+}
+
+// CPutValuesEmpty allows multiple CPut tuple requests to be added to the batch
+// as roachpb.Values using the BulkSource interface. The values for these keys
+// are expected to be empty.
+func (b *Batch) CPutValuesEmpty(bs BulkSource[roachpb.Value]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.ConditionalPutRequest
+		union kvpb.RequestUnion_ConditionalPut
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.ConditionalPut = pr
+		pr.AllowIfDoesNotExist = false
+		pr.ExpBytes = nil
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value = v
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
 }
 
 // InitPut sets the first value for a key to value. An ConditionFailedError is
@@ -519,9 +696,55 @@ func (b *Batch) InitPut(key, value interface{}, failOnTombstones bool) {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewInitPut(k, v, failOnTombstones))
+	b.appendReqs(kvpb.NewInitPut(k, v, failOnTombstones))
 	b.approxMutationReqBytes += len(k) + len(v.RawBytes)
 	b.initResult(1, 1, notRaw, nil)
+}
+
+// InitPutBytes allows multiple []byte value type InitPut requests to be added to
+// the batch using BulkSource interface.
+func (b *Batch) InitPutBytes(bs BulkSource[[]byte]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.InitPutRequest
+		union kvpb.RequestUnion_InitPut
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.InitPut = pr
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value.SetBytes(v)
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
+}
+
+// InitPutTuples allows multiple tuple value type InitPut to be added to the
+// batch using BulkSource interface.
+func (b *Batch) InitPutTuples(bs BulkSource[[]byte]) {
+	numKeys := bs.Len()
+	reqs := make([]struct {
+		req   kvpb.InitPutRequest
+		union kvpb.RequestUnion_InitPut
+	}, numKeys)
+	i := 0
+	bsi := bs.Iter()
+	b.bulkRequest(numKeys, func() (kvpb.RequestUnion, int) {
+		pr := &reqs[i].req
+		union := &reqs[i].union
+		union.InitPut = pr
+		i++
+		k, v := bsi.Next()
+		pr.Key = k
+		pr.Value.SetTuple(v)
+		pr.Value.InitChecksum(k)
+		return kvpb.RequestUnion{Value: union}, len(k) + len(pr.Value.RawBytes)
+	})
 }
 
 // Inc increments the integer value at key. If the key does not exist it will
@@ -538,11 +761,16 @@ func (b *Batch) Inc(key interface{}, value int64) {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewIncrement(k, value))
+	b.appendReqs(kvpb.NewIncrement(k, value))
 	b.initResult(1, 1, notRaw, nil)
 }
 
-func (b *Batch) scan(s, e interface{}, isReverse, forUpdate bool) {
+func (b *Batch) scan(
+	s, e interface{},
+	isReverse bool,
+	str kvpb.KeyLockingStrengthType,
+	dur kvpb.KeyLockingDurabilityType,
+) {
 	begin, err := marshalKey(s)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -553,10 +781,21 @@ func (b *Batch) scan(s, e interface{}, isReverse, forUpdate bool) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	if !isReverse {
-		b.appendReqs(roachpb.NewScan(begin, end, forUpdate))
-	} else {
-		b.appendReqs(roachpb.NewReverseScan(begin, end, forUpdate))
+	switch str {
+	case kvpb.NonLocking:
+		if !isReverse {
+			b.appendReqs(kvpb.NewScan(begin, end))
+		} else {
+			b.appendReqs(kvpb.NewReverseScan(begin, end))
+		}
+	case kvpb.ForShare, kvpb.ForUpdate:
+		if !isReverse {
+			b.appendReqs(kvpb.NewLockingScan(begin, end, str, dur))
+		} else {
+			b.appendReqs(kvpb.NewLockingReverseScan(begin, end, str, dur))
+		}
+	default:
+		panic(errors.AssertionFailedf("unknown str %d", str))
 	}
 	b.initResult(1, 0, notRaw, nil)
 }
@@ -569,19 +808,31 @@ func (b *Batch) scan(s, e interface{}, isReverse, forUpdate bool) {
 //
 // key can be either a byte slice or a string.
 func (b *Batch) Scan(s, e interface{}) {
-	b.scan(s, e, false /* isReverse */, false /* forUpdate */)
+	b.scan(s, e, false /* isReverse */, kvpb.NonLocking, kvpb.Invalid)
 }
 
-// ScanForUpdate retrieves the key/values between begin (inclusive) and end
-// (exclusive) in ascending order. Unreplicated, exclusive locks are acquired on
-// each of the returned keys.
+// ScanForUpdate retrieves the rows between begin (inclusive) and end
+// (exclusive) in ascending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // A new result will be appended to the batch which will contain "rows" (each
 // row is a key/value pair) and Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string.
-func (b *Batch) ScanForUpdate(s, e interface{}) {
-	b.scan(s, e, false /* isReverse */, true /* forUpdate */)
+func (b *Batch) ScanForUpdate(s, e interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.scan(s, e, false /* isReverse */, kvpb.ForUpdate, dur)
+}
+
+// ScanForShare retrieves the key/values between begin (inclusive) and end
+// (exclusive) in ascending order. Shared locks with the supplied durability are
+// acquired on each of the returned keys.
+//
+// A new result will be appended to the batch which will contain "rows" (each
+// row is a key/value pair) and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string.
+func (b *Batch) ScanForShare(s, e interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.scan(s, e, false /* isReverse */, kvpb.ForShare, dur)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -592,40 +843,53 @@ func (b *Batch) ScanForUpdate(s, e interface{}) {
 //
 // key can be either a byte slice or a string.
 func (b *Batch) ReverseScan(s, e interface{}) {
-	b.scan(s, e, true /* isReverse */, false /* forUpdate */)
+	b.scan(s, e, true /* isReverse */, kvpb.NonLocking, kvpb.Invalid)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
-// (exclusive) in descending order. Unreplicated, exclusive locks are acquired
-// on each of the returned keys.
+// (exclusive) in descending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // A new result will be appended to the batch which will contain "rows" (each
 // "row" is a key/value pair) and Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string.
-func (b *Batch) ReverseScanForUpdate(s, e interface{}) {
-	b.scan(s, e, true /* isReverse */, true /* forUpdate */)
+func (b *Batch) ReverseScanForUpdate(s, e interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.scan(s, e, true /* isReverse */, kvpb.ForUpdate, dur)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Shared locks with the supplied durability
+// are acquired on each of the returned keys.
+//
+// A new result will be appended to the batch which will contain "rows" (each
+// "row" is a key/value pair) and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string.
+func (b *Batch) ReverseScanForShare(s, e interface{}, dur kvpb.KeyLockingDurabilityType) {
+	b.scan(s, e, true /* isReverse */, kvpb.ForShare, dur)
 }
 
 // Del deletes one or more keys.
 //
-// A new result will be appended to the batch and each key will have a
-// corresponding row in the returned Result.
+// A new result will be appended to the batch which will contain 0 rows and
+// Result.Err will indicate success or failure. Each key will be included in
+// Result.Keys if it was actually deleted.
 //
 // key can be either a byte slice or a string.
 func (b *Batch) Del(keys ...interface{}) {
-	reqs := make([]roachpb.Request, 0, len(keys))
+	reqs := make([]kvpb.Request, 0, len(keys))
 	for _, key := range keys {
 		k, err := marshalKey(key)
 		if err != nil {
-			b.initResult(0, len(keys), notRaw, err)
+			b.initResult(len(keys), 0, notRaw, err)
 			return
 		}
-		reqs = append(reqs, roachpb.NewDelete(k))
+		reqs = append(reqs, kvpb.NewDelete(k))
 		b.approxMutationReqBytes += len(k)
 	}
 	b.appendReqs(reqs...)
-	b.initResult(len(reqs), len(reqs), notRaw, nil)
+	b.initResult(len(reqs), 0, notRaw, nil)
 }
 
 // DelRange deletes the rows between begin (inclusive) and end (exclusive).
@@ -645,7 +909,31 @@ func (b *Batch) DelRange(s, e interface{}, returnKeys bool) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewDeleteRange(begin, end, returnKeys))
+	b.appendReqs(kvpb.NewDeleteRange(begin, end, returnKeys))
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// DelRangeUsingTombstone deletes the rows between begin (inclusive) and end
+// (exclusive) using an MVCC range tombstone. Callers must check
+// storage.CanUseMVCCRangeTombstones before using this.
+func (b *Batch) DelRangeUsingTombstone(s, e interface{}) {
+	start, err := marshalKey(s)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	end, err := marshalKey(e)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	b.appendReqs(&kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    start,
+			EndKey: end,
+		},
+		UseRangeTombstone: true,
+	})
 	b.initResult(1, 0, notRaw, nil)
 }
 
@@ -657,8 +945,8 @@ func (b *Batch) adminMerge(key interface{}) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AdminMergeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminMergeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: k,
 		},
 	}
@@ -668,18 +956,21 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(splitKeyIn interface{}, expirationTime hlc.Timestamp) {
+func (b *Batch) adminSplit(
+	splitKeyIn interface{}, expirationTime hlc.Timestamp, predicateKeys []roachpb.Key,
+) {
 	splitKey, err := marshalKey(splitKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AdminSplitRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminSplitRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: splitKey,
 		},
 		SplitKey:       splitKey,
 		ExpirationTime: expirationTime,
+		PredicateKeys:  predicateKeys,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -690,8 +981,8 @@ func (b *Batch) adminUnsplit(splitKeyIn interface{}) {
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 	}
-	req := &roachpb.AdminUnsplitRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminUnsplitRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: splitKey,
 		},
 	}
@@ -701,17 +992,20 @@ func (b *Batch) adminUnsplit(splitKeyIn interface{}) {
 
 // adminTransferLease is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
+func (b *Batch) adminTransferLease(
+	key interface{}, target roachpb.StoreID, bypassSafetyChecks bool,
+) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AdminTransferLeaseRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminTransferLeaseRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: k,
 		},
-		Target: target,
+		Target:             target,
+		BypassSafetyChecks: bypassSafetyChecks,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -720,15 +1014,15 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 // adminChangeReplicas is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminChangeReplicas(
-	key interface{}, expDesc roachpb.RangeDescriptor, chgs []roachpb.ReplicationChange,
+	key interface{}, expDesc roachpb.RangeDescriptor, chgs []kvpb.ReplicationChange,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AdminChangeReplicasRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminChangeReplicasRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: k,
 		},
 		ExpDesc: expDesc,
@@ -742,19 +1036,23 @@ func (b *Batch) adminChangeReplicas(
 // adminRelocateRange is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminRelocateRange(
-	key interface{}, voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	key interface{},
+	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	transferLeaseToFirstVoter bool,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AdminRelocateRangeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AdminRelocateRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: k,
 		},
-		VoterTargets:    voterTargets,
-		NonVoterTargets: nonVoterTargets,
+		VoterTargets:                      voterTargets,
+		NonVoterTargets:                   nonVoterTargets,
+		TransferLeaseToFirstVoter:         transferLeaseToFirstVoter,
+		TransferLeaseToFirstVoterAccurate: true,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -764,9 +1062,12 @@ func (b *Batch) adminRelocateRange(
 func (b *Batch) addSSTable(
 	s, e interface{},
 	data []byte,
+	disallowConflicts bool,
 	disallowShadowing bool,
+	disallowShadowingBelow hlc.Timestamp,
 	stats *enginepb.MVCCStats,
 	ingestAsWrites bool,
+	sstTimestampToRequestTimestamp hlc.Timestamp,
 ) {
 	begin, err := marshalKey(s)
 	if err != nil {
@@ -778,15 +1079,32 @@ func (b *Batch) addSSTable(
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.AddSSTableRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.AddSSTableRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    begin,
 			EndKey: end,
 		},
-		Data:              data,
-		DisallowShadowing: disallowShadowing,
-		MVCCStats:         stats,
-		IngestAsWrites:    ingestAsWrites,
+		Data:                           data,
+		DisallowConflicts:              disallowConflicts,
+		DisallowShadowing:              disallowShadowing,
+		DisallowShadowingBelow:         disallowShadowingBelow,
+		MVCCStats:                      stats,
+		IngestAsWrites:                 ingestAsWrites,
+		SSTTimestampToRequestTimestamp: sstTimestampToRequestTimestamp,
+	}
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+func (b *Batch) linkExternalSSTable(
+	span roachpb.Span, externalFile kvpb.LinkExternalSSTableRequest_ExternalFile,
+) {
+	req := &kvpb.LinkExternalSSTableRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    span.Key,
+			EndKey: span.EndKey,
+		},
+		ExternalFile: externalFile,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -804,8 +1122,8 @@ func (b *Batch) migrate(s, e interface{}, version roachpb.Version) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.MigrateRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.MigrateRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    begin,
 			EndKey: end,
 		},
@@ -827,8 +1145,8 @@ func (b *Batch) queryResolvedTimestamp(s, e interface{}) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.QueryResolvedTimestampRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.QueryResolvedTimestampRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    begin,
 			EndKey: end,
 		},
@@ -837,7 +1155,7 @@ func (b *Batch) queryResolvedTimestamp(s, e interface{}) {
 	b.initResult(1, 0, notRaw, nil)
 }
 
-func (b *Batch) scanInterleavedIntents(s, e interface{}) {
+func (b *Batch) barrier(s, e interface{}, withLAI bool) {
 	begin, err := marshalKey(s)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -848,33 +1166,50 @@ func (b *Batch) scanInterleavedIntents(s, e interface{}) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	req := &roachpb.ScanInterleavedIntentsRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.BarrierRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    begin,
 			EndKey: end,
 		},
+		WithLeaseAppliedIndex: withLAI,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
 
-func (b *Batch) barrier(s, e interface{}) {
-	begin, err := marshalKey(s)
-	if err != nil {
-		b.initResult(0, 0, notRaw, err)
-		return
+func (b *Batch) bulkRequest(
+	numKeys int, requestFactory func() (req kvpb.RequestUnion, kvSize int),
+) {
+	n := len(b.reqs)
+	b.growReqs(numKeys)
+	newReqs := b.reqs[n:]
+	for i := 0; i < numKeys; i++ {
+		req, numBytes := requestFactory()
+		b.approxMutationReqBytes += numBytes
+		newReqs[i] = req
 	}
-	end, err := marshalKey(e)
-	if err != nil {
-		b.initResult(0, 0, notRaw, err)
-		return
+	b.initResult(numKeys, numKeys, notRaw, nil)
+}
+
+// GetResult retrieves the Result and Result row KeyValue for a particular index.
+//
+// WARNING: introduce new usages of this function with care. See discussion in
+// https://github.com/cockroachdb/cockroach/pull/112937.
+// TODO(yuzefovich): look into removing this confusing function.
+func (b *Batch) GetResult(idx int) (*Result, KeyValue, error) {
+	origIdx := idx
+	for i := range b.Results {
+		r := &b.Results[i]
+		if idx < r.calls {
+			if idx < len(r.Rows) {
+				return r, r.Rows[idx], nil
+			} else if idx < len(r.Keys) {
+				return r, KeyValue{Key: r.Keys[idx]}, nil
+			} else {
+				return r, KeyValue{}, nil
+			}
+		}
+		idx -= r.calls
 	}
-	req := &roachpb.BarrierRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key:    begin,
-			EndKey: end,
-		},
-	}
-	b.appendReqs(req)
-	b.initResult(1, 0, notRaw, nil)
+	return nil, KeyValue{}, errors.AssertionFailedf("index %d outside of results: %+v", origIdx, b.Results)
 }

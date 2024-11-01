@@ -1,21 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
-import { stdDevLong, Duration, Bytes, longToInt } from "src/util";
 import classNames from "classnames/bind";
-import styles from "../barCharts/barCharts.module.scss";
+
 import { barChartFactory } from "src/barCharts/barChartFactory";
 import { bar, approximify } from "src/barCharts/utils";
+import { stdDevLong, Duration, Bytes, longToInt } from "src/util";
 
-type Transaction = protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
+import styles from "../barCharts/barCharts.module.scss";
+
+import { TransactionInfo } from "./transactionsTable";
+
+type Transaction =
+  protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
 const cx = classNames.bind(styles);
 
 const countBar = [
@@ -23,14 +23,6 @@ const countBar = [
     longToInt(d.stats_data.stats.count),
   ),
 ];
-const rowsReadBar = [
-  bar("rows-read", (d: Transaction) =>
-    longToInt(d.stats_data.stats.rows_read.mean),
-  ),
-];
-const rowsReadStdDev = bar(cx("rows-read-dev"), (d: Transaction) =>
-  stdDevLong(d.stats_data.stats.rows_read, d.stats_data.stats.count),
-);
 const bytesReadBar = [
   bar("bytes-read", (d: Transaction) =>
     longToInt(d.stats_data.stats.bytes_read.mean),
@@ -38,14 +30,6 @@ const bytesReadBar = [
 ];
 const bytesReadStdDev = bar(cx("bytes-read-dev"), (d: Transaction) =>
   stdDevLong(d.stats_data.stats.bytes_read, d.stats_data.stats.count),
-);
-const rowsWrittenBar = [
-  bar("rows-written", (d: Transaction) =>
-    longToInt(d.stats_data.stats.rows_written?.mean),
-  ),
-];
-const rowsWrittenStdDev = bar(cx("rows-written-dev"), (d: Transaction) =>
-  stdDevLong(d.stats_data.stats.rows_written, d.stats_data.stats.count),
 );
 const latencyBar = [
   bar(
@@ -59,7 +43,7 @@ const latencyStdDev = bar(cx("bar-chart__overall-dev"), (d: Transaction) =>
 const contentionBar = [
   bar(
     "contention",
-    (d: Transaction) => d.stats_data.stats.exec_stats.contention_time?.mean,
+    (d: TransactionInfo) => d.stats_data.stats.exec_stats.contention_time?.mean,
   ),
 ];
 const contentionStdDev = bar(cx("contention-dev"), (d: Transaction) =>
@@ -68,8 +52,20 @@ const contentionStdDev = bar(cx("contention-dev"), (d: Transaction) =>
     d.stats_data.stats.exec_stats.count,
   ),
 );
+const cpuBar = [
+  bar(
+    "cpu",
+    (d: TransactionInfo) => d.stats_data.stats.exec_stats.cpu_sql_nanos?.mean,
+  ),
+];
+const cpuStdDev = bar(cx("cpu-dev"), (d: Transaction) =>
+  stdDevLong(
+    d.stats_data.stats.exec_stats.cpu_sql_nanos,
+    d.stats_data.stats.exec_stats.count,
+  ),
+);
 const maxMemUsageBar = [
-  bar("max-mem-usage", (d: Transaction) =>
+  bar("max-mem-usage", (d: TransactionInfo) =>
     longToInt(d.stats_data.stats.exec_stats.max_mem_usage?.mean),
   ),
 ];
@@ -80,7 +76,7 @@ const maxMemUsageStdDev = bar(cx("max-mem-usage-dev"), (d: Transaction) =>
   ),
 );
 const networkBytesBar = [
-  bar("network-bytes", (d: Transaction) =>
+  bar("network-bytes", (d: TransactionInfo) =>
     longToInt(d.stats_data.stats.exec_stats.network_bytes?.mean),
   ),
 ];
@@ -101,23 +97,11 @@ export const transactionsCountBarChart = barChartFactory(
   countBar,
   approximify,
 );
-export const transactionsRowsReadBarChart = barChartFactory(
-  "grey",
-  rowsReadBar,
-  approximify,
-  rowsReadStdDev,
-);
 export const transactionsBytesReadBarChart = barChartFactory(
   "grey",
   bytesReadBar,
   Bytes,
   bytesReadStdDev,
-);
-export const transactionsRowsWrittenBarChart = barChartFactory(
-  "grey",
-  rowsWrittenBar,
-  approximify,
-  rowsWrittenStdDev,
 );
 export const transactionsLatencyBarChart = barChartFactory(
   "grey",
@@ -130,6 +114,12 @@ export const transactionsContentionBarChart = barChartFactory(
   contentionBar,
   v => Duration(v * 1e9),
   contentionStdDev,
+);
+export const transactionsCPUBarChart = barChartFactory(
+  "grey",
+  cpuBar,
+  v => Duration(v),
+  cpuStdDev,
 );
 export const transactionsMaxMemUsageBarChart = barChartFactory(
   "grey",

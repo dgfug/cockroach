@@ -1,21 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package base exposes basic utilities used across cockroach.
 package base
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -26,19 +22,43 @@ var errEnterpriseNotEnabled = errors.New("OSS binaries do not include enterprise
 // enable it.
 //
 // This function is overridden by an init hook in CCL builds.
-var CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, org, feature string) error {
+var CheckEnterpriseEnabled = func(_ *cluster.Settings, feature string) error {
 	return errEnterpriseNotEnabled // nb: this is squarely in the hot path on OSS builds
 }
 
-// TimeToEnterpriseLicenseExpiry returns a duration object that measures the time until
-// the currently set enterprise license expires starting from the 3rd argument
-// passed in.
-//
-// This function is overridden by an init hook in CCL builds
-var TimeToEnterpriseLicenseExpiry = func(
-	ctx context.Context, _ *cluster.Settings, _ time.Time,
-) (time.Duration, error) {
-	return 0, nil
+// CCLDistributionAndEnterpriseEnabled is a simpler version of
+// CheckEnterpriseEnabled which doesn't take in feature-related info and doesn't
+// return an error with a nice message.
+var CCLDistributionAndEnterpriseEnabled = func(st *cluster.Settings) bool {
+	return CheckEnterpriseEnabled(st, "" /* feature */) == nil
+}
+
+var LicenseTTLMetadata = metric.Metadata{
+	// This metric name isn't namespaced for backwards
+	// compatibility. The prior version of this metric was manually
+	// inserted into the prometheus output
+	Name:        "seconds_until_enterprise_license_expiry",
+	Help:        "Seconds until license expiry (0 if no license present)",
+	Measurement: "Seconds",
+	Unit:        metric.Unit_SECONDS,
+}
+
+var AdditionalLicenseTTLMetadata = metric.Metadata{
+	Name:        "seconds_until_license_expiry",
+	Help:        "Seconds until license expiry (0 if no license present)",
+	Measurement: "Seconds",
+	Unit:        metric.Unit_SECONDS,
+}
+
+// GetLicenseTTL is a function which returns the TTL for the active cluster.
+// The implementation here returns 0, but if utilccl is started this function is
+// overridden with an appropriate getter.
+var GetLicenseTTL = func(
+	ctx context.Context,
+	st *cluster.Settings,
+	ts timeutil.TimeSource,
+) int64 {
+	return 0
 }
 
 // LicenseType returns what type of license the cluster is running with, or

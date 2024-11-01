@@ -5,7 +5,8 @@
 # SimplifySelectFilters simplifies the Filters operator in several possible
 # ways:
 #   - Removes True operands
-#   - Replaces the Filters operator with False if any operand is False or Null
+#   - Replaces the Filters operator with False if any operand is False, Null, or
+#     a contradiction
 #   - Flattens nested And operands by merging their conditions into parent
 #   - Simplifies Or operands where one side is a Null to the other side
 #   - Simplifies Is operands where the right side is True or False
@@ -104,6 +105,37 @@ $input
     (ExtractUnboundConditions $filters $inputCols)
 )
 
+# PushSelectIntoOrdinality pushes the Select operator into its Ordinality input
+# if the Ordinality operation was built for the purposes of removing duplicate
+# rows, and the actual values returned by the Ordinality operation don't matter.
+# This is typically preferable because it allows the Select to be pushed into
+# operations beneath the Ordinality, minimizing the number of rows subsequent
+# operations need to process and potentially pushing the Select down far enough
+# to enable constrained scans. This may also enable other normalization rules
+# which match on Select expressions to fire.
+[PushSelectIntoOrdinality, Normalize]
+(Select
+    (Ordinality $input:* $private:*) &
+        (ForDuplicateRemoval $private)
+    $filters:[
+        ...
+        $item:* &
+            (IsBoundBy $item $inputCols:(OutputCols $input))
+        ...
+    ]
+)
+=>
+(Select
+    (Ordinality
+        (Select
+            $input
+            (ExtractBoundConditions $filters $inputCols)
+        )
+        $private
+    )
+    (ExtractUnboundConditions $filters $inputCols)
+)
+
 # MergeSelectInnerJoin merges a Select operator with an InnerJoin input by
 # AND'ing the filter conditions of each and creating a new InnerJoin with that
 # On condition. This is only safe to do with InnerJoin in the general case
@@ -168,7 +200,7 @@ $input
             (CanMapJoinOpFilter
                 $item
                 $rightCols:(OutputCols $right)
-                $equivFD:(GetEquivFD $on $left $right)
+                $equivSet:(GetEquivSet $on $left $right)
             )
         ...
     ]
@@ -181,7 +213,7 @@ $input
             $right
             [
                 (FiltersItem
-                    (MapJoinOpFilter $item $rightCols $equivFD)
+                    (MapJoinOpFilter $item $rightCols $equivSet)
                 )
             ]
         )
@@ -302,6 +334,25 @@ $input
 )
 =>
 (Select $input (RemoveFiltersItem $filters $item))
+
+# SimplifyIsNullCondition replaces a filter with an IS NULL condition with
+# False when the given column has a NOT NULL constraint.
+[SimplifyIsNullCondition, Normalize]
+(Select
+    $input:*
+    $filters:[
+        ...
+        $item:(FiltersItem
+            (Is
+                (Variable $col:* & (IsColNotNull $col $input))
+                (Null)
+            )
+        )
+        ...
+    ]
+)
+=>
+(Select $input [ (FiltersItem (False)) ])
 
 # PushSelectIntoProjectSet pushes filters into a ProjectSet. In particular,
 # the filters that are bound to the input columns of the ProjectSet are

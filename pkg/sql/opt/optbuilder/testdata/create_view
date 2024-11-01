@@ -11,13 +11,21 @@ exec-ddl
 CREATE SEQUENCE s
 ----
 
+exec-ddl
+CREATE TYPE foobar AS ENUM ('foo', 'bar')
+----
+
+exec-ddl
+CREATE TABLE foobars (fb foobar)
+----
+
 build
 CREATE VIEW v1 AS VALUES (1)
 ----
 create-view t.public.v1
  ├── VALUES (1)
  ├── columns: column1:1
- └── dependencies
+ └── no dependencies
 
 build
 CREATE VIEW v1 AS SELECT a FROM ab
@@ -103,11 +111,24 @@ CREATE VIEW v3 (x) AS SELECT a, b FROM ab
 ----
 error (42601): CREATE VIEW specifies 1 column name, but data source has 2 columns
 
-# Verify that we disallow * in view definitions (#10028).
 build
 CREATE VIEW v4 AS SELECT * FROM ab
 ----
-error (0A000): unimplemented: views do not currently support * expressions
+create-view t.public.v4
+ ├── SELECT ab.a, ab.b FROM t.public.ab
+ ├── columns: a:1 b:2
+ └── dependencies
+      └── ab [columns: a b]
+
+build
+CREATE VIEW v4 AS SELECT ARRAY[z.*]::STRING FROM (SELECT * FROM (SELECT * FROM ab), (SELECT * FROM ab)) AS z
+----
+create-view t.public.v4
+ ├── SELECT ARRAY[z.*]::STRING FROM (SELECT "?subquery1?".a, "?subquery1?".b, "?subquery2?".a, "?subquery2?".b FROM (SELECT ab.a, ab.b FROM t.public.ab) AS "?subquery1?", (SELECT ab.a, ab.b FROM t.public.ab) AS "?subquery2?") AS z
+ ├── columns: array:9
+ └── dependencies
+      ├── ab [columns: a b]
+      └── ab [columns: a b]
 
 build
 CREATE VIEW v5 AS SELECT a FROM [53 AS t]
@@ -250,7 +271,7 @@ build
 CREATE VIEW v16 AS SELECT a FROM (SELECT a,b FROM ab);
 ----
 create-view t.public.v16
- ├── SELECT a FROM (SELECT a, b FROM t.public.ab)
+ ├── SELECT a FROM (SELECT a, b FROM t.public.ab) AS "?subquery1?"
  ├── columns: a:1
  └── dependencies
       └── ab [columns: a b]
@@ -352,3 +373,21 @@ create-view t.public.v24
  ├── columns: setval:1
  └── dependencies
       └── s
+
+build
+CREATE VIEW v25 AS VALUES ('foo'::foobar)
+----
+create-view t.public.v25
+ ├── VALUES ('foo'::foobar)
+ ├── columns: column1:1
+ └── dependencies
+      └── foobar
+
+build
+CREATE VIEW v26 AS SELECT fb FROM foobars
+----
+create-view t.public.v26
+ ├── SELECT fb FROM t.public.foobars
+ ├── columns: fb:1
+ └── dependencies
+      └── foobars [columns: fb]

@@ -1,16 +1,11 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { FunctionComponent } from "react";
-import classnames from "classnames/bind";
 import { Badge, BadgeIntent, FuzzyTime } from "@cockroachlabs/ui-components";
+import classnames from "classnames/bind";
+import React, { FunctionComponent } from "react";
 
 import {
   NotificationTypeProp,
@@ -40,14 +35,9 @@ const severityIntent = (s: NotificationSeverity): BadgeIntent => {
   return intentMap[s] as BadgeIntent;
 };
 
-export const NotificationMessage: FunctionComponent<NotificationMessageProps> = ({
-  id,
-  description,
-  read,
-  severity,
-  timestamp,
-  title,
-}) => {
+export const NotificationMessage: FunctionComponent<
+  NotificationMessageProps
+> = ({ id, description, read, severity, timestamp, title }) => {
   const time = new Date(timestamp);
   return (
     <section key={id} className={cx("notification-message", { unread: !read })}>

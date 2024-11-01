@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdcutils
 
@@ -12,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
@@ -69,7 +65,7 @@ func (t *Throttler) AcquireFlushQuota(ctx context.Context) error {
 func (t *Throttler) updateConfig(config changefeedbase.SinkThrottleConfig) {
 	setLimits := func(rl *quotapool.RateLimiter, rate, burst float64) {
 		// set rateBudget to unlimited if rate is 0.
-		rateBudget := quotapool.Limit(math.MaxInt64)
+		rateBudget := quotapool.Inf()
 		if rate > 0 {
 			rateBudget = quotapool.Limit(rate)
 		}

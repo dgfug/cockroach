@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -18,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,7 +25,7 @@ func TestUsersV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
@@ -40,10 +36,10 @@ func TestUsersV2(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
-	client, err := ts1.GetAdminAuthenticatedHTTPClient()
+	client, err := ts1.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"users/", nil)
+	req, err := http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"users/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -63,7 +59,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
@@ -74,17 +70,17 @@ func TestDatabasesTablesV2(t *testing.T) {
 	require.NoError(t, err)
 	_, err = conn.Exec("CREATE TABLE testdb.testtable (id INTEGER PRIMARY KEY, value STRING);")
 	require.NoError(t, err)
-	_, err = conn.Exec("CREATE USER testuser WITH PASSWORD testpassword;")
+	_, err = conn.Exec("CREATE USER testuser WITH PASSWORD 'testpassword';")
 	require.NoError(t, err)
 	_, err = conn.Exec("GRANT ALL ON DATABASE testdb TO testuser;")
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
-	client, err := ts1.GetAdminAuthenticatedHTTPClient()
+	client, err := ts1.GetAdminHTTPClient()
 	require.NoError(t, err)
 	defer client.CloseIdleConnections()
 
-	req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/", nil)
+	req, err := http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -97,7 +93,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 
 	require.Contains(t, dr.Databases, "testdb")
 
-	req, err = http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/testdb/", nil)
+	req, err = http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/testdb/").String(), nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -108,7 +104,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&ddr))
 	require.NoError(t, resp.Body.Close())
 
-	req, err = http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/testdb/grants/", nil)
+	req, err = http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/testdb/grants/").String(), nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -120,7 +116,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	require.NotEmpty(t, dgr.Grants)
 
-	req, err = http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/testdb/tables/", nil)
+	req, err = http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/testdb/tables/").String(), nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -133,7 +129,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 	require.Contains(t, dtr.TableNames, "public.testtable")
 
 	// Test that querying the wrong db name returns 404.
-	req, err = http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/testdb2/tables/", nil)
+	req, err = http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/testdb2/tables/").String(), nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -141,7 +137,7 @@ func TestDatabasesTablesV2(t *testing.T) {
 	require.Equal(t, 404, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
 
-	req, err = http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"databases/testdb/tables/public.testtable/", nil)
+	req, err = http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"databases/testdb/tables/public.testtable/").String(), nil)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -165,7 +161,7 @@ func TestEventsV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
@@ -176,10 +172,10 @@ func TestEventsV2(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
-	client, err := ts1.GetAdminAuthenticatedHTTPClient()
+	client, err := ts1.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"events/", nil)
+	req, err := http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"events/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)

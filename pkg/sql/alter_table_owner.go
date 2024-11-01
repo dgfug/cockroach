@@ -1,29 +1,26 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type alterTableOwnerNode struct {
-	owner  security.SQLUsername
+	owner  username.SQLUsername
 	desc   *tabledesc.Mutable
 	n      *tree.AlterTableOwner
 	prefix catalog.ResolvedObjectPrefix
@@ -63,7 +60,9 @@ func (p *planner) AlterTableOwner(ctx context.Context, n *tree.AlterTableOwner) 
 		return nil, err
 	}
 
-	owner, err := n.Owner.ToSQLUsername(p.SessionData(), security.UsernameValidation)
+	owner, err := decodeusername.FromRoleSpec(
+		p.SessionData(), username.PurposeValidation, n.Owner,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +75,10 @@ func (p *planner) AlterTableOwner(ctx context.Context, n *tree.AlterTableOwner) 
 }
 
 func (n *alterTableOwnerNode) startExec(params runParams) error {
-	telemetry.Inc(n.n.TelemetryCounter())
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra(
+		tree.GetTableType(n.n.IsSequence, n.n.IsView, n.n.IsMaterialized),
+		n.n.TelemetryName(),
+	))
 	ctx := params.ctx
 	p := params.p
 	tableDesc := n.desc
@@ -123,7 +125,7 @@ func (p *planner) setNewTableOwner(
 	ctx context.Context,
 	desc *tabledesc.Mutable,
 	tbNameWithSchema tree.TableName,
-	newOwner security.SQLUsername,
+	newOwner username.SQLUsername,
 ) error {
 	privs := desc.GetPrivileges()
 	privs.SetOwner(newOwner)

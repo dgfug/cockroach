@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -19,20 +14,23 @@ import (
 	"github.com/elastic/gosigar"
 )
 
-func computeStoreProperties(
-	ctx context.Context, dir string, readonly bool, encryptionEnabled bool,
-) roachpb.StoreProperties {
+func computeStoreProperties(ctx context.Context, cfg engineConfig) roachpb.StoreProperties {
 	props := roachpb.StoreProperties{
-		ReadOnly:  readonly,
-		Encrypted: encryptionEnabled,
+		Dir:       cfg.env.Dir,
+		ReadOnly:  cfg.env.IsReadOnly(),
+		Encrypted: cfg.env.Encryption != nil,
+	}
+	if cfg.opts.WALFailover != nil {
+		props.WalFailoverPath = new(string)
+		*props.WalFailoverPath = cfg.opts.WALFailover.Secondary.Dirname
 	}
 
 	// In-memory store?
-	if dir == "" {
+	if cfg.env.Dir == "" {
 		return props
 	}
 
-	fsprops := getFileSystemProperties(ctx, dir)
+	fsprops := getFileSystemProperties(ctx, cfg.env.Dir)
 	props.FileStoreProperties = &fsprops
 	return props
 }

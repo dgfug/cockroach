@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -22,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -369,10 +364,11 @@ func TestCrossJoiner(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -383,24 +379,41 @@ func TestCrossJoiner(t *testing.T) {
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
 
+	// When we have non-empty ON expression, we will plan additional operators
+	// on top of the cross joiner (selection and projection ops). Those
+	// operators currently don't implement the colexecop.Closer interface, so
+	// the closers aren't automatically closed by the RunTests harness (i.e.
+	// closeIfCloser stops early), so we need to close all closers explicitly.
+	// (The alternative would be to make all these selection and projection
+	// operators implement the interface, but it doesn't seem worth it.)
+	var onExprToClose colexecop.Closers
+	defer func() {
+		for _, c := range onExprToClose {
+			require.NoError(t, c.Close(ctx))
+		}
+	}()
+
 	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		for _, tc := range getCJTestCases() {
 			for _, tc := range tc.mutateTypes() {
 				log.Infof(ctx, "spillForced=%t", spillForced)
-				runHashJoinTestCase(t, tc, func(sources []colexecop.Operator) (colexecop.Operator, error) {
+				runHashJoinTestCase(t, tc, nil /* rng */, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 					spec := createSpecForHashJoiner(tc)
 					args := &colexecargs.NewColOperatorArgs{
 						Spec:                spec,
 						Inputs:              colexectestutils.MakeInputs(sources),
 						StreamingMemAccount: testMemAcc,
 						DiskQueueCfg:        queueCfg,
-						FDSemaphore:         colexecop.NewTestingSemaphore(externalHJMinPartitions),
+						FDSemaphore:         colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions),
 						MonitorRegistry:     &monitorRegistry,
 					}
 					result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 					if err != nil {
 						return nil, err
+					}
+					if !tc.onExpr.Empty() {
+						onExprToClose = append(onExprToClose, result.ToClose...)
 					}
 					return result.Root, nil
 				})
@@ -413,10 +426,11 @@ func BenchmarkCrossJoiner(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -437,7 +451,7 @@ func BenchmarkCrossJoiner(b *testing.B) {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		for _, joinType := range []descpb.JoinType{descpb.InnerJoin, descpb.LeftSemiJoin} {
 			for _, nRows := range []int{1, 1 << 4, 1 << 8, 1 << 11, 1 << 13} {
-				cols := newIntColumns(nCols, nRows)
+				cols := newIntColumns(nCols, nRows, 1 /* dupCount */)
 				tc := &joinTestCase{
 					joinType:   joinType,
 					leftTypes:  sourceTypes,

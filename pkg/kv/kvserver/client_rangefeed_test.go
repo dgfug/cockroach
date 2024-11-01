@@ -1,17 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -19,12 +16,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -41,7 +41,15 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SpanConfig: &spanconfig.TestingKnobs{
+					ConfigureScratchRange: true,
+				},
+			},
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	// Make sure the rangefeed setting really is disabled.
@@ -50,6 +58,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 
 	db := tc.Server(0).DB()
 	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
+	tc.Server(0)
 
 	t.Run("works on system ranges", func(t *testing.T) {
 		startTS := db.Clock().Now()
@@ -59,23 +68,19 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 			EndKey: descTableKey.PrefixEnd(),
 		}
 
-		evChan := make(chan *roachpb.RangeFeedEvent)
+		evChan := make(chan kvcoord.RangeFeedMessage)
 		rangefeedErrChan := make(chan error, 1)
 		ctxToCancel, cancel := context.WithCancel(ctx)
 		go func() {
-			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, descTableSpan, startTS, false /* withDiff */, evChan)
+			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, evChan)
 		}()
 
 		// Note: 42 is a system descriptor.
 		const junkDescriptorID = 42
-		require.GreaterOrEqual(t, keys.MaxReservedDescID, junkDescriptorID)
 		junkDescriptorKey := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, junkDescriptorID)
 		junkDescriptor := dbdesc.NewInitial(
-			junkDescriptorID, "junk", security.AdminRoleName())
+			junkDescriptorID, "junk", username.AdminRoleName())
 		require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			if err := txn.SetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
-				return err
-			}
 			return txn.Put(ctx, junkDescriptorKey, junkDescriptor.DescriptorProto())
 		}))
 		after := db.Clock().Now()
@@ -91,21 +96,47 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 				require.EqualValues(t, junkDescriptor.DescriptorProto(), &gotProto)
 				break
 			}
+
+			if !ev.RegisteredSpan.Equal(descTableSpan) {
+				t.Fatal("registered span in the message should be equal to " +
+					"the span used to create the rangefeed")
+			}
 		}
 		cancel()
 		// There are several cases that seems like they can happen due
 		// to closed connections. Instead we just expect an error.
 		// The main point is we get an error in a timely manner.
-		require.Error(t, <-rangefeedErrChan)
+		select {
+		case <-time.After(30 * time.Second):
+			t.Fatal("timed out")
+		case err := <-rangefeedErrChan:
+			require.Error(t, err)
+		}
 	})
 	t.Run("does not work on user ranges", func(t *testing.T) {
 		k := tc.ScratchRange(t)
 		require.NoError(t, tc.WaitForSplitAndInitialization(k))
 		startTS := db.Clock().Now()
 		scratchSpan := roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
-		evChan := make(chan *roachpb.RangeFeedEvent)
+		testutils.SucceedsSoon(t, func() error {
+			for i := 0; i < tc.NumServers(); i++ {
+				repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(roachpb.RKey(k))
+				if repl == nil {
+					return fmt.Errorf("replica not found on n%d", i)
+				}
+				conf, err := repl.LoadSpanConfig(ctx)
+				if err != nil {
+					return err
+				}
+				if conf.RangefeedEnabled {
+					return errors.New("waiting for span configs")
+				}
+			}
+			return nil
+		})
+		evChan := make(chan kvcoord.RangeFeedMessage)
 		require.Regexp(t, `rangefeeds require the kv\.rangefeed.enabled setting`,
-			ds.RangeFeed(ctx, scratchSpan, startTS, false /* withDiff */, evChan))
+			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, evChan))
 	})
 }
 
@@ -153,13 +184,12 @@ func TestMergeOfRangeEventTableWhileRunningRangefeed(t *testing.T) {
 	defer cancel()
 	rangefeedErrChan := make(chan error, 1)
 	// Make the buffer large so we don't risk blocking.
-	eventCh := make(chan *roachpb.RangeFeedEvent, 1000)
+	eventCh := make(chan kvcoord.RangeFeedMessage, 1000)
 	start := db.Clock().Now()
 	go func() {
 		rangefeedErrChan <- ds.RangeFeed(rangefeedCtx,
-			lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals(),
+			[]roachpb.Span{lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals()},
 			start,
-			false, /* withDiff */
 			eventCh)
 	}()
 
@@ -190,15 +220,17 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	clusterArgs := aggressiveResolvedTimestampClusterArgs
-	// We want to manually add a non-voter to a range in this test, so disable
-	// the replicateQueue to prevent it from disrupting the test.
-	clusterArgs.ReplicationMode = base.ReplicationManual
+	clusterArgs := aggressiveResolvedTimestampManuallyReplicatedClusterArgs
 	// NB: setupClusterForClosedTSTesting sets a low closed timestamp target
 	// duration.
-	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, clusterArgs, "cttest", "kv")
+	// NB: the replicate queue is disabled in this test, so we can manually add a
+	// non-voter to a range without being disrupted.
+	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, 0, clusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
-	tc.AddNonVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1))
+	// This test doesn't want the default voters on s2 and s3. We want only
+	// the voter on s1 and a non-voter on s2.
+	desc = tc.RemoveVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
+	desc = tc.AddNonVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1))
 
 	db := tc.Server(1).DB()
 	ds := tc.Server(1).DistSenderI().(*kvcoord.DistSender)
@@ -208,7 +240,7 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	startTS := db.Clock().Now()
 	rangefeedCtx, rangefeedCancel := context.WithCancel(ctx)
 	rangefeedCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(rangefeedCtx,
-		tracing.NewTracer(),
+		tc.Server(1).TracerI().(*tracing.Tracer),
 		"rangefeed over non-voter")
 	defer getRecAndFinish()
 
@@ -218,13 +250,12 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	require.NoError(t, err)
 
 	rangefeedErrChan := make(chan error, 1)
-	eventCh := make(chan *roachpb.RangeFeedEvent, 1000)
+	eventCh := make(chan kvcoord.RangeFeedMessage, 1000)
 	go func() {
 		rangefeedErrChan <- ds.RangeFeed(
 			rangefeedCtx,
-			desc.RSpan().AsRawSpanWithNoLocals(),
+			[]roachpb.Span{desc.RSpan().AsRawSpanWithNoLocals()},
 			startTS,
-			false, /* withDiff */
 			eventCh,
 		)
 	}()
@@ -239,5 +270,83 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	}
 	rangefeedCancel()
 	require.Regexp(t, "context canceled", <-rangefeedErrChan)
-	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRecAndFinish().String())
+	require.Regexp(t, `MuxRangeFeed starting for span .* replica .n2,s2.:\dNON_VOTER`,
+		getRecAndFinish().String())
+}
+
+// TestRangefeedWorksOnLivenessRange ensures that a rangefeed works as expected
+// on the liveness range, which uses an expiration-based lease.
+func TestRangefeedWorksOnLivenessRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Speed up node liveness heartbeats.
+	var raftCfg base.RaftConfig
+	raftCfg.SetDefaults()
+	raftCfg.RangeLeaseDuration = time.Second
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: raftCfg,
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	_, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
+	require.NoError(t, err)
+	_, err = tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+	require.NoError(t, err)
+
+	db := tc.Server(0).DB()
+	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
+	tc.Server(0)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	startTS := db.Clock().Now()
+	eventC := make(chan kvcoord.RangeFeedMessage)
+	errC := make(chan error, 1)
+	go func() {
+		errC <- ds.RangeFeed(ctx, []roachpb.Span{keys.NodeLivenessSpan}, startTS, eventC)
+	}()
+
+	// Wait for a liveness update.
+	var livenessEvent kvpb.RangeFeedValue
+	timeoutC := time.After(10 * time.Second)
+	for {
+		select {
+		case event := <-eventC:
+			if event.Val == nil {
+				continue
+			}
+			require.Equal(t, keys.NodeLivenessSpan, event.RegisteredSpan)
+			require.NotZero(t, event.Val.Value.Timestamp)
+			livenessEvent = *event.Val
+		case err := <-errC:
+			t.Fatalf("rangefeed unexpectedly exited with err=%v", err)
+		case <-timeoutC:
+			t.Fatal("timed out waiting for checkpoint")
+		}
+		break
+	}
+
+	// Wait for a checkpoint after the liveness update.
+	for {
+		select {
+		case event := <-eventC:
+			if checkpoint := event.Checkpoint; checkpoint == nil {
+				continue
+			} else if checkpoint.ResolvedTS.Less(livenessEvent.Value.Timestamp) {
+				continue
+			}
+		case err := <-errC:
+			t.Fatalf("rangefeed unexpectedly exited with err=%v", err)
+		case <-timeoutC:
+			t.Fatal("timed out waiting for checkpoint")
+		}
+		break
+	}
 }

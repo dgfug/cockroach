@@ -1,31 +1,31 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import _ from "lodash";
 import { assert } from "chai";
-import { mount, ReactWrapper } from "enzyme";
-import * as sinon from "sinon";
 import classNames from "classnames/bind";
+import { mount, ReactWrapper } from "enzyme";
+import each from "lodash/each";
+import sortBy from "lodash/sortBy";
+import sumBy from "lodash/sumBy";
+import React from "react";
+
+import styles from "src/sortabletable/sortabletable.module.scss";
 import {
   SortedTable,
   ColumnDescriptor,
   ISortedTablePagination,
   SortSetting,
 } from "src/sortedtable";
-import styles from "src/sortabletable/sortabletable.module.scss";
 
 const cx = classNames.bind(styles);
 
 class TestRow {
-  constructor(public name: string, public value: number) {}
+  constructor(
+    public name: string,
+    public value: number,
+  ) {}
 }
 
 const columns: ColumnDescriptor<TestRow>[] = [
@@ -40,7 +40,7 @@ const columns: ColumnDescriptor<TestRow>[] = [
     title: "second",
     cell: tr => tr.value.toString(),
     sort: tr => tr.value,
-    rollup: trs => _.sumBy(trs, tr => tr.value),
+    rollup: trs => sumBy(trs, tr => tr.value),
   },
 ];
 
@@ -85,8 +85,8 @@ function rowsOf(wrapper: ReactWrapper): Array<Array<string>> {
   return wrapper.find("tr").map(tr => tr.find("td").map(td => td.text()));
 }
 
-describe("<SortedTable>", function() {
-  it("renders the expected table structure.", function() {
+describe("<SortedTable>", function () {
+  it("renders the expected table structure.", function () {
     const wrapper = makeTable([new TestRow("test", 1)]);
     assert.lengthOf(wrapper.find("table"), 1, "one table");
     assert.lengthOf(wrapper.find("thead").find("tr"), 1, "one header row");
@@ -98,21 +98,21 @@ describe("<SortedTable>", function() {
     assert.lengthOf(wrapper.find("tbody"), 1, "tbody element");
   });
 
-  it("correctly uses onChangeSortSetting", function() {
-    const spy = sinon.spy();
+  it("correctly uses onChangeSortSetting", function () {
+    const spy = jest.fn();
     const wrapper = makeTable([new TestRow("test", 1)], undefined, spy);
     wrapper
       .find(`th.${cx("head-wrapper__cell")}`)
       .first()
       .simulate("click");
-    assert.isTrue(spy.calledOnce);
-    assert.deepEqual(spy.getCall(0).args[0], {
+    expect(spy).toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledWith({
       ascending: false,
       columnTitle: "first",
-    } as SortSetting);
+    });
   });
 
-  it("correctly sorts data based on sortSetting", function() {
+  it("correctly sorts data based on sortSetting", function () {
     const data = [
       new TestRow("c", 3),
       new TestRow("d", 4),
@@ -122,21 +122,15 @@ describe("<SortedTable>", function() {
     let wrapper = makeTable(data, undefined);
     const assertMatches = (expected: TestRow[]) => {
       const rows = wrapper.find("tbody");
-      _.each(expected, (rowData, dataIndex) => {
+      each(expected, (rowData, dataIndex) => {
         const row = rows.childAt(dataIndex);
         assert.equal(
-          row
-            .childAt(0)
-            .childAt(0)
-            .text(),
+          row.childAt(0).childAt(0).text(),
           rowData.name,
           "first columns match",
         );
         assert.equal(
-          row
-            .childAt(0)
-            .childAt(1)
-            .text(),
+          row.childAt(0).childAt(1).text(),
           rowData.value.toString(),
           "second columns match",
         );
@@ -147,18 +141,18 @@ describe("<SortedTable>", function() {
       ascending: true,
       columnTitle: "first",
     });
-    assertMatches(_.sortBy(data, r => r.name));
+    assertMatches(sortBy(data, r => r.name));
     wrapper.setProps({
       uiSortSetting: {
         ascending: true,
         columnTitle: "second",
       } as SortSetting,
     });
-    assertMatches(_.sortBy(data, r => r.value));
+    assertMatches(sortBy(data, r => r.value));
   });
 
-  describe("with expandableConfig", function() {
-    it("renders the expected table structure", function() {
+  describe("with expandableConfig", function () {
+    it("renders the expected table structure", function () {
       const wrapper = makeExpandableTable([new TestRow("test", 1)], undefined);
       assert.lengthOf(wrapper.find("table"), 1, "one table");
       assert.lengthOf(wrapper.find("thead").find("tr"), 1, "one header row");
@@ -181,7 +175,7 @@ describe("<SortedTable>", function() {
       );
     });
 
-    it("expands and collapses the clicked row", function() {
+    it("expands and collapses the clicked row", function () {
       const wrapper = makeExpandableTable([new TestRow("test", 1)], undefined);
       assert.lengthOf(
         wrapper.find(`.${cx("row-wrapper__row--expanded-area")}`),
@@ -217,7 +211,7 @@ describe("<SortedTable>", function() {
     });
   });
 
-  it("should correctly render rows with pagination and sort settings", function() {
+  it("should correctly render rows with pagination and sort settings", function () {
     const data = [
       new TestRow("c", 3),
       new TestRow("d", 4),
@@ -231,11 +225,7 @@ describe("<SortedTable>", function() {
     let rows = wrapper.find("tbody");
     assert.lengthOf(wrapper.find("tbody tr"), 2, "two body rows");
     assert.equal(
-      rows
-        .childAt(1)
-        .childAt(0)
-        .childAt(0)
-        .text(),
+      rows.childAt(1).childAt(0).childAt(0).text(),
       "d",
       "second row column at first page match",
     );
@@ -247,11 +237,7 @@ describe("<SortedTable>", function() {
     rows = wrapper.find("tbody");
     assert.lengthOf(wrapper.find("tbody tr"), 2, "two body rows");
     assert.equal(
-      rows
-        .childAt(0)
-        .childAt(0)
-        .childAt(0)
-        .text(),
+      rows.childAt(0).childAt(0).childAt(0).text(),
       "a",
       "first row column at seconds page match",
     );
@@ -267,11 +253,7 @@ describe("<SortedTable>", function() {
     );
     rows = wrapper.find("tbody");
     assert.equal(
-      rows
-        .childAt(1)
-        .childAt(0)
-        .childAt(0)
-        .text(),
+      rows.childAt(1).childAt(0).childAt(0).text(),
       "b",
       "second row column at first page match",
     );
@@ -287,17 +269,13 @@ describe("<SortedTable>", function() {
     );
     rows = wrapper.find("tbody");
     assert.equal(
-      rows
-        .childAt(0)
-        .childAt(0)
-        .childAt(0)
-        .text(),
+      rows.childAt(0).childAt(0).childAt(0).text(),
       "c",
       "first row column at seconds page match",
     );
   });
 
-  it("should update when pagination changes", function() {
+  it("should update when pagination changes", function () {
     const table = makeTable(
       [
         new TestRow("c", 3),

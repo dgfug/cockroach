@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -16,7 +11,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
 
 // selPermutation contains information about which permutation of selection
@@ -143,7 +138,7 @@ func genMergeJoinOps(inputFileContents string, wr io.Writer, jti joinTypeInfo) e
 		SelPermutations interface{}
 		JoinType        interface{}
 	}{
-		Overloads:       sameTypeComparisonOpToOverloads[tree.EQ],
+		Overloads:       sameTypeComparisonOpToOverloads[treecmp.EQ],
 		SelPermutations: selPermutations,
 		JoinType:        jti,
 	})

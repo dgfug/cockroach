@@ -1,17 +1,15 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { Checkbox, Select } from "antd";
-import Dropdown, { arrowRenderer } from "src/views/shared/components/dropdown";
-import React from "react";
 import classNames from "classnames";
+import React from "react";
+
+import { OutsideEventHandler } from "src/components/outsideEventHandler";
+import Dropdown, { arrowRenderer } from "src/views/shared/components/dropdown";
+
 import { NetworkFilter, NetworkSort } from "..";
 import "./filter.styl";
 
@@ -95,7 +93,7 @@ export class Filter extends React.Component<IFilterProps, IFilterState> {
             value.id === "cluster" ? "node" : value.id
           }(s)`}
           value={this.renderSelectValue(value.id)}
-          dropdownRender={_ => (
+          dropdownRender={() => (
             <div onMouseDown={e => e.preventDefault()}>
               <div className="select-selection__deselect">
                 <a onClick={this.onDeselect(value.id)}>Deselect all</a>
@@ -139,45 +137,58 @@ export class Filter extends React.Component<IFilterProps, IFilterState> {
       width >= containerLeft + 240 ? 0 : width - (containerLeft + 240);
     return (
       <div className="Filter-latency">
-        <Dropdown
-          title="Filter"
-          options={[]}
-          selected=""
-          className={classNames(
-            { dropdown__focused: opened },
-            dropDownClassName,
-          )}
-          content={
-            <div ref={this.rangeContainer} className="Range">
-              <div
-                className="click-zone"
-                onClick={() => this.setState({ opened: !opened })}
-              />
-              {opened && (
+        <OutsideEventHandler
+          onOutsideClick={() => this.setState({ opened: false })}
+        >
+          <Dropdown
+            title="Filter"
+            options={[]}
+            selected=""
+            className={classNames(
+              {
+                dropdown__focused: opened,
+              },
+              dropDownClassName,
+            )}
+            onDropdownClick={() => this.setState({ opened: !opened })}
+            content={
+              <div ref={this.rangeContainer} className="Range">
                 <div
-                  className="trigger-container"
-                  onClick={() => this.setState({ opened: false })}
+                  className="click-zone"
+                  onClick={() => {
+                    this.setState({ opened: !opened });
+                  }}
                 />
-              )}
-              <div className="trigger-wrapper">
-                <div
-                  className={`trigger Select ${(opened && "is-open") || ""}`}
-                >
-                  <div className="Select-control">
-                    <div className="Select-arrow-zone">
-                      {arrowRenderer({ isOpen: opened })}
+                {opened && (
+                  <div
+                    className="trigger-container"
+                    onClick={() => this.setState({ opened: false })}
+                  />
+                )}
+                <div className="trigger-wrapper">
+                  <div
+                    className={`trigger Select ${(opened && "is-open") || ""}`}
+                  >
+                    <div className="Select-control">
+                      <div className="Select-arrow-zone">
+                        {arrowRenderer({ isOpen: opened })}
+                      </div>
                     </div>
                   </div>
+                  {opened && (
+                    <div
+                      className="multiple-filter__selection"
+                      style={{ left }}
+                      onClick={e => e.stopPropagation()}
+                    >
+                      {this.renderSelect()}
+                    </div>
+                  )}
                 </div>
-                {opened && (
-                  <div className="multiple-filter__selection" style={{ left }}>
-                    {this.renderSelect()}
-                  </div>
-                )}
               </div>
-            </div>
-          }
-        />
+            }
+          />
+        </OutsideEventHandler>
       </div>
     );
   }

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -14,39 +9,41 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
@@ -57,12 +54,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 )
 
 // debugTSImportFile is the path to a file (containing data coming from
@@ -84,7 +82,7 @@ import (
 //
 // See #64329 for details.
 var debugTSImportFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_FILE", "")
-var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", debugTSImportFile+".yaml")
+var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", "")
 
 // startCmd starts a node by initializing the stores and joining
 // the cluster.
@@ -133,8 +131,14 @@ var serverCmds = append(StartCmds, mtStartSQLCmd)
 // customLoggingSetupCmds lists the commands that call setupLogging()
 // after other types of configuration.
 var customLoggingSetupCmds = append(
-	serverCmds, debugCheckLogConfigCmd, demoCmd, mtStartSQLProxyCmd, mtTestDirectorySvr, statementBundleRecreateCmd,
+	serverCmds, debugCheckLogConfigCmd, demoCmd, statementBundleRecreateCmd,
 )
+
+// RegisterCommandWithCustomLogging is used by cliccl to note commands which
+// want to suppress default logging setup.
+func RegisterCommandWithCustomLogging(cmd *cobra.Command) {
+	customLoggingSetupCmds = append(customLoggingSetupCmds, cmd)
+}
 
 func initBlockProfile() {
 	// Enable the block profile for a sample of mutex and channel operations.
@@ -175,27 +179,10 @@ func initTraceDir(ctx context.Context, dir string) {
 		// to the current directory (.). If running the process
 		// from a directory which is not writable, we won't
 		// be able to create a sub-directory here.
-		log.Warningf(ctx, "cannot create trace dir; traces will not be dumped: %+v", err)
+		err = errors.WithHint(err, "Try changing the CWD of the cockroach process to a writable directory.")
+		log.Warningf(ctx, "cannot create trace dir; traces will not be dumped: %v", err)
 		return
 	}
-}
-
-var cacheSizeValue = newBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
-var sqlSizeValue = newBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
-var diskTempStorageSizeValue = newBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
-
-func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, error) {
-	externalIODir := startCtx.externalIODir
-	if externalIODir == "" && !firstStore.InMemory {
-		externalIODir = filepath.Join(firstStore.Path, "extern")
-	}
-	if externalIODir == "" || externalIODir == "disabled" {
-		return "", nil
-	}
-	if !filepath.IsAbs(externalIODir) {
-		return "", errors.Errorf("%s path must be absolute", cliflags.ExternalIODir.Name)
-	}
-	return externalIODir, nil
 }
 
 func initTempStorageConfig(
@@ -210,16 +197,20 @@ func initTempStorageConfig(
 	// While we look, we also clean up any abandoned temporary directories. We
 	// don't know which store spec was used previously—and it may change if
 	// encryption gets enabled after the fact—so we check each store.
-	var specIdx = 0
+	specIdxDisk := -1
+	specIdxEncrypted := -1
 	for i, spec := range stores.Specs {
-		if spec.IsEncrypted() {
+		if spec.InMemory {
+			continue
+		}
+		if spec.IsEncrypted() && specIdxEncrypted == -1 {
 			// TODO(jackson): One store's EncryptionOptions may say to encrypt
 			// with a real key, while another store's say to use key=plain.
 			// This provides no guarantee that we'll use the encrypted one's.
-			specIdx = i
+			specIdxEncrypted = i
 		}
-		if spec.InMemory {
-			continue
+		if specIdxDisk == -1 {
+			specIdxDisk = i
 		}
 		recordPath := filepath.Join(spec.Path, server.TempDirsRecordFilename)
 		if err := fs.CleanupTempDirs(recordPath); err != nil {
@@ -228,6 +219,15 @@ func initTempStorageConfig(
 		}
 	}
 
+	// Use first store by default. This might be an in-memory store.
+	specIdx := 0
+	if specIdxEncrypted >= 0 {
+		// Prefer an encrypted store.
+		specIdx = specIdxEncrypted
+	} else if specIdxDisk >= 0 {
+		// Prefer a non-encrypted on-disk store.
+		specIdx = specIdxDisk
+	}
 	useStore := stores.Specs[specIdx]
 
 	var recordPath string
@@ -254,12 +254,12 @@ func initTempStorageConfig(
 		tempStorePercentageResolver = memoryPercentResolver
 	}
 	var tempStorageMaxSizeBytes int64
-	if err := diskTempStorageSizeValue.Resolve(
+	if err := startCtx.diskTempStorageSizeValue.Resolve(
 		&tempStorageMaxSizeBytes, tempStorePercentageResolver,
 	); err != nil {
 		return base.TempStorageConfig{}, err
 	}
-	if !diskTempStorageSizeValue.IsSet() {
+	if !startCtx.diskTempStorageSizeValue.IsSet() {
 		// The default temp storage size is different when the temp
 		// storage is in memory (which occurs when no temp directory
 		// is specified and the first store is in memory).
@@ -309,10 +309,12 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
+type newServerFn func(ctx context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverctl.ServerStartupInterface, error)
+
 var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockroach start' instead")
 
 func runStartSingleNode(cmd *cobra.Command, args []string) error {
-	joinFlag := flagSetForCmd(cmd).Lookup(cliflags.Join.Name)
+	joinFlag := cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.Join.Name)
 	if joinFlag.Changed {
 		return errCannotUseJoin
 	}
@@ -344,9 +346,42 @@ func runStartJoin(cmd *cobra.Command, args []string) error {
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
 //
-// If the argument startSingleNode is set the replication factor
-// will be set to 1 all zone configs (see initial_sql.go).
-func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnErr error) {
+// The argument startSingleNode is morally equivalent to `cmd ==
+// startSingleNodeCmd`, and triggers special initialization specific
+// to one-node clusters. See server/initial_sql.go for details.
+//
+// We need a separate argument instead of solely relying on cmd
+// because we cannot refer to startSingleNodeCmd under
+// runStartInternal: there would be a cyclic dependency between
+// runStart, runStartSingleNode and runStartSingleNodeCmd.
+func runStart(cmd *cobra.Command, args []string, startSingleNode bool) error {
+	const serverType redact.SafeString = "node"
+
+	newServerFn := func(_ context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverctl.ServerStartupInterface, error) {
+		// Beware of not writing simply 'return server.NewServer()'. This is
+		// because it would cause the serverctl.ServerStartupInterface reference to
+		// always be non-nil, even if NewServer returns a nil pointer (and
+		// an error). The code below is dependent on the interface
+		// reference remaining nil in case of error.
+		s, err := server.NewServer(serverCfg, stopper)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+
+	return runStartInternal(cmd, serverType, serverCfg.InitNode, newServerFn, startSingleNode)
+}
+
+// runStartInternal contains the code common to start a regular server
+// or a SQL-only server.
+func runStartInternal(
+	cmd *cobra.Command,
+	serverType redact.SafeString,
+	initConfigFn func(context.Context) error,
+	newServerFn newServerFn,
+	startSingleNode bool,
+) error {
 	tBegin := timeutil.Now()
 
 	// First things first: if the user wants background processing,
@@ -374,22 +409,9 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// the buffers in the signal handler below. If we started capturing
 	// signals later, some startup logging might be lost.
 	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, drainSignals...)
-
-	// SIGQUIT is handled differently: for SIGQUIT we spawn a goroutine
-	// and we always handle it, no matter at which point during
-	// execution we are. This makes it possible to use SIGQUIT to
-	// inspect a running process and determine what it is currently
-	// doing, even if it gets stuck somewhere.
-	if quitSignal != nil {
-		quitSignalCh := make(chan os.Signal, 1)
-		signal.Notify(quitSignalCh, quitSignal)
-		go func() {
-			for {
-				<-quitSignalCh
-				log.DumpStacks(context.Background())
-			}
-		}()
+	signal.Notify(signalCh, DrainSignals...)
+	if exitAbruptlySignal != nil {
+		signal.Notify(signalCh, exitAbruptlySignal)
 	}
 
 	// Check for stores with full disks and exit with an informative exit
@@ -402,21 +424,39 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 		return err
 	}
 
+	// If any store has something to say against a server start-up
+	// (e.g. previously detected corruption), listen to them now.
+	if err := serverCfg.Stores.PriorCriticalAlertError(); err != nil {
+		return clierror.NewError(err, exit.FatalError())
+	}
+
+	// Set a MakeProcessUnavailableFunc that will close all sockets. This guards
+	// against a persistent disk stall that prevents the process from exiting or
+	// making progress.
+	log.SetMakeProcessUnavailableFunc(closeAllSockets)
+
 	// Set up a cancellable context for the entire start command.
 	// The context will be canceled at the end.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up a tracing span for the start process.  We want any logging
-	// happening beyond this point to be accounted to this start
-	// context, including logging related to the initialization of
-	// the logging infrastructure below.
-	// This span concludes when the startup goroutine started below
-	// has completed.
-	// TODO(andrei): we don't close the span on the early returns below.
-	tracer := serverCfg.Tracer
-	startupSpan := tracer.StartSpan("server start")
-	ctx = tracing.ContextWithSpan(ctx, startupSpan)
+	// The context annotation ensures that server identifiers show up
+	// in the logging metadata as soon as they are known.
+	ambientCtx := serverCfg.AmbientCtx
+
+	// Annotate the context, and set up a tracing span for the start process.
+	//
+	// The context annotation ensures that server identifiers show up
+	// in the logging metadata as soon as they are known.
+	//
+	// The tracing span is because we want any logging happening beyond
+	// this point to be accounted to this start context, including
+	// logging related to the initialization of the logging
+	// infrastructure below.  This span concludes when the startup
+	// goroutine started below has completed.  TODO(andrei): we don't
+	// close the span on the early returns below.
+	var startupSpan *tracing.Span
+	ctx, startupSpan = ambientCtx.AnnotateCtxWithSpan(ctx, "server start")
 
 	// Set up the logging and profiling output.
 	//
@@ -434,16 +474,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	if err != nil {
 		return err
 	}
-
-	// If any store has something to say against a server start-up
-	// (e.g. previously detected corruption), listen to them now.
-	if err := serverCfg.Stores.PriorCriticalAlertError(); err != nil {
-		return clierror.NewError(err, exit.FatalError())
-	}
-
-	// We don't care about GRPCs fairly verbose logs in most client commands,
-	// but when actually starting a server, we enable them.
-	grpcutil.LowerSeverity(severity.WARNING)
+	stopper.SetTracer(serverCfg.BaseConfig.AmbientCtx.Tracer)
 
 	// Tweak GOMAXPROCS if we're in a cgroup / container that has cpu limits set.
 	// The GO default for GOMAXPROCS is NumCPU(), however this is less
@@ -453,37 +484,140 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// GOMAXPROCS(0) by now.
 	cgroups.AdjustMaxProcs(ctx)
 
+	fs := cliflagcfg.FlagSetForCmd(cmd)
+
 	// Check the --join flag.
-	if !flagSetForCmd(cmd).Lookup(cliflags.Join.Name).Changed {
+	if fl := fs.Lookup(cliflags.Join.Name); fl != nil && !fl.Changed {
 		err := errors.WithHint(
 			errors.New("no --join flags provided to 'cockroach start'"),
 			"Consider using 'cockroach init' or 'cockroach start-single-node' instead")
 		return err
 	}
 
+	// Check the --tenant-id-file flag.
+	if fl := fs.Lookup(cliflags.TenantIDFile.Name); fl != nil && fl.Changed {
+		fileName := fl.Value.String()
+		serverCfg.DelayedSetTenantID = func(
+			ctx context.Context,
+		) (roachpb.TenantID, roachpb.Locality, error) {
+			tenantID, err := tenantIDFromFile(ctx, fileName, nil, nil, nil)
+			if err != nil {
+				return roachpb.TenantID{}, roachpb.Locality{}, err
+			}
+			if err := tryReadLocalityFileFlag(fs); err != nil {
+				return roachpb.TenantID{}, roachpb.Locality{}, err
+			}
+			return tenantID, serverCfg.Locality, nil
+		}
+	}
+
 	// Now perform additional configuration tweaks specific to the start
 	// command.
 
-	// Derive temporary/auxiliary directory specifications.
-	if serverCfg.Settings.ExternalIODir, err = initExternalIODir(ctx, serverCfg.Stores.Specs[0]); err != nil {
+	// Set the soft memory limit on the Go runtime.
+	if err = func() error {
+		if startCtx.goMemLimitValue.IsSet() {
+			if goMemLimit < 0 {
+				return errors.New("--max-go-memory must be non-negative")
+			} else if goMemLimit > 0 && goMemLimit < defaultGoMemLimitMinValue {
+				log.Ops.Shoutf(
+					ctx, severity.WARNING, "--max-go-memory (%s) is smaller "+
+						"than the recommended minimum (%s), consider increasing it",
+					humanizeutil.IBytes(goMemLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+				)
+			}
+		} else {
+			if envVarLimitString, envVarSet := envutil.ExternalEnvString("GOMEMLIMIT", 1); envVarSet {
+				// When --max-go-memory is not specified, but the env var is
+				// set, we don't change it, so we just log a warning if the
+				// value is too small.
+				envVarLimit, err := humanizeutil.ParseBytes(envVarLimitString)
+				if err != nil {
+					return errors.Wrapf(err, "couldn't parse GOMEMLIMIT value %s", envVarLimitString)
+				}
+				if envVarLimit < defaultGoMemLimitMinValue {
+					log.Ops.Shoutf(
+						ctx, severity.WARNING, "GOMEMLIMIT (%s) is smaller "+
+							"than the recommended minimum (%s), consider increasing it",
+						humanizeutil.IBytes(envVarLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+					)
+				}
+				return nil
+			}
+			// If --max-go-memory wasn't specified, we set it to a reasonable
+			// default value.
+			goMemLimit = getDefaultGoMemLimit(ctx)
+		}
+		if goMemLimit == 0 {
+			// Value of 0 indicates that the soft memory limit should be
+			// disabled.
+			goMemLimit = math.MaxInt64
+		} else {
+			log.Ops.Infof(ctx, "soft memory limit of Go runtime is set to %s", humanizeutil.IBytes(goMemLimit))
+		}
+		debug.SetMemoryLimit(goMemLimit)
+		return nil
+	}(); err != nil {
 		return err
 	}
 
-	if serverCfg.TempStorageConfig, err = initTempStorageConfig(
-		ctx, serverCfg.Settings, stopper, serverCfg.Stores,
-	); err != nil {
+	// Set the GC target percent on the Go runtime.
+	if err := func() error {
+		var goGCPercent int
+		if fs.Changed(cliflags.GoGCPercent.Name) {
+			goGCPercent = startCtx.goGCPercent
+		} else {
+			if _, envVarSet := envutil.ExternalEnvString("GOGC", 1); envVarSet {
+				// When --go-gc-percent is not specified but the env var is, we defer to
+				// the env var.
+				return nil
+			}
+			// When neither the --go-gc-percent flag nor the GOGC env var is set,
+			// increase the GC target percent to 300% (default 100%) to reduce the
+			// frequency of GC cycles. However, only do so if a soft memory limit is
+			// also configured, to avoid introducing OOMs.
+			goMemLimit := debug.SetMemoryLimit(-1 /* get without adjusting */)
+			if goMemLimit == math.MaxInt64 {
+				// If the soft memory limit is disabled, don't adjust the GC percent.
+				// Leave it at the default 100%.
+				return nil
+			}
+			goGCPercent = 300
+		}
+		var goGCPercentStr redact.RedactableString
+		if goGCPercent < 0 {
+			goGCPercentStr = `"off"`
+		} else {
+			goGCPercentStr = redact.Sprintf("%d%%", goGCPercent)
+		}
+		log.Ops.Infof(ctx, "GC target percentage of Go runtime is set to %s", goGCPercentStr)
+		debug.SetGCPercent(goGCPercent)
+		return nil
+	}(); err != nil {
 		return err
-	}
-
-	if serverCfg.StorageEngine == enginepb.EngineTypeDefault {
-		serverCfg.StorageEngine = enginepb.EngineTypePebble
 	}
 
 	// Initialize the node's configuration from startup parameters.
 	// This also reads the part of the configuration that comes from
 	// environment variables.
-	if err := serverCfg.InitNode(ctx); err != nil {
-		return errors.Wrap(err, "failed to initialize node")
+	if err := initConfigFn(ctx); err != nil {
+		return errors.Wrapf(err, "failed to initialize %s", serverType)
+	}
+
+	st := serverCfg.BaseConfig.Settings
+
+	// Derive temporary/auxiliary directory specifications.
+	st.ExternalIODir = startCtx.externalIODir
+
+	if serverCfg.SQLConfig.TempStorageConfig, err = initTempStorageConfig(
+		ctx, st, stopper, serverCfg.Stores,
+	); err != nil {
+		return err
+	}
+
+	// Configure the default storage engine.
+	if serverCfg.StorageEngine == enginepb.EngineTypeDefault {
+		serverCfg.StorageEngine = enginepb.EngineTypePebble
 	}
 
 	// The configuration is now ready to report to the user and the log
@@ -495,66 +629,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// ReadyFn will be called when the server has started listening on
 	// its network sockets, but perhaps before it has done bootstrapping
 	// and thus before Start() completes.
-	serverCfg.ReadyFn = func(waitForInit bool) {
-		// Inform the user if the network settings are suspicious. We need
-		// to do that after starting to listen because we need to know
-		// which advertise address NewServer() has decided.
-		hintServerCmdFlags(ctx, cmd)
-
-		// If another process was waiting on the PID (e.g. using a FIFO),
-		// this is when we can tell them the node has started listening.
-		if startCtx.pidFile != "" {
-			log.Ops.Infof(ctx, "PID file: %s", startCtx.pidFile)
-			if err := ioutil.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
-				log.Ops.Errorf(ctx, "failed writing the PID: %v", err)
-			}
-		}
-
-		// If the invoker has requested an URL update, do it now that
-		// the server is ready to accept SQL connections.
-		// (Note: as stated above, ReadyFn is called after the server
-		// has started listening on its socket, but possibly before
-		// the cluster has been initialized and can start processing requests.
-		// This is OK for SQL clients, as the connection will be accepted
-		// by the network listener and will just wait/suspend until
-		// the cluster initializes, at which point it will be picked up
-		// and let the client go through, transparently.)
-		if startCtx.listeningURLFile != "" {
-			log.Ops.Infof(ctx, "listening URL file: %s", startCtx.listeningURLFile)
-			// (Re-)compute the client connection URL. We cannot do this
-			// earlier (e.g. above, in the runStart function) because
-			// at this time the address and port have not been resolved yet.
-			sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
-			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
-			if err != nil {
-				log.Errorf(ctx, "failed computing the URL: %v", err)
-				return
-			}
-
-			if err = ioutil.WriteFile(startCtx.listeningURLFile, []byte(fmt.Sprintf("%s\n", pgURL.ToPQ())), 0644); err != nil {
-				log.Ops.Errorf(ctx, "failed writing the URL: %v", err)
-			}
-		}
-
-		if waitForInit {
-			log.Ops.Shout(ctx, severity.INFO,
-				"initial startup completed.\n"+
-					"Node will now attempt to join a running cluster, or wait for `cockroach init`.\n"+
-					"Client connections will be accepted after this completes successfully.\n"+
-					"Check the log file(s) for progress. ")
-		}
-
-		// Ensure the configuration logging is written to disk in case a
-		// process is waiting for the sdnotify readiness to read important
-		// information from there.
-		log.Flush()
-
-		// Signal readiness. This unblocks the process when running with
-		// --background or under systemd.
-		if err := sdnotify.Ready(); err != nil {
-			log.Ops.Errorf(ctx, "failed to signal readiness using systemd protocol: %s", err)
-		}
-	}
+	serverCfg.ReadyFn = func(waitForInit bool) { reportReadinessExternally(ctx, cmd, waitForInit) }
 
 	// DelayedBootstrapFn will be called if the bootstrap process is
 	// taking a bit long.
@@ -568,7 +643,7 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 If problems persist, please see %s.`
 		docLink := docs.URL("cluster-setup-troubleshooting.html")
 		if !startCtx.inBackground {
-			log.Ops.Shoutf(context.Background(), severity.WARNING, msg, docLink)
+			log.Ops.Shoutf(ctx, severity.WARNING, msg, docLink)
 		} else {
 			// Don't shout to stderr since the server will have detached by
 			// the time this function gets called.
@@ -580,61 +655,169 @@ If problems persist, please see %s.`
 
 	// Beyond this point, the configuration is set and the server is
 	// ready to start.
-	log.Ops.Info(ctx, "starting cockroach node")
 
 	// Run the rest of the startup process in a goroutine separate from
 	// the main goroutine to avoid preventing proper handling of signals
 	// if we get stuck on something during initialization (#10138).
-	var serverStatusMu struct {
-		syncutil.Mutex
-		// Used to synchronize server startup with server shutdown if something
-		// interrupts the process during initialization (it isn't safe to try to
-		// drain a server that doesn't exist or is in the middle of starting up,
-		// or to start a server after draining has begun).
-		started, draining bool
+
+	srvStatus, serverShutdownReqC := createAndStartServerAsync(ctx,
+		tBegin, &serverCfg, stopper, startupSpan, newServerFn, startSingleNode, serverType)
+
+	return waitForShutdown(
+		// NB: we delay the access to s, as it is assigned
+		// asynchronously in a goroutine above.
+		stopper, serverShutdownReqC, signalCh,
+		srvStatus)
+}
+
+const (
+	// defaultGoMemLimitSQLMultiple determines the multiple of SQL memory pool
+	// size that we use in the calculation of the default value of the
+	// goMemLimit.
+	//
+	// Since not every memory allocation is registered with the memory
+	// accounting system of CRDB, we need to give it some room to prevent Go GC
+	// from being too aggressive to stay under the GOMEMLIMIT. The default
+	// multiple of 2.25x over the memory pool size should give enough room for
+	// those unaccounted for allocations.
+	defaultGoMemLimitSQLMultiple = 2.25
+
+	// Lower bound on the default value for goMemLimit. Lower bound has higher
+	// precedence that the upper bound when two bounds conflict with each other.
+
+	// defaultGoMemLimitMinValue determines the lower bound on the default value
+	// of the goMemLimit.
+	defaultGoMemLimitMinValue = 256 << 20 /* 256MiB */
+
+	// Upper bound on the default value for goMemLimit is computed as follows:
+	//
+	//   upper bound = 0.9 * SystemMemory - 1.15 * PebbleCache
+	//
+	// The rationale for this formula is as follows:
+	// - we don't want for the estimated max memory usage to exceed 90% of the
+	// available RAM to prevent the OOMs
+	// - Go runtime doesn't control the pebble cache, so we need to subtract it
+	// - anecdotally, the pebble cache can have some slop over its target size
+	// (perhaps, due to memory fragmentation), so we adjust the footprint of the
+	// cache by 15%.
+
+	// defaultGoMemLimitMaxTotalSystemMemUsage determines the maximum percentage
+	// of the system memory that goMemLimit and the pebble cache can use
+	// together.
+	defaultGoMemLimitMaxTotalSystemMemUsage = 0.9
+	// defaultGoMemLimitCacheSlopMultiple determines a "slop" multiple that we
+	// use on top of the pebble cache size when computing the upper bound.
+	defaultGoMemLimitCacheSlopMultiple = 1.15
+)
+
+// getDefaultGoMemLimit returns a reasonable default value for the soft memory
+// limit of the Go runtime based on SQL memory pool and the cache sizes (which
+// must be already set in serverCfg). It also warns the user in some cases when
+// suboptimal flags or hardware is detected.
+func getDefaultGoMemLimit(ctx context.Context) int64 {
+	sysMem, err := status.GetTotalMemory(ctx)
+	if err != nil {
+		return 0
 	}
-	var s *server.Server
-	errChan := make(chan error, 1)
+	maxGoMemLimit := int64(defaultGoMemLimitMaxTotalSystemMemUsage*float64(sysMem) -
+		defaultGoMemLimitCacheSlopMultiple*float64(serverCfg.CacheSize))
+	if maxGoMemLimit < defaultGoMemLimitMinValue {
+		// Most likely, --cache is set to at least 75% of available RAM which
+		// has already triggered a warning in maybeWarnMemorySizes(), so we
+		// don't shout here.
+		maxGoMemLimit = defaultGoMemLimitMinValue
+	}
+	limit := int64(defaultGoMemLimitSQLMultiple * float64(serverCfg.MemoryPoolSize))
+	if limit < defaultGoMemLimitMinValue {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "--max-sql-memory (%s) is set too low, "+
+				"consider increasing it", humanizeutil.IBytes(serverCfg.MemoryPoolSize),
+		)
+		limit = defaultGoMemLimitMinValue
+	}
+	if limit > maxGoMemLimit {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "recommended default value of "+
+				"--max-go-memory (%s) was truncated to %s, consider reducing "+
+				"--max-sql-memory (%s) and / or --cache (%s); total system/cgroup memory: %s.",
+			humanizeutil.IBytes(limit), humanizeutil.IBytes(maxGoMemLimit),
+			humanizeutil.IBytes(serverCfg.MemoryPoolSize),
+			humanizeutil.IBytes(serverCfg.CacheSize),
+			humanizeutil.IBytes(sysMem),
+		)
+		limit = maxGoMemLimit
+	}
+	return limit
+}
+
+// createAndStartServerAsync starts an async goroutine which instantiates
+// the server and starts it.
+// We run it in a separate goroutine because the instantiation&start
+// could block, and we want to retain the option to start shutting down
+// the process (e.g. via Ctrl+C on the terminal) even in that case.
+// The shutdown logic thus starts running asynchronously, via waitForShutdown,
+// concurrently with createAndStartServerAsync.
+//
+// The arguments are as follows:
+//   - tBegin: time when startup began; used to report statistics at the end of startup.
+//   - serverCfg: the server configuration.
+//   - stopper: the stopper used to start all the async tasks. This is the stopper
+//     used by the shutdown logic.
+//   - startupSpan: the tracing span for the context that was started earlier
+//     during startup. It needs to be finalized when the async goroutine completes.
+//   - newServerFn: a constructor function for the server object.
+//   - serverType: a title used for the type of server. This is used
+//     when reporting the startup messages on the terminal & logs.
+func createAndStartServerAsync(
+	ctx context.Context,
+	tBegin time.Time,
+	serverCfg *server.Config,
+	stopper *stop.Stopper,
+	startupSpan *tracing.Span,
+	newServerFn newServerFn,
+	startSingleNode bool,
+	serverType redact.SafeString,
+) (srvStatus *serverStatus, serverShutdownReqC <-chan serverctl.ShutdownRequest) {
+	var serverStatusMu serverStatus
+	var s serverctl.ServerStartupInterface
+	shutdownReqC := make(chan serverctl.ShutdownRequest, 1)
+
+	log.Ops.Infof(ctx, "starting cockroach %s", serverType)
+
 	go func() {
 		// Ensure that the log files see the startup messages immediately.
-		defer log.Flush()
+		defer log.FlushAllSync()
 		// If anything goes dramatically wrong, use Go's panic/recover
 		// mechanism to intercept the panic and log the panic details to
 		// the error reporting server.
 		defer func() {
+			var sv *settings.Values
 			if s != nil {
-				// We only attempt to log the panic details if the server has
-				// actually been started successfully. If there's no server,
-				// we won't know enough to decide whether reporting is
-				// permitted.
-				logcrash.RecoverAndReportPanic(ctx, &s.ClusterSettings().SV)
+				sv = &s.ClusterSettings().SV
+			}
+			if r := recover(); r != nil {
+				// This ensures that the panic, if any, is also reported on stderr.
+				// The settings.Values, if available, determines whether a Sentry
+				// report should be sent. No Sentry report is sent if sv is nil.
+				logcrash.ReportPanic(ctx, sv, r, 1 /* depth */)
+				panic(r)
 			}
 		}()
-		// When the start up goroutine completes, so can the start up span
-		// defined above.
+		// When the start up goroutine completes, so can the start up span.
 		defer startupSpan.Finish()
 
-		// Any error beyond this point should be reported through the
-		// errChan defined above. However, in Go the code pattern "if err
-		// != nil { return err }" is more common. Expecting contributors
-		// to remember to write "if err != nil { errChan <- err }" beyond
-		// this point is optimistic. To avoid any error, we capture all
-		// the error returns in a closure, and do the errChan reporting,
-		// if needed, when that function returns.
+		// Any error beyond this point is reported through shutdownReqC.
 		if err := func() error {
 			// Instantiate the server.
 			var err error
-			s, err = server.NewServer(serverCfg, stopper)
+			s, err = newServerFn(ctx, *serverCfg, stopper)
 			if err != nil {
 				return errors.Wrap(err, "failed to start server")
 			}
 
 			// Have we already received a signal to terminate? If so, just
 			// stop here.
-			serverStatusMu.Lock()
-			draining := serverStatusMu.draining
-			serverStatusMu.Unlock()
-			if draining {
+			if serverStatusMu.shutdownInProgress() {
 				return nil
 			}
 
@@ -652,22 +835,29 @@ If problems persist, please see %s.`
 				return errors.Wrap(err, "cockroach server exited with error")
 			}
 			// Server started, notify the shutdown monitor running concurrently.
-			serverStatusMu.Lock()
-			serverStatusMu.started = true
-			serverStatusMu.Unlock()
-
-			// Start up the diagnostics reporting and update check loops.
-			// We don't do this in (*server.Server).Start() because we don't
-			// want this overhead and possible interference in tests.
-			if !cluster.TelemetryOptOut() {
-				s.StartDiagnostics(ctx)
+			if shutdownInProgress := serverStatusMu.setStarted(s, stopper); shutdownInProgress {
+				// A shutdown was requested already, e.g. by sending SIGTERM to the process:
+				// maybeWaitForShutdown (which runs concurrently with this goroutine) has
+				// called serverStatusMu.startShutdown() already.
+				// However, because setStarted() had not been called before,
+				// maybeWaitForShutdown did not call Stop on the stopper.
+				// So we do it here.
+				stopper.Stop(ctx)
+				return nil
 			}
-			initialStart := s.InitialStart()
+			// After this point, if a shutdown is requested concurrently
+			// with the startup steps below, the stopper.Stop() method will
+			// be called by the shutdown goroutine, which in turn will cause
+			// all these startup steps to fail. So we do not need to look at
+			// the "shutdown status" in serverStatusMu any more.
 
-			// Run SQL for new clusters.
-			// TODO(knz): If/when we want auto-creation of an initial admin user,
-			// this can be achieved here.
-			if err := runInitialSQL(ctx, s, startSingleNode, "" /* adminUser */, "" /* adminPassword */); err != nil {
+			// Accept internal clients early, as RunInitialSQL might need it.
+			if err := s.AcceptInternalClients(ctx); err != nil {
+				return err
+			}
+
+			// Run one-off cluster initialization.
+			if err := s.RunInitialSQL(ctx, startSingleNode, "" /* adminUser */, "" /* adminPassword */); err != nil {
 				return err
 			}
 
@@ -678,128 +868,123 @@ If problems persist, please see %s.`
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			var buf redact.StringBuilder
-			info := build.GetInfo()
-			buf.Printf("CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
-			buf.Printf("build:\t%s %s @ %s (%s)\n",
-				redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
-			buf.Printf("webui:\t%s\n", serverCfg.AdminURL())
-
-			// (Re-)compute the client connection URL. We cannot do this
-			// earlier (e.g. above, in the runStart function) because
-			// at this time the address and port have not been resolved yet.
-			sCtx := rpc.MakeSecurityContext(serverCfg.Config, security.ClusterTLSSettings(serverCfg.Settings), roachpb.SystemTenantID)
-			pgURL, err := sCtx.PGURL(url.User(security.RootUser))
-			if err != nil {
-				log.Ops.Errorf(ctx, "failed computing the URL: %v", err)
-				return err
-			}
-			buf.Printf("sql:\t%s\n", pgURL.ToPQ())
-			buf.Printf("sql (JDBC):\t%s\n", pgURL.ToJDBC())
-
-			buf.Printf("RPC client flags:\t%s\n", clientFlagsRPC())
-			if len(serverCfg.SocketFile) != 0 {
-				buf.Printf("socket:\t%s\n", serverCfg.SocketFile)
-			}
-			logNum := 1
-			_ = cliCtx.logConfig.IterateDirectories(func(d string) error {
-				if logNum == 1 {
-					// Backward-compatibility.
-					buf.Printf("logs:\t%s\n", d)
-				} else {
-					buf.Printf("logs[%d]:\t%s\n", logNum, d)
-				}
-				logNum++
-				return nil
-			})
-			if serverCfg.Attrs != "" {
-				buf.Printf("attrs:\t%s\n", serverCfg.Attrs)
-			}
-			if len(serverCfg.Locality.Tiers) > 0 {
-				buf.Printf("locality:\t%s\n", serverCfg.Locality)
-			}
-			if s.TempDir() != "" {
-				buf.Printf("temp dir:\t%s\n", s.TempDir())
-			}
-			if ext := s.ClusterSettings().ExternalIODir; ext != "" {
-				buf.Printf("external I/O path: \t%s\n", ext)
-			} else {
-				buf.Printf("external I/O path: \t<disabled>\n")
-			}
-			for i, spec := range serverCfg.Stores.Specs {
-				buf.Printf("store[%d]:\t%s\n", i, spec)
-			}
-			buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
-			nodeID := s.NodeID()
-			if initialStart {
-				if nodeID == kvserver.FirstNodeID {
-					buf.Printf("status:\tinitialized new cluster\n")
-				} else {
-					buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
-				}
-			} else {
-				buf.Printf("status:\trestarted pre-existing node\n")
-			}
-
-			if baseCfg.ClusterName != "" {
-				buf.Printf("cluster name:\t%s\n", baseCfg.ClusterName)
-			}
-
-			// Remember the cluster ID for log file rotation.
-			clusterID := s.ClusterID().String()
-			log.SetNodeIDs(clusterID, int32(nodeID))
-			buf.Printf("clusterID:\t%s\n", clusterID)
-			buf.Printf("nodeID:\t%d\n", nodeID)
-
-			// Collect the formatted string and show it to the user.
-			msg, err := expandTabsInRedactableBytes(buf.RedactableBytes())
-			if err != nil {
-				return err
-			}
-			msgS := msg.ToString()
-			log.Ops.Infof(ctx, "node startup completed:\n%s", msgS)
-			if !startCtx.inBackground && !log.LoggingToStderr(severity.INFO) {
-				fmt.Print(msgS.StripMarkers())
-			}
-
-			return nil
+			return reportServerInfo(ctx, tBegin, serverCfg, s.ClusterSettings(),
+				serverType, s.InitialStart(), s.LogicalClusterID())
 		}(); err != nil {
-			errChan <- err
+			shutdownReqC <- serverctl.MakeShutdownRequest(
+				serverctl.ShutdownReasonServerStartupError, errors.Wrapf(err, "server startup failed"))
+		} else {
+			// Start a goroutine that watches for shutdown requests and notifies
+			// errChan.
+			go func() {
+				select {
+				case req := <-s.ShutdownRequested():
+					shutdownCtx := s.AnnotateCtx(context.Background())
+					log.Infof(shutdownCtx, "server requesting spontaneous shutdown: %v", req.ShutdownCause())
+					shutdownReqC <- req
+				case <-stopper.ShouldQuiesce():
+				}
+			}()
 		}
 	}()
 
-	// The remainder of the main function executes concurrently with the
-	// start up goroutine started above.
-	//
-	// It is concerned with determining when the server should stop
-	// because the main process is being shut down -- either via a stop
-	// message received from `cockroach quit` / `cockroach
-	// decommission`, or a signal.
+	serverShutdownReqC = shutdownReqC
+	srvStatus = &serverStatusMu
+	return srvStatus, serverShutdownReqC
+}
 
-	// We'll want to log any shutdown activity against a separate span.
-	shutdownSpan := tracer.StartSpan("server shutdown")
+// serverStatus coordinates the async goroutine that starts the server
+// up (e.g. in runStart) and the async goroutine that stops the server
+// (in waitForShutdown).
+//
+// We need this intermediate coordination because it isn't safe to try
+// to drain a server that doesn't exist or is in the middle of
+// starting up, or to start a server after shutdown has begun.
+type serverStatus struct {
+	syncutil.Mutex
+	// s is a reference to the server, to be used by the shutdown process. This
+	// starts as nil, and is set by setStarted(). Once set, a graceful shutdown
+	// should use a soft drain.
+	s serverctl.ServerShutdownInterface
+	// stopper is the server's stopper. This is set in setStarted(), together with
+	// `s`. The stopper is handed out to callers of startShutdown(), who will
+	// Stop() it.
+	stopper *stop.Stopper
+	// shutdownRequested indicates that shutdown has started
+	// already. After draining has become true, server startup should
+	// stop.
+	shutdownRequested bool
+}
+
+// setStarted marks the server as started. The serverStatus receives a reference
+// to the server and to the server's stopper. These references will be handed to
+// the shutdown process, which calls startShutdown(). In particular, the
+// shutdown process will take resposibility for calling stopper.Stop().
+//
+// setStarted returns whether shutdown has been requested already. If it has,
+// then the serverStatus does not take ownership of the stopper; the caller is
+// responsible for calling stopper.Stop().
+func (s *serverStatus) setStarted(
+	server serverctl.ServerShutdownInterface, stopper *stop.Stopper,
+) bool {
+	s.Lock()
+	defer s.Unlock()
+	if s.shutdownRequested {
+		return true
+	}
+	s.s = server
+	s.stopper = stopper
+	return false
+}
+
+// shutdownInProgress returns whether a shutdown has been requested
+// already.
+func (s *serverStatus) shutdownInProgress() bool {
+	s.Lock()
+	defer s.Unlock()
+	return s.shutdownRequested
+}
+
+// startShutdown registers the shutdown request and returns whether the server
+// was started already. If the server started, a reference to the server is also
+// returned, and a reference to the stopper that the caller needs to eventually
+// Stop().
+func (s *serverStatus) startShutdown() (bool, serverctl.ServerShutdownInterface, *stop.Stopper) {
+	s.Lock()
+	defer s.Unlock()
+	s.shutdownRequested = true
+	return s.s != nil, s.s, s.stopper
+}
+
+// waitForShutdown blocks until interrupted by a shutdown signal, which can come
+// in several forms:
+//   - a shutdown request coming from an internal module being signaled on
+//     shutdownC. This can be some internal error or a drain RPC.
+//   - receiving a Unix signal on signalCh.
+//   - a log.Fatal() call.
+//
+// Depending on what interruption is received, the server might be drained
+// before shutting down.
+func waitForShutdown(
+	stopper *stop.Stopper,
+	shutdownC <-chan serverctl.ShutdownRequest,
+	signalCh <-chan os.Signal,
+	serverStatusMu *serverStatus,
+) (returnErr error) {
+	shutdownCtx, shutdownSpan := serverCfg.AmbientCtx.AnnotateCtxWithSpan(context.Background(), "server shutdown")
 	defer shutdownSpan.Finish()
-	shutdownCtx := tracing.ContextWithSpan(context.Background(), shutdownSpan)
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
+	msgDrain := redact.SafeString("initiating graceful shutdown of server")
 
-	// Block until one of the signals above is received or the stopper
-	// is stopped externally (for example, via the quit endpoint).
 	select {
-	case err := <-errChan:
-		// StartAlwaysFlush both flushes and ensures that subsequent log
-		// writes are flushed too.
-		log.StartAlwaysFlush()
-		return err
-
-	case <-stopper.ShouldQuiesce():
-		// Server is being stopped externally and our job is finished
-		// here since we don't know if it's a graceful shutdown or not.
-		<-stopper.IsStopped()
-		// StartAlwaysFlush both flushes and ensures that subsequent log
-		// writes are flushed too.
-		log.StartAlwaysFlush()
-		return nil
+	case shutdownRequest := <-shutdownC:
+		returnErr = shutdownRequest.ShutdownCause()
+		drain := shutdownRequest.TerminateUsingGracefulDrain()
+		if !drain {
+			msgDrain = "initiating hard shutdown of server"
+		}
+		startShutdownAsync(serverStatusMu, stopWithoutDrain, drain)
 
 	case sig := <-signalCh:
 		// We start flushing log writes from here, because if a
@@ -808,9 +993,13 @@ If problems persist, please see %s.`
 		// timely, and we don't want logs to be lost.
 		log.StartAlwaysFlush()
 
+		if sig == exitAbruptlySignal {
+			log.Ops.Shoutf(shutdownCtx, severity.ERROR, "received signal '%s', exiting", redact.Safe(sig))
+			exit.WithCode(exit.Killed())
+		}
+
 		log.Ops.Infof(shutdownCtx, "received signal '%s'", sig)
-		switch sig {
-		case os.Interrupt:
+		if sig == os.Interrupt {
 			// Graceful shutdown after an interrupt should cause the process
 			// to terminate with a non-zero exit code; however SIGTERM is
 			// "legitimate" and should be acknowledged with a success exit
@@ -821,54 +1010,13 @@ If problems persist, please see %s.`
 				// INFO because a single interrupt is rather innocuous.
 				severity.INFO,
 			)
-			msgDouble := "Note: a second interrupt will skip graceful shutdown and terminate forcefully"
-			fmt.Fprintln(os.Stdout, msgDouble)
+			if !startCtx.inBackground {
+				msgDouble := "Note: a second interrupt will skip graceful shutdown and terminate forcefully"
+				fmt.Fprintln(os.Stdout, msgDouble)
+			}
 		}
 
-		// Start the draining process in a separate goroutine so that it
-		// runs concurrently with the timeout check below.
-		go func() {
-			serverStatusMu.Lock()
-			serverStatusMu.draining = true
-			drainingIsSafe := serverStatusMu.started
-			serverStatusMu.Unlock()
-
-			// drainingIsSafe may have been set in the meantime, but that's ok.
-			// In the worst case, we're not draining a Server that has *just*
-			// started. Not desirable, but not terrible either.
-			if !drainingIsSafe {
-				close(stopWithoutDrain)
-				return
-			}
-			// Don't use shutdownCtx because this is in a goroutine that may
-			// still be running after shutdownCtx's span has been finished.
-			ac := log.AmbientContext{}
-			ac.AddLogTag("server drain process", nil)
-			drainCtx := ac.AnnotateCtx(context.Background())
-
-			// Perform a graceful drain. We keep retrying forever, in
-			// case there are many range leases or some unavailability
-			// preventing progress. If the operator wants to expedite
-			// the shutdown, they will need to make it ungraceful
-			// via a 2nd signal.
-			for {
-				remaining, _, err := s.Drain(drainCtx)
-				if err != nil {
-					log.Ops.Errorf(drainCtx, "graceful drain failed: %v", err)
-					break
-				}
-				if remaining == 0 {
-					// No more work to do.
-					break
-				}
-				// Avoid a busy wait with high CPU usage if the server replies
-				// with an incomplete drain too quickly.
-				time.Sleep(200 * time.Millisecond)
-			}
-
-			stopper.Stop(drainCtx)
-		}()
-
+		startShutdownAsync(serverStatusMu, stopWithoutDrain, true /* shouldDrain */)
 	// Don't return: we're shutting down gracefully.
 
 	case <-log.FatalChan():
@@ -891,9 +1039,10 @@ If problems persist, please see %s.`
 	// stop. From this point on, we just have to wait until the server
 	// indicates it has stopped.
 
-	const msgDrain = "initiating graceful shutdown of server"
-	log.Ops.Info(shutdownCtx, msgDrain)
-	fmt.Fprintln(os.Stdout, msgDrain)
+	log.Ops.Infof(shutdownCtx, "%s", msgDrain)
+	if !startCtx.inBackground {
+		fmt.Fprintln(os.Stdout, msgDrain)
+	}
 
 	// Notify the user every 5 second of the shutdown progress.
 	go func() {
@@ -902,7 +1051,7 @@ If problems persist, please see %s.`
 		for {
 			select {
 			case <-ticker.C:
-				log.Ops.Infof(context.Background(), "%d running tasks", stopper.NumTasks())
+				log.Ops.Infof(shutdownCtx, "%d running tasks", stopper.NumTasks())
 			case <-stopper.IsStopped():
 				return
 			case <-stopWithoutDrain:
@@ -938,19 +1087,40 @@ If problems persist, please see %s.`
 			// shutdown process.
 			log.Ops.Shoutf(shutdownCtx, severity.ERROR,
 				"received signal '%s' during shutdown, initiating hard shutdown%s",
-				log.Safe(sig), log.Safe(hardShutdownHint))
+				redact.Safe(sig), redact.Safe(hardShutdownHint))
 			handleSignalDuringShutdown(sig)
 			panic("unreachable")
+
+		case shutdownRequest := <-shutdownC:
+			if shutdownRequest.TerminateUsingGracefulDrain() {
+				// Internal graceful drain request during graceful shutdown:
+				// continue the graceful shutdown.
+				log.Ops.Infof(shutdownCtx, "received additional shutdown request '%s'; continuing graceful shutdown", shutdownRequest.ShutdownCause())
+				continue
+			} else {
+				// A non-graceful shutdown request: we're done.
+				const msgDone = "internal error during drain; used hard shutdown instead"
+				returnErr = shutdownRequest.ShutdownCause()
+				log.Ops.Infof(shutdownCtx, "received additional shutdown request '%s'; initiating hard shutdown%s",
+					shutdownRequest.ShutdownCause(), redact.Safe(hardShutdownHint))
+				if !startCtx.inBackground {
+					fmt.Fprintln(os.Stdout, msgDone)
+				}
+			}
 
 		case <-stopper.IsStopped():
 			const msgDone = "server drained and shutdown completed"
 			log.Ops.Infof(shutdownCtx, msgDone)
-			fmt.Fprintln(os.Stdout, msgDone)
+			if !startCtx.inBackground {
+				fmt.Fprintln(os.Stdout, msgDone)
+			}
 
 		case <-stopWithoutDrain:
 			const msgDone = "too early to drain; used hard shutdown instead"
 			log.Ops.Infof(shutdownCtx, msgDone)
-			fmt.Fprintln(os.Stdout, msgDone)
+			if !startCtx.inBackground {
+				fmt.Fprintln(os.Stdout, msgDone)
+			}
 		}
 		break
 	}
@@ -958,36 +1128,195 @@ If problems persist, please see %s.`
 	return returnErr
 }
 
-// expandTabsInRedactableBytes expands tabs in the redactable byte
-// slice, so that columns are aligned. The correctness of this
-// function depends on the assumption that the `tabwriter` does not
-// replace characters.
-func expandTabsInRedactableBytes(s redact.RedactableBytes) (redact.RedactableBytes, error) {
-	var buf bytes.Buffer
-	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
-	if _, err := tw.Write([]byte(s)); err != nil {
-		return nil, err
+// startShutdown begins the process that stops the server, asynchronously.
+//
+// The shouldDrain argument indicates that the shutdown is happening
+// some time after server startup has completed, and we are thus
+// interested in being graceful to application load.
+func startShutdownAsync(
+	serverStatusMu *serverStatus, stopWithoutDrain chan<- struct{}, shouldDrain bool,
+) {
+	// StartAlwaysFlush both flushes and ensures that subsequent log
+	// writes are flushed too.
+	log.StartAlwaysFlush()
+
+	// Start the draining process in a separate goroutine so that it
+	// runs concurrently with the timeout check in waitForShutdown().
+	go func() {
+		// The return value of startShutdown indicates whether the
+		// server has started already, and the graceful shutdown should
+		// call the Drain method. We cannot call Drain if the server has
+		// not started yet.
+		canUseDrain, s, stopper := serverStatusMu.startShutdown()
+
+		if !canUseDrain {
+			// The server has not started yet. We can't use the Drain() call.
+			close(stopWithoutDrain)
+			return
+		}
+
+		// Don't use ctx because this is in a goroutine that may
+		// still be running after shutdownCtx's span has been finished.
+		drainCtx := logtags.AddTag(s.AnnotateCtx(context.Background()), "server drain process", nil)
+
+		if shouldDrain {
+			// Perform a graceful drain. This function keeps retrying and
+			// the call might never complete (e.g. due to some
+			// unavailability preventing progress). This is intentional. If
+			// the operator wants to expedite the shutdown, they will need
+			// to make it ungraceful by sending a second signal to the
+			// process, which will tickle the shortcut in waitForShutdown().
+			server.CallDrainServerSide(drainCtx, s.Drain)
+		}
+
+		stopper.Stop(drainCtx)
+	}()
+}
+
+// reportServerInfo prints out the server version and network details
+// in a standardized format.
+func reportServerInfo(
+	ctx context.Context,
+	startTime time.Time,
+	serverCfg *server.Config,
+	st *cluster.Settings,
+	serverType redact.SafeString,
+	initialStart bool,
+	tenantClusterID uuid.UUID,
+) error {
+	var buf redact.StringBuilder
+	info := build.GetInfo()
+	buf.Printf("CockroachDB %s starting at %s (took %0.1fs)\n", serverType, timeutil.Now(), timeutil.Since(startTime).Seconds())
+	buf.Printf("build:\t%s %s @ %s (%s)\n",
+		redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
+	buf.Printf("webui:\t%s\n", log.SafeManaged(serverCfg.AdminURL()))
+
+	// (Re-)compute the client connection URL. We cannot do this
+	// earlier (e.g. above, in the runStart function) because
+	// at this time the address and port have not been resolved yet.
+	clientConnOptions, serverParams := server.MakeServerOptionsForURL(serverCfg.Config)
+	pgURL, err := clientsecopts.MakeURLForServer(clientConnOptions, serverParams, url.User(username.RootUser))
+	if err != nil {
+		log.Ops.Errorf(ctx, "failed computing the URL: %v", err)
+		return err
 	}
-	if err := tw.Flush(); err != nil {
-		return nil, err
+	buf.Printf("sql:\t%s\n", log.SafeManaged(pgURL.ToPQ()))
+	buf.Printf("sql (JDBC):\t%s\n", log.SafeManaged(pgURL.ToJDBC()))
+
+	buf.Printf("RPC client flags:\t%s\n", log.SafeManaged(clientFlagsRPC()))
+	if len(serverCfg.SocketFile) != 0 {
+		buf.Printf("socket:\t%s\n", log.SafeManaged(serverCfg.SocketFile))
 	}
-	return redact.RedactableBytes(buf.Bytes()), nil
+	logNum := 1
+	_ = cliCtx.logConfig.IterateDirectories(func(d string) error {
+		if logNum == 1 {
+			// Backward-compatibility.
+			buf.Printf("logs:\t%s\n", log.SafeManaged(d))
+		} else {
+			buf.Printf("logs[%d]:\t%s\n", log.SafeManaged(logNum), log.SafeManaged(d))
+		}
+		logNum++
+		return nil
+	})
+	if serverCfg.Attrs != "" {
+		buf.Printf("attrs:\t%s\n", log.SafeManaged(serverCfg.Attrs))
+	}
+	if len(serverCfg.Locality.Tiers) > 0 {
+		buf.Printf("locality:\t%s\n", log.SafeManaged(serverCfg.Locality))
+	}
+	if tmpDir := serverCfg.SQLConfig.TempStorageConfig.Path; tmpDir != "" {
+		buf.Printf("temp dir:\t%s\n", log.SafeManaged(tmpDir))
+	}
+	if ext := st.ExternalIODir; ext != "" {
+		buf.Printf("external I/O path: \t%s\n", log.SafeManaged(ext))
+	} else {
+		buf.Printf("external I/O path: \t<disabled>\n")
+	}
+	for i, spec := range serverCfg.Stores.Specs {
+		buf.Printf("store[%d]:\t%s\n", i, log.SafeManaged(spec))
+	}
+	buf.Printf("storage engine: \t%s\n", &serverCfg.StorageEngine)
+
+	// Print the commong server identifiers.
+	if baseCfg.ClusterName != "" {
+		buf.Printf("cluster name:\t%s\n", log.SafeManaged(baseCfg.ClusterName))
+	}
+	clusterID := serverCfg.BaseConfig.ClusterIDContainer.Get()
+	if tenantClusterID.Equal(clusterID) {
+		buf.Printf("clusterID:\t%s\n", log.SafeManaged(clusterID))
+	} else {
+		buf.Printf("storage clusterID:\t%s\n", log.SafeManaged(clusterID))
+		buf.Printf("tenant clusterID:\t%s\n", log.SafeManaged(tenantClusterID))
+	}
+	nodeID := serverCfg.BaseConfig.IDContainer.Get()
+	if serverCfg.SQLConfig.TenantID.IsSystem() {
+		if initialStart {
+			if nodeID == kvstorage.FirstNodeID {
+				buf.Printf("status:\tinitialized new cluster\n")
+			} else {
+				buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
+			}
+		} else {
+			buf.Printf("status:\trestarted pre-existing node\n")
+		}
+		// Report the server identifiers.
+		buf.Printf("nodeID:\t%d\n", nodeID)
+	} else {
+		// Report the SQL server identifiers.
+		buf.Printf("tenantID:\t%s\n", serverCfg.SQLConfig.TenantID)
+		buf.Printf("instanceID:\t%d\n", nodeID)
+
+		if kvAddrs := serverCfg.SQLConfig.TenantKVAddrs; len(kvAddrs) > 0 {
+			// Report which KV servers are connected.
+			buf.Printf("KV addresses:\t")
+			comma := redact.SafeString("")
+			for _, addr := range serverCfg.SQLConfig.TenantKVAddrs {
+				buf.Printf("%s%s", comma, log.SafeManaged(addr))
+				comma = ", "
+			}
+			buf.Printf("\n")
+		}
+	}
+
+	// Collect the formatted string and show it to the user.
+	msg, err := util.ExpandTabsInRedactableBytes(buf.RedactableBytes())
+	if err != nil {
+		return err
+	}
+	msgS := msg.ToString()
+	log.Ops.Infof(ctx, "%s startup completed:\n%s", serverType, msgS)
+	if !startCtx.inBackground && !log.LoggingToStderr(severity.INFO) {
+		fmt.Print(msgS.StripMarkers())
+	}
+
+	return nil
 }
 
 func hintServerCmdFlags(ctx context.Context, cmd *cobra.Command) {
-	pf := flagSetForCmd(cmd)
+	pf := cliflagcfg.FlagSetForCmd(cmd)
 
-	listenAddrSpecified := pf.Lookup(cliflags.ListenAddr.Name).Changed || pf.Lookup(cliflags.ServerHost.Name).Changed
-	advAddrSpecified := pf.Lookup(cliflags.AdvertiseAddr.Name).Changed || pf.Lookup(cliflags.AdvertiseHost.Name).Changed
+	sqlAddrSpecified := pf.Lookup(cliflags.ListenSQLAddr.Name).Changed
+	if !sqlAddrSpecified {
+		log.Ops.Shoutf(ctx, severity.WARNING,
+			"Running a server without --sql-addr, with a combined RPC/SQL listener, is deprecated.\n"+
+				"This feature will be removed in a later version of CockroachDB.")
+	}
 
+	changed := func(flagName string) bool {
+		fl := pf.Lookup(flagName)
+		return fl != nil && fl.Changed
+	}
+
+	listenAddrSpecified := changed(cliflags.ListenAddr.Name) || changed(cliflags.ServerHost.Name)
+	advAddrSpecified := changed(cliflags.AdvertiseAddr.Name) || changed(cliflags.AdvertiseHost.Name)
 	if !listenAddrSpecified && !advAddrSpecified {
 		host, _, _ := net.SplitHostPort(serverCfg.AdvertiseAddr)
 		log.Ops.Shoutf(ctx, severity.WARNING,
 			"neither --listen-addr nor --advertise-addr was specified.\n"+
 				"The server will advertise %q to other nodes, is this routable?\n\n"+
 				"Consider using:\n"+
-				"- for local-only servers:  --listen-addr=localhost\n"+
-				"- for multi-node clusters: --advertise-addr=<host/IP addr>\n", host)
+				"- for local-only servers:  --listen-addr=localhost:36257 --sql-addr=localhost:26257\n"+
+				"- for multi-node clusters: --listen-addr=:36257 --sql-addr=:26257 --advertise-addr=<host/IP addr>\n", host)
 	}
 }
 
@@ -1014,32 +1343,35 @@ func reportConfiguration(ctx context.Context) {
 	// running as root in a multi-user environment, or using different
 	// uid/gid across runs in the same data directory. To determine
 	// this, it's easier if the information appears in the log file.
-	log.Ops.Infof(ctx, "process identity: %s", sysutil.ProcessIdentity())
+	log.Ops.Infof(ctx, "process identity: %s", log.SafeManaged(sysutil.ProcessIdentity()))
 }
 
 func maybeWarnMemorySizes(ctx context.Context) {
 	// Is the cache configuration OK?
-	if !cacheSizeValue.IsSet() {
+	if !startCtx.cacheSizeValue.IsSet() {
 		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", cacheSizeValue)
+		fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", &startCtx.cacheSizeValue)
 		fmt.Fprintf(&buf, "  A significantly larger value is usually needed for good performance.\n")
-		if size, err := status.GetTotalMemory(context.Background()); err == nil {
+		if size, err := status.GetTotalMemory(ctx); err == nil {
 			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=.25 (%s).",
 				humanizeutil.IBytes(size/4))
 		} else {
 			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
 		}
-		log.Ops.Warningf(ctx, "%s", buf.String())
+		log.Ops.Warningf(ctx, "%s", redact.Safe(buf.String()))
 	}
 
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
-		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize
+		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize + serverCfg.TimeSeriesServerConfig.QueryMemoryMax
+		// TODO(yuzefovich): we might want to adjust this warning higher now
+		// that GOMEMLIMIT is used.
 		maxRecommendedMem := int64(.75 * float64(maxMemory))
 		if requestedMem > maxRecommendedMem {
 			log.Ops.Shoutf(ctx, severity.WARNING,
-				"the sum of --max-sql-memory (%s) and --cache (%s) is larger than 75%% of total RAM (%s).\nThis server is running at increased risk of memory-related failures.",
-				sqlSizeValue, cacheSizeValue, humanizeutil.IBytes(maxRecommendedMem))
+				"the sum of --max-sql-memory (%s), --cache (%s), and --max-tsdb-memory (%s) is larger than 75%% of total RAM (%s).\nThis server is running at increased risk of memory-related failures.",
+				&startCtx.sqlSizeValue, &startCtx.cacheSizeValue, &startCtx.tsdbSizeValue,
+				humanizeutil.IBytes(maxRecommendedMem))
 		}
 	}
 }
@@ -1087,8 +1419,9 @@ disk space exhaustion may result in node loss.`, ballastPathsStr)
 // setupAndInitializeLoggingAndProfiling does what it says on the label.
 // Prior to this however it determines suitable defaults for the
 // logging output directory and the verbosity level of stderr logging.
-// We only do this for the "start" and "start-sql" commands which is why this work
-// occurs here and not in an OnInitialize function.
+// We only do this for special commands which do not use default logging like
+// "start" and "start-sql" commands which is why this work occurs here and not
+// in an OnInitialize function.
 func setupAndInitializeLoggingAndProfiling(
 	ctx context.Context, cmd *cobra.Command, isServerCmd bool,
 ) (stopper *stop.Stopper, err error) {
@@ -1103,7 +1436,7 @@ func setupAndInitializeLoggingAndProfiling(
 		if addr == "" {
 			addr = "any of your IP addresses"
 		}
-		log.Ops.Shoutf(context.Background(), severity.WARNING,
+		log.Ops.Shoutf(ctx, severity.WARNING,
 			"ALL SECURITY CONTROLS HAVE BEEN DISABLED!\n\n"+
 				"This mode is intended for non-production testing only.\n"+
 				"\n"+
@@ -1112,14 +1445,14 @@ func setupAndInitializeLoggingAndProfiling(
 				"- Intruders with access to your machine or network can observe client-server traffic.\n"+
 				"- Intruders can log in without password and read or write any data in the cluster.\n"+
 				"- Intruders can consume all your server's resources and cause unavailability.",
-			addr)
-		log.Ops.Shoutf(context.Background(), severity.INFO,
+			log.SafeManaged(addr))
+		log.Ops.Shoutf(ctx, severity.INFO,
 			"To start a secure server without mandating TLS for clients,\n"+
 				"consider --accept-sql-without-tls instead. For other options, see:\n\n"+
 				"- %s\n"+
 				"- %s",
-			build.MakeIssueURL(53404),
-			log.Safe(docs.URL("secure-a-cluster.html")),
+			redact.Safe(build.MakeIssueURL(53404)),
+			redact.Safe(docs.URL("secure-a-cluster.html")),
 		)
 	}
 
@@ -1132,8 +1465,8 @@ func setupAndInitializeLoggingAndProfiling(
 				"to databases, the --locality flag must contain a \"region\" tier.\n" +
 				"For more information, see:\n\n" +
 				"- %s"
-			log.Shoutf(context.Background(), severity.WARNING, warningString,
-				log.Safe(docs.URL("cockroach-start.html#locality")))
+			log.Shoutf(ctx, severity.WARNING, warningString,
+				redact.Safe(docs.URL("cockroach-start.html#locality")))
 		}
 	}
 
@@ -1142,78 +1475,18 @@ func setupAndInitializeLoggingAndProfiling(
 	// We log build information to stdout (for the short summary), but also
 	// to stderr to coincide with the full logs.
 	info := build.GetInfo()
-	log.Ops.Infof(ctx, "%s", info.Short())
-
-	initTraceDir(ctx, serverCfg.InflightTraceDirName)
-	initCPUProfile(ctx, serverCfg.CPUProfileDirName, serverCfg.Settings)
-	initBlockProfile()
-	initMutexProfile()
+	log.Ops.Infof(ctx, "%s", log.SafeManaged(info.Short()))
 
 	// Disable Stopper task tracking as performing that call site tracking is
 	// moderately expensive (certainly outweighing the infrequent benefit it
 	// provides).
 	stopper = stop.NewStopper()
+	initTraceDir(ctx, serverCfg.InflightTraceDirName)
+	initBlockProfile()
+	initMutexProfile()
 	log.Event(ctx, "initialized profiles")
 
 	return stopper, nil
-}
-
-func addrWithDefaultHost(addr string) (string, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", err
-	}
-	if host == "" {
-		host = "localhost"
-	}
-	return net.JoinHostPort(host, port), nil
-}
-
-// getClientGRPCConn returns a ClientConn, a Clock and a method that blocks
-// until the connection (and its associated goroutines) have terminated.
-func getClientGRPCConn(
-	ctx context.Context, cfg server.Config,
-) (*grpc.ClientConn, *hlc.Clock, func(), error) {
-	if ctx.Done() == nil {
-		return nil, nil, nil, errors.New("context must be cancellable")
-	}
-	// 0 to disable max offset checks; this RPC context is not a member of the
-	// cluster, so there's no need to enforce that its max offset is the same
-	// as that of nodes in the cluster.
-	clock := hlc.NewClock(hlc.UnixNano, 0)
-	stopper := stop.NewStopper()
-	rpcContext := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: cfg.Tracer},
-		Config:     cfg.Config,
-		Clock:      clock,
-		Stopper:    stopper,
-		Settings:   cfg.Settings,
-	})
-	if cfg.TestingKnobs.Server != nil {
-		rpcContext.Knobs = cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs
-	}
-	addr, err := addrWithDefaultHost(cfg.AdvertiseAddr)
-	if err != nil {
-		stopper.Stop(ctx)
-		return nil, nil, nil, err
-	}
-	// We use GRPCUnvalidatedDial() here because it does not matter
-	// to which node we're talking to.
-	conn, err := rpcContext.GRPCUnvalidatedDial(addr).Connect(ctx)
-	if err != nil {
-		stopper.Stop(ctx)
-		return nil, nil, nil, err
-	}
-	stopper.AddCloser(stop.CloserFn(func() {
-		_ = conn.Close() // nolint:grpcconnclose
-	}))
-
-	// Tie the lifetime of the stopper to that of the context.
-	closer := func() {
-		stopper.Stop(ctx)
-	}
-	return conn, clock, closer, nil
 }
 
 // initGEOS sets up the Geospatial library.
@@ -1221,8 +1494,76 @@ func getClientGRPCConn(
 func initGEOS(ctx context.Context) {
 	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {
-		log.Ops.Warningf(ctx, "could not initialize GEOS - spatial functions may not be available: %v", err)
+		log.Ops.Warningf(ctx,
+			"could not initialize GEOS - spatial functions may not be available: %v",
+			log.SafeManaged(err))
 	} else {
-		log.Ops.Infof(ctx, "GEOS loaded from directory %s", loc)
+		log.Ops.Infof(ctx, "GEOS loaded from directory %s", log.SafeManaged(loc))
+	}
+}
+
+// reportReadinessExternally reports when the server has finished initializing
+// and is ready to receive requests. This is useful for other processes on the
+// same machine (e.g. a process manager, a test) that are waiting for a signal
+// that they can start monitoring or using the server process.
+func reportReadinessExternally(ctx context.Context, cmd *cobra.Command, waitForInit bool) {
+	// Inform the user if the network settings are suspicious. We need
+	// to do that after starting to listen because we need to know
+	// which advertise address NewServer() has decided.
+	hintServerCmdFlags(ctx, cmd)
+
+	// If another process was waiting on the PID (e.g. using a FIFO),
+	// this is when we can tell them the node has started listening.
+	if startCtx.pidFile != "" {
+		log.Ops.Infof(ctx, "PID file: %s", startCtx.pidFile)
+		if err := os.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+			log.Ops.Errorf(ctx, "failed writing the PID: %v", err)
+		}
+	}
+
+	// If the invoker has requested an URL update, do it now that
+	// the server is ready to accept SQL connections.
+	// (Note: as stated above, ReadyFn is called after the server
+	// has started listening on its socket, but possibly before
+	// the cluster has been initialized and can start processing requests.
+	// This is OK for SQL clients, as the connection will be accepted
+	// by the network listener and will just wait/suspend until
+	// the cluster initializes, at which point it will be picked up
+	// and let the client go through, transparently.)
+	if startCtx.listeningURLFile != "" {
+		log.Ops.Infof(ctx, "listening URL file: %s", startCtx.listeningURLFile)
+		// (Re-)compute the client connection URL. We cannot do this
+		// earlier (e.g. above, in the runStart function) because
+		// at this time the address and port have not been resolved yet.
+		clientConnOptions, serverParams := server.MakeServerOptionsForURL(serverCfg.Config)
+		pgURL, err := clientsecopts.MakeURLForServer(clientConnOptions, serverParams, url.User(username.RootUser))
+		if err != nil {
+			log.Errorf(ctx, "failed computing the URL: %v", err)
+			return
+		}
+
+		if err = os.WriteFile(startCtx.listeningURLFile, []byte(fmt.Sprintf("%s\n", pgURL.ToPQ())), 0644); err != nil {
+			log.Ops.Errorf(ctx, "failed writing the URL: %v", err)
+		}
+	}
+
+	if waitForInit {
+		log.Ops.Shout(ctx, severity.INFO,
+			"initial startup completed.\n"+
+				"Node will now attempt to join a running cluster, or wait for `cockroach init`.\n"+
+				"Client connections will be accepted after this completes successfully.\n"+
+				"Check the log file(s) for progress. ")
+	}
+
+	// Try to signal readiness. This unblocks the process when running under
+	// systemd. Otherwise, it will be a no-op.
+	if err := sdnotify.Ready(func() {
+		// Ensure the configuration logging is written to disk in case a
+		// process is waiting for the sdnotify readiness to read important
+		// information from there. Given that this blocks and is only used for
+		// the sdnotify readiness, we will only run it conditionally.
+		log.FlushAllSync()
+	}); err != nil {
+		log.Ops.Errorf(ctx, "failed to signal readiness using systemd protocol: %s", err)
 	}
 }

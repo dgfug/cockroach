@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -32,12 +28,25 @@ type StopWatch struct {
 		// timeSource is the source of time used by the stop watch. It is always
 		// timeutil.Now except for tests.
 		timeSource func() time.Time
+		// cpuStopWatch is used to track CPU usage. It may be nil, in which case any
+		// operations on it are no-ops.
+		cpuStopWatch *cpuStopWatch
 	}
 }
 
 // NewStopWatch creates a new StopWatch.
 func NewStopWatch() *StopWatch {
 	return newStopWatch(Now)
+}
+
+// NewStopWatchWithCPU creates a new StopWatch that will track CPU usage in
+// addition to wall-clock time.
+func NewStopWatchWithCPU() *StopWatch {
+	w := newStopWatch(Now)
+	if grunning.Supported() {
+		w.mu.cpuStopWatch = &cpuStopWatch{}
+	}
+	return w
 }
 
 // NewTestStopWatch create a new StopWatch with the given time source. It is
@@ -59,6 +68,7 @@ func (w *StopWatch) Start() {
 	if !w.mu.started {
 		w.mu.started = true
 		w.mu.startedAt = w.mu.timeSource()
+		w.mu.cpuStopWatch.start()
 	}
 }
 
@@ -71,6 +81,7 @@ func (w *StopWatch) Stop() {
 	if w.mu.started {
 		w.mu.started = false
 		w.mu.elapsed += w.mu.timeSource().Sub(w.mu.startedAt)
+		w.mu.cpuStopWatch.stop()
 	}
 }
 
@@ -79,6 +90,23 @@ func (w *StopWatch) Elapsed() time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.mu.elapsed
+}
+
+// ElapsedCPU returns the total CPU time measured by the stop watch so far. It
+// returns zero if cpuStopWatch is nil (which is the case if NewStopWatchWithCPU
+// was not called or the platform does not support grunning).
+func (w *StopWatch) ElapsedCPU() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.mu.cpuStopWatch.elapsed()
+}
+
+// LastStartedAt returns the time the stopwatch was last started, and a bool
+// indicating if the stopwatch is currently started.
+func (w *StopWatch) LastStartedAt() (startedAt time.Time, started bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.mu.startedAt, w.mu.started
 }
 
 // TestTimeSource is a source of time that remembers when it was created (in

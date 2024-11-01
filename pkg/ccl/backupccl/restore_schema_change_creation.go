@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backupccl
 
@@ -16,12 +13,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -104,6 +101,9 @@ func jobDescriptionFromMutationID(
 					}
 				}
 				jobDescBuilder.WriteString(")")
+			case *descpb.DescriptorMutation_MaterializedViewRefresh:
+				jobDescBuilder.WriteString("refreshing materialized view with primary key ")
+				jobDescBuilder.WriteString(t.MaterializedViewRefresh.NewPrimaryIndex.Name)
 			default:
 				return "", 0, errors.Newf("unsupported mutation %+v, while restoring table %+v", m, tableDesc)
 			}
@@ -121,8 +121,8 @@ func createTypeChangeJobFromDesc(
 	ctx context.Context,
 	jr *jobs.Registry,
 	codec keys.SQLCodec,
-	txn *kv.Txn,
-	username security.SQLUsername,
+	txn isql.Txn,
+	user username.SQLUsername,
 	typ catalog.TypeDescriptor,
 ) error {
 	// Any non-public members in the type descriptor are accumulated as
@@ -136,7 +136,7 @@ func createTypeChangeJobFromDesc(
 	}
 	record := jobs.Record{
 		Description:   fmt.Sprintf("RESTORING: type %d", typ.GetID()),
-		Username:      username,
+		Username:      user,
 		DescriptorIDs: descpb.IDs{typ.GetID()},
 		Details: jobspb.TypeSchemaChangeDetails{
 			TypeID:               typ.GetID(),
@@ -162,13 +162,13 @@ func createSchemaChangeJobsFromMutations(
 	ctx context.Context,
 	jr *jobs.Registry,
 	codec keys.SQLCodec,
-	txn *kv.Txn,
-	username security.SQLUsername,
+	txn isql.Txn,
+	username username.SQLUsername,
 	tableDesc *tabledesc.Mutable,
 ) error {
 	mutationJobs := make([]descpb.TableDescriptor_MutationJob, 0, len(tableDesc.Mutations))
 	seenMutations := make(map[descpb.MutationID]bool)
-	for _, mutation := range tableDesc.Mutations {
+	for idx, mutation := range tableDesc.Mutations {
 		if seenMutations[mutation.MutationID] {
 			// We've already seen a mutation with this ID, so a job that handles all
 			// mutations with this ID has already been created.
@@ -182,7 +182,17 @@ func createSchemaChangeJobsFromMutations(
 		}
 		spanList := make([]jobspb.ResumeSpanList, mutationCount)
 		for i := range spanList {
-			spanList[i] = jobspb.ResumeSpanList{ResumeSpans: []roachpb.Span{tableDesc.PrimaryIndexSpan(codec)}}
+			mut := tableDesc.Mutations[idx+i]
+			// Index mutations with UseDeletePreservingEncoding are
+			// used as temporary indexes that are merged back into
+			// newly added indexes. Their resume spans are based on
+			// the index span itself since we iterate over the
+			// temporary index during the merge process.
+			if idx := mut.GetIndex(); idx != nil && idx.UseDeletePreservingEncoding {
+				spanList[i] = jobspb.ResumeSpanList{ResumeSpans: []roachpb.Span{tableDesc.IndexSpan(codec, idx.ID)}}
+			} else {
+				spanList[i] = jobspb.ResumeSpanList{ResumeSpans: []roachpb.Span{tableDesc.PrimaryIndexSpan(codec)}}
+			}
 		}
 		jobRecord := jobs.Record{
 			// We indicate that this schema change was triggered by a RESTORE since
@@ -207,7 +217,7 @@ func createSchemaChangeJobsFromMutations(
 		}
 		newMutationJob := descpb.TableDescriptor_MutationJob{
 			MutationID: mutationID,
-			JobID:      int64(jobID),
+			JobID:      jobID,
 		}
 		mutationJobs = append(mutationJobs, newMutationJob)
 

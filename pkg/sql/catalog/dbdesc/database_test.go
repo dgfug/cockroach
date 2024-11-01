@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package dbdesc
 
@@ -15,15 +10,20 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -72,7 +72,7 @@ func TestMakeDatabaseDesc(t *testing.T) {
 		t.Fatal(err)
 	}
 	const id = 17
-	desc := NewInitial(id, string(stmt.AST.(*tree.CreateDatabase).Name), security.AdminRoleName())
+	desc := NewInitial(id, string(stmt.AST.(*tree.CreateDatabase).Name), username.AdminRoleName())
 	if desc.GetName() != "test" {
 		t.Fatalf("expected Name == test, got %s", desc.GetName())
 	}
@@ -96,7 +96,7 @@ func TestValidateDatabaseDesc(t *testing.T) {
 			descpb.DatabaseDescriptor{
 				Name:       "db",
 				ID:         0,
-				Privileges: descpb.NewBaseDatabasePrivilegeDescriptor(security.RootUserName()),
+				Privileges: catpb.NewBaseDatabasePrivilegeDescriptor(username.RootUserName()),
 			},
 		},
 		{
@@ -105,7 +105,7 @@ func TestValidateDatabaseDesc(t *testing.T) {
 				Name:         "multi-region-db",
 				ID:           200,
 				RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{},
-				Privileges:   descpb.NewBaseDatabasePrivilegeDescriptor(security.RootUserName()),
+				Privileges:   catpb.NewBaseDatabasePrivilegeDescriptor(username.RootUserName()),
 			},
 		},
 	}
@@ -113,7 +113,7 @@ func TestValidateDatabaseDesc(t *testing.T) {
 		t.Run(d.err, func(t *testing.T) {
 			desc := NewBuilder(&d.desc).BuildImmutable()
 			expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), d.err)
-			if err := catalog.ValidateSelf(desc); err == nil {
+			if err := validate.Self(clusterversion.TestingClusterVersion, desc); err == nil {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, d.desc)
 			} else if expectedErr != err.Error() {
 				t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, expectedErr, err)
@@ -155,16 +155,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 			},
 		},
 		{ // 2
-			desc: descpb.DatabaseDescriptor{
-				ID:   51,
-				Name: "db1",
-				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
-					"schema1": {ID: 53, Dropped: true},
-				},
-			},
-		},
-		{ // 3
-			err: `schema mapping entry "schema1" (500): referenced schema ID 500: descriptor not found`,
+			err: `schema mapping entry "schema1" (500): referenced schema ID 500: referenced descriptor not found`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
 				Name: "db1",
@@ -173,7 +164,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 4
+		{ // 3
 			err: `schema mapping entry "schema1" (52): schema name is actually "foo"`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -190,7 +181,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 5
+		{ // 4
 			err: `schema mapping entry "schema1" (52): schema parentID is actually 500`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -207,8 +198,8 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 6
-			err: `multi-region enum: referenced type ID 500: descriptor not found`,
+		{ // 5
+			err: `multi-region enum: referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
 				Name: "db1",
@@ -218,7 +209,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 7
+		{ // 6
 			err: `multi-region enum: parentID is actually 500`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -233,7 +224,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ParentID: 500,
 			},
 		},
-		{ // 8
+		{ // 7
 			err: `schema mapping entry "schema1" (53): referenced schema ID 53: descriptor is a *typedesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -247,7 +238,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ParentID: 51,
 			},
 		},
-		{ // 9
+		{ // 8
 			err: `multi-region enum: referenced type ID 53: descriptor is a *schemadesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -268,27 +259,23 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		privilege := descpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
-		descs := catalog.MakeMapDescGetter()
+		privilege := catpb.NewBasePrivilegeDescriptor(username.AdminRoleName())
+		var cb nstree.MutableCatalog
 		test.desc.Privileges = privilege
 		desc := NewBuilder(&test.desc).BuildImmutable()
-		descs.Descriptors[test.desc.ID] = desc
+		cb.UpsertDescriptor(desc)
 		test.multiRegionEnum.Privileges = privilege
-		descs.Descriptors[test.multiRegionEnum.ID] = typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable()
+		cb.UpsertDescriptor(typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable())
 		for _, schemaDesc := range test.schemaDescs {
 			schemaDesc.Privileges = privilege
-			descs.Descriptors[schemaDesc.ID] = schemadesc.NewBuilder(&schemaDesc).BuildImmutable()
+			cb.UpsertDescriptor(schemadesc.NewBuilder(&schemaDesc).BuildImmutable())
 		}
-		for _, desc := range descs.Descriptors {
-			namespaceKey := descpb.NameInfo{
-				ParentID:       desc.GetParentID(),
-				ParentSchemaID: desc.GetParentSchemaID(),
-				Name:           desc.GetName(),
-			}
-			descs.Namespace[namespaceKey] = desc.GetID()
-		}
+		_ = cb.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			cb.UpsertNamespaceEntry(desc, desc.GetID(), desc.GetModificationTime())
+			return nil
+		})
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
-		results := catalog.Validate(ctx, descs, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
+		results := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, validate.Write, desc)
 		if err := results.CombinedError(); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, test.desc)
@@ -299,29 +286,183 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 	}
 }
 
-// TestFixDroppedSchemaName tests fixing a corrupted descriptor as part of
-// RunPostDeserializationChanges. It tests for a particular corruption that
-// happened when a schema was dropped that had the same name as its parent
-// database name.
-func TestFixDroppedSchemaName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	const (
-		dbName = "foo"
-		dbID   = 1
-	)
-	dbDesc := descpb.DatabaseDescriptor{
-		Name: dbName,
-		ID:   dbID,
-		Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
-			dbName: {ID: dbID, Dropped: true},
+func TestMaybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(t *testing.T) {
+	tests := []struct {
+		privilegeDesc          catpb.PrivilegeDescriptor
+		defaultPrivilegeDesc   catpb.DefaultPrivilegeDescriptor
+		privileges             privilege.List
+		incompatiblePrivileges privilege.List
+		shouldChange           bool
+		users                  []username.SQLUsername
+	}{
+		{ // 0
+			privilegeDesc:          catpb.PrivilegeDescriptor{},
+			defaultPrivilegeDesc:   catpb.DefaultPrivilegeDescriptor{},
+			privileges:             privilege.List{privilege.SELECT},
+			incompatiblePrivileges: privilege.List{privilege.SELECT},
+			shouldChange:           true,
+			users: []username.SQLUsername{
+				username.MakeSQLUsernameFromPreNormalizedString("test"),
+			},
+		},
+		{ // 1
+			privilegeDesc:        catpb.PrivilegeDescriptor{},
+			defaultPrivilegeDesc: catpb.DefaultPrivilegeDescriptor{},
+			privileges: privilege.List{
+				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.ZONECONFIG,
+			},
+			incompatiblePrivileges: privilege.List{},
+			shouldChange:           false,
+			users: []username.SQLUsername{
+				username.MakeSQLUsernameFromPreNormalizedString("test"),
+			},
+		},
+		{ // 2
+			privilegeDesc:          catpb.PrivilegeDescriptor{},
+			defaultPrivilegeDesc:   catpb.DefaultPrivilegeDescriptor{},
+			privileges:             privilege.List{privilege.SELECT, privilege.INSERT, privilege.UPDATE, privilege.DELETE},
+			incompatiblePrivileges: privilege.List{privilege.SELECT, privilege.INSERT, privilege.UPDATE, privilege.DELETE},
+			shouldChange:           true,
+			users: []username.SQLUsername{
+				username.MakeSQLUsernameFromPreNormalizedString("test"),
+			},
+		},
+		{ // 3
+			privilegeDesc:          catpb.PrivilegeDescriptor{},
+			defaultPrivilegeDesc:   catpb.DefaultPrivilegeDescriptor{},
+			privileges:             privilege.List{privilege.SELECT},
+			incompatiblePrivileges: privilege.List{privilege.SELECT},
+			shouldChange:           true,
+			users: []username.SQLUsername{
+				username.MakeSQLUsernameFromPreNormalizedString("test"),
+				username.MakeSQLUsernameFromPreNormalizedString("foo"),
+			},
+		},
+		{ // 4
+			privilegeDesc:        catpb.PrivilegeDescriptor{},
+			defaultPrivilegeDesc: catpb.DefaultPrivilegeDescriptor{},
+			privileges: privilege.List{
+				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.ZONECONFIG,
+			},
+			incompatiblePrivileges: privilege.List{},
+			shouldChange:           false,
+			users: []username.SQLUsername{
+				username.MakeSQLUsernameFromPreNormalizedString("test"),
+				username.MakeSQLUsernameFromPreNormalizedString("foo"),
+			},
 		},
 	}
-	b := NewBuilder(&dbDesc)
-	require.NoError(t, b.RunPostDeserializationChanges(ctx, nil))
-	desc := b.BuildCreatedMutableDatabase()
-	require.Truef(t, desc.HasPostDeserializationChanges(), "expected changes in descriptor, found none")
-	_, ok := desc.Schemas[dbName]
-	require.Falsef(t, ok, "erroneous entry exists")
+
+	for _, test := range tests {
+		for _, testUser := range test.users {
+			test.privilegeDesc.Grant(testUser, test.privileges, false /* withGrantOption */)
+		}
+
+		shouldChange := maybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(&test.privilegeDesc, &test.defaultPrivilegeDesc)
+		require.Equal(t, shouldChange, test.shouldChange)
+
+		for _, testUser := range test.users {
+			for _, priv := range test.incompatiblePrivileges {
+				// Check that the incompatible privileges are removed from the
+				// PrivilegeDescriptor.
+				if test.privilegeDesc.CheckPrivilege(testUser, priv) {
+					t.Errorf("found incompatible privilege %s", priv.DisplayName())
+				}
+
+				forAllRoles := test.defaultPrivilegeDesc.
+					FindOrCreateUser(catpb.DefaultPrivilegesRole{ForAllRoles: true})
+				// Check that the incompatible privileges have been converted to the
+				// equivalent default privileges.
+				if !forAllRoles.DefaultPrivilegesPerObject[privilege.Tables].CheckPrivilege(testUser, priv) {
+					t.Errorf(
+						"expected incompatible privilege %s to be converted to a default privilege",
+						priv.DisplayName(),
+					)
+				}
+			}
+		}
+	}
+}
+
+func TestStripDanglingBackReferencesAndRoles(t *testing.T) {
+	type testCase struct {
+		name                           string
+		input, expectedOutput          descpb.DatabaseDescriptor
+		validIDs                       catalog.DescriptorIDSet
+		strippedDanglingBackReferences bool
+		strippedNonExistentRoles       bool
+	}
+
+	badOwnerPrivilege := catpb.NewBaseDatabasePrivilegeDescriptor(username.MakeSQLUsernameFromPreNormalizedString("dropped_user"))
+	goodOwnerPrivilege := catpb.NewBaseDatabasePrivilegeDescriptor(username.AdminRoleName())
+	badPrivilege := catpb.NewBaseDatabasePrivilegeDescriptor(username.RootUserName())
+	goodPrivilege := catpb.NewBaseDatabasePrivilegeDescriptor(username.RootUserName())
+	badPrivilege.Users = append(badPrivilege.Users, catpb.UserPrivileges{
+		UserProto: username.TestUserName().EncodeProto(),
+	})
+	testData := []testCase{
+		{
+			name: "schema",
+			input: descpb.DatabaseDescriptor{
+				Name: "foo",
+				ID:   100,
+				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
+					"bar": {ID: 101},
+					"baz": {ID: 12345},
+				},
+				Privileges: badPrivilege,
+			},
+			expectedOutput: descpb.DatabaseDescriptor{
+				Name: "foo",
+				ID:   100,
+				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
+					"bar": {ID: 101},
+				},
+				Privileges: goodPrivilege,
+			},
+			validIDs:                       catalog.MakeDescriptorIDSet(100, 101),
+			strippedDanglingBackReferences: true,
+			strippedNonExistentRoles:       true,
+		},
+		{
+			name: "missing owner",
+			input: descpb.DatabaseDescriptor{
+				Name: "foo",
+				ID:   100,
+				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
+					"bar": {ID: 101},
+				},
+				Privileges: badOwnerPrivilege,
+			},
+			expectedOutput: descpb.DatabaseDescriptor{
+				Name: "foo",
+				ID:   100,
+				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
+					"bar": {ID: 101},
+				},
+				Privileges: goodOwnerPrivilege,
+			},
+			validIDs:                 catalog.MakeDescriptorIDSet(100, 101),
+			strippedNonExistentRoles: true,
+		},
+	}
+
+	for _, test := range testData {
+		t.Run(test.name, func(t *testing.T) {
+			b := NewBuilder(&test.input)
+			require.NoError(t, b.RunPostDeserializationChanges())
+			out := NewBuilder(&test.expectedOutput)
+			require.NoError(t, out.RunPostDeserializationChanges())
+			require.NoError(t, b.StripDanglingBackReferences(test.validIDs.Contains, func(id jobspb.JobID) bool {
+				return false
+			}))
+			require.NoError(t, b.StripNonExistentRoles(func(role username.SQLUsername) bool {
+				return role.IsAdminRole() || role.IsPublicRole() || role.IsRootUser() || role.IsNodeUser()
+			}))
+			desc := b.BuildCreatedMutableDatabase()
+			require.Equal(t, test.strippedDanglingBackReferences, desc.GetPostDeserializationChanges().Contains(catalog.StrippedDanglingBackReferences))
+			require.Equal(t, test.strippedNonExistentRoles, desc.GetPostDeserializationChanges().Contains(catalog.StrippedNonExistentRoles))
+			require.Equal(t, out.BuildCreatedMutableDatabase().DatabaseDesc(), desc.DatabaseDesc())
+		})
+	}
 }

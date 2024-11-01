@@ -1,18 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-// This package generated the hardcoded spatial ref sys mapping based
-// on a given data set.
+// This package generates the ref sys mapping based on a given data set as a
+// json.gz file (with the schema defined in the embeddedproj package).
 //
 // Sample run:
-// go run ./pkg/cmd/generate-spatial-ref-sys --src='/tmp/srids.csv' --dest='./pkg/geo/geoprojbase/projections.go' --template="./pkg/cmd/generate-spatial-ref-sys/generate.tmpl"
+//   # In PostgreSQL w/ PostGIS installed, run `copy spatial_ref_sys to '/tmp/srids.csv' DELIMITER ';' CSV HEADER;`
+//   go run ./pkg/cmd/generate-spatial-ref-sys --src='/tmp/srids.csv' --dest='./pkg/geo/geoprojbase/data/proj.json.gz'
 
 package main
 
@@ -23,24 +19,22 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoproj"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase/embeddedproj"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var (
@@ -51,84 +45,37 @@ var (
 	)
 	flagDEST = flag.String(
 		"dest",
-		"",
-		"The resulting map file.",
-	)
-	flagTemplate = flag.String(
-		"template",
-		"generate.tmpl",
-		"Which template file to use",
+		"proj.json.gz",
+		"The resulting .json.gz file.",
 	)
 )
 
-type templateVars struct {
-	Year        int
-	Package     string
-	Projections []projection
-	Spheroids   []spheroid
-}
-
-type projectionBounds struct {
-	MinX string
-	MaxX string
-	MinY string
-	MaxY string
-}
-
-type projection struct {
-	SRID      string
-	AuthName  string
-	AuthSRID  string
-	SRText    string
-	Proj4Text string
-	Bounds    *projectionBounds
-
-	IsLatLng        bool
-	SpheroidVarName string
-}
-
-type spheroid struct {
-	VarName    string
-	MajorAxis  string
-	Flattening string
-}
-
 func main() {
 	flag.Parse()
-	tmplVars := getTemplateVars()
 
-	tmpl, err := template.ParseFiles(*flagTemplate)
-	if err != nil {
-		log.Fatal(err)
-	}
+	data := buildData()
 
 	out, err := os.Create(*flagDEST)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	if err := tmpl.Execute(out, tmplVars); err != nil {
+	if err := embeddedproj.Encode(data, out); err != nil {
 		log.Fatal(err)
 	}
 
 	if err := out.Close(); err != nil {
 		log.Fatal(err)
 	}
-
-	if err := exec.Command("crlfmt", "-w", "-tab", "2", *flagDEST).Run(); err != nil {
-		log.Fatal(err)
-	}
 }
 
-func getTemplateVars() templateVars {
+func buildData() embeddedproj.Data {
 	type spheroidKey struct {
 		majorAxis           float64
 		eccentricitySquared float64
 	}
-	foundSpheroids := make(map[spheroidKey]string)
+	foundSpheroids := make(map[spheroidKey]int64)
 	var mu syncutil.Mutex
-	var projections []projection
-	var spheroids []spheroid
+	var d embeddedproj.Data
 
 	g := ctxgroup.WithContext(context.Background())
 	records := readRecords()
@@ -149,27 +96,33 @@ func getTemplateVars() templateVars {
 					continue
 				}
 
-				key := spheroidKey{s.Radius, s.Flattening}
-				mu.Lock()
-				spheroidVarName, ok := foundSpheroids[key]
-				if !ok {
-					hash := sha256.Sum256([]byte(
-						strconv.FormatFloat(s.Radius, 'f', -1, 64) + "," + strconv.FormatFloat(s.Flattening, 'f', -1, 64),
-					))
-					spheroidVarName = fmt.Sprintf(`spheroid%s`, strings.ToUpper(fmt.Sprintf("%x", hash[:6])))
-					foundSpheroids[key] = spheroidVarName
-					spheroids = append(
-						spheroids,
-						spheroid{
-							VarName:    spheroidVarName,
-							MajorAxis:  strconv.FormatFloat(s.Radius, 'f', -1, 64),
-							Flattening: strconv.FormatFloat(s.Flattening, 'f', -1, 64),
-						},
-					)
-				}
-				mu.Unlock()
+				key := spheroidKey{s.Radius(), s.Flattening()}
+				spheroidHash := func() int64 {
+					mu.Lock()
+					defer mu.Unlock()
+					sphHash, ok := foundSpheroids[key]
+					if !ok {
+						shaBytes := sha256.Sum256([]byte(
+							strconv.FormatFloat(s.Radius(), 'f', -1, 64) + "," + strconv.FormatFloat(s.Flattening(), 'f', -1, 64),
+						))
+						sphHash = 0
+						for _, b := range shaBytes[:6] {
+							sphHash = (sphHash << 8) | int64(b)
+						}
+						foundSpheroids[key] = sphHash
+						d.Spheroids = append(
+							d.Spheroids,
+							embeddedproj.Spheroid{
+								Hash:       sphHash,
+								Radius:     s.Radius(),
+								Flattening: s.Flattening(),
+							},
+						)
+					}
+					return sphHash
+				}()
 
-				var bounds *projectionBounds
+				var bounds embeddedproj.Bounds
 				if record[1] == "EPSG" {
 					var results struct {
 						Results []struct {
@@ -194,7 +147,7 @@ func getTemplateVars() templateVars {
 							return err
 						}
 
-						body, err := ioutil.ReadAll(resp.Body)
+						body, err := io.ReadAll(resp.Body)
 						resp.Body.Close()
 						if err != nil {
 							return err
@@ -262,30 +215,42 @@ func getTemplateVars() templateVars {
 					if skip {
 						continue
 					}
-					bounds = &projectionBounds{
-						MinX: strconv.FormatFloat(xCoords[0], 'f', -1, 64),
-						MaxX: strconv.FormatFloat(xCoords[3], 'f', -1, 64),
-						MinY: strconv.FormatFloat(yCoords[0], 'f', -1, 64),
-						MaxY: strconv.FormatFloat(yCoords[3], 'f', -1, 64),
+					bounds = embeddedproj.Bounds{
+						MinX: xCoords[0],
+						MaxX: xCoords[3],
+						MinY: yCoords[0],
+						MaxY: yCoords[3],
 					}
 				}
 
-				mu.Lock()
-				projections = append(
-					projections,
-					projection{
-						SRID:      record[0],
-						AuthName:  record[1],
-						AuthSRID:  record[2],
-						SRText:    record[3],
-						Proj4Text: proj4text,
+				srid, err := strconv.ParseInt(record[0], 0, 64)
+				if err != nil {
+					return err
+				}
 
-						Bounds:          bounds,
-						IsLatLng:        isLatLng,
-						SpheroidVarName: spheroidVarName,
-					},
-				)
-				mu.Unlock()
+				authSRID, err := strconv.ParseInt(record[2], 0, 64)
+				if err != nil {
+					return err
+				}
+
+				func() {
+					mu.Lock()
+					defer mu.Unlock()
+					d.Projections = append(
+						d.Projections,
+						embeddedproj.Projection{
+							SRID:      int(srid),
+							AuthName:  record[1],
+							AuthSRID:  int(authSRID),
+							SRText:    record[3],
+							Proj4Text: proj4text,
+
+							Bounds:   bounds,
+							IsLatLng: isLatLng,
+							Spheroid: spheroidHash,
+						},
+					)
+				}()
 			}
 			return nil
 		})
@@ -294,33 +259,19 @@ func getTemplateVars() templateVars {
 	if err := g.Wait(); err != nil {
 		log.Fatal(err)
 	}
-	sort.Slice(projections, func(i, j int) bool {
-		l, err := strconv.ParseInt(projections[i].SRID, 0, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-		r, err := strconv.ParseInt(projections[j].SRID, 0, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-		return l < r
+	sort.Slice(d.Projections, func(i, j int) bool {
+		return d.Projections[i].SRID < d.Projections[j].SRID
 	})
-	sort.Slice(spheroids, func(i, j int) bool {
-		return spheroids[i].VarName < spheroids[j].VarName
+	sort.Slice(d.Spheroids, func(i, j int) bool {
+		return d.Spheroids[i].Hash < d.Spheroids[j].Hash
 	})
-	pkgName := strings.Split(*flagDEST, "/")
-	return templateVars{
-		Year:        timeutil.Now().Year(),
-		Package:     pkgName[len(pkgName)-2],
-		Projections: projections,
-		Spheroids:   spheroids,
-	}
+	return d
 }
 
 func readRecords() [][]string {
 	in, err := os.Open(*flagSRC)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("cannot open CSV file '%s'", *flagSRC)
 	}
 	defer func() {
 		if err := in.Close(); err != nil {

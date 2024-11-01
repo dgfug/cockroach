@@ -1,18 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -29,8 +23,8 @@ type StorageTestingKnobs struct {
 	// Called after a lease is acquired, with any operation error.
 	LeaseAcquiredEvent func(desc catalog.Descriptor, err error)
 	// Called before waiting on a results from a DoChan call of acquireNodeLease
-	// in descriptorState.acquire() and descriptorState.acquireFreshestFromStore().
-	LeaseAcquireResultBlockEvent func(leaseBlockType AcquireBlockType, id descpb.ID)
+	// in Acquire and AcquireFreshestFromStore.
+	LeaseAcquireResultBlockEvent func(leaseBlockType AcquireType, id descpb.ID)
 	// RemoveOnceDereferenced forces leases to be removed
 	// as soon as they are dereferenced.
 	RemoveOnceDereferenced bool
@@ -52,15 +46,19 @@ type ManagerTestingKnobs struct {
 	// ignored.
 	TestingDescriptorUpdateEvent func(descriptor *descpb.Descriptor) error
 
+	// TestingBeforeAcquireLeaseDuringRefresh is a callback right before
+	// the lease manager attempts to acquire a lease for descriptor `id`.
+	TestingBeforeAcquireLeaseDuringRefresh func(id descpb.ID) error
+
 	// To disable the deletion of orphaned leases at server startup.
 	DisableDeleteOrphanedLeases bool
 
-	// VersionPollIntervalForRangefeeds controls the polling interval for the
-	// check whether the requisite version for rangefeed-based notifications has
-	// been finalized.
-	//
-	// TODO(ajwerner): Remove this and replace it with a callback.
-	VersionPollIntervalForRangefeeds time.Duration
+	// DisableRangeFeedCheckpoint is used to disable rangefeed checkpoints.
+	DisableRangeFeedCheckpoint bool
+
+	// RangeFeedReset channel is closed to indicate that the range feed
+	// has been reset.
+	RangeFeedResetChannel chan struct{}
 
 	LeaseStoreTestingKnobs StorageTestingKnobs
 }
@@ -93,4 +91,16 @@ func (m *Manager) TestingAcquireAndAssertMinVersion(
 // used by this lease manager.
 func (m *Manager) TestingOutstandingLeasesGauge() *metric.Gauge {
 	return m.storage.outstandingLeases
+}
+
+// TestingSessionBasedLeasesExpiredGauge returns the session based leases
+// expired gauge that is used by this lease manager.
+func (m *Manager) TestingSessionBasedLeasesExpiredGauge() *metric.Gauge {
+	return m.storage.sessionBasedLeasesExpired
+}
+
+// TestingSessionBasedLeasesWaitingToExpireGauge returns the session based leases
+// waiting to expire gauge that is used by this lease manager.
+func (m *Manager) TestingSessionBasedLeasesWaitingToExpireGauge() *metric.Gauge {
+	return m.storage.sessionBasedLeasesWaitingToExpire
 }

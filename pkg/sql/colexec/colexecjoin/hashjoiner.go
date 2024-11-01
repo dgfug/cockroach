@@ -1,18 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecjoin
 
 import (
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -21,7 +15,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -94,12 +90,12 @@ type hashJoinerSourceSpec struct {
 //
 // In the vectorized implementation of the build phase, the following tasks are
 // performed:
-// 1. The bucket number (hash value) of each key tuple is computed and stored
-//    into a buckets array.
-// 2. The values in the buckets array is normalized to fit within the hash table
-//    numBuckets.
-// 3. The bucket-chaining hash table organization is prepared with the computed
-//    buckets.
+//  1. The bucket number (hash value) of each key tuple is computed and stored
+//     into a buckets array.
+//  2. The values in the buckets array is normalized to fit within the hash table
+//     numBuckets.
+//  3. The bucket-chaining hash table organization is prepared with the computed
+//     buckets.
 //
 // Depending on the value of the spec.rightDistinct flag, there are two
 // variations of the probe phase. The planner will set rightDistinct to true if
@@ -108,57 +104,57 @@ type hashJoinerSourceSpec struct {
 // In the columnarized implementation of the distinct build table probe phase,
 // the following tasks are performed by the fastProbe function:
 //
-// 1. Compute the bucket number for each probe row's key tuple and store the
-//    results into the buckets array.
-// 2. In order to find the position of these key tuples in the hash table:
-// - First find the first element in the bucket's linked list for each key tuple
-//   and store it in the GroupID array. Initialize the ToCheck array with the
-//   full sequence of input indices (0...batchSize - 1).
-// - While ToCheck is not empty, each element in ToCheck represents a position
-//   of the key tuples for which the key has not yet been found in the hash
-//   table. Perform a multi-column equality check to see if the key columns
-//   match that of the build table's key columns at GroupID.
-// - Update the differs array to store whether or not the probe's key tuple
-//   matched the corresponding build's key tuple.
-// - Select the indices that differed and store them into ToCheck since they
-//   need to be further processed.
-// - For the differing tuples, find the next ID in that bucket of the hash table
-//   and put it into the GroupID array.
-// 3. Now, GroupID for every probe's key tuple contains the index of the
-//    matching build's key tuple in the hash table. Use it to project output
-//    columns from the has table to build the resulting batch.
+//  1. Compute the bucket number for each probe row's key tuple and store the
+//     results into the buckets array.
+//  2. In order to find the position of these key tuples in the hash table:
+//     - First find the first element in the bucket's linked list for each key tuple
+//     and store it in the ToCheckID array. Initialize the ToCheck array with the
+//     full sequence of input indices (0...batchSize - 1).
+//     - While ToCheck is not empty, each element in ToCheck represents a position
+//     of the key tuples for which the key has not yet been found in the hash
+//     table. Perform a multi-column equality check to see if the key columns
+//     match that of the build table's key columns at ToCheckID.
+//     - Update the differs array to store whether or not the probe's key tuple
+//     matched the corresponding build's key tuple.
+//     - Select the indices that differed and store them into ToCheck since they
+//     need to be further processed.
+//     - For the differing tuples, find the next ID in that bucket of the hash table
+//     and put it into the ToCheckID array.
+//  3. Now, ToCheckID for every probe's key tuple contains the index of the
+//     matching build's key tuple in the hash table. Use it to project output
+//     columns from the has table to build the resulting batch.
 //
 // In the columnarized implementation of the non-distinct build table probe
 // phase, the following tasks are performed by the probe function:
 //
-// 1. Compute the bucket number for each probe row's key tuple and store the
-//    results into the buckets array.
-// 2. In order to find the position of these key tuples in the hash table:
-// - First find the first element in the bucket's linked list for each key tuple
-//   and store it in the GroupID array. Initialize the ToCheck array with the
-//   full sequence of input indices (0...batchSize - 1).
-// - While ToCheck is not empty, each element in ToCheck represents a position
-//   of the key tuples for which the key has not yet been visited by any prior
-//   probe. Perform a multi-column equality check to see if the key columns
-//   match that of the build table's key columns at GroupID.
-// - Update the differs array to store whether or not the probe's key tuple
-//   matched the corresponding build's key tuple.
-// - For the indices that did not differ, we can lazily update the HashTable's
-//   same linked list to store a list of all identical keys starting at head.
-//   Once a key has been added to ht.Same, ht.Visited is set to true. For the
-//   indices that have never been visited, we want to continue checking this
-//   bucket for identical values by adding this key to ToCheck.
-// - Select the indices that differed and store them into ToCheck since they
-//   need to be further processed.
-// - For the differing tuples, find the next ID in that bucket of the hash table
-//   and put it into the GroupID array.
-// 3. Now, head stores the keyID of the first match in the build table for every
-//    probe table key. ht.Same is used to select all build key matches for each
-//    probe key, which are added to the resulting batch. Output batching is done
-//    to ensure that each batch is at most coldata.BatchSize().
+//  1. Compute the bucket number for each probe row's key tuple and store the
+//     results into the buckets array.
+//  2. In order to find the position of these key tuples in the hash table:
+//     - First find the first element in the bucket's linked list for each key tuple
+//     and store it in the ToCheckID array. Initialize the ToCheck array with the
+//     full sequence of input indices (0...batchSize - 1).
+//     - While ToCheck is not empty, each element in ToCheck represents a position
+//     of the key tuples for which the key has not yet been visited by any prior
+//     probe. Perform a multi-column equality check to see if the key columns
+//     match that of the build table's key columns at ToCheckID.
+//     - Update the differs array to store whether or not the probe's key tuple
+//     matched the corresponding build's key tuple.
+//     - For the indices that did not differ, we can lazily update the HashTable's
+//     Same linked list to store a list of all identical keys starting at head.
+//     Once a key has been added to ht.Same, ht.Visited is set to true. For the
+//     indices that have never been visited, we want to continue checking this
+//     bucket for identical values by adding this key to ToCheck.
+//     - Select the indices that differed and store them into ToCheck since they
+//     need to be further processed.
+//     - For the differing tuples, find the next ID in that bucket of the hash table
+//     and put it into the ToCheckID array.
+//  3. Now, head stores the keyID of the first match in the build table for every
+//     probe table key. ht.Same is used to select all build key matches for each
+//     probe key, which are added to the resulting batch. Output batching is done
+//     to ensure that each batch is at most coldata.BatchSize().
 //
 // In the case that an outer join on the probe table side is performed, every
-// single probe row is kept even if its GroupID is 0. If a GroupID of 0 is
+// single probe row is kept even if its ToCheckID is 0. If a ToCheckID of 0 is
 // found, this means that the matching build table row should be all NULL. This
 // is done by setting probeRowUnmatched at that row to true.
 //
@@ -167,11 +163,11 @@ type hashJoinerSourceSpec struct {
 // all build table rows that have never been matched and stitching it together
 // with NULL values on the probe side.
 type hashJoiner struct {
-	*joinHelper
+	colexecop.TwoInputInitHelper
 
-	// buildSideAllocator should be used when building the hash table from the
+	// hashTableAllocator should be used when building the hash table from the
 	// right input.
-	buildSideAllocator *colmem.Allocator
+	hashTableAllocator *colmem.Allocator
 	// outputUnlimitedAllocator should *only* be used when populating the
 	// output when we have already fully built the hash table from the right
 	// input and are only populating output one batch at a time. If we were to
@@ -183,7 +179,7 @@ type hashJoiner struct {
 	spec HashJoinerSpec
 	// state stores the current state of the hash joiner.
 	state                      hashJoinerState
-	hashTableInitialNumBuckets uint64
+	hashTableInitialNumBuckets uint32
 	// ht holds the HashTable that is populated during the build phase and used
 	// during the probe phase.
 	ht *colexechash.HashTable
@@ -194,8 +190,8 @@ type hashJoiner struct {
 
 	// probeState is used in hjProbing state.
 	probeState struct {
-		// buildIdx and probeIdx represents the matching row indices that are used to
-		// stitch together the join results.
+		// buildIdx and probeIdx represents the matching row indices that are
+		// used to stitch together the join results.
 		buildIdx []int
 		probeIdx []int
 
@@ -204,17 +200,22 @@ type hashJoiner struct {
 		// be NULL on the build table. This indicates that the probe table row
 		// did not match any build table rows.
 		probeRowUnmatched []bool
-		// buildRowMatched is used in the case that spec.trackBuildMatches is true. This
-		// means that an outer join is performed on the build side and buildRowMatched
-		// marks all the build table rows that have been matched already. The rows
-		// that were unmatched are emitted during the hjEmittingRight phase.
+		// buildRowMatched is used in the case that spec.trackBuildMatches is
+		// true. This means that an outer join is performed on the build side
+		// and buildRowMatched marks all the build table rows that have been
+		// matched already. The rows that were unmatched are emitted during the
+		// hjEmittingRight phase.
+		//
+		// Note that this is the only slice in probeState of non-constant size
+		// (i.e. not limited by coldata.BatchSize() in capacity), so it's the
+		// only one we perform the memory accounting for.
 		buildRowMatched []bool
 
-		// buckets is used to store the computed hash value of each key in a single
-		// probe batch.
-		buckets []uint64
-		// prevBatch, if not nil, indicates that the previous probe input batch has
-		// not been fully processed.
+		// buckets is used to store the computed hash value of each key in a
+		// single probe batch.
+		buckets []uint32
+		// prevBatch, if not nil, indicates that the previous probe input batch
+		// has not been fully processed.
 		prevBatch coldata.Batch
 		// prevBatchResumeIdx indicates the index of the probe row to resume the
 		// collection from. It is used only in case of non-distinct build source
@@ -225,6 +226,18 @@ type hashJoiner struct {
 	// emittingRightState is used in hjEmittingRight state.
 	emittingRightState struct {
 		rowIdx int
+	}
+
+	// accountedFor tracks how much memory the hash joiner has accounted for so
+	// far related to some of the internal slices in the hash table.
+	accountedFor struct {
+		// hashtableSame tracks the current memory usage of hj.ht.Same.
+		hashtableSame int64
+		// hashtableVisited tracks the current memory usage of hj.ht.Visited.
+		hashtableVisited int64
+		// buildRowMatched tracks the current memory usage of
+		// hj.probeState.buildRowMatched.
+		buildRowMatched int64
 	}
 
 	exportBufferedState struct {
@@ -243,7 +256,7 @@ var _ colexecop.Resetter = &hashJoiner{}
 const HashJoinerInitialNumBuckets = 256
 
 func (hj *hashJoiner) Init(ctx context.Context) {
-	if !hj.init(ctx) {
+	if !hj.TwoInputInitHelper.Init(ctx) {
 		return
 	}
 
@@ -257,7 +270,8 @@ func (hj *hashJoiner) Init(ctx context.Context) {
 	const hashTableLoadFactor = 1.0
 	hj.ht = colexechash.NewHashTable(
 		ctx,
-		hj.buildSideAllocator,
+		hj.hashTableAllocator,
+		coldata.BatchSize(),
 		hashTableLoadFactor,
 		hj.hashTableInitialNumBuckets,
 		hj.spec.Right.SourceTypes,
@@ -267,7 +281,7 @@ func (hj *hashJoiner) Init(ctx context.Context) {
 		probeMode,
 	)
 
-	hj.exportBufferedState.rightWindowedBatch = hj.buildSideAllocator.NewMemBatchWithFixedCapacity(
+	hj.exportBufferedState.rightWindowedBatch = hj.outputUnlimitedAllocator.NewMemBatchWithFixedCapacity(
 		hj.spec.Right.SourceTypes, 0, /* size */
 	)
 	hj.state = hjBuilding
@@ -315,32 +329,59 @@ func (hj *hashJoiner) Next() coldata.Batch {
 }
 
 func (hj *hashJoiner) build() {
-	hj.ht.FullBuild(hj.inputTwo)
+	hj.ht.FullBuild(hj.InputTwo)
 
-	// We might have duplicates in the hash table, so we need to set up
-	// same and visited slices for the prober.
-	if !hj.spec.rightDistinct && !hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-		// We don't need same with LEFT ANTI and EXCEPT ALL joins because
-		// they have separate collectLeftAnti method.
-		hj.ht.Same = colexecutils.MaybeAllocateUint64Array(hj.ht.Same, hj.ht.Vals.Length()+1)
+	// At this point, we have fully built the hash table on the right side
+	// (meaning we have fully consumed the right input), so it'd be a shame to
+	// fall back to disk, thus, we use the unlimited allocator.
+	allocator := hj.outputUnlimitedAllocator
+
+	// If we might have duplicates in the hash table (meaning that rightDistinct
+	// is false), we need to set up Same and Visited slices for the prober
+	// (depending on the join type).
+	var needSame bool
+	// Visited slice is always used for set-operation joins, regardless of
+	// the fact whether the right side is distinct.
+	needVisited := hj.spec.JoinType.IsSetOpJoin()
+
+	if !hj.spec.rightDistinct {
+		switch hj.spec.JoinType {
+		case descpb.LeftAntiJoin, descpb.ExceptAllJoin, descpb.IntersectAllJoin:
+		default:
+			// We don't need Same with LEFT ANTI, EXCEPT ALL, and INTERSECT ALL
+			// joins because they have a separate collectSingleMatch method.
+			needSame = true
+			// Visited isn't needed for LEFT ANTI joins (it's used by EXCEPT ALL
+			// and INTERSECT ALL, but those cases are handled above already).
+			needVisited = true
+		}
 	}
-	if !hj.spec.rightDistinct || hj.spec.JoinType.IsSetOpJoin() {
-		// visited slice is also used for set-operation joins, regardless of
-		// the fact whether the right side is distinct.
+	if needSame {
+		hj.ht.Same = colexecutils.MaybeAllocateUint32Array(hj.ht.Same, hj.ht.Vals.Length()+1)
+		newAccountedFor := memsize.Uint32 * int64(cap(hj.ht.Same))
+		// hj.ht.Same will never shrink, so the delta is non-negative.
+		allocator.AdjustMemoryUsageAfterAllocation(newAccountedFor - hj.accountedFor.hashtableSame)
+		hj.accountedFor.hashtableSame = newAccountedFor
+	}
+
+	if needVisited {
 		hj.ht.Visited = colexecutils.MaybeAllocateBoolArray(hj.ht.Visited, hj.ht.Vals.Length()+1)
-		// Since keyID = 0 is reserved for end of list, it can be marked as visited
-		// at the beginning.
+		newAccountedFor := memsize.Bool * int64(cap(hj.ht.Visited))
+		// hj.ht.Visited will never shrink, so the delta is non-negative.
+		allocator.AdjustMemoryUsageAfterAllocation(newAccountedFor - hj.accountedFor.hashtableVisited)
+		hj.accountedFor.hashtableVisited = newAccountedFor
+		// Since keyID = 0 is reserved for end of list, it can be marked as
+		// visited at the beginning.
 		hj.ht.Visited[0] = true
 	}
 
 	if hj.spec.trackBuildMatches {
-		if cap(hj.probeState.buildRowMatched) < hj.ht.Vals.Length() {
-			hj.probeState.buildRowMatched = make([]bool, hj.ht.Vals.Length())
-		} else {
-			hj.probeState.buildRowMatched = hj.probeState.buildRowMatched[:hj.ht.Vals.Length()]
-			for n := 0; n < hj.ht.Vals.Length(); n += copy(hj.probeState.buildRowMatched[n:], colexecutils.ZeroBoolColumn) {
-			}
-		}
+		hj.probeState.buildRowMatched = colexecutils.MaybeAllocateBoolArray(hj.probeState.buildRowMatched, hj.ht.Vals.Length())
+		newAccountedFor := memsize.Bool * int64(cap(hj.probeState.buildRowMatched))
+		// hj.probeState.buildRowMatched will never shrink, so the delta is
+		// non-negative.
+		allocator.AdjustMemoryUsageAfterAllocation(newAccountedFor - hj.accountedFor.buildRowMatched)
+		hj.accountedFor.buildRowMatched = newAccountedFor
 	}
 
 	hj.state = hjProbing
@@ -412,7 +453,7 @@ func (hj *hashJoiner) emitRight(matched bool) {
 // in a single output batch (this is the case with non-distinct collectProbe*
 // methods).
 func (hj *hashJoiner) prepareForCollecting(batchSize int) {
-	if hj.spec.JoinType.IsRightSemiOrRightAnti() {
+	if !hj.spec.JoinType.ShouldIncludeLeftColsInOutput() {
 		// Right semi/anti joins have a separate collecting method that simply
 		// records the fact whether build rows had a match and don't need these
 		// probing slices.
@@ -426,17 +467,15 @@ func (hj *hashJoiner) prepareForCollecting(batchSize int) {
 	} else {
 		hj.probeState.probeIdx = hj.probeState.probeIdx[:batchSize]
 	}
-	if hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-		// Left anti and except all joins have special collectLeftAnti method
-		// that only uses probeIdx slice.
+	if hj.spec.JoinType.IsLeftAntiOrExceptAll() || hj.spec.JoinType == descpb.IntersectAllJoin {
+		// Left anti, except all, and intersect all joins have special
+		// collectSingleMatch method that only uses the probeIdx slice.
 		return
 	}
 	if hj.spec.JoinType.IsLeftOuterOrFullOuter() {
-		if cap(hj.probeState.probeRowUnmatched) < batchSize {
-			hj.probeState.probeRowUnmatched = make([]bool, batchSize)
-		} else {
-			hj.probeState.probeRowUnmatched = hj.probeState.probeRowUnmatched[:batchSize]
-		}
+		hj.probeState.probeRowUnmatched = colexecutils.MaybeAllocateLimitedBoolArray(
+			hj.probeState.probeRowUnmatched, batchSize,
+		)
 	}
 	if cap(hj.probeState.buildIdx) < batchSize {
 		hj.probeState.buildIdx = make([]int, batchSize)
@@ -471,7 +510,7 @@ func (hj *hashJoiner) exec() coldata.Batch {
 		// There were no matches in that batch, so we move on to the next one.
 	}
 	for {
-		batch := hj.inputOne.Next()
+		batch := hj.InputOne.Next()
 		batchSize := batch.Length()
 
 		if batchSize == 0 {
@@ -486,7 +525,7 @@ func (hj *hashJoiner) exec() coldata.Batch {
 
 		// First, we compute the hash values for all tuples in the batch.
 		if cap(hj.probeState.buckets) < batchSize {
-			hj.probeState.buckets = make([]uint64, batchSize)
+			hj.probeState.buckets = make([]uint32, batchSize)
 		} else {
 			// Note that we don't need to clear old values from buckets
 			// because the correct values will be populated in
@@ -495,68 +534,58 @@ func (hj *hashJoiner) exec() coldata.Batch {
 		}
 		hj.ht.ComputeBuckets(hj.probeState.buckets, hj.ht.Keys, batchSize, sel)
 
-		// Then, we initialize GroupID with the initial hash buckets and
-		// ToCheck with all applicable indices.
-		hj.ht.ProbeScratch.SetupLimitedSlices(batchSize, hj.ht.BuildMode)
+		// Then, we initialize ToCheckID with the initial hash buckets and
+		// ToCheck with all applicable indices. Notably, only probing tuples
+		// that have hash matches are included into ToCheck whereas ToCheckID is
+		// correctly set for all tuples.
+		hj.ht.ProbeScratch.SetupLimitedSlices(batchSize)
 		// Early bounds checks.
-		groupIDs := hj.ht.ProbeScratch.GroupID
-		_ = groupIDs[batchSize-1]
-		var nToCheck uint64
-		switch hj.spec.JoinType {
-		case descpb.LeftAntiJoin, descpb.RightAntiJoin, descpb.ExceptAllJoin:
-			// The setup of probing for LEFT/RIGHT ANTI and EXCEPT ALL joins
-			// needs a special treatment in order to reuse the same "check"
-			// functions below.
-			for i, bucket := range hj.probeState.buckets[:batchSize] {
-				f := hj.ht.BuildScratch.First[bucket]
-				//gcassert:bce
-				groupIDs[i] = f
-				if hj.ht.BuildScratch.First[bucket] != 0 {
-					// Non-zero "first" key indicates that there is a match of hashes
-					// and we need to include the current tuple to check whether it is
-					// an actual match.
-					hj.ht.ProbeScratch.ToCheck[nToCheck] = uint64(i)
+		toCheckIDs := hj.ht.ProbeScratch.ToCheckID
+		_ = toCheckIDs[batchSize-1]
+		var nToCheck uint32
+		for i, bucket := range hj.probeState.buckets[:batchSize] {
+			f := hj.ht.BuildScratch.First[bucket]
+			//gcassert:bce
+			toCheckIDs[i] = f
+			if f != 0 {
+				// Non-zero "first" key indicates that there is a match of
+				// hashes, and we need to include the current tuple to check
+				// whether it is an actual match.
+				hj.ht.ProbeScratch.ToCheck[nToCheck] = uint32(i)
+				nToCheck++
+			}
+		}
+
+		hj.prepareForCollecting(batchSize)
+		checker, collector := hj.ht.Check, hj.collect
+		if hj.spec.rightDistinct {
+			checker, collector = hj.ht.DistinctCheck, hj.distinctCollect
+		}
+
+		// Now we find equality matches for all probing tuples.
+		for nToCheck > 0 {
+			// Continue searching for the build table matching keys while the
+			// ToCheck array is non-empty.
+			nToCheck = checker(nToCheck, sel)
+			toCheckSlice := hj.ht.ProbeScratch.ToCheck[:nToCheck]
+			nToCheck = 0
+			for _, toCheck := range toCheckSlice {
+				nextID := hj.ht.BuildScratch.Next[hj.ht.ProbeScratch.ToCheckID[toCheck]]
+				toCheckIDs[toCheck] = nextID
+				if nextID != 0 {
+					hj.ht.ProbeScratch.ToCheck[nToCheck] = toCheck
 					nToCheck++
 				}
 			}
-		default:
-			for i, bucket := range hj.probeState.buckets[:batchSize] {
-				f := hj.ht.BuildScratch.First[bucket]
-				//gcassert:bce
-				groupIDs[i] = f
-			}
-			copy(hj.ht.ProbeScratch.ToCheck, colexechash.HashTableInitialToCheck[:batchSize])
-			nToCheck = uint64(batchSize)
 		}
 
-		// Now we collect all matches that we can emit in the probing phase
+		// We're processing a new batch, so we'll reset the index to start
+		// collecting from.
+		hj.probeState.prevBatchResumeIdx = 0
+
+		// Finally, we collect all matches that we can emit in the probing phase
 		// in a single batch.
-		hj.prepareForCollecting(batchSize)
-		var nResults int
-		if hj.spec.rightDistinct {
-			for nToCheck > 0 {
-				// Continue searching along the hash table next chains for the corresponding
-				// buckets. If the key is found or end of next chain is reached, the key is
-				// removed from the ToCheck array.
-				nToCheck = hj.ht.DistinctCheck(nToCheck, sel)
-				hj.ht.FindNext(hj.ht.BuildScratch.Next, nToCheck)
-			}
-
-			nResults = hj.distinctCollect(batch, batchSize, sel)
-		} else {
-			for nToCheck > 0 {
-				// Continue searching for the build table matching keys while the ToCheck
-				// array is non-empty.
-				nToCheck = hj.ht.Check(hj.ht.Keys, nToCheck, sel)
-				hj.ht.FindNext(hj.ht.BuildScratch.Next, nToCheck)
-			}
-
-			// We're processing a new batch, so we'll reset the index to start
-			// collecting from.
-			hj.probeState.prevBatchResumeIdx = 0
-			nResults = hj.collect(batch, batchSize, sel)
-		}
-
+		nResults := collector(batch, batchSize, sel)
 		if nResults > 0 {
 			hj.congregate(nResults, batch)
 			break
@@ -568,7 +597,18 @@ func (hj *hashJoiner) exec() coldata.Batch {
 // congregate uses the probeIdx and buildIdx pairs to stitch together the
 // resulting join rows and add them to the output batch with the left table
 // columns preceding the right table columns.
+//
+// This method should not be called for RIGHT SEMI and RIGHT ANTI joins because
+// they populate the output after probing is done, when in the hjEmittingRight
+// state.
 func (hj *hashJoiner) congregate(nResults int, batch coldata.Batch) {
+	if buildutil.CrdbTestBuild {
+		if !hj.spec.JoinType.ShouldIncludeLeftColsInOutput() {
+			panic(errors.AssertionFailedf(
+				"unexpectedly hashJoiner.congregate is called for RIGHT SEMI or RIGHT ANTI join",
+			))
+		}
+	}
 	hj.resetOutput(nResults)
 	// We have already fully built the hash table from the right input and now
 	// are only populating output one batch at a time. If we were to use a
@@ -576,19 +616,20 @@ func (hj *hashJoiner) congregate(nResults int, batch coldata.Batch) {
 	// very hard to fall back to disk backed hash joiner because we might have
 	// already emitted partial output.
 	hj.outputUnlimitedAllocator.PerformOperation(hj.output.ColVecs(), func() {
-		if hj.spec.JoinType.ShouldIncludeLeftColsInOutput() {
-			outCols := hj.output.ColVecs()[:len(hj.spec.Left.SourceTypes)]
-			for i := range hj.spec.Left.SourceTypes {
-				outCol := outCols[i]
-				valCol := batch.ColVec(i)
-				outCol.Copy(
-					coldata.SliceArgs{
-						Src:       valCol,
-						Sel:       hj.probeState.probeIdx,
-						SrcEndIdx: nResults,
-					},
-				)
-			}
+		// Populate the left output columns which are needed by all join types
+		// other than RIGHT SEMI and RIGHT ANTI joins, and those two types don't
+		// use this code path.
+		outCols := hj.output.ColVecs()[:len(hj.spec.Left.SourceTypes)]
+		for i := range hj.spec.Left.SourceTypes {
+			outCol := outCols[i]
+			valCol := batch.ColVec(i)
+			outCol.Copy(
+				coldata.SliceArgs{
+					Src:       valCol,
+					Sel:       hj.probeState.probeIdx,
+					SrcEndIdx: nResults,
+				},
+			)
 		}
 
 		if hj.spec.JoinType.ShouldIncludeRightColsInOutput() {
@@ -596,7 +637,7 @@ func (hj *hashJoiner) congregate(nResults int, batch coldata.Batch) {
 			// If the hash table is empty, then there is nothing to copy. The nulls
 			// will be set below.
 			if hj.ht.Vals.Length() > 0 {
-				outCols := hj.output.ColVecs()[rightColOffset : rightColOffset+len(hj.spec.Right.SourceTypes)]
+				outCols = hj.output.ColVecs()[rightColOffset : rightColOffset+len(hj.spec.Right.SourceTypes)]
 				for i := range hj.spec.Right.SourceTypes {
 					outCol := outCols[i]
 					valCol := hj.ht.Vals.ColVec(i)
@@ -656,13 +697,14 @@ func (hj *hashJoiner) congregate(nResults int, batch coldata.Batch) {
 }
 
 func (hj *hashJoiner) ExportBuffered(input colexecop.Operator) coldata.Batch {
-	if hj.inputOne == input {
+	if hj.InputOne == input {
 		// We do not buffer anything from the left source. Furthermore, the memory
 		// limit can only hit during the building of the hash table step at which
 		// point we haven't requested a single batch from the left.
 		return coldata.ZeroBatch
-	} else if hj.inputTwo == input {
-		if hj.exportBufferedState.rightExported == hj.ht.Vals.Length() {
+	} else if hj.InputTwo == input {
+		if hj.ht == nil || hj.exportBufferedState.rightExported == hj.ht.Vals.Length() {
+			// The right input has been fully exported.
 			return coldata.ZeroBatch
 		}
 		newRightExported := hj.exportBufferedState.rightExported + coldata.BatchSize()
@@ -689,6 +731,30 @@ func (hj *hashJoiner) ExportBuffered(input colexecop.Operator) coldata.Batch {
 	}
 }
 
+// ReleaseBeforeExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (hj *hashJoiner) ReleaseBeforeExport() {}
+
+// ReleaseAfterExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (hj *hashJoiner) ReleaseAfterExport(input colexecop.Operator) {
+	if hj.InputOne == input {
+		// We don't have anything to release for the left input.
+		return
+	}
+	if hj.ht == nil {
+		// Resources have already been released.
+		return
+	}
+	// We can only spill to disk while building the hash table (i.e. before the
+	// probing phase), so we only need to release the hash table and the
+	// windowed batch we used for the export (since we haven't allocated any
+	// other resources).
+	hj.ht.Release()
+	hj.ht = nil
+	hj.exportBufferedState.rightWindowedBatch = nil
+}
+
 func (hj *hashJoiner) resetOutput(nResults int) {
 	// We're resetting the output meaning that we have already fully built the
 	// hash table from the right input and now are only populating output one
@@ -709,19 +775,18 @@ func (hj *hashJoiner) resetOutput(nResults int) {
 	// 4. when the hashJoiner is used by the external hash joiner as the main
 	// strategy, the hash-based partitioner is responsible for making sure that
 	// partitions fit within memory limit.
-	const maxOutputBatchMemSize = math.MaxInt64
-	hj.output, _ = hj.outputUnlimitedAllocator.ResetMaybeReallocate(
-		hj.outputTypes, hj.output, nResults, maxOutputBatchMemSize,
+	hj.output, _ = hj.outputUnlimitedAllocator.ResetMaybeReallocateNoMemLimit(
+		hj.outputTypes, hj.output, nResults,
 	)
 }
 
 func (hj *hashJoiner) Reset(ctx context.Context) {
-	for _, input := range []colexecop.Operator{hj.inputOne, hj.inputTwo} {
-		if r, ok := input.(colexecop.Resetter); ok {
-			r.Reset(ctx)
-		}
-	}
+	hj.TwoInputInitHelper.Reset(ctx)
 	hj.state = hjBuilding
+	// Note that hj.ht.Reset() doesn't reset hj.ht.Same and hj.ht.Visited
+	// slices, but we'll reset them manually in hj.build(). We also keep
+	// references to those slices, so we don't release any of the memory we've
+	// accounted for.
 	hj.ht.Reset(ctx)
 	// Note that we don't zero out hj.probeState.buildIdx,
 	// hj.probeState.probeIdx, and hj.probeState.probeRowUnmatched because the
@@ -729,6 +794,13 @@ func (hj *hashJoiner) Reset(ctx context.Context) {
 	// hj.probeState.buildRowMatched is reset after building the hash table is
 	// complete in build() method.
 	hj.emittingRightState.rowIdx = 0
+	if buildutil.CrdbTestBuild {
+		if hj.ht == nil {
+			colexecerror.InternalError(errors.AssertionFailedf(
+				"the hash joiner is being reset after having spilled to disk",
+			))
+		}
+	}
 	hj.exportBufferedState.rightExported = 0
 }
 
@@ -795,24 +867,29 @@ func MakeHashJoinerSpec(
 	}
 }
 
+// NewHashJoinerArgs encompasses all arguments to NewHashJoiner call.
+type NewHashJoinerArgs struct {
+	BuildSideAllocator       *colmem.Allocator
+	OutputUnlimitedAllocator *colmem.Allocator
+	Spec                     HashJoinerSpec
+	LeftSource               colexecop.Operator
+	RightSource              colexecop.Operator
+	InitialNumBuckets        uint32
+}
+
 // NewHashJoiner creates a new equality hash join operator on the left and
 // right input tables.
-// buildSideAllocator should use a limited memory account and will be used for
+// hashTableAllocator should use a limited memory account and will be used for
 // the build side whereas outputUnlimitedAllocator should use an unlimited
 // memory account and will only be used when populating the output.
 // memoryLimit will limit the size of the batches produced by the hash joiner.
-func NewHashJoiner(
-	buildSideAllocator, outputUnlimitedAllocator *colmem.Allocator,
-	spec HashJoinerSpec,
-	leftSource, rightSource colexecop.Operator,
-	initialNumBuckets uint64,
-) colexecop.ResettableOperator {
+func NewHashJoiner(args NewHashJoinerArgs) colexecop.ResettableOperator {
 	return &hashJoiner{
-		joinHelper:                 newJoinHelper(leftSource, rightSource),
-		buildSideAllocator:         buildSideAllocator,
-		outputUnlimitedAllocator:   outputUnlimitedAllocator,
-		spec:                       spec,
-		outputTypes:                spec.JoinType.MakeOutputTypes(spec.Left.SourceTypes, spec.Right.SourceTypes),
-		hashTableInitialNumBuckets: initialNumBuckets,
+		TwoInputInitHelper:         colexecop.MakeTwoInputInitHelper(args.LeftSource, args.RightSource),
+		hashTableAllocator:         args.BuildSideAllocator,
+		outputUnlimitedAllocator:   args.OutputUnlimitedAllocator,
+		spec:                       args.Spec,
+		outputTypes:                args.Spec.JoinType.MakeOutputTypes(args.Spec.Left.SourceTypes, args.Spec.Right.SourceTypes),
+		hashTableInitialNumBuckets: args.InitialNumBuckets,
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -18,7 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -88,7 +83,7 @@ type caseOp struct {
 	scratch struct {
 		// output contains the result of CASE projections where results that
 		// came from the same WHEN arm are grouped together.
-		output coldata.Vec
+		output *coldata.Vec
 		order  []int
 	}
 
@@ -111,7 +106,7 @@ func (c *caseOp) ChildCount(verbose bool) int {
 	return 1 + len(c.caseOps) + 1
 }
 
-func (c *caseOp) Child(nth int, verbose bool) execinfra.OpNode {
+func (c *caseOp) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return c.buffer
 	} else if nth < len(c.caseOps)+1 {
@@ -127,9 +122,11 @@ func (c *caseOp) Child(nth int, verbose bool) execinfra.OpNode {
 // NewCaseOp returns an operator that runs a case statement.
 // buffer is a bufferOp that will return the input batch repeatedly.
 // caseOps is a list of operator chains, one per branch in the case statement.
-//   Each caseOp is connected to the input buffer op, and filters the input based
-//   on the case arm's WHEN condition, and then projects the remaining selected
-//   tuples based on the case arm's THEN condition.
+//
+//	Each caseOp is connected to the input buffer op, and filters the input based
+//	on the case arm's WHEN condition, and then projects the remaining selected
+//	tuples based on the case arm's THEN condition.
+//
 // elseOp is the ELSE condition.
 // whenCol is the index into the input batch to read from.
 // thenCol is the index into the output batch to write to.
@@ -145,7 +142,7 @@ func NewCaseOp(
 ) colexecop.Operator {
 	// We internally use three selection vectors, scratch.order, origSel, and
 	// prevSel.
-	allocator.AdjustMemoryUsage(3 * colmem.SizeOfBatchSizeSelVector)
+	allocator.AdjustMemoryUsage(3 * colmem.SelVectorSize(coldata.BatchSize()))
 	return &caseOp{
 		allocator: allocator,
 		buffer:    buffer.(*bufferOp),
@@ -173,13 +170,12 @@ func (c *caseOp) Init(ctx context.Context) {
 // vector. It is assumed that the selection vector of batch is non-nil.
 func (c *caseOp) copyIntoScratch(batch coldata.Batch, inputColIdx int, numAlreadyMatched int) {
 	n := batch.Length()
-	inputCol := batch.ColVec(inputColIdx)
 	// Copy the results into the scratch output vector, using the selection
 	// vector to copy only the elements that we actually wrote according to the
 	// current projection arm.
 	c.scratch.output.Copy(
 		coldata.SliceArgs{
-			Src:       inputCol,
+			Src:       batch.ColVecs()[inputColIdx],
 			Sel:       batch.Selection()[:n],
 			DestIdx:   numAlreadyMatched,
 			SrcEndIdx: n,
@@ -211,9 +207,9 @@ func (c *caseOp) Next() coldata.Batch {
 	outputCol := c.buffer.batch.ColVec(c.outputIdx)
 
 	if c.scratch.output == nil || c.scratch.output.Capacity() < origLen {
-		c.scratch.output = c.allocator.NewMemColumn(c.typ, origLen)
-	} else if c.scratch.output.IsBytesLike() {
-		coldata.Reset(c.scratch.output)
+		c.scratch.output = c.allocator.NewVec(c.typ, origLen)
+	} else {
+		coldata.ResetIfBytesLike(c.scratch.output)
 	}
 	orderCapacity := origLen
 	if origHasSel {
@@ -223,7 +219,7 @@ func (c *caseOp) Next() coldata.Batch {
 
 	// Run all WHEN arms.
 	numAlreadyMatched := 0
-	c.allocator.PerformOperation([]coldata.Vec{c.scratch.output}, func() {
+	c.allocator.PerformOperation([]*coldata.Vec{c.scratch.output}, func() {
 		for i := range c.caseOps {
 			// Run the next case operator chain. It will project its THEN expression
 			// for all tuples that matched its WHEN expression and that were not
@@ -319,7 +315,7 @@ func (c *caseOp) Next() coldata.Batch {
 		// projection straight into the output batch because the result will be
 		// in the correct order.
 		batch := c.elseOp.Next()
-		c.allocator.PerformOperation([]coldata.Vec{outputCol}, func() {
+		c.allocator.PerformOperation([]*coldata.Vec{outputCol}, func() {
 			outputCol.Copy(
 				coldata.SliceArgs{
 					Src:       batch.ColVec(c.thenIdxs[len(c.thenIdxs)-1]),
@@ -329,7 +325,7 @@ func (c *caseOp) Next() coldata.Batch {
 		outputReady = true
 	} else if numAlreadyMatched < origLen {
 		batch := c.elseOp.Next()
-		c.allocator.PerformOperation([]coldata.Vec{c.scratch.output}, func() {
+		c.allocator.PerformOperation([]*coldata.Vec{c.scratch.output}, func() {
 			c.copyIntoScratch(batch, c.thenIdxs[len(c.thenIdxs)-1], numAlreadyMatched)
 		})
 	}
@@ -337,7 +333,7 @@ func (c *caseOp) Next() coldata.Batch {
 	// Copy the output vector from the scratch space into the batch if
 	// necessary.
 	if !outputReady {
-		c.allocator.PerformOperation([]coldata.Vec{outputCol}, func() {
+		c.allocator.PerformOperation([]*coldata.Vec{outputCol}, func() {
 			if origHasSel {
 				// If the original batch had a selection vector, we cannot just
 				// copy the output from the scratch because we want to preserve

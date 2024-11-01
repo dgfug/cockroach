@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -27,11 +22,20 @@ func (d *delegator) delegateShowRangeForRow(n *tree.ShowRangeForRow) (tree.State
 	if err != nil {
 		return nil, err
 	}
-	if err := d.catalog.CheckPrivilege(d.ctx, idx.Table(), privilege.SELECT); err != nil {
+	// Basic requirement is SELECT privileges
+	if err = d.catalog.CheckPrivilege(d.ctx, idx.Table(), d.catalog.GetCurrentUser(), privilege.SELECT); err != nil {
 		return nil, err
 	}
 	if idx.Table().IsVirtualTable() {
 		return nil, errors.New("SHOW RANGE FOR ROW may not be called on a virtual table")
+	}
+	// Use qualifyDataSourceNamesInAST similarly to the Builder so that
+	// CREATE TABLE AS can source from a delegated expression.
+	// For example: CREATE TABLE t2 AS SELECT * FROM [SHOW RANGE FROM TABLE t1 FOR ROW (0)];
+	if d.qualifyDataSourceNamesInAST {
+		resName.ExplicitSchema = true
+		resName.ExplicitCatalog = true
+		(n.TableOrIndex).Table = resName.ToUnresolvedObjectName().ToTableName()
 	}
 	span := idx.Span()
 	table := idx.Table()
@@ -60,19 +64,29 @@ func (d *delegator) delegateShowRangeForRow(n *tree.ShowRangeForRow) (tree.State
 
 	const query = `
 SELECT
-	CASE WHEN r.start_key < x'%[5]s' THEN NULL ELSE crdb_internal.pretty_key(r.start_key, 2) END AS start_key,
-	CASE WHEN r.end_key >= x'%[6]s' THEN NULL ELSE crdb_internal.pretty_key(r.end_key, 2) END AS end_key,
+	CASE
+    WHEN r.start_key = crdb_internal.table_span(%[1]d)[1] THEN '…/<TableMin>'
+    WHEN r.start_key < crdb_internal.table_span(%[1]d)[1] THEN '<before:'||crdb_internal.pretty_key(r.start_key,-1)||'>'
+    ELSE '…'||crdb_internal.pretty_key(r.start_key, 2)
+  END AS start_key,
+	CASE
+    WHEN r.end_key = crdb_internal.table_span(%[1]d)[2] THEN '…/<TableMax>'
+    WHEN r.end_key > crdb_internal.table_span(%[1]d)[2] THEN '<after:'||crdb_internal.pretty_key(r.end_key,-1)||'>'
+    ELSE '…'||crdb_internal.pretty_key(r.end_key, 2)
+  END AS end_key,
 	range_id,
 	lease_holder,
 	replica_localities[array_position(replicas, lease_holder)] as lease_holder_locality,
 	replicas,
-	replica_localities
+	replica_localities,
+	voting_replicas,
+	non_voting_replicas
 FROM %[4]s.crdb_internal.ranges AS r
 WHERE (r.start_key <= crdb_internal.encode_key(%[1]d, %[2]d, %[3]s))
   AND (r.end_key   >  crdb_internal.encode_key(%[1]d, %[2]d, %[3]s)) ORDER BY r.start_key
 	`
 	// note: CatalogName.String() != Catalog()
-	return parse(
+	return d.parse(
 		fmt.Sprintf(
 			query,
 			table.ID(),

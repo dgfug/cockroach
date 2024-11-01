@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -69,7 +64,8 @@ func (n *saveTableNode) startExec(params runParams) error {
 		create.Defs = append(create.Defs, def)
 	}
 
-	_, err := params.p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+	_, err := params.p.ExtendedEvalContext().ExecCfg.InternalDB.
+		Executor().Exec(
 		params.ctx,
 		"create save table",
 		nil, /* txn */
@@ -82,7 +78,8 @@ func (n *saveTableNode) startExec(params runParams) error {
 func (n *saveTableNode) issue(params runParams) error {
 	if v := &n.run.vals; len(v.Rows) > 0 {
 		stmt := fmt.Sprintf("INSERT INTO %s %s", n.target.String(), v.String())
-		if _, err := params.p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		if _, err := params.p.ExtendedEvalContext().ExecCfg.InternalDB.
+			Executor().Exec(
 			params.ctx,
 			"insert into save table",
 			nil, /* txn */

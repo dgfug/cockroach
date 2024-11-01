@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -15,10 +10,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // srf represents an srf expression in an expression tree
@@ -43,6 +42,14 @@ func (s *srf) Walk(v tree.Visitor) tree.Expr {
 func (s *srf) TypeCheck(
 	_ context.Context, ctx *tree.SemaContext, desired *types.T,
 ) (tree.TypedExpr, error) {
+	if ctx.Properties.IsSet(tree.RejectGenerators) {
+		// srf replacement can happen before type-checking, so we need to check
+		// invalid usage here.
+		return nil, tree.NewInvalidFunctionUsageError(tree.GeneratorClass, ctx.TypeCheckContext())
+	}
+	if ctx.Properties.Ancestors.Has(tree.ConditionalAncestor) {
+		return nil, tree.NewInvalidFunctionUsageError(tree.GeneratorClass, "conditional expressions")
+	}
 	if ctx.Properties.Derived.SeenGenerator {
 		// This error happens if this srf struct is nested inside a raw srf that
 		// has not yet been replaced. This is possible since scope.replaceSRF first
@@ -56,7 +63,7 @@ func (s *srf) TypeCheck(
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (s *srf) Eval(_ *tree.EvalContext) (tree.Datum, error) {
+func (s *srf) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("srf must be replaced before evaluation"))
 }
 
@@ -70,8 +77,7 @@ var _ tree.TypedExpr = &srf{}
 // returns tuples of values from a,b,c picked "simultaneously". NULLs
 // are used when an iterator is "shorter" than another. For example:
 //
-//    zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
-//
+//	zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
 func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 	outScope = inScope.push()
 
@@ -80,55 +86,95 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 	b.semaCtx.Properties.Require(exprKindFrom.String(),
-		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
+		tree.RejectAggregates|tree.RejectWindowApplications|
+			tree.RejectNestedGenerators|tree.RejectProcedures)
 	inScope.context = exprKindFrom
 
 	// Build each of the provided expressions.
-	zip := make(memo.ZipExpr, len(exprs))
-	for i, expr := range exprs {
+	zip := make(memo.ZipExpr, 0, len(exprs))
+	var outCols opt.ColSet
+	for _, expr := range exprs {
 		// Output column names should exactly match the original expression, so we
 		// have to determine the output column name before we perform type
 		// checking. However, the alias may be overridden later below if the expression
 		// is a function and specifically defines a return label.
-		_, alias, err := tree.ComputeColNameInternal(b.semaCtx.SearchPath, expr)
+		_, alias, err := tree.ComputeColNameInternal(b.ctx, b.semaCtx.SearchPath, expr, b.semaCtx.FunctionResolver)
 		if err != nil {
 			panic(err)
 		}
 		texpr := inScope.resolveType(expr, types.Any)
 
-		var def *tree.FunctionDefinition
-		if funcExpr, ok := texpr.(*tree.FuncExpr); ok {
-			if def, err = funcExpr.Func.Resolve(b.semaCtx.SearchPath); err != nil {
+		var def *tree.ResolvedFunctionDefinition
+		funcExpr, ok := texpr.(*tree.FuncExpr)
+		if ok {
+			if def, err = funcExpr.Func.Resolve(
+				b.ctx, b.semaCtx.SearchPath, b.semaCtx.FunctionResolver,
+			); err != nil {
 				panic(err)
 			}
 		}
 
 		var outCol *scopeColumn
 		startCols := len(outScope.cols)
-		if def == nil || def.Class != tree.GeneratorClass || b.shouldCreateDefaultColumn(texpr) {
 
-			if def != nil && len(def.ReturnLabels) > 0 {
+		isRecordReturningUDF := def != nil && funcExpr.ResolvedOverload().Type == tree.UDFRoutine &&
+			texpr.ResolvedType().Family() == types.TupleFamily && b.insideDataSource
+		var scalar opt.ScalarExpr
+		_, isScopedColumn := texpr.(*scopeColumn)
+
+		if def == nil || (funcExpr.ResolvedOverload().Class != tree.GeneratorClass && !isRecordReturningUDF) || (b.shouldCreateDefaultColumn(texpr) && !isRecordReturningUDF) {
+			if def != nil && len(funcExpr.ResolvedOverload().ReturnLabels) > 0 {
 				// Override the computed alias with the one defined in the ReturnLabels. This
 				// satisfies a Postgres quirk where some json functions use different labels
 				// when used in a from clause.
-				alias = def.ReturnLabels[0]
+				alias = funcExpr.ResolvedOverload().ReturnLabels[0]
 			}
 			outCol = outScope.addColumn(scopeColName(tree.Name(alias)), texpr)
 		}
 
-		scalar := b.buildScalar(texpr, inScope, outScope, outCol, nil)
-		cols := make(opt.ColList, len(outScope.cols)-startCols)
-		for j := startCols; j < len(outScope.cols); j++ {
-			cols[j-startCols] = outScope.cols[j].id
+		if isScopedColumn {
+			// Function `buildScalar` treats a `scopeColumn` as a passthrough column
+			// for projection when a non-nil `outScope` is passed in, resulting in no
+			// scalar expression being built, but project set does not have
+			// passthrough columns and must build a new scalar. Handle this case by
+			// passing a nil `outScope` to `buildScalar`.
+			scalar = b.buildScalar(texpr, inScope, nil, nil, nil)
+
+			// Update the output column in outScope to refer to a new column ID.
+			// We need to use an out column which doesn't overlap with outer columns.
+			// Pre-existing function `populateSynthesizedColumn` does the necessary
+			// steps for us.
+			b.populateSynthesizedColumn(&outScope.cols[len(outScope.cols)-1], scalar)
+		} else {
+			scalar = b.buildScalar(texpr, inScope, outScope, outCol, nil)
 		}
-		zip[i] = b.factory.ConstructZipItem(scalar, cols)
+		numExpectedOutputCols := len(outScope.cols) - startCols
+		cols := make(opt.ColList, 0, numExpectedOutputCols)
+		for j := startCols; j < len(outScope.cols); j++ {
+			// If a newly-added outScope column has already been added in a zip
+			// expression, don't add it again.
+			if outCols.Contains(outScope.cols[j].id) {
+				continue
+			}
+			cols = append(cols, outScope.cols[j].id)
+
+			// Record that this output column has been added.
+			outCols.Add(outScope.cols[j].id)
+		}
+		// Only add the zip expression if it has output columns which haven't
+		// already been built.
+		if len(cols) != 0 {
+			if len(cols) != numExpectedOutputCols {
+				// Building more columns than were just added to outScope could cause
+				// problems for the execution engine. Catch this case.
+				panic(errors.AssertionFailedf("zip expression builds more columns than added to outScope"))
+			}
+			zip = append(zip, b.factory.ConstructZipItem(scalar, cols))
+		}
 	}
 
 	// Construct the zip as a ProjectSet with empty input.
-	input := b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
-		Cols: opt.ColList{},
-		ID:   b.factory.Metadata().NextUniqueID(),
-	})
+	input := b.factory.ConstructNoColsRow()
 	outScope.expr = b.factory.ConstructProjectSet(input, zip)
 	if len(outScope.cols) == 1 {
 		outScope.singleSRFColumn = true
@@ -142,20 +188,108 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 func (b *Builder) finishBuildGeneratorFunction(
 	f *tree.FuncExpr, fn opt.ScalarExpr, inScope, outScope *scope, outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
+	rTyp := f.ResolvedType()
+	b.validateGeneratorFunctionReturnType(f.ResolvedOverload(), rTyp, inScope)
+
 	// Add scope columns.
 	if outCol != nil {
 		// Single-column return type.
 		b.populateSynthesizedColumn(outCol, fn)
 	} else {
-		// Multi-column return type. Use the tuple labels in the SRF's return type
-		// as column aliases.
-		typ := f.ResolvedType()
-		for i := range typ.TupleContents() {
-			b.synthesizeColumn(outScope, scopeColName(tree.Name(typ.TupleLabels()[i])), typ.TupleContents()[i], nil, fn)
+		// Multi-column return type. Note that we already reconciled the function's
+		// return type with the column definition list (if it exists).
+		for i := range rTyp.TupleContents() {
+			colName := scopeColName(tree.Name(rTyp.TupleLabels()[i]))
+			b.synthesizeColumn(outScope, colName, rTyp.TupleContents()[i], nil, fn)
+		}
+	}
+	return fn
+}
+
+// validateGeneratorFunctionReturnType checks for various errors that result
+// from the presence or absence of a column definition list and its
+// compatibility with the actual function return type. This logic mirrors that
+// in postgres.
+func (b *Builder) validateGeneratorFunctionReturnType(
+	overload *tree.Overload, rTyp *types.T, inScope *scope,
+) {
+	lastAlias := inScope.alias
+	hasColumnDefinitionList := false
+	if lastAlias != nil {
+		for _, c := range lastAlias.Cols {
+			if c.Type != nil {
+				hasColumnDefinitionList = true
+				break
+			}
 		}
 	}
 
-	return fn
+	// Validate the column definition list against the concrete return type of the
+	// function.
+	if hasColumnDefinitionList {
+		if !overload.ReturnsRecordType {
+			// Non RECORD-return type with a column definition list is not permitted.
+			for _, param := range overload.RoutineParams {
+				if param.IsOutParam() {
+					panic(pgerror.New(pgcode.Syntax,
+						"a column definition list is redundant for a function with OUT parameters",
+					))
+				}
+			}
+			if rTyp.Family() == types.TupleFamily {
+				panic(pgerror.New(pgcode.Syntax,
+					"a column definition list is redundant for a function returning a named composite type",
+				))
+			} else {
+				panic(pgerror.Newf(pgcode.Syntax,
+					"a column definition list is only allowed for functions returning \"record\"",
+				))
+			}
+		}
+		if len(rTyp.TupleContents()) != len(lastAlias.Cols) {
+			switch overload.Language {
+			case tree.RoutineLangSQL:
+				err := pgerror.New(pgcode.DatatypeMismatch,
+					"function return row and query-specified return row do not match",
+				)
+				panic(errors.WithDetailf(err,
+					"Returned row contains %d attributes, but query expects %d.",
+					len(rTyp.TupleContents()), len(lastAlias.Cols),
+				))
+			case tree.RoutineLangPLpgSQL:
+				err := pgerror.New(pgcode.DatatypeMismatch,
+					"returned record type does not match expected record type",
+				)
+				panic(errors.WithDetailf(err,
+					"Number of returned columns (%d) does not match expected column count (%d).",
+					len(rTyp.TupleContents()), len(lastAlias.Cols),
+				))
+			default:
+				panic(errors.AssertionFailedf(
+					"unexpected language: %s", redact.SafeString(overload.Language),
+				))
+			}
+		}
+	} else if overload.ReturnsRecordType {
+		panic(pgerror.New(pgcode.Syntax,
+			"a column definition list is required for functions returning \"record\"",
+		))
+	}
+
+	// Verify that the function return type can be assignment-casted to the
+	// column definition list type.
+	if hasColumnDefinitionList {
+		colDefListTypes := b.getColumnDefinitionListTypes(inScope)
+		for i := range colDefListTypes.TupleContents() {
+			colTyp, defTyp := rTyp.TupleContents()[i], colDefListTypes.TupleContents()[i]
+			if !colTyp.Identical(defTyp) && !cast.ValidCast(colTyp, defTyp, cast.ContextAssignment) {
+				panic(errors.WithDetailf(pgerror.New(pgcode.InvalidFunctionDefinition,
+					"return type mismatch in function declared to return record",
+				), "Final statement returns %v instead of %v at column %d.",
+					colTyp.SQLStringForError(), defTyp.SQLStringForError(), i+1))
+			}
+		}
+	}
 }
 
 // buildProjectSet builds a ProjectSet, which is a lateral cross join
@@ -167,7 +301,7 @@ func (b *Builder) finishBuildGeneratorFunction(
 // ProjectSet is necessary in case some of the SRFs depend on the input.
 // For example, consider this query:
 //
-//   SELECT generate_series(t.a, t.a + 1) FROM t
+//	SELECT generate_series(t.a, t.a + 1) FROM t
 //
 // In this case, the inputs to generate_series depend on table t, so during
 // execution, generate_series will be called once for each row of t.

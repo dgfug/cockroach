@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package forbiddenmethod defines an suite of Analyzers that
 // detects correct setting of timestamps when unmarshaling table
@@ -79,6 +74,11 @@ var GRPCStatusWithDetailsAnalyzer = Analyzer(grpcStatusWithDetailsOptions)
 
 // Analyzers are all of the Analyzers defined in this package.
 var Analyzers = []*analysis.Analyzer{
+	// NOTE(ricky): The analyzers in this list each have a corresponding
+	// wrapper package (for example, DescriptorMarshalAnalyzer is exposed as
+	// pkg/testutils/lint/passes/descriptormarshal.Analyzer). This is done
+	// for compatibility w/ the Bazel build -- the wrapper packages are
+	// consumed in :crdb_nogo in the top-level BUILD.bazel.
 	DescriptorMarshalAnalyzer,
 	GRPCClientConnCloseAnalyzer,
 	GRPCStatusWithDetailsAnalyzer,

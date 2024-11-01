@@ -35,7 +35,7 @@ INSERT INTO kv VALUES ('nil4', NULL)
 statement ok
 INSERT INTO kv (k,v) VALUES ('a', 'b'), ('c', 'd')
 
-query T
+query T rowsort
 SELECT v || 'hello' FROM [INSERT INTO kv VALUES ('e', 'f'), ('g', '') RETURNING v]
 ----
 fhello
@@ -196,13 +196,13 @@ INSERT INTO kv5 (k, v) VALUES ('a')
 statement ok
 CREATE TABLE return (a INT DEFAULT 3, b INT)
 
-query III
+query III rowsort
 INSERT INTO return (a) VALUES (default), (8) RETURNING a, 2, a+4
 ----
 3 2 7
 8 2 12
 
-query III
+query III rowsort
 INSERT INTO return (b) VALUES (default), (8) RETURNING a, a+4, b
 ----
 3 7 NULL
@@ -248,14 +248,14 @@ INSERT INTO return VALUES (default) RETURNING *
 a b
 3 NULL
 
-query II colnames
+query II colnames,rowsort
 INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.a, b
 ----
 a b
 1 2
 3 4
 
-query II colnames
+query II colnames,rowsort
 INSERT INTO return VALUES (1, 2), (3, 4) RETURNING *
 ----
 a b
@@ -278,7 +278,7 @@ a b
 statement error pq: "return.*" cannot be aliased
 INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.* as x
 
-query III colnames
+query III colnames,rowsort
 INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.*, a + b AS c
 ----
 a  b  c
@@ -306,7 +306,7 @@ INSERT INTO return VALUES (1, 2) RETURNING x[1]
 statement ok
 CREATE VIEW kview AS VALUES ('a', 'b'), ('c', 'd')
 
-query TT
+query TT rowsort
 SELECT * FROM kview
 ----
 a b
@@ -315,7 +315,7 @@ c d
 statement error "kview" is not a table
 INSERT INTO kview VALUES ('e', 'f')
 
-query TT
+query TT rowsort
 SELECT * FROM kview
 ----
 a b
@@ -335,7 +335,7 @@ INSERT INTO abc VALUES (1, 2, 10)
 
 # Verify we get the correct message, even though internally the ConditionalPut
 # for the index key will also fail.
-statement error pgcode 23505 duplicate key value violates unique constraint "abc_pkey"\nDETAIL: Key \(a,b\)=\(1,2\) already exists\.
+statement error pgcode 23505 duplicate key value violates unique constraint "abc_pkey"\nDETAIL: Key \(a, b\)=\(1, 2\) already exists\.
 INSERT INTO abc VALUES (1, 2, 20)
 
 statement ok
@@ -478,22 +478,21 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE sw]
 ----
 CREATE TABLE public.sw (
-   a CHAR NULL,
-   b CHAR(3) NULL,
-   c VARCHAR NULL,
-   d VARCHAR(3) NULL,
-   e STRING NULL,
-   f STRING(3) NULL,
-   g "char" NULL,
-   ac CHAR COLLATE en NULL,
-   bc CHAR(3) COLLATE en NULL,
-   cc VARCHAR COLLATE en NULL,
-   dc VARCHAR(3) COLLATE en NULL,
-   ec STRING COLLATE en NULL,
-   fc STRING(3) COLLATE en NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT sw_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (a, b, c, d, e, f, g, ac, bc, cc, dc, ec, fc, rowid)
+  a CHAR NULL,
+  b CHAR(3) NULL,
+  c VARCHAR NULL,
+  d VARCHAR(3) NULL,
+  e STRING NULL,
+  f STRING(3) NULL,
+  g "char" NULL,
+  ac CHAR COLLATE en NULL,
+  bc CHAR(3) COLLATE en NULL,
+  cc VARCHAR COLLATE en NULL,
+  dc VARCHAR(3) COLLATE en NULL,
+  ec STRING COLLATE en NULL,
+  fc STRING(3) COLLATE en NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT sw_pkey PRIMARY KEY (rowid ASC)
 )
 
 statement ok
@@ -596,17 +595,17 @@ statement ok
 CREATE TABLE t29494(x INT); INSERT INTO t29494 VALUES (12)
 
 statement ok
-BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 # Check that the new column is not visible
 query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
 CREATE TABLE public.t29494 (
-   x INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT t29494_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (x, rowid)
+  x INT8 NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT t29494_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Check that the new column is not usable in RETURNING.
@@ -617,7 +616,8 @@ statement ok
 ROLLBACK
 
 statement ok
-BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 query I
 INSERT INTO t29494(x) VALUES (123) RETURNING *
@@ -636,18 +636,18 @@ CREATE TABLE t32759 (
 )
 
 statement ok
-BEGIN; ALTER TABLE t32759 DROP COLUMN y
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t32759 DROP COLUMN y
 
 # Check that the dropped column is not visible
 query T
 SELECT create_statement FROM [SHOW CREATE t32759]
 ----
 CREATE TABLE public.t32759 (
-   x INT8 NULL,
-   z INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT t32759_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (x, z, rowid)
+  x INT8 NULL,
+  z INT8 NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT t32759_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Check that values cannot be inserted into the dropped column.
@@ -658,7 +658,8 @@ statement ok
 ROLLBACK
 
 statement ok
-BEGIN; ALTER TABLE t32759 DROP COLUMN y
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t32759 DROP COLUMN y
 
 query II colnames
 INSERT INTO t32759(x, z) VALUES (1, 4) RETURNING *
@@ -691,7 +692,8 @@ statement ok
 CREATE TABLE t35611(a INT PRIMARY KEY, CHECK (a > 0))
 
 statement ok
-BEGIN; ALTER TABLE t35611 ADD COLUMN b INT
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t35611 ADD COLUMN b INT
 
 statement ok
 INSERT INTO t35611 (a) VALUES (1)
@@ -788,3 +790,27 @@ SELECT * FROM gen_as_id_seqopt ORDER BY a
 8   5   7
 9   8   11
 10  11  2
+
+# Regression test for hitting an internal error in the vectorized unordered
+# distinct when NULLs are present in the rows being inserted (#74795).
+statement ok
+CREATE TABLE t74795 (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    deletion_request_id TEXT,
+    UNIQUE INDEX (account_id, deletion_request_id)
+);
+INSERT INTO t74795
+    (account_id)
+VALUES
+    ('foo'),
+    ('foo'),
+    ('foo')
+ON CONFLICT (account_id, deletion_request_id) DO NOTHING;
+
+query TT nosort
+SELECT account_id, deletion_request_id FROM t74795
+----
+foo  NULL
+foo  NULL
+foo  NULL

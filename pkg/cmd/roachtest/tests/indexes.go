@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,41 +13,53 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 )
 
 func registerNIndexes(r registry.Registry, secondaryIndexes int) {
 	const nodes = 6
-	geoZones := []string{"us-east1-b", "us-west1-b", "europe-west2-b"}
-	if r.MakeClusterSpec(1).Cloud == spec.AWS {
-		geoZones = []string{"us-east-2b", "us-west-1a", "eu-west-1a"}
-	}
-	geoZonesStr := strings.Join(geoZones, ",")
+	gceGeoZones := []string{"us-east1-b", "us-west1-b", "europe-west2-b"}
+	awsGeoZones := []string{"us-east-2b", "us-west-1a", "eu-west-1a"}
 	r.Add(registry.TestSpec{
-		Name:    fmt.Sprintf("indexes/%d/nodes=%d/multi-region", secondaryIndexes, nodes),
-		Owner:   registry.OwnerKV,
-		Cluster: r.MakeClusterSpec(nodes+1, spec.CPU(16), spec.Geo(), spec.Zones(geoZonesStr)),
+		Name:      fmt.Sprintf("indexes/%d/nodes=%d/multi-region", secondaryIndexes, nodes),
+		Owner:     registry.OwnerKV,
+		Benchmark: true,
+		Cluster: r.MakeClusterSpec(
+			nodes+1,
+			spec.CPU(16),
+			spec.WorkloadNode(),
+			spec.WorkloadNodeCPU(16),
+			spec.Geo(),
+			spec.GCEZones(strings.Join(gceGeoZones, ",")),
+			spec.AWSZones(strings.Join(awsGeoZones, ",")),
+		),
+		// TODO(radu): enable this test on AWS.
+		CompatibleClouds:           registry.OnlyGCE,
+		Suites:                     registry.Suites(registry.Nightly),
+		RequiresDeprecatedWorkload: true, // uses indexes
 		// Uses CONFIGURE ZONE USING ... COPY FROM PARENT syntax.
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			firstAZ := geoZones[0]
-			roachNodes := c.Range(1, nodes)
+			firstAZ := gceGeoZones[0]
+			if c.Cloud() == spec.AWS {
+				firstAZ = awsGeoZones[0]
+			}
 			gatewayNodes := c.Range(1, nodes/3)
-			loadNode := c.Node(nodes + 1)
 
-			c.Put(ctx, t.Cockroach(), "./cockroach", roachNodes)
-			c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
-			c.Start(ctx, roachNodes)
-			conn := c.Conn(ctx, 1)
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
+			conn := c.Conn(ctx, t.L(), 1)
 
 			t.Status("running workload")
-			m := c.NewMonitor(ctx, roachNodes)
+			m := c.NewMonitor(ctx, c.CRDBNodes())
 			m.Go(func(ctx context.Context) error {
 				secondary := " --secondary-indexes=" + strconv.Itoa(secondaryIndexes)
 				initCmd := "./workload init indexes" + secondary + " {pgurl:1}"
-				c.Run(ctx, loadNode, initCmd)
+				c.Run(ctx, option.WithNodes(c.WorkloadNode()), initCmd)
 
 				// Set lease preferences so that all leases for the table are
 				// located in the availability zone with the load generator.
@@ -72,7 +79,7 @@ func registerNIndexes(r registry.Registry, secondaryIndexes int) {
 					t.L().Printf("checking replica balance")
 					retryOpts := retry.Options{MaxBackoff: 15 * time.Second}
 					for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-						WaitForUpdatedReplicationReport(ctx, t, conn)
+						roachtestutil.WaitForUpdatedReplicationReport(ctx, t, conn)
 
 						var ok bool
 						if err := conn.QueryRowContext(ctx, `
@@ -96,8 +103,7 @@ func registerNIndexes(r registry.Registry, secondaryIndexes int) {
 						var ok bool
 						if err := conn.QueryRowContext(ctx, `
 							SELECT lease_holder <= $1
-							FROM crdb_internal.ranges
-							WHERE table_name = 'indexes'`,
+							FROM [SHOW RANGES FROM TABLE indexes.indexes WITH DETAILS]`,
 							nodes/3,
 						).Scan(&ok); err != nil {
 							return err
@@ -126,7 +132,7 @@ func registerNIndexes(r registry.Registry, secondaryIndexes int) {
 				duration := " --duration=" + ifLocal(c, "10s", "10m")
 				runCmd := fmt.Sprintf("./workload run indexes --histograms="+t.PerfArtifactsDir()+"/stats.json"+
 					payload+concurrency+duration+" {pgurl%s}", gatewayNodes)
-				c.Run(ctx, loadNode, runCmd)
+				c.Run(ctx, option.WithNodes(c.WorkloadNode()), runCmd)
 				return nil
 			})
 			m.Wait()
@@ -136,10 +142,4 @@ func registerNIndexes(r registry.Registry, secondaryIndexes int) {
 
 func registerIndexes(r registry.Registry) {
 	registerNIndexes(r, 2)
-}
-
-func registerIndexesBench(r registry.Registry) {
-	for i := 0; i <= 100; i++ {
-		registerNIndexes(r, i)
-	}
 }

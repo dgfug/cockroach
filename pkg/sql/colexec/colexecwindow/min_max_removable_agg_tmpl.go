@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -24,7 +19,7 @@ package colexecwindow
 import (
 	"context"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
@@ -76,9 +71,10 @@ const (
 type minMaxRemovableAggBase struct {
 	partitionSeekerBase
 	colexecop.CloserHelper
-	allocator    *colmem.Allocator
-	outputColIdx int
-	framer       windowFramer
+	cancelChecker colexecutils.CancelChecker
+	allocator     *colmem.Allocator
+	outputColIdx  int
+	framer        windowFramer
 
 	// A partial deque of indices into the current partition ordered by the value
 	// of the input column at each index. It contains only indices that are part
@@ -102,6 +98,7 @@ type minMaxRemovableAggBase struct {
 // Init implements the bufferedWindower interface.
 func (b *minMaxRemovableAggBase) Init(ctx context.Context) {
 	b.InitHelper.Init(ctx)
+	b.cancelChecker.Init(b.Ctx)
 }
 
 // transitionToProcessing implements the bufferedWindower interface.
@@ -173,10 +170,10 @@ func (a *_AGG_TYPEAggregator) processBatch(batch coldata.Batch, startIdx, endIdx
 	outVec := batch.ColVec(a.outputColIdx)
 	outNulls := outVec.Nulls()
 	outCol := outVec.TemplateType()
-	// {{if not .IsBytesLike}}
-	_, _ = outCol.Get(startIdx), outCol.Get(endIdx-1)
-	// {{end}}
-	a.allocator.PerformOperation([]coldata.Vec{outVec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{outVec}, func() {
+		// {{if not .IsBytesLike}}
+		_, _ = outCol.Get(startIdx), outCol.Get(endIdx-1)
+		// {{end}}
 		for i := startIdx; i < endIdx; i++ {
 			a.framer.next(a.Ctx)
 			toAdd, toRemove := a.framer.slidingWindowIntervals()
@@ -220,9 +217,6 @@ func (a *_AGG_TYPEAggregator) processBatch(batch coldata.Batch, startIdx, endIdx
 			if a.queue.isEmpty() {
 				outNulls.SetNull(i)
 			} else {
-				// The aggregate may be reused between rows, so we need to copy it.
-				execgen.COPYVAL(a.curAgg, a.curAgg)
-
 				// {{if not .IsBytesLike}}
 				// gcassert:bce
 				// {{end}}
@@ -238,6 +232,7 @@ func (a *_AGG_TYPEAggregator) aggregateOverIntervals(intervals []windowInterval)
 	for _, interval := range intervals {
 		var cmp bool
 		for j := interval.start; j < interval.end; j++ {
+			a.cancelChecker.Check()
 			idxToAdd := uint32(j)
 			vec, idx, _ := a.buffer.GetVecWithTuple(a.Ctx, argColIdx, j)
 			nulls := vec.Nulls()
@@ -271,17 +266,23 @@ func (a *_AGG_TYPEAggregator) aggregateOverIntervals(intervals []windowInterval)
 				// keep it in the queue. Iterate from the end of the queue, removing any
 				// values that are dominated by the current one. Add the current value
 				// once the last value in the queue is better than the current one.
-				for !a.queue.isEmpty() {
-					cmpVec, cmpIdx, _ := a.buffer.GetVecWithTuple(a.Ctx, argColIdx, int(a.queue.getLast()))
-					cmpVal := cmpVec.TemplateType().Get(cmpIdx)
-					_ASSIGN_CMP(cmp, cmpVal, val, _, col, _)
-					if cmp {
-						break
+				if !a.queue.isEmpty() {
+					// We have to make a copy of val because GetVecWithTuple
+					// calls below might reuse the same underlying vector.
+					var valCopy _GOTYPE
+					execgen.COPYVAL(valCopy, val)
+					for !a.queue.isEmpty() {
+						cmpVec, cmpIdx, _ := a.buffer.GetVecWithTuple(a.Ctx, argColIdx, int(a.queue.getLast()))
+						cmpVal := cmpVec.TemplateType().Get(cmpIdx)
+						_ASSIGN_CMP(cmp, cmpVal, valCopy, _, col, _)
+						if cmp {
+							break
+						}
+						// Any values that could not fit in the queue would also have been
+						// dominated by the current one, so reset omittedIndex.
+						a.queue.removeLast()
+						a.omittedIndex = -1
 					}
-					// Any values that could not fit in the queue would also have been
-					// dominated by the current one, so reset omittedIndex.
-					a.queue.removeLast()
-					a.omittedIndex = -1
 				}
 				if a.queue.addLast(idxToAdd) && a.omittedIndex == -1 {
 					// The value couldn't fit in the queue. Keep track of the first index
@@ -293,10 +294,10 @@ func (a *_AGG_TYPEAggregator) aggregateOverIntervals(intervals []windowInterval)
 	}
 }
 
-func (a *_AGG_TYPEAggregator) Close() {
+func (a *_AGG_TYPEAggregator) Close(ctx context.Context) {
 	a.queue.close()
 	a.framer.close()
-	a.buffer.Close(a.EnsureCtx())
+	a.buffer.Close(ctx)
 	*a = _AGG_TYPEAggregator{}
 }
 

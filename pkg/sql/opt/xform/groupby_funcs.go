@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
@@ -16,7 +11,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,9 +29,12 @@ func (c *CustomFuncs) IsCanonicalGroupBy(private *memo.GroupingPrivate) bool {
 // expressions (aggs) and a scanPrivate into multiple scalar subqueries, with
 // one MIN or MAX expression per subquery.
 func (c *CustomFuncs) MakeMinMaxScalarSubqueries(
-	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, aggs memo.AggregationsExpr,
+	grp memo.RelExpr,
+	required *physical.Required,
+	scanPrivate *memo.ScanPrivate,
+	aggs memo.AggregationsExpr,
 ) {
-	c.MakeMinMaxScalarSubqueriesWithFilter(grp, scanPrivate, aggs, nil)
+	c.MakeMinMaxScalarSubqueriesWithFilter(grp, required, scanPrivate, aggs, nil)
 }
 
 // MakeMinMaxScalarSubqueriesWithFilter transforms a list of MIN and MAX aggregate
@@ -42,6 +42,7 @@ func (c *CustomFuncs) MakeMinMaxScalarSubqueries(
 // subqueries, with one MIN or MAX expression per subquery.
 func (c *CustomFuncs) MakeMinMaxScalarSubqueriesWithFilter(
 	grp memo.RelExpr,
+	required *physical.Required,
 	scanPrivate *memo.ScanPrivate,
 	aggs memo.AggregationsExpr,
 	filters memo.FiltersExpr,
@@ -59,7 +60,7 @@ func (c *CustomFuncs) MakeMinMaxScalarSubqueriesWithFilter(
 		// If the input to the scalar group by is a Select with filters, remap the
 		// column IDs in the filters and use that to build a new Select.
 		if len(filters) > 0 {
-			newFilters := c.MapFilterCols(filters, scanPrivate.Cols, newScanPrivate.Cols)
+			newFilters := c.RemapScanColsInFilter(filters, scanPrivate, newScanPrivate)
 			inputExpr = c.e.f.ConstructSelect(inputExpr, newFilters)
 		}
 
@@ -70,7 +71,7 @@ func (c *CustomFuncs) MakeMinMaxScalarSubqueriesWithFilter(
 		if !ok {
 			panic(errors.AssertionFailedf("expected a variable as input to the aggregate, but found %T", aggs[i].Agg.Child(0)))
 		}
-		newVarExpr := c.mapScalarExprCols(variable, scanPrivate.Cols, newScanPrivate.Cols)
+		newVarExpr := c.RemapScanColsInScalarExpr(variable, scanPrivate, newScanPrivate)
 		var newAggrFunc opt.ScalarExpr
 		switch aggs[i].Agg.(type) {
 		case *memo.MaxExpr:
@@ -147,13 +148,17 @@ func (c *CustomFuncs) TwoOrMoreMinOrMax(aggs memo.AggregationsExpr) bool {
 // input expression is expected to return zero or one rows, and the aggregate
 // functions are expected to always pass through their values in that case.
 func (c *CustomFuncs) MakeProjectFromPassthroughAggs(
-	grp memo.RelExpr, input memo.RelExpr, aggs memo.AggregationsExpr,
+	grp memo.RelExpr,
+	required *physical.Required,
+	input memo.RelExpr,
+	aggs memo.AggregationsExpr,
+	groupingCols opt.ColSet,
 ) {
 	if !input.Relational().Cardinality.IsZeroOrOne() {
 		panic(errors.AssertionFailedf("input expression cannot have more than one row: %v", input))
 	}
 
-	var passthrough opt.ColSet
+	passthrough := groupingCols.Copy()
 	projections := make(memo.ProjectionsExpr, 0, len(aggs))
 	for i := range aggs {
 		// If aggregate remaps the column ID, need to synthesize projection item;
@@ -172,12 +177,141 @@ func (c *CustomFuncs) MakeProjectFromPassthroughAggs(
 	}, grp)
 }
 
+// GroupingColsClosureOverlappingOrdering determines if the specified `ordering`
+// columns overlaps with the closure of the grouping columns in `private` as
+// determined by the functional dependencies of the `input` relation to the
+// grouped aggregation. If found, this expanded set of `groupingCols` is
+// returned, plus the overlapping ordering columns `newOrdering`, along with
+// `ok`=true.
+func (c *CustomFuncs) GroupingColsClosureOverlappingOrdering(
+	input memo.RelExpr, private *memo.GroupingPrivate, ordering props.OrderingChoice,
+) (groupingCols opt.ColSet, newOrdering props.OrderingChoice, ok bool) {
+	if ordering.Any() {
+		// If the limit specifies no ordering, there is no ordering hint for us to
+		// use.
+		return opt.ColSet{}, props.OrderingChoice{}, false
+	}
+	groupingCols = private.GroupingCols
+	// If the result requires a specific ordering, use that as the ordering of the
+	// aggregation if possible.
+	// Find all columns determined by the grouping columns.
+	groupingColumnsClosure := input.Relational().FuncDeps.ComputeClosure(groupingCols)
+	// It is safe to add ordering columns present in the grouping column closure
+	// as grouping columns because the original grouping columns determine all
+	// other column values in the closure (within a group there is only one
+	// combined set of values for the other columns). Doing so allows the required
+	// ordering to be provided by the streaming group by and possibly remove the
+	// requirement for a TopK operator.
+	orderingColsInClosure := groupingColumnsClosure.Intersection(ordering.ColSet())
+	if orderingColsInClosure.Empty() {
+		// If we have no columns to add to the grouping, this rewrite has no effect.
+		return opt.ColSet{}, props.OrderingChoice{}, false
+	}
+	groupingCols = groupingCols.Union(orderingColsInClosure)
+	newOrdering, fullPrefix, found := getPrefixFromOrdering(ordering.ToOrdering(), private.Ordering, input,
+		func(id opt.ColumnID) bool { return groupingCols.Contains(id) })
+	if !found || !fullPrefix {
+		return opt.ColSet{}, props.OrderingChoice{}, false
+	}
+	return groupingCols, newOrdering, true
+}
+
+// GenerateStreamingGroupByLimitOrderingHint generates a LimitExpr with an input
+// which is a GroupBy or DistinctOn expression with an expanded set of
+// `groupingCols` which is an overlap of the closure of the original grouping
+// columns closure and the ordering in the `limitExpr` as determined by
+// `GroupingColsClosureOverlappingOrdering`, which also produces the
+// `newOrdering`. Argument `private` is expected to be a canonical group-by.
+func (c *CustomFuncs) GenerateStreamingGroupByLimitOrderingHint(
+	grp memo.RelExpr,
+	required *physical.Required,
+	limitExpr *memo.LimitExpr,
+	aggregation memo.RelExpr,
+	input memo.RelExpr,
+	aggs memo.AggregationsExpr,
+	private *memo.GroupingPrivate,
+	groupingCols opt.ColSet,
+	newOrdering props.OrderingChoice,
+) {
+	if !c.e.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy {
+		// This transformation rule is explicitly disabled.
+		return
+	}
+	newPrivate := *private
+	newPrivate.Ordering = newOrdering
+	newPrivate.GroupingCols = groupingCols
+
+	// Remove constant column aggregate expressions if they've been added to
+	// the grouping columns. The column should appear in one place or the other,
+	// but not both.
+	newAggs := make(memo.AggregationsExpr, 0, len(aggs))
+	for _, agg := range aggs {
+		if !groupingCols.Contains(agg.Col) {
+			newAggs = append(newAggs, agg)
+			continue
+		}
+		constAggExpr, ok := agg.Agg.(*memo.ConstAggExpr)
+		if !ok {
+			newAggs = append(newAggs, agg)
+			continue
+		}
+		variableExpr, ok := constAggExpr.Input.(*memo.VariableExpr)
+		if !ok {
+			newAggs = append(newAggs, agg)
+			continue
+		}
+		if variableExpr.Col != agg.Col {
+			// Column IDs expected to match to safely remove this aggregation.
+			return
+		}
+	}
+	// Output columns are the union of grouping columns with columns from the
+	// aggregate projection list. Verify this is built correctly.
+	outputCols := groupingCols.Copy()
+	for i := range newAggs {
+		outputCols.Add(newAggs[i].Col)
+	}
+	if !aggregation.Relational().OutputCols.Equals(outputCols) {
+		// If the output columns in the new aggregation don't match those in the
+		// original aggregation, give up on this optimization.
+		return
+	}
+
+	var newAggregation memo.RelExpr
+	constructAggregation := func() {
+		newAggregation =
+			c.e.f.DynamicConstruct(
+				aggregation.Op(),
+				input,
+				&newAggs,
+				&newPrivate,
+			).(memo.RelExpr)
+	}
+	var disabledRules intsets.Fast
+	// The ReduceGroupingCols rule must be disabled to prevent the ordering
+	// columns from being removed from the grouping columns during operation
+	// construction. This rule already reduced the grouping columns on the initial
+	// construction. We are just adding back in any ordering columns which overlap
+	// with grouping columns in order to generate a better plan.
+	disabledRules.Add(int(opt.ReduceGroupingCols))
+
+	c.e.f.DisableOptimizationRulesTemporarily(disabledRules, constructAggregation)
+	newLimitExpr :=
+		&memo.LimitExpr{
+			Input:    newAggregation,
+			Limit:    limitExpr.Limit,
+			Ordering: limitExpr.Ordering,
+		}
+	grp.Memo().AddLimitToGroup(newLimitExpr, grp)
+}
+
 // GenerateStreamingGroupBy generates variants of a GroupBy, DistinctOn,
 // EnsureDistinctOn, UpsertDistinctOn, or EnsureUpsertDistinctOn expression
 // with more specific orderings on the grouping columns, using the interesting
 // orderings property. See the GenerateStreamingGroupBy rule.
 func (c *CustomFuncs) GenerateStreamingGroupBy(
 	grp memo.RelExpr,
+	required *physical.Required,
 	op opt.Operator,
 	input memo.RelExpr,
 	aggs memo.AggregationsExpr,
@@ -186,41 +320,11 @@ func (c *CustomFuncs) GenerateStreamingGroupBy(
 	orders := ordering.DeriveInterestingOrderings(input)
 	intraOrd := private.Ordering
 	for _, ord := range orders {
-		o := ord.ToOrdering()
-		// We are looking for a prefix of o that satisfies the intra-group ordering
-		// if we ignore grouping columns.
-		oIdx, intraIdx := 0, 0
-		for ; oIdx < len(o); oIdx++ {
-			oCol := o[oIdx].ID()
-			if private.GroupingCols.Contains(oCol) || intraOrd.Optional.Contains(oCol) {
-				// Grouping or optional column.
-				continue
-			}
-
-			if intraIdx < len(intraOrd.Columns) &&
-				intraOrd.Group(intraIdx).Contains(oCol) &&
-				intraOrd.Columns[intraIdx].Descending == o[oIdx].Descending() {
-				// Column matches the one in the ordering.
-				intraIdx++
-				continue
-			}
-			break
-		}
-		if oIdx == 0 || intraIdx < len(intraOrd.Columns) {
-			// No match.
+		newOrd, fullPrefix, found := getPrefixFromOrdering(ord.ToOrdering(), intraOrd, input,
+			func(id opt.ColumnID) bool { return private.GroupingCols.Contains(id) })
+		if !found || !fullPrefix {
 			continue
 		}
-		o = o[:oIdx]
-
-		var newOrd props.OrderingChoice
-		newOrd.FromOrderingWithOptCols(o, opt.ColSet{})
-
-		// Simplify the ordering according to the input's FDs. Note that this is not
-		// necessary for correctness because buildChildPhysicalProps would do it
-		// anyway, but doing it here once can make things more efficient (and we may
-		// generate fewer expressions if some of these orderings turn out to be
-		// equivalent).
-		newOrd.Simplify(&input.Relational().FuncDeps)
 
 		newPrivate := *private
 		newPrivate.Ordering = newOrd
@@ -364,6 +468,24 @@ func (c *CustomFuncs) SplitGroupByScanIntoUnionScans(
 		return nil, false
 	}
 
+	md := c.e.mem.Metadata()
+	tableMeta := md.TableMeta(sp.Table)
+	index := tableMeta.Table.Index(sp.Index)
+	if keyPrefixLength >= index.KeyColumnCount() {
+		// There is no benefit to splitting into scans of a single row each.
+		return nil, false
+	}
+
+	// If the original scan cannot provide an ordering on at least one of the
+	// grouping columns, then GenerateStreamingGroupBy will not produce a
+	// streaming grouping operation, and therefore there is no benefit to
+	// splitting into scans.
+	if !indexHasOrderingSequenceOnOne(
+		md, scan, sp, private.GroupingCols, keyPrefixLength,
+	) {
+		return nil, false
+	}
+
 	// Create a UnionAll of scans that can provide the ordering of the
 	// GroupingPrivate (if no such UnionAll is possible this will return
 	// ok=false). We pass a limit of 0 since the scans are unlimited
@@ -406,21 +528,24 @@ func (c *CustomFuncs) MakeGroupingPrivate(
 // GenerateIndexScans, which does not construct an IndexJoin.
 func (c *CustomFuncs) GenerateLimitedGroupByScans(
 	grp memo.RelExpr,
+	required *physical.Required,
 	sp *memo.ScanPrivate,
 	aggs memo.AggregationsExpr,
 	gp *memo.GroupingPrivate,
 	limit opt.ScalarExpr,
-	required props.OrderingChoice,
+	requiredOrdering props.OrderingChoice,
 ) {
-	// If the required ordering and grouping columns do not share columns, then
-	// this optimization is not beneficial.
-	if !required.Any() && !required.Group(0).Intersects(gp.GroupingCols) && !required.Optional.Intersects(gp.GroupingCols) {
+	// If the requiredOrdering ordering and grouping columns do not share columns,
+	// then this optimization is not beneficial.
+	if !requiredOrdering.Any() && !requiredOrdering.Group(0).Intersects(gp.GroupingCols) && !requiredOrdering.Optional.Intersects(gp.GroupingCols) {
 		return
 	}
 	// Iterate over all non-inverted and non-partial secondary indexes.
 	var pkCols opt.ColSet
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, sp, nil /* filters */, rejectPrimaryIndex|rejectInvertedIndexes)
+	var sb indexScanBuilder
+	sb.Init(c, sp.Table)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, sp, nil /* filters */, rejectPrimaryIndex|rejectInvertedIndexes)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool, constProj memo.ProjectionsExpr) {
 		// The iterator only produces pseudo-partial indexes (the predicate is
 		// true) because no filters are passed to iter.Init to imply a partial
@@ -439,6 +564,12 @@ func (c *CustomFuncs) GenerateLimitedGroupByScans(
 			return
 		}
 
+		// Otherwise, try to construct an IndexJoin operator that provides the
+		// columns missing from the index.
+		if sp.Flags.NoIndexJoin {
+			return
+		}
+
 		// Calculate the PK columns once.
 		if pkCols.Empty() {
 			pkCols = c.PrimaryKeyCols(sp.Table)
@@ -450,29 +581,28 @@ func (c *CustomFuncs) GenerateLimitedGroupByScans(
 			return
 		}
 
-		// If the index doesn't contain any of the required order columns, then
+		// If the index doesn't contain any of the requiredOrdering order columns, then
 		// there is no benefit to exploring this index.
-		if !required.Any() && !required.Group(0).Intersects(indexCols) {
+		if !requiredOrdering.Any() && !requiredOrdering.Group(0).Intersects(indexCols) {
 			return
 		}
 
 		// Scan whatever columns we need which are available from the index.
 		newScanPrivate := *sp
+		newScanPrivate.Distribution.Regions = nil
 		newScanPrivate.Index = index.Ordinal()
 		newScanPrivate.Cols = indexCols.Intersection(sp.Cols)
 		// If the index is not covering, scan the needed index columns plus
 		// primary key columns.
 		newScanPrivate.Cols.UnionWith(pkCols)
-		input := c.e.f.ConstructScan(&newScanPrivate)
+		sb.SetScan(&newScanPrivate)
 		// Construct an IndexJoin operator that provides the columns missing from
 		// the index.
-		input = c.e.f.ConstructIndexJoin(input, &memo.IndexJoinPrivate{
-			Table: sp.Table,
-			Cols:  sp.Cols,
-		})
+		sb.AddIndexJoin(sp.Cols)
+		input := sb.BuildNewExpr()
 		// Reconstruct the GroupBy and Limit so the new expression in the memo is
 		// equivalent.
 		input = c.e.f.ConstructGroupBy(input, aggs, gp)
-		grp.Memo().AddLimitToGroup(&memo.LimitExpr{Limit: limit, Ordering: required, Input: input}, grp)
+		grp.Memo().AddLimitToGroup(&memo.LimitExpr{Limit: limit, Ordering: requiredOrdering, Input: input}, grp)
 	})
 }

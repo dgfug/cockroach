@@ -1,31 +1,30 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -43,7 +42,53 @@ const (
 	// RocksDB scans over part of the splitting range to recompute stats. We
 	// allow a limitted number of splits to be processed at once.
 	splitQueueConcurrency = 4
+	// slowSplitThresholdDefault is the split processing time after which we will
+	// output a verbose trace.
+	slowSplitThresholdDefault = 2 * time.Second
 )
+
+var SlowSplitTracingThreshold = settings.RegisterDurationSetting(
+	settings.SystemOnly,
+	"kv.split.slow_split_tracing_threshold",
+	"the duration after which a trace of the split is logged",
+	slowSplitThresholdDefault,
+)
+
+var (
+	metaSizeBasedSplitCount = metric.Metadata{
+		Name:        "queue.split.size_based",
+		Help:        "Number of range splits due to a range being greater than the configured max range size",
+		Measurement: "Range Splits",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLoadBasedSplitCount = metric.Metadata{
+		Name:        "queue.split.load_based",
+		Help:        "Number of range splits due to a range being greater than the configured max range load",
+		Measurement: "Range Splits",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaSpanConfigBasedSplitCount = metric.Metadata{
+		Name:        "queue.split.span_config_based",
+		Help:        "Number of range splits due to span configuration",
+		Measurement: "Range Splits",
+		Unit:        metric.Unit_COUNT,
+	}
+)
+
+// SplitQueueMetrics is the set of metrics for the split queue.
+type SplitQueueMetrics struct {
+	SizeBasedSplitCount       *metric.Counter
+	LoadBasedSplitCount       *metric.Counter
+	SpanConfigBasedSplitCount *metric.Counter
+}
+
+func makeSplitQueueMetrics() SplitQueueMetrics {
+	return SplitQueueMetrics{
+		SizeBasedSplitCount:       metric.NewCounter(metaSizeBasedSplitCount),
+		LoadBasedSplitCount:       metric.NewCounter(metaLoadBasedSplitCount),
+		SpanConfigBasedSplitCount: metric.NewCounter(metaSpanConfigBasedSplitCount),
+	}
+}
 
 // splitQueue manages a queue of ranges slated to be split due to size
 // or along intersecting zone config boundaries.
@@ -54,7 +99,12 @@ type splitQueue struct {
 
 	// loadBasedCount counts the load-based splits performed by the queue.
 	loadBasedCount telemetry.Counter
+	metrics        SplitQueueMetrics
+	// logTracesThreshold is the threshold for logging a trace of a slow split.
+	logTracesThreshold time.Duration
 }
+
+var _ queueImpl = &splitQueue{}
 
 // newSplitQueue returns a new instance of splitQueue.
 func newSplitQueue(store *Store, db *kv.DB) *splitQueue {
@@ -67,23 +117,28 @@ func newSplitQueue(store *Store, db *kv.DB) *splitQueue {
 	}
 
 	sq := &splitQueue{
-		db:             db,
-		purgChan:       purgChan,
-		loadBasedCount: telemetry.GetCounter("kv.split.load"),
+		db:                 db,
+		purgChan:           purgChan,
+		loadBasedCount:     telemetry.GetCounter("kv.split.load"),
+		metrics:            makeSplitQueueMetrics(),
+		logTracesThreshold: SlowSplitTracingThreshold.Get(&store.ClusterSettings().SV),
 	}
+	store.metrics.registry.AddMetricStruct(&sq.metrics)
 	sq.baseQueue = newBaseQueue(
 		"split", sq, store,
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			maxConcurrency:       splitQueueConcurrency,
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.SplitQueueSuccesses,
 			failures:             store.metrics.SplitQueueFailures,
+			storeFailures:        store.metrics.StoreFailures,
 			pending:              store.metrics.SplitQueuePending,
 			processingNanos:      store.metrics.SplitQueueProcessingNanos,
 			purgatory:            store.metrics.SplitQueuePurgatory,
+			disabledConfig:       kvserverbase.SplitQueueEnabled,
 		},
 	)
 	return sq
@@ -97,7 +152,12 @@ func shouldSplitRange(
 	shouldBackpressureWrites bool,
 	confReader spanconfig.StoreReader,
 ) (shouldQ bool, priority float64) {
-	if confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey) {
+	needsSplit, err := confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey)
+	if err != nil {
+		log.Warningf(ctx, "unable to compute NeedsSpilt (%v); skipping range %s", err, desc.RangeID)
+		return false, 0
+	}
+	if needsSplit {
 		// Set priority to 1 in the event the range is split by zone configs.
 		priority = 1
 		shouldQ = true
@@ -137,10 +197,10 @@ func (sq *splitQueue) shouldQueue(
 	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, confReader spanconfig.StoreReader,
 ) (shouldQ bool, priority float64) {
 	shouldQ, priority = shouldSplitRange(ctx, repl.Desc(), repl.GetMVCCStats(),
-		repl.GetMaxBytes(), repl.shouldBackpressureWrites(), confReader)
+		repl.GetMaxBytes(ctx), repl.shouldBackpressureWrites(), confReader)
 
 	if !shouldQ && repl.SplitByLoadEnabled() {
-		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(timeutil.Now()); splitKey != nil {
+		if splitKey := repl.loadSplitKey(ctx, repl.Clock().PhysicalTime()); splitKey != nil {
 			shouldQ, priority = true, 1.0 // default priority
 		}
 	}
@@ -153,23 +213,64 @@ func (sq *splitQueue) shouldQueue(
 type unsplittableRangeError struct{}
 
 func (unsplittableRangeError) Error() string         { return "could not find valid split key" }
-func (unsplittableRangeError) purgatoryErrorMarker() {}
+func (unsplittableRangeError) PurgatoryErrorMarker() {}
 
-var _ purgatoryError = unsplittableRangeError{}
+var _ PurgatoryError = unsplittableRangeError{}
 
 // process synchronously invokes admin split for each proposed split key.
 func (sq *splitQueue) process(
 	ctx context.Context, r *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
-	processed, err = sq.processAttempt(ctx, r, confReader)
-	if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+	processed, err = sq.processAttemptWithTracing(ctx, r, confReader)
+	if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 		// ConditionFailedErrors are an expected outcome for range split
 		// attempts because splits can race with other descriptor modifications.
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be split.
-		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying")
+		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying; err: %v", err)
 		sq.MaybeAddAsync(ctx, r, sq.store.Clock().NowAsClockTimestamp())
 		return false, nil
+	}
+
+	return processed, err
+}
+
+// processAttemptWithTracing executes processAttempt within a tracing span,
+// logging the resulting traces in the case of errors or when the configured log
+// traces threshold is exceeded.
+func (sq *splitQueue) processAttemptWithTracing(
+	ctx context.Context, r *Replica, confReader spanconfig.StoreReader,
+) (processed bool, _ error) {
+	processStart := r.Clock().PhysicalTime()
+	startTracing := log.ExpensiveLogEnabled(ctx, 1)
+	var opts []tracing.SpanOption
+	if startTracing {
+		opts = append(opts, tracing.WithRecording(tracingpb.RecordingVerbose))
+	}
+	ctx, sp := tracing.EnsureChildSpan(ctx, sq.Tracer, "split", opts...)
+	defer sp.Finish()
+
+	processed, err := sq.processAttempt(ctx, r, confReader)
+	processDuration := r.Clock().PhysicalTime().Sub(processStart)
+	exceededDuration := sq.logTracesThreshold > time.Duration(0) && processDuration > sq.logTracesThreshold
+	var traceOutput redact.RedactableString
+	if startTracing {
+		// Utilize a new background context (properly annotated) to avoid writing
+		// traces from a child context into its parent.
+		ctx = r.AnnotateCtx(sq.AnnotateCtx(context.Background()))
+
+		traceLoggingNeeded := (err != nil || exceededDuration)
+		if traceLoggingNeeded {
+			// Add any trace filtering here if the output is too verbose.
+			rec := sp.GetConfiguredRecording()
+			traceOutput = redact.Sprintf("\ntrace:\n%s", rec)
+		}
+	}
+	if err != nil {
+		log.Infof(ctx, "error during range split: %v%s", err, traceOutput)
+	} else if exceededDuration {
+		log.Infof(ctx, "range split took %s, exceeding threshold of %s%s",
+			processDuration, sq.logTracesThreshold, traceOutput)
 	}
 
 	return processed, err
@@ -180,11 +281,15 @@ func (sq *splitQueue) processAttempt(
 ) (processed bool, err error) {
 	desc := r.Desc()
 	// First handle the case of splitting due to span config maps.
-	if splitKey := confReader.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey); splitKey != nil {
+	splitKey, err := confReader.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey)
+	if err != nil {
+		return false, errors.Wrapf(err, "unable to compute split key")
+	}
+	if splitKey != nil {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{
-				RequestHeader: roachpb.RequestHeader{
+			kvpb.AdminSplitRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: splitKey.AsRawKey(),
 				},
 				SplitKey:       splitKey.AsRawKey(),
@@ -193,9 +298,11 @@ func (sq *splitQueue) processAttempt(
 			desc,
 			false, /* delayable */
 			"span config",
+			false, /* findFirstSafeSplitKey */
 		); err != nil {
 			return false, errors.Wrapf(err, "unable to split %s at key %q", r, splitKey)
 		}
+		sq.metrics.SpanConfigBasedSplitCount.Inc(1)
 		return true, nil
 	}
 
@@ -203,28 +310,40 @@ func (sq *splitQueue) processAttempt(
 	// size-based splitting if maxBytes is 0 (happens in certain test
 	// situations).
 	size := r.GetMVCCStats().Total()
-	maxBytes := r.GetMaxBytes()
-	if maxBytes > 0 && float64(size)/float64(maxBytes) > 1 {
-		_, err := r.adminSplitWithDescriptor(
+	maxBytes := r.GetMaxBytes(ctx)
+	if maxBytes > 0 && size > maxBytes {
+		reason := redact.Sprintf(
+			"%s above threshold size %s",
+			humanizeutil.IBytes(size),
+			humanizeutil.IBytes(maxBytes),
+		)
+		if _, err := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{},
+			kvpb.AdminSplitRequest{},
 			desc,
 			false, /* delayable */
-			fmt.Sprintf("%s above threshold size %s", humanizeutil.IBytes(size), humanizeutil.IBytes(maxBytes)),
-		)
-
-		return err == nil, err
+			reason,
+			false, /* findFirstSafeSplitKey */
+		); err != nil {
+			return false, err
+		}
+		sq.metrics.SizeBasedSplitCount.Inc(1)
+		return true, nil
 	}
 
-	now := timeutil.Now()
-	if splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(now); splitByLoadKey != nil {
-		batchHandledQPS, _ := r.QueriesPerSecond()
-		raftAppliedQPS := r.WritesPerSecond()
-		splitQPS := r.loadBasedSplitter.LastQPS(now)
-		reason := fmt.Sprintf(
-			"load at key %s (%.2f splitQPS, %.2f batches/sec, %.2f raft mutations/sec)",
+	now := r.Clock().PhysicalTime()
+	if splitByLoadKey := r.loadSplitKey(ctx, now); splitByLoadKey != nil {
+		loadStats := r.loadStats.Stats()
+		batchHandledQPS := loadStats.QueriesPerSecond
+		raftAppliedQPS := loadStats.WriteKeysPerSecond
+		lbSplitSnap := r.loadBasedSplitter.Snapshot(ctx, now)
+		splitObj := lbSplitSnap.SplitObjective
+
+		reason := redact.Sprintf(
+			"load at key %s (%s %s, %.2f batches/sec, %.2f raft mutations/sec)",
 			splitByLoadKey,
-			splitQPS,
+			splitObj,
+			splitObj.Format(lbSplitSnap.Last),
 			batchHandledQPS,
 			raftAppliedQPS,
 		)
@@ -240,10 +359,14 @@ func (sq *splitQueue) processAttempt(
 		if expDelay := kvserverbase.SplitByLoadMergeDelay.Get(&sq.store.cfg.Settings.SV); expDelay > 0 {
 			expTime = sq.store.Clock().Now().Add(expDelay.Nanoseconds(), 0)
 		}
+		// The splitByLoadKey has no guarantee of being a safe key to split at (not
+		// between SQL rows). To sanitize the split point, pass
+		// findFirstSafeSplitKey set to true, so that the first key after the
+		// suggested split point which is safe to split at is used.
 		if _, pErr := r.adminSplitWithDescriptor(
 			ctx,
-			roachpb.AdminSplitRequest{
-				RequestHeader: roachpb.RequestHeader{
+			kvpb.AdminSplitRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key: splitByLoadKey,
 				},
 				SplitKey:       splitByLoadKey,
@@ -252,17 +375,25 @@ func (sq *splitQueue) processAttempt(
 			desc,
 			false, /* delayable */
 			reason,
+			true, /* findFirstSafeSplitKey */
 		); pErr != nil {
 			return false, errors.Wrapf(pErr, "unable to split %s at key %q", r, splitByLoadKey)
 		}
 
 		telemetry.Inc(sq.loadBasedCount)
+		sq.metrics.LoadBasedSplitCount.Inc(1)
 
 		// Reset the splitter now that the bounds of the range changed.
 		r.loadBasedSplitter.Reset(sq.store.Clock().PhysicalTime())
 		return true, nil
 	}
+
 	return false, nil
+}
+
+func (*splitQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 // timer returns interval between processing successive queued splits.
@@ -273,4 +404,8 @@ func (*splitQueue) timer(_ time.Duration) time.Duration {
 // purgatoryChan returns the split queue's purgatory channel.
 func (sq *splitQueue) purgatoryChan() <-chan time.Time {
 	return sq.purgChan
+}
+
+func (sq *splitQueue) updateChan() <-chan time.Time {
+	return nil
 }

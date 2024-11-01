@@ -1,17 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package geomfn contains functions that are used for geometry-based builtins.
 package geomfn
 
-import "github.com/twpayne/go-geom"
+import (
+	// Blank import so projections are initialized correctly.
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
+	"github.com/twpayne/go-geom"
+)
 
 // applyCoordFunc applies a function on src to copy onto dst.
 // Both slices represent a single Coord within the FlatCoord array.

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord_test
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,7 +35,7 @@ import (
 // transaction status and do an async abort.
 // After the heartbeat loop finds out about the abort, subsequent requests sent
 // through the TxnCoordSender return TransactionAbortedErrors. On those errors,
-// the contract is that the client.Txn creates a new transaction internally and
+// the contract is that the kv.Txn creates a new transaction internally and
 // switches the TxnCoordSender instance. The expectation is that the old
 // transaction has been cleaned up by that point.
 func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
@@ -52,11 +48,11 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 	s, _, origDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					// We'll eventually expect to see an EndTxn(commit=false)
 					// with the right intents.
 					if args.Req.IsSingleEndTxnRequest() {
-						et := args.Req.Requests[0].GetInner().(*roachpb.EndTxnRequest)
+						et := args.Req.Requests[0].GetInner().(*kvpb.EndTxnRequest)
 						if !et.Commit && et.Key.Equal(key) &&
 							reflect.DeepEqual(et.LockSpans, []roachpb.Span{{Key: key}, {Key: key2}}) {
 							atomic.StoreInt64(&cleanupSeen, 1)
@@ -81,11 +77,11 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 		if err := conflictTxn.Put(ctx, key, "pusher was here"); err != nil {
 			return err
 		}
-		return conflictTxn.CommitOrCleanup(ctx)
+		return conflictTxn.Commit(ctx)
 	}
 
 	// Make a db with a short heartbeat interval.
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+	ambient := s.AmbientCtx()
 	tsf := kvcoord.NewTxnCoordSenderFactory(
 		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
@@ -128,7 +124,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 
 	// Check that further sends through the aborted txn are rejected. The
 	// TxnCoordSender is supposed to synthesize a TransactionAbortedError.
-	if err := txn.CommitOrCleanup(ctx); !testutils.IsError(
+	if err := txn.Commit(ctx); !testutils.IsError(
 		err, "TransactionRetryWithProtoRefreshError: TransactionAbortedError",
 	) {
 		t.Fatalf("expected aborted error, got: %s", err)
@@ -150,9 +146,8 @@ func TestNoDuplicateHeartbeatLoops(t *testing.T) {
 
 	key := roachpb.Key("a")
 
-	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("test", tracing.WithRecording(tracing.RecordingVerbose))
-	txnCtx := tracing.ContextWithSpan(context.Background(), sp)
+	tracer := s.TracerI().(*tracing.Tracer)
+	txnCtx, collectAndFinish := tracing.ContextWithRecordingSpan(context.Background(), tracer, "test")
 
 	push := func(ctx context.Context, key roachpb.Key) error {
 		return db.Put(ctx, key, "push")
@@ -177,7 +172,7 @@ func TestNoDuplicateHeartbeatLoops(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("expected 2 attempts, got: %d", attempts)
 	}
-	recording := sp.FinishAndGetRecording(tracing.RecordingVerbose)
+	recording := collectAndFinish()
 	var foundHeartbeatLoop bool
 	for _, sp := range recording {
 		if tracing.LogsContainMsg(sp, kvbase.SpawningHeartbeatLoopMsg) {

@@ -1,19 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build execgen_template
 // +build execgen_template
 
 package colexecjoin
 
-import "github.com/cockroachdb/cockroach/pkg/col/coldata"
+import (
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+)
 
 // execgen:template<useSel>
 func collectProbeOuter(
@@ -144,12 +142,18 @@ func collectProbeNoOuter(
 	return nResults
 }
 
-// This code snippet collects the "matches" for LEFT ANTI and EXCEPT ALL joins.
-// "Matches" are in quotes because we're actually interested in non-matches
-// from the left side.
-// execgen:template<useSel>
-func collectLeftAnti(
-	hj *hashJoiner, batchSize int, nResults int, batch coldata.Batch, sel []int, useSel bool,
+// This code snippet collects the "matches" for LEFT ANTI, EXCEPT ALL, and
+// INTERSECT ALL joins. "Matches" are in quotes because we're actually
+// interested in non-matches from the left side if matchZeroCurrentID is true.
+// execgen:template<matchZeroCurrentID,useSel>
+func collectSingleMatch(
+	hj *hashJoiner,
+	batchSize int,
+	nResults int,
+	batch coldata.Batch,
+	sel []int,
+	matchZeroCurrentID bool,
+	useSel bool,
 ) int {
 	// Early bounds checks.
 	// Capture the slice in order for BCE to occur.
@@ -161,11 +165,25 @@ func collectLeftAnti(
 	for i := 0; i < batchSize; i++ {
 		//gcassert:bce
 		currentID := HeadIDs[i]
-		if currentID == 0 {
-			// currentID of 0 indicates that ith probing row didn't have a match, so
-			// we include it into the output.
-			hj.probeState.probeIdx[nResults] = getIdx(i, sel, useSel)
-			nResults++
+		if matchZeroCurrentID {
+			if currentID == 0 {
+				// {{/*
+				//     currentID of 0 indicates that ith probing row didn't have
+				//     a match, so we include it into the output.
+				// */}}
+				hj.probeState.probeIdx[nResults] = getIdx(i, sel, useSel)
+				nResults++
+			}
+		} else {
+			if currentID != 0 {
+				// {{/*
+				//     Non-zero currentID indicates that ith probing row had a
+				//     match AND that match wasn't previously "visited", so we
+				//     include it into the output.
+				// */}}
+				hj.probeState.probeIdx[nResults] = getIdx(i, sel, useSel)
+				nResults++
+			}
 		}
 	}
 	return nResults
@@ -194,11 +212,11 @@ func collectRightSemiAnti(hj *hashJoiner, batchSize int) {
 func distinctCollectProbeOuter(hj *hashJoiner, batchSize int, sel []int, useSel bool) {
 	// Early bounds checks.
 	// Capture the slices in order for BCE to occur.
-	groupIDs := hj.ht.ProbeScratch.GroupID
+	toCheckIDs := hj.ht.ProbeScratch.ToCheckID
 	probeRowUnmatched := hj.probeState.probeRowUnmatched
 	buildIdx := hj.probeState.buildIdx
 	probeIdx := hj.probeState.probeIdx
-	_ = groupIDs[batchSize-1]
+	_ = toCheckIDs[batchSize-1]
 	_ = probeRowUnmatched[batchSize-1]
 	_ = buildIdx[batchSize-1]
 	_ = probeIdx[batchSize-1]
@@ -208,7 +226,7 @@ func distinctCollectProbeOuter(hj *hashJoiner, batchSize int, sel []int, useSel 
 	for i := 0; i < batchSize; i++ {
 		// Index of keys and outputs in the hash table is calculated as ID - 1.
 		//gcassert:bce
-		id := groupIDs[i]
+		id := toCheckIDs[i]
 		rowUnmatched := id == 0
 		//gcassert:bce
 		probeRowUnmatched[i] = rowUnmatched
@@ -235,14 +253,14 @@ func distinctCollectProbeNoOuter(
 ) int {
 	// Early bounds checks.
 	// Capture the slice in order for BCE to occur.
-	groupIDs := hj.ht.ProbeScratch.GroupID
-	_ = groupIDs[batchSize-1]
+	toCheckIDs := hj.ht.ProbeScratch.ToCheckID
+	_ = toCheckIDs[batchSize-1]
 	if useSel {
 		_ = sel[batchSize-1]
 	}
 	for i := 0; i < batchSize; i++ {
 		//gcassert:bce
-		id := groupIDs[i]
+		id := toCheckIDs[i]
 		if id != 0 {
 			// Index of keys and outputs in the hash table is calculated as ID - 1.
 			hj.probeState.buildIdx[nResults] = int(id - 1)
@@ -259,7 +277,7 @@ func distinctCollectProbeNoOuter(
 func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int {
 	nResults := 0
 
-	if hj.spec.JoinType.IsRightSemiOrRightAnti() {
+	if !hj.spec.JoinType.ShouldIncludeLeftColsInOutput() {
 		collectRightSemiAnti(hj, batchSize)
 		return 0
 	}
@@ -273,13 +291,17 @@ func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int
 	} else {
 		if sel != nil {
 			if hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, true)
+				nResults = collectSingleMatch(hj, batchSize, nResults, batch, sel, true, true)
+			} else if hj.spec.JoinType == descpb.IntersectAllJoin {
+				nResults = collectSingleMatch(hj, batchSize, nResults, batch, sel, false, true)
 			} else {
 				nResults = collectProbeNoOuter(hj, batchSize, nResults, batch, sel, true)
 			}
 		} else {
 			if hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, false)
+				nResults = collectSingleMatch(hj, batchSize, nResults, batch, sel, true, false)
+			} else if hj.spec.JoinType == descpb.IntersectAllJoin {
+				nResults = collectSingleMatch(hj, batchSize, nResults, batch, sel, false, false)
 			} else {
 				nResults = collectProbeNoOuter(hj, batchSize, nResults, batch, sel, false)
 			}
@@ -289,20 +311,16 @@ func (hj *hashJoiner) collect(batch coldata.Batch, batchSize int, sel []int) int
 	return nResults
 }
 
-// distinctCollect prepares the batch with the joined output columns where the build
-// row index for each probe row is given in the GroupID slice. This function
-// requires assumes a N-1 hash join.
+// distinctCollect prepares the batch with the joined output columns where the
+// build row index for each probe row is given in the ToCheckID slice. The
+// function only handles inner, outer, and left semi joins (since all others
+// need facilities of the non-distinct collection) in the case that the equality
+// columns form a key over the right side.
 func (hj *hashJoiner) distinctCollect(batch coldata.Batch, batchSize int, sel []int) int {
 	nResults := 0
 
-	if hj.spec.JoinType.IsRightSemiOrRightAnti() {
-		collectRightSemiAnti(hj, batchSize)
-		return 0
-	}
-
 	if hj.spec.JoinType.IsLeftOuterOrFullOuter() {
 		nResults = batchSize
-
 		if sel != nil {
 			distinctCollectProbeOuter(hj, batchSize, sel, true)
 		} else {
@@ -310,23 +328,9 @@ func (hj *hashJoiner) distinctCollect(batch coldata.Batch, batchSize int, sel []
 		}
 	} else {
 		if sel != nil {
-			if hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
-				// (right) side was distinct, so we only have single variation of COLLECT
-				// method.
-				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, true)
-			} else {
-				nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, true)
-			}
+			nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, true)
 		} else {
-			if hj.spec.JoinType.IsLeftAntiOrExceptAll() {
-				// For LEFT ANTI and EXCEPT ALL joins we don't care whether the build
-				// (right) side was distinct, so we only have single variation of COLLECT
-				// method.
-				nResults = collectLeftAnti(hj, batchSize, nResults, batch, sel, false)
-			} else {
-				nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, false)
-			}
+			nResults = distinctCollectProbeNoOuter(hj, batchSize, nResults, sel, false)
 		}
 	}
 

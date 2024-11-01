@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -14,28 +9,47 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/redact"
 )
 
 // IsolationLevel holds the isolation level for a transaction.
 type IsolationLevel int
 
+var _ redact.SafeValue = IsolationLevel(0)
+
+// SafeValue makes Kind a redact.SafeValue.
+func (k IsolationLevel) SafeValue() {}
+
 // IsolationLevel values
 const (
 	UnspecifiedIsolation IsolationLevel = iota
+	ReadUncommittedIsolation
+	ReadCommittedIsolation
+	RepeatableReadIsolation
+	SnapshotIsolation
 	SerializableIsolation
 )
 
 var isolationLevelNames = [...]string{
-	UnspecifiedIsolation:  "UNSPECIFIED",
-	SerializableIsolation: "SERIALIZABLE",
+	UnspecifiedIsolation:     "UNSPECIFIED",
+	ReadUncommittedIsolation: "READ UNCOMMITTED",
+	ReadCommittedIsolation:   "READ COMMITTED",
+	RepeatableReadIsolation:  "REPEATABLE READ",
+	SnapshotIsolation:        "SNAPSHOT",
+	SerializableIsolation:    "SERIALIZABLE",
 }
 
 // IsolationLevelMap is a map from string isolation level name to isolation
 // level, in the lowercase format that set isolation_level supports.
 var IsolationLevelMap = map[string]IsolationLevel{
-	"serializable": SerializableIsolation,
+	"read uncommitted": ReadUncommittedIsolation,
+	"read committed":   ReadCommittedIsolation,
+	"repeatable read":  RepeatableReadIsolation,
+	"snapshot":         SnapshotIsolation,
+	"serializable":     SerializableIsolation,
 }
 
 func (i IsolationLevel) String() string {
@@ -43,6 +57,76 @@ func (i IsolationLevel) String() string {
 		return fmt.Sprintf("IsolationLevel(%d)", i)
 	}
 	return isolationLevelNames[i]
+}
+
+// ToKVIsoLevel converts an IsolationLevel to its isolation.Level equivalent.
+func (i IsolationLevel) ToKVIsoLevel() isolation.Level {
+	switch i {
+	case ReadUncommittedIsolation, ReadCommittedIsolation:
+		return isolation.ReadCommitted
+	case RepeatableReadIsolation, SnapshotIsolation:
+		return isolation.Snapshot
+	case SerializableIsolation:
+		return isolation.Serializable
+	default:
+		panic(fmt.Sprintf("unknown isolation level: %s", i))
+	}
+}
+
+// FromKVIsoLevel converts an isolation.Level to its SQL semantic equivalent.
+func FromKVIsoLevel(level isolation.Level) IsolationLevel {
+	switch level {
+	case isolation.ReadCommitted:
+		return ReadCommittedIsolation
+	case isolation.Snapshot:
+		return RepeatableReadIsolation
+	case isolation.Serializable:
+		return SerializableIsolation
+	default:
+		panic(fmt.Sprintf("unknown isolation level: %s", level))
+	}
+}
+
+// UpgradeToEnabledLevel upgrades the isolation level to the weakest enabled
+// isolation level that is stronger than or equal to the input level.
+func (i IsolationLevel) UpgradeToEnabledLevel(
+	allowReadCommitted, allowRepeatableRead, hasLicense bool,
+) (_ IsolationLevel, upgraded, upgradedDueToLicense bool) {
+	switch i {
+	case ReadUncommittedIsolation:
+		// READ UNCOMMITTED is mapped to READ COMMITTED. PostgreSQL also does
+		// this: https://www.postgresql.org/docs/current/transaction-iso.html.
+		upgraded = true
+		fallthrough
+	case ReadCommittedIsolation:
+		// READ COMMITTED is only allowed if the cluster setting is enabled and the
+		// cluster has a license. Otherwise, it is mapped to a stronger isolation
+		// level (REPEATABLE READ if enabled, SERIALIZABLE otherwise).
+		if allowReadCommitted && hasLicense {
+			return ReadCommittedIsolation, upgraded, upgradedDueToLicense
+		}
+		upgraded = true
+		if allowReadCommitted && !hasLicense {
+			upgradedDueToLicense = true
+		}
+		fallthrough
+	case RepeatableReadIsolation, SnapshotIsolation:
+		// REPEATABLE READ and SNAPSHOT are considered aliases. The isolation levels
+		// are only allowed if the cluster setting is enabled and the cluster has a
+		// license. Otherwise, they are mapped to SERIALIZABLE.
+		if allowRepeatableRead && hasLicense {
+			return RepeatableReadIsolation, upgraded, upgradedDueToLicense
+		}
+		upgraded = true
+		if allowRepeatableRead && !hasLicense {
+			upgradedDueToLicense = true
+		}
+		fallthrough
+	case SerializableIsolation:
+		return SerializableIsolation, upgraded, upgradedDueToLicense
+	default:
+		panic(fmt.Sprintf("unknown isolation level: %s", i))
+	}
 }
 
 // UserPriority holds the user priority for a transaction.
@@ -221,12 +305,20 @@ func (node *TransactionModes) Merge(other TransactionModes) error {
 
 // BeginTransaction represents a BEGIN statement
 type BeginTransaction struct {
-	Modes TransactionModes
+	// FormatWithStart says whether this statement must be formatted with
+	// "START" rather than "BEGIN". This is needed if this statement is in a
+	// BEGIN ATOMIC block of a procedure or function.
+	FormatWithStart bool
+	Modes           TransactionModes
 }
 
 // Format implements the NodeFormatter interface.
 func (node *BeginTransaction) Format(ctx *FmtCtx) {
-	ctx.WriteString("BEGIN TRANSACTION")
+	if node.FormatWithStart {
+		ctx.WriteString("START TRANSACTION")
+	} else {
+		ctx.WriteString("BEGIN TRANSACTION")
+	}
 	ctx.FormatNode(&node.Modes)
 }
 

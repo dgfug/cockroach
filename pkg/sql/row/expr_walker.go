@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row
 
@@ -18,15 +13,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -61,9 +59,9 @@ func (pos importRandPosition) distance(o importRandPosition) int64 {
 // call to a random function when generating a given row from a given source.
 // numInstances refers to the number of random function invocations per row.
 func getPosForRandImport(rowID int64, sourceID int32, numInstances int) importRandPosition {
-	// We expect r.pos to increment by numInstances for each row.
-	// Therefore, assuming that rowID increments by 1 for every row,
-	// we will initialize the position as rowID * numInstances + sourceID << rowIDBits.
+	// We expect r.pos to increment by numInstances for each row. Therefore,
+	// assuming that rowID increments by 1 for every row, we will initialize the
+	// position as rowID * numInstances + sourceID << rowIDBits.
 	rowIDWithMultiplier := int64(numInstances) * rowID
 	pos := (int64(sourceID) << rowIDBits) ^ rowIDWithMultiplier
 	return importRandPosition(pos)
@@ -86,13 +84,15 @@ type importRand struct {
 }
 
 func (r *importRand) reseed(pos importRandPosition) {
-	adjPos := (pos / reseedRandEveryN) * reseedRandEveryN
-	rnd := rand.New(rand.NewSource(int64(adjPos)))
-	for i := int(pos % reseedRandEveryN); i > 0; i-- {
-		_ = rnd.Float64()
+	adjPos := int64((pos / reseedRandEveryN) * reseedRandEveryN)
+	if r.Rand == nil {
+		r.Rand = rand.New(rand.NewSource(adjPos))
+	} else {
+		r.Rand.Seed(adjPos)
 	}
-
-	r.Rand = rnd
+	for i := int(pos % reseedRandEveryN); i > 0; i-- {
+		_ = r.Rand.Float64()
+	}
 	r.pos = pos
 }
 
@@ -104,7 +104,7 @@ func (r *importRand) maybeReseed(c *CellInfoAnnotation) {
 	// position, so if we skip some rows we need to reseed.
 	// We may skip rows because a single row converter may be responsible for
 	// converting several non-contiguous batches of KVs.
-	newRowPos := getPosForRandImport(c.rowID, c.sourceID, c.randInstancePerRow)
+	newRowPos := getPosForRandImport(c.RowID, c.SourceID, c.randInstancePerRow)
 	rowsSkipped := newRowPos.distance(r.pos) > int64(c.randInstancePerRow)
 	if rowsSkipped {
 		// Reseed at the new position, since our internally tracked r.pos is now out
@@ -137,20 +137,22 @@ func (r *importRand) Int63(c *CellInfoAnnotation) int64 {
 // our own function definition, which produces deterministic results.
 func makeBuiltinOverride(
 	builtin *tree.FunctionDefinition, overloads ...tree.Overload,
-) *tree.FunctionDefinition {
+) *tree.ResolvedFunctionDefinition {
 	props := builtin.FunctionProperties
-	return tree.NewFunctionDefinition(
+	override := tree.NewFunctionDefinition(
 		"import."+builtin.Name, &props, overloads)
+	// Schema name is not really important here since it's already a resolved
+	// function definition, so it won't be actually resolved again.
+	return tree.QualifyBuiltinFunctionDefinition(override, "import")
 }
 
 // SequenceMetadata contains information used when processing columns with
 // default expressions which use sequences.
 type SequenceMetadata struct {
-	id              descpb.ID
-	seqDesc         catalog.TableDescriptor
-	instancesPerRow int64
-	curChunk        *jobspb.SequenceValChunk
-	curVal          int64
+	SeqDesc         catalog.TableDescriptor
+	InstancesPerRow int64
+	CurChunk        *jobspb.SequenceValChunk
+	CurVal          int64
 }
 
 type overrideVolatility bool
@@ -172,8 +174,8 @@ const cellInfoAddr tree.AnnotationIdx = iota + 1
 // CellInfoAnnotation encapsulates the AST annotation for the various supported
 // default expressions for import.
 type CellInfoAnnotation struct {
-	sourceID int32
-	rowID    int64
+	SourceID int32
+	RowID    int64
 
 	// Annotations for unique_rowid().
 	uniqueRowIDInstance int
@@ -195,13 +197,13 @@ func getCellInfoAnnotation(t *tree.Annotations) *CellInfoAnnotation {
 }
 
 func (c *CellInfoAnnotation) reset(sourceID int32, rowID int64) {
-	c.sourceID = sourceID
-	c.rowID = rowID
+	c.SourceID = sourceID
+	c.RowID = rowID
 	c.uniqueRowIDInstance = 0
 }
 
 func makeImportRand(c *CellInfoAnnotation) randomSource {
-	pos := getPosForRandImport(c.rowID, c.sourceID, c.randInstancePerRow)
+	pos := getPosForRandImport(c.RowID, c.SourceID, c.randInstancePerRow)
 	randSource := &importRand{}
 	randSource.reseed(pos)
 	return randSource
@@ -242,17 +244,21 @@ func makeImportRand(c *CellInfoAnnotation) randomSource {
 // TODO(anzoteh96): As per the issue in #51004, having too many columns with
 // default expression unique_rowid() could cause collisions when IMPORTs are run
 // too close to each other. It will therefore be nice to fix this problem.
-func importUniqueRowID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+func importUniqueRowID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	avoidCollisionsWithSQLsIDs := uint64(1 << 63)
-	shiftedIndex := int64(c.uniqueRowIDTotal)*c.rowID + int64(c.uniqueRowIDInstance)
-	returnIndex := (uint64(c.sourceID) << rowIDBits) ^ uint64(shiftedIndex)
+	shiftedIndex := int64(c.uniqueRowIDTotal)*c.RowID + int64(c.uniqueRowIDInstance)
+	returnIndex := (uint64(c.SourceID) << rowIDBits) ^ uint64(shiftedIndex)
 	c.uniqueRowIDInstance++
 	evalCtx.Annotations.Set(cellInfoAddr, c)
 	return tree.NewDInt(tree.DInt(avoidCollisionsWithSQLsIDs | returnIndex)), nil
 }
 
-func importRandom(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+func importRandom(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
 		c.randSource = makeImportRand(c)
@@ -260,7 +266,9 @@ func importRandom(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, erro
 	return tree.NewDFloat(tree.DFloat(c.randSource.Float64(c))), nil
 }
 
-func importGenUUID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+func importGenUUID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
 		c.randSource = makeImportRand(c)
@@ -276,6 +284,7 @@ func importGenUUID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, err
 type SeqChunkProvider struct {
 	JobID    jobspb.JobID
 	Registry *jobs.Registry
+	DB       isql.DB
 }
 
 // RequestChunk updates seqMetadata with information about the chunk of sequence
@@ -283,12 +292,12 @@ type SeqChunkProvider struct {
 // first checks if there is a previously allocated chunk associated with the
 // row, and if not goes on to allocate a new chunk.
 func (j *SeqChunkProvider) RequestChunk(
-	evalCtx *tree.EvalContext, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+	ctx context.Context, evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
 ) error {
 	var hasAllocatedChunk bool
-	return evalCtx.DB.Txn(evalCtx.Context, func(ctx context.Context, txn *kv.Txn) error {
+	return j.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		var foundFromPreviouslyAllocatedChunk bool
-		resolveChunkFunc := func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		resolveChunkFunc := func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 			progress := md.Progress
 
 			// Check if we have already reserved a chunk corresponding to this row in a
@@ -305,7 +314,7 @@ func (j *SeqChunkProvider) RequestChunk(
 
 			// Reserve a new sequence value chunk at the KV level.
 			if !hasAllocatedChunk {
-				if err := reserveChunkOfSeqVals(evalCtx, c, seqMetadata); err != nil {
+				if err := reserveChunkOfSeqVals(ctx, evalCtx, c, seqMetadata, j.DB.KV()); err != nil {
 					return err
 				}
 				hasAllocatedChunk = true
@@ -316,11 +325,11 @@ func (j *SeqChunkProvider) RequestChunk(
 			// ensure correct behavior on job resumption.
 			// We never want to end up in a situation where row x is assigned a different
 			// sequence value on subsequent import job resumptions.
-			fileProgress := progress.GetImport().SequenceDetails[c.sourceID]
+			fileProgress := progress.GetImport().SequenceDetails[c.SourceID]
 			if fileProgress.SeqIdToChunks == nil {
 				fileProgress.SeqIdToChunks = make(map[int32]*jobspb.SequenceDetails_SequenceChunks)
 			}
-			seqID := seqMetadata.id
+			seqID := seqMetadata.SeqDesc.GetID()
 			if _, ok := fileProgress.SeqIdToChunks[int32(seqID)]; !ok {
 				fileProgress.SeqIdToChunks[int32(seqID)] = &jobspb.SequenceDetails_SequenceChunks{
 					Chunks: make([]*jobspb.SequenceValChunk, 0),
@@ -329,7 +338,7 @@ func (j *SeqChunkProvider) RequestChunk(
 			// We can cleanup some of the older chunks which correspond to rows
 			// below the resume pos as we are never going to reprocess those
 			// check pointed rows on job resume.
-			resumePos := progress.GetImport().ResumePos[c.sourceID]
+			resumePos := progress.GetImport().ResumePos[c.SourceID]
 			trim, chunks := 0, fileProgress.SeqIdToChunks[int32(seqID)].Chunks
 			// If the resumePos is below the max bound of the current chunk we need
 			// to keep this chunk in case the job is re-resumed.
@@ -339,20 +348,22 @@ func (j *SeqChunkProvider) RequestChunk(
 				fileProgress.SeqIdToChunks[int32(seqID)].Chunks[trim:]
 
 			fileProgress.SeqIdToChunks[int32(seqID)].Chunks = append(
-				fileProgress.SeqIdToChunks[int32(seqID)].Chunks, seqMetadata.curChunk)
+				fileProgress.SeqIdToChunks[int32(seqID)].Chunks, seqMetadata.CurChunk)
 			ju.UpdateProgress(progress)
 			return nil
 		}
-		const useReadLock = true
-		err := j.Registry.UpdateJobWithTxn(ctx, j.JobID, txn, useReadLock, resolveChunkFunc)
+		job, err := j.Registry.LoadJobWithTxn(ctx, j.JobID, txn)
 		if err != nil {
+			return err
+		}
+		if err := job.WithTxn(txn).Update(ctx, resolveChunkFunc); err != nil {
 			return err
 		}
 
 		// Now that the job progress has been written to, we can use the newly
 		// allocated chunk.
 		if !foundFromPreviouslyAllocatedChunk {
-			seqMetadata.curVal = seqMetadata.curChunk.ChunkStartVal
+			seqMetadata.CurVal = seqMetadata.CurChunk.ChunkStartVal
 		}
 		return nil
 	})
@@ -375,7 +386,7 @@ func incrementSequenceByVal(
 	seqValueKey := codec.SequenceKey(uint32(descriptor.GetID()))
 	val, err = kv.IncrementValRetryable(ctx, db, seqValueKey, incrementBy)
 	if err != nil {
-		if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
+		if errors.HasType(err, (*kvpb.IntegerOverflowError)(nil)) {
 			return 0, boundsExceededError(descriptor)
 		}
 		return 0, err
@@ -415,24 +426,24 @@ func boundsExceededError(descriptor catalog.TableDescriptor) error {
 func (j *SeqChunkProvider) checkForPreviouslyAllocatedChunks(
 	seqMetadata *SequenceMetadata, c *CellInfoAnnotation, progress *jobspb.Progress,
 ) (bool, error) {
+	seqOpts := seqMetadata.SeqDesc.GetSequenceOpts()
 	var found bool
-	fileProgress := progress.GetImport().SequenceDetails[c.sourceID]
+	fileProgress := progress.GetImport().SequenceDetails[c.SourceID]
 	if fileProgress.SeqIdToChunks == nil {
 		return found, nil
 	}
 	var allocatedSeqChunks *jobspb.SequenceDetails_SequenceChunks
 	var ok bool
-	if allocatedSeqChunks, ok = fileProgress.SeqIdToChunks[int32(seqMetadata.id)]; !ok {
+	if allocatedSeqChunks, ok = fileProgress.SeqIdToChunks[int32(seqMetadata.SeqDesc.GetID())]; !ok {
 		return found, nil
 	}
 
 	for _, chunk := range allocatedSeqChunks.Chunks {
 		// We have found the chunk of sequence values that was assigned to the
 		// swath of rows encompassing rowID.
-		if chunk.ChunkStartRow <= c.rowID && chunk.NextChunkStartRow > c.rowID {
-			relativeRowIndex := c.rowID - chunk.ChunkStartRow
-			seqMetadata.curVal = chunk.ChunkStartVal +
-				seqMetadata.seqDesc.GetSequenceOpts().Increment*(seqMetadata.instancesPerRow*relativeRowIndex)
+		if chunk.ChunkStartRow <= c.RowID && chunk.NextChunkStartRow > c.RowID {
+			relativeRowIndex := c.RowID - chunk.ChunkStartRow
+			seqMetadata.CurVal = chunk.ChunkStartVal + seqOpts.Increment*(seqMetadata.InstancesPerRow*relativeRowIndex)
 			found = true
 			return found, nil
 		}
@@ -443,15 +454,20 @@ func (j *SeqChunkProvider) checkForPreviouslyAllocatedChunks(
 // reserveChunkOfSeqVals ascertains the size of the next chunk, and reserves it
 // at the KV level. The seqMetadata is updated to reflect this.
 func reserveChunkOfSeqVals(
-	evalCtx *tree.EvalContext, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	c *CellInfoAnnotation,
+	seqMetadata *SequenceMetadata,
+	db *kv.DB,
 ) error {
+	seqOpts := seqMetadata.SeqDesc.GetSequenceOpts()
 	newChunkSize := int64(initialChunkSize)
 	// If we are allocating a subsequent chunk of sequence values, we attempt
 	// to reserve a factor of 10 more than reserved the last time so as to
 	// prevent clobbering the chunk reservation logic which involves writing
 	// to job progress.
-	if seqMetadata.curChunk != nil {
-		newChunkSize = chunkSizeIncrementRate * seqMetadata.curChunk.ChunkSize
+	if seqMetadata.CurChunk != nil {
+		newChunkSize = chunkSizeIncrementRate * seqMetadata.CurChunk.ChunkSize
 		if newChunkSize > maxChunkSize {
 			newChunkSize = maxChunkSize
 		}
@@ -459,55 +475,60 @@ func reserveChunkOfSeqVals(
 
 	// We want to encompass at least one complete row with our chunk
 	// allocation.
-	if newChunkSize < seqMetadata.instancesPerRow {
-		newChunkSize = seqMetadata.instancesPerRow
+	if newChunkSize < seqMetadata.InstancesPerRow {
+		newChunkSize = seqMetadata.InstancesPerRow
 	}
 
-	incrementValBy := newChunkSize * seqMetadata.seqDesc.GetSequenceOpts().Increment
+	incrementValBy := newChunkSize * seqOpts.Increment
 	// incrementSequenceByVal keeps retrying until it is able to find a slot
 	// of incrementValBy.
-	seqVal, err := incrementSequenceByVal(evalCtx.Context, seqMetadata.seqDesc, evalCtx.DB,
-		evalCtx.Codec, incrementValBy)
+	seqVal, err := incrementSequenceByVal(
+		ctx, seqMetadata.SeqDesc, db, evalCtx.Codec, incrementValBy,
+	)
 	if err != nil {
 		return err
 	}
 
 	// Update the sequence metadata to reflect the newly reserved chunk.
-	seqMetadata.curChunk = &jobspb.SequenceValChunk{
-		ChunkStartVal:     seqVal - incrementValBy + seqMetadata.seqDesc.GetSequenceOpts().Increment,
+	seqMetadata.CurChunk = &jobspb.SequenceValChunk{
+		ChunkStartVal:     seqVal - incrementValBy + seqOpts.Increment,
 		ChunkSize:         newChunkSize,
-		ChunkStartRow:     c.rowID,
-		NextChunkStartRow: c.rowID + (newChunkSize / seqMetadata.instancesPerRow),
+		ChunkStartRow:     c.RowID,
+		NextChunkStartRow: c.RowID + (newChunkSize / seqMetadata.InstancesPerRow),
 	}
 	return nil
 }
 
-func importNextVal(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+func importNextVal(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	seqName := tree.MustBeDString(args[0])
 	seqMetadata, ok := c.seqNameToMetadata[string(seqName)]
 	if !ok {
 		return nil, errors.Newf("sequence %s not found in annotation", seqName)
 	}
-	return importNextValHelper(evalCtx, c, seqMetadata)
+	return importNextValHelper(ctx, evalCtx, c, seqMetadata)
 }
 
-func importNextValByID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+func importNextValByID(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	oid := tree.MustBeDOid(args[0])
-	seqMetadata, ok := c.seqIDToMetadata[descpb.ID(oid.DInt)]
+	seqMetadata, ok := c.seqIDToMetadata[descpb.ID(oid.Oid)]
 	if !ok {
 		return nil, errors.Newf("sequence with ID %v not found in annotation", oid)
 	}
-	return importNextValHelper(evalCtx, c, seqMetadata)
+	return importNextValHelper(ctx, evalCtx, c, seqMetadata)
 }
 
 // importDefaultToDatabasePrimaryRegion returns the primary region of the
 // database being imported into.
 func importDefaultToDatabasePrimaryRegion(
-	evalCtx *tree.EvalContext, _ tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, _ tree.Datums,
 ) (tree.Datum, error) {
-	regionConfig, err := evalCtx.Regions.CurrentDatabaseRegionConfig(evalCtx.Context)
+	regionConfig, err := evalCtx.Regions.CurrentDatabaseRegionConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -520,8 +541,9 @@ func importDefaultToDatabasePrimaryRegion(
 }
 
 func importNextValHelper(
-	evalCtx *tree.EvalContext, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+	ctx context.Context, evalCtx *eval.Context, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
 ) (tree.Datum, error) {
+	seqOpts := seqMetadata.SeqDesc.GetSequenceOpts()
 	if c.seqChunkProvider == nil {
 		return nil, errors.New("no sequence chunk provider configured for the import job")
 	}
@@ -529,16 +551,16 @@ func importNextValHelper(
 	// If the current importWorker does not have an active chunk for the sequence
 	// seqName, or the row we are processing is outside the range of rows covered
 	// by the active chunk, we need to request a chunk.
-	if seqMetadata.curChunk == nil || c.rowID == seqMetadata.curChunk.NextChunkStartRow {
-		if err := c.seqChunkProvider.RequestChunk(evalCtx, c, seqMetadata); err != nil {
+	if seqMetadata.CurChunk == nil || c.RowID == seqMetadata.CurChunk.NextChunkStartRow {
+		if err := c.seqChunkProvider.RequestChunk(ctx, evalCtx, c, seqMetadata); err != nil {
 			return nil, err
 		}
 	} else {
 		// The current chunk of sequence values can be used for the row being
 		// processed.
-		seqMetadata.curVal += seqMetadata.seqDesc.GetSequenceOpts().Increment
+		seqMetadata.CurVal += seqOpts.Increment
 	}
-	return tree.NewDInt(tree.DInt(seqMetadata.curVal)), nil
+	return tree.NewDInt(tree.DInt(seqMetadata.CurVal)), nil
 }
 
 // Besides overriding, there are also counters that we want to keep track of as
@@ -551,7 +573,7 @@ func importNextValHelper(
 // of unique_rowid occurrences in a row.
 type customFunc struct {
 	visitorSideEffect func(annotations *tree.Annotations, fn *tree.FuncExpr) error
-	override          *tree.FunctionDefinition
+	override          *tree.ResolvedFunctionDefinition
 }
 
 var useDefaultBuiltin *customFunc
@@ -579,11 +601,11 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["unique_rowid"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Fn:         importUniqueRowID,
 				Info:       "Returns a unique rowid based on row position and time",
-				Volatility: tree.VolatilityVolatile,
+				Volatility: volatility.Volatile,
 			},
 		),
 	},
@@ -595,11 +617,11 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["random"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Float),
 				Fn:         importRandom,
 				Info:       "Returns a random number between 0 and 1 based on row position and time.",
-				Volatility: tree.VolatilityVolatile,
+				Volatility: volatility.Volatile,
 			},
 		),
 	},
@@ -611,12 +633,12 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["gen_random_uuid"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Uuid),
 				Fn:         importGenUUID,
 				Info: "Generates a random UUID based on row position and time, " +
 					"and returns it as a value of UUID type.",
-				Volatility: tree.VolatilityVolatile,
+				Volatility: volatility.Volatile,
 			},
 		),
 	},
@@ -640,19 +662,19 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 					return errors.Newf("sequence %s not found in annotation", seqIdentifier.SeqName)
 				}
 			}
-			sequenceMetadata.instancesPerRow++
+			sequenceMetadata.InstancesPerRow++
 			return nil
 		},
 		override: makeBuiltinOverride(
 			tree.FunDefs["nextval"],
 			tree.Overload{
-				Types:      tree.ArgTypes{{builtins.SequenceNameArg, types.String}},
+				Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Info:       "Advances the value of the sequence and returns the final value.",
 				Fn:         importNextVal,
 			},
 			tree.Overload{
-				Types:      tree.ArgTypes{{builtins.SequenceNameArg, types.RegClass}},
+				Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.RegClass}},
 				ReturnType: tree.FixedReturnType(types.Int),
 				Info:       "Advances the value of the sequence and returns the final value.",
 				Fn:         importNextValByID,
@@ -663,7 +685,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["default_to_database_primary_region"],
 			tree.Overload{
-				Types:      tree.ArgTypes{{"val", types.String}},
+				Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.String),
 				Info:       "Returns the primary region of the database.",
 				Fn:         importDefaultToDatabasePrimaryRegion,
@@ -674,7 +696,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		override: makeBuiltinOverride(
 			tree.FunDefs["gateway_region"],
 			tree.Overload{
-				Types:      tree.ArgTypes{},
+				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.String),
 				Info:       "Returns the primary region of the database.",
 				// gateway_region also maps to importDefaultToDatabasePrimaryRegion to
@@ -702,7 +724,7 @@ type unsafeErrExpr struct {
 var _ tree.TypedExpr = &unsafeErrExpr{}
 
 // Eval implements the TypedExpr interface.
-func (e *unsafeErrExpr) Eval(_ *tree.EvalContext) (tree.Datum, error) {
+func (e *unsafeErrExpr) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	return nil, e.err
 }
 
@@ -730,12 +752,12 @@ func (v *importDefaultExprVisitor) VisitPost(expr tree.Expr) (newExpr tree.Expr)
 		return expr
 	}
 	fn, ok := expr.(*tree.FuncExpr)
-	if !ok || fn.ResolvedOverload().Volatility <= tree.VolatilityImmutable {
+	if !ok || fn.ResolvedOverload().Volatility <= volatility.Immutable {
 		// If an expression is not a function, or is an immutable function, then
 		// we can use it as it is.
 		return expr
 	}
-	resolvedFnName := fn.Func.FunctionReference.(*tree.FunctionDefinition).Name
+	resolvedFnName := fn.Func.FunctionReference.(*tree.ResolvedFunctionDefinition).Name
 	custom, isSafe := supportedImportFuncOverrides[resolvedFnName]
 	if !isSafe {
 		v.err = errors.Newf(`function %s unsupported by IMPORT INTO`, resolvedFnName)
@@ -774,13 +796,13 @@ func (v *importDefaultExprVisitor) VisitPost(expr tree.Expr) (newExpr tree.Expr)
 // sanitizeExprsForImport checks whether default expressions are supported
 // for import.
 func sanitizeExprsForImport(
-	ctx context.Context, evalCtx *tree.EvalContext, expr tree.Expr, targetType *types.T,
+	ctx context.Context, evalCtx *eval.Context, expr tree.Expr, targetType *types.T,
 ) (tree.TypedExpr, overrideVolatility, error) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 
 	// If we have immutable expressions, then we can just return it right away.
 	typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
-		ctx, expr, targetType, "import_default", &semaCtx, tree.VolatilityImmutable)
+		ctx, expr, targetType, "import_default", &semaCtx, volatility.Immutable, false /*allowAssignmentCast*/)
 	if err == nil {
 		return typedExpr, overrideImmutable, nil
 	}

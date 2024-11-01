@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package exprgen
 
@@ -184,11 +179,11 @@ func (c *customFuncs) substituteCols(str string) string {
 // evaluated in order, and we want to be able to refer to the lookup columns in
 // the ON expression. For example:
 //
-//   (MakeLookupJoin
-//     (Scan [ (Table "def") (Cols "d,e") ])
-//     [ (JoinType "left-join") (Table "abc") (Index "abc@ab") (KeyCols "a") (Cols "a,b") ]
-//     [ (Gt (Var "a") (Var "e")) ]
-//   )
+//	(MakeLookupJoin
+//	  (Scan [ (Table "def") (Cols "d,e") ])
+//	  [ (JoinType "left-join") (Table "abc") (Index "abc@ab") (KeyCols "a") (Cols "a,b") ]
+//	  [ (Gt (Var "a") (Var "e")) ]
+//	)
 //
 // If the order of the last two was swapped, we wouldn't be able to look up
 // column a.
@@ -228,11 +223,12 @@ func (c *customFuncs) NoOrdering() props.OrderingChoice {
 // Root can be used only at the top level on an expression, to annotate the
 // root with a presentation and/or required ordering. The operator must be able
 // to provide the ordering. For example:
-//   (Root
-//     ( ... )
-//     (Presentation "a,b")
-//     (OrderingChoice "+a")
-//   )
+//
+//	(Root
+//	  ( ... )
+//	  (Presentation "a,b")
+//	  (OrderingChoice "+a")
+//	)
 func (c *customFuncs) Root(
 	root memo.RelExpr, presentation physical.Presentation, ordering props.OrderingChoice,
 ) *rootSentinel {

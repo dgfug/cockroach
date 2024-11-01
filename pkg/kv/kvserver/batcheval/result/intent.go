@@ -1,30 +1,34 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package result
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-)
+import "github.com/cockroachdb/cockroach/pkg/roachpb"
 
-// FromAcquiredLocks creates a Result communicating that the locks were
-// acquired or re-acquired by the given transaction and should be handled.
-func FromAcquiredLocks(txn *roachpb.Transaction, keys ...roachpb.Key) Result {
+// WithAcquiredLocks creates a Result communicating that the supplied lock
+// acquisitions (or re-acquisitions) were performed by the caller and they
+// should be handled.
+//
+// If any empty lock acquisitions are supplied by the caller they will not be
+// attached to the returned Result.
+func WithAcquiredLocks(acqs ...roachpb.LockAcquisition) Result {
 	var pd Result
-	if txn == nil {
+	numAcqs := 0
+	for _, acq := range acqs {
+		if !acq.Empty() {
+			numAcqs++
+		}
+	}
+	if numAcqs == 0 { // only allocate if there is at least 1 non-empty acquisition
 		return pd
 	}
-	pd.Local.AcquiredLocks = make([]roachpb.LockAcquisition, len(keys))
-	for i := range pd.Local.AcquiredLocks {
-		pd.Local.AcquiredLocks[i] = roachpb.MakeLockAcquisition(txn, keys[i], lock.Replicated)
+	pd.Local.AcquiredLocks = make([]roachpb.LockAcquisition, 0, numAcqs)
+	for _, acq := range acqs {
+		if !acq.Empty() {
+			pd.Local.AcquiredLocks = append(pd.Local.AcquiredLocks, acq)
+		}
 	}
 	return pd
 }

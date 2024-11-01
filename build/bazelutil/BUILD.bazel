@@ -1,16 +1,15 @@
+exports_files(["nogo_config.json"])
+
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
-load(":lint.bzl", "lint_binary")
 
+# The output file will be empty unless we're using the force_build_cdeps config.
 genrule(
-    name = "test_stamping",
-    outs = ["test_stamping.txt"],
-    cmd = """cat bazel-out/stable-status.txt | grep STABLE_BUILD > $@""",
-    stamp = True,
-)
-
-lint_binary(
-    name = "lint",
-    test = "//pkg/testutils/lint:lint_test",
+    name = "test_force_build_cdeps",
+    outs = ["test_force_build_cdeps.txt"],
+    cmd = select({
+        "//build/toolchains:force_build_cdeps": "echo 1 > $@",
+        "//conditions:default": "touch $@",
+    }),
 )
 
 # This noop target is a workaround for https://github.com/bazelbuild/bazel-gazelle/issues/1078.

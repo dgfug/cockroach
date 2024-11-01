@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package replicaoracle provides functionality for physicalplan to choose a
 // replica for a range.
@@ -16,13 +11,17 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,18 +31,25 @@ type Policy byte
 var (
 	// RandomChoice chooses lease replicas randomly.
 	RandomChoice = RegisterPolicy(newRandomOracle)
-	// BinPackingChoice bin-packs the choices.
+	// BinPackingChoice gives preference to leaseholders if possible, otherwise
+	// bin-packs the choices
 	BinPackingChoice = RegisterPolicy(newBinPackingOracle)
 	// ClosestChoice chooses the node closest to the current node.
 	ClosestChoice = RegisterPolicy(newClosestOracle)
+	// PreferFollowerChoice prefers choosing followers over leaseholders.
+	PreferFollowerChoice = RegisterPolicy(newPreferFollowerOracle)
 )
 
 // Config is used to construct an OracleFactory.
 type Config struct {
-	NodeDescs  kvcoord.NodeDescStore
-	NodeDesc   roachpb.NodeDescriptor // current node
-	Settings   *cluster.Settings
-	RPCContext *rpc.Context
+	NodeDescs   kvclient.NodeDescStore
+	NodeID      roachpb.NodeID   // current node's ID. 0 for secondary tenants.
+	Locality    roachpb.Locality // current node's locality.
+	Settings    *cluster.Settings
+	Clock       *hlc.Clock
+	RPCContext  *rpc.Context
+	LatencyFunc kvcoord.LatencyFunc
+	HealthFunc  kvcoord.HealthFunc
 }
 
 // Oracle is used to choose the lease holder for ranges. This
@@ -66,6 +72,10 @@ type Oracle interface {
 	// When the range's closed timestamp policy is known, it is passed in.
 	// Otherwise, the default closed timestamp policy is provided.
 	//
+	// ignoreMisplannedRanges boolean indicates whether the placement of the
+	// TableReaders according to this replica choice should **not** result in
+	// creating of Ranges ProducerMetadata.
+	//
 	// A RangeUnavailableError can be returned if there's no information in gossip
 	// about any of the nodes that might be tried.
 	ChoosePreferredReplica(
@@ -75,7 +85,7 @@ type Oracle interface {
 		leaseholder *roachpb.ReplicaDescriptor,
 		ctPolicy roachpb.RangeClosedTimestampPolicy,
 		qState QueryState,
-	) (roachpb.ReplicaDescriptor, error)
+	) (_ roachpb.ReplicaDescriptor, ignoreMisplannedRanges bool, _ error)
 }
 
 // OracleFactory creates an oracle from a Config.
@@ -106,22 +116,31 @@ var oracleFactories = map[Policy]OracleFactory{}
 // QueryState encapsulates the history of assignments of ranges to nodes
 // done by an oracle on behalf of one particular query.
 type QueryState struct {
-	RangesPerNode  map[roachpb.NodeID]int
-	AssignedRanges map[roachpb.RangeID]roachpb.ReplicaDescriptor
+	RangesPerNode  util.FastIntMap
+	AssignedRanges map[roachpb.RangeID]ReplicaDescriptorEx
+	LastAssignment roachpb.NodeID
+	NodeStreak     int
+}
+
+// ReplicaDescriptorEx is a small extension of the roachpb.ReplicaDescriptor
+// that also stores whether this replica info should be ignored for the purposes
+// of misplanned ranges.
+type ReplicaDescriptorEx struct {
+	ReplDesc               roachpb.ReplicaDescriptor
+	IgnoreMisplannedRanges bool
 }
 
 // MakeQueryState creates an initialized QueryState.
 func MakeQueryState() QueryState {
 	return QueryState{
-		RangesPerNode:  make(map[roachpb.NodeID]int),
-		AssignedRanges: make(map[roachpb.RangeID]roachpb.ReplicaDescriptor),
+		AssignedRanges: make(map[roachpb.RangeID]ReplicaDescriptorEx),
 	}
 }
 
 // randomOracle is a Oracle that chooses the lease holder randomly
 // among the replicas in a range descriptor.
 type randomOracle struct {
-	nodeDescs kvcoord.NodeDescStore
+	nodeDescs kvclient.NodeDescStore
 }
 
 func newRandomOracle(cfg Config) Oracle {
@@ -135,27 +154,41 @@ func (o *randomOracle) ChoosePreferredReplica(
 	_ *roachpb.ReplicaDescriptor,
 	_ roachpb.RangeClosedTimestampPolicy,
 	_ QueryState,
-) (roachpb.ReplicaDescriptor, error) {
+) (roachpb.ReplicaDescriptor, bool, error) {
 	replicas, err := replicaSliceOrErr(ctx, o.nodeDescs, desc, kvcoord.OnlyPotentialLeaseholders)
 	if err != nil {
-		return roachpb.ReplicaDescriptor{}, err
+		return roachpb.ReplicaDescriptor{}, false, err
 	}
-	return replicas[rand.Intn(len(replicas))].ReplicaDescriptor, nil
+	return replicas[rand.Intn(len(replicas))].ReplicaDescriptor, false, nil
 }
 
 type closestOracle struct {
-	nodeDescs kvcoord.NodeDescStore
-	// nodeDesc is the descriptor of the current node. It will be used to give
-	// preference to the current node and others "close" to it.
-	nodeDesc    roachpb.NodeDescriptor
+	st        *cluster.Settings
+	nodeDescs kvclient.NodeDescStore
+	// nodeID and locality of the current node. Used to give preference to the
+	// current node and others "close" to it.
+	//
+	// NodeID may be 0 in which case the current node will not be given any
+	// preference. NodeID being 0 indicates that no KV instance is available
+	// inside the same process.
+	nodeID      roachpb.NodeID
+	locality    roachpb.Locality
+	healthFunc  kvcoord.HealthFunc
 	latencyFunc kvcoord.LatencyFunc
 }
 
 func newClosestOracle(cfg Config) Oracle {
+	latencyFn := cfg.LatencyFunc
+	if latencyFn == nil {
+		latencyFn = latencyFunc(cfg.RPCContext)
+	}
 	return &closestOracle{
+		st:          cfg.Settings,
 		nodeDescs:   cfg.NodeDescs,
-		nodeDesc:    cfg.NodeDesc,
-		latencyFunc: latencyFunc(cfg.RPCContext),
+		nodeID:      cfg.NodeID,
+		locality:    cfg.Locality,
+		latencyFunc: latencyFn,
+		healthFunc:  cfg.HealthFunc,
 	}
 }
 
@@ -163,18 +196,22 @@ func (o *closestOracle) ChoosePreferredReplica(
 	ctx context.Context,
 	_ *kv.Txn,
 	desc *roachpb.RangeDescriptor,
-	_ *roachpb.ReplicaDescriptor,
+	leaseholder *roachpb.ReplicaDescriptor,
 	_ roachpb.RangeClosedTimestampPolicy,
 	_ QueryState,
-) (roachpb.ReplicaDescriptor, error) {
+) (_ roachpb.ReplicaDescriptor, ignoreMisplannedRanges bool, _ error) {
 	// We know we're serving a follower read request, so consider all non-outgoing
 	// replicas.
 	replicas, err := replicaSliceOrErr(ctx, o.nodeDescs, desc, kvcoord.AllExtantReplicas)
 	if err != nil {
-		return roachpb.ReplicaDescriptor{}, err
+		return roachpb.ReplicaDescriptor{}, false, err
 	}
-	replicas.OptimizeReplicaOrder(&o.nodeDesc, o.latencyFunc)
-	return replicas[0].ReplicaDescriptor, nil
+	replicas.OptimizeReplicaOrder(ctx, o.st, o.nodeID, o.healthFunc, o.latencyFunc, o.locality)
+	repl := replicas[0].ReplicaDescriptor
+	// There are no "misplanned" ranges if we know the leaseholder, and we're
+	// deliberately choosing non-leaseholder.
+	ignoreMisplannedRanges = leaseholder != nil && leaseholder.NodeID != repl.NodeID
+	return repl, ignoreMisplannedRanges, nil
 }
 
 // maxPreferredRangesPerLeaseHolder applies to the binPackingOracle.
@@ -193,20 +230,30 @@ const maxPreferredRangesPerLeaseHolder = 10
 // node.
 // Finally, it tries not to overload any node.
 type binPackingOracle struct {
+	st                               *cluster.Settings
 	maxPreferredRangesPerLeaseHolder int
-	nodeDescs                        kvcoord.NodeDescStore
-	// nodeDesc is the descriptor of the current node. It will be used to give
-	// preference to the current node and others "close" to it.
-	nodeDesc    roachpb.NodeDescriptor
+	nodeDescs                        kvclient.NodeDescStore
+	// nodeID and locality of the current node. Used to give preference to the
+	// current node and others "close" to it.
+	//
+	// NodeID may be 0 in which case the current node will not be given any
+	// preference. NodeID being 0 indicates that no KV instance is available
+	// inside the same process.
+	nodeID      roachpb.NodeID
+	locality    roachpb.Locality
 	latencyFunc kvcoord.LatencyFunc
+	healthFunc  kvcoord.HealthFunc
 }
 
 func newBinPackingOracle(cfg Config) Oracle {
 	return &binPackingOracle{
+		st:                               cfg.Settings,
 		maxPreferredRangesPerLeaseHolder: maxPreferredRangesPerLeaseHolder,
 		nodeDescs:                        cfg.NodeDescs,
-		nodeDesc:                         cfg.NodeDesc,
+		nodeID:                           cfg.NodeID,
+		locality:                         cfg.Locality,
 		latencyFunc:                      latencyFunc(cfg.RPCContext),
+		healthFunc:                       cfg.HealthFunc,
 	}
 }
 
@@ -217,25 +264,25 @@ func (o *binPackingOracle) ChoosePreferredReplica(
 	leaseholder *roachpb.ReplicaDescriptor,
 	_ roachpb.RangeClosedTimestampPolicy,
 	queryState QueryState,
-) (roachpb.ReplicaDescriptor, error) {
+) (_ roachpb.ReplicaDescriptor, ignoreMisplannedRanges bool, _ error) {
 	// If we know the leaseholder, we choose it.
 	if leaseholder != nil {
-		return *leaseholder, nil
+		return *leaseholder, false, nil
 	}
 
 	replicas, err := replicaSliceOrErr(ctx, o.nodeDescs, desc, kvcoord.OnlyPotentialLeaseholders)
 	if err != nil {
-		return roachpb.ReplicaDescriptor{}, err
+		return roachpb.ReplicaDescriptor{}, false, err
 	}
-	replicas.OptimizeReplicaOrder(&o.nodeDesc, o.latencyFunc)
+	replicas.OptimizeReplicaOrder(ctx, o.st, o.nodeID, o.healthFunc, o.latencyFunc, o.locality)
 
 	// Look for a replica that has been assigned some ranges, but it's not yet full.
 	minLoad := int(math.MaxInt32)
 	var leastLoadedIdx int
 	for i, repl := range replicas {
-		assignedRanges := queryState.RangesPerNode[repl.NodeID]
+		assignedRanges := queryState.RangesPerNode.GetDefault(int(repl.NodeID))
 		if assignedRanges != 0 && assignedRanges < o.maxPreferredRangesPerLeaseHolder {
-			return repl.ReplicaDescriptor, nil
+			return repl.ReplicaDescriptor, false, nil
 		}
 		if assignedRanges < minLoad {
 			leastLoadedIdx = i
@@ -245,7 +292,7 @@ func (o *binPackingOracle) ChoosePreferredReplica(
 	// Either no replica was assigned any previous ranges, or all replicas are
 	// full. Use the least-loaded one (if all the load is 0, then the closest
 	// replica is returned).
-	return replicas[leastLoadedIdx].ReplicaDescriptor, nil
+	return replicas[leastLoadedIdx].ReplicaDescriptor, false, nil
 }
 
 // replicaSliceOrErr returns a ReplicaSlice for the given range descriptor.
@@ -254,7 +301,7 @@ func (o *binPackingOracle) ChoosePreferredReplica(
 // RangeUnavailableError is returned.
 func replicaSliceOrErr(
 	ctx context.Context,
-	nodeDescs kvcoord.NodeDescStore,
+	nodeDescs kvclient.NodeDescStore,
 	desc *roachpb.RangeDescriptor,
 	filter kvcoord.ReplicaSliceFilter,
 ) (kvcoord.ReplicaSlice, error) {
@@ -272,4 +319,46 @@ func latencyFunc(rpcCtx *rpc.Context) kvcoord.LatencyFunc {
 		return rpcCtx.RemoteClocks.Latency
 	}
 	return nil
+}
+
+type preferFollowerOracle struct {
+	nodeDescs kvclient.NodeDescStore
+}
+
+func newPreferFollowerOracle(cfg Config) Oracle {
+	return &preferFollowerOracle{nodeDescs: cfg.NodeDescs}
+}
+
+func (o preferFollowerOracle) ChoosePreferredReplica(
+	ctx context.Context,
+	_ *kv.Txn,
+	desc *roachpb.RangeDescriptor,
+	leaseholder *roachpb.ReplicaDescriptor,
+	_ roachpb.RangeClosedTimestampPolicy,
+	_ QueryState,
+) (_ roachpb.ReplicaDescriptor, ignoreMisplannedRanges bool, _ error) {
+	replicas, err := replicaSliceOrErr(ctx, o.nodeDescs, desc, kvcoord.AllExtantReplicas)
+	if err != nil {
+		return roachpb.ReplicaDescriptor{}, false, err
+	}
+
+	leaseholders, err := replicaSliceOrErr(ctx, o.nodeDescs, desc, kvcoord.OnlyPotentialLeaseholders)
+	if err != nil {
+		return roachpb.ReplicaDescriptor{}, false, err
+	}
+	leaseholderNodeIDs := make(map[roachpb.NodeID]bool, len(leaseholders))
+	for i := range leaseholders {
+		leaseholderNodeIDs[leaseholders[i].NodeID] = true
+	}
+
+	sort.Slice(replicas, func(i, j int) bool {
+		return !leaseholderNodeIDs[replicas[i].NodeID] && leaseholderNodeIDs[replicas[j].NodeID]
+	})
+
+	// TODO: Pick a random replica from replicas[:len(replicas)-len(leaseholders)]
+	repl := replicas[0].ReplicaDescriptor
+	// There are no "misplanned" ranges if we know the leaseholder, and we're
+	// deliberately choosing non-leaseholder.
+	ignoreMisplannedRanges = leaseholder != nil && leaseholder.NodeID != repl.NodeID
+	return repl, ignoreMisplannedRanges, nil
 }

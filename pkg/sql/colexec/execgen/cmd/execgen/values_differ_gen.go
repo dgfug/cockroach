@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -15,7 +10,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
 
 const valuesDifferTmpl = "pkg/sql/colexec/values_differ_tmpl.go"
@@ -41,7 +36,7 @@ func genValuesDiffer(inputFileContents string, wr io.Writer) error {
 		return err
 	}
 
-	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.NE])
+	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[treecmp.NE])
 }
 func init() {
 	registerGenerator(genValuesDiffer, "values_differ.eg.go", valuesDifferTmpl)

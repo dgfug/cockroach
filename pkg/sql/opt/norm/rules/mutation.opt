@@ -26,13 +26,27 @@
 (Update
     (Project
         $input
-        (SimplifyPartialIndexProjections
-            $projections
-            $simplifiableCols
+        (Let
+            (
+                $simplifiedProjections
+                $simplifiedPrivate
+            ):(SimplifyPartialIndexProjections
+                $projections
+                $passthrough
+                $simplifiableCols
+                $mutationPrivate
+            )
+            $simplifiedProjections
         )
         $passthrough
     )
     $uniqueChecks
     $fkChecks
-    $mutationPrivate
+    $simplifiedPrivate
 )
+
+# RemoveZeroCardLock removes lock operations when we know no rows will be locked.
+[RemoveZeroCardLock, Normalize]
+(Lock $rows:* & (HasZeroRows $rows))
+=>
+$rows

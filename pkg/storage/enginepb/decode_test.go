@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package enginepb_test
 
@@ -25,7 +20,7 @@ func BenchmarkScanDecodeKeyValue(b *testing.B) {
 	ts := hlc.Timestamp{WallTime: int64(1000000)}
 	value := []byte("foo foo foo")
 	rep := make([]byte, 8)
-	keyBytes := storage.EncodeKey(storage.MVCCKey{Key: key, Timestamp: ts})
+	keyBytes := storage.EncodeMVCCKey(storage.MVCCKey{Key: key, Timestamp: ts})
 	binary.LittleEndian.PutUint64(rep, uint64(len(keyBytes)<<32)|uint64(len(value)))
 	rep = append(rep, keyBytes...)
 	rep = append(rep, value...)

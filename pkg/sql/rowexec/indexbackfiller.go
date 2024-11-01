@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -14,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -22,9 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -46,11 +41,8 @@ type indexBackfiller struct {
 
 	spec execinfrapb.BackfillerSpec
 
-	out execinfra.ProcOutputHelper
-
-	flowCtx *execinfra.FlowCtx
-
-	output execinfra.RowReceiver
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
 
 	filter backfill.MutationFilter
 }
@@ -58,19 +50,13 @@ type indexBackfiller struct {
 var _ execinfra.Processor = &indexBackfiller{}
 
 var backfillerBufferSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
 	"schemachanger.backfiller.buffer_size", "the initial size of the BulkAdder buffer handling index backfills", 32<<20,
 )
 
 var backfillerMaxBufferSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
 	"schemachanger.backfiller.max_buffer_size", "the maximum size of the BulkAdder buffer handling index backfills", 512<<20,
-)
-
-var backfillerBufferIncrementSize = settings.RegisterByteSizeSetting(
-	"schemachanger.backfiller.buffer_increment", "the size by which the BulkAdder attempts to grow its buffer before flushing", 32<<20,
-)
-
-var backillerSSTSize = settings.RegisterByteSizeSetting(
-	"schemachanger.backfiller.max_sst_size", "target size for ingested files during backfills", 16<<20,
 )
 
 func newIndexBackfiller(
@@ -78,21 +64,19 @@ func newIndexBackfiller(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.BackfillerSpec,
-	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*indexBackfiller, error) {
 	indexBackfillerMon := execinfra.NewMonitor(ctx, flowCtx.Cfg.BackfillerMonitor,
 		"index-backfill-mon")
 	ib := &indexBackfiller{
-		desc:    spec.BuildTableDescriptor(),
-		spec:    spec,
-		flowCtx: flowCtx,
-		output:  output,
-		filter:  backfill.IndexMutationFilter,
+		desc:        flowCtx.TableDescriptor(ctx, &spec.Table),
+		spec:        spec,
+		flowCtx:     flowCtx,
+		processorID: processorID,
+		filter:      backfill.IndexMutationFilter,
 	}
 
 	if err := ib.IndexBackfiller.InitForDistributedUse(ctx, flowCtx, ib.desc,
-		indexBackfillerMon); err != nil {
+		ib.spec.IndexesToBackfill, indexBackfillerMon); err != nil {
 		return nil, err
 	}
 
@@ -186,17 +170,16 @@ func (ib *indexBackfiller) ingestIndexEntries(
 
 	minBufferSize := backfillerBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV)
 	maxBufferSize := func() int64 { return backfillerMaxBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
-	sstSize := func() int64 { return backillerSSTSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
-	stepSize := backfillerBufferIncrementSize.Get(&ib.flowCtx.Cfg.Settings.SV)
 	opts := kvserverbase.BulkAdderOptions{
-		SSTSize:        sstSize,
-		MinBufferSize:  minBufferSize,
-		MaxBufferSize:  maxBufferSize,
-		StepBufferSize: stepSize,
-		SkipDuplicates: ib.ContainsInvertedIndex(),
-		BatchTimestamp: ib.spec.ReadAsOf,
+		Name:                     ib.desc.GetName() + " backfill",
+		MinBufferSize:            minBufferSize,
+		MaxBufferSize:            maxBufferSize,
+		SkipDuplicates:           ib.ContainsInvertedIndex(),
+		BatchTimestamp:           ib.spec.ReadAsOf,
+		InitialSplitsIfUnordered: int(ib.spec.InitialSplits),
+		WriteAtBatchTimestamp:    ib.spec.WriteAtBatchTimestamp,
 	}
-	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB, ib.spec.WriteAsOf, opts)
+	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB.KV(), ib.spec.WriteAsOf, opts)
 	if err != nil {
 		return err
 	}
@@ -215,7 +198,7 @@ func (ib *indexBackfiller) ingestIndexEntries(
 	// When the bulk adder flushes, the spans which were previously marked as
 	// "added" can now be considered "completed", and be sent back to the
 	// coordinator node as part of the next progress report.
-	adder.SetOnFlush(func(_ roachpb.BulkOpSummary) {
+	adder.SetOnFlush(func(_ kvpb.BulkOpSummary) {
 		mu.Lock()
 		defer mu.Unlock()
 		mu.completedSpans = append(mu.completedSpans, mu.addedSpans...)
@@ -346,23 +329,17 @@ func (ib *indexBackfiller) runBackfill(
 	return nil
 }
 
-func (ib *indexBackfiller) Run(ctx context.Context) {
+func (ib *indexBackfiller) Run(ctx context.Context, output execinfra.RowReceiver) {
 	opName := "indexBackfillerProcessor"
+	ctx = logtags.AddTag(ctx, "job", ib.spec.JobID)
 	ctx = logtags.AddTag(ctx, opName, int(ib.spec.Table.ID))
-	ctx, span := execinfra.ProcessorSpan(ctx, opName)
+	ctx, span := execinfra.ProcessorSpan(ctx, ib.flowCtx, opName, ib.processorID)
 	defer span.Finish()
-	defer ib.output.ProducerDone()
-	defer execinfra.SendTraceData(ctx, ib.output)
+	defer output.ProducerDone()
+	defer execinfra.SendTraceData(ctx, ib.flowCtx, output)
 	defer ib.Close(ctx)
 
 	progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
-
-	semaCtx := tree.MakeSemaContext()
-	if err := ib.out.Init(&execinfrapb.PostProcessSpec{}, nil, &semaCtx, ib.flowCtx.NewEvalCtx()); err != nil {
-		ib.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
-		return
-	}
-
 	var err error
 	// We don't have to worry about this go routine leaking because next we loop
 	// over progCh which is closed only after the go routine returns.
@@ -377,11 +354,11 @@ func (ib *indexBackfiller) Run(ctx context.Context) {
 		if p.CompletedSpans != nil {
 			log.VEventf(ctx, 2, "sending coordinator completed spans: %+v", p.CompletedSpans)
 		}
-		ib.output.Push(nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p})
+		output.Push(nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p})
 	}
 
 	if err != nil {
-		ib.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
+		output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
 		return
 	}
 }
@@ -395,7 +372,7 @@ func (ib *indexBackfiller) wrapDupError(ctx context.Context, orig error) error {
 		return orig
 	}
 
-	desc, err := ib.desc.MakeFirstMutationPublic(catalog.IncludeConstraints)
+	desc, err := ib.desc.MakeFirstMutationPublic()
 	if err != nil {
 		return err
 	}
@@ -431,15 +408,16 @@ func (ib *indexBackfiller) buildIndexEntryBatch(
 	defer traceSpan.Finish()
 	start := timeutil.Now()
 	var entries []rowenc.IndexEntry
-	if err := ib.flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetFixedTimestamp(ctx, readAsOf); err != nil {
+	if err := ib.flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		if err := txn.KV().SetFixedTimestamp(ctx, readAsOf); err != nil {
 			return err
 		}
 
 		// TODO(knz): do KV tracing in DistSQL processors.
 		var err error
-		entries, key, memUsedBuildingBatch, err = ib.BuildIndexEntriesChunk(ctx, txn, ib.desc, sp,
-			ib.spec.ChunkSize, false /*traceKV*/)
+		entries, key, memUsedBuildingBatch, err = ib.BuildIndexEntriesChunk(
+			ctx, txn.KV(), ib.desc, sp, ib.spec.ChunkSize, false, /* traceKV */
+		)
 		return err
 	}); err != nil {
 		return nil, nil, 0, err
@@ -449,4 +427,14 @@ func (ib *indexBackfiller) buildIndexEntryBatch(
 		len(entries), prepTime)
 
 	return key, entries, memUsedBuildingBatch, nil
+}
+
+// Resume is part of the execinfra.Processor interface.
+func (ib *indexBackfiller) Resume(output execinfra.RowReceiver) {
+	panic("not implemented")
+}
+
+// Close is part of the execinfra.Processor interface.
+func (ib *indexBackfiller) Close(ctx context.Context) {
+	ib.IndexBackfiller.Close(ctx)
 }

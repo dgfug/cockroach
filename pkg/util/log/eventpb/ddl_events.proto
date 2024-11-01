@@ -1,19 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.util.log.eventpb;
-option go_package = "eventpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/util/log/eventpb";
 
 import "gogoproto/gogo.proto";
 import "util/log/eventpb/events.proto";
+import "util/log/eventpb/zone_events.proto";
+import "util/log/logpb/event.proto";
 
 // Category: SQL Logical Schema Changes
 // Channel: SQL_SCHEMA
@@ -108,16 +105,6 @@ message RenameDatabase {
   string database_name = 3  [(gogoproto.jsontag) = ",omitempty"];
   // The new name of the affected database.
   string new_database_name = 4  [(gogoproto.jsontag) = ",omitempty"];
-}
-
-// ConvertToSchema is recorded when a database is converted to a schema.
-message ConvertToSchema {
-  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
-  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
-  // The name of the database being converted to a schema.
-  string database_name = 3  [(gogoproto.jsontag) = ",omitempty"];
-  // The name of the parent database for the new schema.
-  string new_database_parent = 4  [(gogoproto.jsontag) = ",omitempty"];
 }
 
 // CreateSchema is recorded when a schema is created.
@@ -236,12 +223,35 @@ message CommentOnDatabase {
   bool null_comment = 6  [(gogoproto.jsontag) = ",omitempty"];
 }
 
+message CommentOnSchema {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the affected schema.
+  string schema_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // The new comment.
+  string comment = 4 [(gogoproto.jsontag) = ",omitempty"];
+  // Set to true if the comment was removed entirely.
+  bool null_comment = 5 [(gogoproto.jsontag) = ",omitempty"];
+}
+
 // CommentOnTable is recorded when a table is commented.
 message CommentOnTable {
   CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
   CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
   // The name of the affected table.
   string table_name = 3  [(gogoproto.jsontag) = ",omitempty"];
+  // The new comment.
+  string comment = 4  [(gogoproto.jsontag) = ",omitempty"];
+  // Set to true if the comment was removed entirely.
+  bool null_comment = 6  [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// CommentOnType is recorded when a type is commented.
+message CommentOnType {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the affected type.
+  string type_name = 3  [(gogoproto.jsontag) = ",omitempty"];
   // The new comment.
   string comment = 4  [(gogoproto.jsontag) = ",omitempty"];
   // Set to true if the comment was removed entirely.
@@ -312,6 +322,21 @@ message AlterIndex {
   string index_name = 4 [(gogoproto.jsontag) = ",omitempty"];
   // The mutation ID for the asynchronous job that is processing the index update.
   uint32 mutation_id = 5 [(gogoproto.customname) = "MutationID", (gogoproto.jsontag) = ",omitempty"];
+}
+
+// AlterIndex is recorded when an index visibility is altered.
+message AlterIndexVisible {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the table containing the affected index.
+  string table_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // The name of the affected index.
+  string index_name = 4 [(gogoproto.jsontag) = ",omitempty"];
+  // Set true if index is not visible.
+  // NOTE: THIS FIELD IS DEPRECATED in favor of invisibility.
+  bool not_visible = 5 [(gogoproto.jsontag) = ",omitempty", deprecated = true];
+  // The new invisibility of the affected index.
+  double invisibility = 6 [(gogoproto.jsontag) = ",omitempty"];
 }
 
 
@@ -528,3 +553,66 @@ message ForceDeleteTableDataEntry {
   uint32 desc_id = 3 [(gogoproto.customname) = "DescriptorID", (gogoproto.jsontag) = ",omitempty"];
 }
 
+// AlterDatabaseSetZoneConfigExtension is recorded when a zone config extension is changed.
+message AlterDatabaseSetZoneConfigExtension {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonZoneConfigDetails config = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+}
+
+// CreateFunction is recorded when a user-defined function is created.
+message CreateFunction {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the created function.
+  string function_name = 3  [(gogoproto.jsontag) = ",omitempty"];
+  // If the new function is a replace of an existing function.
+  bool is_replace = 4 [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// DropFunction is recorded when a user-defined function is dropped.
+message DropFunction {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the dropped function.
+  string function_name = 3  [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// RenameFunction is recorded when a user-defined function is renamed.
+message RenameFunction {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The old name of the affected function.
+  string function_name = 3  [(gogoproto.jsontag) = ",omitempty"];
+  // The new name of the affected function.
+  string new_function_name = 4  [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// AlterFunctionOptions is recorded when a user-defined function's options are
+// altered.
+message AlterFunctionOptions {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the affected function.
+  string function_name = 3  [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// CreateTrigger is recorded when a trigger is created.
+message CreateTrigger {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the trigger's table.
+  string table_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // Name of the created trigger.
+  string trigger_name = 4  [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// DropTrigger is recorded when a trigger is dropped.
+message DropTrigger {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // Name of the trigger's table.
+  string table_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // Name of the dropped trigger.
+  string trigger_name = 4  [(gogoproto.jsontag) = ",omitempty"];
+}

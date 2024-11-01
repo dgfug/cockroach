@@ -1,19 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.sql.contentionpb;
-option go_package = "contentionpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/contentionpb";
 
+import "kv/kvpb/api.proto";
 import "gogoproto/gogo.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 // IndexContentionEvents describes all of the available contention information
 // about a single index.
@@ -127,4 +124,62 @@ message SerializedRegistry {
   //   transactions.
   repeated SingleNonSQLKeyContention non_sql_keys_contention = 2 [(gogoproto.nullable) = false,
                                                                   (gogoproto.customname) = "NonSQLKeysContention"];
+}
+
+message ResolvedTxnID {
+  bytes txnID = 1 [
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
+    (gogoproto.nullable) = false
+  ];
+
+  // txnFingerprintID is the corresponding transaction fingerprint ID of the
+  // txnID. However, if the transaction fingerprint ID of the txnID is not yet
+  // known, (i.e. when the transaction is still executing), this value is filled
+  // with appstatspb.InvalidTransactionFingerprintID.
+  uint64 txnFingerprintID = 2 [(gogoproto.customname) = "TxnFingerprintID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID",
+    (gogoproto.nullable) = false];
+}
+
+
+enum ContentionType {
+  LOCK_WAIT = 0;
+  SERIALIZATION_CONFLICT = 1;
+}
+
+
+message ExtendedContentionEvent {
+  cockroach.roachpb.ContentionEvent blocking_event = 1 [
+    (gogoproto.nullable) = false
+  ];
+  uint64 blocking_txn_fingerprint_id = 2 [
+    (gogoproto.customname) = "BlockingTxnFingerprintID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID"
+  ];
+
+  bytes waiting_txn_id = 3 [
+    (gogoproto.customname) = "WaitingTxnID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
+    (gogoproto.nullable) = false
+  ];
+  uint64 waiting_txn_fingerprint_id = 4 [
+    (gogoproto.customname) = "WaitingTxnFingerprintID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID"
+  ];
+
+  google.protobuf.Timestamp collection_ts = 5 [
+    (gogoproto.nullable) = false,
+    (gogoproto.stdtime) = true
+  ];
+
+  uint64 waiting_stmt_fingerprint_id = 6 [
+    (gogoproto.customname) = "WaitingStmtFingerprintID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.StmtFingerprintID"
+  ];
+
+  bytes waiting_stmt_id = 7 [(gogoproto.customname) = "WaitingStmtID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/clusterunique.ID",
+    (gogoproto.nullable) = false];
+
+  ContentionType contention_type = 8;
 }

@@ -1,25 +1,21 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/require"
 )
 
 func Example_nodelocal() {
@@ -104,7 +100,7 @@ func TestNodeLocalFileUpload(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			filePath := filepath.Join(dir, fmt.Sprintf("file%d.csv", i))
-			err := ioutil.WriteFile(filePath, tc.fileContent, 0666)
+			err := os.WriteFile(filePath, tc.fileContent, 0666)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +110,7 @@ func TestNodeLocalFileUpload(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			writtenContent, err := ioutil.ReadFile(filepath.Join(c.Cfg.Settings.ExternalIODir, destination))
+			writtenContent, err := os.ReadFile(filepath.Join(c.Server.ClusterSettings().ExternalIODir, destination))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -126,10 +122,10 @@ func TestNodeLocalFileUpload(t *testing.T) {
 }
 
 func createTestFile(name, content string) (string, func()) {
-	tmpDir, err := ioutil.TempDir("", "")
+	tmpDir, err := os.MkdirTemp("", "")
 	tmpFile := filepath.Join(tmpDir, testTempFilePrefix+name)
 	if err == nil {
-		err = ioutil.WriteFile(tmpFile, []byte(content), 0666)
+		err = os.WriteFile(tmpFile, []byte(content), 0666)
 	}
 	if err != nil {
 		return "", func() {}
@@ -137,4 +133,87 @@ func createTestFile(name, content string) (string, func()) {
 	return tmpFile, func() {
 		_ = os.RemoveAll(tmpDir)
 	}
+}
+
+func TestEscapingReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("escapes newlines", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\n34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', 'n', '3', '4'}, buf[:n])
+	})
+	t.Run("escapes carriage returns", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\r34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', 'r', '3', '4'}, buf[:n])
+	})
+	t.Run("escapes tabs", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\t34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', 't', '3', '4'}, buf[:n])
+	})
+	t.Run("escapes backslashes", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\\34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', '\\', '3', '4'}, buf[:n])
+	})
+	t.Run("correctly returns escaped characters that overflow buffer", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\n3"))}
+		buf := make([]byte, 2)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+		require.Equal(t, []byte{'1', '\\'}, buf[:n])
+		n, err = er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+		require.Equal(t, []byte{'n', '3'}, buf[:n])
+	})
+	t.Run("correctly returns remainer when buffer is larger", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\n3"))}
+		buf := make([]byte, 2)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+		require.Equal(t, []byte{'1', '\\'}, buf[:n])
+		buf = make([]byte, 8)
+		n, err = er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+		require.Equal(t, []byte{'n', '3'}, buf[:n])
+	})
+	t.Run("correctly returns remainder when chunksize is small", func(t *testing.T) {
+		oldChunkSize := chunkSize
+		defer func() { chunkSize = oldChunkSize }()
+		chunkSize = 1
+		er := escapingReader{r: bytes.NewReader([]byte("1\n34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', 'n', '3', '4'}, buf[:n])
+	})
+	t.Run("correctly returns EOF when underlying reader returns it", func(t *testing.T) {
+		er := escapingReader{r: bytes.NewReader([]byte("1\n34"))}
+		buf := make([]byte, 5)
+		n, err := er.Read(buf)
+		require.NoError(t, err)
+		require.Equal(t, 5, n)
+		require.Equal(t, []byte{'1', '\\', 'n', '3', '4'}, buf[:n])
+		_, err = er.Read(buf)
+		require.ErrorIs(t, err, io.EOF)
+	})
 }

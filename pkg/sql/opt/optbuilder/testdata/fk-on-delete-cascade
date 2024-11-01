@@ -6,8 +6,16 @@ exec-ddl
 CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p) ON DELETE CASCADE)
 ----
 
+exec-ddl
+CREATE FUNCTION one_volatile() RETURNS INT VOLATILE LANGUAGE SQL AS 'SELECT 1'
+----
+
+exec-ddl
+CREATE FUNCTION one_immutable() RETURNS INT IMMUTABLE LANGUAGE SQL AS 'SELECT 1'
+----
+
 # Simple cascade; fast path (the filter gets transferred over to the cascade).
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1
 ----
 root
@@ -29,12 +37,13 @@ root
            └── select
                 ├── columns: c:11!null child.p:12!null
                 ├── scan child
-                │    └── columns: c:11!null child.p:12!null
+                │    ├── columns: c:11!null child.p:12!null
+                │    └── flags: disabled not visible index feature
                 └── filters
                      └── child.p:12 > 1
 
 # Simple cascade; no fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1 AND random() < 0.5
 ----
 root
@@ -57,7 +66,8 @@ root
            └── semi-join (hash)
                 ├── columns: c:11!null child.p:12!null
                 ├── scan child
-                │    └── columns: c:11!null child.p:12!null
+                │    ├── columns: c:11!null child.p:12!null
+                │    └── flags: disabled not visible index feature
                 ├── with-scan &1
                 │    ├── columns: p:15!null
                 │    └── mapping:
@@ -66,7 +76,7 @@ root
                      └── child.p:12 = p:15
 
 # Delete with subquery; no fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE EXISTS (SELECT p FROM parent)
 ----
 root
@@ -89,20 +99,82 @@ root
  └── cascade
       └── delete child
            ├── columns: <none>
-           ├── fetch columns: c:14 child.p:15
+           ├── fetch columns: c:15 child.p:16
            └── semi-join (hash)
-                ├── columns: c:14!null child.p:15!null
+                ├── columns: c:15!null child.p:16!null
                 ├── scan child
-                │    └── columns: c:14!null child.p:15!null
+                │    ├── columns: c:15!null child.p:16!null
+                │    └── flags: disabled not visible index feature
                 ├── with-scan &1
-                │    ├── columns: p:18!null
+                │    ├── columns: p:19!null
                 │    └── mapping:
-                │         └──  parent.p:4 => p:18
+                │         └──  parent.p:4 => p:19
                 └── filters
-                     └── child.p:15 = p:18
+                     └── child.p:16 = p:19
+
+# Delete with volatile UDF; no fast path.
+build-post-queries
+DELETE FROM parent WHERE p > one_volatile()
+----
+root
+ ├── delete parent
+ │    ├── columns: <none>
+ │    ├── fetch columns: p:4
+ │    ├── input binding: &1
+ │    ├── cascades
+ │    │    └── child_p_fkey
+ │    └── select
+ │         ├── columns: p:4!null crdb_internal_mvcc_timestamp:5 tableoid:6
+ │         ├── scan parent
+ │         │    └── columns: p:4!null crdb_internal_mvcc_timestamp:5 tableoid:6
+ │         └── filters
+ │              └── p:4 > one_volatile()
+ └── cascade
+      └── delete child
+           ├── columns: <none>
+           ├── fetch columns: c:12 child.p:13
+           └── semi-join (hash)
+                ├── columns: c:12!null child.p:13!null
+                ├── scan child
+                │    ├── columns: c:12!null child.p:13!null
+                │    └── flags: disabled not visible index feature
+                ├── with-scan &1
+                │    ├── columns: p:16!null
+                │    └── mapping:
+                │         └──  parent.p:4 => p:16
+                └── filters
+                     └── child.p:13 = p:16
+
+# Delete with immutable UDF; fast path.
+build-post-queries
+DELETE FROM parent WHERE p > one_immutable()
+----
+root
+ ├── delete parent
+ │    ├── columns: <none>
+ │    ├── fetch columns: p:4
+ │    ├── cascades
+ │    │    └── child_p_fkey
+ │    └── select
+ │         ├── columns: p:4!null crdb_internal_mvcc_timestamp:5 tableoid:6
+ │         ├── scan parent
+ │         │    └── columns: p:4!null crdb_internal_mvcc_timestamp:5 tableoid:6
+ │         └── filters
+ │              └── p:4 > one_immutable()
+ └── cascade
+      └── delete child
+           ├── columns: <none>
+           ├── fetch columns: c:12 child.p:13
+           └── select
+                ├── columns: c:12!null child.p:13!null
+                ├── scan child
+                │    ├── columns: c:12!null child.p:13!null
+                │    └── flags: disabled not visible index feature
+                └── filters
+                     └── child.p:13 > one_immutable()
 
 # Delete everything.
-build-cascades
+build-post-queries
 DELETE FROM parent
 ----
 root
@@ -118,14 +190,15 @@ root
            ├── columns: <none>
            ├── fetch columns: c:11 child.p:12
            └── scan child
-                └── columns: c:11!null child.p:12!null
+                ├── columns: c:11!null child.p:12!null
+                └── flags: disabled not visible index feature
 
 exec-ddl
 CREATE TABLE grandchild (g INT PRIMARY KEY, c INT REFERENCES child(c) ON DELETE CASCADE)
 ----
 
 # Two-level cascade; fast path for the first cascade.
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1
 ----
 root
@@ -150,7 +223,8 @@ root
       │    └── select
       │         ├── columns: c:11!null child.p:12!null
       │         ├── scan child
-      │         │    └── columns: c:11!null child.p:12!null
+      │         │    ├── columns: c:11!null child.p:12!null
+      │         │    └── flags: disabled not visible index feature
       │         └── filters
       │              └── child.p:12 > 1
       └── cascade
@@ -160,7 +234,8 @@ root
                 └── semi-join (hash)
                      ├── columns: g:19!null grandchild.c:20
                      ├── scan grandchild
-                     │    └── columns: g:19!null grandchild.c:20
+                     │    ├── columns: g:19!null grandchild.c:20
+                     │    └── flags: disabled not visible index feature
                      ├── with-scan &1
                      │    ├── columns: c:23!null
                      │    └── mapping:
@@ -169,7 +244,7 @@ root
                           └── grandchild.c:20 = c:23
 
 # Two-level cascade; no fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1 AND random() < 0.5
 ----
 root
@@ -195,7 +270,8 @@ root
       │    └── semi-join (hash)
       │         ├── columns: c:11!null child.p:12!null
       │         ├── scan child
-      │         │    └── columns: c:11!null child.p:12!null
+      │         │    ├── columns: c:11!null child.p:12!null
+      │         │    └── flags: disabled not visible index feature
       │         ├── with-scan &1
       │         │    ├── columns: p:15!null
       │         │    └── mapping:
@@ -209,7 +285,8 @@ root
                 └── semi-join (hash)
                      ├── columns: g:20!null grandchild.c:21
                      ├── scan grandchild
-                     │    └── columns: g:20!null grandchild.c:21
+                     │    ├── columns: g:20!null grandchild.c:21
+                     │    └── flags: disabled not visible index feature
                      ├── with-scan &2
                      │    ├── columns: c:24!null
                      │    └── mapping:
@@ -218,7 +295,7 @@ root
                           └── grandchild.c:21 = c:24
 
 # Delete everything.
-build-cascades
+build-post-queries
 DELETE FROM parent
 ----
 root
@@ -236,7 +313,8 @@ root
       │    ├── cascades
       │    │    └── grandchild_c_fkey
       │    └── scan child
-      │         └── columns: c:11!null child.p:12!null
+      │         ├── columns: c:11!null child.p:12!null
+      │         └── flags: disabled not visible index feature
       └── cascade
            └── delete grandchild
                 ├── columns: <none>
@@ -244,7 +322,8 @@ root
                 └── select
                      ├── columns: g:19!null grandchild.c:20!null
                      ├── scan grandchild
-                     │    └── columns: g:19!null grandchild.c:20
+                     │    ├── columns: g:19!null grandchild.c:20
+                     │    └── flags: disabled not visible index feature
                      └── filters
                           └── grandchild.c:20 IS DISTINCT FROM CAST(NULL AS INT8)
 
@@ -257,7 +336,7 @@ exec-ddl
 CREATE TABLE grandchild (g INT PRIMARY KEY, c INT REFERENCES child(c))
 ----
 
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1
 ----
 root
@@ -280,7 +359,8 @@ root
            ├── select
            │    ├── columns: child.c:11!null child.p:12!null
            │    ├── scan child
-           │    │    └── columns: child.c:11!null child.p:12!null
+           │    │    ├── columns: child.c:11!null child.p:12!null
+           │    │    └── flags: disabled not visible index feature
            │    └── filters
            │         └── child.p:12 > 1
            └── f-k-checks
@@ -292,11 +372,12 @@ root
                           │    └── mapping:
                           │         └──  child.c:11 => c:15
                           ├── scan grandchild
-                          │    └── columns: grandchild.c:17
+                          │    ├── columns: grandchild.c:17
+                          │    └── flags: disabled not visible index feature
                           └── filters
                                └── c:15 = grandchild.c:17
 
-build-cascades
+build-post-queries
 DELETE FROM parent WHERE p > 1 AND random() < 0.5
 ----
 root
@@ -320,7 +401,8 @@ root
            ├── semi-join (hash)
            │    ├── columns: child.c:11!null child.p:12!null
            │    ├── scan child
-           │    │    └── columns: child.c:11!null child.p:12!null
+           │    │    ├── columns: child.c:11!null child.p:12!null
+           │    │    └── flags: disabled not visible index feature
            │    ├── with-scan &1
            │    │    ├── columns: p:15!null
            │    │    └── mapping:
@@ -336,7 +418,8 @@ root
                           │    └── mapping:
                           │         └──  child.c:11 => c:16
                           ├── scan grandchild
-                          │    └── columns: grandchild.c:18
+                          │    ├── columns: grandchild.c:18
+                          │    └── flags: disabled not visible index feature
                           └── filters
                                └── c:16 = grandchild.c:18
 
@@ -345,7 +428,7 @@ exec-ddl
 CREATE TABLE self (a INT PRIMARY KEY, b INT REFERENCES self(a) ON DELETE CASCADE)
 ----
 
-build-cascades cascade-levels=3
+build-post-queries post-query-levels=3
 DELETE FROM self WHERE a=1
 ----
 root
@@ -371,7 +454,8 @@ root
       │    └── semi-join (hash)
       │         ├── columns: self.a:13!null b:14
       │         ├── scan self
-      │         │    └── columns: self.a:13!null b:14
+      │         │    ├── columns: self.a:13!null b:14
+      │         │    └── flags: disabled not visible index feature
       │         ├── with-scan &1
       │         │    ├── columns: a:17!null
       │         │    └── mapping:
@@ -388,7 +472,8 @@ root
            │    └── semi-join (hash)
            │         ├── columns: self.a:22!null b:23
            │         ├── scan self
-           │         │    └── columns: self.a:22!null b:23
+           │         │    ├── columns: self.a:22!null b:23
+           │         │    └── flags: disabled not visible index feature
            │         ├── with-scan &2
            │         │    ├── columns: a:26!null
            │         │    └── mapping:
@@ -405,7 +490,8 @@ root
                      └── semi-join (hash)
                           ├── columns: self.a:31!null b:32
                           ├── scan self
-                          │    └── columns: self.a:31!null b:32
+                          │    ├── columns: self.a:31!null b:32
+                          │    └── flags: disabled not visible index feature
                           ├── with-scan &3
                           │    ├── columns: a:35!null
                           │    └── mapping:
@@ -439,7 +525,7 @@ ALTER TABLE ef ADD CONSTRAINT ef_ab FOREIGN KEY (f) REFERENCES ab(a) ON DELETE C
 ----
 
 # Fast path should not be used when there are cycles.
-build-cascades cascade-levels=3
+build-post-queries post-query-levels=3
 DELETE FROM ab WHERE a = 1
 ----
 root
@@ -465,7 +551,8 @@ root
       │    └── semi-join (hash)
       │         ├── columns: e:13!null f:14
       │         ├── scan ef
-      │         │    └── columns: e:13!null f:14
+      │         │    ├── columns: e:13!null f:14
+      │         │    └── flags: disabled not visible index feature
       │         ├── with-scan &1
       │         │    ├── columns: a:17!null
       │         │    └── mapping:
@@ -482,7 +569,8 @@ root
            │    └── semi-join (hash)
            │         ├── columns: c:22!null d:23
            │         ├── scan cd
-           │         │    └── columns: c:22!null d:23
+           │         │    ├── columns: c:22!null d:23
+           │         │    └── flags: disabled not visible index feature
            │         ├── with-scan &2
            │         │    ├── columns: e:26!null
            │         │    └── mapping:
@@ -499,7 +587,8 @@ root
                      └── semi-join (hash)
                           ├── columns: ab.a:31!null b:32
                           ├── scan ab
-                          │    └── columns: ab.a:31!null b:32
+                          │    ├── columns: ab.a:31!null b:32
+                          │    └── flags: disabled not visible index feature
                           ├── with-scan &3
                           │    ├── columns: c:35!null
                           │    └── mapping:
@@ -531,7 +620,7 @@ CREATE TABLE f3 (
 )
 ----
 
-build-cascades
+build-post-queries
 DELETE FROM f1 WHERE a >= 1 AND a <= 4
 ----
 root
@@ -555,7 +644,8 @@ root
       │    └── select
       │         ├── columns: f2.a:14!null b:15!null f2.data:16
       │         ├── scan f2
-      │         │    └── columns: f2.a:14!null b:15!null f2.data:16
+      │         │    ├── columns: f2.a:14!null b:15!null f2.data:16
+      │         │    └── flags: disabled not visible index feature
       │         └── filters
       │              └── (f2.a:14 >= 1) AND (f2.a:14 <= 4)
       └── cascade
@@ -565,12 +655,13 @@ root
                 └── select
                      ├── columns: f3.a:25!null f3.b:26!null c:27!null f3.data:28
                      ├── scan f3
-                     │    └── columns: f3.a:25!null f3.b:26!null c:27!null f3.data:28
+                     │    ├── columns: f3.a:25!null f3.b:26!null c:27!null f3.data:28
+                     │    └── flags: disabled not visible index feature
                      └── filters
                           └── (f3.a:25 >= 1) AND (f3.a:25 <= 4)
 
 # No fast path possible (filter references other columns).
-build-cascades
+build-post-queries
 DELETE FROM f1 WHERE a = 1 AND data = 1
 ----
 root
@@ -596,7 +687,8 @@ root
       │    └── semi-join (hash)
       │         ├── columns: f2.a:14!null b:15!null f2.data:16
       │         ├── scan f2
-      │         │    └── columns: f2.a:14!null b:15!null f2.data:16
+      │         │    ├── columns: f2.a:14!null b:15!null f2.data:16
+      │         │    └── flags: disabled not visible index feature
       │         ├── with-scan &1
       │         │    ├── columns: a:19!null
       │         │    └── mapping:
@@ -610,7 +702,8 @@ root
                 └── semi-join (hash)
                      ├── columns: f3.a:26!null f3.b:27!null c:28!null f3.data:29
                      ├── scan f3
-                     │    └── columns: f3.a:26!null f3.b:27!null c:28!null f3.data:29
+                     │    ├── columns: f3.a:26!null f3.b:27!null c:28!null f3.data:29
+                     │    └── flags: disabled not visible index feature
                      ├── with-scan &2
                      │    ├── columns: a:32!null b:33!null
                      │    └── mapping:
@@ -633,7 +726,7 @@ exec-ddl
 CREATE TABLE g2b (b INT REFERENCES g1(b) ON DELETE CASCADE, data INT)
 ----
 
-build-cascades
+build-post-queries
 DELETE FROM g1 WHERE a = 1
 ----
 root
@@ -657,7 +750,8 @@ root
  │         └── select
  │              ├── columns: g2a.a:16!null data:17 g2a.rowid:18!null
  │              ├── scan g2a
- │              │    └── columns: g2a.a:16 data:17 g2a.rowid:18!null
+ │              │    ├── columns: g2a.a:16 data:17 g2a.rowid:18!null
+ │              │    └── flags: disabled not visible index feature
  │              └── filters
  │                   ├── g2a.a:16 = 1
  │                   └── g2a.a:16 IS DISTINCT FROM CAST(NULL AS INT8)
@@ -668,7 +762,8 @@ root
            └── semi-join (hash)
                 ├── columns: g2b.b:26 g2b.data:27 g2b.rowid:28!null
                 ├── scan g2b
-                │    └── columns: g2b.b:26 g2b.data:27 g2b.rowid:28!null
+                │    ├── columns: g2b.b:26 g2b.data:27 g2b.rowid:28!null
+                │    └── flags: disabled not visible index feature
                 ├── with-scan &1
                 │    ├── columns: b:31
                 │    └── mapping:
@@ -676,7 +771,7 @@ root
                 └── filters
                      └── g2b.b:26 = b:31
 
-build-cascades
+build-post-queries
 DELETE FROM g1 WHERE b = 1
 ----
 root
@@ -700,7 +795,8 @@ root
  │         └── semi-join (hash)
  │              ├── columns: g2a.a:16 data:17 g2a.rowid:18!null
  │              ├── scan g2a
- │              │    └── columns: g2a.a:16 data:17 g2a.rowid:18!null
+ │              │    ├── columns: g2a.a:16 data:17 g2a.rowid:18!null
+ │              │    └── flags: disabled not visible index feature
  │              ├── with-scan &1
  │              │    ├── columns: a:21
  │              │    └── mapping:
@@ -714,7 +810,8 @@ root
            └── select
                 ├── columns: g2b.b:27!null g2b.data:28 g2b.rowid:29!null
                 ├── scan g2b
-                │    └── columns: g2b.b:27 g2b.data:28 g2b.rowid:29!null
+                │    ├── columns: g2b.b:27 g2b.data:28 g2b.rowid:29!null
+                │    └── flags: disabled not visible index feature
                 └── filters
                      ├── g2b.b:27 = 1
                      └── g2b.b:27 IS DISTINCT FROM CAST(NULL AS INT8)
@@ -730,7 +827,7 @@ CREATE TABLE h2 (c INT PRIMARY KEY, p DECIMAL REFERENCES h1(p) ON DELETE CASCADE
 
 # Fast path cannot be used: it would be incorrect to transfer this
 # condition to the child column.
-build-cascades
+build-post-queries
 DELETE FROM h1 WHERE p::STRING = '1.0'
 ----
 root
@@ -753,7 +850,8 @@ root
            └── semi-join (hash)
                 ├── columns: c:11!null h2.p:12
                 ├── scan h2
-                │    └── columns: c:11!null h2.p:12
+                │    ├── columns: c:11!null h2.p:12
+                │    └── flags: disabled not visible index feature
                 ├── with-scan &1
                 │    ├── columns: p:15!null
                 │    └── mapping:
@@ -762,7 +860,7 @@ root
                      └── h2.p:12 = p:15
 
 # It is ok to use the fast path if the expression is not composite-sensitive.
-build-cascades
+build-post-queries
 DELETE FROM h1 WHERE p = 1
 ----
 root
@@ -784,7 +882,8 @@ root
            └── select
                 ├── columns: c:11!null h2.p:12!null
                 ├── scan h2
-                │    └── columns: c:11!null h2.p:12
+                │    ├── columns: c:11!null h2.p:12
+                │    └── flags: disabled not visible index feature
                 └── filters
                      ├── h2.p:12 = 1
                      └── h2.p:12 IS DISTINCT FROM CAST(NULL AS DECIMAL)
@@ -808,7 +907,7 @@ CREATE TABLE m2 (
 )
 ----
 
-build-cascades
+build-post-queries
 DELETE FROM m1 WHERE a+b+c=1
 ----
 root
@@ -830,14 +929,15 @@ root
            └── select
                 ├── columns: m2.a:19!null m2.b:20!null m2.c:21!null m2.rowid:22!null
                 ├── scan m2
-                │    └── columns: m2.a:19 m2.b:20!null m2.c:21 m2.rowid:22!null
+                │    ├── columns: m2.a:19 m2.b:20!null m2.c:21 m2.rowid:22!null
+                │    └── flags: disabled not visible index feature
                 └── filters
                      ├── ((m2.a:19 + m2.b:20) + m2.c:21) = 1
                      ├── m2.a:19 IS DISTINCT FROM CAST(NULL AS INT8)
                      └── m2.c:21 IS DISTINCT FROM CAST(NULL AS INT8)
 
 # The filter will end up being a contradiction, so the cascade is a no-op.
-build-cascades
+build-post-queries
 DELETE FROM m1 WHERE a IS NULL
 ----
 root
@@ -859,7 +959,8 @@ root
            └── select
                 ├── columns: m2.a:19!null m2.b:20!null m2.c:21!null m2.rowid:22!null
                 ├── scan m2
-                │    └── columns: m2.a:19 m2.b:20!null m2.c:21 m2.rowid:22!null
+                │    ├── columns: m2.a:19 m2.b:20!null m2.c:21 m2.rowid:22!null
+                │    └── flags: disabled not visible index feature
                 └── filters
                      ├── m2.a:19 IS NULL
                      ├── m2.a:19 IS DISTINCT FROM CAST(NULL AS INT8)
@@ -881,7 +982,7 @@ CREATE TABLE child_partial (
 ----
 
 # Test a cascade to a child with a partial index; fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent_partial WHERE p > 1
 ----
 root
@@ -907,11 +1008,12 @@ root
                 │    ├── columns: c:12!null child_partial.p:13!null i:14
                 │    ├── scan child_partial
                 │    │    ├── columns: c:12!null child_partial.p:13 i:14
-                │    │    └── partial index predicates
-                │    │         ├── child_partial_p_idx: filters
-                │    │         │    └── i:14 > 0
-                │    │         └── child_partial_i_idx: filters
-                │    │              └── child_partial.p:13 > 0
+                │    │    ├── partial index predicates
+                │    │    │    ├── child_partial_p_idx: filters
+                │    │    │    │    └── i:14 > 0
+                │    │    │    └── child_partial_i_idx: filters
+                │    │    │         └── child_partial.p:13 > 0
+                │    │    └── flags: disabled not visible index feature
                 │    └── filters
                 │         ├── child_partial.p:13 > 1
                 │         └── child_partial.p:13 IS DISTINCT FROM CAST(NULL AS INT8)
@@ -920,7 +1022,7 @@ root
                      └── child_partial.p:13 > 0 [as=partial_index_del2:18]
 
 # Test a cascade to a child with a partial index; no fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent_partial WHERE p > 1 AND random() < 0.5
 ----
 root
@@ -947,11 +1049,12 @@ root
                 │    ├── columns: c:12!null child_partial.p:13 i:14
                 │    ├── scan child_partial
                 │    │    ├── columns: c:12!null child_partial.p:13 i:14
-                │    │    └── partial index predicates
-                │    │         ├── child_partial_p_idx: filters
-                │    │         │    └── i:14 > 0
-                │    │         └── child_partial_i_idx: filters
-                │    │              └── child_partial.p:13 > 0
+                │    │    ├── partial index predicates
+                │    │    │    ├── child_partial_p_idx: filters
+                │    │    │    │    └── i:14 > 0
+                │    │    │    └── child_partial_i_idx: filters
+                │    │    │         └── child_partial.p:13 > 0
+                │    │    └── flags: disabled not visible index feature
                 │    ├── with-scan &1
                 │    │    ├── columns: p:17!null
                 │    │    └── mapping:
@@ -963,7 +1066,7 @@ root
                      └── child_partial.p:13 > 0 [as=partial_index_del2:19]
 
 # Test a cascade to a child with a partial index; delete everything.
-build-cascades
+build-post-queries
 DELETE FROM parent_partial
 ----
 root
@@ -985,11 +1088,12 @@ root
                 │    ├── columns: c:12!null child_partial.p:13!null i:14
                 │    ├── scan child_partial
                 │    │    ├── columns: c:12!null child_partial.p:13 i:14
-                │    │    └── partial index predicates
-                │    │         ├── child_partial_p_idx: filters
-                │    │         │    └── i:14 > 0
-                │    │         └── child_partial_i_idx: filters
-                │    │              └── child_partial.p:13 > 0
+                │    │    ├── partial index predicates
+                │    │    │    ├── child_partial_p_idx: filters
+                │    │    │    │    └── i:14 > 0
+                │    │    │    └── child_partial_i_idx: filters
+                │    │    │         └── child_partial.p:13 > 0
+                │    │    └── flags: disabled not visible index feature
                 │    └── filters
                 │         └── child_partial.p:13 IS DISTINCT FROM CAST(NULL AS INT8)
                 └── projections
@@ -1005,12 +1109,13 @@ exec-ddl
 CREATE TABLE child_virt (
   c INT PRIMARY KEY,
   p INT REFERENCES parent_virt(p) ON DELETE CASCADE,
-  v INT AS (p) VIRTUAL
+  v INT AS (p) VIRTUAL,
+  v2 STRING AS (c::STRING) VIRTUAL
 )
 ----
 
 # Fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent_virt WHERE p > 1
 ----
 root
@@ -1028,20 +1133,28 @@ root
  └── cascade
       └── delete child_virt
            ├── columns: <none>
-           ├── fetch columns: c:12 child_virt.p:13
+           ├── fetch columns: c:13 child_virt.p:14 v:15 v2:16
            └── select
-                ├── columns: c:12!null child_virt.p:13!null
-                ├── scan child_virt
-                │    ├── columns: c:12!null child_virt.p:13
-                │    └── computed column expressions
-                │         └── v:14
-                │              └── child_virt.p:13
+                ├── columns: c:13!null child_virt.p:14!null v:15 v2:16!null
+                ├── project
+                │    ├── columns: v:15 v2:16!null c:13!null child_virt.p:14
+                │    ├── scan child_virt
+                │    │    ├── columns: c:13!null child_virt.p:14
+                │    │    ├── computed column expressions
+                │    │    │    ├── v:15
+                │    │    │    │    └── child_virt.p:14
+                │    │    │    └── v2:16
+                │    │    │         └── c:13::STRING
+                │    │    └── flags: disabled not visible index feature
+                │    └── projections
+                │         ├── child_virt.p:14 [as=v:15]
+                │         └── c:13::STRING [as=v2:16]
                 └── filters
-                     ├── child_virt.p:13 > 1
-                     └── child_virt.p:13 IS DISTINCT FROM CAST(NULL AS INT8)
+                     ├── child_virt.p:14 > 1
+                     └── child_virt.p:14 IS DISTINCT FROM CAST(NULL AS INT8)
 
 # No fast path.
-build-cascades
+build-post-queries
 DELETE FROM parent_virt WHERE p > 1 AND random() < 0.5
 ----
 root
@@ -1060,17 +1173,25 @@ root
  └── cascade
       └── delete child_virt
            ├── columns: <none>
-           ├── fetch columns: c:12 child_virt.p:13
+           ├── fetch columns: c:13 child_virt.p:14 v:15 v2:16
            └── semi-join (hash)
-                ├── columns: c:12!null child_virt.p:13
-                ├── scan child_virt
-                │    ├── columns: c:12!null child_virt.p:13
-                │    └── computed column expressions
-                │         └── v:14
-                │              └── child_virt.p:13
+                ├── columns: c:13!null child_virt.p:14 v:15 v2:16!null
+                ├── project
+                │    ├── columns: v:15 v2:16!null c:13!null child_virt.p:14
+                │    ├── scan child_virt
+                │    │    ├── columns: c:13!null child_virt.p:14
+                │    │    ├── computed column expressions
+                │    │    │    ├── v:15
+                │    │    │    │    └── child_virt.p:14
+                │    │    │    └── v2:16
+                │    │    │         └── c:13::STRING
+                │    │    └── flags: disabled not visible index feature
+                │    └── projections
+                │         ├── child_virt.p:14 [as=v:15]
+                │         └── c:13::STRING [as=v2:16]
                 ├── with-scan &1
-                │    ├── columns: p:17!null
+                │    ├── columns: p:19!null
                 │    └── mapping:
-                │         └──  parent_virt.p:4 => p:17
+                │         └──  parent_virt.p:4 => p:19
                 └── filters
-                     └── child_virt.p:13 = p:17
+                     └── child_virt.p:14 = p:19

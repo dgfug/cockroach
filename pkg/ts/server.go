@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -15,15 +10,18 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -37,10 +35,10 @@ const (
 	// queryWorkerMax is the default maximum number of worker goroutines that
 	// the time series server can use to service incoming queries.
 	queryWorkerMax = 8
-	// queryMemoryMax is a soft limit for the amount of total memory used by
-	// time series queries. This is not currently enforced, but is used for
-	// monitoring purposes.
-	queryMemoryMax = int64(64 * 1024 * 1024) // 64MiB
+	// DefaultQueryMemoryMax is a soft limit for the amount of total
+	// memory used by time series queries. This is not currently enforced,
+	// but is used for monitoring purposes.
+	DefaultQueryMemoryMax = int64(64 * 1024 * 1024) // 64MiB
 	// dumpBatchSize is the number of keys processed in each batch by the dump
 	// command.
 	dumpBatchSize = 100
@@ -67,13 +65,13 @@ type ServerConfig struct {
 // The server attempts to constrain the total amount of memory it uses for
 // processing incoming queries. This is accomplished with a multi-pronged
 // strategy:
-// + The server has a worker memory limit, which is a quota for the amount of
-//   memory that can be used across all currently executing queries.
-// + The server also has a pre-set limit on the number of parallel workers that
-//   can be executing at one time. Each worker is given an even share of the
-//   server's total memory limit, which it should not exceed.
-// + Each worker breaks its task into chunks which it will process sequentially;
-//   the size of each chunk is calculated to avoid exceeding the memory limit.
+//   - The server has a worker memory limit, which is a quota for the amount of
+//     memory that can be used across all currently executing queries.
+//   - The server also has a pre-set limit on the number of parallel workers that
+//     can be executing at one time. Each worker is given an even share of the
+//     server's total memory limit, which it should not exceed.
+//   - Each worker breaks its task into chunks which it will process sequentially;
+//     the size of each chunk is calculated to avoid exceeding the memory limit.
 //
 // In addition to this strategy, the server uses a memory monitor to track the
 // amount of memory being used in reality by worker tasks. This is intended to
@@ -97,6 +95,66 @@ type Server struct {
 	workerSem        *quotapool.IntPool
 }
 
+var _ tspb.TimeSeriesServer = &Server{}
+
+type TenantServer struct {
+	// NB: TenantServer only implements Query from tspb.TimeSeriesServer
+	tspb.UnimplementedTimeSeriesServer
+
+	log.AmbientContext
+	tenantID       roachpb.TenantID
+	tenantConnect  kvtenant.Connector
+	tenantRegistry *metric.Registry
+}
+
+var _ tspb.TenantTimeSeriesServer = &TenantServer{}
+
+// Query delegates to the tenant connector to query
+// the tsdb on the system tenant. The only authorization
+// necessary is the tenant capability check on the
+// connector.
+func (t *TenantServer) Query(
+	ctx context.Context, req *tspb.TimeSeriesQueryRequest,
+) (*tspb.TimeSeriesQueryResponse, error) {
+	ctx = t.AnnotateCtx(ctx)
+	// Currently, secondary tenants are only able to view their own metrics.
+	for i, q := range req.Queries {
+		// Tenant-scoped metrics get marked with the tenantID, otherwise we
+		// leave the request as-is for system-level metrics.
+		if t.tenantRegistry.Contains(q.Name) {
+			req.Queries[i].TenantID = t.tenantID
+		}
+	}
+	return t.tenantConnect.Query(ctx, req)
+}
+
+// RegisterService registers the GRPC service.
+func (s *TenantServer) RegisterService(g *grpc.Server) {
+	tspb.RegisterTimeSeriesServer(g, s)
+}
+
+// RegisterGateway starts the gateway (i.e. reverse proxy) that proxies HTTP requests
+// to the appropriate gRPC endpoints.
+func (s *TenantServer) RegisterGateway(
+	ctx context.Context, mux *gwruntime.ServeMux, conn *grpc.ClientConn,
+) error {
+	return tspb.RegisterTimeSeriesHandler(ctx, mux, conn)
+}
+
+func MakeTenantServer(
+	ambient log.AmbientContext,
+	tenantConnect kvtenant.Connector,
+	tenantID roachpb.TenantID,
+	registry *metric.Registry,
+) *TenantServer {
+	return &TenantServer{
+		AmbientContext: ambient,
+		tenantConnect:  tenantConnect,
+		tenantID:       tenantID,
+		tenantRegistry: registry,
+	}
+}
+
 // MakeServer instantiates a new Server which services requests with data from
 // the supplied DB.
 func MakeServer(
@@ -104,50 +162,47 @@ func MakeServer(
 	db *DB,
 	nodeCountFn ClusterNodeCountFn,
 	cfg ServerConfig,
+	memoryMonitor *mon.BytesMonitor,
 	stopper *stop.Stopper,
 ) Server {
 	ambient.AddLogTag("ts-srv", nil)
+	ctx := ambient.AnnotateCtx(context.Background())
 
 	// Override default values from configuration.
 	queryWorkerMax := queryWorkerMax
 	if cfg.QueryWorkerMax != 0 {
 		queryWorkerMax = cfg.QueryWorkerMax
 	}
-	queryMemoryMax := queryMemoryMax
-	if cfg.QueryMemoryMax != 0 {
+	queryMemoryMax := DefaultQueryMemoryMax
+	if cfg.QueryMemoryMax > DefaultQueryMemoryMax {
 		queryMemoryMax = cfg.QueryMemoryMax
 	}
 	workerSem := quotapool.NewIntPool("ts.Server worker", uint64(queryWorkerMax))
 	stopper.AddCloser(workerSem.Closer("stopper"))
-	return Server{
+	s := Server{
 		AmbientContext: ambient,
 		db:             db,
 		stopper:        stopper,
 		nodeCountFn:    nodeCountFn,
-		workerMemMonitor: mon.NewUnlimitedMonitor(
-			context.Background(),
+		workerMemMonitor: mon.NewMonitorInheritWithLimit(
 			"timeseries-workers",
-			mon.MemoryResource,
-			nil,
-			nil,
-			// Begin logging messages if we exceed our planned memory usage by
-			// more than double.
 			queryMemoryMax*2,
-			db.st,
+			memoryMonitor,
+			true, /* longLiving */
 		),
-		resultMemMonitor: mon.NewUnlimitedMonitor(
-			context.Background(),
+		resultMemMonitor: mon.NewMonitorInheritWithLimit(
 			"timeseries-results",
-			mon.MemoryResource,
-			nil,
-			nil,
 			math.MaxInt64,
-			db.st,
+			memoryMonitor,
+			true, /* longLiving */
 		),
 		queryMemoryMax: queryMemoryMax,
 		queryWorkerMax: queryWorkerMax,
 		workerSem:      workerSem,
 	}
+	s.workerMemMonitor.StartNoReserved(ctx, memoryMonitor)
+	s.resultMemMonitor.StartNoReserved(ambient.AnnotateCtx(context.Background()), memoryMonitor)
+	return s
 }
 
 // RegisterService registers the GRPC service.
@@ -183,7 +238,7 @@ func (s *Server) Query(
 	// dead. This is a conservatively long span, but gives us a good indication of
 	// when a gap likely indicates an outage (and thus missing values should not
 	// be interpolated).
-	interpolationLimit := kvserver.TimeUntilStoreDead.Get(&s.db.st.SV).Nanoseconds()
+	interpolationLimit := liveness.TimeUntilNodeDead.Get(&s.db.st.SV).Nanoseconds()
 
 	// Get the estimated number of nodes on the cluster, used to compute more
 	// accurate memory usage estimates. Set a minimum of 1 in order to avoid
@@ -258,6 +313,7 @@ func (s *Server) Query(
 							BudgetBytes:             s.queryMemoryMax / int64(s.queryWorkerMax),
 							EstimatedSources:        estimatedSourceCount,
 							InterpolationLimitNanos: interpolationLimit,
+							Columnar:                s.db.WriteColumnar(),
 						},
 					)
 
@@ -321,7 +377,7 @@ func (s *Server) Query(
 // set up a KV store and write some keys into it (`MakeDataKey`) to do so without
 // setting up a `*Server`.
 func (s *Server) Dump(req *tspb.DumpRequest, stream tspb.TimeSeries_DumpServer) error {
-	d := defaultDumper{stream}.Dump
+	d := DefaultDumper{stream.Send}.Dump
 	return dumpImpl(stream.Context(), s.db.db, req, d)
 
 }
@@ -335,15 +391,17 @@ func (s *Server) DumpRaw(req *tspb.DumpRequest, stream tspb.TimeSeries_DumpRawSe
 func dumpImpl(
 	ctx context.Context, db *kv.DB, req *tspb.DumpRequest, d func(*roachpb.KeyValue) error,
 ) error {
-	names := req.Names
-	if len(names) == 0 {
-		names = catalog.AllInternalTimeseriesMetricNames()
+	if len(req.Names) == 0 {
+		// In 23.2 behavior changed. Prior to it, tsdump would send an empty slice and
+		// we'd populate it here. Now the client is expected to fill in the slice itself.
+		// Probably the client is running `./cockroach debug tsdump` on a <=23.1 binary.
+		return errors.Errorf("no timeseries names provided, does your cli binary match server's?")
 	}
 	resolutions := req.Resolutions
 	if len(resolutions) == 0 {
 		resolutions = []tspb.TimeSeriesResolution{tspb.TimeSeriesResolution_RESOLUTION_10S}
 	}
-	for _, seriesName := range names {
+	for _, seriesName := range req.Names {
 		for _, res := range resolutions {
 			if err := dumpTimeseriesAllSources(
 				ctx,
@@ -361,11 +419,12 @@ func dumpImpl(
 	return nil
 }
 
-type defaultDumper struct {
-	stream tspb.TimeSeries_DumpServer
+// DefaultDumper translates *roachpb.KeyValue into TimeSeriesData.
+type DefaultDumper struct {
+	Send func(*tspb.TimeSeriesData) error
 }
 
-func (dd defaultDumper) Dump(kv *roachpb.KeyValue) error {
+func (dd DefaultDumper) Dump(kv *roachpb.KeyValue) error {
 	name, source, _, _, err := DecodeDataKey(kv.Key)
 	if err != nil {
 		return err
@@ -389,7 +448,7 @@ func (dd defaultDumper) Dump(kv *roachpb.KeyValue) error {
 			tsdata.Datapoints[i].Value = idata.Samples[i].Sum
 		}
 	}
-	return dd.stream.Send(tsdata)
+	return dd.Send(tsdata)
 }
 
 type rawDumper struct {
@@ -429,7 +488,7 @@ func dumpTimeseriesAllSources(
 
 	for span != nil {
 		b := &kv.Batch{}
-		scan := roachpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
+		scan := kvpb.NewScan(span.Key, span.EndKey)
 		b.AddRawRequest(scan)
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		err := db.Run(ctx, b)

@@ -1,28 +1,29 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { SessionsPageProps } from "./sessionsPage";
-import { createMemoryHistory } from "history";
-import { SessionInfo } from "./sessionsTable";
-import Long from "long";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-const Phase = cockroach.server.serverpb.ActiveQuery.Phase;
+import { createMemoryHistory } from "history";
+import Long from "long";
 import { util } from "protobufjs";
+
 import {
   CancelQueryRequestMessage,
   CancelSessionRequestMessage,
 } from "src/api/terminateQueryApi";
 
+import { defaultFilters, Filters } from "../queryFilter";
+
+import { SessionsPageProps } from "./sessionsPage";
+import { SessionInfo } from "./sessionsTable";
+
+const Status = cockroach.server.serverpb.Session.Status;
+const Phase = cockroach.server.serverpb.ActiveQuery.Phase;
+
 const history = createMemoryHistory({ initialEntries: ["/sessions"] });
 
-const toUuid = function(s: string): Uint8Array {
+const toUuid = function (s: string): Uint8Array {
   const buf = util.newBuffer(util.base64.length(s));
   util.base64.decode(s, buf, 0);
   return buf;
@@ -44,7 +45,12 @@ export const idleSession: SessionInfo = {
     alloc_bytes: Long.fromNumber(0),
     max_alloc_bytes: Long.fromNumber(10240),
     active_queries: [],
-    toJSON: () => ({}),
+    num_txns_executed: 1,
+    txn_fingerprint_ids: [],
+    status: Status.IDLE,
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -81,7 +87,12 @@ export const idleTransactionSession: SessionInfo = {
     },
     last_active_query_no_constants: "SHOW database",
     active_queries: [],
-    toJSON: () => ({}),
+    num_txns_executed: 1,
+    txn_fingerprint_ids: [],
+    status: Status.IDLE,
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -132,7 +143,41 @@ export const activeSession: SessionInfo = {
       num_auto_retries: 3,
     },
     last_active_query_no_constants: "SHOW database",
-    toJSON: () => ({}),
+    status: Status.ACTIVE,
+    num_txns_executed: 1,
+    txn_fingerprint_ids: [],
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
+  },
+};
+
+export const closedSession: SessionInfo = {
+  session: {
+    node_id: 1,
+    username: "root",
+    client_address: "127.0.0.1:57618",
+    application_name: "$ cockroach sql",
+    start: {
+      seconds: Long.fromNumber(1596816670),
+      nanos: 369989000,
+    },
+    last_active_query: "SHOW database",
+    id: toUuid("FekiTsjUZoAAAAAAAAAAAQ=="),
+    last_active_query_no_constants: "SHOW database",
+    alloc_bytes: Long.fromNumber(0),
+    max_alloc_bytes: Long.fromNumber(10240),
+    active_queries: [],
+    end: {
+      seconds: Long.fromNumber(1596819870),
+      nanos: 369989000,
+    },
+    status: Status.CLOSED,
+    num_txns_executed: 1,
+    txn_fingerprint_ids: [],
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -140,9 +185,19 @@ const sessionsList: SessionInfo[] = [
   idleSession,
   idleTransactionSession,
   activeSession,
+  closedSession,
 ];
 
+export const filters: Filters = {
+  app: "",
+  timeNumber: "0",
+  timeUnit: "seconds",
+  regions: "",
+  nodes: "",
+};
+
 export const sessionsPagePropsFixture: SessionsPageProps = {
+  filters: defaultFilters,
   history,
   location: {
     pathname: "/sessions",
@@ -158,12 +213,20 @@ export const sessionsPagePropsFixture: SessionsPageProps = {
   },
   sessions: sessionsList,
   sessionsError: null,
+  sortSetting: {
+    ascending: false,
+    columnTitle: "statementAge",
+  },
+  columns: null,
+  internalAppNamePrefix: "$ internal",
   refreshSessions: () => {},
-  cancelSession: (req: CancelSessionRequestMessage) => {},
-  cancelQuery: (req: CancelQueryRequestMessage) => {},
+  cancelSession: (_req: CancelSessionRequestMessage) => {},
+  cancelQuery: (_req: CancelQueryRequestMessage) => {},
+  onSortingChange: () => {},
 };
 
 export const sessionsPagePropsEmptyFixture: SessionsPageProps = {
+  filters: defaultFilters,
   history,
   location: {
     pathname: "/sessions",
@@ -179,7 +242,14 @@ export const sessionsPagePropsEmptyFixture: SessionsPageProps = {
   },
   sessions: [],
   sessionsError: null,
+  sortSetting: {
+    ascending: false,
+    columnTitle: "statementAge",
+  },
+  columns: null,
+  internalAppNamePrefix: "$ internal",
   refreshSessions: () => {},
-  cancelSession: (req: CancelSessionRequestMessage) => {},
-  cancelQuery: (req: CancelQueryRequestMessage) => {},
+  cancelSession: (_req: CancelSessionRequestMessage) => {},
+  cancelQuery: (_req: CancelQueryRequestMessage) => {},
+  onSortingChange: () => {},
 };

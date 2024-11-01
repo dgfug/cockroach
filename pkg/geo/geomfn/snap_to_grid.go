@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -14,7 +9,8 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -23,10 +19,10 @@ import (
 // If the resulting geometry is invalid, it will be converted to it's EMPTY form.
 func SnapToGrid(g geo.Geometry, origin geom.Coord, gridSize geom.Coord) (geo.Geometry, error) {
 	if len(origin) != 4 {
-		return geo.Geometry{}, errors.Newf("origin must be 4D")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "origin must be 4D")
 	}
 	if len(gridSize) != 4 {
-		return geo.Geometry{}, errors.Newf("gridSize must be 4D")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "gridSize must be 4D")
 	}
 	if g.Empty() {
 		return g, nil

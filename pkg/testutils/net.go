@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
@@ -205,9 +200,11 @@ func NewPartitionableConn(serverConn net.Conn) *PartitionableConn {
 					c.mu.c2sWaiter.Wait()
 				}
 			})
-		c.mu.Lock()
-		c.mu.err = err
-		c.mu.Unlock()
+		func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.mu.err = err
+		}()
 		if err := c.clientConn.Close(); err != nil {
 			log.Errorf(context.TODO(), "unexpected error closing internal pipe: %s", err)
 		}
@@ -227,9 +224,11 @@ func NewPartitionableConn(serverConn net.Conn) *PartitionableConn {
 					c.mu.s2cWaiter.Wait()
 				}
 			})
-		c.mu.Lock()
-		c.mu.err = err
-		c.mu.Unlock()
+		func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.mu.err = err
+		}()
 		if err := c.clientConn.Close(); err != nil {
 			log.Fatalf(context.TODO(), "unexpected error closing internal pipe: %s", err)
 		}
@@ -302,9 +301,11 @@ func (c *PartitionableConn) UnpartitionS2C() {
 
 // Read is part of the net.Conn interface.
 func (c *PartitionableConn) Read(b []byte) (n int, err error) {
-	c.mu.Lock()
-	err = c.mu.err
-	c.mu.Unlock()
+	err = func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.mu.err
+	}()
 	if err != nil {
 		return 0, err
 	}
@@ -315,9 +316,11 @@ func (c *PartitionableConn) Read(b []byte) (n int, err error) {
 
 // Write is part of the net.Conn interface.
 func (c *PartitionableConn) Write(b []byte) (n int, err error) {
-	c.mu.Lock()
-	err = c.mu.err
-	c.mu.Unlock()
+	err = func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.mu.err
+	}()
 	if err != nil {
 		return 0, err
 	}
@@ -367,10 +370,12 @@ func (c *PartitionableConn) copyFromBuffer(
 ) error {
 	for {
 		// Don't read from the buffer while we're partitioned.
-		src.Mutex.Lock()
-		waitForNoPartitionLocked()
-		data, err := src.readLocked(1024 * 1024)
-		src.Mutex.Unlock()
+		data, err := func() ([]byte, error) {
+			src.Mutex.Lock()
+			defer src.Mutex.Unlock()
+			waitForNoPartitionLocked()
+			return src.readLocked(1024 * 1024)
+		}()
 
 		if len(data) > 0 {
 			nw, ew := dst.Write(data)

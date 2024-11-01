@@ -7,13 +7,8 @@
 //
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -21,7 +16,6 @@ package stringencoding
 
 import (
 	"bytes"
-	"fmt"
 	"unicode/utf8"
 )
 
@@ -109,12 +103,27 @@ func EncodeEscapedChar(
 			// Escape non-printable characters.
 			buf.Write(HexMap[currentByte])
 		}
-	} else if ln == 2 {
-		// For multi-byte runes, print them based on their width.
-		fmt.Fprintf(buf, `\u%04X`, currentRune)
 	} else {
-		fmt.Fprintf(buf, `\U%08X`, currentRune)
+		writeMultibyteRuneAsHex(buf, currentRune, ln)
 	}
+}
+
+const uppercaseHex = `0123456789ABCDEF`
+
+// writeMultibyteRuneAsHex is equivalent to either
+// fmt.FPrintf(`\u%04X`) or fmt.FPrintf(`\U%08X`).
+// We can't quite just use strconv since we need uppercase hex.
+func writeMultibyteRuneAsHex(buf *bytes.Buffer, r rune, ln int) {
+	if ln == 2 {
+		buf.WriteString(`\u0000`)
+	} else {
+		buf.WriteString(`\U00000000`)
+	}
+	for i := 1; r > 0; r >>= 4 {
+		buf.Bytes()[buf.Len()-i] = uppercaseHex[r&0x0f]
+		i++
+	}
+
 }
 
 func writeHexDigit(buf *bytes.Buffer, v int) {

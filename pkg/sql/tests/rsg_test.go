@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -15,43 +10,47 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"regexp"
-	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	// Enable CCL statements.
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 var (
 	flagRSGTime                    = flag.Duration("rsg", 0, "random syntax generator test duration")
 	flagRSGGoRoutines              = flag.Int("rsg-routines", 1, "number of Go routines executing random statements in each RSG test")
-	flagRSGExecTimeout             = flag.Duration("rsg-exec-timeout", 15*time.Second, "timeout duration when executing a statement")
-	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 2*time.Minute, "timeout duration when executing a statement for random column changes")
+	flagRSGExecTimeout             = flag.Duration("rsg-exec-timeout", 35*time.Second, "timeout duration when executing a statement")
+	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 50*time.Second, "timeout duration when executing a statement for random column changes")
 )
 
 func verifyFormat(sql string) error {
@@ -81,21 +80,60 @@ type verifyFormatDB struct {
 		syncutil.Mutex
 		// active holds the currently executing statements.
 		active map[string]int
+		// lastStmtBuffer contains the last set of statements executed
+		// within a ring buffer.
+		lastStmtBuffer ring.Buffer[string]
+		// lastStatementsDumped indicates if the statements have already been
+		// dumped.
+		lastStatementsDumped bool
+		// lastCompletedStmt tracks the time when the last statement finished
+		// executing, which will be used for resettable timeouts.
+		lastCompletedStmt time.Time
 	}
+}
+
+// dumpLastStatements dumps out diagnostic information of currently active and the past 50 queries
+// that were executed.
+func (db *verifyFormatDB) dumpLastStatements(printFn func(format string, args ...any)) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// Only dump this information once inside the test.
+	if db.mu.lastStatementsDumped {
+		return
+	}
+	db.mu.lastStatementsDumped = true
+	for i := 0; i < db.mu.lastStmtBuffer.Len(); i++ {
+		// Assuming a fully populated buffer, start from the insertion
+		// point which will be the oldest statement (if the buffer is fully
+		// filled).
+		if len(db.mu.lastStmtBuffer.Get(i)) == 0 {
+			continue
+		}
+		printFn("Last executed (%d): %s", i, db.mu.lastStmtBuffer.Get(i))
+	}
+	// Next dump the set of active statements.
+	printFn("Currently active statements: %v", db.mu.active)
 }
 
 // Incr records sql in the active map and returns a func to decrement it.
 func (db *verifyFormatDB) Incr(sql string) func() {
 	db.mu.Lock()
+	const MaxStatementBufferSize = 50
 	if db.mu.active == nil {
 		db.mu.active = make(map[string]int)
+		db.mu.lastStmtBuffer = ring.MakeBuffer(make([]string, MaxStatementBufferSize))
 	}
+	if db.mu.lastStmtBuffer.Len() == MaxStatementBufferSize {
+		db.mu.lastStmtBuffer.RemoveFirst()
+	}
+	db.mu.lastStmtBuffer.AddLast(sql)
 	db.mu.active[sql]++
 	db.mu.Unlock()
 
 	return func() {
 		db.mu.Lock()
 		db.mu.active[sql]--
+		db.mu.lastCompletedStmt = timeutil.Now()
 		if db.mu.active[sql] == 0 {
 			delete(db.mu.active, sql)
 		}
@@ -127,6 +165,21 @@ func (db *verifyFormatDB) exec(t *testing.T, ctx context.Context, sql string) er
 func (db *verifyFormatDB) execWithTimeout(
 	t *testing.T, ctx context.Context, sql string, duration time.Duration,
 ) error {
+	return db.execWithResettableTimeout(t,
+		ctx,
+		sql,
+		duration,
+		0 /* no resets allowed */)
+}
+
+// execWithResettableTimeout executes a statement with a timeout, if the type of
+// timeout is resettable then the timeout will be reset everytime a query completes.
+// This specifically is used in cases where multiple things might be serially
+// executed, for example schema changes on the same table. maxResets can be used
+// to guarantee we don't endlessly extend the timeout.
+func (db *verifyFormatDB) execWithResettableTimeout(
+	t *testing.T, ctx context.Context, sql string, duration time.Duration, maxResets int,
+) error {
 	if err := func() (retErr error) {
 		defer func() {
 			if err := recover(); err != nil {
@@ -152,66 +205,109 @@ func (db *verifyFormatDB) execWithTimeout(
 		_, err := db.db.ExecContext(ctx, sql)
 		funcdone <- err
 	}()
-	select {
-	case err := <-funcdone:
-		if err != nil {
-			if pqerr := (*pq.Error)(nil); errors.As(err, &pqerr) {
-				// Output Postgres error code if it's available.
-				if pgcode.MakeCode(string(pqerr.Code)) == pgcode.CrashShutdown {
-					return &crasher{
-						sql:    sql,
-						err:    err,
-						detail: pqerr.Detail,
+	retry := true
+	targetDuration := duration
+	cancellationChannel := ctx.Done()
+	for retry {
+		retry = false
+		err := func() error {
+			select {
+			case err := <-funcdone:
+				if err != nil {
+					if pqerr := (*pq.Error)(nil); errors.As(err, &pqerr) {
+						// Output Postgres error code if it's available.
+						if pgcode.MakeCode(string(pqerr.Code)) == pgcode.CrashShutdown {
+							return &crasher{
+								sql:    sql,
+								err:    err,
+								detail: pqerr.Detail,
+							}
+						}
+					}
+					if es := err.Error(); strings.Contains(es, "internal error") ||
+						strings.Contains(es, "driver: bad connection") ||
+						strings.Contains(es, "unexpected error inside CockroachDB") {
+						return &crasher{
+							sql: sql,
+							err: err,
+						}
+					}
+					return &nonCrasher{sql: sql, err: err}
+				}
+				return nil
+			case <-cancellationChannel:
+				// Sanity: The context is cancelled when the test is about to
+				// timeout. We will log whatever statement we're waiting on for
+				// debugging purposes. Sometimes queries won't respect
+				// cancellation due to lib/pq limitations.
+				t.Logf("Context cancelled while executing: %q", sql)
+				// We will intentionally retry, which will us to wait for the
+				// go routine to complete above to avoid leaking it.
+				retry = true
+				cancellationChannel = nil
+				return nil
+			case <-time.After(targetDuration):
+				db.mu.Lock()
+				defer db.mu.Unlock()
+				// In the resettable mode, we are going to wait for no progress on any
+				// queries before declaring this a hang.
+				if maxResets > 0 {
+					if db.mu.lastCompletedStmt.Add(duration).After(timeutil.Now()) {
+						// Recompute the timeout duration based, so that the timeout is
+						// N seconds after the last queries completion. This is done to
+						// the timeouts between queries more reasonable for long intervals:
+						// (1) => Executes work in 1 second (setting the last completed query)
+						// (2) => Times out after 2 minutes
+						// If we simply wait the duration for (2) then we will incur another
+						// 2 minute wait and miss potential hangs (if the test times out first).
+						// Whereas this approach will wait 2 minutes after the completion of
+						// (1), only waiting an extra second more.
+						targetDuration = duration - db.mu.lastCompletedStmt.Add(duration).Sub(timeutil.Now())
+						// Avoid having super tight spins, wait at least a second.
+						if targetDuration <= time.Second {
+							targetDuration = time.Second
+						}
+						retry = true
+						maxResets -= 1
+						return nil
 					}
 				}
-			}
-			// TODO(yuzefovich): allow "no volatility for cast tuple" errors to
-			// fail once #70831 is resolved.
-			if es := err.Error(); (strings.Contains(es, "internal error") && !strings.Contains(es, "no volatility for cast tuple")) ||
-				strings.Contains(es, "driver: bad connection") ||
-				strings.Contains(es, "unexpected error inside CockroachDB") {
+				b := allstacks.GetWithBuf(make([]byte, 1024*1024))
+				t.Logf("%s\n", b)
+				// Now see if we can execute a SELECT 1. This is useful because sometimes an
+				// exec timeout is because of a slow-executing statement, and other times
+				// it's because the server is completely wedged. This is an automated way
+				// to find out.
+				errch := make(chan error, 1)
+				go func() {
+					rows, err := db.db.Query(`SELECT 1`)
+					if err == nil {
+						rows.Close()
+					}
+					errch <- err
+				}()
+				select {
+				case <-time.After(5 * time.Second):
+					t.Log("SELECT 1 timeout: probably a wedged server")
+				case err := <-errch:
+					if err != nil {
+						t.Log("SELECT 1 execute error:", err)
+					} else {
+						t.Log("SELECT 1 executed successfully: probably a slow statement")
+					}
+				}
 				return &crasher{
-					sql: sql,
-					err: err,
+					sql:    sql,
+					err:    errors.Newf("statement exec timeout"),
+					detail: fmt.Sprintf("timeout: %q. currently executing: %v", sql, db.mu.active),
 				}
 			}
-			return &nonCrasher{sql: sql, err: err}
-		}
-		return nil
-	case <-time.After(duration):
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		b := make([]byte, 1024*1024)
-		n := runtime.Stack(b, true)
-		t.Logf("%s\n", b[:n])
-		// Now see if we can execute a SELECT 1. This is useful because sometimes an
-		// exec timeout is because of a slow-executing statement, and other times
-		// it's because the server is completely wedged. This is an automated way
-		// to find out.
-		errch := make(chan error, 1)
-		go func() {
-			rows, err := db.db.Query(`SELECT 1`)
-			if err == nil {
-				rows.Close()
-			}
-			errch <- err
 		}()
-		select {
-		case <-time.After(5 * time.Second):
-			t.Log("SELECT 1 timeout: probably a wedged server")
-		case err := <-errch:
-			if err != nil {
-				t.Log("SELECT 1 execute error:", err)
-			} else {
-				t.Log("SELECT 1 executed successfully: probably a slow statement")
-			}
-		}
-		return &crasher{
-			sql:    sql,
-			err:    errors.Newf("statement exec timeout"),
-			detail: fmt.Sprintf("timeout: %q. currently executing: %v", sql, db.mu.active),
+		if err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func TestRandomSyntaxGeneration(t *testing.T) {
@@ -233,6 +329,9 @@ func TestRandomSyntaxGeneration(t *testing.T) {
 		if strings.HasPrefix(s, "SET SESSION CHARACTERISTICS AS TRANSACTION") {
 			return errors.New("setting session characteristics is unsupported")
 		}
+		if strings.HasPrefix(s, "DROP DATABASE") {
+			return errors.New("dropping the database is likely to timeout since it needs to drop a lot of dependent objects")
+		}
 		if strings.Contains(s, "READ ONLY") || strings.Contains(s, "read_only") {
 			return errors.New("READ ONLY settings are unsupported")
 		}
@@ -242,7 +341,7 @@ func TestRandomSyntaxGeneration(t *testing.T) {
 		if strings.Contains(s, "EXPERIMENTAL SCRUB DATABASE SYSTEM") {
 			return errors.New("See #43693")
 		}
-		// Recreate the database on every run in case it was dropped or renamed in
+		// Recreate the database on every run in case it was renamed in
 		// a previous run. Should always succeed.
 		if err := db.exec(t, ctx, `CREATE DATABASE IF NOT EXISTS ident`); err != nil {
 			return err
@@ -288,7 +387,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 	namedBuiltinChan := make(chan namedBuiltin)
 	go func() {
 		for {
-			for _, name := range builtins.AllBuiltinNames {
+			for _, name := range builtins.AllBuiltinNames() {
 				lower := strings.ToLower(name)
 				if strings.HasPrefix(lower, "crdb_internal.force_") {
 					continue
@@ -296,15 +395,28 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 				switch lower {
 				case "pg_sleep":
 					continue
-				case "st_frechetdistance":
-					// Calculating the Frechet distance is slow and testing it here
+				case "crdb_internal.create_sql_schema_telemetry_job":
+					// We can create a crazy number of telemtry jobs accidentally,
+					// within the test. Leading to terrible contention.
+					continue
+				case "crdb_internal.gen_rand_ident":
+					// Generates random identifiers, so a large number are dangerous and
+					// can take a long time.
+					continue
+				case "st_frechetdistance", "st_buffer":
+					// Some spatial function are slow and testing them here
 					// is not worth it.
 					continue
-				case "crdb_internal.reset_sql_stats", "crdb_internal.check_consistency":
+				case "crdb_internal.reset_sql_stats",
+					"crdb_internal.check_consistency",
+					"crdb_internal.request_statement_bundle",
+					"crdb_internal.reset_activity_tables",
+					"crdb_internal.revalidate_unique_constraints_in_all_tables",
+					"crdb_internal.validate_ttl_scheduled_jobs":
 					// Skipped due to long execution time.
 					continue
 				}
-				_, variations := builtins.GetBuiltinProperties(name)
+				_, variations := builtinsregistry.GetBuiltinProperties(name)
 				for _, builtin := range variations {
 					select {
 					case <-done:
@@ -320,7 +432,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		nb := <-namedBuiltinChan
 		var args []string
 		switch ft := nb.builtin.Types.(type) {
-		case tree.ArgTypes:
+		case tree.ParamTypes:
 			for _, arg := range ft {
 				// CollatedString's default has no Locale, and so GenerateRandomArg will panic
 				// on RandDatumWithNilChance. Copy the typ and fake a locale.
@@ -362,7 +474,11 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 			limit = " LIMIT 100"
 		}
 		s := fmt.Sprintf("SELECT %s(%s) %s", nb.name, strings.Join(args, ", "), limit)
-		return db.exec(t, ctx, s)
+		// Use a re-settable timeout since in concurrent scenario some operations may
+		// involve schema changes like truncates. In general this should make
+		// this test more resilient as the timeouts are reset as long progress
+		// is made on *some* connection.
+		return db.execWithResettableTimeout(t, ctx, s, *flagRSGExecTimeout, *flagRSGGoRoutines)
 	})
 }
 
@@ -391,15 +507,30 @@ func TestRandomSyntaxSchemaChangeDatabase(t *testing.T) {
 		"drop_user_stmt",
 		"alter_user_stmt",
 	}
-
+	// Create multiple databases, so that in concurrent scenarios two connections
+	// will always share the same database.
+	numDatabases := max(*flagRSGGoRoutines/2, 1)
+	databases := make([]string, 0, numDatabases)
+	for dbIdx := 0; dbIdx < numDatabases; dbIdx++ {
+		databases = append(databases, fmt.Sprintf("ident_%d", dbIdx))
+	}
+	var nextDatabaseName atomic.Int64
 	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		return db.exec(t, ctx, `
-			CREATE DATABASE ident;
-		`)
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
+		for _, dbName := range databases {
+			if err := db.exec(t, ctx, fmt.Sprintf(`CREATE DATABASE %s;`, dbName)); err != nil {
+				return err
+			}
+		}
+		return nil
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		n := r.Intn(len(roots))
 		s := r.Generate(roots[n], 30)
-		return db.exec(t, ctx, s)
+		// Select a database and use it in the generated statement.
+		dbName := databases[nextDatabaseName.Add(1)%int64(len(databases))]
+		return db.exec(t, ctx, strings.Replace(s, "ident", dbName, -1))
 	})
 }
 
@@ -407,19 +538,48 @@ func TestRandomSyntaxSchemaChangeColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	numTables := *flagRSGGoRoutines
 	roots := []string{
 		"alter_table_cmd",
 	}
 
+	// The goroutines will use round-robin to pick the next table to modify.
+	tableIDMu := syncutil.Mutex{}
+	tableID := 0
+	incrementTableID := func() int {
+		tableIDMu.Lock()
+		defer tableIDMu.Unlock()
+		tableID++
+		if tableID >= numTables {
+			tableID = 0
+		}
+		return tableID
+	}
+
 	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		return db.exec(t, ctx, `
-			CREATE DATABASE ident;
-			CREATE TABLE ident.ident (ident decimal);
-		`)
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
+		if err := db.exec(t, ctx, `CREATE DATABASE ident;`); err != nil {
+			return err
+		}
+		for i := 0; i < numTables; i++ {
+			if err := db.exec(t, ctx, fmt.Sprintf(`CREATE TABLE ident.ident%d (ident decimal);`, i)); err != nil {
+				return err
+			}
+		}
+		return nil
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		n := r.Intn(len(roots))
-		s := fmt.Sprintf("ALTER TABLE ident.ident %s", r.Generate(roots[n], 500))
-		return db.execWithTimeout(t, ctx, s, *flagRSGExecColumnChangeTimeout)
+		s := fmt.Sprintf("ALTER TABLE ident.ident%d %s", incrementTableID(), r.Generate(roots[n], 500))
+		// Execute with a resettable timeout, where we allow up to N go-routines worth
+		// of resets. This should be the maximum theoretical time we can get
+		// stuck behind other work.
+		return db.execWithResettableTimeout(t,
+			ctx,
+			s,
+			*flagRSGExecColumnChangeTimeout,
+			*flagRSGGoRoutines)
 	})
 }
 
@@ -428,7 +588,7 @@ var ignoredErrorPatterns = []string{
 	"unsupported binary operator",
 	"unsupported comparison operator",
 	"memory budget exceeded",
-	"generator functions are not allowed in",
+	"set-returning functions are not allowed in",
 	"txn already encountered an error; cannot be used anymore",
 	"no data source matches prefix",
 	"index .* already contains column",
@@ -445,7 +605,6 @@ var ignoredErrorPatterns = []string{
 	"index .* in the middle of being added",
 	"could not mark job .* as succeeded",
 	"failed to read backup descriptor",
-	"AS OF SYSTEM TIME: cannot specify timestamp in the future",
 	"AS OF SYSTEM TIME: timestamp before 1970-01-01T00:00:00Z is invalid",
 	"BACKUP for requested time  needs option 'revision_history'",
 	"RESTORE timestamp: supplied backups do not cover requested time",
@@ -504,7 +663,6 @@ var ignoredErrorPatterns = []string{
 	"cannot call json_object_keys on an array",
 	"cannot set path in scalar",
 	"cannot delete path in scalar",
-	"unable to encode table key: \\*tree\\.DJSON",
 	"path element at position .* is null",
 	"path element is not an integer",
 	"cannot delete from object using integer index",
@@ -543,6 +701,7 @@ var ignoredErrorPatterns = []string{
 	// TODO(mjibson): fix these
 	"column .* must appear in the GROUP BY clause or be used in an aggregate function",
 	"aggregate functions are not allowed in ON",
+	"ordered-set aggregations must have a WITHIN GROUP clause containing one ORDER BY column",
 }
 
 var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
@@ -550,20 +709,26 @@ var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
 func TestRandomSyntaxSQLSmith(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()() // allow usage of partitions
 
 	var smither *sqlsmith.Smither
 
 	tableStmts := make([]string, 0)
 	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
 		setups := []string{sqlsmith.RandTableSetupName, "seed"}
 		for _, s := range setups {
 			randTables := sqlsmith.Setups[s](r.Rnd)
-			if err := db.exec(t, ctx, randTables); err != nil {
-				return err
+			for _, stmt := range randTables {
+				if err := db.exec(t, ctx, stmt); err != nil {
+					return err
+				}
+				tableStmts = append(tableStmts, stmt)
+				t.Logf("%s;", stmt)
 			}
-			tableStmts = append(tableStmts, randTables)
-			t.Logf("%s;", randTables)
+
 		}
 		var err error
 		smither, err = sqlsmith.NewSmither(db.db, r.Rnd, sqlsmith.DisableMutations())
@@ -606,7 +771,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	eval := tree.MakeTestingEvalContext(nil)
+	ec := eval.MakeTestingEvalContext(nil)
 
 	var smither *sqlsmith.Smither
 	testRandomSyntax(t, true, "", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
@@ -643,7 +808,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		}
 		serializedGen := tree.Serialize(generated)
 
-		sema := tree.MakeSemaContext()
+		sema := tree.MakeSemaContext(nil /* resolver */)
 		// We don't care about errors below because they are often
 		// caused by sqlsmith generating bogus queries. We're just
 		// looking for datums that don't match.
@@ -655,7 +820,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum1, err := typed1.Eval(&eval)
+		datum1, err := eval.Expr(ctx, &ec, typed1)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -669,7 +834,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		datum2, err := typed2.Eval(&eval)
+		datum2, err := eval.Expr(ctx, &ec, typed2)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -678,7 +843,9 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if serialized1 != serialized2 {
 			panic(errors.Errorf("serialized didn't match:\nexpr: %s\nfirst: %s\nsecond: %s", generated, serialized1, serialized2))
 		}
-		if datum1.Compare(&eval, datum2) != 0 {
+		if cmp, err := datum1.Compare(ctx, &ec, datum2); err != nil {
+			panic(err)
+		} else if cmp != 0 {
 			panic(errors.Errorf("%s [%[1]T] != %s [%[2]T] (original expr: %s)", serialized1, serialized2, serializedGen))
 		}
 		return nil
@@ -701,23 +868,37 @@ func testRandomSyntax(
 		skip.IgnoreLint(t, "enable with '-rsg <duration>'")
 	}
 	ctx := context.Background()
-	defer utilccl.TestingEnableEnterprise()()
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.UseDatabase = databaseName
 	// Catch panics and return them as errors.
 	params.Knobs.PGWireTestingKnobs = &sql.PGWireTestingKnobs{
 		CatchPanics: true,
 	}
-	s, rawDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, rawDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
 	db := &verifyFormatDB{db: rawDB}
+	// If the test fails we can log the previous set of statements.
+	defer func() {
+		if t.Failed() {
+			db.dumpLastStatements(t.Logf)
+		}
+	}()
+	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
+	require.NoError(t, err)
 
-	yBytes, err := ioutil.ReadFile(testutils.TestDataPath(t, "rsg", "sql.y"))
+	// Disable the test object generator. This merely causes the built-in function to report
+	// an error when called. This is OK -- we are testing syntax, so this will still ensure
+	// the function syntax is exercised.
+	err = db.exec(t, ctx, "SET CLUSTER SETTING sql.schema.test_object_generator.enabled = false")
+	require.NoError(t, err)
+
+	yBytes, err := os.ReadFile(datapathutils.TestDataPath(t, "rsg", "sql.y"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := rsg.NewRSG(timeutil.Now().UnixNano(), string(yBytes), allowDuplicates)
+	_, seed := randutil.NewTestRand()
+	r, err := rsg.NewRSG(seed, string(yBytes), allowDuplicates)
 	if err != nil {
 		t.Fatal(err)
 	}

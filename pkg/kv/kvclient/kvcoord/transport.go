@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -17,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -26,7 +22,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-//go:generate mockgen -package=kvcoord -destination=mocks_generated.go . Transport
+//go:generate mockgen -package=kvcoord -destination=mocks_generated_test.go . Transport
 
 // A SendOptions structure describes the algorithm for sending RPCs to one or
 // more replicas, depending on error conditions and how many successful
@@ -48,9 +44,7 @@ type SendOptions struct {
 //
 // The caller is responsible for ordering the replicas in the slice according to
 // the order in which the should be tried.
-type TransportFactory func(
-	SendOptions, *nodedialer.Dialer, ReplicaSlice,
-) (Transport, error)
+type TransportFactory func(SendOptions, ReplicaSlice) Transport
 
 // Transport objects can send RPCs to one or more replicas of a range.
 // All calls to Transport methods are made from a single thread, so
@@ -64,13 +58,11 @@ type Transport interface {
 	//
 	// SendNext is also in charge of importing the remotely collected spans (if
 	// any) into the local trace.
-	SendNext(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, error)
+	SendNext(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, error)
 
 	// NextInternalClient returns the InternalClient to use for making RPC
-	// calls. Returns a context.Context which should be used when making RPC
-	// calls on the returned server (This context is annotated to mark this
-	// request as in-process and bypass ctx.Peer checks).
-	NextInternalClient(context.Context) (context.Context, roachpb.InternalClient, error)
+	// calls.
+	NextInternalClient(context.Context) (rpc.RestrictedInternalClient, error)
 
 	// NextReplica returns the replica descriptor of the replica to be tried in
 	// the next call to SendNext. MoveToFront will cause the return value to
@@ -83,9 +75,15 @@ type Transport interface {
 
 	// MoveToFront locates the specified replica and moves it to the
 	// front of the ordering of replicas to try. If the replica has
-	// already been tried, it will be retried. If the specified replica
-	// can't be found, this is a noop.
-	MoveToFront(roachpb.ReplicaDescriptor)
+	// already been tried, it will be retried. Returns false if the specified
+	// replica can't be found and thus can't be moved to the front of the
+	// transport.
+	MoveToFront(roachpb.ReplicaDescriptor) bool
+
+	// Reset moves back to the first replica in the transport, according to the
+	// current ordering. This may not be the same replica as MoveToFront if it was
+	// called prior, which places the replica at the next rather than first index.
+	Reset()
 
 	// Release releases any resources held by this Transport.
 	Release()
@@ -104,7 +102,7 @@ const (
 // requests in a tight loop, exposing data races; see transport_race.go.
 func grpcTransportFactoryImpl(
 	opts SendOptions, nodeDialer *nodedialer.Dialer, rs ReplicaSlice,
-) (Transport, error) {
+) Transport {
 	transport := grpcTransportPool.Get().(*grpcTransport)
 	// Grab the saved slice memory from grpcTransport.
 	replicas := transport.replicas
@@ -117,7 +115,8 @@ func grpcTransportFactoryImpl(
 
 	// We'll map the index of the replica descriptor in its slice to its health.
 	var health util.FastIntMap
-	for i, r := range rs {
+	for i := range rs {
+		r := &rs[i]
 		replicas[i] = r.ReplicaDescriptor
 		healthy := nodeDialer.ConnHealth(r.NodeID, opts.class) == nil
 		if healthy {
@@ -127,19 +126,21 @@ func grpcTransportFactoryImpl(
 		}
 	}
 
-	if !opts.dontConsiderConnHealth {
-		// Put known-healthy clients first, while otherwise respecting the existing
-		// ordering of the replicas.
-		splitHealthy(replicas, health)
+	*transport = grpcTransport{
+		opts:          opts,
+		nodeDialer:    nodeDialer,
+		class:         opts.class,
+		replicas:      replicas,
+		replicaHealth: health,
 	}
 
-	*transport = grpcTransport{
-		opts:       opts,
-		nodeDialer: nodeDialer,
-		class:      opts.class,
-		replicas:   replicas,
+	if !opts.dontConsiderConnHealth {
+		// Put known-healthy replica first, while otherwise respecting the existing
+		// ordering of the replicas.
+		transport.splitHealthy()
 	}
-	return transport, nil
+
+	return transport
 }
 
 type grpcTransport struct {
@@ -148,6 +149,9 @@ type grpcTransport struct {
 	class      rpc.ConnectionClass
 
 	replicas []roachpb.ReplicaDescriptor
+	// replicaHealth maps replica index within the replicas slice to healthHealthy
+	// if healthy, and healthUnhealthy if unhealthy. Used by splitHealthy.
+	replicaHealth util.FastIntMap
 	// nextReplicaIdx represents the index into replicas of the next replica to be
 	// tried.
 	nextReplicaIdx int
@@ -173,22 +177,23 @@ func (gt *grpcTransport) IsExhausted() bool {
 // client is ready. On success, the reply is sent on the channel;
 // otherwise an error is sent.
 func (gt *grpcTransport) SendNext(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	r := gt.replicas[gt.nextReplicaIdx]
-	ctx, iface, err := gt.NextInternalClient(ctx)
+	iface, err := gt.NextInternalClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	ba.Replica = r
 	return gt.sendBatch(ctx, r.NodeID, iface, ba)
 }
 
 // NB: nodeID is unused, but accessible in stack traces.
 func (gt *grpcTransport) sendBatch(
-	ctx context.Context, nodeID roachpb.NodeID, iface roachpb.InternalClient, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context,
+	nodeID roachpb.NodeID,
+	iface rpc.RestrictedInternalClient,
+	ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	// Bail out early if the context is already canceled. (GRPC will
 	// detect this pretty quickly, but the first check of the context
 	// in the local server comes pretty late)
@@ -200,33 +205,51 @@ func (gt *grpcTransport) sendBatch(
 	if rpc.IsLocal(iface) {
 		gt.opts.metrics.LocalSentCount.Inc(1)
 	}
-	reply, err := iface.Batch(ctx, &ba)
-	// If we queried a remote node, perform extra validation and
-	// import trace spans.
+	log.VEvent(ctx, 2, "sending batch request")
+	reply, err := iface.Batch(ctx, ba)
+	log.VEvent(ctx, 2, "received batch response")
+	// If we queried a remote node, perform extra validation.
 	if reply != nil && !rpc.IsLocal(iface) {
-		for i := range reply.Responses {
-			if err := reply.Responses[i].GetInner().Verify(ba.Requests[i].GetInner()); err != nil {
-				log.Errorf(ctx, "%v", err)
+		if err == nil {
+			for i := range reply.Responses {
+				err = reply.Responses[i].GetInner().Verify(ba.Requests[i].GetInner())
+				if err != nil {
+					log.Errorf(ctx, "verification of response for %s failed: %v", ba.Requests[i].GetInner(), err)
+					break
+				}
 			}
-		}
-		// Import the remotely collected spans, if any.
-		if len(reply.CollectedSpans) != 0 {
-			span := tracing.SpanFromContext(ctx)
-			if span == nil {
-				return nil, errors.Errorf(
-					"trying to ingest remote spans but there is no recording span set up")
-			}
-			span.ImportRemoteSpans(reply.CollectedSpans)
 		}
 	}
-	return reply, err
+
+	// Import the remotely collected spans, if any. Do this on error too, to get
+	// traces in that case as well (or to at least have a chance).
+	//
+	// Note that the server fills in reply.CollectedSpans only on non-local
+	// requests - see setupSpanForIncomingRPC. For local RPCs, the Tracer is
+	// shared between the client and the server, and the server span is a child of
+	// the server span.
+	if reply != nil && len(reply.CollectedSpans) != 0 {
+		span := tracing.SpanFromContext(ctx)
+		if span == nil {
+			return nil, errors.Errorf(
+				"trying to ingest remote spans but there is no recording span set up")
+		}
+		span.ImportRemoteRecording(reply.CollectedSpans)
+		// The field is cleared by the sender because if the spans are re-imported
+		// by accident, duplicate spans may occur.
+		reply.CollectedSpans = nil
+	}
+	if err != nil {
+		return nil, errors.Wrapf(err, "ba: %s RPC error", ba.String())
+	}
+	return reply, nil
 }
 
 // NextInternalClient returns the next InternalClient to use for performing
 // RPCs.
 func (gt *grpcTransport) NextInternalClient(
 	ctx context.Context,
-) (context.Context, roachpb.InternalClient, error) {
+) (rpc.RestrictedInternalClient, error) {
 	r := gt.replicas[gt.nextReplicaIdx]
 	gt.nextReplicaIdx++
 	return gt.nodeDialer.DialInternalClient(ctx, r.NodeID, gt.class)
@@ -247,9 +270,9 @@ func (gt *grpcTransport) SkipReplica() {
 	gt.nextReplicaIdx++
 }
 
-func (gt *grpcTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
+func (gt *grpcTransport) MoveToFront(replica roachpb.ReplicaDescriptor) bool {
 	for i := range gt.replicas {
-		if gt.replicas[i] == replica {
+		if gt.replicas[i].IsSame(replica) {
 			// If we've already processed the replica, decrement the current
 			// index before we swap.
 			if i < gt.nextReplicaIdx {
@@ -257,43 +280,40 @@ func (gt *grpcTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
 			}
 			// Swap the client representing this replica to the front.
 			gt.replicas[i], gt.replicas[gt.nextReplicaIdx] = gt.replicas[gt.nextReplicaIdx], gt.replicas[i]
-			return
+			return true
 		}
 	}
+	return false
 }
 
-// splitHealthy splits the provided client slice into healthy clients and
-// unhealthy clients, based on their connection state. Healthy clients will
-// be rearranged first in the slice, and unhealthy clients will be rearranged
-// last. Within these two groups, the rearrangement will be stable. The function
-// will then return the number of healthy clients.
-// The input FastIntMap maps index within the input replicas slice to an integer
-// healthHealthy or healthUnhealthy.
-func splitHealthy(replicas []roachpb.ReplicaDescriptor, health util.FastIntMap) {
-	sort.Stable(&byHealth{replicas: replicas, health: health})
+func (gt *grpcTransport) Reset() {
+	gt.nextReplicaIdx = 0
 }
 
-// byHealth sorts a slice of batchClients by their health with healthy first.
-type byHealth struct {
-	replicas []roachpb.ReplicaDescriptor
-	// This map maps replica index within the replicas slice to healthHealthy if
-	// healthy, and healthUnhealthy if unhealthy.
-	health util.FastIntMap
+// splitHealthy splits the grpcTransport's replica slice into healthy replica
+// and unhealthy replica, based on their connection state. Healthy replicas will
+// be rearranged first in the replicas slice, and unhealthy replicas will be
+// rearranged last. Within these two groups, the rearrangement will be stable.
+func (gt *grpcTransport) splitHealthy() {
+	sort.Stable((*byHealth)(gt))
 }
+
+// byHealth sorts a slice of replicas by their health with healthy first.
+type byHealth grpcTransport
 
 func (h *byHealth) Len() int { return len(h.replicas) }
 func (h *byHealth) Swap(i, j int) {
 	h.replicas[i], h.replicas[j] = h.replicas[j], h.replicas[i]
-	oldI := h.health.GetDefault(i)
-	h.health.Set(i, h.health.GetDefault(j))
-	h.health.Set(j, oldI)
+	oldI := h.replicaHealth.GetDefault(i)
+	h.replicaHealth.Set(i, h.replicaHealth.GetDefault(j))
+	h.replicaHealth.Set(j, oldI)
 }
 func (h *byHealth) Less(i, j int) bool {
-	ih, ok := h.health.Get(i)
+	ih, ok := h.replicaHealth.Get(i)
 	if !ok {
 		panic(fmt.Sprintf("missing health info for %s", h.replicas[i]))
 	}
-	jh, ok := h.health.Get(j)
+	jh, ok := h.replicaHealth.Get(j)
 	if !ok {
 		panic(fmt.Sprintf("missing health info for %s", h.replicas[j]))
 	}
@@ -304,12 +324,10 @@ func (h *byHealth) Less(i, j int) bool {
 // Transport. This is useful for tests that want to use DistSender
 // without a full RPC stack.
 func SenderTransportFactory(tracer *tracing.Tracer, sender kv.Sender) TransportFactory {
-	return func(
-		_ SendOptions, _ *nodedialer.Dialer, replicas ReplicaSlice,
-	) (Transport, error) {
+	return func(_ SendOptions, replicas ReplicaSlice) Transport {
 		// Always send to the first replica.
 		replica := replicas[0].ReplicaDescriptor
-		return &senderTransport{tracer, sender, replica, false}, nil
+		return &senderTransport{tracer, sender, replica, false}
 	}
 }
 
@@ -327,21 +345,22 @@ func (s *senderTransport) IsExhausted() bool {
 }
 
 func (s *senderTransport) SendNext(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	if s.called {
 		panic("called an exhausted transport")
 	}
 	s.called = true
 
+	ba = ba.ShallowCopy()
 	ba.Replica = s.replica
 	log.Eventf(ctx, "%v", ba.String())
 	br, pErr := s.sender.Send(ctx, ba)
 	if br == nil {
-		br = &roachpb.BatchResponse{}
+		br = &kvpb.BatchResponse{}
 	}
 	if br.Error != nil {
-		panic(roachpb.ErrorUnexpectedlySet(s.sender, br))
+		panic(kvpb.ErrorUnexpectedlySet(s.sender, br))
 	}
 	br.Error = pErr
 	if pErr != nil {
@@ -354,7 +373,10 @@ func (s *senderTransport) SendNext(
 		if span == nil {
 			panic("trying to ingest remote spans but there is no recording span set up")
 		}
-		span.ImportRemoteSpans(br.CollectedSpans)
+		span.ImportRemoteRecording(br.CollectedSpans)
+		// The field is cleared by the sender because if the spans are re-imported
+		// by accident, duplicate spans may occur.
+		br.CollectedSpans = nil
 	}
 
 	return br, nil
@@ -362,7 +384,7 @@ func (s *senderTransport) SendNext(
 
 func (s *senderTransport) NextInternalClient(
 	ctx context.Context,
-) (context.Context, roachpb.InternalClient, error) {
+) (rpc.RestrictedInternalClient, error) {
 	panic("unimplemented")
 }
 
@@ -378,7 +400,10 @@ func (s *senderTransport) SkipReplica() {
 	s.called = true
 }
 
-func (s *senderTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
+func (s *senderTransport) MoveToFront(replica roachpb.ReplicaDescriptor) bool {
+	return true
 }
+
+func (s *senderTransport) Reset() {}
 
 func (s *senderTransport) Release() {}

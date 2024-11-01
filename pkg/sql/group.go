@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,6 +9,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -27,7 +23,7 @@ type groupNode struct {
 	plan planNode
 
 	// Indices of the group by columns in the source plan.
-	groupCols []int
+	groupCols []exec.NodeColumnOrdinal
 
 	// Set when we have an input ordering on (a subset of) grouping columns. Only
 	// column indices in groupCols can appear in this ordering.
@@ -41,6 +37,10 @@ type groupNode struct {
 	funcs []*aggregateFuncHolder
 
 	reqOrdering ReqOrdering
+
+	// estimatedRowCount, when set, is the estimated number of rows that this
+	// groupNode will output.
+	estimatedRowCount uint64
 }
 
 func (n *groupNode) startExec(params runParams) error {
@@ -64,7 +64,7 @@ type aggregateFuncHolder struct {
 	funcName string
 	// The argument of the function is a single value produced by the renderNode
 	// underneath. If the function has no argument (COUNT_ROWS), it is empty.
-	argRenderIdxs []int
+	argRenderIdxs []exec.NodeColumnOrdinal
 	// If there is a filter, the result is a single value produced by the
 	// renderNode underneath. If there is no filter, it is set to
 	// tree.NoColumnIdx.
@@ -74,6 +74,9 @@ type aggregateFuncHolder struct {
 	arguments tree.Datums
 	// isDistinct indicates whether only distinct values are aggregated.
 	isDistinct bool
+	// distsqlBlocklist is set when this function cannot be evaluated in
+	// distributed fashion.
+	distsqlBlocklist bool
 }
 
 // newAggregateFuncHolder creates an aggregateFuncHolder.
@@ -84,14 +87,19 @@ type aggregateFuncHolder struct {
 // If the aggregation function takes no arguments (e.g. COUNT_ROWS),
 // argRenderIdx is noRenderIdx.
 func newAggregateFuncHolder(
-	funcName string, argRenderIdxs []int, arguments tree.Datums, isDistinct bool,
+	funcName string,
+	argRenderIdxs []exec.NodeColumnOrdinal,
+	arguments tree.Datums,
+	isDistinct bool,
+	distsqlBlocklist bool,
 ) *aggregateFuncHolder {
 	res := &aggregateFuncHolder{
-		funcName:        funcName,
-		argRenderIdxs:   argRenderIdxs,
-		filterRenderIdx: tree.NoColumnIdx,
-		arguments:       arguments,
-		isDistinct:      isDistinct,
+		funcName:         funcName,
+		argRenderIdxs:    argRenderIdxs,
+		filterRenderIdx:  tree.NoColumnIdx,
+		arguments:        arguments,
+		isDistinct:       isDistinct,
+		distsqlBlocklist: distsqlBlocklist,
 	}
 	return res
 }

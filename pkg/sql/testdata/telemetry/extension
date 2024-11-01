@@ -1,4 +1,4 @@
-feature-allowlist
+feature-list
 sql.extension.*
 unimplemented.*
 ----
@@ -17,8 +17,7 @@ unimplemented.#54514.CREATE EXTENSION postgis_raster
 feature-usage
 CREATE EXTENSION pg_trgm
 ----
-error: pq: unimplemented: extension "pg_trgm" is not yet supported
-unimplemented.#51137.CREATE EXTENSION pg_trgm
+sql.extension.create.pg_trgm
 
 feature-usage
 CREATE EXTENSION xml2
@@ -29,4 +28,4 @@ unimplemented.#54516.CREATE EXTENSION xml2
 feature-usage
 CREATE EXTENSION asdf
 ----
-error: pq: unknown extension: "asdf"
+error: pq: unknown extension: asdf

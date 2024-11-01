@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpcc
 
@@ -15,14 +10,12 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgx"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/lib/pq"
 	"golang.org/x/exp/rand"
 )
@@ -123,15 +116,15 @@ func createNewOrder(
 		VALUES ($1, $2, $3)`,
 	)
 
-	if err := n.sr.Init(ctx, "new-order", mcp, config.connFlags); err != nil {
+	if err := n.sr.Init(ctx, "new-order", mcp); err != nil {
 		return nil, err
 	}
 
 	return n, nil
 }
 
-func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
-	atomic.AddUint64(&n.config.auditor.newOrderTransactions, 1)
+func (n *newOrder) run(ctx context.Context, wID int) (interface{}, time.Duration, error) {
+	n.config.auditor.newOrderTransactions.Add(1)
 
 	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
@@ -146,7 +139,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 	n.config.auditor.Lock()
 	n.config.auditor.orderLinesFreq[d.oOlCnt]++
 	n.config.auditor.Unlock()
-	atomic.AddUint64(&n.config.auditor.totalOrderLines, uint64(d.oOlCnt))
+	n.config.auditor.totalOrderLines.Add(uint64(d.oOlCnt))
 
 	// itemIDs tracks the item ids in the order so that we can prevent adding
 	// multiple items with the same ID. This would not make sense because each
@@ -212,15 +205,15 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 
 	d.oEntryD = timeutil.Now()
 
-	err := crdbpgx.ExecuteTx(
-		ctx, n.mcp.Get(), n.config.txOpts,
+	onTxnStartDuration, err := n.config.executeTx(
+		ctx, n.mcp.Get(),
 		func(tx pgx.Tx) error {
 			// Select the district tax rate and next available order number, bumping it.
 			var dNextOID int
 			if err := n.updateDistrict.QueryRowTx(
 				ctx, tx, d.wID, d.dID,
 			).Scan(&d.dTax, &dNextOID); err != nil {
-				return err
+				return errors.Wrap(err, "update district failed")
 			}
 			d.oID = dNextOID - 1
 
@@ -228,14 +221,14 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 			if err := n.selectWarehouseTax.QueryRowTx(
 				ctx, tx, wID,
 			).Scan(&d.wTax); err != nil {
-				return err
+				return errors.Wrap(err, "select warehouse failed")
 			}
 
 			// Select the customer's discount, last name and credit.
 			if err := n.selectCustomerInfo.QueryRowTx(
 				ctx, tx, d.wID, d.dID, d.cID,
 			).Scan(&d.cDiscount, &d.cLast, &d.cCredit); err != nil {
-				return err
+				return errors.Wrap(err, "select customer failed")
 			}
 
 			// 2.4.2.2: For each o_ol_cnt item in the order, query the relevant item
@@ -245,134 +238,139 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 			for i, item := range d.items {
 				itemIDs[i] = fmt.Sprint(item.olIID)
 			}
-			rows, err := tx.Query(
-				ctx,
-				fmt.Sprintf(`
-					SELECT i_price, i_name, i_data
-					FROM item
-					WHERE i_id IN (%[1]s)
-					ORDER BY i_id`,
-					strings.Join(itemIDs, ", "),
-				),
-			)
-			if err != nil {
-				return err
-			}
 			iDatas := make([]string, d.oOlCnt)
-			for i := range d.items {
-				item := &d.items[i]
-				iData := &iDatas[i]
-
-				if !rows.Next() {
-					if err := rows.Err(); err != nil {
-						return err
-					}
-					if rollback {
-						// 2.4.2.3: roll back when we're expecting a rollback due to
-						// simulated user error (invalid item id) and we actually
-						// can't find the item. The spec requires us to actually go
-						// to the database for this, even though we know earlier
-						// that the item has an invalid number.
-						atomic.AddUint64(&n.config.auditor.newOrderRollbacks, 1)
-						return errSimulated
-					}
-					return errors.New("missing item row")
-				}
-
-				err = rows.Scan(&item.iPrice, &item.iName, iData)
+			iIDs := strings.Join(itemIDs, ", ")
+			err := func() error {
+				rows, err := tx.Query(
+					ctx,
+					fmt.Sprintf(`
+						SELECT i_price, i_name, i_data
+						FROM item
+						WHERE i_id IN (%[1]s)
+						ORDER BY i_id`,
+						iIDs,
+					),
+				)
 				if err != nil {
-					rows.Close()
 					return err
 				}
+				defer rows.Close()
+
+				for i := range d.items {
+					item := &d.items[i]
+					iData := &iDatas[i]
+
+					if !rows.Next() {
+						if err := rows.Err(); err != nil {
+							return err
+						}
+						if rollback {
+							// 2.4.2.3: roll back when we're expecting a rollback due to
+							// simulated user error (invalid item id) and we actually
+							// can't find the item. The spec requires us to actually go
+							// to the database for this, even though we know earlier
+							// that the item has an invalid number.
+							n.config.auditor.newOrderRollbacks.Add(1)
+							return errSimulated
+						}
+						return errors.New("missing item row")
+					}
+
+					if err := rows.Scan(&item.iPrice, &item.iName, iData); err != nil {
+						return err
+					}
+				}
+				if rows.Next() {
+					return errors.New("extra item row")
+				}
+				return rows.Err()
+			}()
+			if err != nil {
+				return errors.Wrap(err, "select item failed")
 			}
-			if rows.Next() {
-				return errors.New("extra item row")
-			}
-			if err := rows.Err(); err != nil {
-				return err
-			}
-			rows.Close()
 
 			stockIDs := make([]string, d.oOlCnt)
 			for i, item := range d.items {
 				stockIDs[i] = fmt.Sprintf("(%d, %d)", item.olIID, item.olSupplyWID)
-			}
-			rows, err = tx.Query(
-				ctx,
-				fmt.Sprintf(`
-					SELECT s_quantity, s_ytd, s_order_cnt, s_remote_cnt, s_data, s_dist_%02[1]d
-					FROM stock
-					WHERE (s_i_id, s_w_id) IN (%[2]s)
-					ORDER BY s_i_id`,
-					d.dID, strings.Join(stockIDs, ", "),
-				),
-			)
-			if err != nil {
-				return err
 			}
 			distInfos := make([]string, d.oOlCnt)
 			sQuantityUpdateCases := make([]string, d.oOlCnt)
 			sYtdUpdateCases := make([]string, d.oOlCnt)
 			sOrderCntUpdateCases := make([]string, d.oOlCnt)
 			sRemoteCntUpdateCases := make([]string, d.oOlCnt)
-			for i := range d.items {
-				item := &d.items[i]
-
-				if !rows.Next() {
-					if err := rows.Err(); err != nil {
-						return err
-					}
-					return errors.New("missing stock row")
-				}
-
-				var sQuantity, sYtd, sOrderCnt, sRemoteCnt int
-				var sData string
-				err = rows.Scan(&sQuantity, &sYtd, &sOrderCnt, &sRemoteCnt, &sData, &distInfos[i])
+			if err := func() error {
+				rows, err := tx.Query(
+					ctx,
+					fmt.Sprintf(`
+						SELECT s_quantity, s_ytd, s_order_cnt, s_remote_cnt, s_data, s_dist_%02[1]d
+						FROM stock
+						WHERE (s_i_id, s_w_id) IN (%[2]s)
+						ORDER BY s_i_id
+						FOR UPDATE`,
+						d.dID, strings.Join(stockIDs, ", "),
+					),
+				)
 				if err != nil {
-					rows.Close()
 					return err
 				}
+				defer rows.Close()
 
-				if strings.Contains(sData, originalString) && strings.Contains(iDatas[i], originalString) {
-					item.brandGeneric = "B"
-				} else {
-					item.brandGeneric = "G"
+				for i := range d.items {
+					item := &d.items[i]
+
+					if !rows.Next() {
+						if err := rows.Err(); err != nil {
+							return err
+						}
+						return errors.New("missing stock row")
+					}
+
+					var sQuantity, sYtd, sOrderCnt, sRemoteCnt int
+					var sData string
+					if err := rows.Scan(&sQuantity, &sYtd, &sOrderCnt, &sRemoteCnt, &sData, &distInfos[i]); err != nil {
+						return err
+					}
+
+					if strings.Contains(sData, originalString) && strings.Contains(iDatas[i], originalString) {
+						item.brandGeneric = "B"
+					} else {
+						item.brandGeneric = "G"
+					}
+
+					newSQuantity := sQuantity - item.olQuantity
+					if sQuantity < item.olQuantity+10 {
+						newSQuantity += 91
+					}
+
+					newSRemoteCnt := sRemoteCnt
+					if item.remoteWarehouse {
+						newSRemoteCnt++
+					}
+
+					sQuantityUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], newSQuantity)
+					sYtdUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], sYtd+item.olQuantity)
+					sOrderCntUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], sOrderCnt+1)
+					sRemoteCntUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], newSRemoteCnt)
 				}
-
-				newSQuantity := sQuantity - item.olQuantity
-				if sQuantity < item.olQuantity+10 {
-					newSQuantity += 91
+				if rows.Next() {
+					return errors.New("extra stock row")
 				}
-
-				newSRemoteCnt := sRemoteCnt
-				if item.remoteWarehouse {
-					newSRemoteCnt++
-				}
-
-				sQuantityUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], newSQuantity)
-				sYtdUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], sYtd+item.olQuantity)
-				sOrderCntUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], sOrderCnt+1)
-				sRemoteCntUpdateCases[i] = fmt.Sprintf("WHEN %s THEN %d", stockIDs[i], newSRemoteCnt)
+				return rows.Err()
+			}(); err != nil {
+				return errors.Wrap(err, "select stock failed")
 			}
-			if rows.Next() {
-				return errors.New("extra stock row")
-			}
-			if err := rows.Err(); err != nil {
-				return err
-			}
-			rows.Close()
 
 			// Insert row into the orders and new orders table.
 			if _, err := n.insertOrder.ExecTx(
 				ctx, tx,
 				d.oID, d.dID, d.wID, d.cID, d.oEntryD.Format("2006-01-02 15:04:05"), d.oOlCnt, allLocal,
 			); err != nil {
-				return err
+				return errors.Wrap(err, "insert order failed")
 			}
 			if _, err := n.insertNewOrder.ExecTx(
 				ctx, tx, d.oID, d.dID, d.wID,
 			); err != nil {
-				return err
+				return errors.Wrap(err, "insert new_order failed")
 			}
 
 			// Update the stock table for each item.
@@ -393,7 +391,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 					strings.Join(stockIDs, ", "),
 				),
 			); err != nil {
-				return err
+				return errors.Wrap(err, "update stock failed")
 			}
 
 			// Insert a new order line for each item in the order.
@@ -423,7 +421,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 					strings.Join(olValsStrings, ", "),
 				),
 			); err != nil {
-				return err
+				return errors.Wrap(err, "insert order_line failed")
 			}
 
 			// 2.4.2.2: total_amount = sum(OL_AMOUNT) * (1 - C_DISCOUNT) * (1 + W_TAX + D_TAX)
@@ -432,7 +430,7 @@ func (n *newOrder) run(ctx context.Context, wID int) (interface{}, error) {
 			return nil
 		})
 	if errors.Is(err, errSimulated) {
-		return d, nil
+		return d, 0, nil
 	}
-	return d, err
+	return d, onTxnStartDuration, err
 }

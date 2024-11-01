@@ -39,8 +39,12 @@ genrule(
     cmd = """
         $(location //pkg/sql/lexbase/allkeywords) < $(location //pkg/sql/parser:sql.y) > $@
     """,
-    exec_tools = [
+    tools = [
         "//pkg/sql/lexbase/allkeywords",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )
 
@@ -56,8 +60,12 @@ genrule(
      echo; \
      grep '^const [A-Z][_A-Z0-9]* ' $(location //pkg/sql/parser:sql-goyacc)) > $@
     """,
-    exec_tools = [
+    tools = [
         "//pkg/sql/parser:sql-goyacc",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )
 
@@ -73,4 +81,15 @@ genrule(
     cmd = """
           awk -f $(location //pkg/sql/parser:reserved_keywords.awk) < $(location //pkg/sql/parser:sql.y) > $@
     """,
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
+)
+
+exports_files(
+    [
+        "sql-gen.sh",
+    ],
+    visibility = ["//visibility:public"],
 )

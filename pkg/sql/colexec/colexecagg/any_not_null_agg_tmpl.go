@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -24,7 +19,7 @@ package colexecagg
 import (
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
@@ -60,7 +55,19 @@ const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
 // _TYPE_WIDTH is the template variable.
 const _TYPE_WIDTH = 0
 
+// _ALLOC_CODE is the template variable that is replaced in agg_gen_util.go by
+// the template code for sharing allocator objects.
+const _ALLOC_CODE = 0
+
 // */}}
+
+// {{if eq "_AGGKIND" "Ordered"}}
+
+const anyNotNullNumOverloads = 11
+
+// {{end}}
+
+var _ = _ALLOC_CODE
 
 func newAnyNotNull_AGGKINDAggAlloc(
 	allocator *colmem.Allocator, t *types.T, allocSize int64,
@@ -88,27 +95,26 @@ func newAnyNotNull_AGGKINDAggAlloc(
 type anyNotNull_TYPE_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
+	col _GOTYPESLICE
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
-	col                         _GOTYPESLICE
 	curAgg                      _GOTYPE
 	foundNonNullForCurrentGroup bool
 }
 
 var _ AggregateFunc = &anyNotNull_TYPE_AGGKINDAgg{}
 
-func (a *anyNotNull_TYPE_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *anyNotNull_TYPE_AGGKINDAgg) SetOutput(vec *coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
 	a.col = vec.TemplateType()
 }
 
+// {{end}}
+
 func (a *anyNotNull_TYPE_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 	// {{if eq "_AGGKIND" "Hash"}}
 	if a.foundNonNullForCurrentGroup {
@@ -122,7 +128,7 @@ func (a *anyNotNull_TYPE_AGGKINDAgg) Compute(
 	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.TemplateType(), vec.Nulls()
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups and col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -163,7 +169,7 @@ func (a *anyNotNull_TYPE_AGGKINDAgg) Compute(
 	)
 	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
 	if newCurAggSize != oldCurAggSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -175,11 +181,14 @@ func (a *anyNotNull_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
+	col := a.col
+	// {{else}}
+	col := a.vec.TemplateType()
 	// {{end}}
 	if !a.foundNonNullForCurrentGroup {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		a.col.Set(outputIdx, a.curAgg)
+		col.Set(outputIdx, a.curAgg)
 	}
 	// {{if or (.IsBytesLike) (eq .VecMethod "Datum")}}
 	// Release the reference to curAgg eagerly.

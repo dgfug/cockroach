@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package distsql
 
@@ -32,19 +27,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-// staticAddressResolver maps execinfra.StaticNodeID to the given address.
+// staticAddressResolver maps execinfra.StaticSQLInstanceID to the given address.
 func staticAddressResolver(addr net.Addr) nodedialer.AddressResolver {
-	return func(nodeID roachpb.NodeID) (net.Addr, error) {
-		if nodeID == execinfra.StaticNodeID {
-			return addr, nil
+	return func(nodeID roachpb.NodeID) (net.Addr, roachpb.Locality, error) {
+		if nodeID == roachpb.NodeID(execinfra.StaticSQLInstanceID) {
+			return addr, roachpb.Locality{}, nil
 		}
-		return nil, errors.Errorf("node %d not found", nodeID)
+		return nil, roachpb.Locality{}, errors.Errorf("node %d not found", nodeID)
 	}
 }
 
@@ -66,38 +62,38 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 			Metrics:  &mt,
 			NodeID:   base.TestingIDContainer,
 		},
-		flowinfra.NewFlowScheduler(testutils.MakeAmbientCtx(), stopper, st),
+		flowinfra.NewRemoteFlowRunner(log.MakeTestingAmbientCtxWithNewTracer(), stopper, nil /* acc */),
 	)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	clock := hlc.NewClockForTesting(nil)
+	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 
 	// We're going to serve multiple node IDs with that one context. Disable node ID checks.
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
-	rpcSrv := rpc.NewServer(rpcContext)
+	rpcSrv, err := rpc.NewServer(ctx, rpcContext)
+	require.NoError(t, err)
 	defer rpcSrv.Stop()
 
 	execinfrapb.RegisterDistSQLServer(rpcSrv, srv)
 	ln, err := netutil.ListenAndServeGRPC(stopper, rpcSrv, util.IsolatedTestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
 	defer outboxStopper.Stop(ctx)
+	instanceDialer := nodedialer.New(rpcContext, staticAddressResolver(ln.Addr()))
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:   st,
-			NodeDialer: nodedialer.New(rpcContext, staticAddressResolver(ln.Addr())),
-			Stopper:    outboxStopper,
+			Settings:          st,
+			SQLInstanceDialer: instanceDialer,
+			Stopper:           outboxStopper,
 		},
 		NodeID: base.TestingIDContainer,
 	}
 
 	streamID := execinfrapb.StreamID(1)
-	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox := flowinfra.NewOutbox(&flowCtx, 0 /* processorID */, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(types.OneIntCol)
 
 	// WaitGroup for the outbox and inbound stream. If the WaitGroup is done, no
@@ -109,7 +105,10 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	consumer := distsqlutils.NewRowBuffer(types.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
 	connectionInfo := map[execinfrapb.StreamID]*flowinfra.InboundStreamInfo{
 		streamID: flowinfra.NewInboundStreamInfo(
-			flowinfra.RowInboundStreamHandler{RowReceiver: consumer},
+			flowinfra.RowInboundStreamHandler{
+				RowReceiver: consumer,
+				Types:       types.OneIntCol,
+			},
 			wg,
 		),
 	}

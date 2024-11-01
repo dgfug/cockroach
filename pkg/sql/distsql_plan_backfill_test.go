@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,7 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -44,7 +39,7 @@ func TestDistBackfill(t *testing.T) {
 	}
 	const numNodes = 5
 
-	tc := serverutils.StartNewTestCluster(t, numNodes,
+	tc := serverutils.StartCluster(t, numNodes,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -76,13 +71,13 @@ func TestDistBackfill(t *testing.T) {
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowEnglishFn),
 	)
 	// Split the table into multiple ranges.
-	descNumToStr := catalogkv.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "numtostr")
-	var sps []SplitPoint
-	//for i := 1; i <= numNodes-1; i++ {
+	descNumToStr := desctestutils.TestingGetPublicTableDescriptor(cdb, keys.SystemSQLCodec, "test", "numtostr")
+	var sps []serverutils.SplitPoint
+	// for i := 1; i <= numNodes-1; i++ {
 	for i := numNodes - 1; i > 0; i-- {
-		sps = append(sps, SplitPoint{i, []interface{}{n * n / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{n * n / numNodes * i}})
 	}
-	SplitTable(t, tc, descNumToStr, sps)
+	tc.SplitTable(t, descNumToStr, sps)
 
 	db := tc.ServerConn(0)
 	db.SetMaxOpenConns(1)

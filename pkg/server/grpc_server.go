@@ -1,20 +1,16 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
-	"strings"
+	"context"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -26,16 +22,23 @@ import (
 // RPCs.
 type grpcServer struct {
 	*grpc.Server
-	mode serveMode
+	serverInterceptorsInfo rpc.ServerInterceptorInfo
+	mode                   serveMode
 }
 
-func newGRPCServer(rpcCtx *rpc.Context) *grpcServer {
+func newGRPCServer(ctx context.Context, rpcCtx *rpc.Context) (*grpcServer, error) {
 	s := &grpcServer{}
 	s.mode.set(modeInitializing)
-	s.Server = rpc.NewServer(rpcCtx, rpc.WithInterceptor(func(path string) error {
-		return s.intercept(path)
-	}))
-	return s
+	srv, interceptorInfo, err := rpc.NewServerEx(
+		ctx, rpcCtx, rpc.WithInterceptor(func(path string) error {
+			return s.intercept(path)
+		}))
+	if err != nil {
+		return nil, err
+	}
+	s.Server = srv
+	s.serverInterceptorsInfo = interceptorInfo
+	return s, nil
 }
 
 type serveMode int32
@@ -63,6 +66,22 @@ func (s *grpcServer) operational() bool {
 	return sMode == modeOperational || sMode == modeDraining
 }
 
+func (s *grpcServer) health(ctx context.Context) error {
+	sm := s.mode.get()
+	switch sm {
+	case modeInitializing:
+		return grpcstatus.Error(codes.Unavailable, "node is waiting for cluster initialization")
+	case modeDraining:
+		// grpc.mode is set to modeDraining when the Drain(DrainMode_CLIENT) has
+		// been called (client connections are to be drained).
+		return grpcstatus.Errorf(codes.Unavailable, "node is shutting down")
+	case modeOperational:
+		return nil
+	default:
+		return srverrors.ServerError(ctx, errors.Newf("unknown mode: %v", sm))
+	}
+}
+
 var rpcsAllowedWhileBootstrapping = map[string]struct{}{
 	"/cockroach.rpc.Heartbeat/Ping":             {},
 	"/cockroach.gossip.Gossip/Gossip":           {},
@@ -76,7 +95,7 @@ func (s *grpcServer) intercept(fullName string) error {
 		return nil
 	}
 	if _, allowed := rpcsAllowedWhileBootstrapping[fullName]; !allowed {
-		return s.waitingForInitError(fullName)
+		return NewWaitingForInitError(fullName)
 	}
 	return nil
 }
@@ -89,15 +108,9 @@ func (s *serveMode) get() serveMode {
 	return serveMode(atomic.LoadInt32((*int32)(s)))
 }
 
-// waitingForInitError creates an error indicating that the server cannot run
+// NewWaitingForInitError creates an error indicating that the server cannot run
 // the specified method until the node has been initialized.
-func (s *grpcServer) waitingForInitError(methodName string) error {
+func NewWaitingForInitError(methodName string) error {
+	// NB: this error string is sadly matched in grpcutil.IsWaitingForInit().
 	return grpcstatus.Errorf(codes.Unavailable, "node waiting for init; %s not available", methodName)
-}
-
-// IsWaitingForInit checks whether the provided error is because the node is
-// still waiting for initialization.
-func IsWaitingForInit(err error) bool {
-	s, ok := grpcstatus.FromError(errors.UnwrapAll(err))
-	return ok && s.Code() == codes.Unavailable && strings.Contains(err.Error(), "node waiting for init")
 }

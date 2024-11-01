@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -15,11 +10,13 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -32,7 +29,7 @@ func (f FmtFlags) HasFlags(subset FmtFlags) bool {
 	return f&subset == subset
 }
 
-// HasAnyFlags tests whether any of the given flags are all set.
+// HasAnyFlags tests whether any of the given flags are set.
 func (f FmtFlags) HasAnyFlags(subset FmtFlags) bool {
 	return f&subset != 0
 }
@@ -55,15 +52,19 @@ const (
 	// string will be escaped and enclosed in e'...' regardless of
 	// whether FmtBareStrings is specified. See FmtRawStrings below for
 	// an alternative.
-	FmtBareStrings FmtFlags = FmtFlags(lexbase.EncBareStrings)
+	FmtBareStrings = FmtFlags(lexbase.EncBareStrings)
 
 	// FmtBareIdentifiers instructs the pretty-printer to print
 	// identifiers without wrapping quotes in any case.
-	FmtBareIdentifiers FmtFlags = FmtFlags(lexbase.EncBareIdentifiers)
+	FmtBareIdentifiers = FmtFlags(lexbase.EncBareIdentifiers)
+
+	// FmtBareReservedKeywords instructs the pretty-printer to print
+	// reserved keywords without wrapping quotes.
+	FmtBareReservedKeywords = FmtFlags(lexbase.EncBareReservedKeywords)
 
 	// FmtShowPasswords instructs the pretty-printer to not suppress passwords.
 	// If not set, passwords are replaced by *****.
-	FmtShowPasswords FmtFlags = FmtFlags(lexbase.EncFirstFreeFlagBit) << iota
+	FmtShowPasswords = FmtFlags(lexbase.EncFirstFreeFlagBit) << iota
 
 	// FmtShowTypes instructs the pretty-printer to
 	// annotate expressions with their resolved types.
@@ -71,12 +72,10 @@ const (
 
 	// FmtHideConstants instructs the pretty-printer to produce a
 	// representation that does not disclose query-specific data. It
-	// also shorten long lists in tuples, VALUES and array expressions.
+	// also shortens long lists in tuples, VALUES and array expressions.
 	FmtHideConstants
 
-	// FmtAnonymize instructs the pretty-printer to remove
-	// any name but function names.
-	// TODO(knz): temporary until a better solution is found for #13968
+	// FmtAnonymize instructs the pretty-printer to remove any name.
 	FmtAnonymize
 
 	// FmtAlwaysQualifyTableNames instructs the pretty-printer to
@@ -106,10 +105,6 @@ const (
 	// resolutions.
 	fmtDisambiguateDatumTypes
 
-	// fmtSymbolicVars indicates that IndexedVars must be pretty-printed
-	// using numeric notation (@123).
-	fmtSymbolicVars
-
 	// fmtUnicodeStrings prints strings and JSON using the Go string
 	// formatter. This is used e.g. for emitting values to CSV files.
 	fmtRawStrings
@@ -120,13 +115,16 @@ const (
 	// the numeric by enclosing them within parentheses.
 	FmtParsableNumerics
 
-	// FmtPGCatalog is used to produce expressions formatted in a way that's as
-	// close as possible to what clients expect to live in pg_catalog (e.g.
-	// pg_attrdef.adbin, pg_constraint.condef and pg_indexes.indexdef columns).
-	// Specifically, this strips type annotations (Postgres doesn't know what
-	// those are), adds cast expressions for non-numeric constants, and formats
-	// indexes in Postgres-specific syntax.
-	FmtPGCatalog
+	// fmtPGCatalog is used to produce array and bytes expressions formatted in
+	// a way that's as close as possible to what clients expect to live in
+	// pg_catalog (e.g. pg_attrdef.adbin, pg_constraint.condef and
+	// pg_indexes.indexdef columns).
+	fmtPGCatalog
+
+	// fmtPGCatalogCasts adds cast expressions for non-numeric constants and
+	// strips type annotations. This matches Postgres's formatting of
+	// expressions in pg_catalog.
+	fmtPGCatalogCasts
 
 	// If set, user defined types and datums of user defined types will be
 	// formatted in a way that is stable across changes to the underlying type.
@@ -141,7 +139,7 @@ const (
 	fmtFormatByteLiterals
 
 	// FmtMarkRedactionNode instructs the pretty printer to redact datums,
-	// constants, and simples names (i.e. Name, UnrestrictedName) from statements.
+	// constants, and simple names (i.e. Name, UnrestrictedName) from statements.
 	FmtMarkRedactionNode
 
 	// FmtSummary instructs the pretty printer to produced a summarized version
@@ -163,7 +161,47 @@ const (
 	// - Show columns up to 15 characters.
 	// - Show condition up to 15 characters.
 	FmtSummary
+
+	// FmtOmitNameRedaction instructs the pretty printer to omit redaction
+	// for simple names (i.e. Name, UnrestrictedName) from statements.
+	// This flag *overrides* `FmtMarkRedactionNode` above.
+	FmtOmitNameRedaction
+
+	// FmtTagDollarQuotes instructs tags to be kept intact in tagged dollar
+	// quotes. It also applies tags when formatting UDFs.
+	FmtTagDollarQuotes
+
+	// FmtShortenConstants shortens long lists in tuples, VALUES and array
+	// expressions. FmtHideConstants takes precedence over it.
+	FmtShortenConstants
+
+	// FmtCollapseLists instructs the pretty-printer to shorten lists
+	// containing only literals, placeholders and/or similar subexpressions
+	// of literals/placeholders to their first element (scrubbed) followed
+	// by "__more__". E.g.
+	//  SELECT * FROM foo where v IN (1, 2+2, $1, $2*3) => SELECT * FROM foo where v IN (_, __more__)
+	FmtCollapseLists
+
+	// FmtConstantsAsUnderscores instructs the pretty-printer to format
+	// constants (literals, placeholders) as underscores.
+	// e.g.
+	//   SELECT 1, 'a', $1 => SELECT _, _, _
+	FmtConstantsAsUnderscores
+
+	// FmtAlwaysQualifyUserDefinedTypeNames instructs the pretty-printer to include
+	// the name of user-defined types as a three-part name.
+	FmtAlwaysQualifyUserDefinedTypeNames
+
+	// FmtShowFullURIs instructs the pretty-printer to not sanitize URIs. If not
+	// set, URIs are sanitized to prevent leaking secrets.
+	FmtShowFullURIs
 )
+
+const genericArityIndicator = "__more__"
+
+// StmtFingerprintPlaceholder is the char that replaces all literals and
+// placeholders in a query when computing its fingerprint.
+const StmtFingerprintPlaceholder = '_'
 
 // PasswordSubstitution is the string that replaces
 // passwords unless FmtShowPasswords is specified.
@@ -180,21 +218,31 @@ const (
 	// FmtPgwireText instructs the pretty-printer to use
 	// a pg-compatible conversion to strings. See comments
 	// in pgwire_encode.go.
-	FmtPgwireText FmtFlags = fmtPgwireFormat | FmtFlags(lexbase.EncBareStrings)
+	FmtPgwireText = fmtPgwireFormat | FmtFlags(lexbase.EncBareStrings)
+
+	// FmtPGCatalog is used to produce expressions formatted in a way that's as
+	// close as possible to what clients expect to live in pg_catalog (e.g.
+	// pg_attrdef.adbin, pg_constraint.condef and pg_indexes.indexdef columns).
+	// Specifically, this strips type annotations (Postgres doesn't know what
+	// those are), adds cast expressions for non-numeric constants, formats
+	// arrays as strings with curly brackets (like FmtPGWireText), formats bytes
+	// with double quotes (also like FmtPGWireText), and formats indexes in
+	// Postgres-specific syntax.
+	FmtPGCatalog = fmtPGCatalog | fmtPGCatalogCasts
 
 	// FmtParsable instructs the pretty-printer to produce a representation that
 	// can be parsed into an equivalent expression. If there is a chance that the
 	// formatted data will be stored durably on disk or sent to other nodes,
 	// then this formatting directive is not appropriate, and FmtSerializable
 	// should be used instead.
-	FmtParsable FmtFlags = fmtDisambiguateDatumTypes | FmtParsableNumerics
+	FmtParsable = fmtDisambiguateDatumTypes | FmtParsableNumerics
 
 	// FmtSerializable instructs the pretty-printer to produce a representation
 	// for expressions that can be serialized to disk. It serializes user defined
 	// types using representations that are stable across changes of the type
 	// itself. This should be used when serializing expressions that will be
 	// stored on disk, like DEFAULT expressions of columns.
-	FmtSerializable FmtFlags = FmtParsable | fmtStaticallyFormatUserDefinedTypes
+	FmtSerializable = FmtParsable | fmtStaticallyFormatUserDefinedTypes
 
 	// FmtCheckEquivalence instructs the pretty-printer to produce a representation
 	// that can be used to check equivalence of expressions. Specifically:
@@ -207,8 +255,7 @@ const (
 	//  - user defined types and datums of user defined types are formatted
 	//    using static representations to avoid name resolution and invalidation
 	//    due to changes in the underlying type.
-	FmtCheckEquivalence FmtFlags = fmtSymbolicVars |
-		fmtDisambiguateDatumTypes |
+	FmtCheckEquivalence = fmtDisambiguateDatumTypes |
 		FmtParsableNumerics |
 		fmtStaticallyFormatUserDefinedTypes
 
@@ -216,7 +263,7 @@ const (
 	// for the output of array_to_string(). This de-quotes
 	// the strings enclosed in the array and skips the normal escaping
 	// of strings. Special characters are hex-escaped.
-	FmtArrayToString FmtFlags = FmtBareStrings | fmtRawStrings
+	FmtArrayToString = FmtBareStrings | fmtRawStrings
 
 	// FmtExport, if set, formats datums in a raw form suitable for
 	// EXPORT, e.g. suitable for output into a CSV file. The intended
@@ -231,10 +278,13 @@ const (
 	// because the behavior of array_to_string() is fixed for compatibility
 	// with PostgreSQL, whereas EXPORT may evolve over time to support
 	// other things (eg. fixing #33429).
-	FmtExport FmtFlags = FmtBareStrings | fmtRawStrings
+	FmtExport = FmtBareStrings | fmtRawStrings
+
+	// FmtAlwaysQualifyNames will fully qualify various types of names.
+	FmtAlwaysQualifyNames = FmtAlwaysQualifyTableNames | FmtAlwaysQualifyUserDefinedTypeNames
 )
 
-const flagsRequiringAnnotations FmtFlags = FmtAlwaysQualifyTableNames
+const flagsRequiringAnnotations = FmtAlwaysQualifyTableNames
 
 // FmtCtx is suitable for passing to Format() methods.
 // It also exposes the underlying bytes.Buffer interface for
@@ -247,6 +297,7 @@ type FmtCtx struct {
 	bytes.Buffer
 
 	dataConversionConfig sessiondatapb.DataConversionConfig
+	location             *time.Location
 
 	// NOTE: if you add more flags to this structure, make sure to add
 	// corresponding cleanup code in FmtCtx.Close().
@@ -268,6 +319,8 @@ type FmtCtx struct {
 	// indexedTypeFormatter is an optional interceptor for formatting
 	// IDTypeReferences differently than normal.
 	indexedTypeFormatter func(*FmtCtx, *OIDTypeReference)
+	// small scratch buffer to reduce allocations.
+	scratch [64]byte
 }
 
 // FmtCtxOption is an option to pass into NewFmtCtx.
@@ -296,7 +349,7 @@ func FmtPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder)) FmtCtxO
 	}
 }
 
-// FmtReformatTableNames modifies FmtCtx to to substitute the printing of table
+// FmtReformatTableNames modifies FmtCtx to substitute the printing of table
 // naFmtParsable using the provided function.
 func FmtReformatTableNames(tableNameFmt func(*FmtCtx, *TableName)) FmtCtxOption {
 	return func(ctx *FmtCtx) {
@@ -320,6 +373,13 @@ func FmtDataConversionConfig(dcc sessiondatapb.DataConversionConfig) FmtCtxOptio
 	}
 }
 
+// FmtLocation modifies FmtCtx to contain the correct location.
+func FmtLocation(loc *time.Location) FmtCtxOption {
+	return func(ctx *FmtCtx) {
+		ctx.location = loc
+	}
+}
+
 // NewFmtCtx creates a FmtCtx; only flags that don't require Annotations
 // can be used.
 func NewFmtCtx(f FmtFlags, opts ...FmtCtxOption) *FmtCtx {
@@ -331,6 +391,7 @@ func NewFmtCtx(f FmtFlags, opts ...FmtCtxOption) *FmtCtx {
 	if ctx.ann == nil && f&flagsRequiringAnnotations != 0 {
 		panic(errors.AssertionFailedf("no Annotations provided"))
 	}
+
 	return ctx
 }
 
@@ -341,6 +402,13 @@ func (ctx *FmtCtx) SetDataConversionConfig(
 ) sessiondatapb.DataConversionConfig {
 	old := ctx.dataConversionConfig
 	ctx.dataConversionConfig = dcc
+	return old
+}
+
+// SetLocation sets the location on ctx and returns the old one.
+func (ctx *FmtCtx) SetLocation(loc *time.Location) *time.Location {
+	old := ctx.location
+	ctx.location = loc
 	return old
 }
 
@@ -368,9 +436,16 @@ func (ctx *FmtCtx) WithFlags(flags FmtFlags, fn func()) {
 	fn()
 }
 
-// HasFlags returns true iff the given flags are set in the formatter context.
+// HasFlags returns true iff all of the given flags are set in the formatter
+// context.
 func (ctx *FmtCtx) HasFlags(f FmtFlags) bool {
 	return ctx.flags.HasFlags(f)
+}
+
+// HasAnyFlags returns true iff any of the given flags are set in the formatter
+// context.
+func (ctx *FmtCtx) HasAnyFlags(f FmtFlags) bool {
+	return ctx.flags.HasAnyFlags(f)
 }
 
 // Printf calls fmt.Fprintf on the linked bytes.Buffer. It is provided
@@ -404,6 +479,71 @@ func (ctx *FmtCtx) FormatNameP(s *string) {
 	ctx.FormatNode((*Name)(s))
 }
 
+// FormatStringConstant formats a constant string value, redacting it if
+// FmtHideConstants is set.
+func (ctx *FmtCtx) FormatStringConstant(s string) {
+	ctx.WriteString("'")
+	if ctx.HasFlags(FmtHideConstants) {
+		ctx.WriteString("_")
+	} else {
+		ctx.WriteString(s)
+	}
+	ctx.WriteString("'")
+}
+
+// FormatURIs formats a list of string literals or placeholders containing URIs.
+func (ctx *FmtCtx) FormatURIs(uris []Expr) {
+	if len(uris) > 1 {
+		ctx.WriteString("(")
+	}
+	for i, uri := range uris {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatURI(uri)
+	}
+	if len(uris) > 1 {
+		ctx.WriteString(")")
+	}
+}
+
+// FormatURI formats a string literal or placeholder containing a URI. If the
+// node is a string literal, we redact the contents to avoid leaking secrets.
+func (ctx *FmtCtx) FormatURI(uri Expr) {
+	switch n := uri.(type) {
+	case *StrVal, *DString:
+		if ctx.HasAnyFlags(
+			FmtShowPasswords | FmtShowFullURIs | FmtHideConstants | FmtConstantsAsUnderscores,
+		) {
+			ctx.FormatNode(n)
+			return
+		}
+		var raw, elided string
+		if str, ok := n.(*StrVal); ok {
+			raw = str.RawString()
+		} else {
+			raw = string(MustBeDString(uri))
+		}
+		if raw == "" || raw == "_" {
+			// Some commands treat empty URIs as special. And if we've re-parsed a URI
+			// formatted with FmtHideConstants, we should not try to interpret it as a
+			// URL but should leave it as-is.
+			ctx.FormatNode(n)
+			return
+		}
+		// TODO(michae2): Call SanitizeExternalStorageURI for fine-grained
+		// sanitization.
+		elided = strings.Trim(PasswordSubstitution, "'")
+		ctx.FormatNode(NewStrVal(elided))
+	case *Placeholder:
+		ctx.FormatNode(n)
+	default:
+		// We don't want to fail to sanitize other literals, so disallow other types
+		// of expressions (which should already be disallowed by the parser anyway).
+		panic(errors.AssertionFailedf("expected *StrVal, *DString, or *Placeholder, found %T", n))
+	}
+}
+
 // FormatNode recurses into a node for pretty-printing.
 // Flag-driven special cases can hook into this.
 func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
@@ -415,7 +555,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			if f.HasFlags(FmtMarkRedactionNode) {
 				ctx.formatNodeMaybeMarkRedaction(n)
 			} else {
-				ctx.formatNodeOrHideConstants(n)
+				ctx.formatNodeOrAdjustConstants(n)
 			}
 
 			ctx.WriteString(")[")
@@ -432,8 +572,14 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			return
 		}
 	}
+
+	callFuncExpr := func(e Expr) bool {
+		f, ok := e.(*FuncExpr)
+		return ok && f.InCall
+	}
+
 	if f.HasFlags(FmtAlwaysGroupExprs) {
-		if _, ok := n.(Expr); ok {
+		if e, ok := n.(Expr); ok && !callFuncExpr(e) {
 			ctx.WriteByte('(')
 		}
 	}
@@ -441,15 +587,15 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 	if f.HasFlags(FmtMarkRedactionNode) {
 		ctx.formatNodeMaybeMarkRedaction(n)
 	} else {
-		ctx.formatNodeOrHideConstants(n)
+		ctx.formatNodeOrAdjustConstants(n)
 	}
 
 	if f.HasFlags(FmtAlwaysGroupExprs) {
-		if _, ok := n.(Expr); ok {
+		if e, ok := n.(Expr); ok && !callFuncExpr(e) {
 			ctx.WriteByte(')')
 		}
 	}
-	if f.HasAnyFlags(fmtDisambiguateDatumTypes | FmtPGCatalog) {
+	if f.HasAnyFlags(fmtDisambiguateDatumTypes | fmtPGCatalogCasts) {
 		var typ *types.T
 		if d, isDatum := n.(Datum); isDatum {
 			if p, isPlaceholder := d.(*Placeholder); isPlaceholder {
@@ -457,7 +603,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 				typ = p.typ
 			} else if d.AmbiguousFormat() {
 				typ = d.ResolvedType()
-			} else if _, isArray := d.(*DArray); isArray && f.HasFlags(FmtPGCatalog) {
+			} else if _, isArray := d.(*DArray); isArray && f.HasFlags(fmtPGCatalogCasts) {
 				typ = d.ResolvedType()
 			}
 		}
@@ -465,7 +611,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 			if f.HasFlags(fmtDisambiguateDatumTypes) {
 				ctx.WriteString(":::")
 				ctx.FormatTypeReference(typ)
-			} else if f.HasFlags(FmtPGCatalog) && !typ.IsNumeric() {
+			} else if f.HasFlags(fmtPGCatalogCasts) && !typ.IsNumeric() {
 				ctx.WriteString("::")
 				ctx.FormatTypeReference(typ)
 			}
@@ -587,7 +733,7 @@ func AsStringWithFlags(n NodeFormatter, fl FmtFlags, opts ...FmtCtxOption) strin
 // AsStringWithFQNames pretty prints a node to a string with the
 // FmtAlwaysQualifyTableNames flag (which requires annotations).
 func AsStringWithFQNames(n NodeFormatter, ann *Annotations) string {
-	ctx := NewFmtCtx(FmtAlwaysQualifyTableNames, FmtAnnotations(ann))
+	ctx := NewFmtCtx(FmtAlwaysQualifyNames, FmtAnnotations(ann))
 	ctx.FormatNode(n)
 	return ctx.CloseAndGetString()
 }
@@ -625,12 +771,9 @@ var fmtCtxPool = sync.Pool{
 // recommended for performance-sensitive paths.
 func (ctx *FmtCtx) Close() {
 	ctx.Buffer.Reset()
-	ctx.flags = 0
-	ctx.ann = nil
-	ctx.indexedVarFormat = nil
-	ctx.tableNameFormatter = nil
-	ctx.placeholderFormat = nil
-	ctx.dataConversionConfig = sessiondatapb.DataConversionConfig{}
+	*ctx = FmtCtx{
+		Buffer: ctx.Buffer,
+	}
 	fmtCtxPool.Put(ctx)
 }
 
@@ -654,7 +797,15 @@ func (ctx *FmtCtx) formatNodeMaybeMarkRedaction(n NodeFormatter) {
 		case *Placeholder:
 			// Placeholders should be printed as placeholder markers.
 			// Deliberately empty so we format as normal.
-		case Datum, Constant, *Name, *UnrestrictedName:
+		case *Name, *UnrestrictedName:
+			if ctx.flags.HasFlags(FmtOmitNameRedaction) {
+				break
+			}
+			ctx.WriteString(string(redact.StartMarker()))
+			v.Format(ctx)
+			ctx.WriteString(string(redact.EndMarker()))
+			return
+		case Datum, Constant:
 			ctx.WriteString(string(redact.StartMarker()))
 			v.Format(ctx)
 			ctx.WriteString(string(redact.EndMarker()))
@@ -662,4 +813,12 @@ func (ctx *FmtCtx) formatNodeMaybeMarkRedaction(n NodeFormatter) {
 		}
 		n.Format(ctx)
 	}
+}
+
+func init() {
+	ctx := NewFmtCtx(FmtSimple)
+	if len(ctx.scratch) < uuid.RFC4122StrSize {
+		panic(errors.AssertionFailedf("FmtCtx scratch must be at least %d bytes", uuid.RFC4122StrSize))
+	}
+	ctx.Close()
 }

@@ -11,15 +11,15 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/storage",
-        "//pkg/storage/enginepb",
+        "//pkg/storage/fs",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/protoutil",
-        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_pebble//:pebble",
+        "@com_github_cockroachdb_pebble//rangekey",
     ],
 )
 
@@ -33,8 +33,10 @@ go_test(
     embed = [":spanset"],
     deps = [
         "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/concurrency/lock",
+        "//pkg/roachpb",
         "//pkg/storage",
+        "//pkg/storage/fs",
         "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",

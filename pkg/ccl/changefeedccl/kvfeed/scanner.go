@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvfeed
 
@@ -15,57 +12,73 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
+type scanConfig struct {
+	Spans     []roachpb.Span
+	Timestamp hlc.Timestamp
+	WithDiff  bool
+	Knobs     TestingKnobs
+	Boundary  jobspb.ResolvedSpan_BoundaryType
+}
+
 type kvScanner interface {
 	// Scan will scan all of the KVs in the spans specified by the physical config
 	// at the specified timestamp and write them to the buffer.
-	Scan(ctx context.Context, sink kvevent.Writer, cfg physicalConfig) error
+	Scan(ctx context.Context, sink kvevent.Writer, cfg scanConfig) error
 }
 
 type scanRequestScanner struct {
-	settings *cluster.Settings
-	gossip   gossip.OptionalGossip
-	db       *kv.DB
+	settings                *cluster.Settings
+	db                      *kv.DB
+	onBackfillRangeCallback func(int64) (func(), func())
 }
 
 var _ kvScanner = (*scanRequestScanner)(nil)
 
-func (p *scanRequestScanner) Scan(
-	ctx context.Context, sink kvevent.Writer, cfg physicalConfig,
-) error {
+func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg scanConfig) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	if log.V(2) {
-		log.Infof(ctx, "performing scan on %v at %v withDiff %v",
-			cfg.Spans, cfg.Timestamp, cfg.WithDiff)
+		var sp roachpb.Spans = cfg.Spans
+		log.Infof(ctx, "performing scan on %s at %v withDiff %v",
+			sp, cfg.Timestamp, cfg.WithDiff)
 	}
 
 	sender := p.db.NonTransactionalSender()
 	distSender := sender.(*kv.CrossRangeTxnWrapperSender).Wrapped().(*kvcoord.DistSender)
-	spans, err := getSpansToProcess(ctx, distSender, cfg.Spans)
+	spans, numNodesHint, err := getRangesToProcess(ctx, distSender, cfg.Spans)
 	if err != nil {
 		return err
 	}
 
-	maxConcurrentScans := maxConcurrentScanRequests(p.gossip, &p.settings.SV)
+	var backfillDec, backfillClear func()
+	if p.onBackfillRangeCallback != nil {
+		backfillDec, backfillClear = p.onBackfillRangeCallback(int64(len(spans)))
+		defer backfillClear()
+	}
+
+	maxConcurrentScans := maxConcurrentScanRequests(numNodesHint, &p.settings.SV)
 	exportLim := limit.MakeConcurrentRequestLimiter("changefeedScanRequestLimiter", maxConcurrentScans)
 
 	lastScanLimitUserSetting := changefeedbase.ScanRequestLimit.Get(&p.settings.SV)
@@ -79,7 +92,7 @@ func (p *scanRequestScanner) Scan(
 		// If the user defined scan request limit has changed, recalculate it
 		if currentUserScanLimit := changefeedbase.ScanRequestLimit.Get(&p.settings.SV); currentUserScanLimit != lastScanLimitUserSetting {
 			lastScanLimitUserSetting = currentUserScanLimit
-			exportLim.SetLimit(maxConcurrentScanRequests(p.gossip, &p.settings.SV))
+			exportLim.SetLimit(maxConcurrentScanRequests(numNodesHint, &p.settings.SV))
 		}
 
 		limAlloc, err := exportLim.Begin(ctx)
@@ -90,8 +103,17 @@ func (p *scanRequestScanner) Scan(
 
 		g.GoCtx(func(ctx context.Context) error {
 			defer limAlloc.Release()
-			err := p.exportSpan(ctx, span, cfg.Timestamp, cfg.WithDiff, sink, cfg.Knobs)
+			spanAlloc, err := p.tryAcquireMemory(ctx, sink)
+			if err != nil {
+				return err
+			}
+			defer spanAlloc.Release(ctx)
+
+			err = p.exportSpan(ctx, span, cfg.Timestamp, cfg.Boundary, cfg.WithDiff, sink, cfg.Knobs)
 			finished := atomic.AddInt64(&atomicFinished, 1)
+			if backfillDec != nil {
+				backfillDec()
+			}
 			if log.V(2) {
 				log.Infof(ctx, `exported %d of %d: %v`, finished, len(spans), err)
 			}
@@ -101,10 +123,52 @@ func (p *scanRequestScanner) Scan(
 	return g.Wait()
 }
 
+var logMemAcquireEvery = log.Every(5 * time.Second)
+
+// tryAcquireMemory attempts to acquire memory for span export.
+func (p *scanRequestScanner) tryAcquireMemory(
+	ctx context.Context, sink kvevent.Writer,
+) (alloc kvevent.Alloc, err error) {
+	allocator, ok := sink.(kvevent.MemAllocator)
+	if !ok {
+		// Not an allocator -- can't acquire memory.
+		return alloc, nil
+	}
+
+	// Begin by attempting to acquire memory for the request we're about to issue.
+	alloc, err = allocator.AcquireMemory(ctx, changefeedbase.ScanRequestSize.Get(&p.settings.SV))
+	if err == nil {
+		return alloc, nil
+	}
+
+	retryOpts := retry.Options{
+		InitialBackoff: 500 * time.Millisecond,
+		MaxBackoff:     10 * time.Second,
+	}
+
+	// We failed to acquire memory for this export.  Begin retry loop -- we may succeed
+	// in the future, once somebody releases memory.
+	for attempt := retry.StartWithCtx(ctx, retryOpts); attempt.Next(); {
+		// Sink implements memory allocator interface, so acquire
+		// memory needed to hold scan reply.
+		if logMemAcquireEvery.ShouldLog() {
+			log.Errorf(ctx, "Failed to acquire memory for export span: %s (attempt %d)",
+				err, attempt.CurrentAttempt()+1)
+		}
+		alloc, err = allocator.AcquireMemory(ctx, changefeedbase.ScanRequestSize.Get(&p.settings.SV))
+		if err == nil {
+			return alloc, nil
+		}
+	}
+
+	return alloc, ctx.Err()
+}
+
 func (p *scanRequestScanner) exportSpan(
 	ctx context.Context,
 	span roachpb.Span,
 	ts hlc.Timestamp,
+	boundaryType jobspb.ResolvedSpan_BoundaryType,
 	withDiff bool,
 	sink kvevent.Writer,
 	knobs TestingKnobs,
@@ -118,19 +182,35 @@ func (p *scanRequestScanner) exportSpan(
 	}
 	stopwatchStart := timeutil.Now()
 	var scanDuration, bufferDuration time.Duration
-	const targetBytesPerScan = 16 << 20 // 16 MiB
+	targetBytesPerScan := changefeedbase.ScanRequestSize.Get(&p.settings.SV)
 	for remaining := &span; remaining != nil; {
 		start := timeutil.Now()
 		b := txn.NewBatch()
-		r := roachpb.NewScan(remaining.Key, remaining.EndKey, false /* forUpdate */).(*roachpb.ScanRequest)
-		r.ScanFormat = roachpb.BATCH_RESPONSE
+		r := kvpb.NewScan(remaining.Key, remaining.EndKey).(*kvpb.ScanRequest)
+		r.ScanFormat = kvpb.BATCH_RESPONSE
 		b.Header.TargetBytes = targetBytesPerScan
+		b.Header.ConnectionClass = rpc.RangefeedClass
+		b.AdmissionHeader = kvpb.AdmissionHeader{
+			// TODO(irfansharif): Make this configurable if we want system table
+			// scanners or support "high priority" changefeeds to run at higher
+			// priorities. We use higher AC priorities for system-internal
+			// rangefeeds listening in on system table changes.
+			Priority: int32(admissionpb.BulkNormalPri),
+			// We specify a creation time for each batch (as opposed to at the
+			// txn level) -- this way later batches from earlier txns don't just
+			// out compete batches from newer txns.
+			CreateTime:               start.UnixNano(),
+			Source:                   kvpb.AdmissionHeader_FROM_SQL,
+			NoMemoryReservedAtSource: true,
+		}
 		// NB: We use a raw request rather than the Scan() method because we want
 		// the MVCC timestamps which are encoded in the response but are filtered
 		// during result parsing.
 		b.AddRawRequest(r)
 		if knobs.BeforeScanRequest != nil {
-			knobs.BeforeScanRequest(b)
+			if err := knobs.BeforeScanRequest(b); err != nil {
+				return err
+			}
 		}
 
 		if err := txn.Run(ctx, b); err != nil {
@@ -147,7 +227,7 @@ func (p *scanRequestScanner) exportSpan(
 		if res.ResumeSpan != nil {
 			consumed := roachpb.Span{Key: remaining.Key, EndKey: res.ResumeSpan.Key}
 			if err := sink.Add(
-				ctx, kvevent.MakeResolvedEvent(consumed, ts, jobspb.ResolvedSpan_NONE),
+				ctx, kvevent.NewBackfillResolvedEvent(consumed, ts, boundaryType),
 			); err != nil {
 				return err
 			}
@@ -156,7 +236,7 @@ func (p *scanRequestScanner) exportSpan(
 	}
 	// p.metrics.PollRequestNanosHist.RecordValue(scanDuration.Nanoseconds())
 	if err := sink.Add(
-		ctx, kvevent.MakeResolvedEvent(span, ts, jobspb.ResolvedSpan_NONE),
+		ctx, kvevent.NewBackfillResolvedEvent(span, ts, boundaryType),
 	); err != nil {
 		return err
 	}
@@ -167,12 +247,14 @@ func (p *scanRequestScanner) exportSpan(
 	return nil
 }
 
-func getSpansToProcess(
+// getRangesToProcess returns the list of ranges covering input list of spans.
+// Returns the number of nodes that are leaseholders for those spans.
+func getRangesToProcess(
 	ctx context.Context, ds *kvcoord.DistSender, targetSpans []roachpb.Span,
-) ([]roachpb.Span, error) {
-	ranges, err := allRangeSpans(ctx, ds, targetSpans)
+) ([]roachpb.Span, int, error) {
+	ranges, numNodes, err := ds.AllRangeSpans(ctx, targetSpans)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	type spanMarker struct{}
@@ -207,7 +289,7 @@ func getSpansToProcess(
 		}
 		requests = append(requests, roachpb.Span{Key: chunk.Start, EndKey: chunk.End})
 	}
-	return requests, nil
+	return requests, numNodes, nil
 }
 
 // slurpScanResponse iterates the ScanResponse and inserts the contained kvs into
@@ -215,28 +297,24 @@ func getSpansToProcess(
 func slurpScanResponse(
 	ctx context.Context,
 	sink kvevent.Writer,
-	res *roachpb.ScanResponse,
-	ts hlc.Timestamp,
+	res *kvpb.ScanResponse,
+	backfillTS hlc.Timestamp,
 	withDiff bool,
 	span roachpb.Span,
 ) error {
+	var keyBytes, valBytes []byte
+	var ts hlc.Timestamp
+	var err error
 	for _, br := range res.BatchResponses {
 		for len(br) > 0 {
-			var kv roachpb.KeyValue
-			var err error
-			kv.Key, kv.Value.Timestamp, kv.Value.RawBytes, br, err = enginepb.ScanDecodeKeyValue(br)
+			keyBytes, ts, valBytes, br, err = enginepb.ScanDecodeKeyValue(br)
 			if err != nil {
 				return errors.Wrapf(err, `decoding changes for %s`, span)
 			}
-			var prevVal roachpb.Value
-			if withDiff {
-				// Include the same value for the "before" and "after" KV, but
-				// interpret them at different timestamp. Specifically, interpret
-				// the "before" KV at the timestamp immediately before the schema
-				// change. This is handled in kvsToRows.
-				prevVal = kv.Value
+			if log.V(3) {
+				log.Infof(ctx, "scanResponse: %s@%s", keys.PrettyPrint(nil, keyBytes), ts)
 			}
-			if err = sink.Add(ctx, kvevent.MakeKVEvent(kv, prevVal, ts)); err != nil {
+			if err = sink.Add(ctx, kvevent.NewBackfillKVEvent(keyBytes, ts, valBytes, withDiff, backfillTS)); err != nil {
 				return errors.Wrapf(err, `buffering changes for %s`, span)
 			}
 		}
@@ -244,65 +322,20 @@ func slurpScanResponse(
 	return nil
 }
 
-func allRangeSpans(
-	ctx context.Context, ds *kvcoord.DistSender, spans []roachpb.Span,
-) ([]roachpb.Span, error) {
-
-	ranges := make([]roachpb.Span, 0, len(spans))
-
-	it := kvcoord.NewRangeIterator(ds)
-
-	for i := range spans {
-		rSpan, err := keys.SpanAddr(spans[i])
-		if err != nil {
-			return nil, err
-		}
-		for it.Seek(ctx, rSpan.Key, kvcoord.Ascending); ; it.Next(ctx) {
-			if !it.Valid() {
-				return nil, it.Error()
-			}
-			ranges = append(ranges, roachpb.Span{
-				Key: it.Desc().StartKey.AsRawKey(), EndKey: it.Desc().EndKey.AsRawKey(),
-			})
-			if !it.NeedAnother(rSpan) {
-				break
-			}
-		}
-	}
-
-	return ranges, nil
-}
-
-// clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(gw gossip.OptionalGossip) int {
-	g, err := gw.OptionalErr(47971)
-	if err != nil {
-		// can't count nodes in tenants
-		return 1
-	}
-	var nodes int
-	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
-		nodes++
-		return nil
-	})
-	return nodes
-}
-
 // maxConcurrentScanRequests returns the number of concurrent scan requests.
-func maxConcurrentScanRequests(gw gossip.OptionalGossip, sv *settings.Values) int {
+func maxConcurrentScanRequests(numNodesHint int, sv *settings.Values) int {
 	// If the user specified ScanRequestLimit -- use that value.
 	if max := changefeedbase.ScanRequestLimit.Get(sv); max > 0 {
 		return int(max)
 	}
+	if numNodesHint < 1 {
+		return 1
+	}
 
-	// TODO(yevgeniy): Currently, issuing multiple concurrent updates scaled to the size of
-	//  the cluster only make sense for the core change feeds.  This configuration shoould
-	//  be specified explicitly when creating scanner.
-	nodes := clusterNodeCount(gw)
 	// This is all hand-wavy: 3 per node used to be the default for a very long time.
 	// However, this could get out of hand if the clusters are large.
 	// So cap the max to an arbitrary value of a 100.
-	max := 3 * nodes
+	max := 3 * numNodesHint
 	if max > 100 {
 		max = 100
 	}

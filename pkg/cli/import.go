@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -18,7 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -81,27 +76,29 @@ func setImportCLITestingKnobs() (importCLITestingKnobs, func()) {
 }
 
 func runDumpTableImport(cmd *cobra.Command, args []string) (resErr error) {
+	ctx := context.Background()
 	tableName := args[0]
 	importFormat := strings.ToLower(args[1])
 	source := args[2]
-	conn, err := makeSQLClient("cockroach import table", useDefaultDb)
+
+	conn, err := makeSQLClient(ctx, "cockroach import table", useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
-	ctx := context.Background()
 	return runImport(ctx, conn, importFormat, source, tableName, singleTable)
 }
 
 func runDumpFileImport(cmd *cobra.Command, args []string) (resErr error) {
+	ctx := context.Background()
 	importFormat := strings.ToLower(args[0])
 	source := args[1]
-	conn, err := makeSQLClient("cockroach import db", useDefaultDb)
+	conn, err := makeSQLClient(ctx, "cockroach import db", useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
-	ctx := context.Background()
+
 	return runImport(ctx, conn, importFormat, source, "", multiTable)
 }
 
@@ -111,7 +108,7 @@ func runImport(
 	importFormat, source, tableName string,
 	mode importMode,
 ) error {
-	if err := conn.EnsureConn(); err != nil {
+	if err := conn.EnsureConn(ctx); err != nil {
 		return err
 	}
 
@@ -120,7 +117,7 @@ func runImport(
 		return err
 	}
 
-	username, err := security.MakeSQLUsernameFromUserInput(connURL.User.Username(), security.UsernameCreation)
+	username, err := username.MakeSQLUsernameFromUserInput(connURL.User.Username(), username.PurposeCreation)
 	if err != nil {
 		return err
 	}
@@ -216,7 +213,7 @@ func runImport(
 		return nil
 	}
 
-	_, err = ex.ExecContext(ctx, importQuery, nil)
+	err = ex.Exec(ctx, importQuery)
 	if err != nil {
 		return err
 	}

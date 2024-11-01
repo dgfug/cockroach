@@ -1,40 +1,25 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
-import "math/bits"
+import (
+	"math/bits"
+	"unsafe"
+)
 
 // ordinal is used to correlate attributes in a schema.
 // It enables use of the ordinalSet.
-type ordinal uint64
-
-// attributesToOrdinals constructs a slice of ordinals and the corresponding
-// ordinalSet from a slice of Attr.
-func (sc *Schema) attributesToOrdinals(attrs []Attr) ([]ordinal, ordinalSet, error) {
-	var set ordinalSet
-	ret := make([]ordinal, len(attrs))
-	for i, a := range attrs {
-		ord, err := sc.getOrdinal(a)
-		if err != nil {
-			return nil, 0, err
-		}
-		set = set.add(ord)
-		ret[i] = ord
-	}
-	return ret, set, nil
-}
+type ordinal uint8
 
 // ordinalSet represents A bitmask over ordinals.
-// Note that it cannot contain attributes with ordinals greater than 64.
-type ordinalSet uint64
+// Note that it cannot contain attributes with ordinals greater than 30.
+type ordinalSet uint32
+
+const ordinalSetCapacity = (unsafe.Sizeof(ordinalSet(0)) * 8)
+const ordinalSetMaxOrdinal = ordinal(ordinalSetCapacity - 1)
 
 // ForEach iterates the set of attributes.
 func (m ordinalSet) forEach(f func(a ordinal) (wantMore bool)) {
@@ -80,5 +65,19 @@ func (m ordinalSet) union(other ordinalSet) ordinalSet {
 
 // len returns the number of ordinals in the set.
 func (m ordinalSet) len() int {
-	return bits.OnesCount64(uint64(m))
+	return bits.OnesCount32(uint32(m))
+}
+
+// rank returns the rank in the set of the passed ordinal.
+func (m ordinalSet) rank(a ordinal) int {
+	return bits.OnesCount32(uint32(m & ((1 << a) - 1)))
+}
+
+// isContainedIn returns true of m contains every element of other.
+func (m ordinalSet) isContainedIn(other ordinalSet) bool {
+	return other.intersection(m) == m
+}
+
+func (m ordinalSet) empty() bool {
+	return m == 0
 }

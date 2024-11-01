@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package util
 
@@ -16,7 +11,7 @@ import (
 	"math/bits"
 	"sort"
 
-	"golang.org/x/tools/container/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // FastIntMap is a replacement for map[int]int which is more efficient when both
@@ -68,7 +63,7 @@ func (m *FastIntMap) Unset(key int) {
 	delete(m.large, key)
 }
 
-// Get returns the current value mapped to key, or ok=false if the
+// Get returns the current value mapped to key, or (-1, false) if the
 // key is unmapped.
 func (m FastIntMap) Get(key int) (value int, ok bool) {
 	if m.large == nil {
@@ -78,8 +73,10 @@ func (m FastIntMap) Get(key int) (value int, ok bool) {
 		val := m.getSmallVal(uint32(key))
 		return int(val), (val != -1)
 	}
-	value, ok = m.large[key]
-	return value, ok
+	if value, ok = m.large[key]; ok {
+		return value, true
+	}
+	return -1, false
 }
 
 // GetDefault returns the current value mapped to key, or 0 if the key is
@@ -144,7 +141,7 @@ func (m FastIntMap) MaxKey() (_ int, ok bool) {
 }
 
 // MaxValue returns the maximum value that is in the map. If the map
-// is empty, returns ok=false.
+// is empty, returns (0, false).
 func (m FastIntMap) MaxValue() (_ int, ok bool) {
 	if m.large == nil {
 		// In the small case, all values are positive.
@@ -198,7 +195,9 @@ func (m FastIntMap) ForEach(fn func(key, val int)) {
 
 // ContentsIntoBuffer writes the contents of the map into the provided buffer in
 // the following format:
-//   key1:val1 key2:val2 ...
+//
+//	key1:val1 key2:val2 ...
+//
 // The keys are in ascending order.
 func (m FastIntMap) ContentsIntoBuffer(buf *bytes.Buffer) {
 	first := true
@@ -229,7 +228,9 @@ func (m FastIntMap) ContentsIntoBuffer(buf *bytes.Buffer) {
 }
 
 // String prints out the contents of the map in the following format:
-//   map[key1:val1 key2:val2 ...]
+//
+//	map[key1:val1 key2:val2 ...]
+//
 // The keys are in ascending order.
 func (m FastIntMap) String() string {
 	var buf bytes.Buffer

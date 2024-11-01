@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 #
 # reports.sh generates reports about the finite state machine.
 #
@@ -29,4 +35,4 @@ sed -e "s~{tmpl-full-pkg}~$full_pkg~"\
 # Run .go file to generate reports.
 diagram_file="$lower_type"_diagram.gv
 report_file="$lower_type"_report.txt
-go run "$write_reports" "$diagram_file" "$report_file" "$0 $*"
+go run "$write_reports" "$diagram_file" "$report_file"

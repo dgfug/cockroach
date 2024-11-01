@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package allccl
 
@@ -21,6 +18,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/geospatial"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/indexes"
+	_ "github.com/cockroachdb/cockroach/pkg/workload/insights"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/jsonload"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/kv"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ledger"
@@ -35,5 +33,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpccchecks"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpcds"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpch"
+	_ "github.com/cockroachdb/cockroach/pkg/workload/ttlbench"
+	_ "github.com/cockroachdb/cockroach/pkg/workload/ttllogger"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ycsb"
 )

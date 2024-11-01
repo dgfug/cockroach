@@ -208,27 +208,53 @@ build
 SELECT array_agg(NULL)
 ----
 error (42725): ambiguous call: array_agg(unknown), candidates are:
+array_agg(bool[]) -> bool[][]
 array_agg(box2d) -> box2d[]
+array_agg(box2d[]) -> box2d[][]
 array_agg(int) -> int[]
+array_agg(int[]) -> int[][]
 array_agg(float) -> float[]
+array_agg(float[]) -> float[][]
 array_agg(decimal) -> decimal[]
+array_agg(decimal[]) -> decimal[][]
 array_agg(date) -> date[]
+array_agg(date[]) -> date[][]
 array_agg(timestamp) -> timestamp[]
+array_agg(timestamp[]) -> timestamp[][]
 array_agg(interval) -> interval[]
+array_agg(interval[]) -> interval[][]
 array_agg(geography) -> geography[]
+array_agg(geography[]) -> geography[][]
 array_agg(geometry) -> geometry[]
+array_agg(geometry[]) -> geometry[][]
 array_agg(string) -> string[]
+array_agg(string[]) -> string[][]
 array_agg(bytes) -> bytes[]
+array_agg(bytes[]) -> bytes[][]
 array_agg(timestamptz) -> timestamptz[]
+array_agg(timestamptz[]) -> timestamptz[][]
 array_agg(oid) -> oid[]
+array_agg(oid[]) -> oid[][]
 array_agg(uuid) -> uuid[]
+array_agg(uuid[]) -> uuid[][]
 array_agg(inet) -> inet[]
+array_agg(inet[]) -> inet[][]
+array_agg(pg_lsn) -> pg_lsn[]
+array_agg(pg_lsn[]) -> pg_lsn[][]
+array_agg(refcursor) -> refcursor[]
+array_agg(refcursor[]) -> refcursor[][]
 array_agg(time) -> time[]
+array_agg(time[]) -> time[][]
 array_agg(timetz) -> timetz[]
+array_agg(timetz[]) -> timetz[][]
 array_agg(jsonb) -> jsonb[]
+array_agg(jsonb[]) -> jsonb[][]
 array_agg(varbit) -> varbit[]
+array_agg(varbit[]) -> varbit[][]
 array_agg(anyenum) -> anyenum[]
+array_agg(anyenum[]) -> anyenum[][]
 array_agg(tuple) -> tuple[]
+array_agg(tuple[]) -> tuple[][]
 array_agg(bool) -> bool[]
 
 # With an explicit cast, this works as expected.
@@ -2615,7 +2641,7 @@ sort
 
 # Grouping columns cannot be reused inside an aggregate input expression
 # because the aggregate input expressions and grouping expressions are
-# built as part of the same projection. 
+# built as part of the same projection.
 build
 SELECT max((k+v)/(k-v)) AS r, (k+v)*(k-v) AS s FROM kv GROUP BY k+v, k-v
 ----
@@ -3632,17 +3658,7 @@ scalar-group-by
 build
 SELECT array_agg(generate_series(1, 2))
 ----
-scalar-group-by
- ├── columns: array_agg:2
- ├── project-set
- │    ├── columns: generate_series:1
- │    ├── values
- │    │    └── ()
- │    └── zip
- │         └── generate_series(1, 2)
- └── aggregations
-      └── array-agg [as=array_agg:2]
-           └── generate_series:1
+error (0A000): array_agg(): set-returning functions are not allowed in aggregate
 
 # Regression test for #37317: duplicate column in GROUP BY
 build format=show-all
@@ -3663,14 +3679,14 @@ group-by (hash)
  ├── columns: firstcol:1(int!null) secondcol:2(int) thirdcol:2(int)
  ├── grouping columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
  ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
- ├── cost: 1155.01625
+ ├── cost: 1159.01625
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── interesting orderings: (+1)
  └── project
       ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
       ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
-      ├── cost: 1114.84
+      ├── cost: 1118.84
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── prune: (1,2)
@@ -3678,7 +3694,7 @@ group-by (hash)
       └── scan t.public.xyz
            ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int) t.public.xyz.z:3(float) t.public.xyz.crdb_internal_mvcc_timestamp:4(decimal) t.public.xyz.tableoid:5(oid)
            ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
-           ├── cost: 1104.82
+           ├── cost: 1108.82
            ├── key: (1)
            ├── fd: (1)-->(2-5)
            ├── prune: (1-5)
@@ -4023,7 +4039,7 @@ scalar-group-by
 build
 SELECT * FROM ROWS FROM (count(json_each('[]')))
 ----
-error (0A000): count(): json_each(): generator functions are not allowed in aggregate
+error (0A000): count(): json_each(): set-returning functions are not allowed in aggregate
 
 # Tests for projecting non-grouping columns when we group by a PK.
 build
@@ -4781,3 +4797,30 @@ project
                      │              └── unnest:2
                      └── projections
                           └── CASE WHEN arr:1 IS NULL THEN '[]' ELSE json_agg:3 END [as=json_agg:4]
+
+# Regression test for incorrectly ignoring NULLS LAST in aggregate functions (#91295).
+exec-ddl
+CREATE TABLE nulls_last_test (
+    id INT NULL
+)
+----
+
+build
+SELECT array_agg(id ORDER BY id NULLS LAST) FROM nulls_last_test
+----
+scalar-group-by
+ ├── columns: array_agg:6
+ ├── window partition=() ordering=+5,+1
+ │    ├── columns: id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4 column5:5!null array_agg:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4
+ │    │    ├── scan nulls_last_test
+ │    │    │    └── columns: id:1 rowid:2!null crdb_internal_mvcc_timestamp:3 tableoid:4
+ │    │    └── projections
+ │    │         └── id:1 IS NULL [as=column5:5]
+ │    └── windows
+ │         └── array-agg [as=array_agg:6, frame="range from unbounded to unbounded"]
+ │              └── id:1
+ └── aggregations
+      └── const-agg [as=array_agg:6]
+           └── array_agg:6

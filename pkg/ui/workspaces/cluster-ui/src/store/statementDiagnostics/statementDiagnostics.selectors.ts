@@ -1,50 +1,44 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import groupBy from "lodash/groupBy";
+import mapValues from "lodash/mapValues";
+import orderBy from "lodash/orderBy";
+import moment from "moment-timezone";
 import { createSelector } from "reselect";
-import { chain, orderBy } from "lodash";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { AppState } from "../reducers";
 
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { StatementDiagnosticsReport } from "../../api";
+import { AppState } from "../reducers";
 
 export const statementDiagnostics = createSelector(
   (state: AppState) => state.adminUI,
-  state => state.statementDiagnostics,
+  state => state?.statementDiagnostics,
 );
 
 export const selectStatementDiagnosticsReports = createSelector(
   statementDiagnostics,
-  state => state.data?.reports,
+  state => state.data,
 );
 
-type StatementDiagnosticsDictionary = {
-  [statementFingerprint: string]: IStatementDiagnosticsReport[];
+export type StatementDiagnosticsDictionary = {
+  [statementFingerprint: string]: StatementDiagnosticsReport[];
 };
 
 export const selectDiagnosticsReportsPerStatement = createSelector(
   selectStatementDiagnosticsReports,
   (
-    diagnosticsReports: IStatementDiagnosticsReport[],
-  ): StatementDiagnosticsDictionary =>
-    chain(diagnosticsReports)
-      .groupBy(diagnosticsReport => diagnosticsReport.statement_fingerprint)
-      // Perform DESC sorting to get latest report on top
-      .mapValues(diagnostics =>
-        orderBy(
-          diagnostics,
-          [d => d.requested_at.seconds.toNumber()],
-          ["desc"],
-        ),
-      )
-      .value(),
+    diagnosticsReports: StatementDiagnosticsReport[],
+  ): StatementDiagnosticsDictionary => {
+    const diagnosticsPerFingerprint = groupBy(
+      diagnosticsReports,
+      diagnosticsReport => diagnosticsReport.statement_fingerprint,
+    );
+    return mapValues(diagnosticsPerFingerprint, diagnostics =>
+      orderBy(diagnostics, [d => moment(d.requested_at).unix()], ["desc"]),
+    );
+  },
 );
 
 export const selectDiagnosticsReportsByStatementFingerprint = createSelector(

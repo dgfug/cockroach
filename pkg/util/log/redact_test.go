@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -18,12 +13,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const startRedactable = "‹"
@@ -41,7 +38,11 @@ func TestRedactedLogOutput(t *testing.T) {
 
 	defer TestingSetRedactable(false)()
 
-	Errorf(context.Background(), "test1 %v end", "hello")
+	ctx := context.Background()
+	sysIDPayload := testIDPayload{tenantID: "1"}
+	ctx = context.WithValue(ctx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
+
+	Errorf(ctx, "test1 %v end", "hello")
 	if contains(redactableIndicator, t) {
 		t.Errorf("expected no marker indicator, got %q", contents())
 	}
@@ -52,15 +53,15 @@ func TestRedactedLogOutput(t *testing.T) {
 	// markers are disabled.
 	resetCaptured()
 
-	Errorf(context.Background(), "test2 %v end", startRedactable+"hello"+endRedactable)
+	Errorf(ctx, "test2 %v end", startRedactable+"hello"+endRedactable)
 	if !contains("test2 ?hello? end", t) {
 		t.Errorf("expected escaped markers, got %q", contents())
 	}
 
 	resetCaptured()
 	_ = TestingSetRedactable(true)
-	Errorf(context.Background(), "test3 %v end", "hello")
-	if !contains(redactableIndicator+" [-] 3  test3", t) {
+	Errorf(ctx, "test3 %v end", "hello")
+	if !contains(redactableIndicator+" [T1] 3  test3", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3 "+startRedactable+"hello"+endRedactable+" end", t) {
@@ -69,10 +70,10 @@ func TestRedactedLogOutput(t *testing.T) {
 
 	// Verify that safe parts of errors don't get enclosed in redaction markers
 	resetCaptured()
-	Errorf(context.Background(), "test3e %v end",
+	Errorf(ctx, "test3e %v end",
 		errors.AssertionFailedf("hello %v",
-			errors.Newf("error-in-error %s", "world")))
-	if !contains(redactableIndicator+" [-] 4  test3e", t) {
+			errors.Newf("error-in-error %s", "world"))) // nolint:errwrap
+	if !contains(redactableIndicator+" [T1] 4  test3e", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3e hello error-in-error "+startRedactable+"world"+endRedactable+" end", t) {
@@ -83,7 +84,7 @@ func TestRedactedLogOutput(t *testing.T) {
 	resetCaptured()
 
 	const specialString = "x" + startRedactable + "hello" + endRedactable + "y"
-	Errorf(context.Background(), "test4 %v end", specialString)
+	Errorf(ctx, "test4 %v end", specialString)
 	if contains(specialString, t) {
 		t.Errorf("expected markers to be removed, got %q", contents())
 	}
@@ -92,36 +93,53 @@ func TestRedactedLogOutput(t *testing.T) {
 	}
 }
 
-func quote(s string) string {
-	return startRedactable + s + endRedactable
-}
-
-// TestRedactTags ensure that context tags can be redacted.
-func TestRedactTags(t *testing.T) {
-	baseCtx := context.Background()
-
-	testData := []struct {
-		ctx      context.Context
-		expected string
+func TestSafeManaged(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := ScopeWithoutShowLogs(t)
+	defer s.Close(t)
+	tests := []struct {
+		name                          string
+		arg                           interface{}
+		expected                      redact.RedactableString
+		redactionPolicyManagedEnabled bool
 	}{
-		{baseCtx, ""},
-		{logtags.AddTag(baseCtx, "k", nil), "k"},
-		{logtags.AddTag(baseCtx, "k", redact.Unsafe(123)), "k" + quote("123") + ""},
-		{logtags.AddTag(baseCtx, "k", 123), "k123"},
-		{logtags.AddTag(baseCtx, "k", redact.Safe(123)), "k123"},
-		{logtags.AddTag(baseCtx, "k", startRedactable), "k" + quote(escapeMark) + ""},
-		{logtags.AddTag(baseCtx, "kg", redact.Unsafe(123)), "kg=" + quote("123") + ""},
-		{logtags.AddTag(baseCtx, "kg", 123), "kg=123"},
-		{logtags.AddTag(baseCtx, "kg", redact.Safe(123)), "kg=123"},
-		{logtags.AddTag(logtags.AddTag(baseCtx, "k", nil), "n", redact.Unsafe(55)), "k,n" + quote("55") + ""},
-		{logtags.AddTag(logtags.AddTag(baseCtx, "k", nil), "n", 55), "k,n55"},
-		{logtags.AddTag(logtags.AddTag(baseCtx, "k", nil), "n", redact.Safe(55)), "k,n55"},
+		{
+			name:                          "redacts when not in redaction policy managed mode",
+			arg:                           "some value",
+			expected:                      redact.Sprint("some value"),
+			redactionPolicyManagedEnabled: false,
+		},
+		{
+			name:                          "marks safe when in redaction policy managed mode",
+			arg:                           "some value",
+			expected:                      redact.Sprint(redact.Safe("some value")),
+			redactionPolicyManagedEnabled: true,
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reassign `RedactionPolicyManaged` var manually because it's not possible to use
+			// testutils.TestingHook due to circular dependency.
+			initRedactionPolicyManaged := RedactionPolicyManaged
+			RedactionPolicyManaged = tc.redactionPolicyManagedEnabled
+			defer func() {
+				RedactionPolicyManaged = initRedactionPolicyManaged
+			}()
 
-	for _, tc := range testData {
-		tags := logtags.FromContext(tc.ctx)
-		actual := renderTagsAsRedactable(tags)
-		assert.Equal(t, tc.expected, string(actual))
+			TestingResetActive()
+			cfg := logconfig.DefaultConfig()
+			if err := cfg.Validate(&s.logDir); err != nil {
+				t.Fatal(err)
+			}
+			cleanupFn, err := ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanupFn()
+
+			require.Equal(t, logging.hasManagedRedactionPolicy(), tc.redactionPolicyManagedEnabled)
+			require.Equal(t, tc.expected, redact.Sprint(SafeManaged(tc.arg)))
+		})
 	}
 }
 
@@ -154,17 +172,14 @@ func TestRedactedDecodeFile(t *testing.T) {
 			Infof(context.Background(), "marker: this is safe, stray marks ‹›, %s", "this is not safe")
 
 			// Retrieve the log writer and log location for this test.
-			info, ok := debugLog.getFileSink().mu.file.(*syncBuffer)
-			if !ok {
-				t.Fatalf("buffer wasn't created")
-			}
+			debugSink := debugLog.getFileSink()
+			fileName := debugSink.getFileName(t)
+
 			// Ensure our log message above made it to the file.
-			if err := info.Flush(); err != nil {
-				t.Fatal(err)
-			}
+			debugSink.lockAndFlushAndMaybeSync(false)
 
 			// Prepare reading the entries from the file.
-			infoName := filepath.Base(info.file.Name())
+			infoName := filepath.Base(fileName)
 			reader, err := GetLogReader(infoName)
 			if err != nil {
 				t.Fatal(err)

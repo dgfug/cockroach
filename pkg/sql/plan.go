@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,15 +9,17 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/errors"
 )
 
 // runParams is a struct containing all parameters passed to planNode.Next() and
@@ -41,8 +38,8 @@ type runParams struct {
 }
 
 // EvalContext() gives convenient access to the runParam's EvalContext().
-func (r *runParams) EvalContext() *tree.EvalContext {
-	return &r.extendedEvalCtx.EvalContext
+func (r *runParams) EvalContext() *eval.Context {
+	return &r.extendedEvalCtx.Context
 }
 
 // SessionData gives convenient access to the runParam's SessionData.
@@ -57,7 +54,7 @@ func (r *runParams) ExecCfg() *ExecutorConfig {
 
 // Ann is a shortcut for the Annotations from the eval context.
 func (r *runParams) Ann() *tree.Annotations {
-	return r.extendedEvalCtx.EvalContext.Annotations
+	return r.extendedEvalCtx.Context.Annotations
 }
 
 // planNode defines the interface for executing a query or portion of a query.
@@ -69,7 +66,6 @@ func (r *runParams) Ann() *tree.Annotations {
 // - planNodeNames                 (walk.go)
 // - setLimitHint()                (limit_hint.go)
 // - planColumns()                 (plan_columns.go)
-//
 type planNode interface {
 	startExec(params runParams) error
 
@@ -147,6 +143,7 @@ type planNodeReadingOwnWrites interface {
 }
 
 var _ planNode = &alterIndexNode{}
+var _ planNode = &alterIndexVisibleNode{}
 var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
@@ -156,8 +153,10 @@ var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
 var _ planNode = &cancelQueriesNode{}
 var _ planNode = &cancelSessionsNode{}
-var _ planNode = &changePrivilegesNode{}
+var _ planNode = &changeDescriptorBackedPrivilegesNode{}
+var _ planNode = &completionsNode{}
 var _ planNode = &createDatabaseNode{}
+var _ planNode = &createFunctionNode{}
 var _ planNode = &createIndexNode{}
 var _ planNode = &createSequenceNode{}
 var _ planNode = &createStatsNode{}
@@ -195,11 +194,11 @@ var _ planNode = &reassignOwnedByNode{}
 var _ planNode = &refreshMaterializedViewNode{}
 var _ planNode = &recursiveCTENode{}
 var _ planNode = &relocateNode{}
+var _ planNode = &relocateRange{}
 var _ planNode = &renameColumnNode{}
 var _ planNode = &renameDatabaseNode{}
 var _ planNode = &renameIndexNode{}
 var _ planNode = &renameTableNode{}
-var _ planNode = &reparentDatabaseNode{}
 var _ planNode = &renderNode{}
 var _ planNode = &RevokeRoleNode{}
 var _ planNode = &rowCountNode{}
@@ -237,17 +236,17 @@ var _ planNodeReadingOwnWrites = &alterSchemaNode{}
 var _ planNodeReadingOwnWrites = &alterSequenceNode{}
 var _ planNodeReadingOwnWrites = &alterTableNode{}
 var _ planNodeReadingOwnWrites = &alterTypeNode{}
+var _ planNodeReadingOwnWrites = &createFunctionNode{}
 var _ planNodeReadingOwnWrites = &createIndexNode{}
 var _ planNodeReadingOwnWrites = &createSequenceNode{}
 var _ planNodeReadingOwnWrites = &createDatabaseNode{}
 var _ planNodeReadingOwnWrites = &createTableNode{}
 var _ planNodeReadingOwnWrites = &createTypeNode{}
 var _ planNodeReadingOwnWrites = &createViewNode{}
-var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &changeDescriptorBackedPrivilegesNode{}
 var _ planNodeReadingOwnWrites = &dropSchemaNode{}
 var _ planNodeReadingOwnWrites = &dropTypeNode{}
 var _ planNodeReadingOwnWrites = &refreshMaterializedViewNode{}
-var _ planNodeReadingOwnWrites = &reparentDatabaseNode{}
 var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
@@ -300,16 +299,14 @@ type planTop struct {
 	planComponents
 
 	// mem/catalog retains the memo and catalog that were used to create the
-	// plan. Only set if needed by instrumentation (see ShouldSaveMemo).
+	// plan. Set unconditionally but used only by instrumentation (in order to
+	// build the stmt bundle).
 	mem     *memo.Memo
-	catalog *optCatalog
+	catalog optPlanningCatalog
 
-	// auditEvents becomes non-nil if any of the descriptors used by
-	// current statement is causing an auditing event. See exec_log.go.
-	auditEvents []auditEvent
-
-	// flags is populated during planning and execution.
-	flags planFlags
+	// auditEventBuilders becomes non-nil if the current statement
+	// is eligible for auditing (see sql/audit_logging.go)
+	auditEventBuilders []auditlogging.AuditEventBuilder
 
 	// avoidBuffering, when set, causes the execution to avoid buffering
 	// results.
@@ -332,6 +329,8 @@ type physicalPlanTop struct {
 	// closed explicitly since we don't have a planNode tree that performs the
 	// closure.
 	planNodesToClose []planNode
+	// onClose, if non-nil, will be called when closing this object.
+	onClose func()
 }
 
 func (p *physicalPlanTop) Close(ctx context.Context) {
@@ -339,6 +338,10 @@ func (p *physicalPlanTop) Close(ctx context.Context) {
 		plan.Close(ctx)
 	}
 	p.planNodesToClose = nil
+	if p.onClose != nil {
+		p.onClose()
+		p.onClose = nil
+	}
 }
 
 // planMaybePhysical is a utility struct representing a plan. It can currently
@@ -412,6 +415,9 @@ type planComponents struct {
 	// subqueryPlans contains all the sub-query plans.
 	subqueryPlans []subquery
 
+	// flags is populated during planning and execution.
+	flags planFlags
+
 	// plan for the main query.
 	main planMaybePhysical
 
@@ -420,17 +426,20 @@ type planComponents struct {
 	mainRowCount int64
 
 	// cascades contains metadata for all cascades.
-	cascades []cascadeMetadata
+	cascades []postQueryMetadata
 
 	// checkPlans contains all the plans for queries that are to be executed after
 	// the main query (for example, foreign key checks).
 	checkPlans []checkPlan
+
+	// triggers contains metadata for all triggers.
+	triggers []postQueryMetadata
 }
 
-type cascadeMetadata struct {
-	exec.Cascade
-	// plan for the cascade. This plan is not populated upfront; it is created
-	// only when it needs to run, after the main query (and previous cascades).
+type postQueryMetadata struct {
+	exec.PostQuery
+	// plan for the cascade/triggers. This plan is not populated upfront; it is
+	// created only when it needs to run, after the main query.
 	plan planMaybePhysical
 }
 
@@ -452,6 +461,9 @@ func (p *planComponents) close(ctx context.Context) {
 	for i := range p.checkPlans {
 		p.checkPlans[i].plan.Close(ctx)
 	}
+	for i := range p.triggers {
+		p.triggers[i].plan.Close(ctx)
+	}
 }
 
 // init resets planTop to point to a given statement; used at the start of the
@@ -463,16 +475,10 @@ func (p *planTop) init(stmt *Statement, instrumentation *instrumentationHelper) 
 	}
 }
 
-// close ensures that the plan's resources have been deallocated.
-func (p *planTop) close(ctx context.Context) {
-	if p.flags.IsSet(planFlagExecDone) {
-		p.savePlanInfo(ctx)
-	}
-	p.planComponents.close(ctx)
-}
-
-// savePlanInfo uses p.explainPlan to populate the plan string and/or tree.
-func (p *planTop) savePlanInfo(ctx context.Context) {
+// savePlanInfo updates the instrumentationHelper with information about how the
+// plan was executed.
+// NB: should only be called _after_ the execution of the plan has completed.
+func (p *planTop) savePlanInfo() {
 	vectorized := p.flags.IsSet(planFlagVectorized)
 	distribution := physicalplan.LocalPlan
 	if p.flags.IsSet(planFlagFullyDistributed) {
@@ -480,7 +486,12 @@ func (p *planTop) savePlanInfo(ctx context.Context) {
 	} else if p.flags.IsSet(planFlagPartiallyDistributed) {
 		distribution = physicalplan.PartiallyDistributedPlan
 	}
-	p.instrumentation.RecordPlanInfo(distribution, vectorized)
+	containsMutation := p.flags.IsSet(planFlagContainsMutation)
+	generic := p.flags.IsSet(planFlagGeneric)
+	optimized := p.flags.IsSet(planFlagOptimized)
+	p.instrumentation.RecordPlanInfo(
+		distribution, vectorized, containsMutation, generic, optimized,
+	)
 }
 
 // startExec calls startExec() on each planNode using a depth-first, post-order
@@ -524,27 +535,35 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
-		if fn, header, subplans, avoidBuffering, err := planHook(ctx, stmt, p); err != nil {
+
+		// If we don't have placeholder, we know we're just doing prepare and we
+		// should type check instead of doing the actual planning.
+		if !p.EvalContext().HasPlaceholders() {
+			matched, header, err := planHook.typeCheck(ctx, stmt, p)
+			if err != nil {
+				return nil, err
+			}
+			if !matched {
+				continue
+			}
+			return newHookFnNode(planHook.name, func(ctx context.Context, nodes []planNode, datums chan<- tree.Datums) error {
+				return errors.AssertionFailedf(
+					"cannot execute prepared %v statement",
+					planHook.name,
+				)
+			}, header, nil /* subplans */, p.execCfg.Stopper), nil
+		}
+
+		if fn, header, subplans, avoidBuffering, err := planHook.fn(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
 			if avoidBuffering {
 				p.curPlan.avoidBuffering = true
 			}
-			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
+			return newHookFnNode(planHook.name, fn, header, subplans, p.execCfg.Stopper), nil
 		}
 	}
 	return nil, nil
-}
-
-// Mark transaction as operating on the system DB if the descriptor id
-// is within the SystemConfig range.
-func (p *planner) maybeSetSystemConfig(id descpb.ID) error {
-	if !descpb.IsSystemConfigID(id) {
-		return nil
-	}
-	// Mark transaction as operating on the system DB.
-	// Only the system tenant marks the SystemConfigTrigger.
-	return p.txn.SetSystemConfigTrigger(p.execCfg.Codec.ForSystemTenant())
 }
 
 // planFlags is used throughout the planning code to keep track of various
@@ -571,9 +590,6 @@ const (
 	// planFlagNotDistributed is set if the query execution is not distributed.
 	planFlagNotDistributed
 
-	// planFlagExecDone marks that execution has been completed.
-	planFlagExecDone
-
 	// planFlagImplicitTxn marks that the plan was run inside of an implicit
 	// transaction.
 	planFlagImplicitTxn
@@ -585,47 +601,69 @@ const (
 	// engine.
 	planFlagVectorized
 
-	// planFlagTenant is set if the plan is executed on behalf of a tenant.
-	planFlagTenant
-
 	// planFlagContainsFullTableScan is set if the plan involves an unconstrained
 	// scan on (the primary key of) a table. This could be an unconstrained scan
-	// of any cardinality.
+	// of any cardinality. Full scans of virtual tables are ignored.
 	planFlagContainsFullTableScan
 
 	// planFlagContainsFullIndexScan is set if the plan involves an unconstrained
 	// non-partial secondary index scan. This could be an unconstrainted scan of
-	// any cardinality.
+	// any cardinality. Full scans of virtual tables are ignored.
 	planFlagContainsFullIndexScan
 
 	// planFlagContainsLargeFullTableScan is set if the plan involves an
 	// unconstrained scan on (the primary key of) a table estimated to read more
-	// than large_full_scan_rows (or without available stats).
+	// than large_full_scan_rows (or without available stats). Large scans of
+	// virtual tables are ignored.
 	planFlagContainsLargeFullTableScan
 
 	// planFlagContainsLargeFullIndexScan is set if the plan involves an
 	// unconstrained non-partial secondary index scan estimated to read more than
-	// large_full_scan_rows (or without available stats).
+	// large_full_scan_rows (or without available stats). Large scans of virtual
+	// tables are ignored.
 	planFlagContainsLargeFullIndexScan
 
 	// planFlagContainsMutation is set if the plan has any mutations.
 	planFlagContainsMutation
+
+	// planFlagContainsLocking is set if the plan has a node with locking.
+	planFlagContainsLocking
+
+	// planFlagCheckContainsLocking is set if at least one check plan has a node
+	// with locking.
+	planFlagCheckContainsLocking
+
+	// planFlagSessionMigration is set if the plan is being created during
+	// a session migration.
+	planFlagSessionMigration
+
+	// planFlagGeneric is set if a generic query plan was used. A generic query
+	// plan is a plan that is fully-optimized once and can be reused without
+	// being re-optimized.
+	planFlagGeneric
+
+	// planFlagOptimized is set if optimization was performed during the
+	// current execution of the query.
+	planFlagOptimized
 )
 
-func (pf planFlags) IsSet(flag planFlags) bool {
-	return (pf & flag) != 0
+// IsSet returns true if the receiver has all of the given flags set.
+func (pf planFlags) IsSet(flags planFlags) bool {
+	return (pf & flags) == flags
 }
 
-func (pf *planFlags) Set(flag planFlags) {
-	*pf |= flag
+// Set sets all of the given flags in the receiver.
+func (pf *planFlags) Set(flags planFlags) {
+	*pf |= flags
 }
 
-func (pf *planFlags) Unset(flag planFlags) {
-	*pf &= ^flag
+// Unset unsets all of the given flags in the receiver.
+func (pf *planFlags) Unset(flags planFlags) {
+	*pf &^= flags
 }
 
 // IsDistributed returns true if either the fully or the partially distributed
 // flags is set.
 func (pf planFlags) IsDistributed() bool {
-	return pf.IsSet(planFlagFullyDistributed) || pf.IsSet(planFlagPartiallyDistributed)
+	return pf&(planFlagFullyDistributed|planFlagPartiallyDistributed) != 0
 }

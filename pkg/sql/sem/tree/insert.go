@@ -7,13 +7,8 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -52,6 +47,10 @@ func (node *Insert) Format(ctx *FmtCtx) {
 	}
 	if node.OnConflict != nil && !node.OnConflict.IsUpsertAlias() {
 		ctx.WriteString(" ON CONFLICT")
+		if node.OnConflict.Constraint != "" {
+			ctx.WriteString(" ON CONSTRAINT ")
+			ctx.FormatNode(&node.OnConflict.Constraint)
+		}
 		if len(node.OnConflict.Columns) > 0 {
 			ctx.WriteString(" (")
 			ctx.FormatNode(&node.OnConflict.Columns)
@@ -90,7 +89,14 @@ func (node *Insert) DefaultValues() bool {
 // uses the primary key for as the conflict index and the values being inserted
 // for Exprs.
 type OnConflict struct {
-	Columns          NameList
+	// At most one of Columns and Constraint will be set at once.
+	// Columns is the list of arbiter columns, if set, that the user specified
+	// in the ON CONFLICT (columns) list.
+	Columns NameList
+	// Constraint is the name of a table constraint that the user specified to
+	// get the list of arbiter columns from, in the ON CONFLICT ON CONSTRAINT
+	// form.
+	Constraint       Name
 	ArbiterPredicate Expr
 	Exprs            UpdateExprs
 	Where            *Where
@@ -99,5 +105,6 @@ type OnConflict struct {
 
 // IsUpsertAlias returns true if the UPSERT syntactic sugar was used.
 func (oc *OnConflict) IsUpsertAlias() bool {
-	return oc != nil && oc.Columns == nil && oc.ArbiterPredicate == nil && oc.Exprs == nil && oc.Where == nil && !oc.DoNothing
+	return oc != nil && oc.Columns == nil && oc.Constraint == "" &&
+		oc.ArbiterPredicate == nil && oc.Exprs == nil && oc.Where == nil && !oc.DoNothing
 }

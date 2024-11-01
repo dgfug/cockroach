@@ -1,27 +1,24 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import _ from "lodash";
+import { Tooltip } from "@cockroachlabs/ui-components";
+import classNames from "classnames/bind";
+import { History } from "history";
+import orderBy from "lodash/orderBy";
+import times from "lodash/times";
 import * as Long from "long";
-import { Moment } from "moment";
+import { Moment } from "moment-timezone";
+import React from "react";
 import { createSelector } from "reselect";
 
-import times from "lodash/times";
 import { EmptyPanel, EmptyPanelProps } from "../empty";
+
 import styles from "./sortedtable.module.scss";
-import classNames from "classnames/bind";
-import { TableSpinner } from "./tableSpinner";
 import { TableHead } from "./tableHead";
 import { TableRow } from "./tableRow";
-import { Tooltip } from "@cockroachlabs/ui-components";
+import { TableSpinner } from "./tableSpinner";
 
 export interface ISortedTablePagination {
   current: number;
@@ -35,6 +32,9 @@ export interface ISortedTablePagination {
 export interface ColumnDescriptor<T> {
   // Title string that should appear in the header column.
   title: React.ReactNode;
+  // Hides the dashed title underline, which represents that a tooltip exists.
+  // Defaults to false and shows the underline if not defined.
+  hideTitleUnderline?: boolean;
   // Function which generates the contents of an individual cell in this table.
   cell: (obj: T) => React.ReactNode;
   // Function which returns a value that can be used to sort the collection of
@@ -78,6 +78,8 @@ interface SortedTableProps<T> {
   onChangeSortSetting?: { (ss: SortSetting): void };
   // className to be applied to the table element.
   className?: string;
+  // tableWrapperClassName is a class name applied to table wrapper.
+  tableWrapperClassName?: string;
   // A function that returns the class to apply to a given row.
   rowClass?: (obj: T) => string;
 
@@ -97,6 +99,7 @@ interface SortedTableProps<T> {
   pagination?: ISortedTablePagination;
   loading?: boolean;
   loadingLabel?: string;
+  disableSortSizeLimit?: number;
   // empty state for table
   empty?: boolean;
   emptyProps?: EmptyPanelProps;
@@ -127,6 +130,9 @@ const cx = classNames.bind(styles);
 export interface SortableColumn {
   // Text that will appear in the title header of the table.
   title: React.ReactNode;
+  // Hides the dashed title underline, which represents that a tooltip exists.
+  // Defaults to false and shows the underline if not defined.
+  hideTitleUnderline?: boolean;
   // Function which provides the contents for this column for a given row index
   // in the dataset.
   cell: (rowIndex: number) => React.ReactNode;
@@ -135,7 +141,7 @@ export interface SortableColumn {
   // Unique key that identifies this column from others, for the purpose of
   // indicating sort order. If not provided, the column is not considered
   // sortable.
-  columnTitle?: any;
+  columnTitle?: string;
   // className is a classname to apply to the td elements
   className?: string;
   titleAlign?: "left" | "right" | "center";
@@ -179,8 +185,8 @@ export class SortedTable<T> extends React.Component<
   SortedTableProps<T>,
   SortedTableState
 > {
-  static defaultProps: Partial<SortedTableProps<any>> = {
-    rowClass: (_obj: any) => "",
+  static defaultProps: Partial<SortedTableProps<unknown>> = {
+    rowClass: (_obj: unknown) => "",
     columns: [],
     sortSetting: {
       ascending: false,
@@ -193,14 +199,12 @@ export class SortedTable<T> extends React.Component<
     (props: SortedTableProps<T>) => props.data,
     (props: SortedTableProps<T>) => props.columns,
     (data: T[], columns: ColumnDescriptor<T>[]) => {
-      return columns.map(
-        (c): React.ReactNode => {
-          if (c.rollup) {
-            return c.rollup(data);
-          }
-          return undefined;
-        },
-      );
+      return columns.map((c): React.ReactNode => {
+        if (c.rollup) {
+          return c.rollup(data);
+        }
+        return undefined;
+      });
     },
   );
 
@@ -213,21 +217,25 @@ export class SortedTable<T> extends React.Component<
       data: T[],
       sortSetting: SortSetting,
       columns: ColumnDescriptor<T>[],
-      pagination?: ISortedTablePagination,
+      _pagination?: ISortedTablePagination,
     ): T[] => {
       if (!sortSetting) {
         return this.paginatedData();
       }
+
+      if (
+        this.props.disableSortSizeLimit &&
+        data.length > this.props.disableSortSizeLimit
+      ) {
+        return this.paginatedData();
+      }
+
       const sortColumn = columns.find(c => c.name === sortSetting.columnTitle);
       if (!sortColumn || !sortColumn.sort) {
         return this.paginatedData();
       }
       return this.paginatedData(
-        _.orderBy(
-          data,
-          sortColumn.sort,
-          sortSetting.ascending ? "asc" : "desc",
-        ),
+        orderBy(data, sortColumn.sort, sortSetting.ascending ? "asc" : "desc"),
       );
     },
   );
@@ -246,19 +254,22 @@ export class SortedTable<T> extends React.Component<
       rollups: React.ReactNode[],
       columns: ColumnDescriptor<T>[],
     ) => {
-      return columns.map(
-        (cd, ii): SortableColumn => {
-          return {
-            name: cd.name,
-            title: cd.title,
-            cell: index => cd.cell(sorted[index]),
-            columnTitle: cd.sort ? cd.name : undefined,
-            rollup: rollups[ii],
-            className: cd.className,
-            titleAlign: cd.titleAlign,
-          };
-        },
-      );
+      const sort =
+        !this.props.disableSortSizeLimit ||
+        this.props.data.length <= this.props.disableSortSizeLimit;
+
+      return columns.map((cd, ii): SortableColumn => {
+        return {
+          name: cd.name,
+          title: cd.title,
+          hideTitleUnderline: cd.hideTitleUnderline,
+          cell: index => cd.cell(sorted[index]),
+          columnTitle: sort && cd.sort ? cd.name : undefined,
+          rollup: rollups[ii],
+          className: cd.className,
+          titleAlign: cd.titleAlign,
+        };
+      });
     },
   );
 
@@ -319,7 +330,7 @@ export class SortedTable<T> extends React.Component<
     return sortData ? sortData.slice(start, end) : data.slice(start, end);
   };
 
-  render() {
+  render(): React.ReactElement {
     const {
       data,
       loading,
@@ -331,6 +342,7 @@ export class SortedTable<T> extends React.Component<
       empty,
       emptyProps,
       className,
+      tableWrapperClassName,
     } = this.props;
     let expandableConfig: ExpandableConfig = null;
     if (this.props.expandableConfig) {
@@ -344,7 +356,7 @@ export class SortedTable<T> extends React.Component<
     const count = data ? this.paginatedData().length : 0;
     const columns = this.columns(this.props);
     const rowClass = this.rowClass(this.props);
-    const tableWrapperClass = cx("cl-table-wrapper");
+    const tableWrapperClass = cx("cl-table-wrapper", tableWrapperClassName);
     const tableStyleClass = cx("sort-table", className);
     const noResultsClass = cx("table__no-results");
 
@@ -397,7 +409,10 @@ export class SortedTable<T> extends React.Component<
  * @param maxLength the max length to which it should display value
  * and hide the remaining.
  */
-export function longListWithTooltip(value: string, maxLength: number) {
+export function longListWithTooltip(
+  value: string,
+  maxLength: number,
+): React.ReactElement {
   const summary =
     value.length > maxLength ? value.slice(0, maxLength) + "..." : value;
   return (
@@ -411,3 +426,83 @@ export function longListWithTooltip(value: string, maxLength: number) {
     </Tooltip>
   );
 }
+
+/**
+ * Get Sort Setting from Query String and if it's different from current
+ * sortSetting calls the onSortChange function.
+ * @param page the page where the table was added (used for analytics)
+ * @param queryString searchParams
+ * @param sortSetting the current sort Setting on the page
+ * @param onSortingChange function to be called if the values from the search
+ * params are different from the current ones. This function can update
+ * the value stored on localStorage for example.
+ */
+export const handleSortSettingFromQueryString = (
+  page: string,
+  queryString: string,
+  sortSetting: SortSetting,
+  onSortingChange: (
+    name: string,
+    columnTitle: string,
+    ascending: boolean,
+  ) => void,
+): void => {
+  const searchParams = new URLSearchParams(queryString);
+  const ascending = (searchParams.get("ascending") || undefined) === "true";
+  const columnTitle = searchParams.get("columnTitle") || undefined;
+  if (
+    onSortingChange &&
+    columnTitle &&
+    (sortSetting.columnTitle !== columnTitle ||
+      sortSetting.ascending !== ascending)
+  ) {
+    onSortingChange(page, columnTitle, ascending);
+  }
+};
+
+/**
+ * Update the query params to the current values of the Sort Setting.
+ * When we change tabs inside the SQL Activity page for example,
+ * the constructor is called only on the first time.
+ * The component update event is called frequently and can be used to
+ * update the query params by using this function that only updates
+ * the query params if the values did change and we're on the correct tab.
+ * @param tab which the query params should update
+ * @param sortSetting the current sort settings
+ * @param defaultSortSetting the default sort settings
+ * @param history
+ */
+export const updateSortSettingQueryParamsOnTab = (
+  tab: string,
+  sortSetting: SortSetting,
+  defaultSortSetting: SortSetting,
+  history: History,
+): void => {
+  const searchParams = new URLSearchParams(history.location.search);
+  const currentTab = searchParams.get("tab") || "";
+  const ascending =
+    (searchParams.get("ascending") ||
+      defaultSortSetting.ascending.toString()) === "true";
+  const columnTitle =
+    searchParams.get("columnTitle") || defaultSortSetting.columnTitle;
+  if (
+    currentTab === tab &&
+    (sortSetting.columnTitle !== columnTitle ||
+      sortSetting.ascending !== ascending)
+  ) {
+    const params = {
+      ascending: sortSetting.ascending.toString(),
+      columnTitle: sortSetting.columnTitle,
+    };
+    const nextSearchParams = new URLSearchParams(history.location.search);
+    Object.entries(params).forEach(([key, value]) => {
+      if (!value) {
+        nextSearchParams.delete(key);
+      } else {
+        nextSearchParams.set(key, value);
+      }
+    });
+    history.location.search = nextSearchParams.toString();
+    history.replace(history.location);
+  }
+};

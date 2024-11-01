@@ -1,18 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
 import (
+	"math"
+
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/r3"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
@@ -46,14 +44,14 @@ func Centroid(g geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (geo.Geo
 	switch geomRepr.(type) {
 	case *geom.Point, *geom.LineString, *geom.Polygon, *geom.MultiPoint, *geom.MultiLineString, *geom.MultiPolygon:
 	default:
-		return geo.Geography{}, errors.Newf("unhandled geography type %s", g.ShapeType().String())
+		return geo.Geography{}, pgerror.Newf(pgcode.InvalidParameterValue, "unhandled geography type %s", g.ShapeType().String())
 	}
 
 	regions, err := geo.S2RegionsFromGeomT(geomRepr, geo.EmptyBehaviorOmit)
 	if err != nil {
 		return geo.Geography{}, err
 	}
-	spheroid, err := g.Spheroid()
+	spheroid, err := spheroidFromGeography(g)
 	if err != nil {
 		return geo.Geography{}, err
 	}
@@ -119,4 +117,21 @@ func Centroid(g geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (geo.Geo
 	latLng := s2.LatLngFromPoint(s2.Point{Vector: centroidVector.Normalize()})
 	centroid := geom.NewPointFlat(geom.XY, []float64{latLng.Lng.Degrees(), latLng.Lat.Degrees()}).SetSRID(int(g.SRID()))
 	return geo.MakeGeographyFromGeomT(centroid)
+}
+
+// BoundingBoxHasNaNCoordinates checks if the bounding box of a Geography
+// has a NaN coordinate.
+func BoundingBoxHasNaNCoordinates(g geo.Geography) bool {
+	boundingBox := g.BoundingBoxRef()
+	if boundingBox == nil {
+		return false
+	}
+	// Don't use `:= range []float64{...}` to avoid memory allocation.
+	isNaN := func(ord float64) bool {
+		return math.IsNaN(ord)
+	}
+	if isNaN(boundingBox.LoX) || isNaN(boundingBox.LoY) || isNaN(boundingBox.HiX) || isNaN(boundingBox.HiY) {
+		return true
+	}
+	return false
 }

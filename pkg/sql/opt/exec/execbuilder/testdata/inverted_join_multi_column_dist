@@ -78,12 +78,12 @@ ALTER TABLE j2 EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 44), (ARRA
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder
-FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE j2] ORDER BY lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE j2 WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-NULL       /44      {1}       1
-/44        /88      {2}       2
-/88        NULL     {3}       3
+start_key           end_key       replicas  lease_holder
+<before:/Table/67>  …/1/44        {1}       1
+…/1/44              …/1/88        {2}       2
+…/1/88              <after:/Max>  {3}       3
 
 # This query performs an inverted join.
 query T
@@ -115,7 +115,7 @@ vectorized: true
             └── • values
                   size: 1 column, 2 rows
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk11vmzAUhu_3K47OVbJ6DRhIJa7cLkzNlCUdifahDU0sHLWQ1GY2TJmi_PcJ0jVNVti4tH0evw_wskXzY40-Bp9uJpfjKfRG4_li_n7Sh3kwCV4v4CW8CWfvIOMizb6lyYZBZsPH6yAMoJdCRXAGTr8Pl9MR9DJ-noH4WlqWQ5DZ51kfZuEoCOHqc7VcMcj4-QoZSpXQNL4ng_4XtDFimGu1JGOUrra29cA42aBvMUxlXhbVdsRwqTShv8UiLdaEPi7i72sKKU5IDyxkmFARp-v62swWuU7vY_0LGc7zWBofXmG0Y6jK4nCjKeJbQt_esf9P_RCvSzID-zjQhSvocVjelXJl-o1JVmPSIaCUSiekKTlKiCryXyPP6F7H5u6tSiXpAT9WnpWFD8JmgjPhNBrzLu9mLH-SLih5CHROPsqfIiF7nAw2uQYxfCyOqCSfmrlMeI1yThe5SuqhLe5fYoe2TJRalTlkKpWgpA-ieorZFMTFc5IeE0MmLlht2-jpdvGcK12QHnjHjsI9Y8I-a4zwukSEZHIlDZ02rKGzEUNKbmlfU6NKvaQbrZZ1zH45q7l6IyFT7E_5fjGW9VH9kz2F7Q4wP4V5K-wcwdYp7LTCbjvstsJeO-y1wsMTONq9-B0AAP__FQvMtw==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk19v2kgUxd_3U1zdJ9hMgmdsEslPkwSvwopAFtC2VYsiF98kNsbjzthNoojvXo3JH3BjGvyANP9-5xzmzBOaHyn6GHy-Gpz2h9Dq9SfTyX-DNkyCQXA-hb_hn_HoEhIh4-Q6jh4YJBw-XQTjAFox2BOCgdtuw-mwB61EHCUgv5WO4xIk_Chpw2jcC8Zw9sUOFwwScbRAhpmKaBguyaD_FTnOGOZazckYpe3UU7WhHz2g7zCMs7ws7PSM4VxpQv8Ji7hICX2cht9TGlMYke44yDCiIozTCptwmfDrfEGPyPBcpeUyMz5YD8hwkod2dIizFUNVFm8KpghvCX2-YanfQ99ZsY-7-j9MSzIdvm3IgzNoCZjfldnCtBuVnZoyb1R-EywzpSPSFG0pzuzJP215x_5FaO7-VXFGuiO2I4zKwgfJmRRMuo0JRC2B2Oe_62c_SRcUPRtwa5f6UkRkrzuDh1yDPH4tnhS1C4_Xd75p3mOy2-jfrfl39_FvfT8X0vvNeyJeCjlQalHmkKg4A5X5IG3Q0RDkyQdzdJk8ZvKEVYEao3i1KN4-USZKF6Q73e0Y0jtgkh80SnZrkt19JMdkcpUZqvf4Qy_lkNs2U3RL69dhVKnndKXVvNq7Ho4qUDURkSnWq2I96GfVErcKmsLl68PfJPE9SGKTxOsksZPkbpGcTZKok9ydJK-Z5NZJ3k5St5nk1UndnaTjZpJjb_EmVffXcYQ-Os_f4Ts_Lx_aA-GtsVWa3Kn7Cjt9zG0RbsLUEMPLcEE9Kkgv4yw2RTxHv9AlrVZ__QoAAP__E-c4nQ==
 
 statement ok
 CREATE TABLE a1 (
@@ -158,12 +158,12 @@ ALTER TABLE a2 EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 8), (ARRAY
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder
-FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE a2] ORDER BY lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE a2 WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-NULL       /8       {1}       1
-/8         /16      {2}       2
-/16        NULL     {3}       3
+start_key                 end_key       replicas  lease_holder
+<before:/Table/107/1/88>  …/1/8         {1}       1
+…/1/8                     …/1/16        {2}       2
+…/1/16                    <after:/Max>  {3}       3
 
 # This query performs an inverted join.
 query T
@@ -195,4 +195,4 @@ vectorized: true
             └── • values
                   size: 1 column, 2 rows
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk11v2jAUhu_3K47OFaweJE5CpVy5HZnKxKALaB_aoskjR20GtTM7mZgQ_31K6EphTVYubZ_H75PkzQbtzxWGGH26Hl-MJtAZjmbz2ftxF2bROHo9h5fwJp6-A8lFJr9l6ZqBdOHjVRRH0MmgIjgDr9uFi8kQOpL3JIivpeN4BNLtyS5M42EUw-XnarlkIHlviQyVTmki78hi-AVdTBjmRi_IWm2qrU09MErXGDoMM5WXRbWdMFxoQxhusMiKFWGIc_l9RTHJlEzfQYYpFTJb1ddKV-Qmu5PmNzKc5VLZEF5hsmWoy2J_oy3kDWHobtnzUz_IVUm27x4G-nAJHQ6L21ItbbcxyWlM2geUSpuUDKUHCUlF_m_kCd0raW_f6kyR6fND5WlZhCBcJjgTXqMxP-XdjNQvMgWl94He0Uf5WyRkD5PROjcgBg_FEZXkYzOfiaBRzjtFrpK6b4v_j9i-LWOtl2UOP3SmQKsQRPUU0wmI86ckAyYGTJyz2rbR0z_Fc6ZNQaYfHDoK_4wJ96wxIjglIiaba2XpuGENnU0YUnpDu5paXZoFXRu9qGN2y2nN1Rsp2WJ3yneLkaqP6p_sMeyeAPNjmLfC3gHsHMNeK-y3w34rHLTDQSs8OIKT7Ys_AQAA___oWMxC
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk9tv2jAYxd_3V3z6nmB1S-yEVsqT28JUJgodoF20ocojX9uMEGd2sraq-N8nh14ga1jJA5Jvv3MOPn5A-zvBELtfL_rHvQE0Or3xZPyp34Rxt989ncB7-DAanoMSMlaXcXTHQHH4ctYddaERgzshGPjNJhwPOtBQ4kCB_FF4nk-g-IFqwnDU6Y7g5JsbzhkocTBHhqmOaKAWZDH8jhynDDOjZ2StNm7qodzQi-4w9BjGaVbkbnrKcKYNYfiAeZwnhCFO1M-ERqQiMi0PGUaUqzgpsYpLxS-zOd0jw1OdFIvUhuA8IMNxptxoH6dLhrrIXxRsrq4JQ75mqdfB0Fuyt7v6rJKCbItvGgrgBBoCZjdFOrfNWmWvosxrlV8Ei1SbiAxFG4pTd_J_W16xf6bszUcdp2RaYjPCsMhDkJxJwaRfm0BUEohd_rte-odMTtGjAb9yqU9FRPa8s3uXGZCHz8WTonLh8erO180HTLZr_fsV__4u_p3vx0IG_3hX4qmQfa3nRQa_dJyCTkOQLuhwAPLojTnaTB4yecTKQLVRgkqUYJcoY21yMq32ZgwZ7DHJ92ol2xXJ9i6SI7KZTi1Ve_yml7LPXZspuqbV67C6MDO6MHpW7l0NhyWonIjI5qtVsRr00nKJOwVDavH88NdJfAeSWCfxKklsJfkbJG-dJKokfyspqCf5VVKwldSuJwVVUnsr6bCe5LlbvEr07WUcYYje47f_ys_Th-6AurauSuMbfVtiJ_eZK8KVSiwxPFdz6lBOZhGnsc3jGYa5KWi5fPc3AAD__30tN_s=

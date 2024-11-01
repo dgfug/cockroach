@@ -1,145 +1,137 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { RouteComponentProps } from "react-router";
-import { createSelector } from "reselect";
-import _ from "lodash";
-import { DatabaseDetailsPageData } from "@cockroachlabs/cluster-ui";
-
-import { cockroach } from "src/js/protos";
 import {
-  generateTableID,
+  DatabaseDetailsPageData,
+  defaultFilters,
+  Filters,
+  ViewMode,
+  deriveTableDetailsMemoized,
+} from "@cockroachlabs/cluster-ui";
+import { RouteComponentProps } from "react-router";
+
+import {
   refreshDatabaseDetails,
+  refreshNodes,
   refreshTableDetails,
-  refreshTableStats,
 } from "src/redux/apiReducers";
-import { AdminUIState } from "src/redux/state";
-import { databaseNameAttr } from "src/util/constants";
-import { FixLong } from "src/util/fixLong";
-import { getMatchParamByName } from "src/util/query";
+import {
+  selectDropUnusedIndexDuration,
+  selectIndexRecommendationsEnabled,
+} from "src/redux/clusterSettings";
+import { LocalSetting } from "src/redux/localsettings";
 import {
   nodeRegionsByIDSelector,
   selectIsMoreThanOneNode,
 } from "src/redux/nodes";
-import { getNodesByRegionString } from "../utils";
-const {
-  DatabaseDetailsRequest,
-  TableDetailsRequest,
-  TableStatsRequest,
-} = cockroach.server.serverpb;
+import { AdminUIState } from "src/redux/state";
+import { databaseNameAttr } from "src/util/constants";
+import { getMatchParamByName } from "src/util/query";
 
-function normalizeRoles(raw: string[]): string[] {
-  const rolePrecedence: Record<string, number> = {
-    root: 1,
-    admin: 2,
-    public: 3,
-  };
-
-  // Once we have an alphabetized list of roles, we sort it again, promoting
-  // root, admin, and public to the head of the list. (We rely on _.sortBy to
-  // be stable.)
-  const alphabetizedRoles = _.sortBy(_.uniq(_.filter(raw)));
-
-  return _.sortBy(alphabetizedRoles, role => rolePrecedence[role] || 100);
-}
-
-function normalizePrivileges(raw: string[]): string[] {
-  const privilegePrecedence: Record<string, number> = {
-    ALL: 1,
-    CREATE: 2,
-    DROP: 3,
-    GRANT: 4,
-    SELECT: 5,
-    INSERT: 6,
-    UPDATE: 7,
-    DELETE: 8,
-  };
-
-  return _.sortBy(
-    _.uniq(_.map(_.filter(raw), _.toUpper)),
-    privilege => privilegePrecedence[privilege] || 100,
-  );
-}
-
-export const mapStateToProps = createSelector(
-  (_state: AdminUIState, props: RouteComponentProps): string =>
-    getMatchParamByName(props.match, databaseNameAttr),
-
-  state => state.cachedData.databaseDetails,
-  state => state.cachedData.tableDetails,
-  state => state.cachedData.tableStats,
-  state => nodeRegionsByIDSelector(state),
-  state => selectIsMoreThanOneNode(state),
-  (
-    database,
-    databaseDetails,
-    tableDetails,
-    tableStats,
-    nodeRegions,
-    showNodeRegionsColumn,
-  ): DatabaseDetailsPageData => {
-    return {
-      loading: !!databaseDetails[database]?.inFlight,
-      loaded: !!databaseDetails[database]?.valid,
-      name: database,
-      showNodeRegionsColumn,
-      tables: _.map(databaseDetails[database]?.data?.table_names, table => {
-        const tableId = generateTableID(database, table);
-
-        const details = tableDetails[tableId];
-        const stats = tableStats[tableId];
-
-        const roles = normalizeRoles(_.map(details?.data?.grants, "user"));
-        const grants = normalizePrivileges(
-          _.flatMap(details?.data?.grants, "privileges"),
-        );
-        const nodes = stats?.data?.node_ids || [];
-
-        return {
-          name: table,
-          details: {
-            loading: !!details?.inFlight,
-            loaded: !!details?.valid,
-            columnCount: details?.data?.columns?.length || 0,
-            indexCount: details?.data?.indexes?.length || 0,
-            userCount: roles.length,
-            roles: roles,
-            grants: grants,
-          },
-          stats: {
-            loading: !!stats?.inFlight,
-            loaded: !!stats?.valid,
-            replicationSizeInBytes: FixLong(
-              stats?.data?.approximate_disk_bytes || 0,
-            ).toNumber(),
-            rangeCount: FixLong(stats?.data?.range_count || 0).toNumber(),
-            nodesByRegionString: getNodesByRegionString(nodes, nodeRegions),
-          },
-        };
-      }),
-    };
-  },
+const sortSettingTablesLocalSetting = new LocalSetting(
+  "sortSetting/DatabasesDetailsTablesPage",
+  (state: AdminUIState) => state.localSettings,
+  { ascending: true, columnTitle: "name" },
 );
 
+const sortSettingGrantsLocalSetting = new LocalSetting(
+  "sortSetting/DatabasesDetailsGrantsPage",
+  (state: AdminUIState) => state.localSettings,
+  { ascending: true, columnTitle: "name" },
+);
+
+// Hardcoded isTenant value for db-console.
+const isTenant = false;
+
+const viewModeLocalSetting = new LocalSetting(
+  "viewMode/DatabasesDetailsPage",
+  (state: AdminUIState) => state.localSettings,
+  ViewMode.Tables,
+);
+
+const filtersLocalTablesSetting = new LocalSetting<AdminUIState, Filters>(
+  "filters/DatabasesDetailsTablesPage",
+  (state: AdminUIState) => state.localSettings,
+  defaultFilters,
+);
+
+const searchLocalTablesSetting = new LocalSetting(
+  "search/DatabasesDetailsTablesPage",
+  (state: AdminUIState) => state.localSettings,
+  null,
+);
+
+export const mapStateToProps = (
+  state: AdminUIState,
+  props: RouteComponentProps,
+): DatabaseDetailsPageData => {
+  const database = getMatchParamByName(props.match, databaseNameAttr);
+  const databaseDetails = state?.cachedData.databaseDetails;
+  const tableDetails = state?.cachedData.tableDetails;
+  const dbTables =
+    databaseDetails[database]?.data?.results.tablesResp.tables || [];
+  const nodeRegions = nodeRegionsByIDSelector(state);
+  const nodeStatuses = state?.cachedData.nodes.data;
+
+  return {
+    loading: !!databaseDetails[database]?.inFlight,
+    loaded: !!databaseDetails[database]?.valid,
+    requestError: databaseDetails[database]?.lastError,
+    queryError: databaseDetails[database]?.data?.results?.error,
+    name: database,
+    showNodeRegionsColumn: selectIsMoreThanOneNode(state),
+    viewMode: viewModeLocalSetting.selector(state),
+    sortSettingTables: sortSettingTablesLocalSetting.selector(state),
+    sortSettingGrants: sortSettingGrantsLocalSetting.selector(state),
+    filters: filtersLocalTablesSetting.selector(state),
+    search: searchLocalTablesSetting.selector(state),
+    nodeRegions,
+    isTenant,
+    tables: deriveTableDetailsMemoized({
+      dbName: database,
+      tables: dbTables,
+      tableDetails,
+      nodeRegions,
+      isTenant,
+      nodeStatuses,
+    }),
+    showIndexRecommendations: selectIndexRecommendationsEnabled(state),
+    csIndexUnusedDuration: selectDropUnusedIndexDuration(state),
+  };
+};
+
 export const mapDispatchToProps = {
-  refreshDatabaseDetails: (database: string) => {
-    return refreshDatabaseDetails(
-      new DatabaseDetailsRequest({ database, include_stats: true }),
-    );
+  refreshDatabaseDetails: (database: string, csIndexUnusedDuration: string) => {
+    return refreshDatabaseDetails({
+      database,
+      csIndexUnusedDuration,
+    });
   },
-
-  refreshTableDetails: (database: string, table: string) => {
-    return refreshTableDetails(new TableDetailsRequest({ database, table }));
+  refreshTableDetails: (
+    database: string,
+    table: string,
+    csIndexUnusedDuration: string,
+  ) => {
+    return refreshTableDetails({
+      database,
+      table,
+      csIndexUnusedDuration,
+    });
   },
-
-  refreshTableStats: (database: string, table: string) => {
-    return refreshTableStats(new TableStatsRequest({ database, table }));
-  },
+  onViewModeChange: (viewMode: ViewMode) => viewModeLocalSetting.set(viewMode),
+  onSortingTablesChange: (columnName: string, ascending: boolean) =>
+    sortSettingTablesLocalSetting.set({
+      ascending: ascending,
+      columnTitle: columnName,
+    }),
+  onSortingGrantsChange: (columnName: string, ascending: boolean) =>
+    sortSettingGrantsLocalSetting.set({
+      ascending: ascending,
+      columnTitle: columnName,
+    }),
+  onSearchComplete: (query: string) => searchLocalTablesSetting.set(query),
+  onFilterChange: (filters: Filters) => filtersLocalTablesSetting.set(filters),
+  refreshNodes,
 };

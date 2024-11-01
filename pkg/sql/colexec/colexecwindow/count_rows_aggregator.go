@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecwindow
 
@@ -25,7 +20,7 @@ import (
 // aggregate window function.
 func NewCountRowsOperator(
 	args *WindowArgs, frame *execinfrapb.WindowerSpec_Frame, ordering *execinfrapb.Ordering,
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	// Because the buffer is potentially used multiple times per-row, it is
 	// important to prevent it from spilling to disk if possible. For this reason,
 	// we give the buffer half of the memory budget even though it will generally
@@ -35,8 +30,9 @@ func NewCountRowsOperator(
 	framer := newWindowFramer(args.EvalCtx, frame, ordering, args.InputTypes, args.PeersColIdx)
 	colsToStore := framer.getColsToStore(nil /* oldColsToStore */)
 	buffer := colexecutils.NewSpillingBuffer(
-		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
-		args.FdSemaphore, args.InputTypes, args.DiskAcc, colsToStore...)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg, args.FdSemaphore,
+		args.InputTypes, args.DiskAcc, args.DiskQueueMemAcc, colsToStore...,
+	)
 	windower := &countRowsWindowAggregator{
 		partitionSeekerBase: partitionSeekerBase{
 			partitionColIdx: args.PartitionColIdx,
@@ -76,12 +72,12 @@ func (a *countRowsWindowAggregator) Init(ctx context.Context) {
 }
 
 // Close implements the bufferedWindower interface.
-func (a *countRowsWindowAggregator) Close() {
+func (a *countRowsWindowAggregator) Close(ctx context.Context) {
 	if !a.CloserHelper.Close() {
 		return
 	}
 	a.framer.close()
-	a.buffer.Close(a.EnsureCtx())
+	a.buffer.Close(ctx)
 }
 
 // processBatch implements the bufferedWindower interface.
@@ -91,7 +87,7 @@ func (a *countRowsWindowAggregator) processBatch(batch coldata.Batch, startIdx, 
 		return
 	}
 	outVec := batch.ColVec(a.outputColIdx)
-	a.allocator.PerformOperation([]coldata.Vec{outVec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{outVec}, func() {
 		outCol := outVec.Int64()
 		_, _ = outCol[startIdx], outCol[endIdx-1]
 		for i := startIdx; i < endIdx; i++ {

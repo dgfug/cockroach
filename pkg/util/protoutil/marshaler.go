@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package protoutil
 
 import (
 	"io"
-	"io/ioutil"
 
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -58,7 +52,7 @@ func (*ProtoPb) NewDecoder(r io.Reader) gwruntime.Decoder {
 		// NB: we use proto.Message here because grpc-gateway passes us protos that
 		// we don't control and thus don't implement protoutil.Message.
 		if p, ok := v.(proto.Message); ok {
-			bytes, err := ioutil.ReadAll(r)
+			bytes, err := io.ReadAll(r)
 			if err == nil {
 				err = proto.Unmarshal(bytes, p)
 			}

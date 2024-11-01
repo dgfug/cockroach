@@ -1,219 +1,121 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
 import (
-	"encoding/binary"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/batchrepr"
+	"github.com/cockroachdb/pebble/rangekey"
 )
 
-// BatchType represents the type of an entry in an encoded RocksDB batch.
-type BatchType byte
+// Ensure that we always update the batch reader to consider any necessary
+// updates when a new key kind is introduced. To do this, we assert that the
+// latest key we considered equals InternalKeyKindMax, ensuring that compilation
+// will fail if it's not. Unfortunately, this doesn't protect against reusing a
+// currently unused RocksDB key kind.
+const _ = uint(pebble.InternalKeyKindExcise - pebble.InternalKeyKindMax)
 
-// These constants come from rocksdb/db/dbformat.h.
-const (
-	BatchTypeDeletion BatchType = 0x0
-	BatchTypeValue    BatchType = 0x1
-	BatchTypeMerge    BatchType = 0x2
-	BatchTypeLogData  BatchType = 0x3
-	// BatchTypeColumnFamilyDeletion       BatchType = 0x4
-	// BatchTypeColumnFamilyValue          BatchType = 0x5
-	// BatchTypeColumnFamilyMerge          BatchType = 0x6
-	BatchTypeSingleDeletion BatchType = 0x7
-	// BatchTypeColumnFamilySingleDeletion BatchType = 0x8
-	// BatchTypeBeginPrepareXID            BatchType = 0x9
-	// BatchTypeEndPrepareXID              BatchType = 0xA
-	// BatchTypeCommitXID                  BatchType = 0xB
-	// BatchTypeRollbackXID                BatchType = 0xC
-	// BatchTypeNoop                       BatchType = 0xD
-	// BatchTypeColumnFamilyRangeDeletion  BatchType = 0xE
-	BatchTypeRangeDeletion BatchType = 0xF
-	// BatchTypeColumnFamilyBlobIndex      BatchType = 0x10
-	// BatchTypeBlobIndex                  BatchType = 0x11
-	// BatchMaxValue                       BatchType = 0x7F
-)
-
-const (
-	// The batch header is composed of an 8-byte sequence number (all zeroes) and
-	// 4-byte count of the number of entries in the batch.
-	headerSize int = 12
-	countPos   int = 8
-)
-
-// EncodeKey encodes an engine.MVCC key into the RocksDB representation.
-func EncodeKey(key MVCCKey) []byte {
-	keyLen := key.Len()
-	buf := make([]byte, keyLen)
-	encodeKeyToBuf(buf, key, keyLen)
-	return buf
-}
-
-// EncodeKeyToBuf encodes an engine.MVCC key into the RocksDB representation.
-func EncodeKeyToBuf(buf []byte, key MVCCKey) []byte {
-	keyLen := key.Len()
-	if cap(buf) < keyLen {
-		buf = make([]byte, keyLen)
-	} else {
-		buf = buf[:keyLen]
+// decodeBatchHeader decodes the header of Pebble batch representation,
+// returning the parsed header and a batchrepr.Reader into the contents of the
+// batch.
+func decodeBatchHeader(repr []byte) (h batchrepr.Header, r batchrepr.Reader, err error) {
+	h, ok := batchrepr.ReadHeader(repr)
+	switch {
+	case !ok:
+		return batchrepr.Header{}, nil, errors.Errorf("batch invalid: too small: %d bytes", len(repr))
+	case h.SeqNum != 0:
+		return batchrepr.Header{}, nil, errors.Errorf("batch invalid: bad sequence: expected 0, but found %d", h.SeqNum)
+	case h.Count > math.MaxInt32:
+		return batchrepr.Header{}, nil, errors.Errorf("batch invalid: count %d would overflow 32-bit signed int", h.Count)
 	}
-	encodeKeyToBuf(buf, key, keyLen)
-	return buf
+	return h, batchrepr.Read(repr), nil
 }
 
-func encodeKeyToBuf(buf []byte, key MVCCKey, keyLen int) {
-	const (
-		timestampSentinelLen = 1
-		walltimeEncodedLen   = 8
-		logicalEncodedLen    = 4
-		syntheticEncodedLen  = 1
-	)
-
-	copy(buf, key.Key)
-
-	pos := len(key.Key)
-	timestampLength := keyLen - pos - 1
-	if timestampLength > 0 {
-		buf[pos] = 0
-		pos += timestampSentinelLen
-		binary.BigEndian.PutUint64(buf[pos:], uint64(key.Timestamp.WallTime))
-		pos += walltimeEncodedLen
-		if key.Timestamp.Logical != 0 || key.Timestamp.Synthetic {
-			binary.BigEndian.PutUint32(buf[pos:], uint32(key.Timestamp.Logical))
-			pos += logicalEncodedLen
-		}
-		if key.Timestamp.Synthetic {
-			buf[pos] = 1
-			pos += syntheticEncodedLen
-		}
-	}
-	buf[len(buf)-1] = byte(timestampLength)
-}
-
-func encodeTimestamp(ts hlc.Timestamp) []byte {
-	_, encodedTS, _ := enginepb.SplitMVCCKey(EncodeKey(MVCCKey{Timestamp: ts}))
-	return encodedTS
-}
-
-// DecodeMVCCKey decodes an engine.MVCCKey from its serialized representation.
-func DecodeMVCCKey(encodedKey []byte) (MVCCKey, error) {
-	k, ts, err := enginepb.DecodeKey(encodedKey)
-	return MVCCKey{k, ts}, err
-}
-
-// Decode the header of RocksDB batch repr, returning both the count of the
-// entries in the batch and the suffix of data remaining in the batch.
-func rocksDBBatchDecodeHeader(repr []byte) (count int, orepr pebble.BatchReader, err error) {
-	if len(repr) < headerSize {
-		return 0, nil, errors.Errorf("batch repr too small: %d < %d", len(repr), headerSize)
-	}
-	seq := binary.LittleEndian.Uint64(repr[:countPos])
-	if seq != 0 {
-		return 0, nil, errors.Errorf("bad sequence: expected 0, but found %d", seq)
-	}
-	r, c := pebble.ReadBatch(repr)
-	if c > math.MaxInt32 {
-		return 0, nil, errors.Errorf("count %d would overflow max int", c)
-	}
-	return int(c), r, nil
-}
-
-// RocksDBBatchReader is used to iterate the entries in a RocksDB batch
+// BatchReader is used to iterate the entries in a Pebble batch
 // representation.
 //
 // Example:
-// r, err := NewRocksDBBatchReader(...)
-// if err != nil {
-//   return err
-// }
-// for r.Next() {
-// 	 switch r.BatchType() {
-// 	 case BatchTypeDeletion:
-// 	   fmt.Printf("delete(%x)", r.Key())
-// 	 case BatchTypeValue:
-// 	   fmt.Printf("put(%x,%x)", r.Key(), r.Value())
-// 	 case BatchTypeMerge:
-// 	   fmt.Printf("merge(%x,%x)", r.Key(), r.Value())
-//   case BatchTypeSingleDeletion:
-// 	   fmt.Printf("single_delete(%x)", r.Key())
-//   case BatchTypeRangeDeletion:
-// 	   fmt.Printf("delete_range(%x,%x)", r.Key(), r.Value())
-// 	 }
-// }
-// if err := r.Error(); err != nil {
-//   return err
-// }
-type RocksDBBatchReader struct {
-	batchReader pebble.BatchReader
+//
+//	r, err := NewBatchReader(...)
+//	if err != nil {
+//	  return err
+//	}
+//	for r.Next() {
+//		switch r.KeyKind() {
+//		case pebble.InternalKeyKindDelete:
+//			fmt.Printf("delete(%x)", r.Key())
+//		case pebble.InternalKeyKindSet:
+//			fmt.Printf("put(%x,%x)", r.Key(), r.Value())
+//		case pebble.InternalKeyKindMerge:
+//			fmt.Printf("merge(%x,%x)", r.Key(), r.Value())
+//		case pebble.InternalKeyKindSingleDelete:
+//			fmt.Printf("single_delete(%x)", r.Key())
+//		case pebble.InternalKeyKindRangeDelete:
+//			fmt.Printf("delete_range(%x,%x)", r.Key(), r.Value())
+//		 }
+//	}
+//
+//	if err := r.Error(); err != nil {
+//	  return err
+//	}
+type BatchReader struct {
+	header batchrepr.Header
+	reader batchrepr.Reader
 
 	// The error encountered during iterator, if any
 	err error
 
-	// The total number of entries, decoded from the batch header
-	count int
-
 	// The following all represent the current entry and are updated by Next.
-	// `value` is not applicable for BatchTypeDeletion or BatchTypeSingleDeletion.
-	// `value` indicates the end key for BatchTypeRangeDeletion.
-	typ   BatchType
+	// `value` is not applicable for all key kinds. For RangeDelete, value
+	// indicates the end key for the range deletion.
+	kind  pebble.InternalKeyKind
 	key   []byte
 	value []byte
 }
 
-// NewRocksDBBatchReader creates a RocksDBBatchReader from the given repr and
+// NewBatchReader creates a BatchReader from the given batch repr and
 // verifies the header.
-func NewRocksDBBatchReader(repr []byte) (*RocksDBBatchReader, error) {
-	count, batchReader, err := rocksDBBatchDecodeHeader(repr)
+func NewBatchReader(repr []byte) (*BatchReader, error) {
+	h, r, err := decodeBatchHeader(repr)
 	if err != nil {
 		return nil, err
 	}
-	return &RocksDBBatchReader{batchReader: batchReader, count: count}, nil
+	return &BatchReader{header: h, reader: r}, nil
 }
 
 // Count returns the declared number of entries in the batch.
-func (r *RocksDBBatchReader) Count() int {
-	return r.count
+func (r *BatchReader) Count() int {
+	return int(r.header.Count)
 }
 
 // Error returns the error, if any, which the iterator encountered.
-func (r *RocksDBBatchReader) Error() error {
+func (r *BatchReader) Error() error {
 	return r.err
 }
 
-// BatchType returns the type of the current batch entry.
-func (r *RocksDBBatchReader) BatchType() BatchType {
-	return r.typ
+// KeyKind returns the kind of the current entry.
+func (r *BatchReader) KeyKind() pebble.InternalKeyKind {
+	return r.kind
 }
 
 // Key returns the key of the current batch entry.
-func (r *RocksDBBatchReader) Key() []byte {
+func (r *BatchReader) Key() []byte {
 	return r.key
 }
 
-func decodeMVCCKey(k []byte) (MVCCKey, error) {
-	k, ts, err := enginepb.DecodeKey(k)
-	return MVCCKey{k, ts}, err
-}
-
 // MVCCKey returns the MVCC key of the current batch entry.
-func (r *RocksDBBatchReader) MVCCKey() (MVCCKey, error) {
-	return decodeMVCCKey(r.Key())
+func (r *BatchReader) MVCCKey() (MVCCKey, error) {
+	return DecodeMVCCKey(r.Key())
 }
 
 // EngineKey returns the EngineKey for the current batch entry.
-func (r *RocksDBBatchReader) EngineKey() (EngineKey, error) {
+func (r *BatchReader) EngineKey() (EngineKey, error) {
 	key, ok := DecodeEngineKey(r.Key())
 	if !ok {
 		return key, errors.Errorf("invalid encoded engine key: %x", r.Key())
@@ -222,52 +124,104 @@ func (r *RocksDBBatchReader) EngineKey() (EngineKey, error) {
 }
 
 // Value returns the value of the current batch entry. Value panics if the
-// BatchType is BatchTypeDeleted.
-func (r *RocksDBBatchReader) Value() []byte {
-	if r.typ == BatchTypeDeletion || r.typ == BatchTypeSingleDeletion {
+// kind is a point key deletion.
+func (r *BatchReader) Value() []byte {
+	switch r.kind {
+	case pebble.InternalKeyKindDelete, pebble.InternalKeyKindSingleDelete:
 		panic("cannot call Value on a deletion entry")
+	default:
+		return r.value
 	}
-	return r.value
 }
 
-// MVCCEndKey returns the MVCC end key of the current batch entry.
-//lint:ignore U1001 unused
-func (r *RocksDBBatchReader) MVCCEndKey() (MVCCKey, error) {
-	if r.typ != BatchTypeRangeDeletion {
-		panic("can only ask for EndKey on a range deletion entry")
+// EndKey returns the raw end key of the current ranged batch entry.
+func (r *BatchReader) EndKey() ([]byte, error) {
+	var rawKey []byte
+	switch r.kind {
+	case pebble.InternalKeyKindRangeDelete:
+		rawKey = r.Value()
+
+	case pebble.InternalKeyKindRangeKeySet, pebble.InternalKeyKindRangeKeyUnset, pebble.InternalKeyKindRangeKeyDelete:
+		rangeKeys, err := r.rangeKeys()
+		if err != nil {
+			return nil, err
+		}
+		rawKey = rangeKeys.End
+
+	default:
+		return nil, errors.AssertionFailedf(
+			"can only ask for EndKey on a ranged entry, got %v", r.kind)
 	}
-	return decodeMVCCKey(r.Value())
+	return rawKey, nil
 }
 
-// EngineEndKey returns the engine end key of the current batch entry.
-func (r *RocksDBBatchReader) EngineEndKey() (EngineKey, error) {
-	if r.typ != BatchTypeRangeDeletion {
-		panic("can only ask for EndKey on a range deletion entry")
+// EngineEndKey returns the engine end key of the current ranged batch entry.
+func (r *BatchReader) EngineEndKey() (EngineKey, error) {
+	rawKey, err := r.EndKey()
+	if err != nil {
+		return EngineKey{}, err
 	}
-	key, ok := DecodeEngineKey(r.Value())
+
+	key, ok := DecodeEngineKey(rawKey)
 	if !ok {
-		return key, errors.Errorf("invalid encoded engine key: %x", r.Value())
+		return key, errors.Errorf("invalid encoded engine key: %x", rawKey)
 	}
 	return key, nil
 }
 
+// RawRangeKeys returns the raw range key values at the current entry.
+func (r *BatchReader) RawRangeKeys() ([]rangekey.Key, error) {
+	switch r.kind {
+	case pebble.InternalKeyKindRangeKeySet, pebble.InternalKeyKindRangeKeyUnset:
+	default:
+		return nil, errors.AssertionFailedf(
+			"can only ask for range keys on a range key entry, got %v", r.kind)
+	}
+	rangeKeys, err := r.rangeKeys()
+	if err != nil {
+		return nil, err
+	}
+	return rangeKeys.Keys, nil
+}
+
+// EngineRangeKeys returns the engine range key values at the current entry.
+func (r *BatchReader) EngineRangeKeys() ([]EngineRangeKeyValue, error) {
+	switch r.kind {
+	case pebble.InternalKeyKindRangeKeySet, pebble.InternalKeyKindRangeKeyUnset:
+	default:
+		return nil, errors.AssertionFailedf(
+			"can only ask for range keys on a range key entry, got %v", r.kind)
+	}
+	rangeKeys, err := r.rangeKeys()
+	if err != nil {
+		return nil, err
+	}
+	rkvs := make([]EngineRangeKeyValue, 0, len(rangeKeys.Keys))
+	for _, rk := range rangeKeys.Keys {
+		rkvs = append(rkvs, EngineRangeKeyValue{Version: rk.Suffix, Value: rk.Value})
+	}
+	return rkvs, nil
+}
+
+// rangeKeys decodes and returns the current Pebble range key.
+func (r *BatchReader) rangeKeys() (rangekey.Span, error) {
+	return rangekey.Decode(pebble.MakeInternalKey(r.key, 0 /* seqNum */, r.kind), r.value, nil)
+}
+
 // Next advances to the next entry in the batch, returning false when the batch
 // is empty.
-func (r *RocksDBBatchReader) Next() bool {
-	kind, ukey, value, ok := r.batchReader.Next()
-
-	r.typ = BatchType(kind)
-	r.key = ukey
-	r.value = value
-
+func (r *BatchReader) Next() bool {
+	var ok bool
+	r.kind, r.key, r.value, ok, r.err = r.reader.Next()
 	return ok
 }
 
-// RocksDBBatchCount provides an efficient way to get the count of mutations
-// in a RocksDB Batch representation.
-func RocksDBBatchCount(repr []byte) (int, error) {
-	if len(repr) < headerSize {
-		return 0, errors.Errorf("batch repr too small: %d < %d", len(repr), headerSize)
+// BatchCount provides an efficient way to get the count of mutations in a batch
+// representation.
+func BatchCount(repr []byte) (int, error) {
+	h, ok := batchrepr.ReadHeader(repr)
+	if !ok {
+		return 0, errors.Errorf("invalid batch: batch repr too small: %d bytes", len(repr))
 	}
-	return int(binary.LittleEndian.Uint32(repr[countPos:headerSize])), nil
+	return int(h.Count), nil
 }

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -14,10 +9,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
 
 // Use the output from crdb_internal.show_create_all_tables() to recreate the
@@ -27,44 +23,42 @@ func TestRecreateTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
-	if _, err := sqlDB.Exec(`
-		CREATE DATABASE test;
-		USE test;
-		CREATE TABLE foo(x INT primary key);
-		CREATE TABLE bar(x INT, y INT, z STRING, FAMILY f1(x, y, z))
-	`); err != nil {
-		t.Fatal(err)
-	}
+	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
+	sqlRunner.Exec(t, `CREATE DATABASE test;`)
+	sqlRunner.Exec(t, `USE test;`)
+	sqlRunner.Exec(t, `CREATE TABLE foo(x INT primary key);`)
+	sqlRunner.Exec(t, `CREATE TABLE bar(x INT, y INT, z STRING, FAMILY f1(x, y, z))`)
+	sqlRunner.Exec(t, `
+		CREATE TABLE tab (
+			a STRING COLLATE en,
+			b STRING COLLATE en_US,
+			c STRING COLLATE en_US DEFAULT ('c' COLLATE en_US),
+			d STRING COLLATE en_u_ks_level1 DEFAULT ('d'::STRING COLLATE en_u_ks_level1),
+			e STRING COLLATE en_US AS (a COLLATE en_US) STORED,
+			f STRING COLLATE en_US ON UPDATE ('f' COLLATE en_US))`)
 
-	row := sqlDB.QueryRow("SELECT crdb_internal.show_create_all_tables('test')")
-	var recreateTablesStmt string
-	if err := row.Scan(&recreateTablesStmt); err != nil {
-		t.Fatal(err)
+	var recreateTablesStmts []string
+	for _, r := range sqlRunner.QueryStr(t, "SELECT crdb_internal.show_create_all_tables('test')") {
+		recreateTablesStmts = append(recreateTablesStmts, r[0])
 	}
 
 	// Use the recreateTablesStmt to recreate the tables, perform another
 	// show_create_all_tables and compare that the output is the same.
-	if _, err := sqlDB.Exec(`
-		DROP DATABASE test; 
-		CREATE DATABASE test;
-	`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(recreateTablesStmt); err != nil {
-		t.Fatal(err)
+	sqlRunner.Exec(t, `DROP DATABASE test;`)
+	sqlRunner.Exec(t, `CREATE DATABASE test;`)
+
+	for _, stmt := range recreateTablesStmts {
+		sqlRunner.Exec(t, stmt)
 	}
 
-	row = sqlDB.QueryRow("SELECT crdb_internal.show_create_all_tables('test')")
-	var recreateTablesStmt2 string
-	if err := row.Scan(&recreateTablesStmt2); err != nil {
-		t.Fatal(err)
+	var recreateTablesStmts2 []string
+	for _, r := range sqlRunner.QueryStr(t, "SELECT crdb_internal.show_create_all_tables('test')") {
+		recreateTablesStmts2 = append(recreateTablesStmts2, r[0])
 	}
 
-	if recreateTablesStmt != recreateTablesStmt2 {
-		t.Fatalf("got: %s\nexpected: %s", recreateTablesStmt2, recreateTablesStmt)
-	}
+	require.ElementsMatch(t, recreateTablesStmts, recreateTablesStmts2)
 }

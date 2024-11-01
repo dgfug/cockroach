@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,20 +10,23 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
 // QueryResolvedTimestampIntentCleanupAge configures the minimum intent age that
 // QueryResolvedTimestamp requests will consider for async intent cleanup.
 var QueryResolvedTimestampIntentCleanupAge = settings.RegisterDurationSetting(
+	settings.SystemOnly,
 	"kv.query_resolved_timestamp.intent_cleanup_age",
 	"minimum intent age that QueryResolvedTimestamp requests will consider for async intent cleanup",
 	10*time.Second,
@@ -36,7 +34,7 @@ var QueryResolvedTimestampIntentCleanupAge = settings.RegisterDurationSetting(
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.QueryResolvedTimestamp, DefaultDeclareKeys, QueryResolvedTimestamp)
+	RegisterReadOnlyCommand(kvpb.QueryResolvedTimestamp, DefaultDeclareKeys, QueryResolvedTimestamp)
 }
 
 // QueryResolvedTimestamp requests a resolved timestamp for the key span it is
@@ -44,18 +42,18 @@ func init() {
 // which all future reads within the span are guaranteed to produce the same
 // results, i.e. at which MVCC history has become immutable.
 func QueryResolvedTimestamp(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.QueryResolvedTimestampRequest)
-	reply := resp.(*roachpb.QueryResolvedTimestampResponse)
+	args := cArgs.Args.(*kvpb.QueryResolvedTimestampRequest)
+	reply := resp.(*kvpb.QueryResolvedTimestampResponse)
 
 	// Grab the closed timestamp from the local replica. We do this before
 	// iterating over intents to ensure that we observe any and all intents
 	// written before the closed timestamp went into effect. This is important
 	// because QueryResolvedTimestamp requests are often run without acquiring
-	// latches (see roachpb.INCONSISTENT) and often also on follower replicas,
+	// latches (see kvpb.INCONSISTENT) and often also on follower replicas,
 	// so latches won't help them to synchronize with writes.
-	closedTS := cArgs.EvalCtx.GetClosedTimestamp(ctx)
+	closedTS := cArgs.EvalCtx.GetClosedTimestampOlderThanStorageSnapshot()
 
 	// Compute the minimum timestamp of any intent in the request's key span,
 	// which may span the entire range, but does not need to.
@@ -67,12 +65,12 @@ func QueryResolvedTimestamp(
 	// (or until the GC runs). We cap the maximum size of this set to limit its
 	// cost, since this is all best-effort anyway.
 	st := cArgs.EvalCtx.ClusterSettings()
-	maxEncounteredIntents := gc.MaxIntentsPerCleanupBatch.Get(&st.SV)
-	maxEncounteredIntentKeyBytes := gc.MaxIntentKeyBytesPerCleanupBatch.Get(&st.SV)
+	maxEncounteredIntents := gc.MaxLocksPerCleanupBatch.Get(&st.SV)
+	maxEncounteredIntentKeyBytes := gc.MaxLockKeyBytesPerCleanupBatch.Get(&st.SV)
 	intentCleanupAge := QueryResolvedTimestampIntentCleanupAge.Get(&st.SV)
 	intentCleanupThresh := cArgs.EvalCtx.Clock().Now().Add(-intentCleanupAge.Nanoseconds(), 0)
 	minIntentTS, encounteredIntents, err := computeMinIntentTimestamp(
-		reader, args.Span(), maxEncounteredIntents, maxEncounteredIntentKeyBytes, intentCleanupThresh,
+		ctx, reader, args.Span(), maxEncounteredIntents, maxEncounteredIntentKeyBytes, intentCleanupThresh,
 	)
 	if err != nil {
 		return result.Result{}, errors.Wrapf(err, "computing minimum intent timestamp")
@@ -94,6 +92,7 @@ func QueryResolvedTimestamp(
 // minimum timestamp of any intent. While doing so, it also collects and returns
 // up to maxEncounteredIntents intents that are older than intentCleanupThresh.
 func computeMinIntentTimestamp(
+	ctx context.Context,
 	reader storage.Reader,
 	span roachpb.Span,
 	maxEncounteredIntents int64,
@@ -102,7 +101,17 @@ func computeMinIntentTimestamp(
 ) (hlc.Timestamp, []roachpb.Intent, error) {
 	ltStart, _ := keys.LockTableSingleKey(span.Key, nil)
 	ltEnd, _ := keys.LockTableSingleKey(span.EndKey, nil)
-	iter := reader.NewEngineIterator(storage.IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
+	opts := storage.LockTableIteratorOptions{
+		LowerBound: ltStart,
+		UpperBound: ltEnd,
+		// Ignore Exclusive and Shared locks. We only care about intents.
+		MatchMinStr:  lock.Intent,
+		ReadCategory: fs.BatchEvalReadCategory,
+	}
+	iter, err := storage.NewLockTableIterator(ctx, reader, opts)
+	if err != nil {
+		return hlc.Timestamp{}, nil, err
+	}
 	defer iter.Close()
 
 	var meta enginepb.MVCCMetadata
@@ -119,18 +128,20 @@ func computeMinIntentTimestamp(
 		if err != nil {
 			return hlc.Timestamp{}, nil, err
 		}
-		lockedKey, err := keys.DecodeLockTableSingleKey(engineKey.Key)
+		ltKey, err := engineKey.ToLockTableKey()
 		if err != nil {
-			return hlc.Timestamp{}, nil, errors.Wrapf(err, "decoding LockTable key: %v", lockedKey)
+			return hlc.Timestamp{}, nil, errors.Wrapf(err, "decoding LockTable key: %v", ltKey)
+		}
+		if ltKey.Strength != lock.Intent {
+			return hlc.Timestamp{}, nil, errors.AssertionFailedf(
+				"unexpected strength for LockTableKey %s: %v", ltKey.Strength, ltKey)
 		}
 		// Unmarshal.
-		if err := protoutil.Unmarshal(iter.UnsafeValue(), &meta); err != nil {
-			return hlc.Timestamp{}, nil, errors.Wrapf(err, "unmarshaling mvcc meta: %v", lockedKey)
+		if err := iter.ValueProto(&meta); err != nil {
+			return hlc.Timestamp{}, nil, errors.Wrapf(err, "unmarshaling mvcc meta: %v", ltKey)
 		}
 		if meta.Txn == nil {
-			return hlc.Timestamp{}, nil,
-				errors.AssertionFailedf("nil transaction in LockTable. Key: %v,"+"mvcc meta: %v",
-					lockedKey, meta)
+			return hlc.Timestamp{}, nil, errors.AssertionFailedf("nil transaction in LockTable: %v", ltKey)
 		}
 
 		if minTS.IsEmpty() {
@@ -146,8 +157,8 @@ func computeMinIntentTimestamp(
 		intentFitsByCount := int64(len(encountered)) < maxEncounteredIntents
 		intentFitsByBytes := encounteredKeyBytes < maxEncounteredIntentKeyBytes
 		if oldEnough && intentFitsByCount && intentFitsByBytes {
-			encountered = append(encountered, roachpb.MakeIntent(meta.Txn, lockedKey))
-			encounteredKeyBytes += int64(len(lockedKey))
+			encountered = append(encountered, roachpb.MakeIntent(meta.Txn, ltKey.Key))
+			encounteredKeyBytes += int64(len(ltKey.Key))
 		}
 	}
 	return minTS, encountered, nil

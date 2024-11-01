@@ -1,13 +1,8 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code originated in the github.com/golang/glog package.
 
@@ -21,12 +16,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 // logging is the global state of the logging setup.
@@ -100,28 +95,36 @@ type loggingT struct {
 		// to this logger already.
 		active        bool
 		firstUseStack string
-	}
 
-	idMu struct {
-		syncutil.RWMutex
-		idPayload
+		// redactionPolicyManaged indicates whether we're running as part of a managed
+		// service (sourced from COCKROACH_REDACTION_POLICY_MANAGED env var). Impacts
+		// log redaction policies for log args marked with SafeManaged.
+		redactionPolicyManaged bool
 	}
 
 	allSinkInfos sinkInfoRegistry
 	allLoggers   loggerRegistry
+	metrics      LogMetrics
+	processor    StructuredLogProcessor
 }
 
-type idPayload struct {
-	// the Cluster ID is reported on every new log file so as to ease
-	// the correlation of panic reports with self-reported log files.
-	clusterID string
-	// the node ID is reported like the cluster ID, for the same reasons.
-	// We avoid using roahcpb.NodeID to avoid a circular reference.
-	nodeID int32
-	// ditto for the tenant ID.
-	tenantID string
-	// ditto for the SQL instance ID.
-	sqlInstanceID int32
+// SetLogMetrics injects an initialized implementation of
+// the LogMetrics interface into the logging package. The
+// implementation must be injected to avoid a dependency
+// cycle.
+//
+// Should be called within the init() function of the
+// implementing package to avoid the possibility of a nil
+// LogMetrics during server startups.
+func SetLogMetrics(m LogMetrics) {
+	logging.metrics = m
+}
+
+func SetStructuredLogProcessor(p StructuredLogProcessor) {
+	if logging.processor != nil {
+		panic(errors.AssertionFailedf("log package's StructuredLogProcessor has already been set"))
+	}
+	logging.processor = p
 }
 
 func init() {
@@ -221,12 +224,6 @@ func FatalChan() <-chan struct{} {
 	return logging.mu.fatalCh
 }
 
-func (l *loggingT) idPayload() idPayload {
-	l.idMu.RLock()
-	defer l.idMu.RUnlock()
-	return l.idMu.idPayload
-}
-
 // s ignalFatalCh signals the listeners of l.mu.fatalCh by closing the
 // channel.
 // l.mu is not held.
@@ -242,48 +239,31 @@ func (l *loggingT) signalFatalCh() {
 	}
 }
 
-// SetNodeIDs stores the Node and Cluster ID for further reference.
-func SetNodeIDs(clusterID string, nodeID int32) {
-	// Ensure that the IDs are logged with the same format as for
-	// new log files, even on the first log file. This ensures that grep
-	// will always find it.
-	ctx := logtags.AddTag(context.Background(), "config", nil)
-	logfDepth(ctx, 1, severity.INFO, channel.OPS, "clusterID: %s", clusterID)
-	if nodeID != 0 {
-		logfDepth(ctx, 1, severity.INFO, channel.OPS, "nodeID: n%d", nodeID)
-	}
-
-	// Perform the change proper.
-	logging.idMu.Lock()
-	defer logging.idMu.Unlock()
-
-	if logging.idMu.clusterID != "" {
-		panic("clusterID already set")
-	}
-
-	logging.idMu.clusterID = clusterID
-	logging.idMu.nodeID = nodeID
+// setManagedRedactionPolicy configures the logging setup to indicate if
+// we are running as part of a managed service. see SafeManaged for details
+// on how this impacts log redaction policies.
+func (l *loggingT) setManagedRedactionPolicy(isManaged bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.mu.redactionPolicyManaged = isManaged
 }
 
-// SetTenantIDs stores the tenant ID and instance ID for further reference.
-func SetTenantIDs(tenantID string, sqlInstanceID int32) {
-	// Ensure that the IDs are logged with the same format as for
-	// new log files, even on the first log file. This ensures that grep
-	// will always find it.
-	ctx := logtags.AddTag(context.Background(), "config", nil)
-	logfDepth(ctx, 1, severity.INFO, channel.OPS, "tenantID: %s", tenantID)
-	logfDepth(ctx, 1, severity.INFO, channel.OPS, "instanceID: %d", sqlInstanceID)
+// hasManagedRedactionPolicy indicates if the logging setup is being run
+// as part of a managed service. see SafeManaged for details on how this
+// impacts log redaction policies.
+func (l *loggingT) hasManagedRedactionPolicy() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mu.redactionPolicyManaged
+}
 
-	// Perform the change proper.
-	logging.idMu.Lock()
-	defer logging.idMu.Unlock()
-
-	if logging.idMu.tenantID != "" {
-		panic("tenantID already set")
+func (l *loggingT) processStructured(ctx context.Context, eventType EventType, e any) {
+	// TODO(abarganier): I'm not sure how possible this is, need to examine further (we use dependency injection).
+	// For now, panic.
+	if l.processor == nil {
+		panic(errors.AssertionFailedf("attempted to process a structured record before processor initialized"))
 	}
-
-	logging.idMu.tenantID = tenantID
-	logging.idMu.sqlInstanceID = sqlInstanceID
+	l.processor.Process(ctx, eventType, e)
 }
 
 // outputLogEntry marshals a log entry proto into bytes, and writes
@@ -296,6 +276,12 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 	var fatalTrigger chan struct{}
 	extraFlush := false
 	isFatal := entry.sev == severity.FATAL
+	// NB: Generally, we don't need to make this nil check. However, logging.metrics
+	// is injected from an external package's init() function, which isn't guaranteed
+	// to be called (e.g. during tests). Therefore, we protect against such a case.
+	if logging.metrics != nil {
+		logging.metrics.IncrementCounter(LogMessageCount, 1)
+	}
 
 	if isFatal {
 		extraFlush = true
@@ -303,9 +289,9 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 
 		switch traceback {
 		case tracebackSingle:
-			entry.stacks = getStacks(false)
+			entry.stacks = debug.Stack()
 		case tracebackAll:
-			entry.stacks = getStacks(true)
+			entry.stacks = allstacks.Get()
 		}
 
 		for _, s := range l.sinkInfos {
@@ -402,7 +388,7 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 				// The sink was not accepting entries at this level. Nothing to do.
 				continue
 			}
-			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, forceSync: isFatal}); err != nil {
+			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, tryForceSync: isFatal}); err != nil {
 				if !s.criticality {
 					// An error on this sink is not critical. Just report
 					// the error and move on.
@@ -446,11 +432,13 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 	}
 }
 
-// DumpStacks produces a dump of the stack traces in the logging output.
-func DumpStacks(ctx context.Context) {
-	allStacks := getStacks(true)
+// DumpStacks produces a dump of the stack traces in the logging
+// output, and also to stderr if the remainder of the logs don't go to
+// stderr by default.
+func DumpStacks(ctx context.Context, reason redact.RedactableString) {
+	allStacks := allstacks.Get()
 	// TODO(knz): This should really be a "debug" level, not "info".
-	Infof(ctx, "stack traces:\n%s", allStacks)
+	Shoutf(ctx, severity.INFO, "%s. stack traces:\n%s", reason, allStacks)
 }
 
 func setActive() {
@@ -460,6 +448,11 @@ func setActive() {
 		logging.mu.active = true
 		logging.mu.firstUseStack = string(debug.Stack())
 	}
+}
+
+// ShowLogs returns whether -show-logs was passed (used for testing).
+func ShowLogs() bool {
+	return logging.showLogs
 }
 
 const fatalErrorPostamble = `

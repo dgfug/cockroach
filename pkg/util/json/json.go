@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
@@ -14,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"reflect"
 	"sort"
@@ -22,14 +18,14 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
-	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/keysbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	uniq "github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/errors"
 )
@@ -71,8 +67,8 @@ func (t Type) String() string {
 const (
 	wordSize          = unsafe.Sizeof(big.Word(0))
 	decimalSize       = unsafe.Sizeof(apd.Decimal{})
-	stringHeaderSize  = unsafe.Sizeof(reflect.StringHeader{})
-	sliceHeaderSize   = unsafe.Sizeof(reflect.SliceHeader{})
+	stringHeaderSize  = unsafe.Sizeof(reflect.StringHeader{}) //lint:ignore SA1019 deprecated, but no clear replacement
+	sliceHeaderSize   = unsafe.Sizeof(reflect.SliceHeader{})  //lint:ignore SA1019 deprecated, but no clear replacement
 	keyValuePairSize  = unsafe.Sizeof(jsonKeyValuePair{})
 	jsonInterfaceSize = unsafe.Sizeof((JSON)(nil))
 )
@@ -92,6 +88,11 @@ type JSON interface {
 	Format(buf *bytes.Buffer)
 	// Size returns the size of the JSON document in bytes.
 	Size() uintptr
+
+	// EncodeForwardIndex implements forward indexing for JSONB values.
+	// The encoding depends on the direction of the encoding
+	// specified, using `dir`, and is appended to `buf` and returned.
+	EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error)
 
 	// encodeInvertedIndexKeys takes in a key prefix and returns a slice of
 	// inverted index keys, one per path through the receiver.
@@ -179,6 +180,10 @@ type JSON interface {
 	// AsBool returns the JSON document as a boolean if it is a boolean type,
 	// and a boolean indicating if this JSON value is a bool type.
 	AsBool() (bool, bool)
+
+	// AsArray returns the JSON document as an Array if it is a array type,
+	// and a boolean indicating if this JSON value is a array type.
+	AsArray() ([]JSON, bool)
 
 	// Exists implements the `?` operator: does the string exist as a top-level
 	// key within the JSON value?
@@ -349,7 +354,9 @@ func (b *ObjectBuilderWithCounter) Size() uintptr {
 
 // ObjectBuilder builds JSON Object by a key value pair sequence.
 type ObjectBuilder struct {
-	pairs []jsonKeyValuePair
+	pairs     []jsonKeyValuePair
+	unordered bool
+	built     bool
 }
 
 // NewObjectBuilder returns an ObjectBuilder. The builder will reserve spaces
@@ -362,7 +369,7 @@ func NewObjectBuilder(numAddsHint int) *ObjectBuilder {
 
 // Add appends key value pair to the sequence.
 func (b *ObjectBuilder) Add(k string, v JSON) {
-	if b.pairs == nil {
+	if b.built {
 		panic(errors.AssertionFailedf(msgModifyAfterBuild))
 	}
 	b.pairs = append(b.pairs, jsonKeyValuePair{k: jsonString(k), v: v})
@@ -371,9 +378,14 @@ func (b *ObjectBuilder) Add(k string, v JSON) {
 // Build returns a JSON object built from a key value pair sequence. After that,
 // it should not be modified any longer.
 func (b *ObjectBuilder) Build() JSON {
-	if b.pairs == nil {
+	if b.built {
 		panic(errors.AssertionFailedf(msgModifyAfterBuild))
 	}
+	b.built = true
+	if b.unordered {
+		return jsonObject(b.pairs)
+	}
+
 	orders := make([]int, len(b.pairs))
 	for i := range orders {
 		orders[i] = i
@@ -387,6 +399,61 @@ func (b *ObjectBuilder) Build() JSON {
 	sort.Sort(&sorter)
 	sorter.unique()
 	return jsonObject(sorter.pairs)
+}
+
+// FixedKeysObjectBuilder is a JSON object builder that builds
+// an object for the specified fixed set of unique keys.
+// This object can be reused to build multiple instances of JSON object.
+type FixedKeysObjectBuilder struct {
+	pairs   []jsonKeyValuePair
+	keyOrd  map[string]int
+	updated intsets.Fast
+}
+
+// NewFixedKeysObjectBuilder creates JSON object builder for the specified
+// set of fixed, unique keys.
+func NewFixedKeysObjectBuilder(keys []string) (*FixedKeysObjectBuilder, error) {
+	sort.Strings(keys)
+	pairs := make([]jsonKeyValuePair, len(keys))
+	keyOrd := make(map[string]int, len(keys))
+
+	for i, k := range keys {
+		if _, exists := keyOrd[k]; exists {
+			return nil, errors.AssertionFailedf("expected unique keys, found %v", keys)
+		}
+		pairs[i] = jsonKeyValuePair{k: jsonString(keys[i])}
+		keyOrd[k] = i
+	}
+
+	return &FixedKeysObjectBuilder{
+		pairs:  pairs,
+		keyOrd: keyOrd,
+	}, nil
+}
+
+// Set sets the value for the specified key.
+// All previously configured keys must be set before calling Build.
+func (b *FixedKeysObjectBuilder) Set(k string, v JSON) error {
+	ord, ok := b.keyOrd[k]
+	if !ok {
+		return errors.AssertionFailedf("unknown key %s", k)
+	}
+
+	b.pairs[ord].v = v
+	b.updated.Add(ord)
+	return nil
+}
+
+// Build builds JSON object.
+func (b *FixedKeysObjectBuilder) Build() (JSON, error) {
+	if b.updated.Len() != len(b.pairs) {
+		return nil, errors.AssertionFailedf(
+			"expected all %d keys to be updated, %d updated",
+			len(b.pairs), b.updated.Len())
+	}
+	b.updated = intsets.Fast{}
+	// Must copy b.pairs in case builder is reused.
+	return jsonObject(append([]jsonKeyValuePair(nil), b.pairs...)), nil
 }
 
 // pairSorter sorts and uniqueifies JSON pairs. In order to keep
@@ -500,9 +567,29 @@ func cmpJSONTypes(a Type, b Type) int {
 	return 0
 }
 
-func (j jsonNull) Compare(other JSON) (int, error)  { return cmpJSONTypes(j.Type(), other.Type()), nil }
-func (j jsonFalse) Compare(other JSON) (int, error) { return cmpJSONTypes(j.Type(), other.Type()), nil }
-func (j jsonTrue) Compare(other JSON) (int, error)  { return cmpJSONTypes(j.Type(), other.Type()), nil }
+// isEmptyArray returns true if j is a JSON array with length 0.
+func isEmptyArray(j JSON) bool {
+	return j.Type() == ArrayJSONType && j.Len() == 0
+}
+
+func (j jsonNull) Compare(other JSON) (int, error) {
+	if isEmptyArray(other) {
+		return 1, nil
+	}
+	return cmpJSONTypes(j.Type(), other.Type()), nil
+}
+func (j jsonFalse) Compare(other JSON) (int, error) {
+	if isEmptyArray(other) {
+		return 1, nil
+	}
+	return cmpJSONTypes(j.Type(), other.Type()), nil
+}
+func (j jsonTrue) Compare(other JSON) (int, error) {
+	if isEmptyArray(other) {
+		return 1, nil
+	}
+	return cmpJSONTypes(j.Type(), other.Type()), nil
+}
 
 func decodeIfNeeded(j JSON) (JSON, error) {
 	if enc, ok := j.(*jsonEncoded); ok {
@@ -516,6 +603,9 @@ func decodeIfNeeded(j JSON) (JSON, error) {
 }
 
 func (j jsonNumber) Compare(other JSON) (int, error) {
+	if isEmptyArray(other) {
+		return 1, nil
+	}
 	cmp := cmpJSONTypes(j.Type(), other.Type())
 	if cmp != 0 {
 		return cmp, nil
@@ -530,6 +620,9 @@ func (j jsonNumber) Compare(other JSON) (int, error) {
 }
 
 func (j jsonString) Compare(other JSON) (int, error) {
+	if isEmptyArray(other) {
+		return 1, nil
+	}
 	cmp := cmpJSONTypes(j.Type(), other.Type())
 	if cmp != 0 {
 		return cmp, nil
@@ -550,6 +643,14 @@ func (j jsonString) Compare(other JSON) (int, error) {
 }
 
 func (j jsonArray) Compare(other JSON) (int, error) {
+	switch {
+	case isEmptyArray(j) && isEmptyArray(other):
+		return 0, nil
+	case isEmptyArray(j):
+		return -1, nil
+	case isEmptyArray(other):
+		return 1, nil
+	}
 	cmp := cmpJSONTypes(j.Type(), other.Type())
 	if cmp != 0 {
 		return cmp, nil
@@ -581,6 +682,8 @@ func (j jsonArray) Compare(other JSON) (int, error) {
 }
 
 func (j jsonObject) Compare(other JSON) (int, error) {
+	// NOTE: There is no need to check if other is an empty array because all
+	// arrays are less than all objects, so the type comparison is sufficient.
 	cmp := cmpJSONTypes(j.Type(), other.Type())
 	if cmp != 0 {
 		return cmp, nil
@@ -669,6 +772,7 @@ const hexAlphabet = "0123456789abcdef"
 // encodeJSONString writes a string literal to buf as a JSON string.
 // Cribbed from https://github.com/golang/go/blob/7badae85f20f1bce4cc344f9202447618d45d414/src/encoding/json/encode.go.
 func encodeJSONString(buf *bytes.Buffer, s string) {
+	buf.Grow(len(s) + 2)
 	buf.WriteByte('"')
 	start := 0
 	for i := 0; i < len(s); {
@@ -756,8 +860,7 @@ func (jsonFalse) Size() uintptr { return 0 }
 func (jsonTrue) Size() uintptr { return 0 }
 
 func (j jsonNumber) Size() uintptr {
-	intVal := j.Coeff
-	return decimalSize + uintptr(cap(intVal.Bits()))*wordSize
+	return j.Coeff.Size()
 }
 
 func (j jsonString) Size() uintptr {
@@ -785,11 +888,44 @@ func (j jsonObject) Size() uintptr {
 	return valSize
 }
 
-// ParseJSON takes a string of JSON and returns a JSON value.
-func ParseJSON(s string) (JSON, error) {
+func (j jsonNull) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+func (j jsonString) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+func (j jsonFalse) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+func (j jsonTrue) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+func (j jsonObject) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+func (j jsonArray) AsArray() ([]JSON, bool) {
+	return j, true
+}
+
+func (j jsonNumber) AsArray() ([]JSON, bool) {
+	return nil, false
+}
+
+// parseJSONGoStd parses json using encoding/json library.
+// TODO(yevgeniy): Remove this code once we get more confidence in lexer implementation.
+func parseJSONGoStd(s string, _ parseConfig) (JSON, error) {
 	// This goes in two phases - first it parses the string into raw interface{}s
 	// using the Go encoding/json package, then it transforms that into a JSON.
 	// This could be faster if we wrote a parser to go directly into the JSON.
+	// Note: a better way to unmarshal a single JSON value would be to use
+	// json.Unmarshal; however, we cannot do that because we want to get numbers
+	// as strings; Alas, json.Unmarshal does not support that, and so, we have
+	// to use json.Decoder.
 	var result interface{}
 	decoder := json.NewDecoder(strings.NewReader(s))
 	// We want arbitrary size/precision decimals, so we call UseNumber() to tell
@@ -798,15 +934,37 @@ func ParseJSON(s string) (JSON, error) {
 	decoder.UseNumber()
 	err := decoder.Decode(&result)
 	if err != nil {
-		err = errors.Handled(err)
-		err = errors.Wrap(err, "unable to decode JSON")
-		err = pgerror.WithCandidateCode(err, pgcode.InvalidTextRepresentation)
-		return nil, err
+		return nil, jsonDecodeError(err)
 	}
-	if decoder.More() {
+
+	// Check to see if input has more data.
+	// Note: using decoder.More() is wrong since it allows `]` and '}'
+	// characters (i.e. '{}]this is BAD' will be parsed fine, and More will return
+	// false -- thus allowing invalid JSON data to be parsed correctly). The
+	// decoder is meant to be used in the streaming applications; not in a one-off
+	// Unmarshal mode we are using here.  Therefore, to check if input has
+	// trailing characters, we have to attempt to decode the next value.
+	var more interface{}
+	if err := decoder.Decode(&more); err != io.EOF {
 		return nil, errTrailingCharacters
 	}
 	return MakeJSON(result)
+}
+
+func jsonDecodeError(err error) error {
+	return pgerror.Wrapf(
+		errors.Handled(err),
+		pgcode.InvalidTextRepresentation,
+		"unable to decode JSON")
+}
+
+// ParseJSON takes a string of JSON and returns a JSON value.
+func ParseJSON(s string, opts ...ParseOption) (JSON, error) {
+	cfg := parseJSONDefaultConfig
+	for _, o := range opts {
+		o.apply(&cfg)
+	}
+	return cfg.parseJSON(s)
 }
 
 // EncodeInvertedIndexKeys takes in a key prefix and returns a slice of inverted index keys,
@@ -862,6 +1020,59 @@ func EncodeContainedInvertedIndexSpans(
 	// filtered out since '{"a": "b", "c", "d"}' <@ '{"a": "b"}' is false.
 	invertedExpr.SetNotTight()
 	return invertedExpr, nil
+}
+
+// EncodeExistsInvertedIndexSpans takes in a key prefix and returns the
+// spans that must be scanned in the inverted index to evaluate an exists (?)
+// predicate with the given JSON (i.e., find the objects/arrays in the index
+// that contain the given string as a key, or *are* the given string).
+//
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. See
+// comments in the SpanExpression definition for details.
+//
+// The input inKey is prefixed to the keys in all returned spans.
+func EncodeExistsInvertedIndexSpans(
+	b []byte, s string,
+) (invertedExpr inverted.Expression, err error) {
+	b = encoding.EncodeJSONAscending(b)
+	js := jsonString(s)
+	// Make an inverted expression that contains both arrays containing the input
+	// string and objects with keys that are the input string.
+	builder := NewArrayBuilder(1)
+	builder.Add(js)
+	arrayKeys, err := builder.Build().encodeInvertedIndexKeys(b)
+	if err != nil {
+		return nil, err
+	}
+	scalarKeys, err := js.encodeInvertedIndexKeys(b[:len(b):len(b)])
+	if err != nil {
+		return nil, err
+	}
+	if len(arrayKeys) != 1 || len(scalarKeys) != 1 {
+		return nil, errors.AssertionFailedf("unexpectedly found more than 1 inverted index child in single-key array")
+	}
+	arrayKey := arrayKeys[0]
+	scalarKey := scalarKeys[0]
+	// We pass end=true so that we don't get an extra separator at the end of the
+	// key, which would exclude keys that point to non-scalars like non-empty
+	// arrays or non-empty objects.
+	// However, if we don't limit the span we send, we'd also get all paths
+	// that have keys that begin with `s`, and not just keys that exactly equal
+	// `s`, so we have to explicitly define the span as being from `s` to the end
+	// of the`s+sep` prefix.
+	objectKey := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], s, true /* end */)
+	objectSpan := inverted.Span{
+		Start: objectKey,
+		End:   keysbase.PrefixEnd(encoding.AddJSONPathSeparator(objectKey)),
+	}
+	return inverted.Or(
+		inverted.Or(
+			inverted.ExprForSpan(inverted.MakeSingleValSpan(arrayKey), true /* tight */),
+			inverted.ExprForSpan(objectSpan, true /* tight */),
+		),
+		inverted.ExprForSpan(inverted.MakeSingleValSpan(scalarKey), true /* tight */),
+	), nil
 }
 
 func (j jsonNull) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -1342,7 +1553,7 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 			// for JSON objects.
 			Start: inverted.EncVal(encoding.EncodeJSONObjectSpanStartAscending(prefix)),
 			// This end key is equal to jsonInvertedIndex + 1.
-			End: inverted.EncVal(roachpb.Key(prefix).PrefixEnd()),
+			End: inverted.EncVal(keysbase.PrefixEnd(prefix)),
 		}, true /* tight */))
 
 	default:
@@ -1550,15 +1761,6 @@ func (j jsonObject) allPaths() ([]JSON, error) {
 	return ret, nil
 }
 
-// FromSpatialObject transforms a SpatialObject into the json.JSON type.
-func FromSpatialObject(so geopb.SpatialObject, numDecimalDigits int) (JSON, error) {
-	j, err := geo.SpatialObjectToGeoJSON(so, numDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
-	if err != nil {
-		return nil, err
-	}
-	return ParseJSON(string(j))
-}
-
 // FromDecimal returns a JSON value given a apd.Decimal.
 func FromDecimal(v apd.Decimal) JSON {
 	return jsonNumber(v)
@@ -1712,6 +1914,95 @@ func (j jsonObject) FetchValKey(key string) (JSON, error) {
 		return j[i].v, nil
 	}
 	return nil, nil
+}
+
+func (j jsonNull) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONNullKeyMarker(buf, dir)
+	return buf, nil
+}
+
+func (j jsonString) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONStringKeyMarker(buf, dir)
+
+	switch dir {
+	case encoding.Ascending:
+		buf = encoding.EncodeStringAscending(buf, string(j))
+	case encoding.Descending:
+		buf = encoding.EncodeStringDescending(buf, string(j))
+	default:
+		return nil, errors.AssertionFailedf("invalid direction")
+	}
+	buf = encoding.EncodeJSONKeyTerminator(buf, dir)
+	return buf, nil
+}
+
+func (j jsonNumber) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONNumberKeyMarker(buf, dir)
+	var dec = apd.Decimal(j)
+	switch dir {
+	case encoding.Ascending:
+		buf = encoding.EncodeDecimalAscending(buf, &dec)
+	case encoding.Descending:
+		buf = encoding.EncodeDecimalDescending(buf, &dec)
+	default:
+		return nil, errors.AssertionFailedf("invalid direction")
+	}
+	buf = encoding.EncodeJSONKeyTerminator(buf, dir)
+	return buf, nil
+}
+
+func (j jsonFalse) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONFalseKeyMarker(buf, dir)
+	return buf, nil
+}
+
+func (j jsonTrue) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONTrueKeyMarker(buf, dir)
+	return buf, nil
+}
+
+func (j jsonArray) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONArrayKeyMarker(buf, dir, int64(len(j)))
+	buf = encoding.EncodeJSONValueLength(buf, dir, int64(len(j)))
+
+	var err error
+	for _, a := range j {
+		buf, err = a.EncodeForwardIndex(buf, dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	buf = encoding.EncodeJSONKeyTerminator(buf, dir)
+	return buf, nil
+}
+
+func (j jsonObject) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	buf = encoding.EncodeJSONObjectKeyMarker(buf, dir)
+	buf = encoding.EncodeJSONValueLength(buf, dir, int64(len(j)))
+
+	if buildutil.CrdbTestBuild {
+		keys := make([]string, 0, j.Len())
+		for _, a := range j {
+			keys = append(keys, string(a.k))
+		}
+		if !sort.StringsAreSorted(keys) {
+			return nil, errors.AssertionFailedf("unexpectedly unordered keys in jsonObject %s", j)
+		}
+	}
+
+	var err error
+	for _, a := range j {
+		buf, err = a.k.EncodeForwardIndex(buf, dir)
+		if err != nil {
+			return nil, err
+		}
+		buf, err = a.v.EncodeForwardIndex(buf, dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	buf = encoding.EncodeJSONKeyTerminator(buf, dir)
+	return buf, nil
 }
 
 func (jsonNull) FetchValKey(string) (JSON, error)   { return nil, nil }
@@ -2008,6 +2299,9 @@ func (j jsonArray) RemoveString(s string) (JSON, bool, error) {
 			if err != nil {
 				return nil, false, err
 			}
+			if t == nil {
+				return nil, false, errors.AssertionFailedf("StringJSONType should not be nil here")
+			}
 			if *t != s {
 				b.Add(el)
 			} else {
@@ -2030,12 +2324,8 @@ func (j jsonObject) RemoveString(s string) (JSON, bool, error) {
 	}
 
 	newVal := make([]jsonKeyValuePair, len(j)-1)
-	for i, elem := range j[:idx] {
-		newVal[i] = elem
-	}
-	for i, elem := range j[idx+1:] {
-		newVal[idx+i] = elem
-	}
+	copy(newVal, j[:idx])
+	copy(newVal[idx:], j[idx+1:])
 	return jsonObject(newVal), true, nil
 }
 
@@ -2205,8 +2495,15 @@ func (j jsonString) Exists(s string) (bool, error) {
 
 func (j jsonArray) Exists(s string) (bool, error) {
 	for i := 0; i < len(j); i++ {
-		if elem, ok := j[i].(jsonString); ok && string(elem) == s {
-			return true, nil
+		switch elem := j[i].(type) {
+		case jsonString:
+			if string(elem) == s {
+				return true, nil
+			}
+		case *jsonEncoded:
+			if elem.typ == StringJSONType && string(elem.value) == s {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

@@ -1,17 +1,11 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
 import (
-	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
@@ -25,23 +19,21 @@ import (
 // ReorderJoins optimizes the given query and outputs intermediate steps taken
 // during join enumeration. For each call to joinOrderBuilder.Reorder, the
 // output is as follows:
-//   1. The original join tree that is used to form the join graph.
-//   2. The vertexes of the join graph (as well as compact aliases that will be
-//      used to output joins added to the memo).
-//   3. The edges of the join graph.
-//   4. The joins which joinOrderBuilder attempts to add to the memo. An output
-//      like 'AB CD' means a join tree containing relations A and B is being
-//      joined to a join tree containing relations C and D. There is also a
-//      'refs' field containing all relations that are referenced by the join's
-//      ON condition.
+//  1. The original join tree that is used to form the join graph.
+//  2. The vertexes of the join graph (as well as compact aliases that will be
+//     used to output joins added to the memo).
+//  3. The edges of the join graph.
+//  4. The joins which joinOrderBuilder attempts to add to the memo. An output
+//     like 'AB CD' means a join tree containing relations A and B is being
+//     joined to a join tree containing relations C and D. There is also a
+//     'refs' field containing all relations that are referenced by the join's
+//     ON condition.
+//
 // The final optimized plan is then output.
 func (ot *OptTester) ReorderJoins() (string, error) {
 	ot.builder.Reset()
 	o := ot.makeOptimizer()
-
-	// Map from the first ColumnID of each base relation to its assigned name.
-	// this ensures that aliases are consistent across different calls to Reorder.
-	names := map[opt.ColumnID]string{}
+	jof := newJoinOrderFormatter(o)
 
 	// joinsConsidered counts the number of joins which joinOrderBuilder attempts
 	// to add to the memo during each call to Reorder.
@@ -53,111 +45,169 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 		func(
 			join memo.RelExpr,
 			vertexes []memo.RelExpr,
-			edges []memo.FiltersExpr,
-			edgeOps []opt.Operator,
+			edges []xform.OnReorderEdgeParam,
 		) {
 			if treeNum > 1 {
 				// This isn't the first Reorder call. Output the number of joins added to
 				// the memo by the last call to Reorder.
-				ot.builder.WriteString(fmt.Sprintf("\nJoins Considered: %v\n", joinsConsidered))
+				ot.output("Joins Considered: %v\n", joinsConsidered)
 				joinsConsidered = 0
 			}
-			ot.builder.WriteString(separator("-"))
-			ot.builder.WriteString(fmt.Sprintf("----Join Tree #%v----\n", treeNum))
-			ot.builder.WriteString(o.FormatExpr(join, memo.ExprFmtHideAll))
-			ot.builder.WriteString("\n----Vertexes----\n")
-			ot.builder.WriteString(outputVertexes(vertexes, names, o))
-			ot.builder.WriteString("----Edges----\n")
-			for i := range edges {
-				ot.builder.WriteString(outputEdge(edges[i], edgeOps[i], o))
+			ot.separator("-")
+			ot.output("Join Tree #%d\n", treeNum)
+			ot.separator("-")
+			ot.indent(o.FormatExpr(join, memo.ExprFmtHideAll, false /* redactableValues */))
+			ot.output("Vertexes\n")
+			for i := range vertexes {
+				ot.indent(jof.formatVertex(vertexes[i]))
 			}
-			ot.builder.WriteString("\n")
+			ot.output("Edges\n")
+			for i := range edges {
+				ot.indent(jof.formatEdge(edges[i]))
+			}
 			treeNum++
 			relsJoinedLast = ""
 		})
 
-	o.JoinOrderBuilder().NotifyOnAddJoin(func(left, right, all, refs []memo.RelExpr, op opt.Operator) {
-		relsToJoin := outputRels(all, names)
-		if relsToJoin != relsJoinedLast {
-			ot.builder.WriteString(
+	o.JoinOrderBuilder().NotifyOnAddJoin(
+		func(left, right, all, joinRefs, selRefs []memo.RelExpr, op opt.Operator) {
+			relsToJoin := jof.formatVertexSet(all)
+			if relsToJoin != relsJoinedLast {
+				ot.output("Joining %s\n", relsToJoin)
+				relsJoinedLast = relsToJoin
+			}
+			var selString string
+			if len(selRefs) > 0 {
+				selString = fmt.Sprintf(" [select, refs=%s]", jof.formatVertexSet(selRefs))
+			}
+			ot.indent(
 				fmt.Sprintf(
-					"----Joining %s----\n",
-					relsToJoin,
+					"%s %s [%s, refs=%s]%s",
+					jof.formatVertexSet(left),
+					jof.formatVertexSet(right),
+					joinOpLabel(op),
+					jof.formatVertexSet(joinRefs),
+					selString,
 				),
 			)
-			relsJoinedLast = relsToJoin
-		}
-		ot.builder.WriteString(
-			fmt.Sprintf(
-				"%s %s    refs [%s] [%s]\n",
-				outputRels(left, names),
-				outputRels(right, names),
-				outputRels(refs, names),
-				outputOp(op),
-			),
-		)
-		joinsConsidered++
-	})
+			joinsConsidered++
+		})
 
-	expr, err := ot.optimizeExpr(o)
+	expr, err := ot.optimizeExpr(o, nil)
 	if err != nil {
 		return "", err
 	}
-	ot.builder.WriteString(fmt.Sprintf("\nJoins Considered: %v\n", joinsConsidered))
-	ot.builder.WriteString(separator("-"))
-	ot.builder.WriteString("----Final Plan----\n")
-	ot.builder.WriteString(ot.FormatExpr(expr))
-	ot.builder.WriteString(separator("-"))
+	ot.output("Joins Considered: %d\n", joinsConsidered)
+	ot.separator("=")
+	ot.output("Final Plan\n")
+	ot.separator("=")
+	ot.output("%s", ot.FormatExpr(expr))
 	return ot.builder.String(), err
 }
 
-// outputVertexes outputs each base relation in the vertexes slice along with
+type joinOrderFormatter struct {
+	o *xform.Optimizer
+
+	// relLabels is a map from each base relation to its assigned label.
+	relLabels map[memo.RelExpr]string
+}
+
+// newJoinOrderFormatter returns an initialized joinOrderFormatter.
+func newJoinOrderFormatter(o *xform.Optimizer) *joinOrderFormatter {
+	return &joinOrderFormatter{
+		o:         o,
+		relLabels: make(map[memo.RelExpr]string),
+	}
+}
+
+// formatVertex outputs each base relation in the vertexes slice along with
 // its alias.
-func outputVertexes(
-	vertexes []memo.RelExpr, names map[opt.ColumnID]string, o *xform.Optimizer,
-) string {
-	buf := bytes.Buffer{}
-	for i := range vertexes {
-		firstCol, ok := vertexes[i].Relational().OutputCols.Next(0)
-		if !ok {
-			panic(errors.AssertionFailedf("failed to retrieve column from %v", vertexes[i].Op()))
-		}
-		name, ok := names[firstCol]
-		if !ok {
-			name = getRelationName(len(names))
-			names[firstCol] = name
-		}
-		buf.WriteString(
-			fmt.Sprintf(
-				"%s:\n%s",
-				name,
-				o.FormatExpr(vertexes[i], memo.ExprFmtHideAll),
-			),
-		)
-		buf.WriteString("\n")
+func (jof *joinOrderFormatter) formatVertex(vertex memo.RelExpr) string {
+	var b strings.Builder
+	b.WriteString(jof.relLabel(vertex))
+	b.WriteString(":\n")
+	expr := jof.o.FormatExpr(vertex, memo.ExprFmtHideAll, false /* redactableValues */)
+	expr = strings.TrimRight(expr, " \n\t\r")
+	lines := strings.Split(expr, "\n")
+	for _, line := range lines {
+		b.WriteString(fmt.Sprintf("  %s\n", line))
 	}
-	return buf.String()
+	return b.String()
 }
 
-// outputEdge returns a formatted string for the given FiltersItem along with
+// formatVertexSet outputs each base relation in the vertexes slice along with
+// its alias.
+func (jof *joinOrderFormatter) formatVertexSet(vertexSet []memo.RelExpr) string {
+	var b strings.Builder
+	for i := range vertexSet {
+		b.WriteString(jof.relLabel(vertexSet[i]))
+	}
+	return b.String()
+}
+
+// formatEdge returns a formatted string for the given FiltersItem along with
 // the type of join the edge came from, like so: "x = a left".
-func outputEdge(edge memo.FiltersExpr, op opt.Operator, o *xform.Optimizer) string {
-	buf := bytes.Buffer{}
-	if len(edge) == 0 {
-		buf.WriteString("cross")
+func (jof *joinOrderFormatter) formatEdge(edge xform.OnReorderEdgeParam) string {
+	var b strings.Builder
+	if len(edge.Filters) == 0 {
+		b.WriteString("cross")
 	} else {
-		for i := range edge {
+		for i := range edge.Filters {
 			if i != 0 {
-				buf.WriteString(", ")
+				b.WriteString(", ")
 			}
-			buf.WriteString(strings.TrimSuffix(o.FormatExpr(&edge[i], memo.ExprFmtHideAll), "\n"))
+			b.WriteString(strings.TrimSuffix(
+				jof.o.FormatExpr(&edge.Filters[i], memo.ExprFmtHideAll, false /* redactableValues*/), "\n",
+			))
 		}
 	}
-	buf.WriteString(fmt.Sprintf(" [%s]\n", outputOp(op)))
-	return buf.String()
+	b.WriteString(fmt.Sprintf(
+		" [%s, ses=%s, tes=%s, rules=%s]",
+		joinOpLabel(edge.Op),
+		jof.formatVertexSet(edge.SES),
+		jof.formatVertexSet(edge.TES),
+		jof.formatRules(edge.Rules),
+	))
+	return b.String()
 }
 
-func outputOp(op opt.Operator) string {
+func (jof *joinOrderFormatter) formatRules(rules []xform.OnReorderRuleParam) string {
+	var b strings.Builder
+	b.WriteRune('(')
+	for i, rule := range rules {
+		if i > 0 {
+			b.WriteRune(',')
+		}
+		b.WriteString(fmt.Sprintf(
+			"%s->%s",
+			jof.formatVertexSet(rule.From),
+			jof.formatVertexSet(rule.To),
+		))
+	}
+	b.WriteRune(')')
+	return b.String()
+}
+
+// relLabel returns the label for the given relation. Labels will follow the
+// pattern A, B, ..., Z, A1, B1, etc.
+func (jof *joinOrderFormatter) relLabel(e memo.RelExpr) string {
+	if label, ok := jof.relLabels[e]; ok {
+		return label
+	}
+	const lenAlphabet = 26
+	labelCount := len(jof.relLabels)
+	label := string(rune(int('A') + (labelCount % lenAlphabet)))
+	number := labelCount / lenAlphabet
+	if number > 0 {
+		// Names will follow the pattern: A, B, ..., Z, A1, B1, etc.
+		label += strconv.Itoa(number)
+	}
+	jof.relLabels[e] = label
+	return label
+}
+
+// joinOpLabel returns an abbreviated string representation of a join operator.
+func joinOpLabel(op opt.Operator) string {
 	switch op {
 	case opt.InnerJoinOp:
 		return "inner"
@@ -177,35 +227,4 @@ func outputOp(op opt.Operator) string {
 	default:
 		panic(errors.AssertionFailedf("unexpected operator: %v", op))
 	}
-}
-
-// outputRels returns a string with the aliases of the given base relations
-// concatenated together. Panics if there is no alias for a base relation.
-func outputRels(baseRels []memo.RelExpr, names map[opt.ColumnID]string) string {
-	buf := bytes.Buffer{}
-	for i := range baseRels {
-		firstCol, ok := baseRels[i].Relational().OutputCols.Next(0)
-		if !ok {
-			panic(errors.AssertionFailedf("failed to retrieve column from %v", baseRels[i].Op()))
-		}
-		buf.WriteString(names[firstCol])
-	}
-	return buf.String()
-}
-
-// getRelationName returns a simple alias for a base relation given the number
-// of names generated so far.
-func getRelationName(nameCount int) string {
-	const lenAlphabet = 26
-	name := string(rune(int('A') + (nameCount % lenAlphabet)))
-	number := nameCount / lenAlphabet
-	if number > 0 {
-		// Names will follow the pattern: A, B, ..., Z, A1, B1, etc.
-		name += strconv.Itoa(number)
-	}
-	return name
-}
-
-func separator(sep string) string {
-	return fmt.Sprintf("%s\n", strings.Repeat(sep, 80))
 }

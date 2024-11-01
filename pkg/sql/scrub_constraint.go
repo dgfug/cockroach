@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,7 +11,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
@@ -29,7 +23,7 @@ import (
 type sqlCheckConstraintCheckOperation struct {
 	tableName *tree.TableName
 	tableDesc catalog.TableDescriptor
-	checkDesc *descpb.TableDescriptor_CheckConstraint
+	check     catalog.CheckConstraint
 	asOf      hlc.Timestamp
 
 	// columns is a list of the columns returned in the query result
@@ -53,13 +47,13 @@ type sqlCheckConstraintCheckRun struct {
 func newSQLCheckConstraintCheckOperation(
 	tableName *tree.TableName,
 	tableDesc catalog.TableDescriptor,
-	checkDesc *descpb.TableDescriptor_CheckConstraint,
+	check catalog.CheckConstraint,
 	asOf hlc.Timestamp,
 ) *sqlCheckConstraintCheckOperation {
 	return &sqlCheckConstraintCheckOperation{
 		tableName: tableName,
 		tableDesc: tableDesc,
-		checkDesc: checkDesc,
+		check:     check,
 		asOf:      asOf,
 	}
 }
@@ -69,7 +63,7 @@ func newSQLCheckConstraintCheckOperation(
 // then runs in the distSQL execution engine.
 func (o *sqlCheckConstraintCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
-	expr, err := parser.ParseExpr(o.checkDesc.Expr)
+	expr, err := parser.ParseExpr(o.check.GetExpr())
 	if err != nil {
 		return err
 	}
@@ -98,7 +92,7 @@ func (o *sqlCheckConstraintCheckOperation) Start(params runParams) error {
 		}
 	}
 
-	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBuffered(
+	rows, err := params.p.InternalSQLTxn().QueryBuffered(
 		ctx, "check-constraint", params.p.txn, tree.AsStringWithFlags(sel, tree.FmtParsable),
 	)
 	if err != nil {
@@ -134,7 +128,7 @@ func (o *sqlCheckConstraintCheckOperation) Next(params runParams) (tree.Datums, 
 	details := make(map[string]interface{})
 	rowDetails := make(map[string]interface{})
 	details["row_data"] = rowDetails
-	details["constraint_name"] = o.checkDesc.Name
+	details["constraint_name"] = o.check.GetName()
 	for rowIdx, col := range o.columns {
 		// TODO(joey): We should maybe try to get the underlying type.
 		rowDetails[col.GetName()] = row[rowIdx].String()

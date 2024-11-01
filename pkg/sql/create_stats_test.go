@@ -1,27 +1,20 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
 import (
 	"context"
-	gosql "database/sql"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -29,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // TestStatsWithLowTTL simulates a CREATE STATISTICS run that takes longer than
@@ -52,20 +46,15 @@ func TestStatsWithLowTTL(t *testing.T) {
 
 	r := sqlutils.MakeSQLRunner(db)
 	r.Exec(t, `
-		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
+SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
+`)
+	r.Exec(t, `
 		CREATE DATABASE test;
 		USE test;
 		CREATE TABLE t (k INT PRIMARY KEY, a INT, b INT);
 	`)
 	const numRows = 20
 	r.Exec(t, `INSERT INTO t SELECT k, 2*k, 3*k FROM generate_series(0, $1) AS g(k)`, numRows-1)
-
-	pgURL, cleanupFunc := sqlutils.PGUrl(t,
-		s.ServingSQLAddr(),
-		"TestStatsWithLowTTL",
-		url.User(security.RootUser),
-	)
-	defer cleanupFunc()
 
 	// Start a goroutine that keeps updating rows in the table and issues
 	// GCRequests simulating a 2 second TTL. While this is running, reading at a
@@ -79,14 +68,9 @@ func TestStatsWithLowTTL(t *testing.T) {
 		defer wg.Done()
 
 		// Open a separate connection to the database.
-		db2, err := gosql.Open("postgres", pgURL.String())
-		if err != nil {
-			goroutineErr = err
-			return
-		}
-		defer db2.Close()
+		db2 := s.SQLConn(t)
 
-		_, err = db2.Exec("USE test")
+		_, err := db2.Exec("USE test")
 		if err != nil {
 			goroutineErr = err
 			return
@@ -154,4 +138,46 @@ func TestStatsWithLowTTL(t *testing.T) {
 	if goroutineErr != nil {
 		t.Fatal(goroutineErr)
 	}
+}
+
+func TestStaleStatsForDeletedTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	stats.AutomaticStatisticsClusterMode.Override(ctx, &s.ClusterSettings().SV, false)
+
+	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
+	sqlRunner.Exec(t, `CREATE TABLE t(a int PRIMARY KEY)`)
+	sqlRunner.Exec(t, `CREATE STATISTICS s FROM t`)
+
+	// Simulate a stale entry in system.table_statistics that references a
+	// table descriptor that does not exist anywhere else.
+	sqlRunner.Exec(t, `
+INSERT INTO system.table_statistics (
+	"tableID",
+	"name",
+	"columnIDs",
+	"createdAt",
+	"rowCount",
+	"distinctCount",
+	"nullCount",
+	"avgSize"
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		201,
+		"t_deleted",
+		"{1}",
+		timeutil.Now(),
+		1, /* rowCount */
+		1, /* distinctCount */
+		0, /* nullCount */
+		4, /* avgSize */
+	)
+	sqlRunner.CheckQueryResults(
+		t,
+		`SELECT stxrelid::regclass::text, stxname, stxnamespace::regnamespace::text FROM pg_catalog.pg_statistic_ext`,
+		[][]string{{"t", "s", "public"}},
+	)
 }

@@ -141,6 +141,22 @@ SET server_encoding = 'UTF8'
 statement error parameter "server_encoding" cannot be changed
 SET server_encoding = 'other'
 
+query T
+SHOW ssl
+----
+on
+
+statement error parameter "ssl" cannot be changed
+SET ssl = 'off'
+
+query T
+SHOW authentication_method
+----
+cert-password
+
+statement error parameter "authentication_method" cannot be changed
+SET authentication_method = 'password'
+
 statement ok
 SET escape_string_warning = 'ON'
 
@@ -170,9 +186,6 @@ query T
 SHOW datestyle
 ----
 ISO, MDY
-
-statement ok
-SET datestyle_enabled = true
 
 statement ok
 SET datestyle = 'ymd'
@@ -206,15 +219,12 @@ statement ok
 SET intervalstyle = 'postgres'
 
 statement ok
-SET intervalstyle_enabled = true
-
-statement ok
 SET intervalstyle = 'iso_8601'
 
 statement ok
 SET intervalstyle = 'sql_standard'
 
-statement error invalid value for parameter "IntervalStyle": "other"
+statement error invalid value for parameter "IntervalStyle": "other"\nHINT: Available values: postgres,iso_8601,sql_standard
 SET intervalstyle = 'other'
 
 statement ok
@@ -241,7 +251,7 @@ SET vectorize = experimental_always
 statement ok
 SET vectorize = off
 
-statement error invalid value for parameter "vectorize": "bogus"
+statement error invalid value for parameter "vectorize": "bogus"\nHINT: Available values: off,on,experimental_always
 SET vectorize = bogus
 
 statement ok
@@ -283,12 +293,20 @@ SHOW server_version_num
 server_version_num
 130000
 
+query T
+SHOW log_timezone
+----
+UTC
+
 # Test read-only variables
 statement error parameter "max_index_keys" cannot be changed
 SET max_index_keys = 32
 
 statement error parameter "node_id" cannot be changed
 SET node_id = 123
+
+statement error invalid value for parameter "log_timezone"
+SET log_timezone = 'Australia/South'
 
 query TT
 SELECT name, value FROM system.settings WHERE name = 'testing.str'
@@ -387,12 +405,20 @@ SHOW lock_timeout
 0
 
 statement ok
-SET idle_in_session_timeout = 10000
+SET deadlock_timeout = '1ms'
 
 query T
-SHOW idle_in_session_timeout
+SHOW deadlock_timeout
 ----
-10000
+1
+
+statement ok
+SET deadlock_timeout = 0
+
+query T
+SHOW deadlock_timeout
+----
+0
 
 statement ok
 SET idle_in_session_timeout = 10000
@@ -401,6 +427,24 @@ query T
 SHOW idle_in_session_timeout
 ----
 10000
+
+query T
+SHOW idle_session_timeout
+----
+10000
+
+statement ok
+SET idle_session_timeout = 100000
+
+query T
+SHOW idle_in_session_timeout
+----
+100000
+
+query T
+SHOW idle_session_timeout
+----
+100000
 
 statement ok
 SET idle_in_session_timeout = 0;
@@ -530,6 +574,60 @@ SET standard_conforming_strings='true'
 statement ok
 SET standard_conforming_strings='on'
 
+subtest default_table_access_method_test
+
+query T
+SHOW default_table_access_method
+----
+heap
+
+statement ok
+SET default_table_access_method = 'heap'
+
+query T
+SHOW default_table_access_method
+----
+heap
+
+statement error invalid value for parameter "default_table_access_method": "not-heap"
+SET default_table_access_method = 'not-heap'
+
+subtest default_with_oids_test
+
+query T
+SHOW default_with_oids
+----
+off
+
+statement ok
+SET default_with_oids = 'false'
+
+query T
+SHOW default_with_oids
+----
+off
+
+statement error invalid value for parameter "default_with_oids": "true"
+SET default_with_oids = 'true'
+
+subtest xmloption_test
+
+query T
+SHOW xmloption
+----
+content
+
+statement ok
+SET xmloption = 'content'
+
+query T
+SHOW xmloption
+----
+content
+
+statement error invalid value for parameter "xmloption": "document"
+SET xmloption = 'document'
+
 subtest backslash_quote_test
 
 statement ok
@@ -557,6 +655,12 @@ SET disable_plan_gists = 'true'
 
 statement ok
 SET disable_plan_gists = 'false'
+
+statement ok
+SET index_recommendations_enabled = 'true'
+
+statement ok
+SET index_recommendations_enabled = 'false'
 
 query T
 SHOW LC_COLLATE
@@ -618,6 +722,24 @@ SET LC_NUMERIC = 'en_US.UTF-8'
 statement error invalid value for parameter "lc_time": "en_US.UTF-8"
 SET LC_TIME = 'en_US.UTF-8'
 
+subtest check_function_bodies_test
+
+statement ok
+SET check_function_bodies = true
+
+query T
+SHOW check_function_bodies
+----
+on
+
+statement ok
+SET check_function_bodies = false
+
+query T
+SHOW check_function_bodies
+----
+off
+
 # Test custom session variables
 
 statement ok
@@ -661,9 +783,160 @@ SELECT name FROM pg_catalog.pg_settings WHERE name LIKE 'custom_option.%'
 ----
 
 query T
+SHOW tracing
+----
+off
+
+query T
 SHOW tracing.custom
 ----
 ijk
 
+# Show a notice if a custom session variable has the same name as a cluster setting.
+query T noticetrace
+SET server.shutdown.initial_wait = '10s'
+----
+NOTICE: setting custom variable "server.shutdown.initial_wait"
+HINT: did you mean SET CLUSTER SETTING?
+
+# Test that RESET ALL changes custom options to empty strings.
+statement ok
+RESET ALL
+
+query T
+SHOW tracing.custom
+----
+·
+
+query T
+SHOW custom_option.set_sql
+----
+·
+
 statement error unrecognized configuration parameter "custom_option.does_not_yet_exist"
 SHOW custom_option.does_not_yet_exist
+
+statement error join_reader_ordering_strategy_batch_size can only be set to a positive value
+SET join_reader_ordering_strategy_batch_size = '-1B'
+
+statement ok
+SET join_reader_ordering_strategy_batch_size = '1B'
+
+statement ok
+SET parallelize_multi_key_lookup_joins_enabled = true
+
+statement ok
+SET parallelize_multi_key_lookup_joins_enabled = false
+
+query T
+SHOW opt_split_scan_limit
+----
+2048
+
+statement error pq: cannot set opt_split_scan_limit to a negative value: -1
+SET opt_split_scan_limit = -1
+
+statement error pq: cannot set opt_split_scan_limit to a value greater than 2147483647
+SET opt_split_scan_limit = 2147483648
+
+statement ok
+SET opt_split_scan_limit = 100000
+
+query T
+SHOW opt_split_scan_limit
+----
+100000
+
+statement ok
+RESET opt_split_scan_limit
+
+query T
+SHOW opt_split_scan_limit
+----
+2048
+
+query T
+SHOW enable_auto_rehoming
+----
+off
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+off
+
+statement ok
+SET enable_auto_rehoming = on
+
+query T
+SHOW enable_auto_rehoming
+----
+on
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+on
+
+statement ok
+SET experimental_enable_auto_rehoming = off
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+off
+
+query T
+SHOW enable_auto_rehoming
+----
+off
+
+statement error pq: parameter "enable_auto_rehoming" requires a Boolean value
+SET enable_auto_rehoming = bogus
+
+statement error pq: parameter "enable_auto_rehoming" requires a Boolean value
+SET experimental_enable_auto_rehoming = bogus
+
+statement error cannot set max_retries_for_read_committed to a negative value: -1
+SET max_retries_for_read_committed = -1
+
+statement error cannot set max_retries_for_read_committed to a value greater than 2147483647: 2147483648
+SET max_retries_for_read_committed = 2147483648
+
+statement ok
+SET max_retries_for_read_committed = 5
+
+query T
+SHOW max_retries_for_read_committed
+----
+5
+
+subtest new_session_resets_var
+
+user root nodeidx=0
+
+query T
+SHOW application_name
+----
+·
+
+statement ok
+SET application_name TO '🥭db'
+
+query T
+SHOW application_name
+----
+🥭db
+
+user root nodeidx=0 newsession
+
+query T
+SHOW application_name
+----
+·
+
+subtest end
+
+# Regression test for incorrectly marking this variable as boolean.
+statement ok
+SET copy_num_retries_per_batch = 5;

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -32,7 +27,7 @@ func LineStringFromMultiPoint(g geo.Geometry) (geo.Geometry, error) {
 			"geometry must be a MultiPoint")
 	}
 	if mp.NumPoints() == 1 {
-		return geo.Geometry{}, errors.Newf("a LineString must have at least 2 points")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "a LineString must have at least 2 points")
 	}
 	flatCoords := make([]float64, 0, mp.NumCoords()*mp.Stride())
 	var prevPoint *geom.Point
@@ -59,6 +54,9 @@ func LineMerge(g geo.Geometry) (geo.Geometry, error) {
 	// Mirrors PostGIS behavior
 	if g.Empty() {
 		return g, nil
+	}
+	if BoundingBoxHasInfiniteCoordinates(g) {
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "value out of range: overflow")
 	}
 	ret, err := geos.LineMerge(g.EWKB())
 	if err != nil {
@@ -132,7 +130,10 @@ func AddPoint(lineString geo.Geometry, index int, point geo.Geometry) (geo.Geome
 
 func addPoint(lineString *geom.LineString, index int, point *geom.Point) (*geom.LineString, error) {
 	if lineString.Layout() != point.Layout() {
-		return nil, geom.ErrLayoutMismatch{Got: point.Layout(), Want: lineString.Layout()}
+		return nil, pgerror.WithCandidateCode(
+			geom.ErrLayoutMismatch{Got: point.Layout(), Want: lineString.Layout()},
+			pgcode.InvalidParameterValue,
+		)
 	}
 	if point.Empty() {
 		point = geom.NewPointFlat(point.Layout(), make([]float64, point.Stride()))
@@ -141,12 +142,12 @@ func addPoint(lineString *geom.LineString, index int, point *geom.Point) (*geom.
 	coords := lineString.Coords()
 
 	if index > len(coords) {
-		return nil, errors.Newf("index %d out of range of LineString with %d coordinates",
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "index %d out of range of LineString with %d coordinates",
 			index, len(coords))
 	} else if index == -1 {
 		index = len(coords)
 	} else if index < 0 {
-		return nil, errors.Newf("invalid index %v", index)
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "invalid index %v", index)
 	}
 
 	// Shift the slice right by one element, then replace the element at the index, to avoid
@@ -202,7 +203,7 @@ func setPoint(lineString *geom.LineString, index int, point *geom.Point) (*geom.
 	hasNegIndex := index < 0
 
 	if index >= len(coords) || (hasNegIndex && index*-1 > len(coords)) {
-		return nil, errors.Newf("index %d out of range of LineString with %d coordinates", index, len(coords))
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "index %d out of range of LineString with %d coordinates", index, len(coords))
 	}
 
 	if hasNegIndex {
@@ -228,7 +229,7 @@ func RemovePoint(lineString geo.Geometry, index int) (geo.Geometry, error) {
 	}
 
 	if lineStringG.NumCoords() == 2 {
-		return geo.Geometry{}, errors.Newf("cannot remove a point from a LineString with only two Points")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "cannot remove a point from a LineString with only two Points")
 	}
 
 	g, err = removePoint(lineStringG, index)
@@ -243,7 +244,7 @@ func removePoint(lineString *geom.LineString, index int) (*geom.LineString, erro
 	coords := lineString.Coords()
 
 	if index >= len(coords) || index < 0 {
-		return nil, errors.Newf("index %d out of range of LineString with %d coordinates", index, len(coords))
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "index %d out of range of LineString with %d coordinates", index, len(coords))
 	}
 
 	coords = append(coords[:index], coords[index+1:]...)

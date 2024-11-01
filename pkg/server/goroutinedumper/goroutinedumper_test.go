@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package goroutinedumper
 
@@ -14,7 +9,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -220,7 +215,7 @@ func TestTakeGoroutineDump(t *testing.T) {
 		if err != nil {
 			t.Fatalf("could not create gzip reader for file %s: %s", expectedFile, err)
 		}
-		if _, err = ioutil.ReadAll(r); err != nil {
+		if _, err = io.ReadAll(r); err != nil {
 			t.Fatalf("could not read goroutine dump file %s with gzip: %s", expectedFile, err)
 		}
 		if err = r.Close(); err != nil {

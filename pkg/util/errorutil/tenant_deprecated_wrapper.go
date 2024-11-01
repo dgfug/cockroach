@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package errorutil
 
@@ -19,11 +14,11 @@ package errorutil
 // and which will be inaccessible from a SQL tenant server. Their uses in SQL
 // fall into two categories:
 //
-// - functionality essential for multi-tenancy, i.e. a use which will
-//   have to be removed before we can start SQL tenant servers.
-// - non-essential functionality, which will be disabled when run in
-//   a SQL tenant server. It may or may not be a long-term goal to remove
-//   this usage; this is determined on a case-by-case basis.
+//   - functionality essential for multi-tenancy, i.e. a use which will
+//     have to be removed before we can start SQL tenant servers.
+//   - non-essential functionality, which will be disabled when run in
+//     a SQL tenant server. It may or may not be a long-term goal to remove
+//     this usage; this is determined on a case-by-case basis.
 //
 // As work towards multi-tenancy is taking place, semi-dedicated SQL tenant
 // servers are supported. These are essentially SQL tenant servers that get
@@ -76,7 +71,7 @@ func (w TenantSQLDeprecatedWrapper) Optional() (interface{}, bool) {
 func (w TenantSQLDeprecatedWrapper) OptionalErr(issue int) (interface{}, error) {
 	v, ok := w.Optional()
 	if !ok {
-		return nil, UnsupportedWithMultiTenancy(issue)
+		return nil, UnsupportedUnderClusterVirtualization(issue)
 	}
 	return v, nil
 }

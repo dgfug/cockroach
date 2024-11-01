@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 Package kv and its KV API have been deprecated for external usage. Please use
@@ -16,7 +11,7 @@ http://www.cockroachlabs.com/blog/sql-in-cockroachdb-mapping-table-data-to-key-v
 Package kv provides clients for accessing the various externally-facing
 Cockroach database endpoints.
 
-DB Client
+# DB Client
 
 The DB client is a fully-featured client of Cockroach's key-value database. It
 provides a simple, synchronous interface well-suited to parallel updates and
@@ -51,7 +46,7 @@ parallel and then sends a sequence of puts in parallel:
 		log.Fatal(err)
 	}
 
-	b1 := &client.Batch{}
+	b1 := &kv.Batch{}
 	b1.Scan("a", "c\x00", 1000)
 	b1.Scan("x", "z\x00", 1000)
 
@@ -93,7 +88,7 @@ necessary. An example of using transactions with parallel writes:
 		log.Fatal(err)
 	}
 
-	err := db.Txn(func(ctx context.Context, txn *client.Txn) error {
+	err := db.Txn(func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
 		for i := 0; i < 100; i++ {
 			key := fmt.Sprintf("testkey-%02d", i)

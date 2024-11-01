@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -21,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -105,10 +101,10 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	manual := hlc.NewHybridManualClock()
 
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				ClockSource: manual.UnixNano,
+				WallClock: manual,
 			},
 			Store: &kvserver.StoreTestingKnobs{
 				DisableScanner:      true,
@@ -118,9 +114,8 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 			},
 		},
 	})
-	s := serv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
-	store, err := s.Stores().GetStore(s.GetFirstStoreID())
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	require.NoError(t, err)
 
 	// Generate several splits. The "c"-"zz" range is not going to be considered
@@ -129,7 +124,7 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	for _, k := range splitKeys {
 		repl := store.LookupReplica(roachpb.RKey(k))
 		args := adminSplitArgs(k)
-		if _, pErr := kv.SendWrappedWith(ctx, store, roachpb.Header{
+		if _, pErr := kv.SendWrappedWith(ctx, store, kvpb.Header{
 			RangeID: repl.RangeID,
 		}, args); pErr != nil {
 			t.Fatal(pErr)
@@ -235,8 +230,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.(*server.TestServer)
-	tsdb := tsrv.TsDB()
+	tsdb := s.TsDB().(*ts.DB)
 
 	// Populate time series data into the server. One time series, with one
 	// datapoint at the current time and two datapoints older than the pruning
@@ -244,7 +238,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	// periods; this simplifies verification.
 	seriesName := "test.metric"
 	sourceName := "source1"
-	now := tsrv.Clock().PhysicalNow()
+	now := s.Clock().PhysicalNow()
 	nearPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 2)
 	farPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 4)
 	sampleDuration := ts.Resolution10s.SampleDuration()
@@ -279,20 +273,19 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 
 	// Force a range split in between near past and far past. This guarantees
 	// that the pruning operation will issue a DeleteRange which spans ranges.
-	if err := db.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := db.AdminSplit(
+		context.Background(),
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
-	memMon := mon.NewMonitor(
-		"test",
-		mon.MemoryResource,
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		-1,            /* increment: use default block size */
-		math.MaxInt64, /* noteworthy */
-		cluster.MakeTestingClusterSettings(),
-	)
-	memMon.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	memMon := mon.NewMonitor(mon.Options{
+		Name:     "test",
+		Settings: cluster.MakeTestingClusterSettings(),
+	})
+	memMon.Start(context.Background(), nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer memMon.Stop(context.Background())
 	memContext := ts.MakeQueryMemoryContext(
 		memMon,
@@ -334,7 +327,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 
 	// Force pruning.
 	storeID := roachpb.StoreID(1)
-	store, err := tsrv.Stores().GetStore(roachpb.StoreID(1))
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(roachpb.StoreID(1))
 	if err != nil {
 		t.Fatalf("error retrieving store %d: %+v", storeID, err)
 	}

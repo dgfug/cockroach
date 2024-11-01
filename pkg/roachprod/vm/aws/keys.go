@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package aws
 
@@ -14,20 +9,16 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/errors/oserror"
 )
 
-const sshPublicKeyFile = "${HOME}/.ssh/id_rsa.pub"
-
 // sshKeyExists checks to see if there is a an SSH key with the given name in the given region.
-func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
+func (p *Provider) sshKeyExists(l *logger.Logger, keyName, region string) (bool, error) {
 	var data struct {
 		KeyPairs []struct {
 			KeyName string
@@ -37,7 +28,7 @@ func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
 		"ec2", "describe-key-pairs",
 		"--region", region,
 	}
-	err := p.runJSONCommand(args, &data)
+	err := p.runJSONCommand(l, args, &data)
 	if err != nil {
 		return false, err
 	}
@@ -51,12 +42,9 @@ func (p *Provider) sshKeyExists(keyName string, region string) (bool, error) {
 
 // sshKeyImport takes the user's local, public SSH key and imports it into the ec2 region so that
 // we can create new hosts with it.
-func (p *Provider) sshKeyImport(keyName string, region string) error {
-	_, err := os.Stat(os.ExpandEnv(sshPublicKeyFile))
+func (p *Provider) sshKeyImport(l *logger.Logger, keyName, region string) error {
+	sshPublicKeyPath, err := config.SSHPublicKeyPath()
 	if err != nil {
-		if oserror.IsNotExist(err) {
-			return errors.Wrapf(err, "please run ssh-keygen externally to create your %s file", sshPublicKeyFile)
-		}
 		return err
 	}
 
@@ -65,7 +53,7 @@ func (p *Provider) sshKeyImport(keyName string, region string) error {
 	}
 	_ = data.KeyName // silence unused warning
 
-	user, err := p.FindActiveAccount()
+	user, err := p.FindActiveAccount(l)
 	if err != nil {
 		return err
 	}
@@ -81,10 +69,10 @@ func (p *Provider) sshKeyImport(keyName string, region string) error {
 		"ec2", "import-key-pair",
 		"--region", region,
 		"--key-name", keyName,
-		"--public-key-material", fmt.Sprintf("fileb://%s", sshPublicKeyFile),
+		"--public-key-material", fmt.Sprintf("fileb://%s", sshPublicKeyPath),
 		"--tag-specifications", tagSpecs,
 	}
-	err = p.runJSONCommand(args, &data)
+	err = p.runJSONCommand(l, args, &data)
 	// If two roachprod instances run at the same time with the same key, they may
 	// race to upload the key pair.
 	if err == nil || strings.Contains(err.Error(), "InvalidKeyPair.Duplicate") {
@@ -94,22 +82,19 @@ func (p *Provider) sshKeyImport(keyName string, region string) error {
 }
 
 // sshKeyName computes the name of the ec2 ssh key that we'll store the local user's public key in
-func (p *Provider) sshKeyName() (string, error) {
-	user, err := p.FindActiveAccount()
+func (p *Provider) sshKeyName(l *logger.Logger) (string, error) {
+	user, err := p.FindActiveAccount(l)
 	if err != nil {
 		return "", err
 	}
 
-	keyBytes, err := ioutil.ReadFile(os.ExpandEnv(sshPublicKeyFile))
+	sshKey, err := config.SSHPublicKey()
 	if err != nil {
-		if oserror.IsNotExist(err) {
-			return "", errors.Wrapf(err, "please run ssh-keygen externally to create your %s file", sshPublicKeyFile)
-		}
 		return "", err
 	}
 
 	hash := sha1.New()
-	if _, err := hash.Write(keyBytes); err != nil {
+	if _, err := hash.Write([]byte(sshKey)); err != nil {
 		return "", err
 	}
 	hashBytes := hash.Sum(nil)

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -19,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -28,6 +23,7 @@ import (
 
 func TestProjectSet(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -116,6 +112,8 @@ func TestProjectSet(t *testing.T) {
 				append(c.inputTypes, c.spec.GeneratedColumns...), /* outputTypes */
 				c.expected,
 				nil,
+				nil,
+				nil,
 			)
 		})
 	}
@@ -126,7 +124,7 @@ func BenchmarkProjectSet(b *testing.B) {
 	defer log.Scope(b).Close(b)
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 
 	v := [10]rowenc.EncDatum{}
@@ -162,6 +160,7 @@ func BenchmarkProjectSet(b *testing.B) {
 				flowCtx := execinfra.FlowCtx{
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 					EvalCtx: &evalCtx,
+					Mon:     evalCtx.TestingMon,
 				}
 
 				in := distsqlutils.NewRowBuffer(c.inputTypes, c.input, distsqlutils.RowBufferArgs{})
@@ -169,12 +168,12 @@ func BenchmarkProjectSet(b *testing.B) {
 				p, err := NewProcessor(
 					context.Background(), &flowCtx, 0, /* processorID */
 					&execinfrapb.ProcessorCoreUnion{ProjectSet: &c.spec}, &execinfrapb.PostProcessSpec{},
-					[]execinfra.RowSource{in}, []execinfra.RowReceiver{out}, []execinfra.LocalProcessor{})
+					[]execinfra.RowSource{in}, []execinfra.LocalProcessor{})
 				if err != nil {
 					b.Fatal(err)
 				}
 
-				p.Run(context.Background())
+				p.Run(context.Background(), out)
 			}
 		})
 	}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 Package ordering contains operator-specific logic related to orderings - whether
@@ -16,7 +11,7 @@ their children, etc.
 The package provides generic APIs that can be called on any RelExpr, as well as
 operator-specific APIs in some cases.
 
-Required orderings
+# Required orderings
 
 A Required ordering is part of the physical properties with respect to which an
 expression was optimized. It effectively describes a set of orderings, any of
@@ -30,7 +25,7 @@ way. This package implements the logic that decides whether each operator can
 provide a Required ordering, as well as what Required orderings on its input(s)
 are necessary.
 
-Provided orderings
+# Provided orderings
 
 In a single-node serial execution model, the Required ordering would be
 sufficient to configure execution. But in a distributed setting, even if an
@@ -41,7 +36,9 @@ single node. We must know exactly what order must be maintained on the streams
 (i.e. along which columns we should perform the comparisons).
 
 Consider a Scan operator that is scanning an index on a,b. In query:
-  SELECT a, b FROM abc ORDER BY a, b
+
+	SELECT a, b FROM abc ORDER BY a, b
+
 the Scan has Required ordering "+a,+b". Now consider another case where (as part
 of some more complicated query) we have the same Scan operator but with Required
 ordering "+b opt(a)"¹, which means that any of "+b", "+b,±a", "±a,+b" are

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemadesc
 
@@ -14,7 +9,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -29,6 +30,7 @@ type synthetic struct {
 // syntheticBase is an interface to differentiate some of the
 // behavior of synthetic.
 type syntheticBase interface {
+	GetPrivileges() *catpb.PrivilegeDescriptor
 	kindName() string
 	kind() catalog.ResolvedSchemaKind
 }
@@ -44,15 +46,6 @@ func (p synthetic) GetVersion() descpb.DescriptorVersion {
 }
 func (p synthetic) GetModificationTime() hlc.Timestamp {
 	return hlc.Timestamp{}
-}
-
-// Deprecated: Do not use.
-func (p synthetic) GetDrainingNames() []descpb.NameInfo {
-	return nil
-}
-func (p synthetic) GetPrivileges() *descpb.PrivilegeDescriptor {
-	log.Fatalf(context.TODO(), "cannot access privileges on a %s descriptor", p.kindName())
-	return nil
 }
 func (p synthetic) DescriptorType() catalog.DescriptorType {
 	return catalog.Schema
@@ -75,10 +68,8 @@ func (p synthetic) Offline() bool {
 func (p synthetic) GetOfflineReason() string {
 	return ""
 }
-func (p synthetic) DescriptorProto() *descpb.Descriptor {
-	log.Fatalf(context.TODO(),
-		"%s schema cannot be encoded", p.kindName())
-	return nil // unreachable
+func (p synthetic) ByteSize() int64 {
+	return 0
 }
 func (p synthetic) NewBuilder() catalog.DescriptorBuilder {
 	log.Fatalf(context.TODO(),
@@ -88,18 +79,106 @@ func (p synthetic) NewBuilder() catalog.DescriptorBuilder {
 func (p synthetic) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	return catalog.DescriptorIDSet{}, nil
 }
-func (p synthetic) ValidateSelf(vea catalog.ValidationErrorAccumulator) {}
-func (p synthetic) ValidateCrossReferences(
-	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+func (p synthetic) ValidateSelf(_ catalog.ValidationErrorAccumulator) {
+}
+func (p synthetic) ValidateForwardReferences(
+	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
+) {
+}
+func (p synthetic) ValidateBackReferences(
+	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
 ) {
 }
 func (p synthetic) ValidateTxnCommit(
-	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
 ) {
 }
 func (p synthetic) SchemaKind() catalog.ResolvedSchemaKind { return p.kind() }
-func (p synthetic) SchemaDesc() *descpb.SchemaDescriptor {
-	log.Fatalf(context.TODO(),
-		"synthetic %s cannot be encoded", p.kindName())
-	return nil // unreachable
+func (p synthetic) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return nil
+}
+func (p synthetic) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return catalog.PostDeserializationChanges{}
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (p synthetic) HasConcurrentSchemaChanges() bool {
+	return false
+}
+
+// ConcurrentSchemaChangeJobIDs implements catalog.Descriptor.
+func (p synthetic) ConcurrentSchemaChangeJobIDs() []catpb.JobID {
+	return nil
+}
+
+// SkipNamespace implements the descriptor interface.
+// We never store synthetic descriptors.
+func (p synthetic) SkipNamespace() bool {
+	return true
+}
+
+// GetObjectType implements the Object interface.
+func (p synthetic) GetObjectType() privilege.ObjectType {
+	return privilege.Schema
+}
+
+// GetObjectTypeString implements the Object interface.
+func (p synthetic) GetObjectTypeString() string {
+	return string(privilege.Schema)
+}
+
+// GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
+func (p synthetic) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
+	return catprivilege.MakeDefaultPrivileges(makeSyntheticDefaultPrivilegeDescriptor())
+}
+
+// GetFunction implements the SchemaDescriptor interface.
+func (p synthetic) GetFunction(name string) (descpb.SchemaDescriptor_Function, bool) {
+	return descpb.SchemaDescriptor_Function{}, false
+}
+
+// ForEachFunctionSignature implements the SchemaDescriptor interface.
+func (p synthetic) ForEachFunctionSignature(
+	fn func(sig descpb.SchemaDescriptor_FunctionSignature) error,
+) error {
+	return nil
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (p synthetic) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	return nil
+}
+
+// MaybeRequiresTypeHydration implements the catalog.Descriptor interface.
+func (p synthetic) MaybeRequiresTypeHydration() bool { return false }
+
+func (p synthetic) GetRawBytesInStorage() []byte {
+	return nil
+}
+
+// GetResolvedFuncDefinition implements the SchemaDescriptor interface.
+func (p synthetic) GetResolvedFuncDefinition(
+	context.Context, string,
+) (*tree.ResolvedFunctionDefinition, bool) {
+	return nil, false
+}
+
+func makeSyntheticDefaultPrivilegeDescriptor() *catpb.DefaultPrivilegeDescriptor {
+	return catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_SCHEMA)
+}
+
+func makeSyntheticSchemaDesc(sc catalog.SchemaDescriptor) *descpb.SchemaDescriptor {
+	return &descpb.SchemaDescriptor{
+		ID:                sc.GetID(),
+		ParentID:          sc.GetParentID(),
+		Version:           sc.GetVersion(),
+		Name:              sc.GetName(),
+		State:             descpb.DescriptorState_PUBLIC,
+		Privileges:        sc.GetPrivileges(),
+		DefaultPrivileges: makeSyntheticDefaultPrivilegeDescriptor(),
+	}
+}
+
+func makeSyntheticDesc(sc catalog.SchemaDescriptor) *descpb.Descriptor {
+	return &descpb.Descriptor{Union: &descpb.Descriptor_Schema{Schema: makeSyntheticSchemaDesc(sc)}}
 }

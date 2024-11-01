@@ -1,83 +1,98 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spec
 
-import "time"
+import (
+	"time"
 
-// Option is the interface satisfied by options to MakeClusterSpec.
-type Option interface {
-	apply(spec *ClusterSpec)
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+)
+
+// Option for MakeClusterSpec.
+type Option func(spec *ClusterSpec)
+
+// Arch requests a specific CPU architecture.
+//
+// Note that it is not guaranteed that this architecture will be used (e.g. if
+// the requested machine size isn't available in this architecture).
+//
+// TODO(radu): add a flag to indicate whether it's a preference or a requirement.
+func Arch(arch vm.CPUArch) Option {
+	return func(spec *ClusterSpec) {
+		spec.Arch = arch
+	}
 }
 
-type nodeCPUOption int
-
-func (o nodeCPUOption) apply(spec *ClusterSpec) {
-	spec.CPUs = int(o)
-}
-
-// CPU is a node option which requests nodes with the specified number of CPUs.
+// CPU sets the number of CPUs for each node.
 func CPU(n int) Option {
-	return nodeCPUOption(n)
+	return func(spec *ClusterSpec) {
+		spec.CPUs = n
+	}
 }
 
-type volumeSizeOption int
+// WorkloadNode indicates that the last node is a workload node.
+// Defaults to a VM with 4 CPUs if not specified by WorkloadNodeCPUs.
+func WorkloadNode() Option {
+	return func(spec *ClusterSpec) {
+		spec.WorkloadNode = true
+	}
+}
 
-func (o volumeSizeOption) apply(spec *ClusterSpec) {
-	spec.VolumeSize = int(o)
+func WorkloadNodeCPU(n int) Option {
+	return func(spec *ClusterSpec) {
+		spec.WorkloadNodeCPUs = n
+	}
+}
+
+// Mem requests nodes with low/standard/high ratio of memory per CPU.
+func Mem(level MemPerCPU) Option {
+	return func(spec *ClusterSpec) {
+		spec.Mem = level
+	}
 }
 
 // VolumeSize is the size in GB of the disk volume.
 func VolumeSize(n int) Option {
-	return volumeSizeOption(n)
-}
-
-type nodeSSDOption int
-
-func (o nodeSSDOption) apply(spec *ClusterSpec) {
-	spec.SSDs = int(o)
+	return func(spec *ClusterSpec) {
+		spec.VolumeSize = n
+	}
 }
 
 // SSD is a node option which requests nodes with the specified number of SSDs.
 func SSD(n int) Option {
-	return nodeSSDOption(n)
+	return func(spec *ClusterSpec) {
+		spec.SSDs = n
+	}
 }
 
-type nodeGeoOption struct{}
-
-func (o nodeGeoOption) apply(spec *ClusterSpec) {
-	spec.Geo = true
+// RAID0 enables RAID 0 striping across all disks on the node.
+func RAID0(enabled bool) Option {
+	return func(spec *ClusterSpec) {
+		spec.RAID0 = enabled
+	}
 }
 
-// Geo is a node option which requests Geo-distributed nodes.
+// Geo requests Geo-distributed nodes.
 func Geo() Option {
-	return nodeGeoOption{}
+	return func(spec *ClusterSpec) {
+		spec.Geo = true
+	}
 }
 
-type nodeZonesOption string
-
-func (o nodeZonesOption) apply(spec *ClusterSpec) {
-	spec.Zones = string(o)
+func nodeLifetime(lifetime time.Duration) Option {
+	return func(spec *ClusterSpec) {
+		spec.Lifetime = lifetime
+	}
 }
 
-// Zones is a node option which requests Geo-distributed nodes. Note that this
-// overrides the --zones flag and is useful for tests that require running on
-// specific Zones.
-func Zones(s string) Option {
-	return nodeZonesOption(s)
-}
-
-type nodeLifetimeOption time.Duration
-
-func (o nodeLifetimeOption) apply(spec *ClusterSpec) {
-	spec.Lifetime = time.Duration(o)
+// GatherCores enables core gathering after test runs.
+func GatherCores() Option {
+	return func(spec *ClusterSpec) {
+		spec.GatherCores = true
+	}
 }
 
 // clusterReusePolicy indicates what clusters a particular test can run on and
@@ -123,58 +138,74 @@ func (ReusePolicyAny) clusterReusePolicy()    {}
 func (ReusePolicyNone) clusterReusePolicy()   {}
 func (ReusePolicyTagged) clusterReusePolicy() {}
 
-type clusterReusePolicyOption struct {
-	p clusterReusePolicy
-}
-
 // ReuseAny is an Option that specifies a cluster with ReusePolicyAny.
 func ReuseAny() Option {
-	return clusterReusePolicyOption{p: ReusePolicyAny{}}
+	return func(spec *ClusterSpec) {
+		spec.ReusePolicy = ReusePolicyAny{}
+	}
 }
 
 // ReuseNone is an Option that specifies a cluster with ReusePolicyNone.
 func ReuseNone() Option {
-	return clusterReusePolicyOption{p: ReusePolicyNone{}}
+	return func(spec *ClusterSpec) {
+		spec.ReusePolicy = ReusePolicyNone{}
+	}
 }
 
 // ReuseTagged is an Option that specifies a cluster with ReusePolicyTagged.
 func ReuseTagged(tag string) Option {
-	return clusterReusePolicyOption{p: ReusePolicyTagged{Tag: tag}}
+	return func(spec *ClusterSpec) {
+		spec.ReusePolicy = ReusePolicyTagged{Tag: tag}
+	}
 }
 
-func (p clusterReusePolicyOption) apply(spec *ClusterSpec) {
-	spec.ReusePolicy = p.p
+// PreferLocalSSD specifies that we use instance-local SSDs whenever possible
+// (depending on other constraints on machine type).
+//
+// By default, a test cluster may or may not use a local SSD depending on
+// --local-ssd flag and machine type.
+func PreferLocalSSD() Option {
+	return func(spec *ClusterSpec) {
+		spec.LocalSSD = LocalSSDPreferOn
+	}
 }
 
-type preferSSDOption struct{}
-
-func (*preferSSDOption) apply(spec *ClusterSpec) {
-	spec.PreferLocalSSD = true
+// DisableLocalSSD specifies that we never use instance-local SSDs.
+//
+// By default, a test cluster may or may not use a local SSD depending on
+// --local-ssd flag and machine type.
+func DisableLocalSSD() Option {
+	return func(spec *ClusterSpec) {
+		spec.LocalSSD = LocalSSDDisable
+	}
 }
 
-// PreferSSD prefers using local SSD, when possible.
-func PreferSSD() Option {
-	return &preferSSDOption{}
+// TerminateOnMigration ensures VM is terminated in case GCE triggers a live migration.
+func TerminateOnMigration() Option {
+	return func(spec *ClusterSpec) {
+		spec.TerminateOnMigration = true
+	}
 }
 
-type setFileSystem struct {
-	fs fileSystemType
-}
-
-func (s *setFileSystem) apply(spec *ClusterSpec) {
-	spec.FileSystem = s.fs
+// UseSpotVMs creates a spot vm or equivalent of a cloud provider.
+// Using this option creates SpotVMs instead of on demand VMS. SpotVMS are
+// cheaper but can be terminated at any time by the cloud provider.
+// This option is only supported by GCE for now.
+// See https://cloud.google.com/compute/docs/instances/spot,
+// https://azure.microsoft.com/en-in/products/virtual-machines/spot
+// and https://aws.amazon.com/ec2/spot/ for more details.
+func UseSpotVMs() Option {
+	return func(spec *ClusterSpec) {
+		spec.UseSpotVMs = true
+	}
 }
 
 // SetFileSystem is an Option which can be used to set
 // the underlying file system to be used.
 func SetFileSystem(fs fileSystemType) Option {
-	return &setFileSystem{fs}
-}
-
-type randomlyUseZfs struct{}
-
-func (r *randomlyUseZfs) apply(spec *ClusterSpec) {
-	spec.RandomlyUseZfs = true
+	return func(spec *ClusterSpec) {
+		spec.FileSystem = fs
+	}
 }
 
 // RandomlyUseZfs is an Option which randomly picks
@@ -182,5 +213,80 @@ func (r *randomlyUseZfs) apply(spec *ClusterSpec) {
 // about 20% of the time.
 // Zfs is only picked if the cloud is gce.
 func RandomlyUseZfs() Option {
-	return &randomlyUseZfs{}
+	return func(spec *ClusterSpec) {
+		spec.RandomlyUseZfs = true
+	}
+}
+
+// GCEMachineType sets the machine (instance) type when the cluster is on GCE.
+func GCEMachineType(machineType string) Option {
+	return func(spec *ClusterSpec) {
+		spec.GCE.MachineType = machineType
+	}
+}
+
+// GCEMinCPUPlatform sets the minimum CPU platform when the cluster is on GCE.
+func GCEMinCPUPlatform(platform string) Option {
+	return func(spec *ClusterSpec) {
+		spec.GCE.MinCPUPlatform = platform
+	}
+}
+
+// GCEVolumeType sets the volume type when the cluster is on GCE.
+func GCEVolumeType(volumeType string) Option {
+	return func(spec *ClusterSpec) {
+		spec.GCE.VolumeType = volumeType
+	}
+}
+
+// GCEZones is a node option which requests Geo-distributed nodes; only applies
+// when the test runs on GCE.
+//
+// Note that this overrides the --zones flag and is useful for tests that
+// require running on specific zones.
+func GCEZones(zones string) Option {
+	return func(spec *ClusterSpec) {
+		spec.GCE.Zones = zones
+	}
+}
+
+// AWSMachineType sets the machine (instance) type when the cluster is on AWS.
+func AWSMachineType(machineType string) Option {
+	return func(spec *ClusterSpec) {
+		spec.AWS.MachineType = machineType
+	}
+}
+
+// AWSVolumeThroughput sets the minimum provisioned EBS volume throughput when
+// the cluster is on AWS.
+func AWSVolumeThroughput(throughput int) Option {
+	return func(spec *ClusterSpec) {
+		spec.AWS.VolumeThroughput = throughput
+	}
+}
+
+// AWSZones is a node option which requests Geo-distributed nodes; only applies
+// when the test runs on AWS.
+//
+// Note that this overrides the --zones flag and is useful for tests that
+// require running on specific zones.
+func AWSZones(zones string) Option {
+	return func(spec *ClusterSpec) {
+		spec.AWS.Zones = zones
+	}
+}
+
+// AzureZones is a node option which requests Geo-distributed nodes; only applies
+// when the test runs on Azure.
+//
+// Note that this overrides the --zones flag and is useful for tests that
+// require running on specific zones.
+//
+// TODO(darrylwong): Something is not quite right when creating
+// zones that have overlapping address spaces, i.e. eastus and westus.
+// See: https://github.com/cockroachdb/cockroach/issues/124612
+func AzureZones(zones string) Option {
+	return func(spec *ClusterSpec) {
+		spec.Azure.Zones = zones
+	}
 }

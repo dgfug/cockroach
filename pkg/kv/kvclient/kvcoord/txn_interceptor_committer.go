@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -14,6 +9,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -25,9 +22,11 @@ import (
 )
 
 var parallelCommitsEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
 	"kv.transaction.parallel_commits_enabled",
 	"if enabled, transactional commits will be parallelized with transactional writes",
 	true,
+	settings.WithName("kv.transaction.parallel_commits.enabled"),
 )
 
 // txnCommitter is a txnInterceptor that concerns itself with committing and
@@ -49,12 +48,12 @@ var parallelCommitsEnabled = settings.RegisterBoolSetting(
 //
 // Parallel commits works by defining a committed transaction as a transaction
 // that meets one of the two following commit conditions:
-// 1. a transaction is *explicitly committed* if it has a transaction record with
-//    a COMMITTED status
-// 2. a transaction is *implicitly committed* if it has a transaction record with
-//    a STAGING status and intents written for all writes declared as "in-flight"
-//    on the transaction record at equal or lower timestamps than the transaction
-//    record's commit timestamp
+//  1. a transaction is *explicitly committed* if it has a transaction record with
+//     a COMMITTED status
+//  2. a transaction is *implicitly committed* if it has a transaction record with
+//     a STAGING status and intents written for all writes declared as "in-flight"
+//     on the transaction record at equal or lower timestamps than the transaction
+//     record's commit timestamp
 //
 // A transaction may move from satisfying the implicit commit condition to
 // satisfying the explicit commit condition. This is desirable because it moves
@@ -87,20 +86,34 @@ var parallelCommitsEnabled = settings.RegisterBoolSetting(
 // satisfied and the transaction is still in-progress (and could still be
 // committed or aborted at a later time). There are a number of reasons why
 // some of the requests in the final batch may have failed:
-// - intent writes: these requests may fail to write an intent due to a logical
-//     error like a ConditionFailedError. They also could have succeeded at writing
-//     an intent but failed to write it at the desired timestamp because they ran
-//     into the timestamp cache or another committed value. In the first case, the
-//     txnCommitter will receive an error. In the second, it will generate one in
-//     needTxnRetryAfterStaging.
-// - query intents: these requests may fail because they discover that one of the
+//
+//   - intent writes (error): these requests may fail to write an intent due to
+//     a logical error like a ConditionFailedError during evaluation. In these
+//     cases, the txnCommitter will receive an error and can conclude that
+//     intent was never written and so the implicit commit condition is not
+//     satisfied. The error is returned to the client.
+//
+//   - intent writes (successful but pushed): these requests may also succeed at
+//     writing an intent but fail to write it at the desired (staging) timestamp
+//     because they run into the timestamp cache or another committed value
+//     (forms of contention). In these cases, the txnCommitter will receive a
+//     successful response, but can determine (isTxnCommitImplicit) that the
+//     transaction does not satisfy the implicit commit condition because one or
+//     more of its intents are written with a timestamp higher than the staging
+//     transaction record's. It will retry the transaction commit by re-issuing
+//     the EndTxn request (retryTxnCommitAfterFailedParallelCommit) to attempt
+//     to move the transaction directly to the explicitly committed state. This
+//     retry is called a "parallel commit auto-retry".
+//
+//   - query intents: these requests may fail because they discover that one of the
 //     previously issued writes has failed; either because it never left an intent
 //     or because it left one at too high of a timestamp. In this case, the request
 //     will return an error because the requests all have the ErrorIfMissing option
 //     set. It will also prevent the write from ever succeeding in the future, which
 //     ensures that the transaction will never suddenly become implicitly committed
 //     at a later point due to the write eventually succeeding (e.g. after a replay).
-// - end txn: this request may fail with a TransactionRetryError for any number of
+//
+//   - end txn: this request may fail with a TransactionRetryError for any number of
 //     reasons, such as if the transaction's provisional commit timestamp has been
 //     pushed past its read timestamp. In all of these cases, an error will be
 //     returned and the transaction record will not be staged.
@@ -112,27 +125,29 @@ var parallelCommitsEnabled = settings.RegisterBoolSetting(
 // In all cases, the interceptor abstracts away the details of this from all
 // interceptors above it in the coordinator interceptor stack.
 type txnCommitter struct {
-	st      *cluster.Settings
-	stopper *stop.Stopper
-	wrapped lockedSender
-	mu      sync.Locker
+	st         *cluster.Settings
+	stopper    *stop.Stopper
+	wrapped    lockedSender
+	metrics    *TxnMetrics
+	mu         sync.Locker
+	disable1PC bool
 }
 
 // SendLocked implements the lockedSender interface.
 func (tc *txnCommitter) SendLocked(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+	tc.maybeDisable1PC(ba)
 	// If the batch does not include an EndTxn request, pass it through.
-	rArgs, hasET := ba.GetArg(roachpb.EndTxn)
+	rArgs, hasET := ba.GetArg(kvpb.EndTxn)
 	if !hasET {
 		return tc.wrapped.SendLocked(ctx, ba)
 	}
-	et := rArgs.(*roachpb.EndTxnRequest)
+	et := rArgs.(*kvpb.EndTxnRequest)
 
 	if err := tc.validateEndTxnBatch(ba); err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
-
 	// Determine whether we can elide the EndTxn entirely. We can do so if the
 	// transaction is read-only, which we determine based on whether the EndTxn
 	// request contains any writes.
@@ -140,46 +155,19 @@ func (tc *txnCommitter) SendLocked(
 		return tc.sendLockedWithElidedEndTxn(ctx, ba, et)
 	}
 
-	// Assign the transaction's key to the Request's header if it isn't already
-	// set. This is the only place where EndTxnRequest.Key is assigned, but we
-	// could be dealing with a re-issued batch after a refresh. Remember, the
-	// committer is below the span refresh on the interceptor stack.
-	var etAttempt endTxnAttempt
-	if et.Key == nil {
-		et.Key = ba.Txn.Key
-		etAttempt = endTxnFirstAttempt
-	} else {
-		// If this is a retry, we'll disable parallel commit. Since the previous
-		// attempt might have partially succeeded (i.e. the batch might have been
-		// split into sub-batches and some of them might have evaluated
-		// successfully), there might be intents laying around. If we'd perform a
-		// parallel commit, and the batch gets split again, and the STAGING txn
-		// record were written before we evaluate some of the other sub-batche. We
-		// could technically enter the "implicitly committed" state before all the
-		// sub-batches are evaluated and this is problematic: there's a race between
-		// evaluating those requests and other pushers coming along and
-		// transitioning the txn to explicitly committed (and cleaning up all the
-		// intents), and the evaluations of the outstanding sub-batches. If the
-		// randos win, then the re-evaluations will fail because we don't have
-		// idempotency of evaluations across a txn commit (for example, the
-		// re-evaluations might notice that their transaction is already committed
-		// and get confused).
-		etAttempt = endTxnRetry
-		if len(et.InFlightWrites) > 0 {
-			// Make a copy of the EndTxn, since we're going to change it below to
-			// disable the parallel commit.
-			etCpy := *et
-			ba.Requests[len(ba.Requests)-1].MustSetInner(&etCpy)
-			et = &etCpy
-		}
+	// Assign the transaction's key to the Request's header.
+	if et.Key != nil {
+		return nil, kvpb.NewError(errors.AssertionFailedf("client must not assign Key to EndTxn"))
 	}
+	et.Key = ba.Txn.Key
+	et.Disable1PC = tc.disable1PC // disable the 1PC optimization, if necessary
 
 	// Determine whether the commit request can be run in parallel with the rest
 	// of the requests in the batch. If not, move the in-flight writes currently
 	// attached to the EndTxn request to the LockSpans and clear the in-flight
 	// write set; no writes will be in-flight concurrently with the EndTxn
 	// request.
-	if len(et.InFlightWrites) > 0 && !tc.canCommitInParallel(ctx, ba, et, etAttempt) {
+	if len(et.InFlightWrites) > 0 && !tc.canCommitInParallel(ba, et) {
 		// NB: when parallel commits is disabled, this is the best place to
 		// detect whether the batch has only distinct spans. We can set this
 		// flag based on whether any of previously declared in-flight writes
@@ -206,9 +194,7 @@ func (tc *txnCommitter) SendLocked(
 		// of STAGING, we know that the transaction failed to implicitly commit,
 		// so interceptors above the txnCommitter in the stack don't need to be
 		// made aware that the record is staging.
-		if txn := pErr.GetTxn(); txn != nil && txn.Status == roachpb.STAGING {
-			pErr.SetTxn(cloneWithStatus(txn, roachpb.PENDING))
-		}
+		pErr = maybeRemoveStagingStatusInErr(pErr)
 		return nil, pErr
 	}
 
@@ -229,20 +215,27 @@ func (tc *txnCommitter) SendLocked(
 		// and there were no writes in the batch request.
 		return br, nil
 	default:
-		return nil, roachpb.NewErrorf("unexpected response status without error: %v", br.Txn)
+		return nil, kvpb.NewErrorf("unexpected response status without error: %v", br.Txn)
 	}
 
-	// Determine whether the transaction needs to either retry or refresh. When
-	// the EndTxn request evaluated while STAGING the transaction record, it
-	// performed this check. However, the transaction proto may have changed due
-	// to writes evaluated concurrently with the EndTxn even if none of those
-	// writes returned an error. Remember that the transaction proto we see here
-	// could be a combination of protos from responses, all merged by
-	// DistSender.
-	if pErr := needTxnRetryAfterStaging(br); pErr != nil {
-		log.VEventf(ctx, 2, "parallel commit failed since some writes were pushed. "+
-			"Synthesized err: %s", pErr)
-		return nil, pErr
+	// Determine whether the transaction satisfies the implicit commit condition.
+	// If not, it needs to retry the EndTxn request, and possibly also refresh if
+	// it is serializable.
+	implicitCommit, err := isTxnCommitImplicit(br)
+	if err != nil {
+		return nil, kvpb.NewError(err)
+	}
+
+	// Retry the EndTxn request (and nothing else) if the transaction does not
+	// satisfy the implicit commit condition. This EndTxn request will not be
+	// in-flight concurrently with any other writes (they all succeeded), so it
+	// will move the transaction record directly to the COMMITTED state.
+	//
+	// Note that we leave the transaction record that we wrote in the STAGING
+	// state, which is not ideal. But as long as we continue heartbeating the
+	// txn record, it being PENDING or STAGING does not make a difference.
+	if !implicitCommit {
+		return tc.retryTxnCommitAfterFailedParallelCommit(ctx, ba, br)
 	}
 
 	// If the transaction doesn't need to retry then it is implicitly committed!
@@ -252,7 +245,7 @@ func (tc *txnCommitter) SendLocked(
 	// we transition to an explicitly committed transaction as soon as possible.
 	// This also has the side-effect of kicking off intent resolution.
 	mergedLockSpans, _ := mergeIntoSpans(et.LockSpans, et.InFlightWrites)
-	tc.makeTxnCommitExplicitAsync(ctx, br.Txn, mergedLockSpans, ba.CanForwardReadTimestamp)
+	tc.makeTxnCommitExplicitAsync(ctx, br.Txn, mergedLockSpans)
 
 	// Switch the status on the batch response's transaction to COMMITTED. No
 	// interceptor above this one in the stack should ever need to deal with
@@ -262,7 +255,7 @@ func (tc *txnCommitter) SendLocked(
 }
 
 // validateEndTxnBatch runs sanity checks on a commit or rollback request.
-func (tc *txnCommitter) validateEndTxnBatch(ba roachpb.BatchRequest) error {
+func (tc *txnCommitter) validateEndTxnBatch(ba *kvpb.BatchRequest) error {
 	// Check that we don't combine a limited DeleteRange with a commit. We cannot
 	// attempt to run such a batch as a 1PC because, if it gets split and thus
 	// doesn't run as a 1PC, resolving the intents will be very expensive.
@@ -275,10 +268,17 @@ func (tc *txnCommitter) validateEndTxnBatch(ba roachpb.BatchRequest) error {
 	if ba.Header.MaxSpanRequestKeys == 0 {
 		return nil
 	}
-	e, endTxn := ba.GetArg(roachpb.EndTxn)
-	_, delRange := ba.GetArg(roachpb.DeleteRange)
-	if delRange && endTxn && !e.(*roachpb.EndTxnRequest).Require1PC {
+	e, endTxn := ba.GetArg(kvpb.EndTxn)
+	_, delRange := ba.GetArg(kvpb.DeleteRange)
+	if delRange && endTxn && !e.(*kvpb.EndTxnRequest).Require1PC {
 		return errors.Errorf("possible 1PC batch cannot contain EndTxn without setting Require1PC; see #37457")
+	}
+	// Check that the EndTxn request doesn't require a 1PC when we've previously
+	// determined 1PC should be disabled.
+	if e.(*kvpb.EndTxnRequest).Require1PC && tc.disable1PC {
+		return errors.AssertionFailedf(
+			"cannot require 1PC when for transactions that acquire replicated locks",
+		)
 	}
 	return nil
 }
@@ -291,11 +291,12 @@ func (tc *txnCommitter) validateEndTxnBatch(ba roachpb.BatchRequest) error {
 // The method is used for read-only transactions, which never need to write a
 // transaction record.
 func (tc *txnCommitter) sendLockedWithElidedEndTxn(
-	ctx context.Context, ba roachpb.BatchRequest, et *roachpb.EndTxnRequest,
-) (br *roachpb.BatchResponse, pErr *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest, et *kvpb.EndTxnRequest,
+) (br *kvpb.BatchResponse, pErr *kvpb.Error) {
 	// Send the batch without its final request, which we know to be the EndTxn
 	// request that we're eliding. If this would result in us sending an empty
 	// batch, mock out a reply instead of sending anything.
+	ba = ba.ShallowCopy()
 	ba.Requests = ba.Requests[:len(ba.Requests)-1]
 	if len(ba.Requests) > 0 {
 		br, pErr = tc.wrapped.SendLocked(ctx, ba)
@@ -303,7 +304,7 @@ func (tc *txnCommitter) sendLockedWithElidedEndTxn(
 			return nil, pErr
 		}
 	} else {
-		br = &roachpb.BatchResponse{}
+		br = &kvpb.BatchResponse{}
 		// NB: there's no need to clone the txn proto here because we already
 		// call cloneWithStatus below.
 		br.Txn = ba.Txn
@@ -313,8 +314,8 @@ func (tc *txnCommitter) sendLockedWithElidedEndTxn(
 	// transaction is trying to commit.
 	if et.Commit {
 		deadline := et.Deadline
-		if deadline != nil && deadline.LessEq(br.Txn.WriteTimestamp) {
-			return nil, generateTxnDeadlineExceededErr(ba.Txn, *deadline)
+		if !deadline.IsEmpty() && deadline.LessEq(br.Txn.WriteTimestamp) {
+			return nil, generateTxnDeadlineExceededErr(ba.Txn, deadline)
 		}
 	}
 
@@ -329,34 +330,16 @@ func (tc *txnCommitter) sendLockedWithElidedEndTxn(
 	br.Txn = cloneWithStatus(br.Txn, status)
 
 	// Synthesize and append an EndTxn response.
-	br.Add(&roachpb.EndTxnResponse{})
+	br.Add(&kvpb.EndTxnResponse{})
 	return br, nil
 }
-
-// endTxnAttempt specifies whether it's the first time that we're attempting to
-// evaluate an EndTxn request or whether it's a retry (i.e. after a successful
-// refresh). There are some precautions we need to take when sending out
-// retries.
-type endTxnAttempt int
-
-const (
-	endTxnFirstAttempt endTxnAttempt = iota
-	endTxnRetry
-)
 
 // canCommitInParallel determines whether the batch can issue its committing
 // EndTxn in parallel with the rest of its requests and with any in-flight
 // writes, which all should have corresponding QueryIntent requests in the
 // batch.
-func (tc *txnCommitter) canCommitInParallel(
-	ctx context.Context, ba roachpb.BatchRequest, et *roachpb.EndTxnRequest, etAttempt endTxnAttempt,
-) bool {
+func (tc *txnCommitter) canCommitInParallel(ba *kvpb.BatchRequest, et *kvpb.EndTxnRequest) bool {
 	if !parallelCommitsEnabled.Get(&tc.st.SV) {
-		return false
-	}
-
-	if etAttempt == endTxnRetry {
-		log.VEventf(ctx, 2, "retrying batch not eligible for parallel commit")
 		return false
 	}
 
@@ -378,31 +361,21 @@ func (tc *txnCommitter) canCommitInParallel(
 	for _, ru := range ba.Requests[:len(ba.Requests)-1] {
 		req := ru.GetInner()
 		switch {
-		case roachpb.IsIntentWrite(req):
-			if roachpb.IsRange(req) {
-				// Similar to how we can't pipeline ranged writes, we also can't
-				// commit in parallel with them. The reason for this is that the
-				// status resolution process for STAGING transactions wouldn't
-				// know where to look for the corresponding intents.
-				return false
-			}
-			// All other point writes are included in the EndTxn request's
-			// InFlightWrites set and are visible to the status resolution
-			// process for STAGING transactions. Populating InFlightWrites
-			// has already been done by the txnPipeliner.
+		case kvpb.CanParallelCommit(req):
+			//  The request can be part of a batch that is committed in parallel.
 
-		case req.Method() == roachpb.QueryIntent:
-			// QueryIntent requests are compatable with parallel commits. The
+		case req.Method() == kvpb.QueryIntent:
+			// QueryIntent requests are compatible with parallel commits. The
 			// intents being queried are also attached to the EndTxn request's
 			// InFlightWrites set and are visible to the status resolution
 			// process for STAGING transactions. Populating InFlightWrites has
 			// already been done by the txnPipeliner.
 
 		default:
-			// All other request types, notably Get and Scan requests, are
-			// incompatible with parallel commits because their outcome is
-			// not taken into consideration by the status resolution process
-			// for STAGING transactions.
+			// All other request types, notably Get, Scan and DeleteRange requests,
+			// are incompatible with parallel commits because their outcome is not
+			// taken into consideration by the status resolution process for STAGING
+			// transactions.
 			return false
 		}
 	}
@@ -421,42 +394,82 @@ func mergeIntoSpans(s []roachpb.Span, ws []roachpb.SequencedWrite) ([]roachpb.Sp
 	return roachpb.MergeSpans(&m)
 }
 
-// needTxnRetryAfterStaging determines whether the transaction needs to refresh
-// (see txnSpanRefresher) or retry based on the batch response of a parallel
-// commit attempt.
-func needTxnRetryAfterStaging(br *roachpb.BatchResponse) *roachpb.Error {
+// isTxnCommitImplicit determines whether the transaction has satisfied the
+// implicit commit requirements. It is used to determine whether the transaction
+// needs to retry its EndTxn based on the response to a parallel commit attempt.
+func isTxnCommitImplicit(br *kvpb.BatchResponse) (bool, error) {
 	if len(br.Responses) == 0 {
-		return roachpb.NewErrorf("no responses in BatchResponse: %v", br)
+		return false, errors.AssertionFailedf("no responses in BatchResponse: %v", br)
 	}
 	lastResp := br.Responses[len(br.Responses)-1].GetInner()
-	etResp, ok := lastResp.(*roachpb.EndTxnResponse)
+	etResp, ok := lastResp.(*kvpb.EndTxnResponse)
 	if !ok {
-		return roachpb.NewErrorf("unexpected response in BatchResponse: %v", lastResp)
+		return false, errors.AssertionFailedf("unexpected response in BatchResponse: %v", lastResp)
 	}
 	if etResp.StagingTimestamp.IsEmpty() {
-		return roachpb.NewErrorf("empty StagingTimestamp in EndTxnResponse: %v", etResp)
+		return false, errors.AssertionFailedf("empty StagingTimestamp in EndTxnResponse: %v", etResp)
 	}
-	if etResp.StagingTimestamp.Less(br.Txn.WriteTimestamp) {
-		// If the timestamp that the transaction record was staged at
-		// is less than the timestamp of the transaction in the batch
-		// response then one of the concurrent writes was pushed to
-		// a higher timestamp. This violates the "implicit commit"
-		// condition and neither the transaction coordinator nor any
-		// other concurrent actor will consider this transaction to
-		// be committed as is.
-		// Note that we leave the transaction record that we wrote in the STAGING
-		// state, which is not ideal. But as long as we continue heartbeating the
-		// txn record, it being PENDING or STAGING does not make a difference.
-		reason := roachpb.RETRY_SERIALIZABLE
-		if br.Txn.WriteTooOld {
-			reason = roachpb.RETRY_WRITE_TOO_OLD
-		}
-		err := roachpb.NewTransactionRetryError(
-			reason, "serializability failure concurrent with STAGING")
-		txn := cloneWithStatus(br.Txn, roachpb.PENDING)
-		return roachpb.NewErrorWithTxn(err, txn)
+	// If the timestamp that the transaction record was staged at is less than
+	// the timestamp of the transaction in the batch response then one of the
+	// concurrent writes was pushed to a higher timestamp. This violates the
+	// "implicit commit" condition and neither the transaction coordinator nor
+	// any other concurrent actor will consider this transaction to be committed
+	// as is.
+	failed := etResp.StagingTimestamp.Less(br.Txn.WriteTimestamp)
+	return !failed, nil
+}
+
+// retryTxnCommitAfterFailedParallelCommit retries the batch's EndTxn request
+// after the batch has previously succeeded (with the response br), but failed
+// to qualify for the implicit commit condition. This EndTxn request will not be
+// in-flight concurrently with any other writes (they all succeeded), so it will
+// move the transaction record directly to the COMMITTED state.
+//
+// If successful, the response for the re-issued EndTxn request is stitched back
+// together with the rest of the BatchResponse and returned.
+func (tc *txnCommitter) retryTxnCommitAfterFailedParallelCommit(
+	ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+	log.Eventf(ctx, "parallel commit failed; retrying EndTxn request")
+	tc.metrics.ParallelCommitAutoRetries.Inc(1)
+
+	// Issue a batch containing only the EndTxn request.
+	etIdx := len(ba.Requests) - 1
+	baSuffix := ba.ShallowCopy()
+	baSuffix.Requests = ba.Requests[etIdx:]
+	baSuffix.Txn = cloneWithStatus(br.Txn, roachpb.PENDING)
+	// Update the EndTxn request to move the in-flight writes currently attached
+	// to the EndTxn request to the LockSpans and clear the in-flight write set;
+	// the writes already succeeded and will not be in-flight concurrently with
+	// the EndTxn request.
+	{
+		et := baSuffix.Requests[0].GetEndTxn().ShallowCopy().(*kvpb.EndTxnRequest)
+		et.LockSpans, _ = mergeIntoSpans(et.LockSpans, et.InFlightWrites)
+		et.InFlightWrites = nil
+		baSuffix.Requests[0].MustSetInner(et)
 	}
-	return nil
+	brSuffix, pErr := tc.wrapped.SendLocked(ctx, baSuffix)
+	if pErr != nil {
+		// If the request determined that the transaction record had been staging,
+		// but then fails to commit the transaction, downgrade the status back to
+		// PENDING. We issued the request with a PENDING status, so we typically
+		// don't expect this to happen. However, it can happen if the error is
+		// constructed using the proto from the transaction record, as is the case
+		// for TransactionRetryErrors returned from request evaluation.
+		pErr = maybeRemoveStagingStatusInErr(pErr)
+		return nil, pErr
+	}
+
+	// Combine the responses.
+	br.Responses[etIdx] = kvpb.ResponseUnion{}
+	if err := br.Combine(ctx, brSuffix, []int{etIdx}, ba); err != nil {
+		return nil, kvpb.NewError(err)
+	}
+	if br.Txn == nil || !br.Txn.Status.IsFinalized() {
+		return nil, kvpb.NewError(errors.AssertionFailedf(
+			"txn status not finalized after successful retried EndTxn: %v", br.Txn))
+	}
+	return br, nil
 }
 
 // makeTxnCommitExplicitAsync launches an async task that attempts to move the
@@ -464,7 +477,7 @@ func needTxnRetryAfterStaging(br *roachpb.BatchResponse) *roachpb.Error {
 // written) to explicitly committed (COMMITTED status). It does so by sending a
 // second EndTxnRequest, this time with no InFlightWrites attached.
 func (tc *txnCommitter) makeTxnCommitExplicitAsync(
-	ctx context.Context, txn *roachpb.Transaction, lockSpans []roachpb.Span, canFwdRTS bool,
+	ctx context.Context, txn *roachpb.Transaction, lockSpans []roachpb.Span,
 ) {
 	// TODO(nvanbenschoten): consider adding tracing for this request.
 	// TODO(nvanbenschoten): add a timeout to this request.
@@ -482,7 +495,7 @@ func (tc *txnCommitter) makeTxnCommitExplicitAsync(
 		asyncCtx, "txnCommitter: making txn commit explicit", func(ctx context.Context) {
 			tc.mu.Lock()
 			defer tc.mu.Unlock()
-			if err := makeTxnCommitExplicitLocked(ctx, tc.wrapped, txn, lockSpans, canFwdRTS); err != nil {
+			if err := makeTxnCommitExplicitLocked(ctx, tc.wrapped, txn, lockSpans); err != nil {
 				log.Errorf(ctx, "making txn commit explicit failed for %s: %v", txn, err)
 			}
 		},
@@ -492,19 +505,15 @@ func (tc *txnCommitter) makeTxnCommitExplicitAsync(
 }
 
 func makeTxnCommitExplicitLocked(
-	ctx context.Context,
-	s lockedSender,
-	txn *roachpb.Transaction,
-	lockSpans []roachpb.Span,
-	canFwdRTS bool,
+	ctx context.Context, s lockedSender, txn *roachpb.Transaction, lockSpans []roachpb.Span,
 ) error {
 	// Clone the txn to prevent data races.
 	txn = txn.Clone()
 
 	// Construct a new batch with just an EndTxn request.
-	ba := roachpb.BatchRequest{}
-	ba.Header = roachpb.Header{Txn: txn, CanForwardReadTimestamp: canFwdRTS}
-	et := roachpb.EndTxnRequest{Commit: true}
+	ba := &kvpb.BatchRequest{}
+	ba.Header = kvpb.Header{Txn: txn}
+	et := kvpb.EndTxnRequest{Commit: true}
 	et.Key = txn.Key
 	et.LockSpans = lockSpans
 	ba.Add(&et)
@@ -512,13 +521,13 @@ func makeTxnCommitExplicitLocked(
 	_, pErr := s.SendLocked(ctx, ba)
 	if pErr != nil {
 		switch t := pErr.GetDetail().(type) {
-		case *roachpb.TransactionStatusError:
+		case *kvpb.TransactionStatusError:
 			// Detect whether the error indicates that someone else beat
 			// us to explicitly committing the transaction record.
-			if t.Reason == roachpb.TransactionStatusError_REASON_TXN_COMMITTED {
+			if t.Reason == kvpb.TransactionStatusError_REASON_TXN_COMMITTED {
 				return nil
 			}
-		case *roachpb.TransactionRetryError:
+		case *kvpb.TransactionRetryError:
 			logFunc := log.Errorf
 			if util.RaceEnabled {
 				logFunc = log.Fatalf
@@ -528,6 +537,53 @@ func makeTxnCommitExplicitLocked(
 		return pErr.GoError()
 	}
 	return nil
+}
+
+// maybeDisable1PC checks if the supplied batch would require us to disable 1PC
+// when it's time to commit the transaction. A transaction that has acquired one
+// or more replicated locks is not allowed to commit using 1PC; everyone else,
+// if they're able to (determined on the server), is.
+//
+// Replicated locks must be held until and provide protection up till their
+// transaction's commit timestamp[1]. We ensure this by bumping the timestamp
+// cache to the transaction's commit timestamp for all locked keys when
+// resolving locks. Let's consider external and local replicated locks
+// separately:
+//
+// - External locks: 1PC transactions do not write a transaction record. This
+// means if any of its external locks are resolved by another transaction
+// they'll be resolved as if the transaction were aborted, thus not providing us
+// protection until the transaction's commit timestamp.
+// - Local locks: we have all the information to locally resolve replicated
+// locks and bump the timestamp cache correctly if we're only dealing with local
+// replicated locks. However, the mechanics of 1PC transactions prevent us from
+// hitting it in the common case, where we're acquiring a replicated lock and
+// writing to the same key. 1PC transactions work by stripping the batch of its
+// EndTxnRequest and running it as a non-transactional batch. This means that
+// without some elbow grease, 1PC is bound to fail when it discovers its own
+// replicated lock. For now, we disable 1PC on the client for local locks as
+// well -- this can be optimized in the future.
+// TODO(arul): file an issue about improving things for local locks.
+//
+// [1] This distinction is currently moot for serializable transactions, as they
+// refresh all their reads (locked and unlocked) before committing. Doing so
+// bumps the timestamp cache. However, one can imagine a world where
+// serializable transactions do not need to refresh keys they acquired
+// replicated locks on. In such a world, we would be relying on lock resolution
+// to bump the timestamp cache to the commit timestamp of the transaction.
+func (tc *txnCommitter) maybeDisable1PC(ba *kvpb.BatchRequest) {
+	if tc.disable1PC {
+		return // already disabled; early return
+	}
+	for _, req := range ba.Requests {
+		if readOnlyReq, ok := req.GetInner().(kvpb.LockingReadRequest); ok {
+			_, dur := readOnlyReq.KeyLocking()
+			if dur == lock.Replicated {
+				tc.disable1PC = true
+				return
+			}
+		}
+	}
 }
 
 // setWrapped implements the txnInterceptor interface.
@@ -540,7 +596,9 @@ func (*txnCommitter) populateLeafInputState(*roachpb.LeafTxnInputState) {}
 func (*txnCommitter) populateLeafFinalState(*roachpb.LeafTxnFinalState) {}
 
 // importLeafFinalState is part of the txnInterceptor interface.
-func (*txnCommitter) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) {}
+func (*txnCommitter) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error {
+	return nil
+}
 
 // epochBumpedLocked implements the txnInterceptor interface.
 func (tc *txnCommitter) epochBumpedLocked() {}
@@ -558,4 +616,11 @@ func cloneWithStatus(txn *roachpb.Transaction, s roachpb.TransactionStatus) *roa
 	clone := txn.Clone()
 	clone.Status = s
 	return clone
+}
+
+func maybeRemoveStagingStatusInErr(pErr *kvpb.Error) *kvpb.Error {
+	if txn := pErr.GetTxn(); txn != nil && txn.Status == roachpb.STAGING {
+		pErr.SetTxn(cloneWithStatus(txn, roachpb.PENDING))
+	}
+	return pErr
 }

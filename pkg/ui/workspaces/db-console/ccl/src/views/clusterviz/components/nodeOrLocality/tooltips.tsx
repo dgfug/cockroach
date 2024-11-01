@@ -1,23 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React from "react";
+
 import { Tooltip, Anchor } from "src/components";
+import { TooltipProps } from "src/components/tooltip/tooltip";
 import {
   howAreCapacityMetricsCalculatedOverview,
   clusterStore,
 } from "src/util/docs";
-import { TooltipProps } from "src/components/tooltip/tooltip";
 
-export const NodeArcPercentageTooltip: React.FC<TooltipProps & {
-  localityLabel?: string;
-  nodeLabel?: string;
-}> = props => (
+export const NodeArcPercentageTooltip: React.FC<
+  TooltipProps & {
+    localityLabel?: string;
+    nodeLabel?: string;
+  }
+> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -46,10 +46,12 @@ export const NodeArcPercentageTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const NodeArcUsedCapacityTooltip: React.FC<TooltipProps & {
-  localityLabel?: string;
-  nodeLabel?: string;
-}> = props => (
+export const NodeArcUsedCapacityTooltip: React.FC<
+  TooltipProps & {
+    localityLabel?: string;
+    nodeLabel?: string;
+  }
+> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -74,10 +76,12 @@ export const NodeArcUsedCapacityTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const NodeArcTotalCapacityTooltip: React.FC<TooltipProps & {
-  localityLabel?: string;
-  nodeLabel?: string;
-}> = props => (
+export const NodeArcTotalCapacityTooltip: React.FC<
+  TooltipProps & {
+    localityLabel?: string;
+    nodeLabel?: string;
+  }
+> = props => (
   <Tooltip
     {...props}
     placement="bottom"

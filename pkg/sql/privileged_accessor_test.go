@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -17,7 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -31,14 +26,14 @@ func TestLookupNamespaceID(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
 	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return txn.Put(
 			ctx,
-			catalogkeys.MakePublicObjectNameKey(keys.SystemSQLCodec, 999, "bob"),
+			catalogkeys.EncodeNameKey(keys.SystemSQLCodec, &descpb.NameInfo{ParentID: 999, ParentSchemaID: 1000, Name: "bob"}),
 			9999,
 		)
 	})
@@ -47,8 +42,9 @@ func TestLookupNamespaceID(t *testing.T) {
 	// Assert the row exists in the database.
 	var id int64
 	err = sqlDB.QueryRow(
-		`SELECT crdb_internal.get_namespace_id($1, $2)`,
+		`SELECT crdb_internal.get_namespace_id($1, $2, $3)`,
 		999,
+		1000,
 		"bob",
 	).Scan(&id)
 	require.NoError(t, err)

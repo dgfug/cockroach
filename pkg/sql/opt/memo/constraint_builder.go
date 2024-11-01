@@ -1,34 +1,35 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // BuildConstraints returns a constraint.Set that represents the given scalar
 // expression. A "tight" boolean is also returned which is true if the
 // constraint is exactly equivalent to the expression.
 func BuildConstraints(
-	e opt.ScalarExpr, md *opt.Metadata, evalCtx *tree.EvalContext,
+	ctx context.Context,
+	e opt.ScalarExpr,
+	md *opt.Metadata,
+	evalCtx *eval.Context,
+	skipExtraConstraints bool,
 ) (_ *constraint.Set, tight bool) {
-	cb := constraintsBuilder{md: md, evalCtx: evalCtx}
+	cb := constraintsBuilder{md: md, ctx: ctx, evalCtx: evalCtx, skipExtraConstraints: skipExtraConstraints}
 	return cb.buildConstraints(e)
 }
 
@@ -48,9 +49,19 @@ var contradiction = constraint.Contradiction
 //
 // A constraint is "tight" if it is exactly equivalent to the expression. A
 // constraint that is not tight is weaker than the expression.
+//
+// A `skipExtraConstraints` value of `true` instructs the constraints builder to
+// avoid building extra constraints when a single tight constraint is sufficient
+// to fully represent an expression. For example, `buildConstraintForTupleIn`
+// called on `(a, b, c) IN ((1,2,3), (4,5,6))` builds a constraint on `(a, b,
+// c)`, and also individually on columns `(a)`, `(b)` and `(c)`.
+// When `skipExtraConstraints` is true, only the constraint on `(a, b, c)` is
+// built.
 type constraintsBuilder struct {
-	md      *opt.Metadata
-	evalCtx *tree.EvalContext
+	md                   *opt.Metadata
+	ctx                  context.Context
+	evalCtx              *eval.Context
+	skipExtraConstraints bool
 }
 
 // buildSingleColumnConstraint creates a constraint set implied by
@@ -60,7 +71,7 @@ func (cb *constraintsBuilder) buildSingleColumnConstraint(
 ) (_ *constraint.Set, tight bool) {
 	if op == opt.InOp && CanExtractConstTuple(val) {
 		els := val.(*TupleExpr).Elems
-		keyCtx := constraint.KeyContext{EvalCtx: cb.evalCtx}
+		keyCtx := constraint.KeyContext{Ctx: cb.ctx, EvalCtx: cb.evalCtx}
 		keyCtx.Columns.InitSingle(opt.MakeOrderingColumn(col, false /* descending */))
 
 		var spans constraint.Spans
@@ -97,7 +108,7 @@ func (cb *constraintsBuilder) buildSingleColumnConstraint(
 		res := cb.notNullSpan(col)
 		// Check if the right-hand side is a variable too (e.g. a > b).
 		if v, ok := val.(*VariableExpr); ok {
-			res = res.Intersect(cb.evalCtx, cb.notNullSpan(v.Col))
+			res = res.Intersect(cb.ctx, cb.evalCtx, cb.notNullSpan(v.Col))
 		}
 		return res, false
 	}
@@ -165,37 +176,42 @@ func (cb *constraintsBuilder) buildSingleColumnConstraintConst(
 		}
 		key := constraint.MakeKey(datum)
 		c := contradiction
-		if startKey.IsEmpty() || !datum.IsMin(cb.evalCtx) {
+		if startKey.IsEmpty() || !datum.IsMin(cb.ctx, cb.evalCtx) {
 			c = cb.singleSpan(col, startKey, startBoundary, key, excludeBoundary)
 		}
-		if !datum.IsMax(cb.evalCtx) {
+		if !datum.IsMax(cb.ctx, cb.evalCtx) {
 			other := cb.singleSpan(col, key, excludeBoundary, emptyKey, includeBoundary)
-			c = c.Union(cb.evalCtx, other)
+			c = c.Union(cb.ctx, cb.evalCtx, other)
 		}
 		return c, true
 
 	case opt.LikeOp:
 		if s, ok := tree.AsDString(datum); ok {
-			if i := strings.IndexAny(string(s), "_%"); i >= 0 {
-				if i == 0 {
-					// Mask starts with _ or %.
-					return unconstrained, false
+			// Normalize the like pattern to a RE.
+			if pattern, err := eval.LikeEscape(string(s)); err == nil {
+				if re, err := regexp.Compile(pattern); err == nil {
+					prefix, complete := re.LiteralPrefix()
+					if complete {
+						return cb.eqSpan(col, tree.NewDString(prefix)), true
+					}
+					if prefix == "" {
+						// Mask starts with _ or %.
+						return unconstrained, false
+					}
+					c := cb.makeStringPrefixSpan(col, prefix)
+					// If pattern is simply prefix + .* the span is tight. Also pattern
+					// will have regexp special chars escaped and so prefix needs to be
+					// escaped too.
+					prefixEscape := regexp.QuoteMeta(prefix)
+					return c, strings.HasSuffix(pattern, ".*") && strings.TrimSuffix(pattern, ".*") == prefixEscape
 				}
-				c := cb.makeStringPrefixSpan(col, string(s[:i]))
-				// A mask like ABC% is equivalent to restricting the prefix to ABC.
-				// A mask like ABC%Z requires restricting the prefix, but is a stronger
-				// condition.
-				tight := (i == len(s)-1) && s[i] == '%'
-				return c, tight
 			}
-			// No wildcard characters, this is an equality.
-			return cb.eqSpan(col, &s), true
 		}
 
 	case opt.SimilarToOp:
 		// a SIMILAR TO 'foo_*' -> prefix "foo"
 		if s, ok := tree.AsDString(datum); ok {
-			pattern := tree.SimilarEscape(string(s))
+			pattern := eval.SimilarEscape(string(s))
 			if re, err := regexp.Compile(pattern); err == nil {
 				prefix, complete := re.LiteralPrefix()
 				if complete {
@@ -220,7 +236,7 @@ func (cb *constraintsBuilder) buildSingleColumnConstraintConst(
 // buildConstraintForTupleIn handles the case where we have a tuple IN another
 // tuple, for instance:
 //
-//   (a, b, c) IN ((1, 2, 3), (4, 5, 6))
+//	(a, b, c) IN ((1, 2, 3), (4, 5, 6))
 //
 // This function is a less powerful version of makeSpansForTupleIn, since it
 // does not operate on a particular index.  The <tight> return value indicates
@@ -271,7 +287,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleIn(
 	// tight.
 	tight = (len(constrainedCols) == len(lhs.Elems))
 
-	keyCtx := constraint.KeyContext{EvalCtx: cb.evalCtx}
+	keyCtx := constraint.KeyContext{Ctx: cb.ctx, EvalCtx: cb.evalCtx}
 	keyCtx.Columns.Init(constrainedCols)
 	var sp constraint.Span
 	var spans constraint.Spans
@@ -324,24 +340,26 @@ func (cb *constraintsBuilder) buildConstraintForTupleIn(
 	// TODO(justin): remove this when #27018 is resolved.
 	// We already have a constraint starting with the first column: the
 	// multi-column constraint we added above.
-	for i := 1; i < len(colIdxsInLHS); i++ {
-		var spans constraint.Spans
-		keyCtx := constraint.KeyContext{EvalCtx: cb.evalCtx}
-		keyCtx.Columns.InitSingle(constrainedCols[i])
-		for _, elem := range rhs.Elems {
-			// Element must be tuple (checked above).
-			constVal := elem.(*TupleExpr).Elems[colIdxsInLHS[i]]
-			datum := ExtractConstDatum(constVal)
-			key := constraint.MakeKey(datum)
-			var sp constraint.Span
-			sp.Init(key, constraint.IncludeBoundary, key, constraint.IncludeBoundary)
-			spans.Append(&sp)
-		}
+	if !cb.skipExtraConstraints {
+		for i := 1; i < len(colIdxsInLHS); i++ {
+			var spans constraint.Spans
+			keyCtx := constraint.KeyContext{Ctx: cb.ctx, EvalCtx: cb.evalCtx}
+			keyCtx.Columns.InitSingle(constrainedCols[i])
+			for _, elem := range rhs.Elems {
+				// Element must be tuple (checked above).
+				constVal := elem.(*TupleExpr).Elems[colIdxsInLHS[i]]
+				datum := ExtractConstDatum(constVal)
+				key := constraint.MakeKey(datum)
+				var sp constraint.Span
+				sp.Init(key, constraint.IncludeBoundary, key, constraint.IncludeBoundary)
+				spans.Append(&sp)
+			}
 
-		spans.SortAndMerge(&keyCtx)
-		var c constraint.Constraint
-		c.Init(&keyCtx, &spans)
-		con = con.Intersect(cb.evalCtx, constraint.SingleConstraint(&c))
+			spans.SortAndMerge(&keyCtx)
+			var c constraint.Constraint
+			c.Init(&keyCtx, &spans)
+			con = con.Intersect(cb.ctx, cb.evalCtx, constraint.SingleConstraint(&c))
+		}
 	}
 
 	return con, tight
@@ -399,7 +417,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 	case opt.GeOp:
 		less, boundary = false, includeBoundary
 	default:
-		panic(errors.AssertionFailedf("unsupported operator type %s", log.Safe(e.Op())))
+		panic(errors.AssertionFailedf("unsupported operator type %s", redact.Safe(e.Op())))
 	}
 	// Disallow NULLs on the first column.
 	startKey, startBoundary := constraint.MakeKey(tree.DNull), excludeBoundary
@@ -413,7 +431,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 	var span constraint.Span
 	span.Init(startKey, startBoundary, endKey, endBoundary)
 
-	keyCtx := constraint.KeyContext{EvalCtx: cb.evalCtx}
+	keyCtx := constraint.KeyContext{Ctx: cb.ctx, EvalCtx: cb.evalCtx}
 	cols := make([]opt.OrderingColumn, len(lhs.Elems))
 	for i := range cols {
 		v := lhs.Elems[i].(*VariableExpr)
@@ -427,7 +445,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 func (cb *constraintsBuilder) buildFunctionConstraints(
 	f *FunctionExpr,
 ) (_ *constraint.Set, tight bool) {
-	if f.Properties.NullableArgs {
+	if f.FunctionPrivate.Overload.CalledOnNullInput {
 		return unconstrained, false
 	}
 
@@ -436,7 +454,7 @@ func (cb *constraintsBuilder) buildFunctionConstraints(
 	cs := unconstrained
 	for _, arg := range f.Args {
 		if variable, ok := arg.(*VariableExpr); ok {
-			cs = cs.Intersect(cb.evalCtx, cb.notNullSpan(variable.Col))
+			cs = cs.Intersect(cb.ctx, cb.evalCtx, cb.notNullSpan(variable.Col))
 		}
 	}
 
@@ -458,7 +476,7 @@ func (cb *constraintsBuilder) binaryBuildConstraintsForOr(
 
 	cl, tightl := cb.binaryBuildConstraintsForOr(left)
 	cr, tightr := cb.binaryBuildConstraintsForOr(right)
-	res := cl.Union(cb.evalCtx, cr)
+	res := cl.Union(cb.ctx, cb.evalCtx, cr)
 
 	// The union may not be "tight" because the new constraint set might
 	// allow combinations of values that the expression does not allow.
@@ -542,7 +560,7 @@ func (cb *constraintsBuilder) buildConstraints(e opt.ScalarExpr) (_ *constraint.
 	case *AndExpr:
 		cl, tightl := cb.buildConstraints(t.Left)
 		cr, tightr := cb.buildConstraints(t.Right)
-		cl = cl.Intersect(cb.evalCtx, cr)
+		cl = cl.Intersect(cb.ctx, cb.evalCtx, cr)
 		tightl = tightl && tightr
 		return cl, (tightl || cl == contradiction)
 
@@ -591,7 +609,7 @@ func (cb *constraintsBuilder) singleSpan(
 ) *constraint.Set {
 	var span constraint.Span
 	span.Init(start, startBoundary, end, endBoundary)
-	keyCtx := constraint.KeyContext{EvalCtx: cb.evalCtx}
+	keyCtx := constraint.KeyContext{Ctx: cb.ctx, EvalCtx: cb.evalCtx}
 	keyCtx.Columns.InitSingle(opt.MakeOrderingColumn(col, false /* descending */))
 	span.PreferInclusive(&keyCtx)
 	return constraint.SingleSpanConstraint(&keyCtx, &span)

@@ -1,20 +1,15 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 // A Name is an SQL identifier.
@@ -55,13 +50,13 @@ func NameString(s string) string {
 // identifier suitable for printing in error messages, avoiding a heap
 // allocation.
 func ErrNameStringP(s *string) string {
-	return ErrString(((*Name)(s)))
+	return ErrString((*Name)(s))
 }
 
 // ErrNameString escapes an identifier stored a string to a SQL
 // identifier suitable for printing in error messages.
 func ErrNameString(s string) string {
-	return ErrString(((*Name)(&s)))
+	return ErrString((*Name)(&s))
 }
 
 // Normalize normalizes to lowercase and Unicode Normalization Form C
@@ -106,20 +101,6 @@ func (l NameList) ToStrings() []string {
 	return names
 }
 
-// ToSQLUsernames converts a NameList containing SQL input of usernames,
-// normalizes the names and returns them as a list of SQLUsernames.
-func (l NameList) ToSQLUsernames() ([]security.SQLUsername, error) {
-	targetRoles := make([]security.SQLUsername, len(l))
-	for i, role := range l {
-		user, err := security.MakeSQLUsernameFromUserInput(string(role), security.UsernameValidation)
-		if err != nil {
-			return nil, err
-		}
-		targetRoles[i] = user
-	}
-	return targetRoles, nil
-}
-
 // A NameList is a list of identifiers.
 type NameList []Name
 
@@ -131,6 +112,16 @@ func (l *NameList) Format(ctx *FmtCtx) {
 		}
 		ctx.FormatNode(&(*l)[i])
 	}
+}
+
+// Contains returns true if the NameList contains the name.
+func (l NameList) Contains(name Name) bool {
+	for _, n := range l {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ArraySubscript corresponds to the syntax `<name>[ ... ]`.
@@ -182,6 +173,7 @@ type NameParts = [4]string
 
 // Format implements the NodeFormatter interface.
 func (u *UnresolvedName) Format(ctx *FmtCtx) {
+	isCrdbInternal := false
 	stopAt := 1
 	if u.Star {
 		stopAt = 2
@@ -192,9 +184,23 @@ func (u *UnresolvedName) Format(ctx *FmtCtx) {
 		// the grammar, so print it out as a "Name". Every part after that is
 		// necessarily an unrestricted name.
 		if i == u.NumParts {
-			ctx.FormatNode((*Name)(&u.Parts[i-1]))
+			if u.Parts[i-1] == "crdb_internal" && i > 1 {
+				ctx.WithFlags(ctx.flags&^FmtAnonymize&^FmtMarkRedactionNode, func() {
+					ctx.FormatNode((*Name)(&u.Parts[i-1]))
+				})
+				isCrdbInternal = true
+			} else {
+				ctx.FormatNode((*Name)(&u.Parts[i-1]))
+			}
 		} else {
-			ctx.FormatNode((*UnrestrictedName)(&u.Parts[i-1]))
+			if isCrdbInternal {
+				ctx.WithFlags(ctx.flags&^FmtAnonymize&^FmtMarkRedactionNode, func() {
+					ctx.FormatNode((*UnrestrictedName)(&u.Parts[i-1]))
+				})
+			} else {
+				ctx.FormatNode((*UnrestrictedName)(&u.Parts[i-1]))
+
+			}
 		}
 		if i > 1 {
 			ctx.WriteByte('.')
@@ -222,13 +228,22 @@ func MakeUnresolvedName(args ...string) UnresolvedName {
 }
 
 // ToUnresolvedObjectName converts an UnresolvedName to an UnresolvedObjectName.
-func (u *UnresolvedName) ToUnresolvedObjectName(idx AnnotationIdx) (*UnresolvedObjectName, error) {
+func (u *UnresolvedName) ToUnresolvedObjectName(idx AnnotationIdx) (UnresolvedObjectName, error) {
 	if u.NumParts == 4 {
-		return nil, pgerror.Newf(pgcode.Syntax, "improper qualified name (too many dotted names): %s", u)
+		return UnresolvedObjectName{}, pgerror.Newf(pgcode.Syntax, "improper qualified name (too many dotted names): %s", u)
 	}
-	return NewUnresolvedObjectName(
+	return MakeUnresolvedObjectName(
 		u.NumParts,
 		[3]string{u.Parts[0], u.Parts[1], u.Parts[2]},
 		idx,
 	)
+}
+
+// ToRoutineName converts an UnresolvedName to a RoutineName.
+func (u *UnresolvedName) ToRoutineName() (RoutineName, error) {
+	un, err := u.ToUnresolvedObjectName(NoAnnotation)
+	if err != nil {
+		return RoutineName{}, errors.Newf("invalid function name: %s", u.String())
+	}
+	return un.ToRoutineName(), nil
 }

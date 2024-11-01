@@ -36,7 +36,7 @@ INSERT INTO d(x) VALUES (((9 / 3) * (1 / 3))), (2.0), (2.4 + 4.6)
 query R rowsort
 SELECT * FROM d
 ----
-0.99999999999999999999
+0.999999999999999999990000000000000000000
 2.0
 7.0
 
@@ -46,7 +46,7 @@ UPDATE d SET x = x + 1 WHERE x + sqrt(x) >= 2 + .1
 query R rowsort
 SELECT * FROM d
 ----
-0.99999999999999999999
+0.999999999999999999990000000000000000000
 3.0
 8.0
 
@@ -227,6 +227,13 @@ SELECT 1::pg_catalog.int4, 1::pg_catalog.int8, 'aa'::pg_catalog.text, 4.2::pg_ca
 ----
 1 1 aa 4.2
 
+# Test fixed-length types.
+
+query TTT
+SELECT VARCHAR(4) 'foo', CHAR(2) 'bar', STRING(1) 'cat'
+----
+foo  ba  c
+
 # Test that we error out referencing unknown types in pg_catalog.
 query error pq: type "pg_catalog.special_int" does not exist
 SELECT 1::pg_catalog.special_int
@@ -254,3 +261,170 @@ SELECT CASE WHEN x > 1 THEN true ELSE NULL OR false END FROM (VALUES (1), (2)) A
 ----
 NULL
 true
+
+query B
+SELECT ARRAY[]::TIMESTAMPTZ[] >
+       SOME (ARRAY[TIMESTAMPTZ '1969-12-29T21:20:13+01'], ARRAY[NULL])
+----
+false
+
+query B
+SELECT ARRAY[]::TIMESTAMPTZ[] <
+       SOME (ARRAY[TIMESTAMPTZ '1969-12-29T21:20:13+01'], ARRAY[NULL])
+----
+true
+
+# Regression test for #102110. Ensure CASE is typed correctly.
+statement ok
+CREATE TABLE t102110_1 (t TEXT);
+INSERT INTO t102110_1 VALUES ('tt');
+
+statement ok
+CREATE TABLE t102110_2 (c CHAR);
+INSERT INTO t102110_2 VALUES ('c');
+
+query T
+SELECT t102110_1.t FROM t102110_1, t102110_2
+WHERE t102110_1.t NOT BETWEEN t102110_1.t AND
+  (CASE WHEN NULL THEN t102110_2.c ELSE t102110_1.t END);
+----
+
+query T
+SELECT t102110_1.t FROM t102110_1, t102110_2
+WHERE t102110_1.t NOT BETWEEN t102110_1.t AND
+  IF(NULL, t102110_2.c, t102110_1.t);
+----
+
+statement ok
+CREATE TABLE t108360_1 (t TEXT);
+INSERT INTO t108360_1 VALUES ('tt');
+
+statement ok
+CREATE TABLE t108360_2 (c CHAR);
+INSERT INTO t108360_2 VALUES ('c');
+
+query T
+SELECT (CASE WHEN t108360_1.t > t108360_2.c THEN t108360_1.t ELSE t108360_2.c END)
+FROM t108360_1, t108360_2
+WHERE t108360_1.t = (CASE WHEN t108360_1.t > t108360_2.c THEN t108360_1.t ELSE t108360_2.c END);
+----
+tt
+
+# Regression test for #131346. Ensure CASE is typed correctly and that a cast to
+# the BIT type with an unspecified length behaves correctly during distributed
+# execution.
+statement ok
+CREATE TABLE t131346v (v VARBIT);
+INSERT INTO t131346v VALUES ('11');
+
+statement ok
+CREATE TABLE t131346b (b BIT);
+INSERT INTO t131346b VALUES ('0');
+
+query T
+SELECT v FROM t131346v, t131346b
+WHERE v NOT BETWEEN v AND
+  (CASE WHEN NULL THEN '0'::BIT ELSE v END)
+----
+
+query T
+SELECT v FROM t131346v, t131346b
+WHERE v NOT BETWEEN v AND
+  (CASE WHEN NULL THEN b ELSE v END)
+----
+
+query T
+SELECT v FROM t131346v, t131346b
+WHERE v NOT BETWEEN v AND
+  IF(NULL, '0'::BIT, v);
+----
+
+query T
+SELECT v FROM t131346v, t131346b
+WHERE v NOT BETWEEN v AND
+  IF(NULL, b, v);
+----
+
+query T
+SELECT (CASE WHEN v > '0'::BIT THEN v ELSE '0'::BIT END)
+FROM t131346v, t131346b
+WHERE v = (CASE WHEN v > '0'::BIT THEN v ELSE '0'::BIT END)
+----
+11
+
+query T
+SELECT (CASE WHEN v > b THEN v ELSE b END)
+FROM t131346v, t131346b
+WHERE v = (CASE WHEN v > b THEN v ELSE b END)
+----
+11
+
+query T
+SELECT (CASE WHEN v > '0'::BIT THEN v ELSE '0'::BIT END)
+FROM t131346v, t131346b
+WHERE v = (CASE WHEN v < '0'::BIT THEN '0'::BIT ELSE v END)
+----
+11
+
+query T
+SELECT (CASE WHEN v > b THEN v ELSE b END)
+FROM t131346v, t131346b
+WHERE v = (CASE WHEN v < b THEN b ELSE v END)
+----
+11
+
+# Static analysis types should never make it to execution.
+statement ok
+CREATE TABLE t83496 (
+  a STRING,
+  b STRING
+);
+CREATE TYPE typ83496 AS ENUM ('foo', 'bar');
+
+statement ok
+SELECT * FROM t83496
+WHERE (
+  (SELECT 'bar':::typ83496 FROM t83496 WHERE false)
+  IS NOT DISTINCT FROM CASE WHEN NULL THEN NULL ELSE NULL END
+);
+
+# Issue #115054: ignore trailing whitespace in varchar
+statement ok
+CREATE TABLE t115054_1 (v varchar(2));
+
+statement ok
+INSERT INTO t115054_1 (v) VALUES ('c     ');
+
+statement ok
+INSERT INTO t115054_1 (v) VALUES (' c    ');
+
+statement ok
+INSERT INTO t115054_1 (v) VALUES ('cc    ');
+
+statement error pq: value too long for type VARCHAR\(2\)
+INSERT INTO t115054_1 (v) VALUES ('ccc   ');
+
+query T nosort
+SELECT json_agg(v ORDER BY v) FROM t115054_1
+----
+[" c", "c ", "cc"]
+
+statement ok
+CREATE TABLE t115054_2 (v varchar);
+
+statement ok
+INSERT INTO t115054_2 (v) VALUES ('c     ');
+
+statement ok
+INSERT INTO t115054_2 (v) VALUES (' c    ');
+
+statement ok
+INSERT INTO t115054_2 (v) VALUES ('cc    ');
+
+statement ok
+INSERT INTO t115054_2 (v) VALUES ('ccc   ');
+
+query T nosort
+SELECT json_agg(v ORDER BY v) FROM t115054_2
+----
+[" c    ", "c     ", "cc    ", "ccc   "]

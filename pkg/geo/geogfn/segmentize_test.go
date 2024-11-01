@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
@@ -16,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geotest"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
 )
@@ -130,7 +126,7 @@ func TestSegmentize(t *testing.T) {
 			require.NoError(t, err)
 			expectedGeog, err := geo.ParseGeography(test.expectedWKT)
 			require.NoError(t, err)
-			require.Equal(t, expectedGeog, modifiedGeog)
+			geotest.RequireGeographyInEpsilon(t, expectedGeog, modifiedGeog, geotest.Epsilon)
 		})
 	}
 	// Test for segment maximum length as negative.
@@ -216,7 +212,7 @@ func TestSegmentizeCoords(t *testing.T) {
 		t.Run(test.desc, func(t *testing.T) {
 			convertedPoints, err := segmentizeCoords(test.a, test.b, test.segmentMaxAngle)
 			require.NoError(t, err)
-			require.Equal(t, test.resultantCoordinates, convertedPoints)
+			geotest.FlatCoordsInEpsilon(t, test.resultantCoordinates, convertedPoints, geotest.Epsilon)
 		})
 	}
 

@@ -58,6 +58,10 @@
 # EliminateJoinUnderGroupByLeft should stay at the top of the file so that it
 # has a chance to fire before rules like EliminateDistinctOn that might prevent
 # matching.
+#
+# Similar to the join-elimination rules that match on Project operators,
+# EliminateJoinUnderGroupByLeft can remap references to the right input of the
+# join to refer to equivalent columns on the left input.
 [EliminateJoinUnderGroupByLeft, Normalize]
 (GroupBy | ScalarGroupBy | DistinctOn
     $input:(InnerJoin | LeftJoin $left:*)
@@ -67,18 +71,24 @@
             $ordering
             $leftCols:(OutputCols $left)
         ) &
-        (ColsAreSubset
-            (UnionCols
+        (CanRemapCols
+            $toRemap:(UnionCols
                 $groupingCols
                 (AggregationOuterCols $aggs)
             )
             $leftCols
+            $fds:(FuncDeps $input)
         ) &
+        (CanUseImprovedJoinElimination $toRemap $leftCols) &
         (CanEliminateJoinUnderGroupByLeft $input $aggs)
 )
 =>
 ((OpName)
-    $left
+    (Project
+        $left
+        (ProjectRemappedCols $toRemap $leftCols $fds)
+        $leftCols
+    )
     $aggs
     (MakeGrouping
         $groupingCols
@@ -97,18 +107,24 @@
             $ordering
             $rightCols:(OutputCols $right)
         ) &
-        (ColsAreSubset
-            (UnionCols
+        (CanRemapCols
+            $toRemap:(UnionCols
                 $groupingCols
                 (AggregationOuterCols $aggs)
             )
             $rightCols
+            $fds:(FuncDeps $input)
         ) &
+        (CanUseImprovedJoinElimination $toRemap $rightCols) &
         (CanEliminateJoinUnderGroupByRight $input $aggs)
 )
 =>
 ((OpName)
-    $right
+    (Project
+        $right
+        (ProjectRemappedCols $toRemap $rightCols $fds)
+        $rightCols
+    )
     $aggs
     (MakeGrouping
         $groupingCols
@@ -117,8 +133,8 @@
 )
 
 # EliminateDistinct discards a DistinctOn operator that is eliminating duplicate
-# rows by using grouping columns that are statically known to form a strong key.
-# By definition, a strong key does not allow duplicate values, so the GroupBy is
+# rows by using grouping columns that are statically known to form a strict key.
+# By definition, a strict key does not allow duplicate values, so the GroupBy is
 # redundant and can be eliminated.
 #
 # Since a DistinctOn operator can serve as a projection operator, we need to
@@ -133,6 +149,45 @@
 )
 =>
 (Project $input [] (GroupingOutputCols $groupingPrivate $aggs))
+
+# EliminateUpsertDistinct is similar to EliminateDistinct, but it only checks if
+# the grouping columns are a lax key because UpsertDistinctOn considers NULL
+# values to be distinct from one another for the purposes of grouping.
+[EliminateUpsertDistinct, Normalize]
+(UpsertDistinctOn | EnsureUpsertDistinctOn
+    $input:*
+    $aggs:*
+    $groupingPrivate:* &
+        (ColsAreLaxKey (GroupingCols $groupingPrivate) $input)
+)
+=>
+(Project $input [] (GroupingOutputCols $groupingPrivate $aggs))
+
+# EliminateGroupBy is similar to EliminateDistinct, but it operates on GroupBy
+# expressions where the grouping columns are statically known to form a strict
+# key in the GroupBy's input.
+#
+# It only applies if all the aggregate functions are ConstAgg, ConstNotNullAgg,
+# or AnyNotNullAgg. These aggregate functions all evaluate to the first non-NULL
+# value encountered, and NULL if there are no such values. Because the input is
+# guaranteed to produce one row per group, these aggregate functions are
+# equivalent to projecting their input column.
+[EliminateGroupBy, Normalize]
+(GroupBy
+    $input:*
+    $aggs:* & (AreAllAnyNotNullAggs $aggs)
+    $groupingPrivate:* &
+        (ColsAreStrictKey (GroupingCols $groupingPrivate) $input)
+)
+=>
+(Project
+    $input
+    (ConvertAnyNotNullAggsToProjections $aggs)
+    (IntersectionCols
+        (GroupingOutputCols $groupingPrivate $aggs)
+        (OutputCols $input)
+    )
+)
 
 # ReduceGroupingCols eliminates redundant grouping columns from the GroupBy
 # operator and replaces them by ConstAgg aggregate functions. A grouping

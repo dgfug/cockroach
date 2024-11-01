@@ -1,17 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"math"
 	"math/rand"
 	"reflect"
@@ -20,8 +17,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -34,9 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 func makeClockTS(walltime int64, logical int32) hlc.ClockTimestamp {
@@ -53,12 +53,15 @@ func makeTS(walltime int64, logical int32) hlc.Timestamp {
 	}
 }
 
-func makeSynTS(walltime int64, logical int32) hlc.Timestamp {
-	return hlc.Timestamp{
-		WallTime:  walltime,
-		Logical:   logical,
-		Synthetic: true,
-	}
+func TestKeyClone(t *testing.T) {
+	k := Key{0x01, 0x02, 0x03}
+	c := k.Clone()
+	require.Equal(t, k, c)
+
+	k[0] = 0xff
+	require.NotEqual(t, k, c)
+
+	require.Nil(t, Key(nil).Clone())
 }
 
 // TestKeyNext tests that the method for creating lexicographic
@@ -208,6 +211,27 @@ func TestNextKey(t *testing.T) {
 	}
 }
 
+func TestPrevish(t *testing.T) {
+	const length = 4
+	testcases := []struct {
+		key    Key
+		expect Key
+	}{
+		{nil, nil},
+		{[]byte{}, []byte{}},
+		{[]byte{0x00}, []byte{}},
+		{[]byte{0x01, 0x00}, []byte{0x01}},
+		{[]byte{0x01}, []byte{0x00, 0xff, 0xff, 0xff}},
+		{[]byte{0x01, 0x01}, []byte{0x01, 0x00, 0xff, 0xff}},
+		{[]byte{0xff, 0xff, 0xff, 0xff}, []byte{0xff, 0xff, 0xff, 0xfe}},
+	}
+	for _, tc := range testcases {
+		t.Run(hex.EncodeToString(tc.key), func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.key.Prevish(length))
+		})
+	}
+}
+
 func TestIsPrev(t *testing.T) {
 	for i, tc := range []struct {
 		k, m Key
@@ -332,6 +356,57 @@ func TestValueChecksumWithBytes(t *testing.T) {
 	}
 }
 
+func TestValueGetErrorsRedacted(t *testing.T) {
+	v := MakeValueFromString("Hello world")
+	_, err := v.GetInt()
+	require.EqualError(t, err, "value type is not INT: BYTES")
+	require.Equal(t, string(redact.Sprintf("%s %s", err, "sensitive").Redact()), "value type is not INT: BYTES ‹×›")
+}
+
+func TestStorePropertiesSafeFormat(t *testing.T) {
+	type testCase struct {
+		props     *StoreProperties
+		formatted redact.RedactableString
+	}
+
+	walFailoverPath := "/mnt/data2/cockroach/auxiliary/among-stores"
+
+	testCases := []testCase{
+		{
+			props: &StoreProperties{
+				Dir:             "/mnt/data1/cockroach",
+				Encrypted:       true,
+				WalFailoverPath: &walFailoverPath,
+				FileStoreProperties: &FileStoreProperties{
+					BlockDevice:  "nvme1n1",
+					FsType:       "ext4",
+					MountPoint:   "/mnt/data1",
+					MountOptions: "rw,relatime",
+				},
+			},
+			formatted: "/mnt/data1/cockroach: rw encrypted=true wal_failover_path=/mnt/data2/cockroach/auxiliary/among-stores fs:{bdev=nvme1n1 fstype=ext4 mountpoint=/mnt/data1 mountopts=rw,relatime}",
+		},
+		{
+			props: &StoreProperties{
+				Dir:       "/mnt/data3/cockroach",
+				ReadOnly:  true,
+				Encrypted: false,
+				FileStoreProperties: &FileStoreProperties{
+					BlockDevice:  "nvme1n1",
+					FsType:       "zfs",
+					MountPoint:   "/mnt/data3",
+					MountOptions: "ro,relatime",
+				},
+			},
+			formatted: "/mnt/data3/cockroach: ro encrypted=false fs:{bdev=nvme1n1 fstype=zfs mountpoint=/mnt/data3 mountopts=ro,relatime}",
+		},
+	}
+	for _, tc := range testCases {
+		got := redact.Sprintf("%s", tc.props)
+		require.Equal(t, tc.formatted, got)
+	}
+}
+
 func TestSetGetChecked(t *testing.T) {
 	v := Value{}
 
@@ -402,12 +477,47 @@ func TestSetGetChecked(t *testing.T) {
 
 func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
-	txn := MakeTransaction("test", Key("a"), 1, origNow, 0)
+	txn := MakeTransaction("test", Key("a"), isolation.Serializable, 1, origNow, 0, 99, 0, false /* omitInRangefeeds */)
 	// Advance the txn timestamp.
 	txn.WriteTimestamp = txn.WriteTimestamp.Add(10, 2)
 	txn.BumpEpoch()
 	if a, e := txn.Epoch, enginepb.TxnEpoch(1); a != e {
 		t.Errorf("expected epoch %d; got %d", e, a)
+	}
+}
+
+func TestTransactionBumpReadTimestamp(t *testing.T) {
+	ts9 := makeTS(9, 1)
+	ts10 := makeTS(10, 1)
+	ts11 := makeTS(11, 1)
+	ts12 := makeTS(12, 1)
+	ts13 := makeTS(13, 1)
+	origReadTs := ts10
+	origWriteTs := ts12
+
+	testCases := []struct {
+		bumpTs     hlc.Timestamp
+		expReadTs  hlc.Timestamp
+		expWriteTs hlc.Timestamp
+	}{
+		{ts9, origReadTs, origWriteTs},
+		{ts10, origReadTs, origWriteTs},
+		{ts11, ts11, origWriteTs},
+		{ts12, ts12, origWriteTs},
+		{ts13, ts13, ts13},
+	}
+	for _, c := range testCases {
+		t.Run(c.bumpTs.String(), func(t *testing.T) {
+			var txn Transaction
+			txn.ReadTimestamp = origReadTs
+			txn.WriteTimestamp = origWriteTs
+			txn.WriteTooOld = true
+
+			txn.BumpReadTimestamp(c.bumpTs)
+			require.Equal(t, c.expReadTs, txn.ReadTimestamp)
+			require.Equal(t, c.expWriteTs, txn.WriteTimestamp)
+			require.False(t, txn.WriteTooOld)
+		})
 	}
 }
 
@@ -469,32 +579,35 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 
 var nonZeroTxn = Transaction{
 	TxnMeta: enginepb.TxnMeta{
-		Key:            Key("foo"),
-		ID:             uuid.MakeV4(),
-		Epoch:          2,
-		WriteTimestamp: makeSynTS(20, 21),
-		MinTimestamp:   makeSynTS(10, 11),
-		Priority:       957356782,
-		Sequence:       123,
+		ID:                uuid.MakeV4(),
+		Key:               Key("foo"),
+		IsoLevel:          isolation.Snapshot,
+		Epoch:             2,
+		WriteTimestamp:    makeTS(20, 21),
+		MinTimestamp:      makeTS(10, 11),
+		Priority:          957356782,
+		Sequence:          123,
+		CoordinatorNodeID: 3,
 	},
 	Name:                   "name",
 	Status:                 COMMITTED,
-	LastHeartbeat:          makeSynTS(1, 2),
-	ReadTimestamp:          makeSynTS(20, 22),
-	GlobalUncertaintyLimit: makeSynTS(40, 41),
+	LastHeartbeat:          makeTS(1, 2),
+	ReadTimestamp:          makeTS(20, 22),
+	GlobalUncertaintyLimit: makeTS(40, 41),
 	ObservedTimestamps: []ObservedTimestamp{{
 		NodeID: 1,
 		Timestamp: hlc.ClockTimestamp{
-			WallTime:  1,
-			Logical:   2,
-			Synthetic: true, // normally not set, but needed for zerofields.NoZeroField
+			WallTime: 1,
+			Logical:  2,
 		},
 	}},
-	WriteTooOld:          true,
-	LockSpans:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
-	InFlightWrites:       []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
-	CommitTimestampFixed: true,
-	IgnoredSeqNums:       []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	WriteTooOld:        true,
+	LockSpans:          []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	InFlightWrites:     []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
+	ReadTimestampFixed: true,
+	IgnoredSeqNums:     []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	AdmissionPriority:  1,
+	OmitInRangefeeds:   true,
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -517,6 +630,7 @@ func TestTransactionUpdate(t *testing.T) {
 	txn3.Status = STAGING
 	txn3.Name = "carl"
 	txn3.Priority = 123
+	txn3.CoordinatorNodeID = 3
 	txn3.Update(&txn)
 
 	expTxn3 := txn
@@ -531,6 +645,7 @@ func TestTransactionUpdate(t *testing.T) {
 	txn4.Sequence = txn.Sequence + 10
 	txn4.Name = "carl"
 	txn4.Priority = 123
+	txn4.CoordinatorNodeID = 3
 	txn4.Update(&txn)
 
 	expTxn4 := txn
@@ -570,6 +685,7 @@ func TestTransactionUpdate(t *testing.T) {
 	txn5.Sequence = txn.Sequence - 10
 	txn5.Name = "carl"
 	txn5.Priority = 123
+	txn5.CoordinatorNodeID = 3
 	txn5.Update(&txn)
 
 	expTxn5 := txn
@@ -581,7 +697,7 @@ func TestTransactionUpdate(t *testing.T) {
 	expTxn5.InFlightWrites = nil
 	expTxn5.IgnoredSeqNums = nil
 	expTxn5.WriteTooOld = false
-	expTxn5.CommitTimestampFixed = false
+	expTxn5.ReadTimestampFixed = false
 	require.Equal(t, expTxn5, txn5)
 
 	// Updating a different transaction fatals.
@@ -657,21 +773,46 @@ func TestTransactionUpdateStaging(t *testing.T) {
 
 // TestTransactionUpdateAbortedOldEpoch tests that Transaction.Update propagates
 // an ABORTED status even when that status comes from a proto with an old epoch.
-// Once a transaction is ABORTED, it will stay aborted, even if its coordinator
-// doesn't know this at the time that it increments its epoch and retries.
+// It also tests that Transaction.Update retains an ABORTED status even when it
+// is updated with a new epoch with a PENDING status. Either way, once a
+// transaction is ABORTED, it will stay aborted, even if its coordinator doesn't
+// know this at the time that it increments its epoch and retries.
 func TestTransactionUpdateAbortedOldEpoch(t *testing.T) {
-	txn := nonZeroTxn
-	txn.Status = ABORTED
+	txnAbort := nonZeroTxn
+	txnAbort.Status = ABORTED
 
-	txnRestart := txn
+	txnRestart := nonZeroTxn
 	txnRestart.Epoch++
 	txnRestart.Status = PENDING
-	txnRestart.Update(&txn)
 
-	expTxn := txn
-	expTxn.Epoch++
-	expTxn.Status = ABORTED
-	require.Equal(t, expTxn, txnRestart)
+	testCases := []struct {
+		name      string
+		recv, arg Transaction
+	}{
+		{name: "aborted receiver", recv: txnAbort, arg: txnRestart},
+		{name: "aborted argument", recv: txnRestart, arg: txnAbort},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.recv.Update(&tc.arg)
+
+			expTxn := nonZeroTxn
+			expTxn.Epoch++
+			expTxn.Status = ABORTED
+			require.Equal(t, expTxn, tc.recv)
+		})
+	}
+}
+
+// TestTransactionUpdateFromRecord tests that updating a transaction with
+// another transaction, derived from a TransactionRecord proto, does not
+// overwrite non-zero fields in the original Transaction.
+func TestTransactionUpdateFromRecord(t *testing.T) {
+	txn := nonZeroTxn
+	txnRecord := txn.AsRecord()
+	txnFromRecord := txnRecord.AsTransaction()
+	txn.Update(&txnFromRecord)
+	require.Equal(t, nonZeroTxn, txn)
 }
 
 func TestTransactionClone(t *testing.T) {
@@ -712,7 +853,7 @@ func TestTransactionRestart(t *testing.T) {
 	expTxn.WriteTimestamp = makeTS(25, 1)
 	expTxn.ReadTimestamp = makeTS(25, 1)
 	expTxn.WriteTooOld = false
-	expTxn.CommitTimestampFixed = false
+	expTxn.ReadTimestampFixed = false
 	expTxn.LockSpans = nil
 	expTxn.InFlightWrites = nil
 	expTxn.IgnoredSeqNums = nil
@@ -721,7 +862,7 @@ func TestTransactionRestart(t *testing.T) {
 
 func TestTransactionRefresh(t *testing.T) {
 	txn := nonZeroTxn
-	txn.Refresh(makeTS(25, 1))
+	txn.BumpReadTimestamp(makeTS(25, 1))
 
 	expTxn := nonZeroTxn
 	expTxn.WriteTimestamp = makeTS(25, 1)
@@ -735,14 +876,14 @@ func TestTransactionRefresh(t *testing.T) {
 // with the former and contains a subset of its protos.
 //
 // Assertions:
-// 1. Transaction->TransactionRecord->Transaction is lossless for the fields
-//    in TransactionRecord. It drops all other fields.
-// 2. TransactionRecord->Transaction->TransactionRecord is lossless.
-//    Fields not in TransactionRecord are set as zero values.
-// 3. Transaction messages can be decoded as TransactionRecord messages.
-//    Fields not in TransactionRecord are dropped.
-// 4. TransactionRecord messages can be decoded as Transaction messages.
-//    Fields not in TransactionRecord are decoded as zero values.
+//  1. Transaction->TransactionRecord->Transaction is lossless for the fields
+//     in TransactionRecord. It drops all other fields.
+//  2. TransactionRecord->Transaction->TransactionRecord is lossless.
+//     Fields not in TransactionRecord are set as zero values.
+//  3. Transaction messages can be decoded as TransactionRecord messages.
+//     Fields not in TransactionRecord are dropped.
+//  4. TransactionRecord messages can be decoded as Transaction messages.
+//     Fields not in TransactionRecord are decoded as zero values.
 func TestTransactionRecordRoundtrips(t *testing.T) {
 	// Verify that converting from a Transaction to a TransactionRecord
 	// strips out fields but is lossless for the desired fields.
@@ -839,7 +980,7 @@ func TestMakePriority(t *testing.T) {
 	}
 
 	// Generate values for all priorities.
-	const trials = 100000
+	const trials = 1000000
 	values := make([][trials]enginepb.TxnPriority, len(userPs))
 	for i, userPri := range userPs {
 		for tr := 0; tr < trials; tr++ {
@@ -934,6 +1075,83 @@ func TestMakePriorityLimits(t *testing.T) {
 	}
 }
 
+func TestLeaseStringAndSafeFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lease Lease
+		exp   string
+	}{
+		{
+			name:  "empty",
+			lease: Lease{},
+			exp:   "<empty>",
+		},
+		{
+			name: "expiration",
+			lease: Lease{
+				Replica: ReplicaDescriptor{
+					NodeID:    1,
+					StoreID:   1,
+					ReplicaID: 1,
+				},
+				Start:      makeClockTS(1, 1),
+				Expiration: makeTS(2, 1).Clone(),
+				ProposedTS: makeClockTS(1, 0),
+				Sequence:   3,
+			},
+			exp: "repl=(n1,s1):1 seq=3 start=0.000000001,1 exp=0.000000002,1 pro=0.000000001,0",
+		},
+		{
+			name: "epoch",
+			lease: Lease{
+				Replica: ReplicaDescriptor{
+					NodeID:    1,
+					StoreID:   1,
+					ReplicaID: 1,
+				},
+				Start:         makeClockTS(1, 1),
+				ProposedTS:    makeClockTS(1, 0),
+				Sequence:      3,
+				Epoch:         4,
+				MinExpiration: makeTS(2, 1),
+			},
+			exp: "repl=(n1,s1):1 seq=3 start=0.000000001,1 epo=4 min-exp=0.000000002,1 pro=0.000000001,0",
+		},
+		{
+			name: "leader",
+			lease: Lease{
+				Replica: ReplicaDescriptor{
+					NodeID:    1,
+					StoreID:   1,
+					ReplicaID: 1,
+				},
+				Start:         makeClockTS(1, 1),
+				ProposedTS:    makeClockTS(1, 0),
+				Sequence:      3,
+				MinExpiration: makeTS(2, 1),
+				Term:          5,
+			},
+			exp: "repl=(n1,s1):1 seq=3 start=0.000000001,1 term=5 min-exp=0.000000002,1 pro=0.000000001,0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// String.
+			require.Equal(t, tc.exp, tc.lease.String())
+			// Redactable string. Should be identical.
+			require.EqualValues(t, tc.exp, redact.Sprint(tc.lease))
+			// Redacted string. Should be identical.
+			require.EqualValues(t, tc.exp, redact.Sprint(tc.lease).Redact())
+		})
+	}
+}
+
+func TestLeaseType(t *testing.T) {
+	require.Equal(t, LeaseExpiration, Lease{}.Type())
+	require.Equal(t, LeaseEpoch, Lease{Epoch: 1}.Type())
+	require.Equal(t, LeaseLeader, Lease{Term: 1}.Type())
+	require.Panics(t, func() { Lease{Epoch: 1, Term: 1}.Type() })
+}
+
 func TestLeaseEquivalence(t *testing.T) {
 	r1 := ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1}
 	r2 := ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2}
@@ -942,24 +1160,40 @@ func TestLeaseEquivalence(t *testing.T) {
 	ts3 := makeClockTS(3, 1)
 
 	epoch1 := Lease{Replica: r1, Start: ts1, Epoch: 1}
+	epoch1R2 := Lease{Replica: r2, Start: ts1, Epoch: 1}
+	epoch1TS2 := Lease{Replica: r1, Start: ts2, Epoch: 1}
 	epoch2 := Lease{Replica: r1, Start: ts1, Epoch: 2}
+	epoch2R2TS2 := Lease{Replica: r2, Start: ts2, Epoch: 2}
 	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.ToTimestamp().Clone()}
+	expire1R2 := Lease{Replica: r2, Start: ts1, Expiration: ts2.ToTimestamp().Clone()}
+	expire1TS2 := Lease{Replica: r1, Start: ts2, Expiration: ts2.ToTimestamp().Clone()}
 	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.ToTimestamp().Clone()}
-	epoch2TS2 := Lease{Replica: r2, Start: ts2, Epoch: 2}
-	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.ToTimestamp().Clone()}
+	expire2R2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.ToTimestamp().Clone()}
+	leader1 := Lease{Replica: r1, Start: ts1, Term: 1}
+	leader1R2 := Lease{Replica: r2, Start: ts1, Term: 1}
+	leader1TS2 := Lease{Replica: r1, Start: ts2, Term: 1}
+	leader2 := Lease{Replica: r1, Start: ts1, Term: 2}
+	leader2R2TS2 := Lease{Replica: r2, Start: ts2, Term: 2}
 
-	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts1}
-	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: &ts1}
-	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts2}
+	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts1}
+	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: ts1}
+	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts2}
 
 	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.ToTimestamp().Clone()}
 	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.ToTimestamp().Clone()}
 
 	r1Voter, r1Learner := r1, r1
-	r1Voter.Type = ReplicaTypeVoterFull()
-	r1Learner.Type = ReplicaTypeLearner()
+	r1Voter.Type = VOTER_FULL
+	r1Learner.Type = LEARNER
 	epoch1Voter := Lease{Replica: r1Voter, Start: ts1, Epoch: 1}
 	epoch1Learner := Lease{Replica: r1Learner, Start: ts1, Epoch: 1}
+
+	epoch1MinExp2 := Lease{Replica: r1, Start: ts1, Epoch: 1, MinExpiration: ts2.ToTimestamp()}
+	epoch1MinExp3 := Lease{Replica: r1, Start: ts1, Epoch: 1, MinExpiration: ts3.ToTimestamp()}
+	epoch2MinExp2 := Lease{Replica: r1, Start: ts1, Epoch: 2, MinExpiration: ts2.ToTimestamp()}
+	leader1MinExp2 := Lease{Replica: r1, Start: ts1, Term: 1, MinExpiration: ts2.ToTimestamp()}
+	leader1MinExp3 := Lease{Replica: r1, Start: ts1, Term: 1, MinExpiration: ts3.ToTimestamp()}
+	leader2MinExp2 := Lease{Replica: r1, Start: ts1, Term: 2, MinExpiration: ts2.ToTimestamp()}
 
 	testCases := []struct {
 		l, ol      Lease
@@ -967,13 +1201,30 @@ func TestLeaseEquivalence(t *testing.T) {
 	}{
 		{epoch1, epoch1, true},             // same epoch lease
 		{expire1, expire1, true},           // same expiration lease
+		{leader1, leader1, true},           // same leader lease
+		{epoch1, epoch1R2, false},          // different epoch leases
+		{epoch1, epoch1TS2, false},         // different epoch leases
 		{epoch1, epoch2, false},            // different epoch leases
-		{epoch1, epoch2TS2, false},         // different epoch leases
-		{expire1, expire2TS2, false},       // different expiration leases
+		{epoch1, epoch2R2TS2, false},       // different epoch leases
+		{expire1, expire1R2, false},        // different expiration leases
+		{expire1, expire1TS2, false},       // different expiration leases
+		{expire1, expire2R2TS2, false},     // different expiration leases
 		{expire1, expire2, true},           // same expiration lease, extended
 		{expire2, expire1, false},          // same expiration lease, extended but backwards
-		{epoch1, expire1, false},           // epoch and expiration leases
-		{expire1, epoch1, false},           // expiration and epoch leases
+		{leader1, leader1R2, false},        // different leader leases
+		{leader1, leader1TS2, false},       // different leader leases
+		{leader1, leader2, false},          // different leader leases
+		{leader1, leader2R2TS2, false},     // different leader leases
+		{epoch1, expire1, false},           // epoch and expiration leases, same replica and start time
+		{epoch1, expire1R2, false},         // epoch and expiration leases, different replica
+		{epoch1, expire1TS2, false},        // epoch and expiration leases, different start time
+		{expire1, epoch1, true},            // expiration and epoch leases, same replica and start time
+		{expire1, epoch1R2, false},         // expiration and epoch leases, different replica
+		{expire1, epoch1TS2, false},        // expiration and epoch leases, different start time
+		{epoch1, leader1, false},           // epoch and leader leases, same replica and start time
+		{leader1, epoch1, false},           // leader and epoch leases, same replica and start time
+		{expire1, leader1, true},           // expiration and leader leases, same replica and start time
+		{leader1, expire1, false},          // leader and expiration leases, same replica and start time
 		{proposed1, proposed1, true},       // exact leases with identical timestamps
 		{proposed1, proposed2, false},      // same proposed timestamps, but diff epochs
 		{proposed1, proposed3, true},       // different proposed timestamps, same lease
@@ -981,35 +1232,64 @@ func TestLeaseEquivalence(t *testing.T) {
 		{epoch1, epoch1Voter, true},        // same epoch lease, different replica type
 		{epoch1, epoch1Learner, true},      // same epoch lease, different replica type
 		{epoch1Voter, epoch1Learner, true}, // same epoch lease, different replica type
+		// Test minimum expiration with epoch leases.
+		{epoch1, epoch1MinExp2, true},         // different epoch leases, newer min expiration
+		{epoch1, epoch1MinExp3, true},         // different epoch leases, newer min expiration
+		{epoch1MinExp2, epoch1, false},        // different epoch leases, older min expiration
+		{epoch1MinExp2, epoch1MinExp2, true},  // same epoch leases, same min expiration
+		{epoch1MinExp2, epoch1MinExp3, true},  // different epoch leases, newer min expiration
+		{epoch1MinExp3, epoch1, false},        // different epoch leases, older min expiration
+		{epoch1MinExp3, epoch1MinExp2, false}, // different epoch leases, older min expiration
+		{epoch1MinExp3, epoch1MinExp3, true},  // same epoch leases, same min expiration
+		{epoch1MinExp2, epoch2MinExp2, false}, // different epoch leases
+		// Test minimum expiration with leader leases.
+		{leader1, leader1MinExp2, true},         // different leader leases, newer min expiration
+		{leader1, leader1MinExp3, true},         // different leader leases, newer min expiration
+		{leader1MinExp2, leader1, false},        // different leader leases, older min expiration
+		{leader1MinExp2, leader1MinExp2, true},  // same leader leases, same min expiration
+		{leader1MinExp2, leader1MinExp3, true},  // different leader leases, newer min expiration
+		{leader1MinExp3, leader1, false},        // different leader leases, older min expiration
+		{leader1MinExp3, leader1MinExp2, false}, // different leader leases, older min expiration
+		{leader1MinExp3, leader1MinExp3, true},  // same leader leases, same min expiration
+		{leader1MinExp2, leader2MinExp2, false}, // different leader leases
 	}
 
 	for i, tc := range testCases {
-		if ok := tc.l.Equivalent(tc.ol); tc.expSuccess != ok {
-			t.Errorf("%d: expected success? %t; got %t", i, tc.expSuccess, ok)
+		t.Run("", func(t *testing.T) {
+			// Test expToEpochEquiv = true.
+			require.Equal(t, tc.expSuccess, tc.l.Equivalent(tc.ol, true /* expToEpochEquiv */), "%d", i)
+			if tc.l == expire1 && tc.ol == epoch1 {
+				// The one case where expToEpochEquiv = false makes a difference.
+				require.Equal(t, !tc.expSuccess, tc.l.Equivalent(tc.ol, false /* expToEpochEquiv */), "%d", i)
+			} else {
+				require.Equal(t, tc.expSuccess, tc.l.Equivalent(tc.ol, false /* expToEpochEquiv */), "%d", i)
+			}
+		})
+	}
+
+	t.Run("DeprecatedStartStasis", func(t *testing.T) {
+		// #18689 changed the nullability of the DeprecatedStartStasis, ProposedTS, and Expiration
+		// field. It introduced a bug whose regression is caught below where a zero Expiration and a nil
+		// Expiration in an epoch-based lease led to mistakenly considering leases non-equivalent.
+		prePRLease := Lease{
+			Start: hlc.ClockTimestamp{WallTime: 10},
+			Epoch: 123,
+
+			// The bug-trigger.
+			Expiration: new(hlc.Timestamp),
+
+			// Similar potential bug triggers, but these were actually handled correctly.
+			DeprecatedStartStasis: new(hlc.Timestamp),
+			ProposedTS:            hlc.ClockTimestamp{WallTime: 10},
 		}
-	}
+		postPRLease := prePRLease
+		postPRLease.DeprecatedStartStasis = nil
+		postPRLease.Expiration = nil
 
-	// #18689 changed the nullability of the DeprecatedStartStasis, ProposedTS, and Expiration
-	// field. It introduced a bug whose regression is caught below where a zero Expiration and a nil
-	// Expiration in an epoch-based lease led to mistakenly considering leases non-equivalent.
-	prePRLease := Lease{
-		Start: hlc.ClockTimestamp{WallTime: 10},
-		Epoch: 123,
-
-		// The bug-trigger.
-		Expiration: new(hlc.Timestamp),
-
-		// Similar potential bug triggers, but these were actually handled correctly.
-		DeprecatedStartStasis: new(hlc.Timestamp),
-		ProposedTS:            &hlc.ClockTimestamp{WallTime: 10},
-	}
-	postPRLease := prePRLease
-	postPRLease.DeprecatedStartStasis = nil
-	postPRLease.Expiration = nil
-
-	if !postPRLease.Equivalent(prePRLease) || !prePRLease.Equivalent(postPRLease) {
-		t.Fatalf("leases not equivalent but should be despite diff(pre,post) = %s", pretty.Diff(prePRLease, postPRLease))
-	}
+		if !postPRLease.Equivalent(prePRLease, true) || !prePRLease.Equivalent(postPRLease, true) {
+			t.Fatalf("leases not equivalent but should be despite diff(pre,post) = %s", pretty.Diff(prePRLease, postPRLease))
+		}
+	})
 }
 
 func TestLeaseEqual(t *testing.T) {
@@ -1018,10 +1298,12 @@ func TestLeaseEqual(t *testing.T) {
 		Expiration            *hlc.Timestamp
 		Replica               ReplicaDescriptor
 		DeprecatedStartStasis *hlc.Timestamp
-		ProposedTS            *hlc.ClockTimestamp
+		ProposedTS            hlc.ClockTimestamp
 		Epoch                 int64
 		Sequence              LeaseSequence
 		AcquisitionType       LeaseAcquisitionType
+		MinExpiration         hlc.Timestamp
+		Term                  uint64
 	}
 	// Verify that the lease structure does not change unexpectedly. If a compile
 	// error occurs on the following line of code, update the expectedLease
@@ -1038,6 +1320,14 @@ func TestLeaseEqual(t *testing.T) {
 	if !a.Equal(b) {
 		t.Fatalf("unexpectedly did not compare equal: %s", pretty.Diff(a, b))
 	}
+
+	// Verify that DeprecatedStartStasis is ignored entirely.
+	a = Lease{DeprecatedStartStasis: &hlc.Timestamp{WallTime: 1}}
+	b = Lease{DeprecatedStartStasis: &hlc.Timestamp{WallTime: 2}}
+	c := Lease{}
+	require.True(t, a.Equal(b))
+	require.True(t, a.Equal(c))
+	require.True(t, b.Equal(c))
 
 	if !(*Lease)(nil).Equal(nil) {
 		t.Fatalf("unexpectedly did not compare equal")
@@ -1064,10 +1354,12 @@ func TestLeaseEqual(t *testing.T) {
 		{Start: clockTS},
 		{Expiration: &ts},
 		{Replica: ReplicaDescriptor{NodeID: 1}},
-		{DeprecatedStartStasis: &ts},
-		{ProposedTS: &clockTS},
+		{ProposedTS: clockTS},
 		{Epoch: 1},
 		{Sequence: 1},
+		{AcquisitionType: 1},
+		{MinExpiration: ts},
+		{Term: 1},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
@@ -1212,6 +1504,13 @@ func TestSpanCombine(t *testing.T) {
 // or key range is contained within the span.
 func TestSpanContains(t *testing.T) {
 	s := Span{Key: []byte("a"), EndKey: []byte("b")}
+	sp := func(start, end string) Span {
+		res := Span{Key: Key(start)}
+		if end != "" {
+			res.EndKey = Key(end)
+		}
+		return res
+	}
 
 	testData := []struct {
 		start, end string
@@ -1278,8 +1577,8 @@ func TestSpanSplitOnKey(t *testing.T) {
 		// Simple split.
 		{
 			[]byte("bb"),
-			sp("b", "bb"),
-			sp("bb", "c"),
+			Span{Key: Key("b"), EndKey: Key("bb")},
+			Span{Key: Key("bb"), EndKey: Key("c")},
 		},
 	}
 	for testIdx, test := range testData {
@@ -1343,15 +1642,9 @@ func TestSpansMemUsage(t *testing.T) {
 			s[j].Key = []byte(test.spans[j].start)
 			s[j].EndKey = []byte(test.spans[j].end)
 		}
-		for j := 0; j <= len(s); j++ {
-			// Test that we account for all memory used even when we reduce the length
-			// below the capacity.
-			reduced := s[:j]
-
-			if actual := reduced.MemUsage(); test.expected != actual {
-				t.Errorf("%d.%d: expected spans %v (sliced from %v) to return %d for MemUsage, instead got %d",
-					i, j, reduced, test.spans, test.expected, actual)
-			}
+		if actual := s.MemUsageUpToLen(); test.expected != actual {
+			t.Errorf("%d: expected spans %v to return %d for MemUsageUpToLen, instead got %d",
+				i, test.spans, test.expected, actual)
 		}
 	}
 }
@@ -1443,7 +1736,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
 
-		actual, err := rs.Intersect(&desc)
+		actual, err := rs.Intersect(desc.RSpan())
 		if err != nil {
 			t.Error(err)
 			continue
@@ -1465,7 +1758,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc := RangeDescriptor{}
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
-		if _, err := rs.Intersect(&desc); err == nil {
+		if _, err := rs.Intersect(desc.RSpan()); err == nil {
 			t.Errorf("%d: unexpected success", i)
 		}
 	}
@@ -1647,6 +1940,72 @@ func BenchmarkValueGetTuple(b *testing.B) {
 	}
 }
 
+func TestExtendedDecoding(t *testing.T) {
+	// A bit of duplication to avoid import cycles.
+	encodeWithValueHeader := func(v Value, vh enginepb.MVCCValueHeader) []byte {
+		// Extended encoding. Wrap the roachpb.Value encoding with a header containing
+		// MVCC-level metadata. Requires a re-allocation and copy.
+		headerLen := vh.Size()
+		headerSize := extendedPreludeSize + headerLen
+		valueSize := headerSize + len(v.RawBytes)
+		buf := make([]byte, valueSize)
+		// Extended encoding. Wrap the roachpb.Value encoding with a header containing
+		// MVCC-level metadata. Requires a copy.
+		// 4-byte-header-len
+		binary.BigEndian.PutUint32(buf, uint32(headerLen))
+		// 1-byte-sentinel
+		buf[tagPos] = byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL)
+		_, err := protoutil.MarshalTo(&vh, buf[extendedPreludeSize:headerSize])
+		require.NoError(t, err)
+		// <4-byte-checksum><1-byte-tag><encoded-data> or empty for tombstone
+		copy(buf[headerSize:], v.RawBytes)
+		return buf
+	}
+
+	key := Key("hello")
+	var boolValue Value
+	boolValue.SetBool(true)
+
+	testValues := map[string]Value{
+		"bool":      boolValue,
+		"tombstone": {Timestamp: hlc.Timestamp{WallTime: 1}},
+		"untagged":  {RawBytes: []byte("val"), Timestamp: hlc.Timestamp{WallTime: 1}},
+	}
+	for name, tv := range testValues {
+		t.Run(name, func(t *testing.T) {
+			tv.InitChecksum(key)
+			extendedValueBytes := encodeWithValueHeader(tv, enginepb.MVCCValueHeader{OriginID: 1})
+			extendedValue := Value{RawBytes: extendedValueBytes, Timestamp: tv.Timestamp}
+
+			// These methods error on degenerate values.
+			if len(tv.RawBytes) >= headerSize {
+				require.NoError(t, tv.Verify(key))
+				require.NoError(t, extendedValue.Verify(key))
+			}
+
+			require.Equal(t, tv.checksum(), extendedValue.checksum())
+			require.Equal(t, tv.computeChecksum(key), tv.computeChecksum(key))
+
+			require.Equal(t, tv.IsPresent(), extendedValue.IsPresent())
+			require.Equal(t, tv.GetTag(), extendedValue.GetTag())
+			vh, err := tv.GetMVCCValueHeader()
+			require.NoError(t, err)
+			require.Equal(t, uint32(0), vh.OriginID)
+
+			vh, err = extendedValue.GetMVCCValueHeader()
+			require.NoError(t, err)
+			require.Equal(t, uint32(1), vh.OriginID)
+
+			// These methods crash if called on tombstones or degenerate values.
+			if len(tv.RawBytes) > tagPos {
+				require.Equal(t, tv.TagAndDataBytes(), extendedValue.TagAndDataBytes())
+				require.True(t, tv.EqualTagAndData(extendedValue))
+				require.True(t, extendedValue.EqualTagAndData(tv))
+			}
+		})
+	}
+}
+
 func TestValuePrettyPrint(t *testing.T) {
 	var boolValue Value
 	boolValue.SetBool(true)
@@ -1776,17 +2135,13 @@ func TestUpdateObservedTimestamps(t *testing.T) {
 func TestChangeReplicasTrigger_String(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	vi := VOTER_INCOMING
-	vo := VOTER_OUTGOING
-	vd := VOTER_DEMOTING_LEARNER
-	l := LEARNER
-	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: &vi}
-	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: &vo}
-	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: &l}
-	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: &vd}
+	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: VOTER_INCOMING}
+	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: VOTER_FULL}
+	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: LEARNER}
+	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: VOTER_DEMOTING_LEARNER}
 	crt := ChangeReplicasTrigger{
 		InternalAddedReplicas:   []ReplicaDescriptor{repl1},
-		InternalRemovedReplicas: []ReplicaDescriptor{repl2, repl3},
+		InternalRemovedReplicas: []ReplicaDescriptor{repl3},
 		Desc: &RangeDescriptor{
 			RangeID:  1,
 			StartKey: RKey("a"),
@@ -1802,15 +2157,15 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 		},
 	}
 	act := crt.String()
-	exp := "ENTER_JOINT(r6 r12 l12 v3) [(n1,s2):3VOTER_INCOMING], " +
-		"[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING_LEARNER]: " +
-		"after=[(n1,s2):3VOTER_INCOMING (n4,s5):6VOTER_OUTGOING (n7,s8):9LEARNER " +
+	exp := "ENTER_JOINT(r12 l12 v3) [(n1,s2):3VOTER_INCOMING], " +
+		"[(n10,s11):12VOTER_DEMOTING_LEARNER]: " +
+		"after=[(n1,s2):3VOTER_INCOMING (n4,s5):6 (n7,s8):9LEARNER " +
 		"(n10,s11):12VOTER_DEMOTING_LEARNER] next=10"
 	require.Equal(t, exp, act)
 
 	crt.InternalRemovedReplicas = nil
 	crt.InternalAddedReplicas = nil
-	repl1.Type = ReplicaTypeVoterFull()
+	repl1.Type = VOTER_FULL
 	crt.Desc.SetReplicas(MakeReplicaSet([]ReplicaDescriptor{repl1, learner}))
 	act = crt.String()
 	require.Empty(t, crt.Added())
@@ -1841,7 +2196,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			typ := alt[i].(ReplicaType)
 			id := alt[i+1].(int)
 			rDescs = append(rDescs, ReplicaDescriptor{
-				Type:      &typ,
+				Type:      typ,
 				NodeID:    NodeID(3 * id),
 				StoreID:   StoreID(2 * id),
 				ReplicaID: ReplicaID(id),
@@ -1867,7 +2222,9 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 	vf1 := sl(VOTER_FULL, 1)
 	vo1 := sl(VOTER_OUTGOING, 1)
 	vi1 := sl(VOTER_INCOMING, 1)
-	vl1 := sl(LEARNER, 1)
+	vdl1 := sl(VOTER_DEMOTING_LEARNER, 1)
+	l1 := sl(LEARNER, 1)
+	nv1 := sl(NON_VOTER, 1)
 
 	testCases := []struct {
 		crt mockCRT
@@ -1881,13 +2238,12 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			Transition: raftpb.ConfChangeTransitionJointExplicit,
 			Changes:    []raftpb.ConfChangeSingle{{Type: raftpb.ConfChangeAddNode, NodeID: 1}},
 		}},
+		// A replica of type VOTER_FULL being removed is unsafe.
+		{crt: mk(in{del: vf1}), err: "removal of VOTER_FULL unsafe, demote to LEARNER first"},
+		// A replica of type VOTER_OUTGOING being removed is unsafe.
+		{crt: mk(in{del: vo1}), err: "removal of VOTER_OUTGOING unsafe, demote to LEARNER first"},
 		// A replica of type VOTER_INCOMING being removed makes no sense.
-		{crt: mk(in{del: vi1}), err: "can't remove replica in state VOTER_INCOMING"},
-		// But during a joint removal we can see VOTER_OUTGOING.
-		{crt: mk(in{del: vo1, repls: vo1}), exp: raftpb.ConfChangeV2{
-			Transition: raftpb.ConfChangeTransitionJointExplicit,
-			Changes:    []raftpb.ConfChangeSingle{{Type: raftpb.ConfChangeRemoveNode, NodeID: 1}},
-		}},
+		{crt: mk(in{del: vi1}), err: "removal of VOTER_INCOMING unsafe, demote to LEARNER first"},
 
 		// Adding a voter via the V1 path.
 		{crt: mk(in{add: vf1, repls: vf1}), exp: raftpb.ConfChange{
@@ -1895,20 +2251,16 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			NodeID: 1,
 		}},
 		// Adding a learner via the V1 path.
-		{crt: mk(in{add: vl1, repls: vl1}), exp: raftpb.ConfChange{
+		{crt: mk(in{add: l1, repls: l1}), exp: raftpb.ConfChange{
 			Type:   raftpb.ConfChangeAddLearnerNode,
 			NodeID: 1,
 		}},
 
-		// Removing a voter or learner via the V1 path but falsely the replica is still in the descriptor.
-		{crt: mk(in{del: vf1, repls: vf1}), err: "(n3,s2):1 must no longer be present in descriptor"},
-		{crt: mk(in{del: vl1, repls: vl1}), err: "(n3,s2):1LEARNER must no longer be present in descriptor"},
+		// Removing a learner or non-voter via the V1 path but falsely the replica is still in the descriptor.
+		{crt: mk(in{del: l1, repls: l1}), err: "(n3,s2):1LEARNER must no longer be present in descriptor"},
+		{crt: mk(in{del: nv1, repls: nv1}), err: "(n3,s2):1NON_VOTER must no longer be present in descriptor"},
 		// Well-formed examples.
-		{crt: mk(in{del: vf1}), exp: raftpb.ConfChange{
-			Type:   raftpb.ConfChangeRemoveNode,
-			NodeID: 1,
-		}},
-		{crt: mk(in{del: vl1}), exp: raftpb.ConfChange{
+		{crt: mk(in{del: l1}), exp: raftpb.ConfChange{
 			Type:   raftpb.ConfChangeRemoveNode,
 			NodeID: 1,
 		}},
@@ -1932,7 +2284,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 		// Adding a learner via the V2 path and without joint consensus. (There is currently
 		// no way to request joint consensus when adding a single learner, but there is no
 		// reason one would ever want that).
-		{crt: mk(in{v2: true, add: vl1, repls: vl1}), exp: raftpb.ConfChangeV2{
+		{crt: mk(in{v2: true, add: l1, repls: l1}), exp: raftpb.ConfChangeV2{
 			Transition: raftpb.ConfChangeTransitionAuto,
 			Changes: []raftpb.ConfChangeSingle{{
 				Type:   raftpb.ConfChangeAddLearnerNode,
@@ -1940,16 +2292,9 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			}},
 		}},
 
-		// Removing a voter or learner via the V2 path without joint consensus.
-		// Note that this means that the replica is not in the desc any more.
-		{crt: mk(in{v2: true, del: vf1}), exp: raftpb.ConfChangeV2{
-			Transition: raftpb.ConfChangeTransitionAuto,
-			Changes: []raftpb.ConfChangeSingle{{
-				Type:   raftpb.ConfChangeRemoveNode,
-				NodeID: 1,
-			}},
-		}},
-		{crt: mk(in{v2: true, del: vl1}), exp: raftpb.ConfChangeV2{
+		// Removing a learner via the V2 path without joint consensus. Note that
+		// this means that the replica is not in the desc any more.
+		{crt: mk(in{v2: true, del: l1}), exp: raftpb.ConfChangeV2{
 			Transition: raftpb.ConfChangeTransitionAuto,
 			Changes: []raftpb.ConfChangeSingle{{
 				Type:   raftpb.ConfChangeRemoveNode,
@@ -1957,14 +2302,14 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			}},
 		}},
 
-		// Ditto but with joint consensus. (This can happen only with a voter;
-		// learners disappear immediately).
-		{crt: mk(in{v2: true, del: vo1, repls: vo1}), exp: raftpb.ConfChangeV2{
+		// Demoting a voter or removing a learner via the V2 path with joint
+		// consensus.
+		{crt: mk(in{v2: true, del: vdl1, repls: vdl1}), exp: raftpb.ConfChangeV2{
 			Transition: raftpb.ConfChangeTransitionJointExplicit,
-			Changes: []raftpb.ConfChangeSingle{{
-				Type:   raftpb.ConfChangeRemoveNode,
-				NodeID: 1,
-			}},
+			Changes: []raftpb.ConfChangeSingle{
+				{NodeID: 1, Type: raftpb.ConfChangeRemoveNode},
+				{NodeID: 1, Type: raftpb.ConfChangeAddLearnerNode},
+			},
 		}},
 
 		// Run a more complex change (necessarily) via the V2 path.
@@ -1974,7 +2319,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			),
 			del: sl(
 				// Voter removals.
-				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_DEMOTING_LEARNER, 9,
+				LEARNER, 2, VOTER_DEMOTING_LEARNER, 9,
 			),
 			repls: sl(
 				// Replicas.
@@ -1983,14 +2328,12 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 				VOTER_INCOMING, 3, // added
 				VOTER_DEMOTING_LEARNER, 9, // removing
 				LEARNER, 4, // added
-				VOTER_OUTGOING, 8, // removing
 				VOTER_FULL, 10,
 			)}),
 			exp: raftpb.ConfChangeV2{
 				Transition: raftpb.ConfChangeTransitionJointExplicit,
 				Changes: []raftpb.ConfChangeSingle{
 					{NodeID: 2, Type: raftpb.ConfChangeRemoveNode},
-					{NodeID: 8, Type: raftpb.ConfChangeRemoveNode},
 					{NodeID: 9, Type: raftpb.ConfChangeRemoveNode},
 					{NodeID: 9, Type: raftpb.ConfChangeAddLearnerNode},
 					{NodeID: 6, Type: raftpb.ConfChangeAddNode},
@@ -2011,7 +2354,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			err: "descriptor enters joint state, but trigger is requesting to leave one",
 		},
 		{
-			crt: mk(in{v2: true, repls: sl(VOTER_OUTGOING, 1)}),
+			crt: mk(in{v2: true, repls: sl(VOTER_DEMOTING_LEARNER, 1)}),
 			err: "descriptor enters joint state, but trigger is requesting to leave one",
 		},
 	}
@@ -2035,7 +2378,7 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := MakeTransaction("hello", Key("k"), 0, ts, 0)
+	txn := MakeTransaction("hello", Key("k"), isolation.Serializable, 0, ts, 0, 99, 0, false /* omitInRangefeeds */)
 
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}
@@ -2045,6 +2388,74 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 		require.Equal(t, txn.IgnoredSeqNums, intent.IgnoredSeqNums)
 		require.Equal(t, txn.TxnMeta, intent.Txn)
 	}
+}
+
+func TestLockStateInfoSafeFormat(t *testing.T) {
+	waiter1 := lock.Waiter{
+		WaitingTxn: &enginepb.TxnMeta{
+			Key:               Key("foo"),
+			ID:                uuid.NamespaceDNS,
+			Epoch:             2,
+			WriteTimestamp:    hlc.Timestamp{Logical: 3},
+			MinTimestamp:      hlc.Timestamp{Logical: 3},
+			Priority:          10,
+			Sequence:          456,
+			CoordinatorNodeID: 3,
+		},
+		ActiveWaiter: true,
+		Strength:     lock.Exclusive,
+		WaitDuration: 135 * time.Second,
+	}
+	waiter2 := lock.Waiter{
+		WaitingTxn:   nil,
+		ActiveWaiter: false,
+		Strength:     lock.None,
+		WaitDuration: 17 * time.Millisecond,
+	}
+
+	holder := &enginepb.TxnMeta{
+		Key:               Key("a"),
+		ID:                uuid.Must(uuid.FromString("deadbeef-0000-0000-0000-000000000000")),
+		Epoch:             0,
+		WriteTimestamp:    hlc.Timestamp{Logical: 1},
+		MinTimestamp:      hlc.Timestamp{Logical: 1},
+		Priority:          100,
+		Sequence:          123,
+		CoordinatorNodeID: 1,
+	}
+	lockStateInfo := &LockStateInfo{
+		RangeID:      35,
+		Key:          Key("bar"),
+		LockHolder:   holder,
+		Durability:   lock.Unreplicated,
+		HoldDuration: 5 * time.Minute,
+		Waiters:      []lock.Waiter{waiter1, waiter2},
+	}
+
+	require.EqualValues(t,
+		"range_id=35 key=\"bar\" holder=deadbeef durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprint(lockStateInfo).StripMarkers())
+	require.EqualValues(t,
+		"range_id=35 key=\"bar\" holder=deadbeef-0000-0000-0000-000000000000 durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810-9dad-11d1-80b4-00c04fd430c8 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprintf("%+v", lockStateInfo).StripMarkers())
+	require.EqualValues(t,
+		"range_id=35 key=‹×› holder=deadbeef durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprint(lockStateInfo).Redact())
+	require.EqualValues(t,
+		"range_id=35 key=‹×› holder=‹×› durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:‹×› active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprintf("%+v", lockStateInfo).Redact())
 }
 
 func TestAddIgnoredSeqNumRange(t *testing.T) {

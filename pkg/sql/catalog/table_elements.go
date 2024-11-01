@@ -1,22 +1,29 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catalog
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"fmt"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/errors"
 )
 
 // TableElementMaybeMutation is an interface used as a subtype for the various
@@ -40,6 +47,14 @@ type TableElementMaybeMutation interface {
 	// delete-only state.
 	DeleteOnly() bool
 
+	// Backfilling returns true iff the table element is in a
+	// mutation in the backfilling state.
+	Backfilling() bool
+
+	// Mergin returns true iff the table element is in a
+	// mutation in the merging state.
+	Merging() bool
+
 	// Adding returns true iff the table element is in an add mutation.
 	Adding() bool
 
@@ -47,9 +62,31 @@ type TableElementMaybeMutation interface {
 	Dropped() bool
 }
 
+// ConstraintProvider is an interface for something which might unwrap
+// a constraint.
+type ConstraintProvider interface {
+
+	// AsCheck returns the corresponding CheckConstraint if there is one,
+	// nil otherwise.
+	AsCheck() CheckConstraint
+
+	// AsForeignKey returns the corresponding ForeignKeyConstraint if
+	// there is one, nil otherwise.
+	AsForeignKey() ForeignKeyConstraint
+
+	// AsUniqueWithIndex returns the corresponding UniqueWithIndexConstraint if
+	// there is one, nil otherwise.
+	AsUniqueWithIndex() UniqueWithIndexConstraint
+
+	// AsUniqueWithoutIndex returns the corresponding
+	// UniqueWithoutIndexConstraint if there is one, nil otherwise.
+	AsUniqueWithoutIndex() UniqueWithoutIndexConstraint
+}
+
 // Mutation is an interface around a table descriptor mutation.
 type Mutation interface {
 	TableElementMaybeMutation
+	ConstraintProvider
 
 	// AsColumn returns the corresponding Column if the mutation is on a column,
 	// nil otherwise.
@@ -59,9 +96,10 @@ type Mutation interface {
 	// nil otherwise.
 	AsIndex() Index
 
-	// AsConstraint returns the corresponding ConstraintToUpdate if the mutation
-	// is on a constraint, nil otherwise.
-	AsConstraint() ConstraintToUpdate
+	// AsConstraintWithoutIndex returns the corresponding WithoutIndexConstraint
+	// if the mutation is on a check constraint or on a foreign key constraint or
+	// on a non-index-backed unique constraint, nil otherwise.
+	AsConstraintWithoutIndex() WithoutIndexConstraint
 
 	// AsPrimaryKeySwap returns the corresponding PrimaryKeySwap if the mutation
 	// is a primary key swap, nil otherwise.
@@ -75,6 +113,10 @@ type Mutation interface {
 	// if the mutation is a materialized view refresh, nil otherwise.
 	AsMaterializedViewRefresh() MaterializedViewRefresh
 
+	// AsModifyRowLevelTTL returns the corresponding ModifyRowLevelTTL
+	// if the mutation is a row-level TTL alter, nil otherwise.
+	AsModifyRowLevelTTL() ModifyRowLevelTTL
+
 	// NOTE: When adding new types of mutations to this interface, be sure to
 	// audit the code which unpacks and introspects mutations to be sure to add
 	// cases for the new type.
@@ -87,6 +129,7 @@ type Mutation interface {
 // Index is an interface around the index descriptor types.
 type Index interface {
 	TableElementMaybeMutation
+	ConstraintProvider
 
 	// IndexDesc returns the underlying protobuf descriptor.
 	// Ideally, this method should be called as rarely as possible.
@@ -118,32 +161,38 @@ type Index interface {
 	// The remaining methods operate on the underlying descpb.IndexDescriptor object.
 
 	GetID() descpb.IndexID
+	GetConstraintID() descpb.ConstraintID
 	GetName() string
 	IsPartial() bool
 	IsUnique() bool
 	IsDisabled() bool
 	IsSharded() bool
+	IsNotVisible() bool
 	IsCreatedExplicitly() bool
+	GetInvisibility() float64
 	GetPredicate() string
 	GetType() descpb.IndexDescriptor_Type
-	GetGeoConfig() geoindex.Config
+	GetGeoConfig() geopb.Config
 	GetVersion() descpb.IndexDescriptorVersion
-	GetEncodingType() descpb.IndexDescriptorEncodingType
+	GetEncodingType() catenumpb.IndexDescriptorEncodingType
 
-	GetSharded() descpb.ShardedDescriptor
+	GetSharded() catpb.ShardedDescriptor
 	GetShardColumnName() string
 
-	IsValidOriginIndex(originColIDs descpb.ColumnIDs) bool
-	IsValidReferencedUniqueConstraint(referencedColIDs descpb.ColumnIDs) bool
+	// IsValidOriginIndex returns whether the index can serve as an origin index
+	// for a foreign key constraint.
+	IsValidOriginIndex(fk ForeignKeyConstraint) bool
 
 	GetPartitioning() Partitioning
+	PartitioningColumnCount() int
+	ImplicitPartitioningColumnCount() int
 
 	ExplicitColumnStartIdx() int
 
 	NumKeyColumns() int
 	GetKeyColumnID(columnOrdinal int) descpb.ColumnID
 	GetKeyColumnName(columnOrdinal int) string
-	GetKeyColumnDirection(columnOrdinal int) descpb.IndexDescriptor_Direction
+	GetKeyColumnDirection(columnOrdinal int) catenumpb.IndexColumn_Direction
 
 	CollectKeyColumnIDs() TableColSet
 	CollectKeySuffixColumnIDs() TableColSet
@@ -151,8 +200,27 @@ type Index interface {
 	CollectSecondaryStoredColumnIDs() TableColSet
 	CollectCompositeColumnIDs() TableColSet
 
+	// InvertedColumnID returns the ColumnID of the inverted column of the
+	// inverted index.
+	//
+	// Panics if the index is not inverted.
 	InvertedColumnID() descpb.ColumnID
+
+	// InvertedColumnName returns the name of the inverted column of the inverted
+	// index.
+	//
+	// Panics if the index is not inverted.
 	InvertedColumnName() string
+
+	// InvertedColumnKeyType returns the type of the data element that is encoded
+	// as the inverted index key. This is currently always EncodedKey.
+	//
+	// Panics if the index is not inverted.
+	InvertedColumnKeyType() *types.T
+
+	// InvertedColumnKind returns the kind of the inverted column of the inverted
+	// index.
+	InvertedColumnKind() catpb.InvertedIndexColumnKind
 
 	NumPrimaryStoredColumns() int
 	NumSecondaryStoredColumns() int
@@ -165,6 +233,42 @@ type Index interface {
 
 	NumCompositeColumns() int
 	GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID
+	UseDeletePreservingEncoding() bool
+	// ForcePut forces all writes to use Put rather than CPut or InitPut.
+	//
+	// Users of this options should take great care as it
+	// effectively mean unique constraints are not respected.
+	//
+	// Currently (2022-07-15) there are three users:
+	//   * delete preserving indexes
+	//   * merging indexes
+	//   * dropping primary indexes
+	//
+	// Delete preserving encoding indexes are used only as a log of
+	// index writes during backfill, thus we can blindly put values into
+	// them.
+	//
+	// New indexes may miss updates during the backfilling process
+	// that would lead to CPut failures until the missed updates
+	// are merged into the index. Uniqueness for such indexes is
+	// checked by the schema changer before they are brought back
+	// online.
+	//
+	// In the case of dropping primary indexes, we always ensure that
+	// there's a replacement primary index which has become public.
+	// The reason we must not use cput is that the new primary index
+	// may not store all the columns stored in this index.
+	ForcePut() bool
+
+	// CreatedAt is an approximate timestamp at which the index was created.
+	// It is derived from the statement time at which the relevant statement
+	// was issued.
+	CreatedAt() time.Time
+
+	// IsTemporaryIndexForBackfill returns true iff the index is
+	// an index being used as the temporary index being used by an
+	// in-progress index backfill.
+	IsTemporaryIndexForBackfill() bool
 }
 
 // Column is an interface around the column descriptor types.
@@ -217,6 +321,10 @@ type Column interface {
 	// HasDefault returns true iff the column has a default expression set.
 	HasDefault() bool
 
+	// HasNullDefault returns true if the column has a default expression and
+	// that expression is NULL.
+	HasNullDefault() bool
+
 	// GetDefaultExpr returns the column default expression if it exists,
 	// empty string otherwise.
 	GetDefaultExpr() string
@@ -252,6 +360,13 @@ type Column interface {
 	// GetUsesSequenceID returns the ID of a sequence used by this column.
 	GetUsesSequenceID(usesSequenceOrdinal int) descpb.ID
 
+	// NumUsesFunctions returns the number of functions used by this column.
+	NumUsesFunctions() int
+
+	// GetUsesFunctionID returns the ID of a function used by this column at the
+	// given ordinal.
+	GetUsesFunctionID(ordinal int) descpb.ID
+
 	// NumOwnsSequences returns the number of sequences owned by this column.
 	NumOwnsSequences() int
 
@@ -272,7 +387,7 @@ type Column interface {
 	// GetPGAttributeNum returns the PGAttributeNum of the column descriptor
 	// if the PGAttributeNum is set (non-zero). Returns the ID of the
 	// column descriptor if the PGAttributeNum is not set.
-	GetPGAttributeNum() uint32
+	GetPGAttributeNum() descpb.PGAttributeNum
 
 	// IsSystemColumn returns true iff the column is a system column.
 	IsSystemColumn() bool
@@ -296,53 +411,189 @@ type Column interface {
 	// if the column is created with `GENERATED BY DEFAULT AS IDENTITY` syntax,
 	// it will return descpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT;
 	// otherwise, returns descpb.GeneratedAsIdentityType_NOT_IDENTITY_COLUMN.
-	GetGeneratedAsIdentityType() descpb.GeneratedAsIdentityType
+	GetGeneratedAsIdentityType() catpb.GeneratedAsIdentityType
 
 	// HasGeneratedAsIdentitySequenceOption returns true if there is a
 	// customized sequence option when this column is created as a
 	// `GENERATED AS IDENTITY` column.
 	HasGeneratedAsIdentitySequenceOption() bool
 
+	// GetGeneratedAsIdentitySequenceOptionStr returns the string representation
+	// of the column's `GENERATED AS IDENTITY` sequence option if it exists, empty
+	// string otherwise.
+	GetGeneratedAsIdentitySequenceOptionStr() string
+
 	// GetGeneratedAsIdentitySequenceOption returns the column's `GENERATED AS
-	// IDENTITY` sequence option if it exists, empty string otherwise.
-	GetGeneratedAsIdentitySequenceOption() string
+	// IDENTITY` sequence option if it exists, and possible error.
+	// If the column is not an identity column, return nil for both sequence option
+	// and the error.
+	// Note it doesn't return the sequence owner info.
+	GetGeneratedAsIdentitySequenceOption(defaultIntSize int32) (*descpb.TableDescriptor_SequenceOpts, error)
 }
 
-// ConstraintToUpdate is an interface around a constraint mutation.
-type ConstraintToUpdate interface {
+// Constraint is an interface around a constraint.
+type Constraint interface {
 	TableElementMaybeMutation
+	ConstraintProvider
+	fmt.Stringer
 
-	// ConstraintToUpdateDesc returns the underlying protobuf descriptor.
-	ConstraintToUpdateDesc() *descpb.ConstraintToUpdate
+	// GetConstraintID returns the ID for the constraint.
+	GetConstraintID() descpb.ConstraintID
+
+	// GetConstraintValidity returns the validity of this constraint.
+	GetConstraintValidity() descpb.ConstraintValidity
+
+	// IsEnforced returns true iff the constraint is enforced for all writes to
+	// the parent table.
+	IsEnforced() bool
 
 	// GetName returns the name of this constraint update mutation.
 	GetName() string
 
-	// IsCheck returns true iff this is an update for a check constraint.
-	IsCheck() bool
+	// IsConstraintValidated returns true iff the constraint is enforced for
+	// all writes to the table data and has also been validated on the table's
+	// existing data prior to the addition of the constraint, if there was any.
+	IsConstraintValidated() bool
 
-	// IsForeignKey returns true iff this is an update for a fk constraint.
-	IsForeignKey() bool
+	// IsConstraintUnvalidated returns true iff the constraint is enforced for
+	// all writes to the table data but which is explicitly NOT to be validated
+	// on any data in the table prior to the addition of the constraint.
+	IsConstraintUnvalidated() bool
+}
 
-	// IsNotNull returns true iff this is an update for a not-null constraint.
-	IsNotNull() bool
+// UniqueConstraint is an interface for a unique constraint.
+// These are either backed by an index, or not, see respectively
+// UniqueWithIndexConstraint and UniqueWithoutIndexConstraint.
+type UniqueConstraint interface {
+	Constraint
 
-	// IsUniqueWithoutIndex returns true iff this is an update for a unique
-	// without index constraint.
-	IsUniqueWithoutIndex() bool
+	// IsValidReferencedUniqueConstraint returns whether the unique constraint can
+	// serve as a referenced unique constraint for a foreign key constraint.
+	IsValidReferencedUniqueConstraint(fk ForeignKeyConstraint) bool
 
-	// Check returns the underlying check constraint, if there is one.
-	Check() descpb.TableDescriptor_CheckConstraint
+	// NumKeyColumns returns the number of columns in this unique constraint.
+	NumKeyColumns() int
 
-	// ForeignKey returns the underlying fk constraint, if there is one.
-	ForeignKey() descpb.ForeignKeyConstraint
+	// GetKeyColumnID returns the ID of the column in the unique constraint at
+	// ordinal `columnOrdinal`.
+	GetKeyColumnID(columnOrdinal int) descpb.ColumnID
 
-	// NotNullColumnID returns the underlying not-null column ID, if there is one.
-	NotNullColumnID() descpb.ColumnID
+	// CollectKeyColumnIDs returns the columns in the unique constraint in a new
+	// TableColSet.
+	CollectKeyColumnIDs() TableColSet
 
-	// UniqueWithoutIndex returns the underlying unique without index constraint, if
-	// there is one.
-	UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint
+	// IsPartial returns true iff this is a partial uniqueness constraint.
+	IsPartial() bool
+
+	// GetPredicate returns the partial predicate if there is one, "" otherwise.
+	GetPredicate() string
+}
+
+// UniqueWithIndexConstraint is an interface around a unique constraint
+// which backed by an index.
+type UniqueWithIndexConstraint interface {
+	UniqueConstraint
+	Index
+}
+
+// WithoutIndexConstraint is the supertype of all constraint subtypes which are
+// not backed by an index.
+type WithoutIndexConstraint interface {
+	Constraint
+}
+
+// CheckConstraint is an interface around a check constraint.
+type CheckConstraint interface {
+	WithoutIndexConstraint
+
+	// CheckDesc returns the underlying descriptor protobuf.
+	CheckDesc() *descpb.TableDescriptor_CheckConstraint
+
+	// GetExpr returns the check expression as a string.
+	GetExpr() string
+
+	// NumReferencedColumns returns the number of column references in the check
+	// expression. Note that a column may be referenced multiple times in an
+	// expression; the number returned here is the number of references, not the
+	// number of distinct columns.
+	NumReferencedColumns() int
+
+	// GetReferencedColumnID returns the ID of the column referenced in the check
+	// expression at ordinal `columnOrdinal`.
+	GetReferencedColumnID(columnOrdinal int) descpb.ColumnID
+
+	// CollectReferencedColumnIDs returns the columns referenced in the check
+	// constraint expression in a new TableColSet.
+	CollectReferencedColumnIDs() TableColSet
+
+	// IsNotNullColumnConstraint returns true iff this check constraint is a
+	// NOT NULL on a column.
+	IsNotNullColumnConstraint() bool
+
+	// IsHashShardingConstraint returns true iff this check constraint is
+	// associated with a hash-sharding column in this table.
+	IsHashShardingConstraint() bool
+}
+
+// ForeignKeyConstraint is an interface around a check constraint.
+type ForeignKeyConstraint interface {
+	WithoutIndexConstraint
+
+	// ForeignKeyDesc returns the underlying descriptor protobuf.
+	ForeignKeyDesc() *descpb.ForeignKeyConstraint
+
+	// GetOriginTableID returns the ID of the table at the origin of this foreign
+	// key.
+	GetOriginTableID() descpb.ID
+
+	// NumOriginColumns returns the number of origin columns in the foreign key.
+	NumOriginColumns() int
+
+	// GetOriginColumnID returns the ID of the origin column in the foreign
+	// key at ordinal `columnOrdinal`.
+	GetOriginColumnID(columnOrdinal int) descpb.ColumnID
+
+	// CollectOriginColumnIDs returns the origin columns in the foreign key
+	// in a new TableColSet.
+	CollectOriginColumnIDs() TableColSet
+
+	// GetReferencedTableID returns the ID of the table referenced by this
+	// foreign key.
+	GetReferencedTableID() descpb.ID
+
+	// NumReferencedColumns returns the number of columns referenced by this
+	// foreign key.
+	NumReferencedColumns() int
+
+	// GetReferencedColumnID returns the ID of the column referenced by the
+	// foreign key at ordinal `columnOrdinal`.
+	GetReferencedColumnID(columnOrdinal int) descpb.ColumnID
+
+	// CollectReferencedColumnIDs returns the columns referenced by the foreign
+	// key in a new TableColSet.
+	CollectReferencedColumnIDs() TableColSet
+
+	// OnDelete returns the action to take ON DELETE.
+	OnDelete() semenumpb.ForeignKeyAction
+
+	// OnUpdate returns the action to take ON UPDATE.
+	OnUpdate() semenumpb.ForeignKeyAction
+
+	// Match returns the type of algorithm used to match composite keys.
+	Match() semenumpb.Match
+}
+
+// UniqueWithoutIndexConstraint is an interface around a unique constraint
+// which is not backed by an index.
+type UniqueWithoutIndexConstraint interface {
+	WithoutIndexConstraint
+	UniqueConstraint
+
+	// UniqueWithoutIndexDesc returns the underlying descriptor protobuf.
+	UniqueWithoutIndexDesc() *descpb.UniqueWithoutIndexConstraint
+
+	// ParentTableID returns the ID of the table this constraint applies to.
+	ParentTableID() descpb.ID
 }
 
 // PrimaryKeySwap is an interface around a primary key swap mutation.
@@ -356,14 +607,14 @@ type PrimaryKeySwap interface {
 	NumOldIndexes() int
 
 	// ForEachOldIndexIDs iterates through each of the old index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachOldIndexIDs(fn func(id descpb.IndexID) error) error
 
 	// NumNewIndexes returns the number of new active indexes to swap in.
 	NumNewIndexes() int
 
 	// ForEachNewIndexIDs iterates through each of the new index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachNewIndexIDs(fn func(id descpb.IndexID) error) error
 
 	// HasLocalityConfig returns true iff the locality config is swapped also.
@@ -397,7 +648,7 @@ type MaterializedViewRefresh interface {
 	AsOf() hlc.Timestamp
 
 	// ForEachIndexID iterates through each of the index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachIndexID(func(id descpb.IndexID) error) error
 
 	// TableWithNewIndexes returns a new TableDescriptor based on the old one
@@ -405,11 +656,19 @@ type MaterializedViewRefresh interface {
 	TableWithNewIndexes(tbl TableDescriptor) TableDescriptor
 }
 
+// ModifyRowLevelTTL is an interface around a modify row level TTL mutation.
+type ModifyRowLevelTTL interface {
+	TableElementMaybeMutation
+
+	// RowLevelTTL returns the row level TTL for the mutation.
+	RowLevelTTL() *catpb.RowLevelTTL
+}
+
 // Partitioning is an interface around an index partitioning.
 type Partitioning interface {
 
 	// PartitioningDesc returns the underlying protobuf descriptor.
-	PartitioningDesc() *descpb.PartitioningDescriptor
+	PartitioningDesc() *catpb.PartitioningDescriptor
 
 	// DeepCopy returns a deep copy of the receiver.
 	DeepCopy() Partitioning
@@ -420,15 +679,15 @@ type Partitioning interface {
 
 	// ForEachPartitionName applies fn on each of the partition names in this
 	// partition and recursively in its subpartitions.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachPartitionName(fn func(name string) error) error
 
 	// ForEachList applies fn on each list element of the wrapped partitioning.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachList(fn func(name string, values [][]byte, subPartitioning Partitioning) error) error
 
 	// ForEachRange applies fn on each range element of the wrapped partitioning.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachRange(fn func(name string, from, to []byte) error) error
 
 	// NumColumns is how large of a prefix of the columns in an index are used in
@@ -476,10 +735,7 @@ func ForEachIndex(desc TableDescriptor, opts IndexOpts, f func(idx Index) error)
 			continue
 		}
 		if err := f(idx); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -488,10 +744,7 @@ func ForEachIndex(desc TableDescriptor, opts IndexOpts, f func(idx Index) error)
 func forEachIndex(slice []Index, f func(idx Index) error) error {
 	for _, idx := range slice {
 		if err := f(idx); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -510,6 +763,12 @@ func ForEachNonDropIndex(desc TableDescriptor, f func(idx Index) error) error {
 // ForEachPartialIndex is like ForEachIndex over PartialIndexes().
 func ForEachPartialIndex(desc TableDescriptor, f func(idx Index) error) error {
 	return forEachIndex(desc.PartialIndexes(), f)
+}
+
+// ForEachNonPrimaryIndex is like ForEachIndex over
+// NonPrimaryIndexes().
+func ForEachNonPrimaryIndex(desc TableDescriptor, f func(idx Index) error) error {
+	return forEachIndex(desc.NonPrimaryIndexes(), f)
 }
 
 // ForEachPublicNonPrimaryIndex is like ForEachIndex over
@@ -596,36 +855,61 @@ func FindDeletableNonPrimaryIndex(desc TableDescriptor, test func(idx Index) boo
 	return findIndex(desc.DeletableNonPrimaryIndexes(), test)
 }
 
+// FindNonPrimaryIndex returns the first index in
+// NonPrimaryIndex() for which test returns true.
+func FindNonPrimaryIndex(desc TableDescriptor, test func(idx Index) bool) Index {
+	return findIndex(desc.NonPrimaryIndexes(), test)
+}
+
 // FindDeleteOnlyNonPrimaryIndex returns the first index in
 // DeleteOnlyNonPrimaryIndex() for which test returns true.
 func FindDeleteOnlyNonPrimaryIndex(desc TableDescriptor, test func(idx Index) bool) Index {
 	return findIndex(desc.DeleteOnlyNonPrimaryIndexes(), test)
 }
 
-// FullIndexColumnIDs returns the index column IDs including any extra (implicit or
-// stored (old STORING encoding)) column IDs for non-unique indexes. It also
-// returns the direction with which each column was encoded.
-func FullIndexColumnIDs(idx Index) ([]descpb.ColumnID, []descpb.IndexDescriptor_Direction) {
-	n := idx.NumKeyColumns()
-	if !idx.IsUnique() {
-		n += idx.NumKeySuffixColumns()
-	}
-	ids := make([]descpb.ColumnID, 0, n)
-	dirs := make([]descpb.IndexDescriptor_Direction, 0, n)
-	for i := 0; i < idx.NumKeyColumns(); i++ {
-		ids = append(ids, idx.GetKeyColumnID(i))
-		dirs = append(dirs, idx.GetKeyColumnDirection(i))
-	}
-	// Non-unique indexes have some of the primary-key columns appended to
-	// their key.
-	if !idx.IsUnique() {
-		for i := 0; i < idx.NumKeySuffixColumns(); i++ {
-			// Extra columns are encoded in ascending order.
-			ids = append(ids, idx.GetKeySuffixColumnID(i))
-			dirs = append(dirs, descpb.IndexDescriptor_ASC)
+// FindCorrespondingTemporaryIndexByID finds the temporary index that
+// corresponds to the currently mutated index identified by ID. It
+// assumes that the temporary index for a given index ID exists
+// directly after it in the mutations array.
+//
+// Callers should take care that AllocateIDs() has been called before
+// using this function.
+func FindCorrespondingTemporaryIndexByID(desc TableDescriptor, id descpb.IndexID) Index {
+	mutations := desc.AllMutations()
+	var ord int
+	for _, m := range mutations {
+		idx := m.AsIndex()
+		if idx != nil && idx.IndexDesc().ID == id {
+			// We want the mutation after this mutation
+			// since the temporary index is added directly
+			// after.
+			ord = m.MutationOrdinal() + 1
 		}
 	}
-	return ids, dirs
+
+	// A temporary index will never be found at index 0 since we
+	// always add them _after_ the index they correspond to.
+	if ord == 0 {
+		return nil
+	}
+
+	if len(mutations) >= ord+1 {
+		candidateMutation := mutations[ord]
+		if idx := candidateMutation.AsIndex(); idx != nil {
+			if idx.IsTemporaryIndexForBackfill() {
+				return idx
+			}
+		}
+	}
+	return nil
+}
+
+// IsCorrespondingTemporaryIndex returns true iff idx is a temporary index
+// created during a backfill and is the corresponding temporary index for
+// otherIdx. It assumes that idx and otherIdx are both indexes from the same
+// table.
+func IsCorrespondingTemporaryIndex(idx Index, otherIdx Index) bool {
+	return idx.IsTemporaryIndexForBackfill() && idx.Ordinal() == otherIdx.Ordinal()+1
 }
 
 // UserDefinedTypeColsHaveSameVersion returns whether one table descriptor's
@@ -643,6 +927,34 @@ func UserDefinedTypeColsHaveSameVersion(desc TableDescriptor, otherDesc TableDes
 	return true
 }
 
+// UserDefinedTypeColsInFamilyHaveSameVersion returns whether one table descriptor's
+// columns with user defined type metadata have the same versions of metadata
+// as in the other descriptor, for all columns in the same family.
+// Note that this function is only valid on two
+// descriptors representing the same table at the same version.
+func UserDefinedTypeColsInFamilyHaveSameVersion(
+	desc TableDescriptor, otherDesc TableDescriptor, familyID descpb.FamilyID,
+) (bool, error) {
+	family, err := MustFindFamilyByID(desc, familyID)
+	if err != nil {
+		return false, err
+	}
+
+	familyCols := intsets.Fast{}
+	for _, colID := range family.ColumnIDs {
+		familyCols.Add(int(colID))
+	}
+
+	otherCols := otherDesc.UserDefinedTypeColumns()
+	for i, thisCol := range desc.UserDefinedTypeColumns() {
+		this, other := thisCol.GetType(), otherCols[i].GetType()
+		if familyCols.Contains(int(thisCol.GetID())) && this.TypeMeta.Version != other.TypeMeta.Version {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // ColumnIDToOrdinalMap returns a map from Column ID to the ordinal
 // position of that column.
 func ColumnIDToOrdinalMap(columns []Column) TableColMap {
@@ -651,11 +963,6 @@ func ColumnIDToOrdinalMap(columns []Column) TableColMap {
 		m.Set(col.GetID(), col.Ordinal())
 	}
 	return m
-}
-
-// ColumnTypes returns the types of the given columns
-func ColumnTypes(columns []Column) []*types.T {
-	return ColumnTypesWithInvertedCol(columns, nil /* invertedCol */)
 }
 
 // ColumnTypesWithInvertedCol returns the types of all given columns,
@@ -670,6 +977,17 @@ func ColumnTypesWithInvertedCol(columns []Column, invertedCol Column) []*types.T
 		}
 	}
 	return t
+}
+
+// ColumnsByIDs returns a map of Columns keyed by their ID for the given table.
+func ColumnsByIDs(tbl TableDescriptor) map[descpb.ColumnID]Column {
+	cols := tbl.AllColumns()
+	byID := make(map[descpb.ColumnID]Column, len(cols))
+	for i := range cols {
+		col := cols[i]
+		byID[col.GetID()] = col
+	}
+	return byID
 }
 
 // ColumnNeedsBackfill returns true if adding or dropping (according to
@@ -689,8 +1007,351 @@ func ColumnNeedsBackfill(col Column) bool {
 	//  - computed columns
 	//  - non-nullable columns (note: if a non-nullable column doesn't have a
 	//    default value, the backfill will fail unless the table is empty).
-	if col.ColumnDesc().HasNullDefault() {
+	if col.HasNullDefault() {
 		return false
 	}
 	return col.HasDefault() || !col.IsNullable() || col.IsComputed()
+}
+
+// GetConstraintType finds the type of constraint.
+func GetConstraintType(c Constraint) catconstants.ConstraintType {
+	if c.AsCheck() != nil {
+		return catconstants.ConstraintTypeCheck
+	} else if c.AsForeignKey() != nil {
+		return catconstants.ConstraintTypeFK
+	} else if c.AsUniqueWithoutIndex() != nil {
+		return catconstants.ConstraintTypeUniqueWithoutIndex
+	} else if c.AsUniqueWithIndex() != nil {
+		if c.AsUniqueWithIndex().GetEncodingType() == catenumpb.PrimaryIndexEncoding {
+			return catconstants.ConstraintTypePK
+		} else {
+			return catconstants.ConstraintTypeUnique
+		}
+	} else {
+		panic(errors.AssertionFailedf("unknown constraint type %T", c))
+	}
+}
+
+// FindTargetIndexNameByID returns the name of an index based on an ID, taking
+// into account any ongoing declarative schema changes. Declarative schema
+// changes do not propagate the index name into the mutations until changes are
+// fully validated and swap operations are complete (to avoid having two
+// constraints with the same name).
+func FindTargetIndexNameByID(desc TableDescriptor, indexID descpb.IndexID) (string, error) {
+	// Check if there are any ongoing schema changes and prefer the name from
+	// them.
+	if scState := desc.GetDeclarativeSchemaChangerState(); scState != nil {
+		for _, target := range scState.Targets {
+			if indexName := target.GetIndexName(); indexName != nil &&
+				target.TargetStatus == scpb.Status_PUBLIC &&
+				indexName.TableID == desc.GetID() &&
+				indexName.IndexID == indexID {
+				return indexName.Name, nil
+			}
+		}
+	}
+	// Otherwise, try fetching the name from the index descriptor.
+	index, err := MustFindIndexByID(desc, indexID)
+	if err != nil {
+		return "", err
+	}
+	return index.GetName(), err
+}
+
+// ColumnNamesForIDs returns the names for the given column IDs, or an error
+// if one or more column ids was missing. Note - this allocates! It's not for
+// hot path code.
+func ColumnNamesForIDs(tbl TableDescriptor, ids descpb.ColumnIDs) ([]string, error) {
+	names := make([]string, len(ids))
+	columns := tbl.AllColumns()
+	for i, id := range ids {
+		for _, c := range columns {
+			if c.GetID() == id {
+				names[i] = c.GetName()
+				break
+			}
+		}
+		if names[i] == "" {
+			return nil, errors.AssertionFailedf("no column with ID %d found in table %q (%q)",
+				id, tbl.GetName(), tbl.GetID())
+		}
+	}
+	return names, nil
+}
+
+// FindIndexByID returns the first Index that matches the ID
+// in the set of all indexes, or nil if none was found.
+// The order of traversal is the canonical order, see Index.Ordinal().
+func FindIndexByID(tbl TableDescriptor, id descpb.IndexID) Index {
+	return FindIndex(tbl, IndexOpts{
+		NonPhysicalPrimaryIndex: true,
+		DropMutations:           true,
+		AddMutations:            true,
+	}, func(idx Index) bool {
+		return idx.GetID() == id
+	})
+}
+
+// MustFindIndexByID is like FindIndexByID but returns an error when no Index
+// was found.
+func MustFindIndexByID(tbl TableDescriptor, id descpb.IndexID) (Index, error) {
+	if idx := FindIndexByID(tbl, id); idx != nil {
+		return idx, nil
+	}
+	return nil, errors.Errorf("index-id \"%d\" does not exist", id)
+}
+
+// FindIndexByName is like FindIndexByID but with names instead of IDs.
+func FindIndexByName(tbl TableDescriptor, name string) Index {
+	return FindIndex(tbl, IndexOpts{
+		NonPhysicalPrimaryIndex: true,
+		DropMutations:           true,
+		AddMutations:            true,
+	}, func(idx Index) bool {
+		return idx.GetName() == name
+	})
+}
+
+// MustFindIndexByName is like MustFindIndexByID but with names instead of IDs.
+func MustFindIndexByName(tbl TableDescriptor, name string) (Index, error) {
+	if idx := FindIndexByName(tbl, name); idx != nil {
+		return idx, nil
+	}
+	return nil, errors.Errorf("index %q does not exist", name)
+}
+
+// FindConstraintByID traverses the slice returned by the AllConstraints
+// method on the table descriptor and returns the first Constraint that
+// matches the desired ID, or nil if none was found.
+func FindConstraintByID(tbl TableDescriptor, id descpb.ConstraintID) Constraint {
+	all := tbl.AllConstraints()
+	for _, c := range all {
+		if c.GetConstraintID() == id {
+			return c
+		}
+	}
+	return nil
+}
+
+// MustFindConstraintByID is like FindConstraintByID but returns an error when
+// no Constraint was found.
+func MustFindConstraintByID(tbl TableDescriptor, id descpb.ConstraintID) (Constraint, error) {
+	if c := FindConstraintByID(tbl, id); c != nil {
+		return c, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedObject, "constraint-id \"%d\" does not exist", id)
+}
+
+// FindConstraintByName is like FindConstraintByID but with names instead of
+// IDs.
+func FindConstraintByName(tbl TableDescriptor, name string) Constraint {
+	all := tbl.AllConstraints()
+	for _, c := range all {
+		if c.GetName() == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// MustFindConstraintWithName is like MustFindConstraintByID but with names
+// instead of IDs.
+func MustFindConstraintWithName(tbl TableDescriptor, name string) (Constraint, error) {
+	if c := FindConstraintByName(tbl, name); c != nil {
+		return c, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedObject, "constraint named %q does not exist", name)
+}
+
+// silence the linter
+var _ = MustFindConstraintWithName
+
+// FindTriggerByID traverses the slice returned by the GetTriggers method on the
+// table descriptor and returns the first trigger that matches the desired ID,
+// or nil if none was found.
+func FindTriggerByID(tbl TableDescriptor, id descpb.TriggerID) *descpb.TriggerDescriptor {
+	triggers := tbl.GetTriggers()
+	for i := range triggers {
+		if triggers[i].ID == id {
+			return &triggers[i]
+		}
+	}
+	return nil
+}
+
+// FindFamilyByID traverses the family descriptors on the table descriptor
+// and returns the first column family with the desired ID, or nil if none was
+// found.
+func FindFamilyByID(tbl TableDescriptor, id descpb.FamilyID) (ret *descpb.ColumnFamilyDescriptor) {
+	_ = tbl.ForeachFamily(func(family *descpb.ColumnFamilyDescriptor) error {
+		if family.ID == id {
+			ret = family
+			return iterutil.StopIteration()
+		}
+		return nil
+	})
+	return ret
+}
+
+// MustFindFamilyByID is like FindFamilyByID but returns an error if no column
+// family was found.
+func MustFindFamilyByID(
+	tbl TableDescriptor, id descpb.FamilyID,
+) (*descpb.ColumnFamilyDescriptor, error) {
+	if f := FindFamilyByID(tbl, id); f != nil {
+		return f, nil
+	}
+	return nil, fmt.Errorf("family-id \"%d\" does not exist", id)
+}
+
+// FindColumnByID traverses the slice returned by the AllColumns
+// method on the table descriptor and returns the first Column that
+// matches the desired ID, or nil if none was found.
+func FindColumnByID(tbl TableDescriptor, id descpb.ColumnID) Column {
+	for _, col := range tbl.AllColumns() {
+		if col.GetID() == id {
+			return col
+		}
+	}
+	return nil
+}
+
+// MustFindColumnByID is like FindColumnByID but returns an error when
+// no Column was found.
+func MustFindColumnByID(tbl TableDescriptor, id descpb.ColumnID) (Column, error) {
+	if col := FindColumnByID(tbl, id); col != nil {
+		return col, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column-id \"%d\" does not exist", id)
+}
+
+// FindColumnByName is like FindColumnByID but with names instead of
+// IDs.
+func FindColumnByName(tbl TableDescriptor, name string) Column {
+	for _, col := range tbl.AllColumns() {
+		if col.GetName() == name {
+			return col
+		}
+	}
+	return nil
+}
+
+// MustFindColumnByName is like MustFindColumnByID but with names
+// instead of IDs.
+func MustFindColumnByName(tbl TableDescriptor, name string) (Column, error) {
+	if col := FindColumnByName(tbl, name); col != nil {
+		return col, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column %q does not exist", name)
+}
+
+// FindColumnByTreeName is like FindColumnByID but with names instead of
+// IDs.
+func FindColumnByTreeName(tbl TableDescriptor, name tree.Name) Column {
+	for _, col := range tbl.AllColumns() {
+		if col.ColName() == name {
+			return col
+		}
+	}
+	return nil
+}
+
+// MustFindColumnByTreeName is like MustFindColumnByID but with names
+// instead of IDs.
+func MustFindColumnByTreeName(tbl TableDescriptor, name tree.Name) (Column, error) {
+	if col := FindColumnByTreeName(tbl, name); col != nil {
+		return col, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column %q does not exist", name)
+}
+
+// FindColumnByPGAttributeNum traverses the slice returned by the AllColumns
+// method on the table descriptor and returns the first Column that
+// matches the desired PGAttributeNum, or the ID if not set.
+// Returns nil if none was found.
+func FindColumnByPGAttributeNum(tbl TableDescriptor, attNum descpb.PGAttributeNum) Column {
+	for _, col := range tbl.AllColumns() {
+		if col.GetPGAttributeNum() == attNum {
+			return col
+		}
+	}
+	return nil
+}
+
+// MustFindColumnByPGAttributeNum is like FindColumnByPGAttributeNum but returns
+// an error when no column is found.
+func MustFindColumnByPGAttributeNum(
+	tbl TableDescriptor, attNum descpb.PGAttributeNum,
+) (Column, error) {
+	if col := FindColumnByPGAttributeNum(tbl, attNum); col != nil {
+		return col, nil
+	}
+	return nil, pgerror.Newf(pgcode.UndefinedColumn,
+		"column with logical order %d does not exist", attNum)
+}
+
+// MustFindPublicColumnsByNameList is a convenience function which behaves
+// exactly like MustFindPublicColumnByTreeName applied repeatedly to the
+// names in the provided list, returning early at the first encountered error.
+func MustFindPublicColumnsByNameList(desc TableDescriptor, names tree.NameList) ([]Column, error) {
+	cols := make([]Column, len(names))
+	for i, name := range names {
+		c, err := MustFindPublicColumnByTreeName(desc, name)
+		if err != nil {
+			return nil, err
+		}
+		cols[i] = c
+	}
+	return cols, nil
+}
+
+// MustFindPublicColumnByTreeName is a convenience function which behaves exactly
+// like FindColumnByName except it ignores column mutations.
+func MustFindPublicColumnByTreeName(desc TableDescriptor, name tree.Name) (Column, error) {
+	col, err := MustFindColumnByTreeName(desc, name)
+	if err != nil {
+		return nil, err
+	}
+	if !col.Public() {
+		return nil, pgerror.Newf(pgcode.UndefinedColumn, "column %q does not exist", name)
+	}
+	return col, nil
+}
+
+// MustFindPublicColumnByID is a convenience function which behaves exactly
+// like FindColumnByID except it ignores column mutations.
+func MustFindPublicColumnByID(desc TableDescriptor, id descpb.ColumnID) (Column, error) {
+	col, err := MustFindColumnByID(desc, id)
+	if err != nil {
+		return nil, err
+	}
+	if !col.Public() {
+		return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
+	}
+	return col, nil
+}
+
+// FindFKReferencedUniqueConstraint finds the first index in the supplied
+// referencedTable that can satisfy a foreign key of the supplied column ids.
+// If no such index exists, attempts to find a unique constraint on the supplied
+// column ids. If neither an index nor unique constraint is found, returns an
+// error.
+func FindFKReferencedUniqueConstraint(
+	referencedTable TableDescriptor, fk ForeignKeyConstraint,
+) (UniqueConstraint, error) {
+	for _, uwi := range referencedTable.UniqueConstraintsWithIndex() {
+		if !uwi.Dropped() && uwi.IsValidReferencedUniqueConstraint(fk) {
+			return uwi, nil
+		}
+	}
+	for _, uwoi := range referencedTable.UniqueConstraintsWithoutIndex() {
+		if !uwoi.Dropped() && uwoi.IsValidReferencedUniqueConstraint(fk) {
+			return uwoi, nil
+		}
+	}
+	return nil, pgerror.Newf(
+		pgcode.ForeignKeyViolation,
+		"there is no unique constraint matching given keys for referenced table %s",
+		referencedTable.GetName(),
+	)
 }

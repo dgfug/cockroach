@@ -1,27 +1,22 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -41,34 +36,22 @@ type databaseRegionChangeFinalizer struct {
 // newDatabaseRegionChangeFinalizer returns a databaseRegionChangeFinalizer.
 // It pre-fetches all REGIONAL BY ROW tables from the database.
 func newDatabaseRegionChangeFinalizer(
-	ctx context.Context,
-	txn *kv.Txn,
-	execCfg *ExecutorConfig,
-	descsCol *descs.Collection,
-	dbID descpb.ID,
-	typeID descpb.ID,
+	ctx context.Context, txn descs.Txn, execCfg *ExecutorConfig, dbID descpb.ID, typeID descpb.ID,
 ) (*databaseRegionChangeFinalizer, error) {
 	p, cleanup := NewInternalPlanner(
 		"repartition-regional-by-row-tables",
-		txn,
-		security.RootUserName(),
+		txn.KV(),
+		username.NodeUserName(),
 		&MemoryMetrics{},
 		execCfg,
-		sessiondatapb.SessionData{},
-		WithDescCollection(descsCol),
+		txn.SessionData(),
+		WithDescCollection(txn.Descriptors()),
 	)
 	localPlanner := p.(*planner)
 
 	var regionalByRowTables []*tabledesc.Mutable
 	if err := func() error {
-		_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-			ctx,
-			txn,
-			dbID,
-			tree.DatabaseLookupFlags{
-				Required: true,
-			},
-		)
+		dbDesc, err := txn.Descriptors().ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Database(ctx, dbID)
 		if err != nil {
 			return err
 		}
@@ -111,7 +94,7 @@ func (r *databaseRegionChangeFinalizer) cleanup() {
 
 // finalize updates the zone configurations of the database and all enclosed
 // REGIONAL BY ROW tables once the region promotion/demotion is complete.
-func (r *databaseRegionChangeFinalizer) finalize(ctx context.Context, txn *kv.Txn) error {
+func (r *databaseRegionChangeFinalizer) finalize(ctx context.Context, txn descs.Txn) error {
 	if err := r.updateDatabaseZoneConfig(ctx, txn); err != nil {
 		return err
 	}
@@ -126,19 +109,21 @@ func (r *databaseRegionChangeFinalizer) finalize(ctx context.Context, txn *kv.Tx
 // advance of the type descriptor change, to ensure that the table and type
 // descriptors never become incorrect (from a query perspective). For more info,
 // see the callers.
-func (r *databaseRegionChangeFinalizer) preDrop(ctx context.Context, txn *kv.Txn) error {
+func (r *databaseRegionChangeFinalizer) preDrop(ctx context.Context, txn descs.Txn) error {
 	repartitioned, zoneConfigUpdates, err := r.repartitionRegionalByRowTables(ctx, txn)
 	if err != nil {
 		return err
 	}
 	for _, update := range zoneConfigUpdates {
 		if _, err := writeZoneConfigUpdate(
-			ctx, txn, r.localPlanner.ExecCfg(), update,
+			ctx, txn,
+			r.localPlanner.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+			update,
 		); err != nil {
 			return err
 		}
 	}
-	b := txn.NewBatch()
+	b := txn.KV().NewBatch()
 	for _, t := range repartitioned {
 		const kvTrace = false
 		if err := r.localPlanner.Descriptors().WriteDescToBatch(
@@ -147,7 +132,7 @@ func (r *databaseRegionChangeFinalizer) preDrop(ctx context.Context, txn *kv.Txn
 			return err
 		}
 	}
-	return txn.Run(ctx, b)
+	return txn.KV().Run(ctx, b)
 }
 
 // updateGlobalTablesZoneConfig refreshes all global tables' zone configs so
@@ -157,9 +142,9 @@ func (r *databaseRegionChangeFinalizer) preDrop(ctx context.Context, txn *kv.Txn
 // will inherit the database's constraints. In the RESTRICTED case, however,
 // constraints must be explicitly refreshed when new regions are added/removed.
 func (r *databaseRegionChangeFinalizer) updateGlobalTablesZoneConfig(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn isql.Txn,
 ) error {
-	regionConfig, err := SynthesizeRegionConfig(ctx, txn, r.dbID, r.localPlanner.Descriptors())
+	regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), r.dbID, r.localPlanner.Descriptors())
 	if err != nil {
 		return err
 	}
@@ -172,17 +157,12 @@ func (r *databaseRegionChangeFinalizer) updateGlobalTablesZoneConfig(
 
 	descsCol := r.localPlanner.Descriptors()
 
-	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(
-		ctx,
-		txn,
-		r.dbID,
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := descsCol.ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Database(ctx, r.dbID)
 	if err != nil {
 		return err
 	}
 
-	err = r.localPlanner.updateZoneConfigsForTables(ctx, dbDesc, WithOnlyGlobalTables)
+	err = r.localPlanner.refreshZoneConfigsForTables(ctx, dbDesc, WithOnlyGlobalTables)
 	if err != nil {
 		return err
 	}
@@ -194,9 +174,9 @@ func (r *databaseRegionChangeFinalizer) updateGlobalTablesZoneConfig(
 // encloses the multi-region enum such that there is an entry for all PUBLIC
 // region values.
 func (r *databaseRegionChangeFinalizer) updateDatabaseZoneConfig(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn descs.Txn,
 ) error {
-	regionConfig, err := SynthesizeRegionConfig(ctx, txn, r.dbID, r.localPlanner.Descriptors())
+	regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), r.dbID, r.localPlanner.Descriptors())
 	if err != nil {
 		return err
 	}
@@ -206,6 +186,8 @@ func (r *databaseRegionChangeFinalizer) updateDatabaseZoneConfig(
 		regionConfig,
 		txn,
 		r.localPlanner.ExecCfg(),
+		true, /* validateLocalities */
+		r.localPlanner.extendedEvalCtx.Tracing.KVTracingEnabled(),
 	)
 }
 
@@ -229,9 +211,16 @@ func (r *databaseRegionChangeFinalizer) updateDatabaseZoneConfig(
 // write the descriptors through the collection or inject them as synthetic
 // descriptors.
 func (r *databaseRegionChangeFinalizer) repartitionRegionalByRowTables(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn descs.Txn,
 ) (repartitioned []*tabledesc.Mutable, zoneConfigUpdates []*zoneConfigUpdate, _ error) {
-	regionConfig, err := SynthesizeRegionConfig(ctx, txn, r.dbID, r.localPlanner.Descriptors())
+	var regionConfigOpts []SynthesizeRegionConfigOption
+	// For regional by row tables these will be forced as survive zone on
+	// the system database, even if the system database is survive region
+	if r.dbID == keys.SystemDatabaseID {
+		regionConfigOpts = []SynthesizeRegionConfigOption{SynthesizeRegionConfigOptionForceSurvivalZone}
+	}
+
+	regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), r.dbID, r.localPlanner.Descriptors(), regionConfigOpts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -243,19 +232,14 @@ func (r *databaseRegionChangeFinalizer) repartitionRegionalByRowTables(
 		for i := range tableDesc.Columns {
 			col := &tableDesc.Columns[i]
 			if col.Type.UserDefined() {
-				tid, err := typedesc.UserDefinedTypeOIDToID(col.Type.Oid())
-				if err != nil {
-					return nil, nil, err
-				}
+				tid := typedesc.UserDefinedTypeOIDToID(col.Type.Oid())
 				if tid == r.typeID {
 					col.Type.TypeMeta = types.UserDefinedTypeMetadata{}
 				}
 			}
 		}
-		if err := typedesc.HydrateTypesInTableDescriptor(
-			ctx,
-			tableDesc.TableDesc(),
-			r.localPlanner,
+		if err := typedesc.HydrateTypesInDescriptor(
+			ctx, tableDesc, r.localPlanner,
 		); err != nil {
 			return nil, nil, err
 		}
@@ -264,7 +248,7 @@ func (r *databaseRegionChangeFinalizer) repartitionRegionalByRowTables(
 		if err != nil {
 			return nil, nil, err
 		}
-		partitionAllBy := partitionByForRegionalByRow(regionConfig, colName)
+		partitionAllBy := multiregion.PartitionByForRegionalByRow(regionConfig, colName)
 
 		// oldPartitionings saves the old partitionings for each
 		// index that is repartitioned. This is later used to remove zone
@@ -289,35 +273,6 @@ func (r *databaseRegionChangeFinalizer) repartitionRegionalByRowTables(
 				return nil, nil, err
 			}
 			tabledesc.UpdateIndexPartitioning(index.IndexDesc(), index.Primary(), newImplicitCols, newPartitioning)
-		}
-
-		// Remove zone configurations that applied to partitions that were removed
-		// in the previous step. This requires all indexes to have been
-		// repartitioned such that there is no partitioning on the removed enum
-		// value. This is because `deleteRemovedPartitionZoneConfigs` generates
-		// subzone spans for the entire table (all indexes) downstream for each
-		// index. Spans can only be generated if partitioning values are present on
-		// the type descriptor (removed enum values obviously aren't), so we must
-		// remove the partition from all indexes before trying to delete zone
-		// configurations.
-		for _, index := range tableDesc.NonDropIndexes() {
-			// Remove zone configurations that reference partition values we removed
-			// in the previous step.
-			update, err := prepareRemovedPartitionZoneConfigs(
-				ctx,
-				txn,
-				tableDesc,
-				index.GetID(),
-				oldPartitionings[index.GetID()],
-				index.GetPartitioning(),
-				r.localPlanner.ExecCfg(),
-			)
-			if err != nil {
-				return nil, nil, err
-			}
-			if update != nil {
-				zoneConfigUpdates = append(zoneConfigUpdates, update)
-			}
 		}
 
 		// Update the zone configurations now that the partition's been added.

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -19,19 +14,21 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/google/btree"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLargeEnums(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 
 	// The idea here is that we're going to create a very large number of
 	// enum elements corresponding to non-negative integers and then we're
@@ -42,7 +39,7 @@ func TestLargeEnums(t *testing.T) {
 	const N = 100
 
 	order := rand.Perm(N)
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(conn)
 
 	tdb.Exec(t, "CREATE TYPE e AS ENUM ()")
 	// Construct a single transaction to insert all the values; otherwise we'd
@@ -114,12 +111,13 @@ func (i intItem) Less(o btree.Item) bool {
 // with bind where we would not properly deal with leases involving types.
 func TestEnumPlaceholderWithAsOfSystemTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 
-	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	db := sqlutils.MakeSQLRunner(conn)
 	db.Exec(t, "CREATE TYPE typ AS ENUM ('a', 'b')")
 	db.Exec(t, "CREATE TABLE tab (k INT PRIMARY KEY, v typ)")
 	db.Exec(t, "INSERT INTO tab VALUES ($1, $2)", 1, "a")
@@ -133,10 +131,13 @@ func TestEnumPlaceholderWithAsOfSystemTime(t *testing.T) {
 	require.Equal(t, [][]string{{"1"}}, db.QueryStr(t, q, "a"))
 	db.Exec(t, "ALTER TYPE typ RENAME VALUE 'a' TO 'd'")
 	db.Exec(t, "ALTER TYPE typ RENAME VALUE 'b' TO 'a'")
-	// The AOST does not apply to the transaction that binds 'a' to the
-	// placeholder.
-	require.Equal(t, [][]string{}, db.QueryStr(t, q, "a"))
-	require.Equal(t, [][]string{{"1"}}, db.QueryStr(t, q, "d"))
+	// The AOST should apply to the transaction that binds the placeholder,
+	// since the same implicit transaction is used for binding and executing.
+	require.Equal(t, [][]string{{"1"}}, db.QueryStr(t, q, "a"))
+	require.Equal(t, [][]string{}, db.QueryStr(t, q, "b"))
+	db.ExpectErr(t, "invalid input value for enum typ: \"d\"", q, "d")
+	require.Equal(t, [][]string{}, db.QueryStr(t, "SELECT k FROM tab WHERE v = $1", "a"))
+	require.Equal(t, [][]string{{"1"}}, db.QueryStr(t, "SELECT k FROM tab WHERE v = $1", "d"))
 }
 
 // TestEnumDropValueCheckConstraint tests that check constraints containing
@@ -144,12 +145,13 @@ func TestEnumPlaceholderWithAsOfSystemTime(t *testing.T) {
 // to drop said value.
 func TestEnumDropValueCheckConstraint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 
-	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	db := sqlutils.MakeSQLRunner(conn)
 	db.Exec(t, "CREATE TYPE typ AS ENUM ('a', 'b', 'c')")
 
 	// Check that an enum value cannot be dropped if it is referenced in a table's

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
@@ -22,8 +17,7 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,8 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	logictest "github.com/cockroachdb/cockroach/pkg/sql/logictest/logictestbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -42,13 +37,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/gogo/protobuf/proto"
 	yaml "gopkg.in/yaml.v2"
 )
 
 var (
-	paralleltestdata = flag.String("partestdata", "testdata/parallel_test/[^.]*", "test data glob")
+	paralleltestdata = flag.String("partestdata", filepath.Join("testdata", "parallel_test", "[^.]*"), "test data glob")
 )
 
 type parallelTest struct {
@@ -77,11 +71,11 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 		cluster: t.cluster,
 		nodeIdx: nodeIdx,
 		db:      db,
-		user:    security.RootUser,
+		user:    username.RootUser,
 		verbose: testing.Verbose() || log.V(1),
 		rng:     rng,
 	}
-	if err := l.processTestFile(path, testClusterConfig{}); err != nil {
+	if err := l.processTestFile(path, logictest.TestClusterConfig{}); err != nil {
 		log.Errorf(context.Background(), "error processing %s: %s", path, err)
 		t.Error(err)
 	}
@@ -89,21 +83,8 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 
 func (t *parallelTest) getClient(nodeIdx, clientIdx int) *gosql.DB {
 	for len(t.clients[nodeIdx]) <= clientIdx {
-		// Add a client.
-		pgURL, cleanupFunc := sqlutils.PGUrl(t.T,
-			t.cluster.Server(nodeIdx).ServingSQLAddr(),
-			"TestParallel",
-			url.User(security.RootUser))
-		db, err := gosql.Open("postgres", pgURL.String())
-		if err != nil {
-			t.Fatal(err)
-		}
+		db := t.cluster.ApplicationLayer(nodeIdx).SQLConn(t)
 		sqlutils.MakeSQLRunner(db).Exec(t, "SET DATABASE = test")
-		t.cluster.Stopper().AddCloser(
-			stop.CloserFn(func() {
-				_ = db.Close()
-				cleanupFunc()
-			}))
 		t.clients[nodeIdx] = append(t.clients[nodeIdx], db)
 	}
 	return t.clients[nodeIdx][clientIdx]
@@ -130,7 +111,7 @@ type parTestSpec struct {
 func (t *parallelTest) run(dir string) {
 	// Process the spec file.
 	mainFile := filepath.Join(dir, "test.yaml")
-	yamlData, err := ioutil.ReadFile(mainFile)
+	yamlData, err := os.ReadFile(mainFile)
 	if err != nil {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
@@ -184,21 +165,23 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 		log.Infof(t.ctx, "Cluster Size: %d", spec.ClusterSize)
 	}
 
-	t.cluster = serverutils.StartNewTestCluster(t, spec.ClusterSize, base.TestClusterArgs{})
+	t.cluster = serverutils.StartCluster(t, spec.ClusterSize, base.TestClusterArgs{})
 
 	for i := 0; i < t.cluster.NumServers(); i++ {
 		server := t.cluster.Server(i)
 		mode := sessiondatapb.DistSQLOff
 		st := server.ClusterSettings()
 		st.Manual.Store(true)
-		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, int64(mode))
+		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, mode)
 		// Disable automatic stats - they can interfere with the test shutdown.
 		stats.AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
+		stats.UseStatisticsOnSystemTables.Override(ctx, &st.SV, false)
+		stats.AutomaticStatisticsOnSystemTables.Override(ctx, &st.SV, false)
 	}
 
 	t.clients = make([][]*gosql.DB, spec.ClusterSize)
 	for i := range t.clients {
-		t.clients[i] = append(t.clients[i], t.cluster.ServerConn(i))
+		t.clients[i] = append(t.clients[i], t.cluster.ApplicationLayer(i).SQLConn(t))
 	}
 	r0 := sqlutils.MakeSQLRunner(t.clients[0][0])
 
@@ -216,6 +199,13 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 		objID := keys.RootNamespaceID
 		r0.Exec(t, `UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
 	}
+
+	// Disable the circuit breakers on this cluster because they can lead to
+	// rare test flakes since the machine is likely to be overloaded when
+	// running TestParallel.
+	sqlutils.MakeSQLRunner(t.cluster.Server(0).SystemLayer().SQLConn(t)).Exec(
+		t, `SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '0s'`,
+	)
 
 	if testing.Verbose() || log.V(1) {
 		log.Infof(t.ctx, "Creating database")
@@ -235,11 +225,7 @@ func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	skip.UnderRace(t, "takes >1 min under race")
-	// Note: there is special code in teamcity-trigger/main.go to run this package
-	// with less concurrency in the nightly stress runs. If you see problems
-	// please make adjustments there.
-	// As of 6/4/2019, the logic tests never complete under race.
-	skip.UnderStressRace(t, "logic tests and race detector don't mix: #37993")
+	skip.UnderDeadlock(t, "too slow")
 
 	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)
@@ -253,6 +239,7 @@ func TestParallel(t *testing.T) {
 	failed := 0
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
+			defer log.Scope(t).Close(t)
 			pt := parallelTest{T: t, ctx: context.Background()}
 			pt.run(path)
 			total++

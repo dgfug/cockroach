@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -26,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -49,7 +44,6 @@ type sketchInfo struct {
 type samplerProcessor struct {
 	execinfra.ProcessorBase
 
-	flowCtx         *execinfra.FlowCtx
 	input           execinfra.RowSource
 	memAcc          mon.BoundAccount
 	sr              stats.SampleReservoir
@@ -100,12 +94,12 @@ const cpuUsageMaxThrottle = 0.75
 var bytesRowType = []*types.T{types.Bytes}
 
 func newSamplerProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SamplerSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*samplerProcessor, error) {
 	for _, s := range spec.Sketches {
 		if _, ok := supportedSketchTypes[s.SketchType]; !ok {
@@ -113,13 +107,20 @@ func newSamplerProcessor(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "sampler-mem")
+	//
+	// sampler doesn't spill to disk, so ensure some reasonable lower bound on
+	// the workmem limit.
+	var minMemoryLimit int64 = 8 << 20 // 8MiB
+	if flowCtx.Cfg.TestingKnobs.MemoryLimitBytes != 0 {
+		minMemoryLimit = flowCtx.Cfg.TestingKnobs.MemoryLimitBytes
+	}
+	memMonitor := execinfra.NewLimitedMonitorWithLowerBound(
+		ctx, flowCtx, "sampler-mem", minMemoryLimit,
+	)
 	s := &samplerProcessor{
-		flowCtx:         flowCtx,
 		input:           input,
 		memAcc:          memMonitor.MakeBoundAccount(),
 		sketches:        make([]sketchInfo, len(spec.Sketches)),
@@ -129,7 +130,7 @@ func newSamplerProcessor(
 	}
 
 	inTypes := input.OutputTypes()
-	var sampleCols util.FastIntSet
+	var sampleCols intsets.Fast
 	for i := range spec.Sketches {
 		s.sketches[i] = sketchInfo{
 			spec:     spec.Sketches[i],
@@ -145,7 +146,7 @@ func newSamplerProcessor(
 		var sr stats.SampleReservoir
 		// The datums are converted to their inverted index bytes and
 		// sent as single DBytes column.
-		var srCols util.FastIntSet
+		var srCols intsets.Fast
 		srCols.Add(0)
 		sr.Init(int(spec.SampleSize), int(spec.MinSampleSize), bytesRowType, &s.memAcc, srCols)
 		col := spec.InvertedSketches[i].Columns[0]
@@ -204,7 +205,7 @@ func newSamplerProcessor(
 	s.outTypes = outTypes
 
 	if err := s.Init(
-		nil, post, outTypes, flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, outTypes, flowCtx, processorID, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
@@ -217,42 +218,40 @@ func newSamplerProcessor(
 	return s, nil
 }
 
-func (s *samplerProcessor) pushTrailingMeta(ctx context.Context) {
-	execinfra.SendTraceData(ctx, s.Output)
-}
-
 // Run is part of the Processor interface.
-func (s *samplerProcessor) Run(ctx context.Context) {
+func (s *samplerProcessor) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx = s.StartInternal(ctx, samplerProcName)
 	s.input.Start(ctx)
 
-	earlyExit, err := s.mainLoop(ctx)
+	earlyExit, err := s.mainLoop(ctx, output)
 	if err != nil {
-		execinfra.DrainAndClose(ctx, s.Output, err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, s.FlowCtx, s.input, output, err)
 	} else if !earlyExit {
-		s.pushTrailingMeta(ctx)
+		execinfra.SendTraceData(ctx, s.FlowCtx, output)
 		s.input.ConsumerClosed()
-		s.Output.ProducerDone()
+		output.ProducerDone()
 	}
 	s.MoveToDraining(nil /* err */)
 }
 
-func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err error) {
+func (s *samplerProcessor) mainLoop(
+	ctx context.Context, output execinfra.RowReceiver,
+) (earlyExit bool, err error) {
 	rng, _ := randutil.NewPseudoRand()
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	var buf []byte
 	rowCount := 0
 	lastWakeupTime := timeutil.Now()
 
 	var invKeys [][]byte
 	invRow := rowenc.EncDatumRow{rowenc.EncDatum{}}
-	timer := timeutil.NewTimer()
+	var timer timeutil.Timer
 	defer timer.Stop()
 
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, nil /* row */, meta) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}
@@ -269,7 +268,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 			meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 				RowsProcessed: uint64(SamplerProgressInterval),
 			}}
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, nil /* row */, meta) {
 				return true, nil
 			}
 
@@ -278,7 +277,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				//  - if it is lower than cpuUsageMinThrottle, we do not throttle;
 				//  - if it is higher than cpuUsageMaxThrottle, we throttle all the way;
 				//  - in-between, we scale the idle time proportionally.
-				usage := s.flowCtx.Cfg.RuntimeStats.GetCPUCombinedPercentNorm()
+				usage := s.FlowCtx.Cfg.RuntimeStats.GetCPUCombinedPercentNorm()
 
 				if usage > cpuUsageMinThrottle {
 					fractionIdle := s.maxFractionIdle
@@ -308,7 +307,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 					case <-timer.C:
 						timer.Read = true
 						break
-					case <-s.flowCtx.Stopper().ShouldQuiesce():
+					case <-s.FlowCtx.Stopper().ShouldQuiesce():
 						break
 					}
 				}
@@ -321,7 +320,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				return false, err
 			}
 		}
-		if earlyExit, err = s.sampleRow(ctx, &s.sr, row, rng); earlyExit || err != nil {
+		if earlyExit, err = s.sampleRow(ctx, output, &s.sr, row, rng); earlyExit || err != nil {
 			return earlyExit, err
 		}
 
@@ -338,7 +337,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 			}
 			switch s.outTypes[col].Family() {
 			case types.GeographyFamily, types.GeometryFamily:
-				invKeys, err = rowenc.EncodeGeoInvertedIndexTableKeys(row[col].Datum, nil /* inKey */, index.GeoConfig)
+				invKeys, err = rowenc.EncodeGeoInvertedIndexTableKeys(ctx, row[col].Datum, nil /* inKey */, index.GeoConfig)
 			default:
 				invKeys, err = rowenc.EncodeInvertedIndexTableKeys(row[col].Datum, nil /* inKey */, index.Version)
 			}
@@ -350,7 +349,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				if err := s.invSketch[col].addRow(ctx, invRow, bytesRowType, &buf, &da); err != nil {
 					return false, err
 				}
-				if earlyExit, err = s.sampleRow(ctx, invSr, invRow, rng); earlyExit || err != nil {
+				if earlyExit, err = s.sampleRow(ctx, output, invSr, invRow, rng); earlyExit || err != nil {
 					return earlyExit, err
 				}
 			}
@@ -360,20 +359,20 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	outRow := make(rowenc.EncDatumRow, len(s.outTypes))
 	// Emit the sampled rows.
 	for i := range outRow {
-		outRow[i] = rowenc.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = rowenc.NullEncDatum()
 	}
 	// Reuse the numRows column for the capacity of the sample reservoir.
 	outRow[s.numRowsCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(s.sr.Cap()))}
 	for _, sample := range s.sr.Get() {
 		copy(outRow, sample.Row)
 		outRow[s.rankCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(sample.Rank))}
-		if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+		if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, outRow, nil /* meta */) {
 			return true, nil
 		}
 	}
 	// Emit the inverted sample rows.
 	for i := range outRow {
-		outRow[i] = rowenc.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = rowenc.NullEncDatum()
 	}
 	for col, invSr := range s.invSr {
 		// Reuse the numRows column for the capacity of the sample reservoir.
@@ -383,7 +382,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 			// Reuse the rank column for inverted index keys.
 			outRow[s.rankCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(sample.Rank))}
 			outRow[s.invIdxKeyCol] = sample.Row[0]
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, outRow, nil /* meta */) {
 				return true, nil
 			}
 		}
@@ -394,22 +393,22 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 
 	// Emit the sketch rows.
 	for i := range outRow {
-		outRow[i] = rowenc.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = rowenc.NullEncDatum()
 	}
 	for i, si := range s.sketches {
 		outRow[s.sketchIdxCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(i))}
-		if earlyExit, err := s.emitSketchRow(ctx, &si, outRow); earlyExit || err != nil {
+		if earlyExit, err := s.emitSketchRow(ctx, output, &si, outRow); earlyExit || err != nil {
 			return earlyExit, err
 		}
 	}
 
 	// Emit the inverted sketch rows.
 	for i := range outRow {
-		outRow[i] = rowenc.DatumToEncDatum(s.outTypes[i], tree.DNull)
+		outRow[i] = rowenc.NullEncDatum()
 	}
 	for col, invSketch := range s.invSketch {
 		outRow[s.invColIdxCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(col))}
-		if earlyExit, err := s.emitSketchRow(ctx, invSketch, outRow); earlyExit || err != nil {
+		if earlyExit, err := s.emitSketchRow(ctx, output, invSketch, outRow); earlyExit || err != nil {
 			return earlyExit, err
 		}
 	}
@@ -418,7 +417,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 		RowsProcessed: uint64(rowCount % SamplerProgressInterval),
 	}}
-	if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+	if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, nil /* row */, meta) {
 		return true, nil
 	}
 
@@ -426,7 +425,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 }
 
 func (s *samplerProcessor) emitSketchRow(
-	ctx context.Context, si *sketchInfo, outRow rowenc.EncDatumRow,
+	ctx context.Context, output execinfra.RowReceiver, si *sketchInfo, outRow rowenc.EncDatumRow,
 ) (earlyExit bool, err error) {
 	outRow[s.numRowsCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(si.numRows))}
 	outRow[s.numNullsCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(si.numNulls))}
@@ -436,7 +435,7 @@ func (s *samplerProcessor) emitSketchRow(
 		return false, err
 	}
 	outRow[s.sketchCol] = rowenc.EncDatum{Datum: tree.NewDBytes(tree.DBytes(data))}
-	if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+	if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, outRow, nil /* meta */) {
 		return true, nil
 	}
 	return false, nil
@@ -444,12 +443,16 @@ func (s *samplerProcessor) emitSketchRow(
 
 // sampleRow looks at a row and either drops it or adds it to the reservoir.
 func (s *samplerProcessor) sampleRow(
-	ctx context.Context, sr *stats.SampleReservoir, row rowenc.EncDatumRow, rng *rand.Rand,
+	ctx context.Context,
+	output execinfra.RowReceiver,
+	sr *stats.SampleReservoir,
+	row rowenc.EncDatumRow,
+	rng *rand.Rand,
 ) (earlyExit bool, err error) {
 	// Use Int63 so we don't have headaches converting to DInt.
 	rank := uint64(rng.Int63())
 	prevCapacity := sr.Cap()
-	if err := sr.SampleRow(ctx, s.EvalCtx, row, rank); err != nil {
+	if err := sr.SampleRow(ctx, s.FlowCtx.EvalCtx, row, rank); err != nil {
 		if !sqlerrors.IsOutOfMemoryError(err) {
 			return false, err
 		}
@@ -464,7 +467,7 @@ func (s *samplerProcessor) sampleRow(
 		meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 			HistogramDisabled: true,
 		}}
-		if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+		if !emitHelper(ctx, s.FlowCtx, s.input, output, &s.OutputHelper, nil /* row */, meta) {
 			return true, nil
 		}
 	} else if sr.Cap() != prevCapacity {
@@ -476,10 +479,16 @@ func (s *samplerProcessor) sampleRow(
 	return false, nil
 }
 
+// Close is part of the execinfra.Processor interface.
+func (s *samplerProcessor) Close(context.Context) {
+	s.input.ConsumerClosed()
+	s.close()
+}
+
 func (s *samplerProcessor) close() {
 	if s.InternalClose() {
-		s.memAcc.Close(s.Ctx)
-		s.MemMonitor.Stop(s.Ctx)
+		s.memAcc.Close(s.Ctx())
+		s.MemMonitor.Stop(s.Ctx())
 	}
 }
 
@@ -493,7 +502,7 @@ func (s *samplerProcessor) DoesNotUseTxn() bool {
 
 // addRow adds a row to the sketch and updates row counts.
 func (s *sketchInfo) addRow(
-	ctx context.Context, row rowenc.EncDatumRow, typs []*types.T, buf *[]byte, da *rowenc.DatumAlloc,
+	ctx context.Context, row rowenc.EncDatumRow, typs []*types.T, buf *[]byte, da *tree.DatumAlloc,
 ) error {
 	var err error
 	s.numRows++
@@ -502,6 +511,9 @@ func (s *sketchInfo) addRow(
 	var useFastPath bool
 	if len(s.spec.Columns) == 1 {
 		col = s.spec.Columns[0]
+		if row[col].IsUnset() {
+			return errors.AssertionFailedf("unset datum: col=%d row=%s", col, row.String(typs))
+		}
 		isNull := row[col].IsNull()
 		useFastPath = typs[col].Family() == types.IntFamily && !isNull
 	}
@@ -545,7 +557,12 @@ func (s *sketchInfo) addRow(
 		if err != nil {
 			return err
 		}
-		isNull = isNull && row[col].IsNull()
+		if isNull {
+			if row[col].IsUnset() {
+				return errors.AssertionFailedf("unset datum: col=%d row=%s", col, row.String(typs))
+			}
+			isNull = row[col].IsNull()
+		}
 		s.size += int64(row[col].DiskSize())
 	}
 	if isNull {

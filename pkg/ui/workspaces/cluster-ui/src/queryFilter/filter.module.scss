@@ -1,18 +1,24 @@
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 @import "../core/index.module";
 
 $dropdown-hover-color: darken($colors--background, 2.5%);
 
 .dropdown-btn {
   font-family: $font-family--semi-bold;
+  font-size: $font-size--medium;
   padding: 8px 0 8px 17px;
   vertical-align: middle;
-  border: 1px solid $colors--neutral-5;
+  border: 1px solid $colors--neutral-4;
   border-radius: 3px;
   white-space: nowrap;
   color: $colors--neutral-7;
   cursor: pointer;
   position: relative;
-  background: $colors--neutral-1;
+  background: white;
   display: flex;
   align-items: center;
   height: 40px;
@@ -33,13 +39,15 @@ $dropdown-hover-color: darken($colors--background, 2.5%);
   height: max-content;
   background-color: $colors--neutral-0;
   margin-top: 6px;
-  border: 0.5px solid #E5E5E5;
+  border: 0.5px solid #e5e5e5;
   box-shadow: 0px 0px 4px rgba(154, 161, 171, 0.33);
   border-radius: 4px;
   z-index: 2;
 
   .dropdown-content-wrapper {
     padding: 18px 20px 22px 16px;
+    overflow-y: scroll;
+    max-height: 580px;
 
     .filter-label {
       height: 16px;
@@ -50,6 +58,7 @@ $dropdown-hover-color: darken($colors--background, 2.5%);
       letter-spacing: 0.3px;
       font-style: normal;
       margin-bottom: 8px;
+      color: $colors--neutral-7;
 
       &__transaction-type {
         margin-top: 25px;
@@ -64,7 +73,7 @@ $dropdown-hover-color: darken($colors--background, 2.5%);
       display: flex;
       justify-content: space-evenly;
       gap: 11px;
-      
+
       .time-number {
         width: 96px;
         height: 40px;
@@ -104,8 +113,8 @@ $dropdown-hover-color: darken($colors--background, 2.5%);
 
     .apply-btn {
       &__wrapper {
-      text-align: end;
-      margin-top: 30px;
+        text-align: end;
+        margin-top: 30px;
       }
 
       &__btn {
@@ -123,4 +132,33 @@ $dropdown-hover-color: darken($colors--background, 2.5%);
 
 .hide {
   display: none;
+}
+
+.badges-area {
+  display: flex;
+  margin-bottom: 5px;
+}
+
+.badge-wrapper {
+  background-color: $colors--neutral-2;
+  border-radius: 3px;
+  color: $colors--neutral-7;
+  display: flex;
+  font-family: $font-family--semi-bold;
+  font-size: $font-size--small;
+  line-height: $line-height--small;
+  margin: 5px 5px 5px 0;
+  padding: 3px 7px;
+  width: fit-content;
+}
+
+.close-area {
+  margin-top: 4px;
+  margin-left: 5px;
+  width: 12px;
+  cursor: pointer;
+}
+
+.clear-btn {
+  margin-top: 3px;
 }

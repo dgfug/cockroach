@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euo pipefail
 
 dir="$(dirname $(dirname $(dirname $(dirname $(dirname "${0}")))))"
 source "$dir/teamcity/util.sh"
+
+if [[ "$(uname -m)" =~ (arm64|aarch64)$ ]]; then
+  export CROSSLINUX_CONFIG="crosslinuxarm"
+else
+  export CROSSLINUX_CONFIG="crosslinux"
+fi
 
 # Enumerate test targets that have benchmarks.
 all_tests=$(bazel query 'kind(go_test, //pkg/...)' --output=label)
@@ -20,8 +32,8 @@ for target in $targets
 do
     tc_start_block "Bench $target"
     # We need the `test_sharding_strategy` flag or else the benchmarks will
-    # fail to run sharded tests like //pkg/ccl/importccl:importccl_test.
-    bazel run --config=test --config=crosslinux --config=ci --test_sharding_strategy=disabled $target -- \
-          -test.bench=. -test.benchtime=1ns -test.short -test.run=-
+    # fail to run sharded tests like //pkg/sql/importer:importer_test.
+    bazel run --config=test --config=$CROSSLINUX_CONFIG --config=ci --test_sharding_strategy=disabled $target -- \
+          -test.bench=. -test.benchtime=1x -test.short -test.run=-
     tc_end_block "Bench $target"
 done

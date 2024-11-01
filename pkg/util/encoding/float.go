@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package encoding
 
@@ -93,5 +88,11 @@ func DecodeFloatAscending(buf []byte) ([]byte, float64, error) {
 // DecodeFloatDescending decodes floats encoded with EncodeFloatDescending.
 func DecodeFloatDescending(buf []byte) ([]byte, float64, error) {
 	b, r, err := DecodeFloatAscending(buf)
-	return b, -r, err
+	if r != 0 && !math.IsNaN(r) {
+		// All values except for 0 and NaN were negated in EncodeFloatDescending, so
+		// we have to negate them back. Negative zero uses composite indexes to
+		// decode itself correctly.
+		r = -r
+	}
+	return b, r, err
 }

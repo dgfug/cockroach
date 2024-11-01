@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -14,11 +9,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // RemoveGroupingCols returns a new grouping private struct with the given
@@ -36,12 +31,11 @@ func (c *CustomFuncs) RemoveGroupingCols(
 // aggregates are written into outElems and outColList. As an example, for
 // columns (1,2) and operator ConstAggOp, makeAggCols will set the following:
 //
-//   outElems[0] = (ConstAggOp (Variable 1))
-//   outElems[1] = (ConstAggOp (Variable 2))
+//	outElems[0] = (ConstAggOp (Variable 1))
+//	outElems[1] = (ConstAggOp (Variable 2))
 //
-//   outColList[0] = 1
-//   outColList[1] = 2
-//
+//	outColList[0] = 1
+//	outColList[1] = 2
 func (c *CustomFuncs) makeAggCols(
 	aggOp opt.Operator, cols opt.ColSet, outAggs memo.AggregationsExpr,
 ) {
@@ -62,7 +56,7 @@ func (c *CustomFuncs) makeAggCols(
 			outAgg = c.f.ConstructFirstAgg(varExpr)
 
 		default:
-			panic(errors.AssertionFailedf("unrecognized aggregate operator type: %v", log.Safe(aggOp)))
+			panic(errors.AssertionFailedf("unrecognized aggregate operator type: %v", redact.Safe(aggOp)))
 		}
 
 		outAggs[i] = c.f.ConstructAggregationsItem(outAgg, id)
@@ -219,7 +213,7 @@ func (c *CustomFuncs) AreValuesDistinct(
 func (c *CustomFuncs) areRowsDistinct(
 	rows memo.ScalarListExpr, cols opt.ColList, groupingCols opt.ColSet, nullsAreDistinct bool,
 ) bool {
-	var seen map[string]bool
+	var seen map[string]struct{}
 	var encoded []byte
 	for _, scalar := range rows {
 		row := scalar.(*memo.TupleExpr)
@@ -255,7 +249,7 @@ func (c *CustomFuncs) areRowsDistinct(
 			// Encode the datum using the key encoding format. The encodings for
 			// multiple column datums are simply appended to one another.
 			var err error
-			encoded, err = rowenc.EncodeTableKey(encoded, datum, encoding.Ascending)
+			encoded, err = keyside.Encode(encoded, datum, encoding.Ascending)
 			if err != nil {
 				// Assume rows are not distinct if an encoding error occurs.
 				return false
@@ -263,7 +257,7 @@ func (c *CustomFuncs) areRowsDistinct(
 		}
 
 		if seen == nil {
-			seen = make(map[string]bool, len(rows))
+			seen = make(map[string]struct{}, len(rows))
 		}
 
 		// Determine whether key has already been seen.
@@ -274,7 +268,7 @@ func (c *CustomFuncs) areRowsDistinct(
 		}
 
 		// Add the key to the seen map.
-		seen[key] = true
+		seen[key] = struct{}{}
 	}
 
 	return true
@@ -298,9 +292,9 @@ func (c *CustomFuncs) SingleRegressionCountArgument(
 
 // CanMergeAggs returns true if one of the following applies to each of the
 // given outer aggregation expressions:
-//   1. The aggregation can be merged with a single inner aggregation.
-//   2. The aggregation takes an inner grouping column as input and ignores
-//      duplicates.
+//  1. The aggregation can be merged with a single inner aggregation.
+//  2. The aggregation takes an inner grouping column as input and ignores
+//     duplicates.
 func (c *CustomFuncs) CanMergeAggs(
 	innerAggs, outerAggs memo.AggregationsExpr, innerGroupingCols opt.ColSet,
 ) bool {
@@ -444,4 +438,40 @@ func canEliminateGroupByJoin(
 	}
 	// All aggregates ignore duplicates.
 	return true
+}
+
+// AreAllAnyNotNullAggs returns true if all the given aggregate functions have
+// "any not null" semantics, meaning they select the first encountered non-null
+// input value. This is true of ConstAgg, ConstNotNullAgg, and AnyNotNullAgg.
+// See also opt.AggregateOpReverseMap.
+func (c *CustomFuncs) AreAllAnyNotNullAggs(aggs memo.AggregationsExpr) bool {
+	for i := range aggs {
+		switch aggs[i].Agg.Op() {
+		case opt.ConstAggOp, opt.ConstNotNullAggOp, opt.AnyNotNullAggOp:
+			if _, ok := aggs[i].Agg.Child(0).(*memo.VariableExpr); !ok {
+				// ConstAgg-like aggregates always have a variable as input.
+				panic(errors.AssertionFailedf("expected variable as input to aggregate"))
+			}
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// ConvertAnyNotNullAggsToProjections builds a projection for each ConstAgg,
+// ConstNotNullAgg, or AnyNotNullAgg which returns a different output column ID
+// than its input column ID.
+func (c *CustomFuncs) ConvertAnyNotNullAggsToProjections(
+	aggs memo.AggregationsExpr,
+) memo.ProjectionsExpr {
+	projections := make(memo.ProjectionsExpr, 0, len(aggs))
+	for i := range aggs {
+		// ConstAgg-like aggregates always have a variable as input.
+		inputVar := aggs[i].Agg.Child(0).(*memo.VariableExpr)
+		if inputVar.Col != aggs[i].Col {
+			projections = append(projections, c.f.ConstructProjectionsItem(inputVar, aggs[i].Col))
+		}
+	}
+	return projections
 }

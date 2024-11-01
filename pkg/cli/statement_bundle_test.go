@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -14,7 +9,6 @@ import (
 	"context"
 	"net/url"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -22,7 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -32,16 +27,21 @@ import (
 func TestRunExplainCombinations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tests := []struct {
-		bundlePath          string
-		placeholderToColMap map[int]string
-		expectedInputs      [][]string
-		expectedOutputs     []string
+		bundlePath            string
+		placeholderToColMap   map[int]string
+		placeholderFQColNames map[string]struct{}
+		expectedInputs        [][]string
+		expectedOutputs       []string
 	}{
 		{
 			bundlePath: "bundle",
 			placeholderToColMap: map[int]string{
 				1: "public.a.a",
 				2: "public.a.b",
+			},
+			placeholderFQColNames: map[string]struct{}{
+				"public.a.a": {},
+				"public.a.b": {},
 			},
 			expectedInputs: [][]string{{"999", "8"}},
 			expectedOutputs: []string{`select
@@ -61,25 +61,31 @@ func TestRunExplainCombinations(t *testing.T) {
 		ExecCtx: &clisqlexec.Context{CliCtx: cliCtx},
 	}
 	c.LoadDefaults(os.Stdout, os.Stderr)
-	pgURL, cleanupFn := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, tc.Server(0).AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanupFn()
+
+	ctx := context.Background()
+
 	conn := c.ConnCtx.MakeSQLConn(os.Stdout, os.Stdout, pgURL.String())
 	for _, test := range tests {
-		bundle, err := loadStatementBundle(filepath.Join("testdata/explain-bundle", test.bundlePath))
+		bundle, err := loadStatementBundle(datapathutils.TestDataPath(t, "explain-bundle", test.bundlePath))
 		assert.NoError(t, err)
 		// Disable autostats collection, which will override the injected stats.
-		if err := conn.Exec(`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`, nil); err != nil {
+		if err := conn.Exec(ctx, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`); err != nil {
 			t.Fatal(err)
 		}
 		var initStmts = [][]byte{bundle.env, bundle.schema}
 		initStmts = append(initStmts, bundle.stats...)
 		for _, a := range initStmts {
-			if err := conn.Exec(string(a), nil); err != nil {
+			if err := conn.Exec(ctx, string(a)); err != nil {
 				t.Fatal(err)
 			}
 		}
 
-		inputs, outputs, err := getExplainCombinations(conn, "EXPLAIN(OPT)", test.placeholderToColMap, bundle)
+		inputs, outputs, err := getExplainCombinations(
+			ctx, conn, "EXPLAIN(OPT)", test.placeholderToColMap,
+			test.placeholderFQColNames, bundle,
+		)
 		assert.NoError(t, err)
 		assert.Equal(t, test.expectedInputs, inputs)
 		assert.Equal(t, test.expectedOutputs, outputs)

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
@@ -23,8 +18,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/errors"
@@ -43,44 +40,71 @@ type lazyCertificateManager struct {
 }
 
 func wrapError(err error) error {
-	if !errors.HasType(err, (*security.Error)(nil)) {
-		return &security.Error{
-			Message: "problem using security settings",
-			Err:     err,
-		}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, security.ErrCertManagement) {
+		err = errors.Wrap(err, "problem using security settings")
 	}
 	return err
+}
+
+// SecurityContextOptions contains the subset of base.Config
+// useful to define a SecurityContext.
+type SecurityContextOptions struct {
+	SSLCertsDir string
+	Insecure    bool
+
+	// DisableTLSForHTTP is only used by GetUIServerTLSConfig().
+	//
+	// TODO(kv): it's a bit strange that the 'rpc' package
+	// is responsible for the HTTP TLS config. Maybe move it
+	// elsewhere?
+	DisableTLSForHTTP bool
+	// AdvertiseAddrH is only used by CheckCertificateAddrs().
+	*base.AdvertiseAddrH
+	// SQLAdvertiseAddrH is only used by CheckCertificateAddrs().
+	//
+	// TODO(kv): it's a bit strange that the 'rpc' package is
+	// responsible for the SQL TLS config. Maybe move it elsewhere?
+	*base.SQLAdvertiseAddrH
 }
 
 // SecurityContext is a wrapper providing transport security helpers such as
 // the certificate manager.
 type SecurityContext struct {
-	security.CertsLocator
+	certnames.Locator
 	security.TLSSettings
-	config *base.Config
-	tenID  roachpb.TenantID
-	lazy   struct {
+	config                 SecurityContextOptions
+	tenID                  roachpb.TenantID
+	capabilitiesAuthorizer tenantcapabilities.Authorizer
+	lazy                   struct {
 		// The certificate manager. Must be accessed through GetCertificateManager.
 		certificateManager lazyCertificateManager
 		// httpClient uses the client TLS config. It is initialized lazily.
 		httpClient lazyHTTPClient
 	}
+	useNodeAuth bool
 }
 
-// MakeSecurityContext makes a SecurityContext.
+// NewSecurityContext instantiates a SecurityContext.
 //
 // TODO(tbg): don't take a whole Config. This can be trimmed down significantly.
-func MakeSecurityContext(
-	cfg *base.Config, tlsSettings security.TLSSettings, tenID roachpb.TenantID,
-) SecurityContext {
+func NewSecurityContext(
+	cfg SecurityContextOptions,
+	tlsSettings security.TLSSettings,
+	tenID roachpb.TenantID,
+	capabilitiesAuthorizer tenantcapabilities.Authorizer,
+) *SecurityContext {
 	if tenID.ToUint64() == 0 {
 		panic(errors.AssertionFailedf("programming error: tenant ID not defined"))
 	}
-	return SecurityContext{
-		CertsLocator: security.MakeCertsLocator(cfg.SSLCertsDir),
-		TLSSettings:  tlsSettings,
-		config:       cfg,
-		tenID:        tenID,
+	return &SecurityContext{
+		Locator:                certnames.MakeLocator(cfg.SSLCertsDir),
+		TLSSettings:            tlsSettings,
+		config:                 cfg,
+		tenID:                  tenID,
+		capabilitiesAuthorizer: capabilitiesAuthorizer,
 	}
 }
 
@@ -90,7 +114,7 @@ func MakeSecurityContext(
 func (ctx *SecurityContext) GetCertificateManager() (*security.CertificateManager, error) {
 	ctx.lazy.certificateManager.Do(func() {
 		var opts []security.Option
-		if ctx.tenID != roachpb.SystemTenantID {
+		if !(ctx.useNodeAuth || ctx.tenID == roachpb.SystemTenantID) {
 			opts = append(opts, security.ForTenant(ctx.tenID.ToUint64()))
 		}
 		ctx.lazy.certificateManager.cm, ctx.lazy.certificateManager.err =
@@ -104,12 +128,16 @@ func (ctx *SecurityContext) GetCertificateManager() (*security.CertificateManage
 				// If we know there should be certificates (we're in secure mode)
 				// but there aren't any, this likely indicates that the certs dir
 				// was misconfigured.
-				ctx.lazy.certificateManager.err = errors.New("no certificates found; does certs dir exist?")
+				ctx.lazy.certificateManager.err = errNoCertificatesFound
 			}
 		}
 	})
 	return ctx.lazy.certificateManager.cm, ctx.lazy.certificateManager.err
 }
+
+var errNoCertificatesFound = errors.Mark(
+	errors.New("no certificates found; does certs dir exist?"),
+	security.ErrCertManagement)
 
 // GetServerTLSConfig returns the server TLS config, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
@@ -126,52 +154,6 @@ func (ctx *SecurityContext) GetServerTLSConfig() (*tls.Config, error) {
 	}
 
 	tlsCfg, err := cm.GetServerTLSConfig()
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return tlsCfg, nil
-}
-
-// GetClientTLSConfig returns the client TLS config, initializing it if needed.
-// If Insecure is true, return a nil config, otherwise ask the certificate
-// manager for a TLS config using certs for the config.User.
-// This TLSConfig might **NOT** be suitable to talk to the Admin UI, use GetUIClientTLSConfig instead.
-func (ctx *SecurityContext) GetClientTLSConfig() (*tls.Config, error) {
-	// Early out.
-	if ctx.config.Insecure {
-		return nil, nil
-	}
-
-	cm, err := ctx.GetCertificateManager()
-	if err != nil {
-		return nil, wrapError(err)
-	}
-
-	tlsCfg, err := cm.GetClientTLSConfig(ctx.config.User)
-	if err != nil {
-		return nil, wrapError(err)
-	}
-	return tlsCfg, nil
-}
-
-// GetTenantTLSConfig returns the client TLS config for the tenant, provided
-// the SecurityContext operates on behalf of a secondary tenant (i.e. not the
-// system tenant).
-//
-// If Insecure is true, return a nil config, otherwise retrieves the client
-// certificate for the configured tenant from the cert manager.
-func (ctx *SecurityContext) GetTenantTLSConfig() (*tls.Config, error) {
-	// Early out.
-	if ctx.config.Insecure {
-		return nil, nil
-	}
-
-	cm, err := ctx.GetCertificateManager()
-	if err != nil {
-		return nil, wrapError(err)
-	}
-
-	tlsCfg, err := cm.GetTenantTLSConfig()
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -318,7 +300,10 @@ func (ctx *SecurityContext) CheckCertificateAddrs(cctx context.Context) {
 // HTTPRequestScheme returns "http" or "https" based on the value of
 // Insecure and DisableTLSForHTTP.
 func (ctx *SecurityContext) HTTPRequestScheme() string {
-	return ctx.config.HTTPRequestScheme()
+	if ctx.config.Insecure || ctx.config.DisableTLSForHTTP {
+		return "http"
+	}
+	return "https"
 }
 
 // certAddrs formats the list of addresses included in a certificate for

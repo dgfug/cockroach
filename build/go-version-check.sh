@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 
+# Copyright 2018 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 # Detect whether the installed version of Go can build this version of
 # CockroachDB.
 #
 # To bump the required version of Go, edit the appropriate variables:
 
 required_version_major=1
-minimum_version_minor=16
-minimum_version_16_patch=5
+minimum_version_minor=20
 
 go=${1-go}
 

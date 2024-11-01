@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -30,6 +26,8 @@ import (
 
 func TestValuesProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	rng, _ := randutil.NewTestRand()
 	for _, numRows := range []int{0, 1, 10, 13, 15} {
 		for _, numCols := range []int{0, 1, 3} {
@@ -43,18 +41,19 @@ func TestValuesProcessor(t *testing.T) {
 
 				out := &distsqlutils.RowBuffer{}
 				st := cluster.MakeTestingClusterSettings()
-				evalCtx := tree.NewTestingEvalContext(st)
+				evalCtx := eval.NewTestingEvalContext(st)
 				defer evalCtx.Stop(context.Background())
 				flowCtx := execinfra.FlowCtx{
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 					EvalCtx: evalCtx,
+					Mon:     evalCtx.TestingMon,
 				}
 
-				v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{}, out)
+				v, err := newValuesProcessor(context.Background(), &flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				v.Run(context.Background())
+				v.Run(context.Background(), out)
 				if !out.ProducerClosed() {
 					t.Fatalf("output RowReceiver not closed")
 				}
@@ -72,13 +71,13 @@ func TestValuesProcessor(t *testing.T) {
 					t.Fatalf("incorrect number of rows %d, expected %d", len(res), numRows)
 				}
 
-				var a rowenc.DatumAlloc
+				var a tree.DatumAlloc
 				for i := 0; i < numRows; i++ {
 					if len(res[i]) != numCols {
 						t.Fatalf("row %d incorrect length %d, expected %d", i, len(res[i]), numCols)
 					}
 					for j, val := range res[i] {
-						cmp, err := val.Compare(colTypes[j], &a, evalCtx, &inRows[i][j])
+						cmp, err := val.Compare(context.Background(), colTypes[j], &a, evalCtx, &inRows[i][j])
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -100,12 +99,13 @@ func BenchmarkValuesProcessor(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	post := execinfrapb.PostProcessSpec{}
 	output := rowDisposer{}
@@ -122,11 +122,11 @@ func BenchmarkValuesProcessor(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &post, &output)
+					v, err := newValuesProcessor(ctx, &flowCtx, 0 /* processorID */, &spec, &post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					v.Run(ctx)
+					v.Run(ctx, &output)
 				}
 			})
 		}

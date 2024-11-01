@@ -1,25 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React from "react";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 
 import { GraphDashboardProps } from "./dashboardUtils";
 
-export default function(props: GraphDashboardProps) {
-  const { storeSources } = props;
+export default function (props: GraphDashboardProps) {
+  const { storeSources, tenantSource } = props;
 
   return [
-    <LineGraph title="Slow Raft Proposals" sources={storeSources}>
+    <LineGraph
+      title="Slow Raft Proposals"
+      sources={storeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
       <Axis label="proposals">
         <Metric
           name="cr.store.requests.slow.raft"
@@ -29,7 +29,12 @@ export default function(props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Slow DistSender RPCs" sources={storeSources}>
+    <LineGraph
+      title="Slow DistSender RPCs"
+      sources={storeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
       <Axis label="proposals">
         <Metric
           name="cr.node.requests.slow.distsender"
@@ -39,7 +44,12 @@ export default function(props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Slow Lease Acquisitions" sources={storeSources}>
+    <LineGraph
+      title="Slow Lease Acquisitions"
+      sources={storeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
       <Axis label="lease acquisitions">
         <Metric
           name="cr.store.requests.slow.lease"
@@ -49,7 +59,12 @@ export default function(props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Slow Latch Acquisitions" sources={storeSources}>
+    <LineGraph
+      title="Slow Latch Acquisitions"
+      sources={storeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
       <Axis label="latch acquisitions">
         <Metric
           name="cr.store.requests.slow.latch"

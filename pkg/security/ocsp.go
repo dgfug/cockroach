@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
@@ -15,12 +10,12 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/crypto/ocsp"
 	"golang.org/x/sync/errgroup"
@@ -38,7 +33,7 @@ func makeOCSPVerifier(settings TLSSettings) func([][]byte, [][]*x509.Certificate
 			return nil
 		}
 
-		return contextutil.RunWithTimeout(context.Background(), "OCSP verification", settings.ocspTimeout(),
+		return timeutil.RunWithTimeout(context.Background(), "OCSP verification", settings.ocspTimeout(),
 			func(ctx context.Context) error {
 				// Per-conn telemetry counter.
 				telemetry.Inc(ocspChecksCounter)
@@ -151,7 +146,7 @@ func queryOCSP(ctx context.Context, url string, cert, issuer *x509.Certificate) 
 		return false, errors.Newf("OCSP server returned unexpected content-type %q", errors.Safe(ct))
 	}
 
-	httpBody, err := ioutil.ReadAll(httpResp.Body)
+	httpBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return false, err
 	}

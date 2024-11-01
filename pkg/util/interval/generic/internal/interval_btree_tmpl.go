@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build ignore
 // +build ignore
@@ -19,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 // nilT is a nil instance of the Template type.
@@ -31,20 +25,23 @@ const (
 	minItems = degree - 1
 )
 
-// cmp returns a value indicating the sort order relationship between
+// compare returns a value indicating the sort order relationship between
 // a and b. The comparison is performed lexicographically on
-//  (a.Key(), a.EndKey(), a.ID())
+//
+//	(a.Key(), a.EndKey(), a.ID())
+//
 // and
-//  (b.Key(), b.EndKey(), b.ID())
+//
+//	(b.Key(), b.EndKey(), b.ID())
+//
 // tuples.
 //
-// Given c = cmp(a, b):
+// Given c = compare(a, b):
 //
-//  c == -1  if (a.Key(), a.EndKey(), a.ID()) <  (b.Key(), b.EndKey(), b.ID())
-//  c ==  0  if (a.Key(), a.EndKey(), a.ID()) == (b.Key(), b.EndKey(), b.ID())
-//  c ==  1  if (a.Key(), a.EndKey(), a.ID()) >  (b.Key(), b.EndKey(), b.ID())
-//
-func cmp(a, b T) int {
+//	c == -1  if (a.Key(), a.EndKey(), a.ID()) <  (b.Key(), b.EndKey(), b.ID())
+//	c ==  0  if (a.Key(), a.EndKey(), a.ID()) == (b.Key(), b.EndKey(), b.ID())
+//	c ==  1  if (a.Key(), a.EndKey(), a.ID()) >  (b.Key(), b.EndKey(), b.ID())
+func compare(a, b T) int {
 	c := bytes.Compare(a.Key(), b.Key())
 	if c != 0 {
 		return c
@@ -97,43 +94,45 @@ func upperBound(c T) keyBound {
 	return keyBound{key: c.Key(), inc: true}
 }
 
-type leafNode struct {
+type node struct {
 	ref   int32
 	count int16
-	leaf  bool
-	max   keyBound
+
+	// These fields form a keyBound, but by inlining them into node we can avoid
+	// the extra word that would be needed to pad out maxInc if it were part of
+	// its own struct.
+	maxInc bool
+	maxKey []byte
+
 	items [maxItems]T
+
+	// The children array pointer is only populated for interior nodes; it is nil
+	// for leaf nodes.
+	children *childrenArray
 }
 
-type node struct {
-	leafNode
-	children [maxItems + 1]*node
-}
-
-//go:nocheckptr casts a ptr to a smaller struct to a ptr to a larger struct.
-func leafToNode(ln *leafNode) *node {
-	return (*node)(unsafe.Pointer(ln))
-}
-
-func nodeToLeaf(n *node) *leafNode {
-	return (*leafNode)(unsafe.Pointer(n))
-}
+type childrenArray = [maxItems + 1]*node
 
 var leafPool = sync.Pool{
-	New: func() interface{} {
-		return new(leafNode)
-	},
-}
-
-var nodePool = sync.Pool{
 	New: func() interface{} {
 		return new(node)
 	},
 }
 
+var nodePool = sync.Pool{
+	New: func() interface{} {
+		type interiorNode struct {
+			node
+			children childrenArray
+		}
+		n := new(interiorNode)
+		n.node.children = &n.children
+		return &n.node
+	},
+}
+
 func newLeafNode() *node {
-	n := leafToNode(leafPool.Get().(*leafNode))
-	n.leaf = true
+	n := leafPool.Get().(*node)
 	n.ref = 1
 	return n
 }
@@ -170,6 +169,25 @@ func mut(n **node) *node {
 	return *n
 }
 
+// leaf returns true if this is a leaf node.
+func (n *node) leaf() bool {
+	return n.children == nil
+}
+
+// max returns the maximum keyBound in the subtree rooted at this node.
+func (n *node) max() keyBound {
+	return keyBound{
+		key: n.maxKey,
+		inc: n.maxInc,
+	}
+}
+
+// setMax sets the maximum keyBound for the subtree rooted at this node.
+func (n *node) setMax(k keyBound) {
+	n.maxKey = k.key
+	n.maxInc = k.inc
+}
+
 // incRef acquires a reference to the node.
 func (n *node) incRef() {
 	atomic.AddInt32(&n.ref, 1)
@@ -183,10 +201,9 @@ func (n *node) decRef(recursive bool) {
 		return
 	}
 	// Clear and release node into memory pool.
-	if n.leaf {
-		ln := nodeToLeaf(n)
-		*ln = leafNode{}
-		leafPool.Put(ln)
+	if n.leaf() {
+		*n = node{}
+		leafPool.Put(n)
 	} else {
 		// Release child references first, if requested.
 		if recursive {
@@ -194,7 +211,8 @@ func (n *node) decRef(recursive bool) {
 				n.children[i].decRef(true /* recursive */)
 			}
 		}
-		*n = node{}
+		*n = node{children: n.children}
+		*n.children = childrenArray{}
 		nodePool.Put(n)
 	}
 }
@@ -202,7 +220,7 @@ func (n *node) decRef(recursive bool) {
 // clone creates a clone of the receiver with a single reference count.
 func (n *node) clone() *node {
 	var c *node
-	if n.leaf {
+	if n.leaf() {
 		c = newLeafNode()
 	} else {
 		c = newNode()
@@ -210,11 +228,12 @@ func (n *node) clone() *node {
 	// NB: copy field-by-field without touching n.ref to avoid
 	// triggering the race detector and looking like a data race.
 	c.count = n.count
-	c.max = n.max
+	c.maxKey = n.maxKey
+	c.maxInc = n.maxInc
 	c.items = n.items
-	if !c.leaf {
+	if !c.leaf() {
 		// Copy children and increase each refcount.
-		c.children = n.children
+		*c.children = *n.children
 		for i := int16(0); i <= c.count; i++ {
 			c.children[i].incRef()
 		}
@@ -225,12 +244,12 @@ func (n *node) clone() *node {
 func (n *node) insertAt(index int, item T, nd *node) {
 	if index < int(n.count) {
 		copy(n.items[index+1:n.count+1], n.items[index:n.count])
-		if !n.leaf {
+		if !n.leaf() {
 			copy(n.children[index+2:n.count+2], n.children[index+1:n.count+1])
 		}
 	}
 	n.items[index] = item
-	if !n.leaf {
+	if !n.leaf() {
 		n.children[index+1] = nd
 	}
 	n.count++
@@ -238,14 +257,14 @@ func (n *node) insertAt(index int, item T, nd *node) {
 
 func (n *node) pushBack(item T, nd *node) {
 	n.items[n.count] = item
-	if !n.leaf {
+	if !n.leaf() {
 		n.children[n.count+1] = nd
 	}
 	n.count++
 }
 
 func (n *node) pushFront(item T, nd *node) {
-	if !n.leaf {
+	if !n.leaf() {
 		copy(n.children[1:n.count+2], n.children[:n.count+1])
 		n.children[0] = nd
 	}
@@ -258,7 +277,7 @@ func (n *node) pushFront(item T, nd *node) {
 // back.
 func (n *node) removeAt(index int) (T, *node) {
 	var child *node
-	if !n.leaf {
+	if !n.leaf() {
 		child = n.children[index+1]
 		copy(n.children[index+1:n.count], n.children[index+2:n.count+1])
 		n.children[n.count] = nil
@@ -275,7 +294,7 @@ func (n *node) popBack() (T, *node) {
 	n.count--
 	out := n.items[n.count]
 	n.items[n.count] = nilT
-	if n.leaf {
+	if n.leaf() {
 		return out, nil
 	}
 	child := n.children[n.count+1]
@@ -287,7 +306,7 @@ func (n *node) popBack() (T, *node) {
 func (n *node) popFront() (T, *node) {
 	n.count--
 	var child *node
-	if !n.leaf {
+	if !n.leaf() {
 		child = n.children[0]
 		copy(n.children[:n.count+1], n.children[1:n.count+2])
 		n.children[n.count+1] = nil
@@ -308,7 +327,7 @@ func (n *node) find(item T) (index int, found bool) {
 	for i < j {
 		h := int(uint(i+j) >> 1) // avoid overflow when computing h
 		// i ≤ h < j
-		v := cmp(item, n.items[h])
+		v := compare(item, n.items[h])
 		if v == 0 {
 			return h, true
 		} else if v > 0 {
@@ -326,25 +345,25 @@ func (n *node) find(item T) (index int, found bool) {
 //
 // Before:
 //
-//          +-----------+
-//          |   x y z   |
-//          +--/-/-\-\--+
+//	+-----------+
+//	|   x y z   |
+//	+--/-/-\-\--+
 //
 // After:
 //
-//          +-----------+
-//          |     y     |
-//          +----/-\----+
-//              /   \
-//             v     v
+//	+-----------+
+//	|     y     |
+//	+----/-\----+
+//	    /   \
+//	   v     v
+//
 // +-----------+     +-----------+
 // |         x |     | z         |
 // +-----------+     +-----------+
-//
 func (n *node) split(i int) (T, *node) {
 	out := n.items[i]
 	var next *node
-	if n.leaf {
+	if n.leaf() {
 		next = newLeafNode()
 	} else {
 		next = newNode()
@@ -354,7 +373,7 @@ func (n *node) split(i int) (T, *node) {
 	for j := int16(i); j < n.count; j++ {
 		n.items[j] = nilT
 	}
-	if !n.leaf {
+	if !n.leaf() {
 		copy(next.children[:], n.children[i+1:n.count+1])
 		for j := int16(i + 1); j <= n.count; j++ {
 			n.children[j] = nil
@@ -362,12 +381,14 @@ func (n *node) split(i int) (T, *node) {
 	}
 	n.count = int16(i)
 
-	next.max = next.findUpperBound()
-	if n.max.compare(next.max) != 0 && n.max.compare(upperBound(out)) != 0 {
+	nextMax := next.findUpperBound()
+	next.setMax(nextMax)
+	nMax := n.max()
+	if nMax.compare(nextMax) != 0 && nMax.compare(upperBound(out)) != 0 {
 		// If upper bound wasn't from new node or item
 		// at index i, it must still be from old node.
 	} else {
-		n.max = n.findUpperBound()
+		n.setMax(n.findUpperBound())
 	}
 	return out, next
 }
@@ -382,7 +403,7 @@ func (n *node) insert(item T) (replaced, newBound bool) {
 		n.items[i] = item
 		return true, false
 	}
-	if n.leaf {
+	if n.leaf() {
 		n.insertAt(i, item, nil)
 		return false, n.adjustUpperBoundOnInsertion(item, nil)
 	}
@@ -390,10 +411,10 @@ func (n *node) insert(item T) (replaced, newBound bool) {
 		splitLa, splitNode := mut(&n.children[i]).split(maxItems / 2)
 		n.insertAt(i, splitLa, splitNode)
 
-		switch cmp := cmp(item, n.items[i]); {
-		case cmp < 0:
+		switch v := compare(item, n.items[i]); {
+		case v < 0:
 			// no change, we want first split node
-		case cmp > 0:
+		case v > 0:
 			i++ // we want second split node
 		default:
 			n.items[i] = item
@@ -410,7 +431,7 @@ func (n *node) insert(item T) (replaced, newBound bool) {
 // removeMax removes and returns the maximum item from the subtree rooted at
 // this node.
 func (n *node) removeMax() T {
-	if n.leaf {
+	if n.leaf() {
 		n.count--
 		out := n.items[n.count]
 		n.items[n.count] = nilT
@@ -435,7 +456,7 @@ func (n *node) removeMax() T {
 // the node's upper bound changes.
 func (n *node) remove(item T) (out T, newBound bool) {
 	i, found := n.find(item)
-	if n.leaf {
+	if n.leaf() {
 		if found {
 			out, _ = n.removeAt(i)
 			return out, n.adjustUpperBoundOnRemoval(out, nil)
@@ -576,7 +597,7 @@ func (n *node) rebalanceOrMerge(i int) {
 		mergeLa, mergeChild := n.removeAt(i)
 		child.items[child.count] = mergeLa
 		copy(child.items[child.count+1:], mergeChild.items[:mergeChild.count])
-		if !child.leaf {
+		if !child.leaf() {
 			copy(child.children[child.count+1:], mergeChild.children[:mergeChild.count+1])
 		}
 		child.count += mergeChild.count + 1
@@ -596,9 +617,9 @@ func (n *node) findUpperBound() keyBound {
 			max = up
 		}
 	}
-	if !n.leaf {
+	if !n.leaf() {
 		for i := int16(0); i <= n.count; i++ {
-			up := n.children[i].max
+			up := n.children[i].max()
 			if max.compare(up) < 0 {
 				max = up
 			}
@@ -613,12 +634,12 @@ func (n *node) findUpperBound() keyBound {
 func (n *node) adjustUpperBoundOnInsertion(item T, child *node) bool {
 	up := upperBound(item)
 	if child != nil {
-		if up.compare(child.max) < 0 {
-			up = child.max
+		if childMax := child.max(); up.compare(childMax) < 0 {
+			up = childMax
 		}
 	}
-	if n.max.compare(up) < 0 {
-		n.max = up
+	if n.max().compare(up) < 0 {
+		n.setMax(up)
 		return true
 	}
 	return false
@@ -630,14 +651,15 @@ func (n *node) adjustUpperBoundOnInsertion(item T, child *node) bool {
 func (n *node) adjustUpperBoundOnRemoval(item T, child *node) bool {
 	up := upperBound(item)
 	if child != nil {
-		if up.compare(child.max) < 0 {
-			up = child.max
+		if childMax := child.max(); up.compare(childMax) < 0 {
+			up = childMax
 		}
 	}
-	if n.max.compare(up) == 0 {
+	if n.max().compare(up) == 0 {
 		// up was previous upper bound of n.
-		n.max = n.findUpperBound()
-		return n.max.compare(up) != 0
+		max := n.findUpperBound()
+		n.setMax(max)
+		return max.compare(up) != 0
 	}
 	return false
 }
@@ -703,7 +725,7 @@ func (t *btree) Delete(item T) {
 	}
 	if t.root.count == 0 {
 		old := t.root
-		if t.root.leaf {
+		if t.root.leaf() {
 			t.root = nil
 		} else {
 			t.root = t.root.children[0]
@@ -724,7 +746,7 @@ func (t *btree) Set(item T) {
 		newRoot.items[0] = splitLa
 		newRoot.children[0] = t.root
 		newRoot.children[1] = splitNode
-		newRoot.max = newRoot.findUpperBound()
+		newRoot.setMax(newRoot.findUpperBound())
 		t.root = newRoot
 	}
 	if replaced, _ := mut(&t.root).insert(item); !replaced {
@@ -746,7 +768,7 @@ func (t *btree) Height() int {
 	}
 	h := 1
 	n := t.root
-	for !n.leaf {
+	for !n.leaf() {
 		n = n.children[0]
 		h++
 	}
@@ -770,7 +792,7 @@ func (t *btree) String() string {
 }
 
 func (n *node) writeString(b *strings.Builder) {
-	if n.leaf {
+	if n.leaf() {
 		for i := int16(0); i < n.count; i++ {
 			if i != 0 {
 				b.WriteString(",")
@@ -887,7 +909,7 @@ func (i *iterator) SeekGE(item T) {
 		if found {
 			return
 		}
-		if i.n.leaf {
+		if i.n.leaf() {
 			if i.pos == i.n.count {
 				i.Next()
 			}
@@ -906,7 +928,7 @@ func (i *iterator) SeekLT(item T) {
 	for {
 		pos, found := i.n.find(item)
 		i.pos = int16(pos)
-		if found || i.n.leaf {
+		if found || i.n.leaf() {
 			i.Prev()
 			return
 		}
@@ -920,7 +942,7 @@ func (i *iterator) First() {
 	if i.n == nil {
 		return
 	}
-	for !i.n.leaf {
+	for !i.n.leaf() {
 		i.descend(i.n, 0)
 	}
 	i.pos = 0
@@ -932,7 +954,7 @@ func (i *iterator) Last() {
 	if i.n == nil {
 		return
 	}
-	for !i.n.leaf {
+	for !i.n.leaf() {
 		i.descend(i.n, i.n.count)
 	}
 	i.pos = i.n.count - 1
@@ -945,7 +967,7 @@ func (i *iterator) Next() {
 		return
 	}
 
-	if i.n.leaf {
+	if i.n.leaf() {
 		i.pos++
 		if i.pos < i.n.count {
 			return
@@ -957,7 +979,7 @@ func (i *iterator) Next() {
 	}
 
 	i.descend(i.n, i.pos+1)
-	for !i.n.leaf {
+	for !i.n.leaf() {
 		i.descend(i.n, 0)
 	}
 	i.pos = 0
@@ -970,7 +992,7 @@ func (i *iterator) Prev() {
 		return
 	}
 
-	if i.n.leaf {
+	if i.n.leaf() {
 		i.pos--
 		if i.pos >= 0 {
 			return
@@ -983,7 +1005,7 @@ func (i *iterator) Prev() {
 	}
 
 	i.descend(i.n, i.pos)
-	for !i.n.leaf {
+	for !i.n.leaf() {
 		i.descend(i.n, i.n.count)
 	}
 	i.pos = i.n.count - 1
@@ -1005,9 +1027,9 @@ func (i *iterator) Cur() T {
 // is to minimize the number of key comparisons performed in total. The
 // algorithm operates based on the following two invariants maintained by
 // augmented interval btree:
-// 1. all items are sorted in the btree based on their start key.
-// 2. all btree nodes maintain the upper bound end key of all items
-//    in their subtree.
+//  1. all items are sorted in the btree based on their start key.
+//  2. all btree nodes maintain the upper bound end key of all items
+//     in their subtree.
 //
 // The scan algorithm starts in "unconstrained minimum" and "unconstrained
 // maximum" states. To enter a "constrained minimum" state, the scan must reach
@@ -1022,28 +1044,28 @@ func (i *iterator) Cur() T {
 //
 // The scan algorithm works like a standard btree forward scan with the
 // following augmentations:
-// 1. before tranversing the tree, the scan performs a binary search on the
-//    root node's items to determine a "soft" lower-bound constraint position
-//    and a "hard" upper-bound constraint position in the root's children.
-// 2. when tranversing into a child node in the lower or upper bound constraint
-//    position, the constraint is refined by searching the child's items.
-// 3. the initial traversal down the tree follows the left-most children
-//    whose upper bound end keys are equal to or greater than the start key
-//    of the search range. The children followed will be equal to or less
-//    than the soft lower bound constraint.
-// 4. once the initial tranversal completes and the scan is in the left-most
-//    btree node whose upper bound overlaps the search range, key comparisons
-//    must be performed with each item in the tree. This is necessary because
-//    any of these items may have end keys that cause them to overlap with the
-//    search range.
-// 5. once the scan reaches the lower bound constraint position (the first item
-//    with a start key equal to or greater than the search range's start key),
-//    it can begin scaning without performing key comparisons. This is allowed
-//    because all items from this point forward will have end keys that are
-//    greater than the search range's start key.
-// 6. once the scan reaches the upper bound constraint position, it terminates.
-//    It does so because the item at this position is the first item with a
-//    start key larger than the search range's end key.
+//  1. before tranversing the tree, the scan performs a binary search on the
+//     root node's items to determine a "soft" lower-bound constraint position
+//     and a "hard" upper-bound constraint position in the root's children.
+//  2. when tranversing into a child node in the lower or upper bound constraint
+//     position, the constraint is refined by searching the child's items.
+//  3. the initial traversal down the tree follows the left-most children
+//     whose upper bound end keys are equal to or greater than the start key
+//     of the search range. The children followed will be equal to or less
+//     than the soft lower bound constraint.
+//  4. once the initial tranversal completes and the scan is in the left-most
+//     btree node whose upper bound overlaps the search range, key comparisons
+//     must be performed with each item in the tree. This is necessary because
+//     any of these items may have end keys that cause them to overlap with the
+//     search range.
+//  5. once the scan reaches the lower bound constraint position (the first item
+//     with a start key equal to or greater than the search range's start key),
+//     it can begin scaning without performing key comparisons. This is allowed
+//     because all items from this point forward will have end keys that are
+//     greater than the search range's start key.
+//  6. once the scan reaches the upper bound constraint position, it terminates.
+//     It does so because the item at this position is the first item with a
+//     start key larger than the search range's end key.
 type overlapScan struct {
 	// The "soft" lower-bound constraint.
 	constrMinN       *node
@@ -1102,9 +1124,9 @@ func (i *iterator) findNextOverlap(item T) {
 		if i.pos > i.n.count {
 			// Iterate up tree.
 			i.ascend()
-		} else if !i.n.leaf {
+		} else if !i.n.leaf() {
 			// Iterate down tree.
-			if i.o.constrMinReached || i.n.children[i.pos].max.contains(item) {
+			if i.o.constrMinReached || i.n.children[i.pos].max().contains(item) {
 				par := i.n
 				pos := i.pos
 				i.descend(par, pos)

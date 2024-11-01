@@ -1,21 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catprivilege
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 )
 
 var (
@@ -23,13 +18,14 @@ var (
 		catconstants.NamespaceTableName,
 		catconstants.DescriptorTableName,
 		catconstants.DescIDSequenceTableName,
+		catconstants.TenantIDSequenceTableName,
 		catconstants.TenantsTableName,
 		catconstants.ProtectedTimestampsMetaTableName,
 		catconstants.ProtectedTimestampsRecordsTableName,
 		catconstants.StatementStatisticsTableName,
 		catconstants.TransactionStatisticsTableName,
-		// TODO(postamar): remove in 21.2
-		catconstants.PreMigrationNamespaceTableName,
+		catconstants.StatementActivityTableName,
+		catconstants.TransactionActivityTableName,
 	}
 
 	readWriteSystemTables = []catconstants.SystemTableName{
@@ -62,13 +58,33 @@ var (
 		catconstants.TenantUsageTableName,
 		catconstants.SQLInstancesTableName,
 		catconstants.SpanConfigurationsTableName,
+		catconstants.TaskPayloadsTableName,
+		catconstants.TenantSettingsTableName,
+		catconstants.TenantTasksTableName,
+		catconstants.SpanCountTableName,
+		catconstants.SystemPrivilegeTableName,
+		catconstants.SystemExternalConnectionsTableName,
+		catconstants.SystemJobInfoTableName,
+		catconstants.SpanStatsUniqueKeys,
+		catconstants.SpanStatsBuckets,
+		catconstants.SpanStatsSamples,
+		catconstants.SpanStatsTenantBoundaries,
+		catconstants.RegionalLiveness,
+		catconstants.MVCCStatistics,
+		catconstants.TxnExecInsightsTableName,
+		catconstants.StmtExecInsightsTableName,
+		catconstants.TableMetadata,
+	}
+
+	readWriteSystemSequences = []catconstants.SystemTableName{
+		catconstants.RoleIDSequenceName,
 	}
 
 	systemSuperuserPrivileges = func() map[descpb.NameInfo]privilege.List {
 		m := make(map[descpb.NameInfo]privilege.List)
 		tableKey := descpb.NameInfo{
 			ParentID:       keys.SystemDatabaseID,
-			ParentSchemaID: keys.PublicSchemaID,
+			ParentSchemaID: keys.SystemPublicSchemaID,
 		}
 		for _, rw := range readWriteSystemTables {
 			tableKey.Name = string(rw)
@@ -78,7 +94,11 @@ var (
 			tableKey.Name = string(r)
 			m[tableKey] = privilege.ReadData
 		}
-		m[descpb.NameInfo{Name: catconstants.SystemDatabaseName}] = privilege.ReadData
+		for _, r := range readWriteSystemSequences {
+			tableKey.Name = string(r)
+			m[tableKey] = privilege.ReadWriteSequenceData
+		}
+		m[descpb.NameInfo{Name: catconstants.SystemDatabaseName}] = privilege.List{privilege.CONNECT}
 		return m
 	}()
 )

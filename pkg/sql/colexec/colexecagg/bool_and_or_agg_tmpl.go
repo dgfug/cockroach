@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -59,10 +54,10 @@ func newBool_OP_TYPE_AGGKINDAggAlloc(
 type bool_OP_TYPE_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
+	col coldata.Bools
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
-	col    []bool
 	curAgg bool
 	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 	// for the group that is currently being aggregated.
@@ -71,23 +66,22 @@ type bool_OP_TYPE_AGGKINDAgg struct {
 
 var _ AggregateFunc = &bool_OP_TYPE_AGGKINDAgg{}
 
-func (a *bool_OP_TYPE_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *bool_OP_TYPE_AGGKINDAgg) SetOutput(vec *coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
 	a.col = vec.Bool()
 }
 
+// {{end}}
+
 func (a *bool_OP_TYPE_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bool(), vec.Nulls()
 	// {{if not (eq "_AGGKIND" "Window")}}
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups and col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -143,7 +137,7 @@ func (a *bool_OP_TYPE_AGGKINDAgg) Compute(
 	// {{end}}
 	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
 	if newCurAggSize != oldCurAggSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -153,11 +147,14 @@ func (a *bool_OP_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
+	col := a.col
+	// {{else}}
+	col := a.vec.Bool()
 	// {{end}}
 	if !a.foundNonNullForCurrentGroup {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		a.col[outputIdx] = a.curAgg
+		col[outputIdx] = a.curAgg
 	}
 }
 
@@ -196,6 +193,21 @@ func (a *bool_OP_TYPE_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 	return f
 }
 
+// {{if eq "_AGGKIND" "Window"}}
+
+// Remove implements the slidingWindowAggregateFunc interface (see
+// window_aggregator_tmpl.go). This allows bool_and and bool_or operators to be
+// used when the window frame only grows. For the case when the window frame can
+// shrink, the default quadratic-scaling implementation is necessary.
+func (*bool_OP_TYPE_AGGKINDAgg) Remove(
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int,
+) {
+	colexecerror.InternalError(
+		errors.AssertionFailedf("Remove called on bool_OP_TYPE_AGGKINDAgg"),
+	)
+}
+
+// {{end}}
 // {{end}}
 
 // {{/*

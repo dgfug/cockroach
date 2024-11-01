@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package hba implements an hba.conf parser.
 package hba
@@ -24,7 +19,8 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/rulebasedscanner"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
@@ -41,13 +37,13 @@ type Entry struct {
 	ConnType ConnType
 	// Database is the list of databases to match. An empty list means
 	// "match any database".
-	Database []String
+	Database []rulebasedscanner.String
 	// User is the list of users to match. An empty list means "match
 	// any user".
-	User []String
+	User []rulebasedscanner.String
 	// Address is either AnyAddr, *net.IPNet or (unsupported) String for a hostname.
 	Address interface{}
-	Method  String
+	Method  rulebasedscanner.String
 	// MethodFn is populated during name resolution of Method.
 	MethodFn     interface{}
 	Options      [][2]string
@@ -74,9 +70,13 @@ const (
 	// ConnHostAny matches TCP connections with or without SSL/TLS.
 	ConnHostAny = ConnHostNoSSL | ConnHostSSL
 
+	// ConnInternalLoopback matches internal connections running over the loopback
+	// interface.
+	ConnInternalLoopback = 8
+
 	// ConnAny matches any connection type. Used when registering auth
 	// methods.
-	ConnAny = ConnHostAny | ConnLocal
+	ConnAny = ConnHostAny | ConnLocal | ConnInternalLoopback
 )
 
 // String implements the fmt.Stringer interface.
@@ -90,6 +90,8 @@ func (t ConnType) String() string {
 		return "hostssl"
 	case ConnHostAny:
 		return "host"
+	case ConnInternalLoopback:
+		return "loopback"
 	default:
 		panic(errors.Newf("unimplemented conn type: %v", int(t)))
 	}
@@ -188,6 +190,8 @@ func (h Entry) ConnTypeMatches(clientConn ConnType) bool {
 	case ConnHostNoSSL:
 		// A non-SSL connection matches both "hostnossl" and "host".
 		return h.ConnType&ConnHostNoSSL != 0
+	case ConnInternalLoopback:
+		return h.ConnType&ConnInternalLoopback != 0
 	default:
 		panic("unimplemented")
 	}
@@ -205,14 +209,14 @@ func (h Entry) ConnMatches(clientConn ConnType, ip net.IP) (bool, error) {
 	return true, nil
 }
 
-// UserMatches returns true iff the provided username matches the an
+// UserMatches returns true iff the provided username matches an
 // entry in the User list or if the user list is empty (the entry
 // matches all).
 //
 // The provided username must be normalized already.
 // The function assumes the entry was normalized to contain only
 // one user and its username normalized. See ParseAndNormalize().
-func (h Entry) UserMatches(userName security.SQLUsername) bool {
+func (h Entry) UserMatches(userName username.SQLUsername) bool {
 	if h.User == nil {
 		return true
 	}
@@ -284,7 +288,7 @@ func (h Entry) OptionsString() string {
 	sp := ""
 	for i, opt := range h.Options {
 		sb.WriteString(sp)
-		sb.WriteString(String{Value: opt[0] + "=" + opt[1], Quoted: h.OptionQuotes[i]}.String())
+		sb.WriteString(rulebasedscanner.String{Value: opt[0] + "=" + opt[1], Quoted: h.OptionQuotes[i]}.String())
 		sp = " "
 	}
 	return sb.String()
@@ -295,38 +299,15 @@ func (h Entry) String() string {
 	return Conf{Entries: []Entry{h}}.String()
 }
 
-// String is a possibly quoted string.
-type String struct {
-	Value  string
-	Quoted bool
-}
-
-// String implements the fmt.Stringer interface.
-func (s String) String() string {
-	if s.Quoted {
-		return `"` + s.Value + `"`
-	}
-	return s.Value
-}
-
-// Empty returns true iff s is the unquoted empty string.
-func (s String) Empty() bool { return s.IsKeyword("") }
-
-// IsKeyword returns whether s is the non-quoted string v.
-func (s String) IsKeyword(v string) bool {
-	return !s.Quoted && s.Value == v
-}
-
 // ParseAndNormalize parses the HBA configuration from the provided
 // string and performs two tasks:
 //
-// - it unicode-normalizes the usernames. Since usernames are
-//   initialized during pgwire session initialization, this
-//   ensures that string comparisons can be used to match usernames.
+//   - it unicode-normalizes the usernames. Since usernames are
+//     initialized during pgwire session initialization, this
+//     ensures that string comparisons can be used to match usernames.
 //
-// - it ensures there is one entry per username. This simplifies
-//   the code in the authentication logic.
-//
+//   - it ensures there is one entry per username. This simplifies
+//     the code in the authentication logic.
 func ParseAndNormalize(val string) (*Conf, error) {
 	conf, err := Parse(val)
 	if err != nil {
@@ -343,7 +324,7 @@ outer:
 		entry.Database = nil
 
 		// Normalize the 'all' keyword into AnyAddr.
-		if addr, ok := entry.Address.(String); ok && addr.IsKeyword("all") {
+		if addr, ok := entry.Address.(rulebasedscanner.String); ok && addr.IsKeyword("all") {
 			entry.Address = AnyAddr{}
 		}
 

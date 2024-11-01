@@ -1,17 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -19,16 +15,19 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 type session interface {
-	CombinedOutput(cmd string) ([]byte, error)
-	Run(cmd string) error
+	CombinedOutput(ctx context.Context) ([]byte, error)
+	Run(ctx context.Context) error
 	SetStdin(r io.Reader)
 	SetStdout(w io.Writer)
 	SetStderr(w io.Writer)
-	Start(cmd string) error
+	Start() error
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
 	StderrPipe() (io.Reader, error)
@@ -43,25 +42,74 @@ type remoteSession struct {
 	logfile string // captures ssh -vvv
 }
 
-func newRemoteSession(user, host string, logdir string) (*remoteSession, error) {
-	// TODO(tbg): this is disabled at the time of writing. It was difficult
-	// to assign the logfiles to the roachtest and as a bonus our CI harness
-	// never actually managed to collect the files since they had wrong
-	// permissions; instead they clogged up the roachprod dir.
-	// logfile := filepath.Join(
-	//	logdir,
-	// 	fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
-	// )
-	const logfile = ""
+type remoteCommand struct {
+	node          Node
+	user          string
+	host          string
+	cmd           string
+	debugDisabled bool
+	debugName     string
+}
+
+type remoteSessionOption = func(c *remoteCommand)
+
+func withDebugDisabled() remoteSessionOption {
+	return func(c *remoteCommand) {
+		c.debugDisabled = true
+	}
+}
+
+func withDebugName(name string) remoteSessionOption {
+	return func(c *remoteCommand) {
+		c.debugName = name
+	}
+}
+
+func newRemoteSession(l *logger.Logger, command *remoteCommand) *remoteSession {
+	var loggingArgs []string
+
+	// NB: -q suppresses -E, at least on *nix.
+	loggingArgs = []string{"-q"}
+	logfile := ""
+	if !command.debugDisabled {
+		var debugName = command.debugName
+		if debugName == "" {
+			debugName = GenFilenameFromArgs(20, command.cmd)
+		}
+
+		// Check the logger file since running roachprod from the cli will
+		// result in a fileless logger.
+		if l.File != nil {
+			// We use the logger instance as a proxy to the artifacts dir in
+			// a roachtest run. The RootLogger's directory will be the root
+			// of the artifacts directory, which ensures that every ssh_*
+			// file ends up in the same location.
+			artifactsLogger := l
+			if rl := l.RootLogger(); rl.File != nil {
+				artifactsLogger = rl
+			}
+			cl, err := artifactsLogger.ChildLogger(filepath.Join("ssh", fmt.Sprintf(
+				"ssh_%s_n%v_%s",
+				timeutil.Now().Format(`150405.000000000`),
+				command.node,
+				debugName,
+			)))
+
+			if err == nil {
+				logfile = cl.File.Name()
+				loggingArgs = []string{
+					"-vvv", "-E", logfile,
+				}
+				cl.Close()
+			} else {
+				l.Printf("could not create child logger: %v", err)
+			}
+		}
+	}
+
 	args := []string{
-		user + "@" + host,
+		command.user + "@" + command.host,
 
-		// TODO(tbg): see above.
-		//"-vvv", "-E", logfile,
-		// NB: -q suppresses -E, at least on OSX. Difficult decisions will have
-		// to be made if omitting -q leads to annoyance on stdout/stderr.
-
-		"-q",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
 		// Send keep alives every minute to prevent connections without activity
@@ -74,34 +122,64 @@ func newRemoteSession(user, host string, logdir string) (*remoteSession, error) 
 		// context cancellation killing hanging roachprod processes.
 		"-o", "ConnectTimeout=5",
 	}
+	args = append(args, loggingArgs...)
 	args = append(args, sshAuthArgs()...)
+	args = append(args, command.cmd)
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	return &remoteSession{cmd, cancel, logfile}, nil
+	fullCmd := exec.CommandContext(ctx, "ssh", args...)
+	return &remoteSession{fullCmd, cancel, logfile}
 }
 
 func (s *remoteSession) errWithDebug(err error) error {
-	if err != nil && s.logfile != "" {
-		err = errors.Wrapf(err, "ssh verbose log retained in %s", s.logfile)
+	err = rperrors.ClassifyCmdError(err)
+	// The verbose logs are noisy and not useful for most errors, so only
+	// retain them for potential flakes.
+	if rperrors.IsSSHError(err) && s.logfile != "" {
+		err = errors.Wrapf(err, "_potential_ SSH flake (`ssh -vvv` log retained in %s)", s.logfile)
 		s.logfile = "" // prevent removal on close
 	}
 	return err
 }
 
-func (s *remoteSession) CombinedOutput(cmd string) ([]byte, error) {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	b, err := s.Cmd.CombinedOutput()
-	return b, s.errWithDebug(err)
+func (s *remoteSession) CombinedOutput(ctx context.Context) ([]byte, error) {
+	var b []byte
+	var err error
+	commandFinished := make(chan struct{})
+
+	go func() {
+		b, err = s.Cmd.CombinedOutput()
+		err = s.errWithDebug(err)
+		close(commandFinished)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.Close()
+		return nil, ctx.Err()
+	case <-commandFinished:
+		return b, err
+	}
 }
 
-func (s *remoteSession) Run(cmd string) error {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.errWithDebug(s.Cmd.Run())
+func (s *remoteSession) Run(ctx context.Context) error {
+	var err error
+	commandFinished := make(chan struct{})
+	go func() {
+		err = s.errWithDebug(s.Cmd.Run())
+		close(commandFinished)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.Close()
+		return ctx.Err()
+	case <-commandFinished:
+		return err
+	}
 }
 
-func (s *remoteSession) Start(cmd string) error {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Start()
+func (s *remoteSession) Start() error {
+	return s.errWithDebug(s.Cmd.Start())
 }
 
 func (s *remoteSession) SetStdin(r io.Reader) {
@@ -131,7 +209,15 @@ func (s *remoteSession) StderrPipe() (io.Reader, error) {
 }
 
 func (s *remoteSession) RequestPty() error {
-	s.Cmd.Args = append(s.Cmd.Args, "-t")
+	if len(s.Cmd.Args) == 0 {
+		return fmt.Errorf("unexpected remote command: expected arguments, none found")
+	}
+
+	// Add the `-t` option after `ssh user@host`, otherwise, "-t" could
+	// confuse the underlying shell used when executing complex commands
+	// using `ssh`, leading to cryptic errors like: `bash: line 70:
+	// syntax error near -t`.
+	s.Cmd.Args = append(s.Cmd.Args[:1], append([]string{"-t"}, s.Cmd.Args[1:]...)...)
 	return nil
 }
 
@@ -151,25 +237,50 @@ type localSession struct {
 	cancel func()
 }
 
-func newLocalSession() *localSession {
+func newLocalSession(cmd string) *localSession {
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c")
-	return &localSession{cmd, cancel}
+	fullCmd := exec.CommandContext(ctx, "/bin/bash", "-c", cmd)
+	return &localSession{fullCmd, cancel}
 }
 
-func (s *localSession) CombinedOutput(cmd string) ([]byte, error) {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.CombinedOutput()
+func (s *localSession) CombinedOutput(ctx context.Context) ([]byte, error) {
+	var b []byte
+	var err error
+	commandFinished := make(chan struct{})
+
+	go func() {
+		b, err = s.Cmd.CombinedOutput()
+		close(commandFinished)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.Close()
+		return nil, ctx.Err()
+	case <-commandFinished:
+		return b, rperrors.ClassifyCmdError(err)
+	}
 }
 
-func (s *localSession) Run(cmd string) error {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Run()
+func (s *localSession) Run(ctx context.Context) error {
+	var err error
+	commandFinished := make(chan struct{})
+	go func() {
+		err = s.Cmd.Run()
+		close(commandFinished)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.Close()
+		return ctx.Err()
+	case <-commandFinished:
+		return rperrors.ClassifyCmdError(err)
+	}
 }
 
-func (s *localSession) Start(cmd string) error {
-	s.Cmd.Args = append(s.Cmd.Args, cmd)
-	return s.Cmd.Start()
+func (s *localSession) Start() error {
+	return rperrors.ClassifyCmdError(s.Cmd.Start())
 }
 
 func (s *localSession) SetStdin(r io.Reader) {
@@ -215,10 +326,9 @@ var sshAuthArgsOnce sync.Once
 
 func sshAuthArgs() []string {
 	sshAuthArgsOnce.Do(func() {
-		paths := []string{
-			filepath.Join(config.OSUser.HomeDir, ".ssh", "id_ed25519"),
-			filepath.Join(config.OSUser.HomeDir, ".ssh", "id_rsa"),
-			filepath.Join(config.OSUser.HomeDir, ".ssh", "google_compute_engine"),
+		paths := make([]string, len(config.DefaultPubKeyNames))
+		for idx, name := range config.DefaultPubKeyNames {
+			paths[idx] = filepath.Join(config.SSHDirectory, name)
 		}
 		for _, p := range paths {
 			if _, err := os.Stat(p); err == nil {

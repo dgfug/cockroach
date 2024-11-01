@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pretty_test
 
@@ -60,7 +55,10 @@ func Example_align() {
 	for _, n := range []int{1, 15, 30, 80} {
 		fmt.Printf("%d:\n", n)
 		for _, doc := range testData {
-			p := pretty.Pretty(doc, n, true /*useTabs*/, 4 /*tabWidth*/, nil /*keywordTransform*/)
+			p, err := pretty.Pretty(doc, n, true /*useTabs*/, 4 /*tabWidth*/, nil /*keywordTransform*/)
+			if err != nil {
+				panic(err)
+			}
 			fmt.Printf("%s\n\n", p)
 		}
 	}
@@ -216,7 +214,10 @@ func Example_tree() {
 		))
 	}
 	for _, n := range []int{1, 30, 80} {
-		p := pretty.Pretty(showTree(tree), n, false /*useTabs*/, 4 /*tabWidth*/, nil /*keywordTransform*/)
+		p, err := pretty.Pretty(showTree(tree), n, false /*useTabs*/, 4 /*tabWidth*/, nil /*keywordTransform*/)
+		if err != nil {
+			panic(err)
+		}
 		fmt.Printf("%d:\n%s\n\n", n, p)
 	}
 	// Output:

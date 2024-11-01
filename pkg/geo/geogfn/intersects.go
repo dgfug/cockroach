@@ -1,19 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/s2"
 )
 
@@ -63,7 +58,7 @@ func singleRegionIntersects(aRegion s2.Region, bRegion s2.Region) (bool, error) 
 		case *s2.Polygon:
 			return bRegion.IntersectsCell(s2.CellFromPoint(aRegion)), nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	case *s2.Polyline:
 		switch bRegion := bRegion.(type) {
@@ -74,7 +69,7 @@ func singleRegionIntersects(aRegion s2.Region, bRegion s2.Region) (bool, error) 
 		case *s2.Polygon:
 			return polygonIntersectsPolyline(bRegion, aRegion), nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	case *s2.Polygon:
 		switch bRegion := bRegion.(type) {
@@ -85,10 +80,10 @@ func singleRegionIntersects(aRegion s2.Region, bRegion s2.Region) (bool, error) 
 		case *s2.Polygon:
 			return aRegion.Intersects(bRegion), nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	}
-	return false, fmt.Errorf("unknown s2 type of a: %#v", aRegion)
+	return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of a: %#v", aRegion)
 }
 
 // polylineIntersectsPolyline returns whether polyline a intersects with

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
@@ -16,19 +11,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
 // IterateStatementStats implements sqlstats.Provider interface.
 func (s *PersistedSQLStats) IterateStatementStats(
-	ctx context.Context, options *sqlstats.IteratorOptions, visitor sqlstats.StatementVisitor,
+	ctx context.Context, options sqlstats.IteratorOptions, visitor sqlstats.StatementVisitor,
 ) (err error) {
 	// We override the sorting options since otherwise we would need to implement
 	// sorted and unsorted merge separately. We can revisit this decision if
@@ -39,11 +34,11 @@ func (s *PersistedSQLStats) IterateStatementStats(
 
 	// We compute the current aggregated_ts so that the in-memory stats can be
 	// merged with the persisted stats.
-	curAggTs := s.computeAggregatedTs()
-	aggInterval := SQLStatsFlushInterval.Get(&s.cfg.Settings.SV)
+	curAggTs := s.ComputeAggregatedTs()
+	aggInterval := s.GetAggregationInterval()
 	memIter := newMemStmtStatsIterator(s.SQLStats, options, curAggTs, aggInterval)
 
-	var persistedIter sqlutil.InternalRows
+	var persistedIter isql.Rows
 	var colCnt int
 	persistedIter, colCnt, err = s.persistedStmtStatsIter(ctx, options)
 	if err != nil {
@@ -79,15 +74,15 @@ func (s *PersistedSQLStats) IterateStatementStats(
 }
 
 func (s *PersistedSQLStats) persistedStmtStatsIter(
-	ctx context.Context, options *sqlstats.IteratorOptions,
-) (iter sqlutil.InternalRows, expectedColCnt int, err error) {
-	query, expectedColCnt := s.getFetchQueryForStmtStatsTable(options)
+	ctx context.Context, options sqlstats.IteratorOptions,
+) (iter isql.Rows, expectedColCnt int, err error) {
+	query, expectedColCnt := s.getFetchQueryForStmtStatsTable(ctx, options)
 
-	persistedIter, err := s.cfg.InternalExecutor.QueryIteratorEx(
+	persistedIter, err := s.cfg.DB.Executor().QueryIteratorEx(
 		ctx,
 		"read-stmt-stats",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		query,
 	)
 
@@ -99,7 +94,7 @@ func (s *PersistedSQLStats) persistedStmtStatsIter(
 }
 
 func (s *PersistedSQLStats) getFetchQueryForStmtStatsTable(
-	options *sqlstats.IteratorOptions,
+	ctx context.Context, options sqlstats.IteratorOptions,
 ) (query string, colCnt int) {
 	selectedColumns := []string{
 		"aggregated_ts",
@@ -111,6 +106,7 @@ func (s *PersistedSQLStats) getFetchQueryForStmtStatsTable(
 		"statistics",
 		"plan",
 		"agg_interval",
+		"index_recommendations",
 	}
 
 	// [1]: selection columns
@@ -122,11 +118,7 @@ FROM
 	system.statement_statistics
 %[2]s`
 
-	followerReadClause := "AS OF SYSTEM TIME follower_read_timestamp()"
-
-	if s.cfg.Knobs != nil {
-		followerReadClause = s.cfg.Knobs.AOSTClause
-	}
+	followerReadClause := s.cfg.Knobs.GetAOSTClause()
 
 	query = fmt.Sprintf(query, strings.Join(selectedColumns, ","), followerReadClause)
 
@@ -148,22 +140,22 @@ FROM
 	return query, len(selectedColumns)
 }
 
-func rowToStmtStats(row tree.Datums) (*roachpb.CollectedStatementStatistics, error) {
-	var stats roachpb.CollectedStatementStatistics
+func rowToStmtStats(row tree.Datums) (*appstatspb.CollectedStatementStatistics, error) {
+	var stats appstatspb.CollectedStatementStatistics
 	stats.AggregatedTs = tree.MustBeDTimestampTZ(row[0]).Time
 
 	stmtFingerprintID, err := sqlstatsutil.DatumToUint64(row[1])
 	if err != nil {
 		return nil, err
 	}
-	stats.ID = roachpb.StmtFingerprintID(stmtFingerprintID)
+	stats.ID = appstatspb.StmtFingerprintID(stmtFingerprintID)
 
 	transactionFingerprintID, err := sqlstatsutil.DatumToUint64(row[2])
 	if err != nil {
 		return nil, err
 	}
 	stats.Key.TransactionFingerprintID =
-		roachpb.TransactionFingerprintID(transactionFingerprintID)
+		appstatspb.TransactionFingerprintID(transactionFingerprintID)
 
 	stats.Key.PlanHash, err = sqlstatsutil.DatumToUint64(row[3])
 	if err != nil {
@@ -191,6 +183,13 @@ func rowToStmtStats(row tree.Datums) (*roachpb.CollectedStatementStatistics, err
 
 	aggInterval := tree.MustBeDInterval(row[8]).Duration
 	stats.AggregationInterval = time.Duration(aggInterval.Nanos())
+
+	recommendations := tree.MustBeDArray(row[9])
+	var indexRecommendations []string
+	for _, s := range recommendations.Array {
+		indexRecommendations = util.CombineUnique(indexRecommendations, []string{string(tree.MustBeDString(s))})
+	}
+	stats.Stats.IndexRecommendations = indexRecommendations
 
 	return &stats, nil
 }

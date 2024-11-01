@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package oidcccl
 
@@ -15,6 +12,7 @@ import (
 	"encoding/base64"
 	"net/http"
 
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -33,7 +31,9 @@ type keyAndSignedToken struct {
 // newKeyAndSignedToken creates an instance of `keyAndSignedToken` by randomly generating a key
 // and a message of the requested sizes and encoding them into the datatypes we need in order to
 // proceed with a secure OIDC auth request.
-func newKeyAndSignedToken(keySize int, tokenSize int) (*keyAndSignedToken, error) {
+func newKeyAndSignedToken(
+	keySize int, tokenSize int, mode serverpb.OIDCState_Mode,
+) (*keyAndSignedToken, error) {
 	secretKey := make([]byte, keySize)
 	if _, err := crypto_rand.Read(secretKey); err != nil {
 		return nil, err
@@ -53,21 +53,19 @@ func newKeyAndSignedToken(keySize int, tokenSize int) (*keyAndSignedToken, error
 	signedTokenEncoded, err := encodeOIDCState(serverpb.OIDCState{
 		Token:    token,
 		TokenMAC: mac.Sum(nil),
+		Mode:     mode,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	secretKeyCookie := http.Cookie{
-		Name:     secretCookieName,
-		Value:    base64.URLEncoding.EncodeToString(secretKey),
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	}
+	secretKeyCookie := authserver.CreateOIDCCookie(
+		secretCookieName,
+		base64.URLEncoding.EncodeToString(secretKey),
+	)
 
 	return &keyAndSignedToken{
-		&secretKeyCookie,
+		secretKeyCookie,
 		signedTokenEncoded,
 	}, nil
 }
@@ -76,24 +74,24 @@ func newKeyAndSignedToken(keySize int, tokenSize int) (*keyAndSignedToken, error
 // string type, decoding the HMAC key from the cookie, and recomputing the HMAC to sure that it
 // matches the `TokenMAC` field in the protobuf. It returns the result of the equality check from
 // the HMAC library.
-func (kast *keyAndSignedToken) validate() (bool, error) {
+func (kast *keyAndSignedToken) validate() (bool, serverpb.OIDCState_Mode, error) {
 	key, err := base64.URLEncoding.DecodeString(kast.secretKeyCookie.Value)
 	if err != nil {
-		return false, err
+		return false, serverpb.OIDCState_MODE_LOG_IN, err
 	}
 	mac := hmac.New(sha256.New, key)
 
 	signedToken, err := decodeOIDCState(kast.signedTokenEncoded)
 	if err != nil {
-		return false, err
+		return false, serverpb.OIDCState_MODE_LOG_IN, err
 	}
 
 	_, err = mac.Write(signedToken.Token)
 	if err != nil {
-		return false, err
+		return false, serverpb.OIDCState_MODE_LOG_IN, err
 	}
 
-	return hmac.Equal(signedToken.TokenMAC, mac.Sum(nil)), nil
+	return hmac.Equal(signedToken.TokenMAC, mac.Sum(nil)), signedToken.Mode, nil
 }
 
 func encodeOIDCState(statePb serverpb.OIDCState) (string, error) {

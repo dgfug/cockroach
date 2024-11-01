@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -66,7 +61,7 @@ func TestSecondaryGC(t *testing.T) {
 	// Validate and apply the config.
 	require.NoError(t, config.Validate(&s.logDir))
 	TestingResetActive()
-	cleanupFn, err := ApplyConfig(config)
+	cleanupFn, err := ApplyConfig(config, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	require.NoError(t, err)
 	defer cleanupFn()
 
@@ -158,7 +153,7 @@ func testLogGC(t *testing.T, fileSink *fileSink, logFn func(ctx context.Context,
 	const newLogFiles = 20
 	for i := 1; i < newLogFiles; i++ {
 		logFn(context.Background(), fmt.Sprint(i))
-		Flush()
+		FlushFiles()
 	}
 	if _, err := expectFileCount(newLogFiles); err != nil {
 		t.Fatal(err)
@@ -169,7 +164,7 @@ func testLogGC(t *testing.T, fileSink *fileSink, logFn func(ctx context.Context,
 
 	// Emit a log line which will rotate the files and trigger GC.
 	logFn(context.Background(), "final")
-	Flush()
+	FlushFiles()
 
 	succeedsSoon(t, func() error {
 		_, err := expectFileCount(expectedFilesAfterGC)

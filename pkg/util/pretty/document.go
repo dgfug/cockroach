@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package pretty prints documents based on a target line width.
 //
@@ -27,7 +22,6 @@
 //
 // For example code with SQL to experiment further, refer to
 // https://github.com/knz/prettier/
-//
 package pretty
 
 import "fmt"
@@ -82,8 +76,9 @@ var Line Doc = line{}
 //
 // For example, text "hello" <> softbreak <> text "world"
 // flattens to "helloworld" (one word) but splits across lines as:
-//     hello
-//     world
+//
+//	hello
+//	world
 //
 // This is a common extension to Wadler's printer.
 //

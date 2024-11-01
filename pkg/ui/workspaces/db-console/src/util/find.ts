@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React from "react";
 
@@ -21,7 +16,8 @@ export function findChildrenOfType<P>(
   const matchingChildren: React.ReactElement<P>[] = [];
   const childrenToSearch = React.Children.toArray(children);
   while (childrenToSearch.length > 0) {
-    const child: React.ReactChild = childrenToSearch.shift() as React.ReactChild;
+    const child: React.ReactChild =
+      childrenToSearch.shift() as React.ReactChild;
     if (!isReactElement(child)) {
       continue;
     } else {

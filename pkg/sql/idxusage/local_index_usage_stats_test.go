@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package idxusage
 
@@ -110,41 +105,16 @@ func TestIndexUsageStatisticsSubsystem(t *testing.T) {
 		},
 	}
 
-	statsProcessedSignal := make(chan struct{})
-	onStatsIngested := func(_ roachpb.IndexUsageKey) {
-		statsProcessedSignal <- struct{}{}
-	}
-	waitForStatsIngested := func() {
-		statsProcessed := 0
-		var timer timeutil.Timer
-		timer.Reset(time.Second)
-		for statsProcessed < len(testInputs) {
-			select {
-			case <-statsProcessedSignal:
-				statsProcessed++
-			case <-timer.C:
-				timer.Read = true
-				t.Fatalf("expected stats ingestion to complete, but it didn't.")
-			}
-		}
-	}
-
 	localIndexUsage := NewLocalIndexUsageStats(&Config{
 		ChannelSize: 10,
 		Setting:     cluster.MakeTestingClusterSettings(),
-		Knobs: &TestingKnobs{
-			OnIndexUsageStatsProcessedCallback: onStatsIngested,
-		},
 	})
 
-	localIndexUsage.Start(ctx, stopper)
 	defer stopper.Stop(ctx)
 
 	for _, input := range testInputs {
-		localIndexUsage.record(ctx, input)
+		localIndexUsage.insertIndexUsage(input.key, input.usageTyp)
 	}
-
-	waitForStatsIngested()
 
 	t.Run("point lookup", func(t *testing.T) {
 		actualEntryCount := 0
@@ -191,7 +161,7 @@ func TestIndexUsageStatisticsSubsystem(t *testing.T) {
 	t.Run("clear", func(t *testing.T) {
 		actualEntryCount := 0
 		expectedEntryCount := 0
-		localIndexUsage.clear()
+		localIndexUsage.clear(timeutil.Now())
 		err := localIndexUsage.ForEach(IteratorOptions{}, func(_ *roachpb.IndexUsageKey, _ *roachpb.IndexUsageStatistics) error {
 			actualEntryCount++
 			return nil

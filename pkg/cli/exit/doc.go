@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package exit encapsulates calls to os.Exit to control the
 // production of process exit status codes.
@@ -39,11 +34,10 @@
 //
 // This package accommodates this as follows:
 //
-// - exit codes common to all commands should be allocated
-//   incrementally starting from the last defined common error
-//   in codes.go.
+//   - exit codes common to all commands should be allocated
+//     incrementally starting from the last defined common error
+//     in codes.go.
 //
-// - exit codes specific to one command should be allocated downwards
-//   starting from 125.
-//
+//   - exit codes specific to one command should be allocated downwards
+//     starting from 125.
 package exit

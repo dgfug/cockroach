@@ -1,18 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -23,12 +19,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/errors"
 )
 
 // analyzeOrderBy analyzes an Ordering physical property from the ORDER BY
 // clause and adds the resulting typed expressions to orderByScope.
 func (b *Builder) analyzeOrderBy(
-	orderBy tree.OrderBy, inScope, projectionsScope *scope, rejectFlags tree.SemaRejectFlags,
+	orderBy tree.OrderBy,
+	inScope, projectionsScope *scope,
+	kind exprKind,
+	rejectFlags tree.SemaRejectFlags,
 ) (orderByScope *scope) {
 	if orderBy == nil {
 		return nil
@@ -41,8 +42,8 @@ func (b *Builder) analyzeOrderBy(
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require(exprKindOrderBy.String(), rejectFlags)
-	inScope.context = exprKindOrderBy
+	b.semaCtx.Properties.Require(kind.String(), rejectFlags)
+	inScope.context = kind
 
 	for i := range orderBy {
 		b.analyzeOrderByArg(orderBy[i], inScope, projectionsScope, orderByScope)
@@ -57,7 +58,9 @@ func (b *Builder) analyzeOrderBy(
 // Since the ordering property can only refer to output columns, we may need
 // to add a projection for the ordering columns. For example, consider the
 // following query:
-//     SELECT a FROM t ORDER BY c
+//
+//	SELECT a FROM t ORDER BY c
+//
 // The `c` column must be retained in the projection (and the presentation
 // property then omits it).
 //
@@ -168,14 +171,7 @@ func (b *Builder) analyzeOrderByArg(
 
 	// Set NULL order. The default order in Cockroach if null_ordered_last=False
 	// is nulls first for ascending order and nulls last for descending order.
-	nullsDefaultOrder := true
-	if (b.evalCtx.SessionData().NullOrderedLast && order.NullsOrder == tree.DefaultNullsOrder) ||
-		(order.NullsOrder != tree.DefaultNullsOrder &&
-			((order.NullsOrder == tree.NullsFirst && order.Direction == tree.Descending) ||
-				(order.NullsOrder == tree.NullsLast && order.Direction != tree.Descending))) {
-		nullsDefaultOrder = false
-		telemetry.Inc(sqltelemetry.OrderByNullsNonStandardCounter)
-	}
+	nullsDefaultOrder := b.hasDefaultNullsOrder(order)
 
 	// Analyze the ORDER BY column(s).
 	start := len(orderByScope.cols)
@@ -271,6 +267,12 @@ func (b *Builder) analyzeExtraArgument(
 		// Ensure we can order on the given column(s).
 		ensureColumnOrderable(e)
 		if !nullsDefaultOrder {
+			if buildutil.CrdbTestBuild && containsSubquery(e) {
+				panic(errors.UnimplementedError(
+					errors.IssueLink{IssueURL: build.MakeIssueURL(129956)},
+					"subqueries in ORDER BY with non-default NULLS ordering is not supported"),
+				)
+			}
 			metadataName := fmt.Sprintf("nulls_ordering_%s", e.String())
 			extraColsScope.addColumn(
 				scopeColName("").WithMetadataName(metadataName),
@@ -281,10 +283,53 @@ func (b *Builder) analyzeExtraArgument(
 	}
 }
 
+func containsSubquery(expr tree.Expr) bool {
+	var v subqueryVisitor
+	tree.WalkExprConst(&v, expr)
+	return v.foundSubquery
+}
+
+type subqueryVisitor struct {
+	foundSubquery bool
+}
+
+var _ tree.Visitor = &subqueryVisitor{}
+
+func (s *subqueryVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
+	if s.foundSubquery {
+		return false, expr
+	}
+	if _, ok := expr.(*subquery); ok {
+		s.foundSubquery = true
+		return false, expr
+	}
+	return true, expr
+}
+
+func (s *subqueryVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }
+
+// hasDefaultNullsOrder returns whether the provided ordering uses the default
+// ordering for NULLs. The default order in Cockroach if null_ordered_last=False
+// is nulls first for ascending order and nulls last for descending order.
+func (b *Builder) hasDefaultNullsOrder(order *tree.Order) bool {
+	if (b.evalCtx.SessionData().NullOrderedLast && order.NullsOrder == tree.DefaultNullsOrder) ||
+		(order.NullsOrder != tree.DefaultNullsOrder &&
+			((order.NullsOrder == tree.NullsFirst && order.Direction == tree.Descending) ||
+				(order.NullsOrder == tree.NullsLast && order.Direction != tree.Descending))) {
+		telemetry.Inc(sqltelemetry.OrderByNullsNonStandardCounter)
+		return false
+	}
+	telemetry.Inc(sqltelemetry.OrderByNullsStandardCounter)
+	return true
+}
+
 func ensureColumnOrderable(e tree.TypedExpr) {
 	typ := e.ResolvedType()
-	if typ.Family() == types.JsonFamily ||
-		(typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.JsonFamily) {
-		panic(unimplementedWithIssueDetailf(35706, "", "can't order by column type jsonb"))
+	if typ.Family() == types.ArrayFamily {
+		typ = typ.ArrayContents()
+	}
+	switch typ.Family() {
+	case types.TSQueryFamily, types.TSVectorFamily, types.PGVectorFamily:
+		panic(unimplementedWithIssueDetailf(92165, "", "can't order by column type %s", typ.SQLString()))
 	}
 }

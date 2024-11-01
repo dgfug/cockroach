@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package enginepb
 
@@ -25,11 +20,18 @@ import (
 // code out from abstract interfaces -- See #30114 and #30001.
 
 // SplitMVCCKey returns the key and timestamp components of an encoded MVCC key.
+// This function is similar to storage.DecodeEngineKey.
+// TODO(sumeer): remove SplitMVCCKey. It requires moving EngineKey into
+// enginepb.
 func SplitMVCCKey(mvccKey []byte) (key []byte, ts []byte, ok bool) {
 	if len(mvccKey) == 0 {
 		return nil, nil, false
 	}
 	tsLen := int(mvccKey[len(mvccKey)-1])
+	if tsLen == 1 {
+		// We never encode an empty version.
+		return nil, nil, false
+	}
 	keyPartEnd := len(mvccKey) - 1 - tsLen
 	if keyPartEnd < 0 {
 		return nil, nil, false
@@ -43,28 +45,28 @@ func SplitMVCCKey(mvccKey []byte) (key []byte, ts []byte, ok bool) {
 }
 
 // DecodeKey decodes an key/timestamp from its serialized representation.
-func DecodeKey(encodedKey []byte) (key []byte, timestamp hlc.Timestamp, _ error) {
-	key, ts, ok := SplitMVCCKey(encodedKey)
+func DecodeKey(encodedKey []byte) ([]byte, hlc.Timestamp, error) {
+	key, encodedTS, ok := SplitMVCCKey(encodedKey)
 	if !ok {
-		return nil, timestamp, errors.Errorf("invalid encoded mvcc key: %x", encodedKey)
+		return nil, hlc.Timestamp{}, errors.Errorf("invalid encoded mvcc key: %x", encodedKey)
 	}
-	switch len(ts) {
+	// NB: This logic is duplicated with storage.decodeMVCCTimestamp() to avoid the
+	// overhead of an additional function call (~13%).
+	var timestamp hlc.Timestamp
+	switch len(encodedTS) {
 	case 0:
 		// No-op.
 	case 8:
-		timestamp.WallTime = int64(binary.BigEndian.Uint64(ts[0:8]))
-	case 12:
-		timestamp.WallTime = int64(binary.BigEndian.Uint64(ts[0:8]))
-		timestamp.Logical = int32(binary.BigEndian.Uint32(ts[8:12]))
-	case 13:
-		timestamp.WallTime = int64(binary.BigEndian.Uint64(ts[0:8]))
-		timestamp.Logical = int32(binary.BigEndian.Uint32(ts[8:12]))
-		timestamp.Synthetic = ts[12] != 0
+		timestamp.WallTime = int64(binary.BigEndian.Uint64(encodedTS[0:8]))
+	case 12, 13:
+		timestamp.WallTime = int64(binary.BigEndian.Uint64(encodedTS[0:8]))
+		timestamp.Logical = int32(binary.BigEndian.Uint32(encodedTS[8:12]))
+		// NOTE: byte 13 used to store the timestamp's synthetic bit, but this is no
+		// longer consulted and can be ignored during decoding.
 	default:
-		return nil, timestamp, errors.Errorf(
-			"invalid encoded mvcc key: %x bad timestamp %x", encodedKey, ts)
+		return nil, hlc.Timestamp{}, errors.Errorf(
+			"invalid encoded mvcc key: %x bad timestamp %x", encodedKey, encodedTS)
 	}
-
 	return key, timestamp, nil
 }
 
@@ -119,4 +121,28 @@ func ScanDecodeKeyValueNoTS(repr []byte) (key []byte, value []byte, orepr []byte
 		return nil, nil, nil, errors.Errorf("invalid encoded mvcc key: %x", rawKey)
 	}
 	return key, value, ret, err
+}
+
+// ScanDecodeKeyValues decodes all key/value pairs returned in one or more
+// MVCCScan "batches" (this is not the RocksDB batch repr format). The provided
+// function is called for each key/value pair.
+func ScanDecodeKeyValues(
+	repr [][]byte, fn func(key []byte, ts hlc.Timestamp, rawBytes []byte) error,
+) error {
+	var k []byte
+	var ts hlc.Timestamp
+	var rawBytes []byte
+	var err error
+	for _, data := range repr {
+		for len(data) > 0 {
+			k, ts, rawBytes, data, err = ScanDecodeKeyValue(data)
+			if err != nil {
+				return err
+			}
+			if err = fn(k, ts, rawBytes); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

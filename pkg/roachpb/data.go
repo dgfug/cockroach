@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
@@ -26,12 +21,17 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -42,13 +42,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 const (
 	localPrefixByte = '\x01'
 	// LocalMaxByte is the end of the local key range.
 	LocalMaxByte = '\x02'
+	// PrevishKeyLength is a reasonable key length to use for Key.Prevish(),
+	// typically when peeking to the left of a known key. We want this to be as
+	// tight as possible, since it can e.g. be used for latch spans. However, the
+	// exact previous key has infinite length, so we assume that most keys are
+	// less than 1024 bytes, or have a fairly unique 1024-byte prefix.
+	PrevishKeyLength = 1024
 )
 
 var (
@@ -57,7 +62,7 @@ var (
 	// KeyMin is a minimum key value which sorts before all other keys.
 	KeyMin = Key(RKeyMin)
 	// RKeyMax is a maximum key value which sorts after all other keys.
-	RKeyMax = RKey{0xff, 0xff}
+	RKeyMax = RKey(keysbase.KeyMax)
 	// KeyMax is a maximum key value which sorts after all other keys.
 	KeyMax = Key(RKeyMax)
 
@@ -68,12 +73,23 @@ var (
 
 	// PrettyPrintKey prints a key in human readable format. It's
 	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
-	// package circle import.
+	// circular package import dependencies (see keys.PrettyPrint for
+	// implementation).
 	// valDirs correspond to the encoding direction of each encoded value
 	// in the key (if known). If left unspecified, the default encoding
 	// direction for each value type is used (see
 	// encoding.go:prettyPrintFirstValue).
+	// See SafeFormatKey for a redaction-safe implementation.
 	PrettyPrintKey func(valDirs []encoding.Direction, key Key) string
+
+	// SafeFormatKey is the generalized redaction function used to redact pretty
+	// printed keys. It's implemented in git.com/cockroachdb/cockroach/keys to
+	// avoid circular package import dependencies (see keys.SafeFormat for
+	// implementation).
+	// valDirs correspond to the encoding direction of each encoded value
+	// in the key (if known). If left unspecified, the default encoding
+	// direction for each value type is used (see encoding.go:prettyPrintFirstValue).
+	SafeFormatKey func(w redact.SafeWriter, valDirs []encoding.Direction, key Key)
 
 	// PrettyPrintRange prints a key range in human readable format. It's
 	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
@@ -115,7 +131,7 @@ func (rk RKey) Equal(other []byte) bool {
 // The method may only take a shallow copy of the RKey, so both the
 // receiver and the return value should be treated as immutable after.
 func (rk RKey) Next() RKey {
-	return RKey(BytesNext(rk))
+	return RKey(encoding.BytesNext(rk))
 }
 
 // PrefixEnd determines the end key given key as a prefix, that is the
@@ -123,62 +139,59 @@ func (rk RKey) Next() RKey {
 // is added to the final byte and the carry propagated. The special
 // cases of nil and KeyMin always returns KeyMax.
 func (rk RKey) PrefixEnd() RKey {
-	if len(rk) == 0 {
-		return RKeyMax
-	}
-	return RKey(bytesPrefixEnd(rk))
+	return RKey(keysbase.PrefixEnd(rk))
+}
+
+// SafeFormat - see Key.SafeFormat.
+func (rk RKey) SafeFormat(w redact.SafePrinter, r rune) {
+	rk.AsRawKey().SafeFormat(w, r)
 }
 
 func (rk RKey) String() string {
 	return Key(rk).String()
 }
 
-// StringWithDirs - see Key.String.WithDirs.
-func (rk RKey) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
-	return Key(rk).StringWithDirs(valDirs, maxLen)
+// StringWithDirs - see Key.StringWithDirs.
+func (rk RKey) StringWithDirs(valDirs []encoding.Direction) string {
+	var buf redact.StringBuilder
+	Key(rk).StringWithDirs(&buf, valDirs)
+	return buf.String()
 }
 
 // Key is a custom type for a byte string in proto
 // messages which refer to Cockroach keys.
 type Key []byte
 
-// BytesNext returns the next possible byte slice, using the extra capacity
-// of the provided slice if possible, and if not, appending an \x00.
-func BytesNext(b []byte) []byte {
-	if cap(b) > len(b) {
-		bNext := b[:len(b)+1]
-		if bNext[len(bNext)-1] == 0 {
-			return bNext
-		}
+// Clone returns a copy of the key.
+func (k Key) Clone() Key {
+	if k == nil {
+		return nil
 	}
-	// TODO(spencer): Do we need to enforce KeyMaxLength here?
-	// Switched to "make and copy" pattern in #4963 for performance.
-	bn := make([]byte, len(b)+1)
-	copy(bn, b)
-	bn[len(bn)-1] = 0
-	return bn
-}
-
-func bytesPrefixEnd(b []byte) []byte {
-	// Switched to "make and copy" pattern in #4963 for performance.
-	end := make([]byte, len(b))
-	copy(end, b)
-	for i := len(end) - 1; i >= 0; i-- {
-		end[i] = end[i] + 1
-		if end[i] != 0 {
-			return end[:i+1]
-		}
-	}
-	// This statement will only be reached if the key is already a
-	// maximal byte string (i.e. already \xff...).
-	return b
+	c := make(Key, len(k))
+	copy(c, k)
+	return c
 }
 
 // Next returns the next key in lexicographic sort order. The method may only
 // take a shallow copy of the Key, so both the receiver and the return
 // value should be treated as immutable after.
 func (k Key) Next() Key {
-	return Key(BytesNext(k))
+	return Key(encoding.BytesNext(k))
+}
+
+// Prevish returns a previous key in lexicographic sort order. It is impossible
+// in general to find the exact immediate predecessor key, because it has an
+// infinite number of 0xff bytes at the end, so this returns the nearest
+// previous key right-padded with 0xff up to length bytes. An infinite number of
+// keys may exist between Key and Key.Prevish(), as keys have unbounded length.
+// This also implies that k.Prevish().IsPrev(k) will often be false.
+//
+// PrevishKeyLength can be used as a reasonable length in most situations.
+//
+// The method may only take a shallow copy of the Key, so both the receiver and
+// the return value should be treated as immutable after.
+func (k Key) Prevish(length int) Key {
+	return Key(encoding.BytesPrevish(k, length))
 }
 
 // IsPrev is a more efficient version of k.Next().Equal(m).
@@ -192,10 +205,7 @@ func (k Key) IsPrev(m Key) bool {
 // is added to the final byte and the carry propagated. The special
 // cases of nil and KeyMin always returns KeyMax.
 func (k Key) PrefixEnd() Key {
-	if len(k) == 0 {
-		return Key(RKeyMax)
-	}
-	return Key(bytesPrefixEnd(k))
+	return Key(keysbase.PrefixEnd(k))
 }
 
 // Equal returns whether two keys are identical.
@@ -208,30 +218,31 @@ func (k Key) Compare(b Key) int {
 	return bytes.Compare(k, b)
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (k Key) SafeFormat(w redact.SafePrinter, _ rune) {
+	SafeFormatKey(w, nil /* valDirs */, k)
+}
+
 // String returns a string-formatted version of the key.
 func (k Key) String() string {
-	return k.StringWithDirs(nil /* valDirs */, 0 /* maxLen */)
+	return redact.StringWithoutMarkers(k)
 }
 
 // StringWithDirs is the value encoding direction-aware version of String.
 //
 // Args:
-// valDirs: The direction for the key's components, generally needed for correct
-// 	decoding. If nil, the values are pretty-printed with default encoding
-// 	direction.
-// maxLen: If not 0, only the first maxLen chars from the decoded key are
-//   returned, plus a "..." suffix.
-func (k Key) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
-	var s string
+//
+//	valDirs: The direction for the key's components, generally needed for
+//	correct decoding. If nil, the values are pretty-printed with default
+//	encoding direction.
+//
+//	returned, plus a "..." suffix.
+func (k Key) StringWithDirs(buf *redact.StringBuilder, valDirs []encoding.Direction) {
 	if PrettyPrintKey != nil {
-		s = PrettyPrintKey(valDirs, k)
+		buf.Print(PrettyPrintKey(valDirs, k))
 	} else {
-		s = fmt.Sprintf("%q", []byte(k))
+		buf.Printf("%q", []byte(k))
 	}
-	if maxLen != 0 && len(s) > maxLen {
-		return s[0:maxLen] + "..."
-	}
-	return s
 }
 
 // Format implements the fmt.Formatter interface.
@@ -252,13 +263,33 @@ const (
 	checksumSize          = 4
 	tagPos                = checksumSize
 	headerSize            = tagPos + 1
+
+	extendedMVCCValLenSize = 4
+	extendedPreludeSize    = extendedMVCCValLenSize + 1
 )
+
+var _ redact.SafeFormatter = ValueType(0)
+
+// Safeformat implements the redact.SafeFormatter interface.
+func (t ValueType) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.SafeString(redact.SafeString(t.String()))
+}
 
 func (v Value) checksum() uint32 {
 	if len(v.RawBytes) < checksumSize {
 		return 0
 	}
-	_, u, err := encoding.DecodeUint32Ascending(v.RawBytes[:checksumSize])
+
+	checksumStart := 0
+	if v.usesExtendedEncoding() {
+		extendedHeaderSize := int(extendedMVCCValLenSize + binary.BigEndian.Uint32(v.RawBytes))
+		if len(v.RawBytes) < extendedHeaderSize+headerSize {
+			return 0
+		}
+		checksumStart = extendedHeaderSize + 1
+	}
+
+	_, u, err := encoding.DecodeUint32Ascending(v.RawBytes[checksumStart : checksumStart+checksumSize])
 	if err != nil {
 		panic(err)
 	}
@@ -269,6 +300,10 @@ func (v *Value) setChecksum(cksum uint32) {
 	if len(v.RawBytes) >= checksumSize {
 		encoding.EncodeUint32Ascending(v.RawBytes[:0], cksum)
 	}
+}
+
+func (v *Value) usesExtendedEncoding() bool {
+	return len(v.RawBytes) > headerSize && v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL)
 }
 
 // InitChecksum initializes a checksum based on the provided key and
@@ -302,7 +337,7 @@ func (v Value) Verify(key []byte) error {
 	}
 	if sum := v.checksum(); sum != 0 {
 		if computedSum := v.computeChecksum(key); computedSum != sum {
-			return fmt.Errorf("%s: invalid checksum (%x) value [% x]",
+			return errors.Errorf("%s: invalid checksum (%x) value [% x]",
 				Key(key), computedSum, v.RawBytes)
 		}
 	}
@@ -328,7 +363,20 @@ func (v *Value) ShallowClone() *Value {
 
 // IsPresent returns true if the value is present (existent and not a tombstone).
 func (v *Value) IsPresent() bool {
-	return v != nil && len(v.RawBytes) != 0
+	if v == nil || len(v.RawBytes) == 0 {
+		return false
+	}
+	// TODO(ssd): This is a bit awkward because this is the right thing to
+	// do for production callers trying to determine if this value is a
+	// tombstone. But, many tests shove random strings into RawBytes, and in
+	// then case we'll hit this case if the 5th character of that string
+	// happens to be `e` (ascii 101). There aren't _that_ many callers to
+	// IsPresent(). We may just need to audit them all.
+	if v.usesExtendedEncoding() {
+		extendedHeaderSize := extendedPreludeSize + binary.BigEndian.Uint32(v.RawBytes)
+		return len(v.RawBytes) > int(extendedHeaderSize)
+	}
+	return true
 }
 
 // MakeValueFromString returns a value with bytes and tag set.
@@ -358,20 +406,64 @@ func (v Value) GetTag() ValueType {
 	if len(v.RawBytes) <= tagPos {
 		return ValueType_UNKNOWN
 	}
+	if v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		simpleTagPos := v.extendedSimpleTagPos()
+		if len(v.RawBytes) <= simpleTagPos {
+			return ValueType_UNKNOWN
+		}
+		return ValueType(v.RawBytes[simpleTagPos])
+	}
 	return ValueType(v.RawBytes[tagPos])
+}
+
+// GetMVCCValueHeader returns the MVCCValueHeader if one exists.
+func (v Value) GetMVCCValueHeader() (enginepb.MVCCValueHeader, error) {
+	if len(v.RawBytes) <= tagPos {
+		return enginepb.MVCCValueHeader{}, nil
+	}
+	if v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		extendedHeaderSize := extendedPreludeSize + binary.BigEndian.Uint32(v.RawBytes)
+		if len(v.RawBytes) < int(extendedHeaderSize) {
+			return enginepb.MVCCValueHeader{}, nil
+		}
+
+		parseBytes := v.RawBytes[extendedPreludeSize:extendedHeaderSize]
+		var vh enginepb.MVCCValueHeader
+		// NOTE: we don't use protoutil to avoid passing header through an interface,
+		// which would cause a heap allocation and incur the cost of dynamic dispatch.
+		if err := vh.Unmarshal(parseBytes); err != nil {
+			return enginepb.MVCCValueHeader{}, errors.Wrapf(err, "unmarshaling MVCCValueHeader")
+		}
+		return vh, nil
+	}
+	return enginepb.MVCCValueHeader{}, nil
 }
 
 func (v *Value) setTag(t ValueType) {
 	v.RawBytes[tagPos] = byte(t)
 }
 
+// extendedSimpleTagPos returns the position of the value tag assuming
+// that the value contains an enginepb.MVCCValueHeader.
+func (v Value) extendedSimpleTagPos() int {
+	return int(extendedMVCCValLenSize + binary.BigEndian.Uint32(v.RawBytes) + headerSize)
+}
+
 func (v Value) dataBytes() []byte {
+	if v.usesExtendedEncoding() {
+		simpleTagPos := v.extendedSimpleTagPos()
+		return v.RawBytes[simpleTagPos+1:]
+	}
 	return v.RawBytes[headerSize:]
 }
 
 // TagAndDataBytes returns the value's tag and data (no checksum, no timestamp).
 // This is suitable to be used as the expected value in a CPut.
 func (v Value) TagAndDataBytes() []byte {
+	if v.usesExtendedEncoding() {
+		simpleTagPos := v.extendedSimpleTagPos()
+		return v.RawBytes[simpleTagPos:]
+	}
 	return v.RawBytes[tagPos:]
 }
 
@@ -483,7 +575,7 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
 	v.ensureRawBytes(headerSize + msg.Size())
-	if _, err := protoutil.MarshalTo(msg, v.RawBytes[headerSize:]); err != nil {
+	if _, err := protoutil.MarshalToSizedBuffer(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
 	// Special handling for timeseries data.
@@ -556,7 +648,7 @@ func (v *Value) SetTuple(data []byte) {
 // BYTES an error will be returned.
 func (v Value) GetBytes() ([]byte, error) {
 	if tag := v.GetTag(); tag != ValueType_BYTES {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_BYTES, tag)
+		return nil, errors.Errorf("value type is not %s: %s", ValueType_BYTES, tag)
 	}
 	return v.dataBytes(), nil
 }
@@ -566,11 +658,11 @@ func (v Value) GetBytes() ([]byte, error) {
 // will be returned.
 func (v Value) GetFloat() (float64, error) {
 	if tag := v.GetTag(); tag != ValueType_FLOAT {
-		return 0, fmt.Errorf("value type is not %s: %s", ValueType_FLOAT, tag)
+		return 0, errors.Errorf("value type is not %s: %s", ValueType_FLOAT, tag)
 	}
 	dataBytes := v.dataBytes()
 	if len(dataBytes) != 8 {
-		return 0, fmt.Errorf("float64 value should be exactly 8 bytes: %d", len(dataBytes))
+		return 0, errors.Errorf("float64 value should be exactly 8 bytes: %d", len(dataBytes))
 	}
 	_, u, err := encoding.DecodeUint64Ascending(dataBytes)
 	if err != nil {
@@ -583,7 +675,7 @@ func (v Value) GetFloat() (float64, error) {
 // tag is not GEO an error will be returned.
 func (v Value) GetGeo() (geopb.SpatialObject, error) {
 	if tag := v.GetTag(); tag != ValueType_GEO {
-		return geopb.SpatialObject{}, fmt.Errorf("value type is not %s: %s", ValueType_GEO, tag)
+		return geopb.SpatialObject{}, errors.Errorf("value type is not %s: %s", ValueType_GEO, tag)
 	}
 	var ret geopb.SpatialObject
 	err := protoutil.Unmarshal(v.dataBytes(), &ret)
@@ -595,11 +687,11 @@ func (v Value) GetGeo() (geopb.SpatialObject, error) {
 func (v Value) GetBox2D() (geopb.BoundingBox, error) {
 	box := geopb.BoundingBox{}
 	if tag := v.GetTag(); tag != ValueType_BOX2D {
-		return box, fmt.Errorf("value type is not %s: %s", ValueType_BOX2D, tag)
+		return box, errors.Errorf("value type is not %s: %s", ValueType_BOX2D, tag)
 	}
 	dataBytes := v.dataBytes()
 	if len(dataBytes) != 32 {
-		return box, fmt.Errorf("float64 value should be exactly 32 bytes: %d", len(dataBytes))
+		return box, errors.Errorf("float64 value should be exactly 32 bytes: %d", len(dataBytes))
 	}
 	var err error
 	var val uint64
@@ -632,14 +724,14 @@ func (v Value) GetBox2D() (geopb.BoundingBox, error) {
 // an error will be returned.
 func (v Value) GetBool() (bool, error) {
 	if tag := v.GetTag(); tag != ValueType_INT {
-		return false, fmt.Errorf("value type is not %s: %s", ValueType_INT, tag)
+		return false, errors.Errorf("value type is not %s: %s", ValueType_INT, tag)
 	}
 	i, n := binary.Varint(v.dataBytes())
 	if n <= 0 {
-		return false, fmt.Errorf("int64 varint decoding failed: %d", n)
+		return false, errors.Errorf("int64 varint decoding failed: %d", n)
 	}
 	if i > 1 || i < 0 {
-		return false, fmt.Errorf("invalid bool: %d", i)
+		return false, errors.Errorf("invalid bool: %d", i)
 	}
 	return i != 0, nil
 }
@@ -648,11 +740,11 @@ func (v Value) GetBool() (bool, error) {
 // tag is not INT or the value cannot be decoded an error will be returned.
 func (v Value) GetInt() (int64, error) {
 	if tag := v.GetTag(); tag != ValueType_INT {
-		return 0, fmt.Errorf("value type is not %s: %s", ValueType_INT, tag)
+		return 0, errors.Errorf("value type is not %s: %s", ValueType_INT, tag)
 	}
 	i, n := binary.Varint(v.dataBytes())
 	if n <= 0 {
-		return 0, fmt.Errorf("int64 varint decoding failed: %d", n)
+		return 0, errors.Errorf("int64 varint decoding failed: %d", n)
 	}
 	return i, nil
 }
@@ -669,7 +761,7 @@ func (v Value) GetProto(msg protoutil.Message) error {
 	}
 
 	if tag := v.GetTag(); tag != expectedTag {
-		return fmt.Errorf("value type is not %s: %s", expectedTag, tag)
+		return errors.Errorf("value type is not %s: %s", expectedTag, tag)
 	}
 	return protoutil.Unmarshal(v.dataBytes(), msg)
 }
@@ -678,7 +770,7 @@ func (v Value) GetProto(msg protoutil.Message) error {
 // tag is not TIME an error will be returned.
 func (v Value) GetTime() (time.Time, error) {
 	if tag := v.GetTag(); tag != ValueType_TIME {
-		return time.Time{}, fmt.Errorf("value type is not %s: %s", ValueType_TIME, tag)
+		return time.Time{}, errors.Errorf("value type is not %s: %s", ValueType_TIME, tag)
 	}
 	_, t, err := encoding.DecodeTimeAscending(v.dataBytes())
 	return t, err
@@ -688,7 +780,7 @@ func (v Value) GetTime() (time.Time, error) {
 // tag is not TIMETZ an error will be returned.
 func (v Value) GetTimeTZ() (timetz.TimeTZ, error) {
 	if tag := v.GetTag(); tag != ValueType_TIMETZ {
-		return timetz.TimeTZ{}, fmt.Errorf("value type is not %s: %s", ValueType_TIMETZ, tag)
+		return timetz.TimeTZ{}, errors.Errorf("value type is not %s: %s", ValueType_TIMETZ, tag)
 	}
 	_, t, err := encoding.DecodeTimeTZAscending(v.dataBytes())
 	return t, err
@@ -698,7 +790,7 @@ func (v Value) GetTimeTZ() (timetz.TimeTZ, error) {
 // the tag is not DURATION an error will be returned.
 func (v Value) GetDuration() (duration.Duration, error) {
 	if tag := v.GetTag(); tag != ValueType_DURATION {
-		return duration.Duration{}, fmt.Errorf("value type is not %s: %s", ValueType_DURATION, tag)
+		return duration.Duration{}, errors.Errorf("value type is not %s: %s", ValueType_DURATION, tag)
 	}
 	_, t, err := encoding.DecodeDurationAscending(v.dataBytes())
 	return t, err
@@ -708,7 +800,7 @@ func (v Value) GetDuration() (duration.Duration, error) {
 // the tag is not BITARRAY an error will be returned.
 func (v Value) GetBitArray() (bitarray.BitArray, error) {
 	if tag := v.GetTag(); tag != ValueType_BITARRAY {
-		return bitarray.BitArray{}, fmt.Errorf("value type is not %s: %s", ValueType_BITARRAY, tag)
+		return bitarray.BitArray{}, errors.Errorf("value type is not %s: %s", ValueType_BITARRAY, tag)
 	}
 	_, t, err := encoding.DecodeUntaggedBitArrayValue(v.dataBytes())
 	return t, err
@@ -718,7 +810,7 @@ func (v Value) GetBitArray() (bitarray.BitArray, error) {
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimal() (apd.Decimal, error) {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
-		return apd.Decimal{}, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+		return apd.Decimal{}, errors.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeNonsortingDecimal(v.dataBytes(), nil)
 }
@@ -728,7 +820,7 @@ func (v Value) GetDecimal() (apd.Decimal, error) {
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimalInto(d *apd.Decimal) error {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
-		return fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+		return errors.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeIntoNonsortingDecimal(d, v.dataBytes(), nil)
 }
@@ -750,7 +842,7 @@ func (v Value) GetTimeseries() (InternalTimeSeriesData, error) {
 // error will be returned.
 func (v Value) GetTuple() ([]byte, error) {
 	if tag := v.GetTag(); tag != ValueType_TUPLE {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_TUPLE, tag)
+		return nil, errors.Errorf("value type is not %s: %s", ValueType_TUPLE, tag)
 	}
 	return v.dataBytes(), nil
 }
@@ -765,6 +857,15 @@ func computeChecksum(key, rawBytes []byte, crc hash.Hash32) uint32 {
 	if len(rawBytes) < headerSize {
 		return 0
 	}
+
+	if rawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		simpleValueStart := extendedMVCCValLenSize + binary.BigEndian.Uint32(rawBytes) + 1
+		rawBytes = rawBytes[simpleValueStart:]
+		if len(rawBytes) < headerSize {
+			return 0
+		}
+	}
+
 	if _, err := crc.Write(key); err != nil {
 		panic(err)
 	}
@@ -796,10 +897,18 @@ func (v Value) computeChecksum(key []byte) uint32 {
 // In `1:3:Float/6.28`, the `1` is the column id diff as stored, `3` is the
 // computed (i.e. not stored) actual column id, `Float` is the type, and `6.28`
 // is the encoded value.
-func (v Value) PrettyPrint() string {
+func (v Value) PrettyPrint() (ret string) {
 	if len(v.RawBytes) == 0 {
 		return "/<empty>"
 	}
+	// In certain cases untagged bytes could be malformed because they are
+	// coming from user input, in which case recover with an error instead
+	// of crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			ret = fmt.Sprintf("/<err: paniced parsing with %v>", r)
+		}
+	}()
 	var buf bytes.Buffer
 	t := v.GetTag()
 	buf.WriteRune('/')
@@ -871,6 +980,29 @@ func (v Value) PrettyPrint() string {
 	return buf.String()
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (sp StoreProperties) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.SafeString(redact.SafeString(sp.Dir))
+	w.SafeString(":")
+	if sp.ReadOnly {
+		w.SafeString(" ro")
+	} else {
+		w.SafeString(" rw")
+	}
+	w.Printf(" encrypted=%t", sp.Encrypted)
+	if sp.WalFailoverPath != nil {
+		w.Printf(" wal_failover_path=%s", redact.SafeString(*sp.WalFailoverPath))
+	}
+	if sp.FileStoreProperties != nil {
+		w.SafeString(" fs:{")
+		w.Printf("bdev=%s", redact.SafeString(sp.FileStoreProperties.BlockDevice))
+		w.Printf(" fstype=%s", redact.SafeString(sp.FileStoreProperties.FsType))
+		w.Printf(" mountpoint=%s", redact.SafeString(sp.FileStoreProperties.MountPoint))
+		w.Printf(" mountopts=%s", redact.SafeString(sp.FileStoreProperties.MountOptions))
+		w.SafeString("}")
+	}
+}
+
 // Kind returns the kind of commit trigger as a string.
 func (ct InternalCommitTrigger) Kind() redact.SafeString {
 	switch {
@@ -882,12 +1014,10 @@ func (ct InternalCommitTrigger) Kind() redact.SafeString {
 		return "change-replicas"
 	case ct.ModifiedSpanTrigger != nil:
 		switch {
-		case ct.ModifiedSpanTrigger.SystemConfigSpan:
-			return "modified-span (system-config)"
 		case ct.ModifiedSpanTrigger.NodeLivenessSpan != nil:
 			return "modified-span (node-liveness)"
 		default:
-			panic("unknown modified-span commit trigger kind")
+			panic(fmt.Sprintf("unknown modified-span commit trigger kind %v", ct))
 		}
 	case ct.StickyBitTrigger != nil:
 		return "sticky-bit"
@@ -914,40 +1044,61 @@ func (TransactionStatus) SafeValue() {}
 // write conflicts in a way that avoids starvation of long-running
 // transactions (see Replica.PushTxn).
 //
+// coordinatorNodeID is provided to track the SQL (or possibly KV) node
+// that created this transaction, in order to be used (as
+// of this writing) to enable observability on contention events
+// between different transactions.
+//
 // baseKey can be nil, in which case it will be set when sending the first
 // write.
+//
+// omitInRangefeeds controls whether the transaction's writes are exposed via
+// rangefeeds. When set to true, all the transaction's writes will be
+// filtered out by rangefeeds, and will not be available in changefeeds.
 func MakeTransaction(
-	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
+	name string,
+	baseKey Key,
+	isoLevel isolation.Level,
+	userPriority UserPriority,
+	now hlc.Timestamp,
+	maxOffsetNs int64,
+	coordinatorNodeID int32,
+	admissionPriority admissionpb.WorkPriority,
+	omitInRangefeeds bool,
 ) Transaction {
-	u := uuid.FastMakeV4()
-	// TODO(nvanbenschoten): technically, gul should be a synthetic timestamp.
-	// Make this change in v21.2 when all nodes in a cluster are guaranteed to
-	// be aware of synthetic timestamps by addressing the TODO in Timestamp.Add.
+	u := uuid.MakeV4()
 	gul := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
-			Key:            baseKey,
-			ID:             u,
-			WriteTimestamp: now,
-			MinTimestamp:   now,
-			Priority:       MakePriority(userPriority),
-			Sequence:       0, // 1-indexed, incremented before each Request
+			Key:               baseKey,
+			ID:                u,
+			IsoLevel:          isoLevel,
+			WriteTimestamp:    now,
+			MinTimestamp:      now,
+			Priority:          MakePriority(userPriority),
+			Sequence:          0, // 1-indexed, incremented before each Request
+			CoordinatorNodeID: coordinatorNodeID,
 		},
 		Name:                   name,
 		LastHeartbeat:          now,
 		ReadTimestamp:          now,
 		GlobalUncertaintyLimit: gul,
+		AdmissionPriority:      int32(admissionPriority),
+		// When set to true OmitInRangefeeds indicates that none of the
+		// transaction's writes will appear in rangefeeds. Should be set to false
+		// for all transactions that write to internal system tables and most other
+		// transactions unless specifically stated otherwise (e.g. by the
+		// disable_changefeed_replication session variable).
+		OmitInRangefeeds: omitInRangefeeds,
 	}
 }
 
 // LastActive returns the last timestamp at which client activity definitely
-// occurred, i.e. the maximum of ReadTimestamp and LastHeartbeat.
+// occurred, i.e. the maximum of MinTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
-	ts := t.LastHeartbeat
-	if !t.ReadTimestamp.Synthetic {
-		ts.Forward(t.ReadTimestamp)
-	}
+	ts := t.MinTimestamp
+	ts.Forward(t.LastHeartbeat)
 	return ts
 }
 
@@ -998,6 +1149,35 @@ func (t *Transaction) AssertInitialized(ctx context.Context) {
 		log.Fatalf(ctx, "uninitialized txn: %s", *t)
 	}
 }
+
+// UserPriority is a custom type for transaction's user priority.
+type UserPriority float64
+
+func (up UserPriority) String() string {
+	switch up {
+	case MinUserPriority:
+		return "low"
+	case UnspecifiedUserPriority, NormalUserPriority:
+		return "normal"
+	case MaxUserPriority:
+		return "high"
+	default:
+		return fmt.Sprintf("%g", float64(up))
+	}
+}
+
+const (
+	// MinUserPriority is the minimum allowed user priority.
+	MinUserPriority UserPriority = 0.001
+	// UnspecifiedUserPriority means NormalUserPriority.
+	UnspecifiedUserPriority UserPriority = 0
+	// NormalUserPriority is set to 1, meaning ops run through the database
+	// are all given equal weight when a random priority is chosen. This can
+	// be set specifically via client.NewDBWithPriority().
+	NormalUserPriority UserPriority = 1
+	// MaxUserPriority is the maximum allowed user priority.
+	MaxUserPriority UserPriority = 1000
+)
 
 // MakePriority generates a random priority value, biased by the specified
 // userPriority. If userPriority=100, the random priority will be 100x more
@@ -1105,7 +1285,7 @@ func (t *Transaction) Restart(
 	// Reset all epoch-scoped state.
 	t.Sequence = 0
 	t.WriteTooOld = false
-	t.CommitTimestampFixed = false
+	t.ReadTimestampFixed = false
 	t.LockSpans = nil
 	t.InFlightWrites = nil
 	t.IgnoredSeqNums = nil
@@ -1118,12 +1298,34 @@ func (t *Transaction) BumpEpoch() {
 	t.Epoch++
 }
 
-// Refresh reconfigures a transaction to account for a read refresh up to the
-// specified timestamp. For details about transaction read refreshes, see the
-// comment on txnSpanRefresher.
-func (t *Transaction) Refresh(timestamp hlc.Timestamp) {
-	t.WriteTimestamp.Forward(timestamp)
-	t.ReadTimestamp.Forward(t.WriteTimestamp)
+// BumpReadTimestamp forwards the transaction's read timestamp to the provided
+// timestamp. It also forwards its write timestamp, if necessary, to ensure that
+// its write timestamp is always greater than or equal to its read timestamp.
+//
+// A transaction's write timestamp serves as a lower bound on its commit
+// timestamp. It is free to advance over the course of the transaction's
+// lifetime when experiencing read-write or write-write contention. The write
+// timestamp can advance without restraint or prior validation.
+//
+// A transaction's read timestamp establishes the consistent read snapshot that
+// the transaction observes when reading data. Unlike the write timestamp, the
+// read timestamp is not free to advance, except in specific circumstances.
+// Movement of the read timestamp outside these circumstances would break the
+// consistent view of data that the transaction is meaning to provide. The read
+// can be advanced in three situations:
+//   - When a transaction restarts and moves to a new epoch. At this time, the
+//     reads and writes performed in the prior epoch(s) are considered invalid
+//     and the read snapshot can be re-established using a new read timestamp.
+//   - When a transaction performs a read refresh, having validated that all
+//     prior reads are equivalent at the old and new read timestamp. For details
+//     about transaction read refreshes, see the comment on txnSpanRefresher.
+//   - When the transaction reaches a statement boundary, if the transaction's
+//     isolation level permits it to observe a different read snapshot on each
+//     statement. For more, see the comment on isolation.Level.
+func (t *Transaction) BumpReadTimestamp(timestamp hlc.Timestamp) {
+	t.ReadTimestamp.Forward(timestamp)
+	t.WriteTimestamp.Forward(t.ReadTimestamp)
+	// TODO(nvanbenschoten): remove this when the WriteTooOld flag is removed.
 	t.WriteTooOld = false
 }
 
@@ -1131,28 +1333,36 @@ func (t *Transaction) Refresh(timestamp hlc.Timestamp) {
 // others) for the transaction. If t.ID is empty, then the transaction is
 // copied from o.
 func (t *Transaction) Update(o *Transaction) {
+	ctx := context.TODO()
 	if o == nil {
 		return
 	}
-	o.AssertInitialized(context.TODO())
+	o.AssertInitialized(ctx)
 	if t.ID == (uuid.UUID{}) {
 		*t = *o
 		return
 	} else if t.ID != o.ID {
-		log.Fatalf(context.Background(), "updating txn %s with different txn %s", t.String(), o.String())
+		log.Fatalf(ctx, "updating txn %s with different txn %s", t.String(), o.String())
 		return
 	}
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
+	t.IsoLevel = o.IsoLevel
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
+		// Ensure that the transaction status makes sense. If the transaction
+		// has already been finalized, then it should remain finalized.
+		if !t.Status.IsFinalized() {
+			t.Status = o.Status
+		} else if t.Status == COMMITTED {
+			log.Warningf(ctx, "updating COMMITTED txn %s with txn at later epoch %s", t.String(), o.String())
+		}
 		// Replace all epoch-scoped state.
 		t.Epoch = o.Epoch
-		t.Status = o.Status
 		t.WriteTooOld = o.WriteTooOld
-		t.CommitTimestampFixed = o.CommitTimestampFixed
+		t.ReadTimestampFixed = o.ReadTimestampFixed
 		t.Sequence = o.Sequence
 		t.LockSpans = o.LockSpans
 		t.InFlightWrites = o.InFlightWrites
@@ -1168,7 +1378,7 @@ func (t *Transaction) Update(o *Transaction) {
 			}
 		case ABORTED:
 			if o.Status == COMMITTED {
-				log.Warningf(context.Background(), "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
+				log.Warningf(ctx, "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
 			}
 		case COMMITTED:
 			// Nothing to do.
@@ -1178,7 +1388,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// If neither of the transactions has a bumped ReadTimestamp, then the
 			// WriteTooOld flag is cumulative.
 			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
-			t.CommitTimestampFixed = t.CommitTimestampFixed || o.CommitTimestampFixed
+			t.ReadTimestampFixed = t.ReadTimestampFixed || o.ReadTimestampFixed
 		} else if t.ReadTimestamp.Less(o.ReadTimestamp) {
 			// If `o` has a higher ReadTimestamp (i.e. it's the result of a refresh,
 			// which refresh generally clears the WriteTooOld field), then it dictates
@@ -1186,7 +1396,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// concurrently with any requests whose response's WriteTooOld field
 			// matters.
 			t.WriteTooOld = o.WriteTooOld
-			t.CommitTimestampFixed = o.CommitTimestampFixed
+			t.ReadTimestampFixed = o.ReadTimestampFixed
 		}
 		// If t has a higher ReadTimestamp, than it gets to dictate the
 		// WriteTooOld field - so there's nothing to update.
@@ -1213,7 +1423,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// aborted.
 			t.Status = ABORTED
 		case COMMITTED:
-			log.Warningf(context.Background(), "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+			log.Warningf(ctx, "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
 		}
 	}
 
@@ -1239,6 +1449,24 @@ func (t *Transaction) Update(o *Transaction) {
 
 	// Ratchet the transaction priority.
 	t.UpgradePriority(o.Priority)
+
+	// The following fields are not present in TransactionRecord, so we need to be
+	// careful when updating them since Transaction o might be coming from a
+	// TransactionRecord. If the fields were previously set, do not overwrite them
+	// with the default values. Conversely, if the fields were previously unset,
+	// allow updating them to handle the case when a Transaction proto updates a
+	// TransactionRecord proto.
+
+	// AdmissionPriority doesn't change after the transaction is created, so we
+	// don't ever expect to change it from a non-zero value to 0.
+	if o.AdmissionPriority != 0 {
+		t.AdmissionPriority = o.AdmissionPriority
+	}
+	// OmitInRangefeeds doesn't change after the transaction is created, so we
+	// don't ever expect to change it from true to false.
+	if o.OmitInRangefeeds {
+		t.OmitInRangefeeds = o.OmitInRangefeeds
+	}
 }
 
 // UpgradePriority sets transaction priority to the maximum of current
@@ -1336,28 +1564,29 @@ func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.ClockTimestamp, b
 //
 // Additionally, the caller must ensure:
 //
-// 1) if the new range overlaps with some range in the list, then it
-//    also overlaps with every subsequent range in the list.
+//  1. if the new range overlaps with some range in the list, then it
+//     also overlaps with every subsequent range in the list.
 //
-// 2) the new range's "end" seqnum is larger or equal to the "end"
-//    seqnum of the last element in the list.
+//  2. the new range's "end" seqnum is larger or equal to the "end"
+//     seqnum of the last element in the list.
 //
 // For example:
-//     current list [3 5] [10 20] [22 24]
-//     new item:    [8 26]
-//     final list:  [3 5] [8 26]
 //
-//     current list [3 5] [10 20] [22 24]
-//     new item:    [28 32]
-//     final list:  [3 5] [10 20] [22 24] [28 32]
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [8 26]
+//	final list:  [3 5] [8 26]
+//
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [28 32]
+//	final list:  [3 5] [10 20] [22 24] [28 32]
 //
 // This corresponds to savepoints semantics:
 //
-// - Property 1 says that a rollback to an earlier savepoint
-//   rolls back over all writes following that savepoint.
-// - Property 2 comes from that the new range's 'end' seqnum is the
-//   current write seqnum and thus larger than or equal to every
-//   previously seen value.
+//   - Property 1 says that a rollback to an earlier savepoint
+//     rolls back over all writes following that savepoint.
+//   - Property 2 comes from that the new range's 'end' seqnum is the
+//     current write seqnum and thus larger than or equal to every
+//     previously seen value.
 func (t *Transaction) AddIgnoredSeqNumRange(newRange enginepb.IgnoredSeqNumRange) {
 	// Truncate the list at the last element not included in the new range.
 
@@ -1397,181 +1626,6 @@ func (tr *TransactionRecord) AsTransaction() Transaction {
 	t.InFlightWrites = tr.InFlightWrites
 	t.IgnoredSeqNums = tr.IgnoredSeqNums
 	return t
-}
-
-// PrepareTransactionForRetry returns a new Transaction to be used for retrying
-// the original Transaction. Depending on the error, this might return an
-// already-existing Transaction with an incremented epoch, or a completely new
-// Transaction.
-//
-// The caller should generally check that the error was meant for this
-// Transaction before calling this.
-//
-// pri is the priority that should be used when giving the restarted transaction
-// the chance to get a higher priority. Not used when the transaction is being
-// aborted.
-//
-// In case retryErr tells us that a new Transaction needs to be created,
-// isolation and name help initialize this new transaction.
-func PrepareTransactionForRetry(
-	ctx context.Context, pErr *Error, pri UserPriority, clock *hlc.Clock,
-) Transaction {
-	if pErr.TransactionRestart() == TransactionRestart_NONE {
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
-	}
-
-	if pErr.GetTxn() == nil {
-		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
-	}
-
-	txn := *pErr.GetTxn()
-	aborted := false
-	switch tErr := pErr.GetDetail().(type) {
-	case *TransactionAbortedError:
-		// The txn coming with a TransactionAbortedError is not supposed to be used
-		// for the restart. Instead, a brand new transaction is created.
-		aborted = true
-		// TODO(andrei): Should we preserve the ObservedTimestamps across the
-		// restart?
-		errTxnPri := txn.Priority
-		// Start the new transaction at the current time from the local clock.
-		// The local hlc should have been advanced to at least the error's
-		// timestamp already.
-		now := clock.NowAsClockTimestamp()
-		txn = MakeTransaction(
-			txn.Name,
-			nil, // baseKey
-			// We have errTxnPri, but this wants a UserPriority. So we're going to
-			// overwrite the priority below.
-			NormalUserPriority,
-			now.ToTimestamp(),
-			clock.MaxOffset().Nanoseconds(),
-		)
-		// Use the priority communicated back by the server.
-		txn.Priority = errTxnPri
-	case *ReadWithinUncertaintyIntervalError:
-		txn.WriteTimestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(tErr))
-	case *TransactionPushError:
-		// Increase timestamp if applicable, ensuring that we're just ahead of
-		// the pushee.
-		txn.WriteTimestamp.Forward(tErr.PusheeTxn.WriteTimestamp)
-		txn.UpgradePriority(tErr.PusheeTxn.Priority - 1)
-	case *TransactionRetryError:
-		// Transaction.Timestamp has already been forwarded to be ahead of any
-		// timestamp cache entries or newer versions which caused the restart.
-		if tErr.Reason == RETRY_SERIALIZABLE {
-			// For RETRY_SERIALIZABLE case, we want to bump timestamp further than
-			// timestamp cache.
-			// This helps transactions that had their commit timestamp fixed (See
-			// roachpb.Transaction.CommitTimestampFixed for details on when it happens)
-			// or transactions that hit read-write contention and can't bump
-			// read timestamp because of later writes.
-			// Upon retry, we want those transactions to restart on now() instead of
-			// closed ts to give them some time to complete without a need to refresh
-			// read spans yet again and possibly fail.
-			// The tradeoff here is that transactions that failed because they were
-			// waiting on locks or were slowed down in their first epoch for any other
-			// reason (e.g. lease transfers, network congestion, node failure, etc.)
-			// would have a chance to retry and succeed, but transactions that are
-			// just slow would still retry indefinitely and delay transactions that
-			// try to write to the keys this transaction reads because reads are not
-			// in the past anymore.
-			now := clock.Now()
-			txn.WriteTimestamp.Forward(now)
-		}
-	case *WriteTooOldError:
-		// Increase the timestamp to the ts at which we've actually written.
-		txn.WriteTimestamp.Forward(writeTooOldRetryTimestamp(tErr))
-	default:
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
-	}
-	if !aborted {
-		if txn.Status.IsFinalized() {
-			log.Fatalf(ctx, "transaction unexpectedly finalized in (%T): %s", pErr.GetDetail(), pErr)
-		}
-		txn.Restart(pri, txn.Priority, txn.WriteTimestamp)
-	}
-	return txn
-}
-
-// PrepareTransactionForRefresh returns whether the transaction can be refreshed
-// to the specified timestamp to avoid a client-side transaction restart. If
-// true, returns a cloned, updated Transaction object with the provisional
-// commit timestamp and read timestamp set appropriately.
-func PrepareTransactionForRefresh(txn *Transaction, timestamp hlc.Timestamp) (bool, *Transaction) {
-	if txn.CommitTimestampFixed {
-		return false, nil
-	}
-	newTxn := txn.Clone()
-	newTxn.Refresh(timestamp)
-	return true, newTxn
-}
-
-// CanTransactionRefresh returns whether the transaction specified in the
-// supplied error can be retried at a refreshed timestamp to avoid a client-side
-// transaction restart. If true, returns a cloned, updated Transaction object
-// with the provisional commit timestamp and read timestamp set appropriately.
-func CanTransactionRefresh(ctx context.Context, pErr *Error) (bool, *Transaction) {
-	txn := pErr.GetTxn()
-	if txn == nil {
-		return false, nil
-	}
-	timestamp := txn.WriteTimestamp
-	switch err := pErr.GetDetail().(type) {
-	case *TransactionRetryError:
-		if err.Reason != RETRY_SERIALIZABLE && err.Reason != RETRY_WRITE_TOO_OLD {
-			return false, nil
-		}
-	case *WriteTooOldError:
-		// TODO(andrei): Chances of success for on write-too-old conditions might be
-		// usually small: if our txn previously read the key that generated this
-		// error, obviously the refresh will fail. It might be worth trying to
-		// detect these cases and save the futile attempt; we'd need to have access
-		// to the key that generated the error.
-		timestamp.Forward(writeTooOldRetryTimestamp(err))
-	case *ReadWithinUncertaintyIntervalError:
-		timestamp.Forward(readWithinUncertaintyIntervalRetryTimestamp(err))
-	default:
-		return false, nil
-	}
-	return PrepareTransactionForRefresh(txn, timestamp)
-}
-
-func readWithinUncertaintyIntervalRetryTimestamp(
-	err *ReadWithinUncertaintyIntervalError,
-) hlc.Timestamp {
-	// If the reader encountered a newer write within the uncertainty interval,
-	// we advance the txn's timestamp just past the uncertain value's timestamp.
-	// This ensures that we read above the uncertain value on a retry.
-	ts := err.ExistingTimestamp.Next()
-	// In addition to advancing past the uncertainty value's timestamp, we also
-	// advance the txn's timestamp up to the local uncertainty limit on the node
-	// which hit the error. This ensures that no future read after the retry on
-	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
-	// and values with synthetic timestamps) will throw an uncertainty error,
-	// even when reading other keys.
-	//
-	// Note that if the request was not able to establish a local uncertainty
-	// limit due to a missing observed timestamp (for instance, if the request
-	// was evaluated on a follower replica and the txn had never visited the
-	// leaseholder), then LocalUncertaintyLimit will be empty and the Forward
-	// will be a no-op. In this case, we could advance all the way past the
-	// global uncertainty limit, but this time would likely be in the future, so
-	// this would necessitate a commit-wait period after committing.
-	//
-	// In general, we expect the local uncertainty limit, if set, to be above
-	// the uncertainty value's timestamp. So we expect this Forward to advance
-	// ts. However, this is not always the case. The one exception is if the
-	// uncertain value had a synthetic timestamp, so it was compared against the
-	// global uncertainty limit to determine uncertainty (see IsUncertain). In
-	// such cases, we're ok advancing just past the value's timestamp. Either
-	// way, we won't see the same value in our uncertainty interval on a retry.
-	ts.Forward(err.LocalUncertaintyLimit)
-	return ts
-}
-
-func writeTooOldRetryTimestamp(err *WriteTooOldError) hlc.Timestamp {
-	return err.ActualTimestamp
 }
 
 // Replicas returns all of the replicas present in the descriptor after this
@@ -1615,7 +1669,7 @@ func confChangeImpl(
 	checkExists := func(in ReplicaDescriptor) error {
 		for _, rDesc := range replicas {
 			if rDesc.ReplicaID == in.ReplicaID {
-				if a, b := in.GetType(), rDesc.GetType(); a != b {
+				if in.Type != rDesc.Type {
 					return errors.Errorf("have %s, but descriptor has %s", in, rDesc)
 				}
 				return nil
@@ -1635,16 +1689,10 @@ func confChangeImpl(
 	for _, rDesc := range removed {
 		sl = append(sl, raftpb.ConfChangeSingle{
 			Type:   raftpb.ConfChangeRemoveNode,
-			NodeID: uint64(rDesc.ReplicaID),
+			NodeID: raftpb.PeerID(rDesc.ReplicaID),
 		})
 
-		switch rDesc.GetType() {
-		case VOTER_OUTGOING:
-			// If a voter is removed through joint consensus, it will
-			// be turned into an outgoing voter first.
-			if err := checkExists(rDesc); err != nil {
-				return nil, err
-			}
+		switch rDesc.Type {
 		case VOTER_DEMOTING_LEARNER, VOTER_DEMOTING_NON_VOTER:
 			// If a voter is demoted through joint consensus, it will
 			// be turned into a demoting voter first.
@@ -1654,7 +1702,7 @@ func confChangeImpl(
 			// It's being re-added as a learner, not only removed.
 			sl = append(sl, raftpb.ConfChangeSingle{
 				Type:   raftpb.ConfChangeAddLearnerNode,
-				NodeID: uint64(rDesc.ReplicaID),
+				NodeID: raftpb.PeerID(rDesc.ReplicaID),
 			})
 		case LEARNER:
 			// A learner could in theory show up in the descriptor if the removal was
@@ -1672,13 +1720,8 @@ func confChangeImpl(
 			if err := checkNotExists(rDesc); err != nil {
 				return nil, err
 			}
-		case VOTER_FULL:
-			// A voter can't be in the descriptor if it's being removed.
-			if err := checkNotExists(rDesc); err != nil {
-				return nil, err
-			}
 		default:
-			return nil, errors.Errorf("can't remove replica in state %v", rDesc.GetType())
+			return nil, errors.Errorf("removal of %v unsafe, demote to LEARNER first", rDesc.Type)
 		}
 	}
 
@@ -1691,7 +1734,7 @@ func confChangeImpl(
 		}
 
 		var changeType raftpb.ConfChangeType
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_FULL:
 			// We're adding a new voter.
 			changeType = raftpb.ConfChangeAddNode
@@ -1710,11 +1753,11 @@ func confChangeImpl(
 			// A voter that is demoting was just removed and re-added in the
 			// `removals` handler. We should not see it again here.
 			// A voter that's outgoing similarly has no reason to show up here.
-			return nil, errors.Errorf("can't add replica in state %v", rDesc.GetType())
+			return nil, errors.Errorf("can't add replica in state %v", rDesc.Type)
 		}
 		sl = append(sl, raftpb.ConfChangeSingle{
 			Type:   changeType,
-			NodeID: uint64(rDesc.ReplicaID),
+			NodeID: raftpb.PeerID(rDesc.ReplicaID),
 		})
 	}
 
@@ -1724,7 +1767,7 @@ func confChangeImpl(
 	// descriptor already.
 	var enteringJoint bool
 	for _, rDesc := range replicas {
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_INCOMING, VOTER_OUTGOING, VOTER_DEMOTING_LEARNER, VOTER_DEMOTING_NON_VOTER:
 			enteringJoint = true
 		default:
@@ -1859,10 +1902,13 @@ func (crt ChangeReplicasTrigger) Removed() []ReplicaDescriptor {
 }
 
 // LeaseSequence is a custom type for a lease sequence number.
-type LeaseSequence int64
+type LeaseSequence uint64
 
 // SafeValue implements the redact.SafeValue interface.
 func (s LeaseSequence) SafeValue() {}
+
+// SafeValue implements the redact.SafeValue interface.
+func (LeaseAcquisitionType) SafeValue() {}
 
 var _ fmt.Stringer = &Lease{}
 
@@ -1876,19 +1922,23 @@ func (l Lease) SafeFormat(w redact.SafePrinter, _ rune) {
 		w.SafeString("<empty>")
 		return
 	}
-	if l.Type() == LeaseExpiration {
-		w.Printf("repl=%s seq=%d start=%s exp=%s", l.Replica, l.Sequence, l.Start, l.Expiration)
-	} else {
-		w.Printf("repl=%s seq=%d start=%s epo=%d", l.Replica, l.Sequence, l.Start, l.Epoch)
+	w.Printf("repl=%s seq=%d start=%s", l.Replica, l.Sequence, l.Start)
+	switch l.Type() {
+	case LeaseExpiration:
+		w.Printf(" exp=%s", l.Expiration)
+	case LeaseEpoch:
+		w.Printf(" epo=%d min-exp=%s", l.Epoch, l.MinExpiration)
+	case LeaseLeader:
+		w.Printf(" term=%d min-exp=%s", l.Term, l.MinExpiration)
+	default:
+		panic("unexpected lease type")
 	}
-	if l.ProposedTS != nil {
-		w.Printf(" pro=%s", l.ProposedTS)
-	}
+	w.Printf(" pro=%s", l.ProposedTS)
 }
 
 // Empty returns true for the Lease zero-value.
 func (l *Lease) Empty() bool {
-	return *l == (Lease{})
+	return l == nil || *l == (Lease{})
 }
 
 // OwnedBy returns whether the given store is the lease owner.
@@ -1897,6 +1947,8 @@ func (l Lease) OwnedBy(storeID StoreID) bool {
 }
 
 // LeaseType describes the type of lease.
+//
+//go:generate stringer -type=LeaseType
 type LeaseType int
 
 const (
@@ -1908,14 +1960,28 @@ const (
 	// LeaseEpoch allows range operations while the node liveness epoch
 	// is equal to the lease epoch.
 	LeaseEpoch
+	// LeaseLeader allows range operations while the replica is guaranteed
+	// to be the range's raft leader.
+	LeaseLeader
 )
+
+// LeaseTypes returns a list of all lease types.
+func LeaseTypes() []LeaseType {
+	return []LeaseType{LeaseExpiration, LeaseEpoch, LeaseLeader}
+}
 
 // Type returns the lease type.
 func (l Lease) Type() LeaseType {
-	if l.Epoch == 0 {
-		return LeaseExpiration
+	if l.Epoch != 0 && l.Term != 0 {
+		panic("lease cannot have both epoch and term")
 	}
-	return LeaseEpoch
+	if l.Epoch != 0 {
+		return LeaseEpoch
+	}
+	if l.Term != 0 {
+		return LeaseLeader
+	}
+	return LeaseExpiration
 }
 
 // Speculative returns true if this lease instance doesn't correspond to a
@@ -1927,22 +1993,55 @@ func (l Lease) Speculative() bool {
 	return l.Sequence == 0
 }
 
-// Equivalent determines whether ol is considered the same lease
-// for the purposes of matching leases when executing a command.
+// Equivalent determines whether the old lease (l) is considered the same as
+// the new lease (newL) for the purposes of matching leases when executing a
+// command.
+//
 // For expiration-based leases, extensions are allowed.
 // Ignore proposed timestamps for lease verification; for epoch-
 // based leases, the start time of the lease is sufficient to
 // avoid using an older lease with same epoch.
 //
+// expToEpochEquiv indicates whether an expiration-based lease
+// can be considered equivalent to an epoch-based lease during
+// a promotion from expiration-based to epoch-based. It is used
+// for mixed-version compatibility. No such flag is needed for
+// expiration-based to leader lease promotion, because there is
+// no need for mixed-version compatibility.
+//
 // NB: Lease.Equivalent is NOT symmetric. For expiration-based
 // leases, a lease is equivalent to another with an equal or
-// later expiration, but not an earlier expiration.
-func (l Lease) Equivalent(newL Lease) bool {
+// later expiration, but not an earlier expiration. Similarly,
+// an expiration-based lease is equivalent to an epoch-based
+// lease with the same replica and start time (representing a
+// promotion from expiration-based to epoch-based), but the
+// reverse is not true.
+//
+// One of the uses of Equivalent is in deciding what Sequence to assign to
+// newL, so this method must not use the value of Sequence for equivalency.
+//
+// The Start time of the two leases is compared, and a necessary condition
+// for equivalency is that they must be equal. So in the case where the
+// caller is someone who is constructing a new lease proposal, it is the
+// caller's responsibility to realize that the two leases *could* be
+// equivalent, and adjust the start time to be the same. Even if the start
+// times are the same, the leases could turn out to be non-equivalent -- in
+// that case they will share a start time but not the sequence.
+//
+// NB: we do not allow transitions from epoch-based or leader leases to
+// expiration-based leases to be equivalent. This was because both of the
+// former lease types don't have an expiration in the lease, while the
+// latter does. We can introduce safety violations by shortening the lease
+// expiration if we allow this transition, since the new lease may not apply
+// at the leaseholder until much after it applies at some other replica, so
+// the leaseholder may continue acting as one based on an old lease, while
+// the other replica has stepped up as leaseholder.
+func (l Lease) Equivalent(newL Lease, expToEpochEquiv bool) bool {
 	// Ignore proposed timestamp & deprecated start stasis.
-	l.ProposedTS, newL.ProposedTS = nil, nil
+	l.ProposedTS, newL.ProposedTS = hlc.ClockTimestamp{}, hlc.ClockTimestamp{}
 	l.DeprecatedStartStasis, newL.DeprecatedStartStasis = nil, nil
-	// Ignore sequence numbers, they are simply a reflection of
-	// the equivalency of other fields.
+	// Ignore sequence numbers, they are simply a reflection of the equivalency of
+	// other fields. Also, newL may not have an initialized sequence number.
 	l.Sequence, newL.Sequence = 0, 0
 	// Ignore the acquisition type, as leases will always be extended via
 	// RequestLease requests regardless of how a leaseholder first acquired its
@@ -1951,13 +2050,8 @@ func (l Lease) Equivalent(newL Lease) bool {
 	// Ignore the ReplicaDescriptor's type. This shouldn't affect lease
 	// equivalency because Raft state shouldn't be factored into the state of a
 	// Replica's lease. We don't expect a leaseholder to ever become a LEARNER
-	// replica, but that also shouldn't prevent it from extending its lease. The
-	// code also avoids a potential bug where an unset ReplicaType and a set
-	// VOTER ReplicaType are considered distinct and non-equivalent.
-	//
-	// Change this line to the following when ReplicaType becomes non-nullable:
-	//  l.Replica.Type, newL.Replica.Type = 0, 0
-	l.Replica.Type, newL.Replica.Type = nil, nil
+	// replica, but that also shouldn't prevent it from extending its lease.
+	l.Replica.Type, newL.Replica.Type = 0, 0
 	// If both leases are epoch-based, we must dereference the epochs
 	// and then set to nil.
 	switch l.Type() {
@@ -1970,17 +2064,84 @@ func (l Lease) Equivalent(newL Lease) bool {
 		if l.Epoch == newL.Epoch {
 			l.Epoch, newL.Epoch = 0, 0
 		}
-	case LeaseExpiration:
-		// See the comment above, though this field's nullability wasn't
-		// changed. We nil it out for completeness only.
-		l.Epoch, newL.Epoch = 0, 0
 
-		// For expiration-based leases, extensions are considered equivalent.
-		// This is the one case where Equivalent is not commutative and, as
-		// such, requires special handling beneath Raft (see checkForcedErr).
-		if l.GetExpiration().LessEq(newL.GetExpiration()) {
-			l.Expiration, newL.Expiration = nil, nil
+		// For epoch-based leases, extensions to the minimum expiration are
+		// considered equivalent.
+		if l.MinExpiration.LessEq(newL.MinExpiration) {
+			l.MinExpiration, newL.MinExpiration = hlc.Timestamp{}, hlc.Timestamp{}
 		}
+
+	case LeaseLeader:
+		if l.Term == newL.Term {
+			l.Term, newL.Term = 0, 0
+		}
+		// For leader leases, extensions to the minimum expiration are considered
+		// equivalent.
+		if l.MinExpiration.LessEq(newL.MinExpiration) {
+			l.MinExpiration, newL.MinExpiration = hlc.Timestamp{}, hlc.Timestamp{}
+		}
+
+	case LeaseExpiration:
+		switch newL.Type() {
+		case LeaseEpoch:
+			// An expiration-based lease being promoted to an epoch-based lease. This
+			// transition occurs after a successful lease transfer if the setting
+			// kv.transfer_expiration_leases_first.enabled is enabled.
+			//
+			// Expiration-based leases carry a local expiration timestamp. Epoch-based
+			// leases store their expiration indirectly in NodeLiveness. We assume that
+			// this promotion is only proposed if the liveness expiration is later than
+			// previous expiration carried by the expiration-based lease. This is a
+			// case where Equivalent is not commutative, as the reverse transition
+			// (from epoch-based to expiration-based) requires a sequence increment.
+			//
+			// Ignore expiration, epoch, and min expiration. The remaining fields
+			// which are compared are Replica and Start.
+			if expToEpochEquiv {
+				l.Expiration = nil
+				newL.Epoch = 0
+				newL.MinExpiration = hlc.Timestamp{}
+			}
+
+		case LeaseLeader:
+			// An expiration-based lease being promoted to a leader lease. This
+			// transition occurs after a successful lease transfer if the setting
+			// kv.transfer_expiration_leases_first.enabled is enabled and leader
+			// leases are in use.
+			//
+			// Expiration-based leases carry a local expiration timestamp. Leader
+			// leases extend their expiration indirectly through the leadership
+			// fortification protocol and associated Store Liveness heartbeats. We
+			// assume that this promotion is only proposed if the leader support
+			// expiration (and associated min expiration) is equal to or later than
+			// previous expiration carried by the expiration-based lease. This is a
+			// case where Equivalent is not commutative, as the reverse transition
+			// (from leader lease to expiration-based) requires a sequence increment.
+			//
+			// Ignore expiration, term, and min expiration. The remaining fields
+			// which are compared are Replica and Start.
+			l.Expiration = nil
+			newL.Term = 0
+			newL.MinExpiration = hlc.Timestamp{}
+
+		case LeaseExpiration:
+			// See the comment above, though this field's nullability wasn't
+			// changed. We nil it out for completeness only.
+			l.Epoch, newL.Epoch = 0, 0
+
+			// For expiration-based leases, extensions are considered equivalent.
+			// This is one case where Equivalent is not commutative and, as such,
+			// requires special handling beneath Raft (see checkForcedErr).
+			if l.GetExpiration().LessEq(newL.GetExpiration()) {
+				l.Expiration, newL.Expiration = nil, nil
+			}
+
+		default:
+			panic("unexpected lease type")
+		}
+
+	default:
+		panic("unexpected lease type")
 	}
 	return l == newL
 }
@@ -2014,8 +2175,8 @@ func equivalentTimestamps(a, b *hlc.Timestamp) bool {
 
 // Equal implements the gogoproto Equal interface. This implementation is
 // forked from the gogoproto generated code to allow l.Expiration == nil and
-// l.Expiration == &hlc.Timestamp{} to compare equal. Ditto for
-// DeprecatedStartStasis.
+// l.Expiration == &hlc.Timestamp{} to compare equal. It also ignores
+// DeprecatedStartStasis entirely to allow for its removal in a later release.
 func (l *Lease) Equal(that interface{}) bool {
 	if that == nil {
 		return l == nil
@@ -2045,9 +2206,6 @@ func (l *Lease) Equal(that interface{}) bool {
 	if !l.Replica.Equal(&that1.Replica) {
 		return false
 	}
-	if !equivalentTimestamps(l.DeprecatedStartStasis, that1.DeprecatedStartStasis) {
-		return false
-	}
 	if !l.ProposedTS.Equal(that1.ProposedTS) {
 		return false
 	}
@@ -2057,20 +2215,55 @@ func (l *Lease) Equal(that interface{}) bool {
 	if l.Sequence != that1.Sequence {
 		return false
 	}
+	if l.AcquisitionType != that1.AcquisitionType {
+		return false
+	}
+	if !l.MinExpiration.Equal(&that1.MinExpiration) {
+		return false
+	}
+	if l.Term != that1.Term {
+		return false
+	}
 	return true
 }
 
-// MakeIntent makes an intent with the given txn and key.
-// This is suitable for use when constructing WriteIntentError.
-func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
-	var i Intent
-	i.Key = key
-	i.Txn = *txn
-	return i
+// MakeLock makes a lock with the given txn, key, and strength.
+// This is suitable for use when constructing a LockConflictError or
+// WriteIntentError.
+func MakeLock(txn *enginepb.TxnMeta, key Key, str lock.Strength) Lock {
+	var l Lock
+	l.Txn = *txn
+	l.Key = key
+	l.Strength = str
+	return l
 }
 
-// AsIntents takes a transaction and a slice of keys and
-// returns it as a slice of intents.
+// Intent is an intent-strength lock. The type is a specialization of Lock and
+// should be constructed using MakeIntent.
+type Intent Lock
+
+// MakeIntent makes an intent-strength lock with the given txn and key.
+func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
+	return Intent(MakeLock(txn, key, lock.Intent))
+}
+
+// AsLock casts an Intent to a Lock.
+func (i Intent) AsLock() Lock {
+	return Lock(i)
+}
+
+// AsLockPtr casts a *Intent to a *Lock.
+func (i *Intent) AsLockPtr() *Lock {
+	return (*Lock)(i)
+}
+
+// AsLocks casts a slice of Intents to a slice of Locks.
+func AsLocks(s []Intent) []Lock {
+	return *(*[]Lock)(unsafe.Pointer(&s))
+}
+
+// AsIntents takes a transaction and a slice of keys and returns it as a slice
+// of intent-strength locks.
 func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 	ret := make([]Intent, len(keys))
 	for i := range keys {
@@ -2080,9 +2273,26 @@ func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 }
 
 // MakeLockAcquisition makes a lock acquisition message from the given
-// txn, key, and durability level.
-func MakeLockAcquisition(txn *Transaction, key Key, dur lock.Durability) LockAcquisition {
-	return LockAcquisition{Span: Span{Key: key}, Txn: txn.TxnMeta, Durability: dur}
+// txn, key, durability level, and lock strength.
+func MakeLockAcquisition(
+	txn enginepb.TxnMeta,
+	key Key,
+	dur lock.Durability,
+	str lock.Strength,
+	ignoredSeqNums []enginepb.IgnoredSeqNumRange,
+) LockAcquisition {
+	return LockAcquisition{
+		Span:           Span{Key: key},
+		Txn:            txn,
+		Durability:     dur,
+		Strength:       str,
+		IgnoredSeqNums: ignoredSeqNums,
+	}
+}
+
+// Empty returns true if the lock acquisition is empty.
+func (m *LockAcquisition) Empty() bool {
+	return m.Span.Equal(Span{})
 }
 
 // MakeLockUpdate makes a lock update from the given txn and span.
@@ -2101,6 +2311,43 @@ func (u *LockUpdate) SetTxn(txn *Transaction) {
 	u.IgnoredSeqNums = txn.IgnoredSeqNums
 }
 
+// SafeFormat implements redact.SafeFormatter.
+func (ls LockStateInfo) SafeFormat(w redact.SafePrinter, r rune) {
+	expand := w.Flag('+')
+	w.Printf("range_id=%d key=%s ", ls.RangeID, ls.Key)
+	redactableLockHolder := redact.Sprint(nil)
+	if ls.LockHolder != nil {
+		if expand {
+			redactableLockHolder = redact.Sprint(ls.LockHolder.ID)
+		} else {
+			redactableLockHolder = redact.Sprint(ls.LockHolder.Short())
+		}
+	}
+	w.Printf("holder=%s ", redactableLockHolder)
+	w.Printf("durability=%s ", ls.Durability)
+	w.Printf("duration=%s", ls.HoldDuration)
+	if len(ls.Waiters) > 0 {
+		w.Printf("\n waiters:")
+
+		for _, lw := range ls.Waiters {
+			if expand {
+				w.Printf("\n  %+v", lw)
+			} else {
+				w.Printf("\n  %s", lw)
+			}
+		}
+	}
+}
+
+func (ls LockStateInfo) String() string {
+	return redact.StringWithoutMarkers(ls)
+}
+
+// Clone returns a copy of the span.
+func (s Span) Clone() Span {
+	return Span{Key: s.Key.Clone(), EndKey: s.EndKey.Clone()}
+}
+
 // EqualValue is Equal.
 //
 // TODO(tbg): remove this passthrough.
@@ -2114,11 +2361,11 @@ func (s Span) Equal(o Span) bool {
 }
 
 // Overlaps returns true WLOG for span A and B iff:
-// 1. Both spans contain one key (just the start key) and they are equal; or
-// 2. The span with only one key is contained inside the other span; or
-// 3. The end key of span A is strictly greater than the start key of span B
-//    and the end key of span B is strictly greater than the start key of span
-//    A.
+//  1. Both spans contain one key (just the start key) and they are equal; or
+//  2. The span with only one key is contained inside the other span; or
+//  3. The end key of span A is strictly greater than the start key of span B
+//     and the end key of span B is strictly greater than the start key of span
+//     A.
 func (s Span) Overlaps(o Span) bool {
 	if !s.Valid() || !o.Valid() {
 		return false
@@ -2321,22 +2568,97 @@ func (a Spans) ContainsKey(key Key) bool {
 // SpansOverhead is the overhead of Spans in bytes.
 const SpansOverhead = int64(unsafe.Sizeof(Spans{}))
 
-// MemUsage returns the size of the Spans in bytes for memory accounting
-// purposes.
-func (a Spans) MemUsage() int64 {
-	// Slice the full capacity of a so we can account for the memory
-	// used by spans past the length of a.
-	aCap := a[:cap(a)]
-	size := SpansOverhead
-	for i := range aCap {
-		size += aCap[i].MemUsage()
+// MemUsageUpToLen returns the size of the Spans in bytes for memory accounting
+// purposes. The method assumes that all spans in [len(a), cap(a)] range are
+// empty and will panic in test builds when not.
+func (a Spans) MemUsageUpToLen() int64 {
+	if buildutil.CrdbTestBuild {
+		l := len(a)
+		aCap := a[:cap(a)]
+		for _, s := range aCap[l:] {
+			if len(s.Key) > 0 || len(s.EndKey) > 0 {
+				panic(errors.AssertionFailedf(
+					"spans are not empty past length: %v (len=%d, cap=%d)", aCap, l, cap(a)),
+				)
+			}
+		}
+	}
+	size := SpansOverhead + int64(cap(a)-len(a))*SpanOverhead
+	for i := range a {
+		size += a[i].MemUsage()
 	}
 	return size
+}
+
+func (a Spans) String() string {
+	var buf bytes.Buffer
+	for i, span := range a {
+		if i != 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(span.String())
+	}
+	return buf.String()
+}
+
+// BoundedString returns a stringified representation of Spans while adhering to
+// the provided hint on the length (although not religiously). The following
+// heuristics are used:
+// - if there are no more than 6 spans, then all are printed,
+// - otherwise, at least 3 "head" and at least 3 "tail" spans are always printed
+//   - the bytes "budget" is consumed from the "head".
+func (a Spans) BoundedString(bytesHint int) string {
+	if len(a) <= 6 {
+		return a.String()
+	}
+	var buf bytes.Buffer
+	var i int
+	headEndIdx, tailStartIdx := 2, len(a)-3
+	for i = range a {
+		if i != 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(a[i].String())
+		if buf.Len() >= bytesHint && i >= headEndIdx && i+1 < tailStartIdx {
+			// If the bytes budget has been consumed, and we've included at
+			// least 3 spans from the "head", and we have more than 3 spans left
+			// total, we stop iteration from the front.
+			break
+		}
+	}
+	if i+1 < len(a) {
+		buf.WriteString(" ... ")
+		for i = tailStartIdx; i < len(a); i++ {
+			if i != tailStartIdx {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(a[i].String())
+		}
+	}
+	return buf.String()
 }
 
 // RSpan is a key range with an inclusive start RKey and an exclusive end RKey.
 type RSpan struct {
 	Key, EndKey RKey
+}
+
+// KeySpan returns the Span with the StartKey forwarded to LocalMax, if necessary.
+//
+// See: https://github.com/cockroachdb/cockroach/issues/95055
+func (rs RSpan) KeySpan() RSpan {
+	start := rs.Key
+	if start.Equal(RKeyMin) {
+		// The first range in the keyspace is declared to start at KeyMin (the
+		// lowest possible key). That is a lie, however, since the local key space
+		// ([LocalMin,LocalMax)) doesn't belong to this range; it doesn't belong to
+		// any range in particular.
+		start = RKey(LocalMax)
+	}
+	return RSpan{
+		Key:    start,
+		EndKey: rs.EndKey,
+	}
 }
 
 // Equal compares for equality.
@@ -2377,20 +2699,20 @@ func (rs RSpan) String() string {
 }
 
 // Intersect returns the intersection of the current span and the
-// descriptor's range. Returns an error if the span and the
-// descriptor's range do not overlap.
-func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
-	if !rs.Key.Less(desc.EndKey) || !desc.StartKey.Less(rs.EndKey) {
-		return rs, errors.Errorf("span and descriptor's range do not overlap: %s vs %s", rs, desc)
+// given range. Returns an error if the span and the range do not
+// overlap.
+func (rs RSpan) Intersect(rspan RSpan) (RSpan, error) {
+	if !rs.Key.Less(rspan.EndKey) || !rspan.Key.Less(rs.EndKey) {
+		return rs, errors.Errorf("spans do not overlap: %s vs %s", rs, rspan)
 	}
 
 	key := rs.Key
-	if key.Less(desc.StartKey) {
-		key = desc.StartKey
+	if key.Less(rspan.Key) {
+		key = rspan.Key
 	}
 	endKey := rs.EndKey
-	if !desc.ContainsKeyRange(desc.StartKey, endKey) {
-		endKey = desc.EndKey
+	if !rspan.ContainsKeyRange(rspan.Key, endKey) {
+		endKey = rspan.EndKey
 	}
 	return RSpan{key, endKey}, nil
 }
@@ -2509,8 +2831,9 @@ var _ = (SequencedWriteBySeq{}).Find
 
 func init() {
 	// Inject the format dependency into the enginepb package.
-	enginepb.FormatBytesAsKey = func(k []byte) string { return Key(k).String() }
-	enginepb.FormatBytesAsValue = func(v []byte) string { return Value{RawBytes: v}.PrettyPrint() }
+	enginepb.FormatBytesAsKey = func(k []byte) redact.RedactableString {
+		return redact.Sprint(Key(k))
+	}
 }
 
 // SafeValue implements the redact.SafeValue interface.
@@ -2519,4 +2842,21 @@ func (ReplicaChangeType) SafeValue() {}
 func (ri RangeInfo) String() string {
 	return fmt.Sprintf("desc: %s, lease: %s, closed_timestamp_policy: %s",
 		ri.Desc, ri.Lease, ri.ClosedTimestampPolicy)
+}
+
+// Add adds another RowCount to the receiver.
+func (r *RowCount) Add(other RowCount) {
+	r.DataSize += other.DataSize
+	r.Rows += other.Rows
+	r.IndexEntries += other.IndexEntries
+}
+
+func (tid *TenantID) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var id uint64
+	if err := unmarshal(&id); err == nil {
+		tid.InternalValue = id
+		return nil
+	} else {
+		return unmarshal(tid)
+	}
 }

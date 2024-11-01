@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -22,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -33,9 +30,10 @@ func TestScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.NewTestingEvalContext(st)
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(ctx, evalCtx, tc)
 	md := f.Metadata()
 	tn := tree.NewUnqualifiedTableName("t")
 	tab := md.AddTable(tc.Table(tn), tn)
@@ -48,7 +46,7 @@ func TestScan(t *testing.T) {
 	var columns constraint.Columns
 	columns.Init([]opt.OrderingColumn{-3, +4, +1, +2})
 	var c constraint.Constraint
-	keyCtx := constraint.MakeKeyContext(&columns, evalCtx)
+	keyCtx := constraint.MakeKeyContext(ctx, &columns, evalCtx)
 	var span constraint.Span
 	span.Init(
 		constraint.MakeCompositeKey(tree.NewDInt(1), tree.NewDInt(10)),
@@ -172,7 +170,7 @@ func TestScan(t *testing.T) {
 			for tcIdx, tc := range g.cases {
 				t.Run(fmt.Sprintf("case%d", tcIdx+1), func(t *testing.T) {
 					req := props.ParseOrderingChoice(tc.req)
-					g.p.SetConstraint(evalCtx, g.c)
+					g.p.SetConstraint(ctx, evalCtx, g.c)
 					ok, rev := ScanPrivateCanProvide(md, &g.p, &req)
 					res := "no"
 					if ok {

@@ -1,21 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import Analytics from "analytics-node";
 import { Location } from "history";
-import _ from "lodash";
+import each from "lodash/each";
+import isEmpty from "lodash/isEmpty";
 import { Store } from "redux";
 
 import * as protos from "src/js/protos";
+import { history } from "src/redux/history";
 import { versionsSelector } from "src/redux/nodes";
-import { store, history, AdminUIState } from "src/redux/state";
+import { AdminUIState } from "src/redux/state";
 import { COCKROACHLABS_ADDR } from "src/util/cockroachlabsAPI";
 
 type ClusterResponse = protos.cockroach.server.serverpb.IClusterResponse;
@@ -26,6 +23,7 @@ interface TrackMessage {
   timestamp?: Date;
   context?: Object;
 }
+
 /**
  * List of current redactions needed for pages tracked by the Admin UI.
  * TODO(mrtracy): It this list becomes more extensive, it might benefit from a
@@ -155,7 +153,7 @@ export class AnalyticsSync {
     }
 
     // If there are any queued pages, push them.
-    _.each(this.queuedPages, l => this.pushPage(cluster_id, l));
+    each(this.queuedPages, l => this.pushPage(cluster_id, l));
     this.queuedPages = [];
 
     // Push the page that was just accessed.
@@ -186,7 +184,7 @@ export class AnalyticsSync {
     // Do nothing if version information is not yet available.
     const state = this.deprecatedStore.getState();
     const versions = versionsSelector(state);
-    if (_.isEmpty(versions)) {
+    if (isEmpty(versions)) {
       return;
     }
 
@@ -275,7 +273,7 @@ export class AnalyticsSync {
   };
 
   private redact(path: string): string {
-    _.each(this.redactions, r => {
+    each(this.redactions, r => {
       if (r.match.test(path)) {
         // Apparently TypeScript doesn't know how to dispatch functions.
         // If there are two function overloads defined (as with
@@ -299,42 +297,40 @@ export class AnalyticsSync {
   }
 }
 
-// Create a global instance of AnalyticsSync which can be used from various
-// packages. If enabled, this instance will push to segment using the following
-// analytics key.
-const analyticsOpts = {
-  host: COCKROACHLABS_ADDR + "/api/segment",
-};
-const analyticsInstance = new Analytics(
-  "5Vbp8WMYDmZTfCwE0uiUqEdAcTiZWFDb",
-  analyticsOpts,
-);
-export const analytics = new AnalyticsSync(
-  analyticsInstance,
-  store,
-  defaultRedactions,
-);
+export let analytics: AnalyticsSync | undefined;
+export function initializeAnalytics(store: Store<AdminUIState>) {
+  // Create a global instance of AnalyticsSync which can be used from various
+  // packages. If enabled, this instance will push to segment using the following
+  // analytics key.
+  const analyticsOpts = {
+    host: COCKROACHLABS_ADDR + "/api/segment",
+  };
+  const analyticsInstance = new Analytics(
+    "5Vbp8WMYDmZTfCwE0uiUqEdAcTiZWFDb",
+    analyticsOpts,
+  );
+  analytics = new AnalyticsSync(analyticsInstance, store, defaultRedactions);
+  // Attach a listener to the history object which will track a 'page' event
+  // whenever the user navigates to a new path.
+  let lastPageLocation: Location;
+  history.listen((location: Location) => {
+    // Do not log if the pathname is the same as the previous.
+    // Needed because history.listen() fires twice when using hash history, this
+    // bug is "won't fix" in the version of history we are using, and upgrading
+    // would imply a difficult upgrade to react-router v4.
+    // (https://github.com/ReactTraining/history/issues/427).
+    if (lastPageLocation && lastPageLocation.pathname === location.pathname) {
+      return;
+    }
+    lastPageLocation = location;
+    analytics.page(location);
+    // Identify the cluster.
+    analytics.identify();
+  });
 
-// Attach a listener to the history object which will track a 'page' event
-// whenever the user navigates to a new path.
-let lastPageLocation: Location;
-history.listen((location: Location) => {
-  // Do not log if the pathname is the same as the previous.
-  // Needed because history.listen() fires twice when using hash history, this
-  // bug is "won't fix" in the version of history we are using, and upgrading
-  // would imply a difficult upgrade to react-router v4.
-  // (https://github.com/ReactTraining/history/issues/427).
-  if (lastPageLocation && lastPageLocation.pathname === location.pathname) {
-    return;
-  }
-  lastPageLocation = location;
-  analytics.page(location);
+  // Record the initial page that was accessed; listen won't fire for the first
+  // page loaded.
+  analytics.page(history.location);
   // Identify the cluster.
   analytics.identify();
-});
-
-// Record the initial page that was accessed; listen won't fire for the first
-// page loaded.
-analytics.page(history.location);
-// Identify the cluster.
-analytics.identify();
+}

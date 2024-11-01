@@ -1,27 +1,34 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
 import (
 	"context"
+	"fmt"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,21 +47,144 @@ func (d *fakeResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	}
 }
 
-func (d *fakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+func (d *fakeResumer) OnFailOrCancel(context.Context, interface{}, error) error {
 	return nil
 }
 
-func waitForJobStatus(
-	runner *sqlutils.SQLRunner, t *testing.T, id jobspb.JobID, targetStatus string,
-) {
-	testutils.SucceedsSoon(t, func() error {
-		var jobStatus string
-		query := `SELECT status FROM [SHOW CHANGEFEED JOB $1]`
-		runner.QueryRow(t, query, id).Scan(&jobStatus)
-		if targetStatus != jobStatus {
-			return errors.Errorf("Expected status:%s but found status:%s", targetStatus, jobStatus)
+func (d *fakeResumer) CollectProfile(context.Context, interface{}) error {
+	return nil
+}
+
+func TestShowChangefeedJobsBasic(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH format='json'`)
+		defer closeFeed(t, foo)
+
+		type row struct {
+			id             jobspb.JobID
+			SinkURI        string
+			FullTableNames []uint8
+			format         string
+			topics         string
 		}
-		return nil
+
+		var out row
+
+		query := `SELECT job_id, sink_uri, full_table_names, format, IFNULL(topics, '') FROM [SHOW CHANGEFEED JOBS] ORDER BY sink_uri`
+		rowResults := sqlDB.Query(t, query)
+
+		if !rowResults.Next() {
+			err := rowResults.Err()
+			if err != nil {
+				t.Fatalf("Error encountered while querying the next row: %v", err)
+			} else {
+				t.Fatalf("Expected more rows when querying and none found for query: %s", query)
+			}
+		}
+		err := rowResults.Scan(&out.id, &out.SinkURI, &out.FullTableNames, &out.format, &out.topics)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if testFeed, ok := foo.(cdctest.EnterpriseTestFeed); ok {
+			details, err := testFeed.Details()
+			require.NoError(t, err)
+			sinkURI := details.SinkURI
+			jobID := testFeed.JobID()
+
+			require.Equal(t, jobID, out.id, "Expected id:%d but found id:%d", jobID, out.id)
+			require.Equal(t, sinkURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", sinkURI, out.SinkURI)
+
+			u, err := url.Parse(sinkURI)
+			require.NoError(t, err)
+			if u.Scheme == changefeedbase.SinkSchemeKafka {
+				require.Equal(t, "foo", out.topics, "Expected topics:%s but found topics:%s", "foo", out.topics)
+			}
+		}
+		require.Equal(t, "{d.public.foo}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{d.public.foo}", string(out.FullTableNames))
+		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+	}
+
+	// TODO: Webhook disabled since the query parameters on the sinkURI are
+	// correct but out of order
+	cdcTest(t, testFn, feedTestOmitSinks("webhook", "sinkless"), feedTestNoExternalConnection)
+}
+
+// TestShowChangefeedJobsRedacted verifies that SHOW CHANGEFEED JOB, SHOW
+// CHANGEFEED JOBS, and SHOW JOBS redact sensitive information (including keys
+// and secrets) for its output. Regression for #113503.
+func TestShowChangefeedJobsRedacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, stopServer := makeServer(t)
+	defer stopServer()
+
+	knobs := s.TestingKnobs.
+		DistSQL.(*execinfra.TestingKnobs).
+		Changefeed.(*TestingKnobs)
+	knobs.WrapSink = func(s Sink, _ jobspb.JobID) Sink {
+		if _, ok := s.(*externalConnectionKafkaSink); ok {
+			return s
+		}
+		return &externalConnectionKafkaSink{sink: s, ignoreDialError: true}
+	}
+
+	sqlDB := sqlutils.MakeSQLRunner(s.DB)
+	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+	const apiSecret = "bar"
+	const certSecret = "Zm9v"
+	for _, tc := range []struct {
+		name                string
+		uri                 string
+		expectedSinkURI     string
+		expectedDescription string
+	}{
+		{
+			name: "api_secret",
+			uri:  fmt.Sprintf("confluent-cloud://nope?api_key=fee&api_secret=%s", apiSecret),
+		},
+		{
+			name: "sasl_password",
+			uri:  fmt.Sprintf("kafka://nope/?sasl_enabled=true&sasl_handshake=false&sasl_password=%s&sasl_user=aa", apiSecret),
+		},
+		{
+			name: "ca_cert",
+			uri:  fmt.Sprintf("kafka://nope?ca_cert=%s&tls_enabled=true", certSecret),
+		},
+		{
+			name: "shared_access_key",
+			uri:  fmt.Sprintf("azure-event-hub://nope?shared_access_key=%s&shared_access_key_name=plain", apiSecret),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			createStmt := fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE foo INTO '%s'`, tc.uri)
+			var jobID jobspb.JobID
+			sqlDB.QueryRow(t, createStmt).Scan(&jobID)
+			var sinkURI, description string
+			sqlDB.QueryRow(t, "SELECT sink_uri, description from [SHOW CHANGEFEED JOB $1]", jobID).Scan(&sinkURI, &description)
+			replacer := strings.NewReplacer(apiSecret, "redacted", certSecret, "redacted")
+			expectedSinkURI := replacer.Replace(tc.uri)
+			expectedDescription := replacer.Replace(createStmt)
+			require.Equal(t, expectedSinkURI, sinkURI)
+			require.Equal(t, expectedDescription, description)
+		})
+	}
+
+	t.Run("jobs", func(t *testing.T) {
+		queryStr := sqlDB.QueryStr(t, "SELECT description from [SHOW JOBS]")
+		require.NotContains(t, queryStr, apiSecret)
+		require.NotContains(t, queryStr, certSecret)
+		queryStr = sqlDB.QueryStr(t, "SELECT sink_uri, description from [SHOW CHANGEFEED JOBS]")
+		require.NotContains(t, queryStr, apiSecret)
+		require.NotContains(t, queryStr, certSecret)
 	})
 }
 
@@ -62,10 +192,11 @@ func TestShowChangefeedJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	bucket, accessKey, secretKey := checkS3Credentials(t)
+
+	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	registry := s.JobRegistry().(*jobs.Registry)
+	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -77,6 +208,7 @@ func TestShowChangefeedJobs(t *testing.T) {
 		FullTableNames []uint8
 		format         string
 		description    string
+		topics         string
 		DescriptorIDs  []descpb.ID
 	}
 
@@ -97,40 +229,41 @@ func TestShowChangefeedJobs(t *testing.T) {
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeChangefeed,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := fakeResumer{
 				done: doneCh,
 			}
 			return &r
-		},
-	}
+		})
 
 	query = `SET CLUSTER SETTING kv.rangefeed.enabled = true`
 	sqlDB.Exec(t, query)
 
 	var singleChangefeedID, multiChangefeedID jobspb.JobID
 
-	query = `CREATE CHANGEFEED FOR TABLE foo INTO 
+	query = `CREATE CHANGEFEED FOR TABLE foo INTO
 		'webhook-https://fake-http-sink:8081' WITH webhook_auth_header='Basic Zm9v'`
 	sqlDB.QueryRow(t, query).Scan(&singleChangefeedID)
 
 	// Cannot use kafka for tests right now because of leaked goroutine issue
-	query = `CREATE CHANGEFEED FOR TABLE foo, bar INTO 
-		'experimental-s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456'`
+	query = fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE foo, bar INTO
+		'experimental-s3://%s/fake/path?AWS_ACCESS_KEY_ID=%s&AWS_SECRET_ACCESS_KEY=%s'`, bucket, accessKey, secretKey)
 	sqlDB.QueryRow(t, query).Scan(&multiChangefeedID)
 
 	var out row
 
-	query = `SELECT job_id, sink_uri, full_table_names, format FROM [SHOW CHANGEFEED JOB $1]`
-	sqlDB.QueryRow(t, query, multiChangefeedID).Scan(&out.id, &out.SinkURI, &out.FullTableNames, &out.format)
+	query = `SELECT job_id, sink_uri, full_table_names, format, IFNULL(topics, '') FROM [SHOW CHANGEFEED JOB $1]`
+	sqlDB.QueryRow(t, query, multiChangefeedID).Scan(&out.id, &out.SinkURI, &out.FullTableNames, &out.format, &out.topics)
 
+	expectedURI := fmt.Sprintf("experimental-s3://%s/fake/path?AWS_ACCESS_KEY_ID=%s&AWS_SECRET_ACCESS_KEY=redacted", bucket, accessKey)
 	require.Equal(t, multiChangefeedID, out.id, "Expected id:%d but found id:%d", multiChangefeedID, out.id)
-	require.Equal(t, "experimental-s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=redacted", out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", "experimental-s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=redacted", out.SinkURI)
+	require.Equal(t, expectedURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", expectedURI, out.SinkURI)
 	require.Equal(t, "{defaultdb.public.foo,defaultdb.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{defaultdb.public.foo,defaultdb.public.bar}", string(out.FullTableNames))
 	require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+	require.Equal(t, "", out.topics, "Expected topics to be empty")
 
-	query = `SELECT job_id, description, sink_uri, full_table_names, format FROM [SHOW CHANGEFEED JOBS] ORDER BY sink_uri`
+	query = `SELECT job_id, description, sink_uri, full_table_names, format, IFNULL(topics, '') FROM [SHOW CHANGEFEED JOBS] ORDER BY sink_uri`
 	rowResults := sqlDB.Query(t, query)
 
 	if !rowResults.Next() {
@@ -141,15 +274,16 @@ func TestShowChangefeedJobs(t *testing.T) {
 			t.Fatalf("Expected more rows when querying and none found for query: %s", query)
 		}
 	}
-	err := rowResults.Scan(&out.id, &out.description, &out.SinkURI, &out.FullTableNames, &out.format)
+	err := rowResults.Scan(&out.id, &out.description, &out.SinkURI, &out.FullTableNames, &out.format, &out.topics)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	require.Equal(t, multiChangefeedID, out.id, "Expected id:%d but found id:%d", multiChangefeedID, out.id)
-	require.Equal(t, "experimental-s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=redacted", out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", "experimental-s3://fake-bucket-name/fake/path?AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=redacted", out.SinkURI)
+	require.Equal(t, expectedURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", expectedURI, out.SinkURI)
 	require.Equal(t, "{defaultdb.public.foo,defaultdb.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{defaultdb.public.foo,defaultdb.public.bar}", string(out.FullTableNames))
 	require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+	require.Equal(t, "", out.topics, "Expected topics to be empty")
 
 	if !rowResults.Next() {
 		err := rowResults.Err()
@@ -159,7 +293,7 @@ func TestShowChangefeedJobs(t *testing.T) {
 			t.Fatalf("Expected more rows when querying and none found for query: %s", query)
 		}
 	}
-	err = rowResults.Scan(&out.id, &out.description, &out.SinkURI, &out.FullTableNames, &out.format)
+	err = rowResults.Scan(&out.id, &out.description, &out.SinkURI, &out.FullTableNames, &out.format, &out.topics)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +303,7 @@ func TestShowChangefeedJobs(t *testing.T) {
 	require.Equal(t, "webhook-https://fake-http-sink:8081", out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", "webhook-https://fake-http-sink:8081", out.SinkURI)
 	require.Equal(t, "{defaultdb.public.foo}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{defaultdb.public.foo}", string(out.FullTableNames))
 	require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+	require.Equal(t, "", out.topics, "Expected topics to be empty")
 
 	hasNext := rowResults.Next()
 	require.Equal(t, false, hasNext, "Expected no more rows for query:%s", query)
@@ -181,12 +316,21 @@ func TestShowChangefeedJobsStatusChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	ctx := context.Background()
+
+	var params base.TestServerArgs
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	srv, rawSQLDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
+	for _, l := range []serverutils.ApplicationLayerInterface{s, srv.SystemLayer()} {
+		kvserver.RangefeedEnabled.Override(ctx, &l.ClusterSettings().SV, true)
+	}
+
 	registry := s.JobRegistry().(*jobs.Registry)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	defer s.Stopper().Stop(context.Background())
 
 	query := `CREATE TABLE foo (a string)`
 	sqlDB.Exec(t, query)
@@ -194,17 +338,13 @@ func TestShowChangefeedJobsStatusChange(t *testing.T) {
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeChangefeed,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := fakeResumer{
 				done: doneCh,
 			}
 			return &r
-		},
-	}
-
-	query = `SET CLUSTER SETTING kv.rangefeed.enabled = true`
-	sqlDB.Exec(t, query)
+		})
 
 	var changefeedID jobspb.JobID
 
@@ -229,8 +369,7 @@ func TestShowChangefeedJobsNoResults(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	defer s.Stopper().Stop(context.Background())
 
@@ -272,4 +411,200 @@ func TestShowChangefeedJobsNoResults(t *testing.T) {
 	if rowResults.Next() || rowResults.Err() != nil {
 		t.Fatalf("Expected no results for query:%s", query)
 	}
+}
+
+func TestShowChangefeedJobsAlterChangefeed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		defer closeFeed(t, foo)
+
+		feed, ok := foo.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		jobID := feed.JobID()
+		details, err := feed.Details()
+		require.NoError(t, err)
+		sinkURI := details.SinkURI
+
+		type row struct {
+			id             jobspb.JobID
+			description    string
+			SinkURI        string
+			FullTableNames []uint8
+			format         string
+			topics         string
+		}
+
+		obtainJobRowFn := func() row {
+			var out row
+
+			query := fmt.Sprintf(
+				`SELECT job_id, description, sink_uri, full_table_names, format, IFNULL(topics, '') FROM [SHOW CHANGEFEED JOB %d]`,
+				jobID,
+			)
+
+			rowResults := sqlDB.Query(t, query)
+			if !rowResults.Next() {
+				err := rowResults.Err()
+				if err != nil {
+					t.Fatalf("Error encountered while querying the next row: %v", err)
+				} else {
+					t.Fatalf("Expected more rows when querying and none found for query: %s", query)
+				}
+			}
+			err := rowResults.Scan(&out.id, &out.description, &out.SinkURI, &out.FullTableNames, &out.format, &out.topics)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			return out
+		}
+
+		sqlDB.Exec(t, `PAUSE JOB $1`, jobID)
+		waitForJobStatus(sqlDB, t, jobID, `paused`)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar`, jobID))
+
+		out := obtainJobRowFn()
+
+		topicsArr := strings.Split(out.topics, ",")
+		sort.Strings(topicsArr)
+		sortedTopics := strings.Join(topicsArr, ",")
+		require.Equal(t, jobID, out.id, "Expected id:%d but found id:%d", jobID, out.id)
+		require.Equal(t, sinkURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", sinkURI, out.SinkURI)
+		require.Equal(t, "bar,foo", sortedTopics, "Expected topics:%s but found topics:%s", "bar,foo", sortedTopics)
+		require.Equal(t, "{d.public.foo,d.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{d.public.foo,d.public.bar}", string(out.FullTableNames))
+		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d DROP foo`, feed.JobID()))
+
+		out = obtainJobRowFn()
+
+		require.Equal(t, jobID, out.id, "Expected id:%d but found id:%d", jobID, out.id)
+		require.Equal(t, "CREATE CHANGEFEED FOR TABLE d.public.bar INTO 'kafka://does.not.matter/'", out.description, "Expected description:%s but found description:%s", "CREATE CHANGEFEED FOR TABLE bar INTO 'kafka://does.not.matter/'", out.description)
+		require.Equal(t, sinkURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", sinkURI, out.SinkURI)
+		require.Equal(t, "bar", out.topics, "Expected topics:%s but found topics:%s", "bar", sortedTopics)
+		require.Equal(t, "{d.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{d.public.bar}", string(out.FullTableNames))
+		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d SET resolved = '5s'`, feed.JobID()))
+
+		out = obtainJobRowFn()
+
+		require.Equal(t, jobID, out.id, "Expected id:%d but found id:%d", jobID, out.id)
+		require.Equal(t, "CREATE CHANGEFEED FOR TABLE d.public.bar INTO 'kafka://does.not.matter/' WITH OPTIONS (resolved = '5s')", out.description, "Expected description:%s but found description:%s", "CREATE CHANGEFEED FOR TABLE bar INTO 'kafka://does.not.matter/ WITH resolved = '5s''", out.description)
+		require.Equal(t, sinkURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", sinkURI, out.SinkURI)
+		require.Equal(t, "bar", out.topics, "Expected topics:%s but found topics:%s", "bar", sortedTopics)
+		require.Equal(t, "{d.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{d.public.bar}", string(out.FullTableNames))
+		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
+	}
+
+	// Force kafka to validate topics
+	cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestNoExternalConnection)
+}
+
+func TestShowChangefeedJobsAuthorization(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		ChangefeedJobPermissionsTestSetup(t, s)
+
+		var jobID jobspb.JobID
+		createFeed := func(stmt string) {
+			successfulFeed := feed(t, f, stmt)
+			defer closeFeed(t, successfulFeed)
+			_, err := successfulFeed.Next()
+			require.NoError(t, err)
+			jobID = successfulFeed.(cdctest.EnterpriseTestFeed).JobID()
+		}
+		rootDB := sqlutils.MakeSQLRunner(s.DB)
+
+		// Create a changefeed and assert who can see it.
+		asUser(t, f, `feedCreator`, func(userDB *sqlutils.SQLRunner) {
+			createFeed(`CREATE CHANGEFEED FOR table_a, table_b`)
+		})
+		expectedJobIDStr := strconv.Itoa(int(jobID))
+		asUser(t, f, `adminUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `userWithAllGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `userWithSomeGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+		asUser(t, f, `jobController`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `regularUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+
+		// Assert behavior when one of the tables is dropped.
+		rootDB.Exec(t, "DROP TABLE table_b")
+		// Having CHANGEFEED on only table_a is now sufficient.
+		asUser(t, f, `userWithSomeGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `regularUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+	}
+
+	// Only enterprise sinks create jobs.
+	cdcTest(t, testFn, feedTestEnterpriseSinks)
+}
+
+// TestShowChangefeedJobsDefaultFilter verifies that "SHOW JOBS" AND "SHOW CHANGEFEED JOBS"
+// use the same age filter (12 hours).
+func TestShowChangefeedJobsDefaultFilter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		countChangefeedJobs := func() (count int) {
+			query := `select count(*) from [SHOW CHANGEFEED JOBS]`
+			sqlDB.QueryRow(t, query).Scan(&count)
+			return count
+		}
+		changefeedJobExists := func(id catpb.JobID) bool {
+			rows := sqlDB.Query(t, `SHOW CHANGEFEED JOB $1`, id)
+			defer rows.Close()
+			return rows.Next()
+		}
+
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		waitForJobStatus(sqlDB, t, foo.(cdctest.EnterpriseTestFeed).JobID(), jobs.StatusRunning)
+		require.Equal(t, 1, countChangefeedJobs())
+
+		// The job is not visible after closed (and its finished time is older than 12 hours).
+		closeFeed(t, foo)
+		require.Equal(t, 0, countChangefeedJobs())
+
+		// We can still see the job if we explicitly ask for it.
+		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
+		require.True(t, changefeedJobExists(jobID))
+	}
+
+	updateKnobs := func(opts *feedTestOptions) {
+		opts.knobsFn = func(knobs *base.TestingKnobs) {
+			knobs.JobsTestingKnobs.(*jobs.TestingKnobs).StubTimeNow = func() time.Time {
+				return timeutil.Now().Add(-13 * time.Hour)
+			}
+		}
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("kafka"), updateKnobs)
 }

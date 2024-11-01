@@ -1,23 +1,22 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"github.com/cockroachdb/errors"
 )
 
 // replica_application_*.go files provide concrete implementations of
@@ -55,7 +54,7 @@ func (d *replicaDecoder) DecodeAndBind(ctx context.Context, ents []raftpb.Entry)
 	if err := d.decode(ctx, ents); err != nil {
 		return false, err
 	}
-	anyLocal := d.retrieveLocalProposals(ctx)
+	anyLocal := d.retrieveLocalProposals()
 	d.createTracingSpans(ctx)
 	return anyLocal, nil
 }
@@ -64,67 +63,68 @@ func (d *replicaDecoder) DecodeAndBind(ctx context.Context, ents []raftpb.Entry)
 func (d *replicaDecoder) decode(ctx context.Context, ents []raftpb.Entry) error {
 	for i := range ents {
 		ent := &ents[i]
-		if err := d.cmdBuf.allocate().decode(ctx, ent); err != nil {
+		if err := d.cmdBuf.allocate().Decode(ent); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// retrieveLocalProposals binds each of the decoder's commands to their local
-// proposals if they were proposed locally. The method also sets the ctx fields
-// on all commands.
-func (d *replicaDecoder) retrieveLocalProposals(ctx context.Context) (anyLocal bool) {
+// retrieveLocalProposals removes all proposals which have a log entry pending
+// immediate application from the proposals map. The entries which are paired up
+// with a proposal in that way are considered "local", meaning a client is
+// waiting on their result, and may be reproposed (as a new proposal) with a new
+// lease index in case they apply with an illegal lease index (see
+// tryReproposeWithNewLeaseIndexRaftMuLocked).
+func (d *replicaDecoder) retrieveLocalProposals() (anyLocal bool) {
 	d.r.mu.Lock()
 	defer d.r.mu.Unlock()
-	// Assign all the local proposals first then delete all of them from the map
-	// in a second pass. This ensures that we retrieve all proposals correctly
-	// even if the applier has multiple entries for the same proposal, in which
-	// case the proposal was reproposed (either under its original or a new
-	// MaxLeaseIndex) which we handle in a second pass below.
+
 	var it replicatedCmdBufSlice
+
 	for it.init(&d.cmdBuf); it.Valid(); it.Next() {
 		cmd := it.cur()
-		cmd.proposal = d.r.mu.proposals[cmd.idKey]
-		anyLocal = anyLocal || cmd.IsLocal()
-	}
-	if !anyLocal && d.r.mu.proposalQuota == nil {
-		// Fast-path.
-		return false
-	}
-	for it.init(&d.cmdBuf); it.Valid(); it.Next() {
-		cmd := it.cur()
-		var toRelease *quotapool.IntAlloc
-		shouldRemove := cmd.IsLocal() &&
-			// If this entry does not have the most up-to-date view of the
-			// corresponding proposal's maximum lease index then the proposal
-			// must have been reproposed with a higher lease index. (see
-			// tryReproposeWithNewLeaseIndex). In that case, there's a newer
-			// version of the proposal in the pipeline, so don't remove the
-			// proposal from the map. We expect this entry to be rejected by
-			// checkForcedErr.
-			cmd.raftCmd.MaxLeaseIndex == cmd.proposal.command.MaxLeaseIndex
-		if shouldRemove {
-			// Delete the proposal from the proposals map. There may be reproposals
-			// of the proposal in the pipeline, but those will all have the same max
-			// lease index, meaning that they will all be rejected after this entry
-			// applies (successfully or otherwise). If tryReproposeWithNewLeaseIndex
-			// picks up the proposal on failure, it will re-add the proposal to the
-			// proposal map, but this won't affect this replicaApplier.
+		cmd.proposal = d.r.mu.proposals[cmd.ID]
+		var alloc *quotapool.IntAlloc
+		if cmd.proposal != nil {
+			// INVARIANT: a proposal is consumed (i.e. removed from the proposals map)
+			// the first time it comes up for application. (If the proposal fails due
+			// to an illegal LeaseAppliedIndex, a new proposal might be spawned to
+			// retry but that proposal will be unrelated as far as log application is
+			// concerned).
 			//
-			// While here, add the proposal's quota size to the quota release queue.
-			// We check the proposal map again first to avoid double free-ing quota
-			// when reproposals from the same proposal end up in the same entry
-			// application batch.
-			delete(d.r.mu.proposals, cmd.idKey)
-			toRelease = cmd.proposal.quotaAlloc
-			cmd.proposal.quotaAlloc = nil
+			// INVARIANT: local proposals are not in the proposals map while being
+			// applied, and they never re-enter the proposals map either during or
+			// afterwards.
+			//
+			// (propBuf.{Insert,ReinsertLocked} ignores proposals that have
+			// v2SeenDuringApplicationSet to make this true).
+			if cmd.proposal.v2SeenDuringApplication {
+				err := errors.AssertionFailedf("ProposalData seen twice during application: %+v", cmd.proposal)
+				logcrash.ReportOrPanic(d.r.AnnotateCtx(cmd.ctx), &d.r.store.ClusterSettings().SV, "%v", err)
+				// If we didn't panic, treat the proposal as non-local. This makes sure
+				// we don't repropose it under a new lease index.
+				cmd.proposal = nil
+			} else {
+				cmd.proposal.v2SeenDuringApplication = true
+				anyLocal = true
+				delete(d.r.mu.proposals, cmd.ID)
+				if d.r.mu.proposalQuota != nil {
+					alloc = cmd.proposal.quotaAlloc
+					cmd.proposal.quotaAlloc = nil
+				}
+			}
 		}
-		// At this point we're not guaranteed to have proposalQuota initialized,
-		// the same is true for quotaReleaseQueues. Only queue the proposal's
-		// quota for release if the proposalQuota is initialized.
+
+		// NB: this may append nil. It's intentional. The quota release queue
+		// needs to have one slice entry per entry applied (even if the entry
+		// is rejected).
+		//
+		// TODO(tbg): there used to be an optimization where we'd elide mutating
+		// this slice until we saw a local proposal under a populated
+		// b.r.mu.proposalQuota. We can bring it back.
 		if d.r.mu.proposalQuota != nil {
-			d.r.mu.quotaReleaseQueue = append(d.r.mu.quotaReleaseQueue, toRelease)
+			d.r.mu.quotaReleaseQueue = append(d.r.mu.quotaReleaseQueue, alloc)
 		}
 	}
 	return anyLocal
@@ -138,13 +138,24 @@ func (d *replicaDecoder) createTracingSpans(ctx context.Context) {
 	var it replicatedCmdBufSlice
 	for it.init(&d.cmdBuf); it.Valid(); it.Next() {
 		cmd := it.cur()
+
 		if cmd.IsLocal() {
-			cmd.ctx, cmd.sp = tracing.ForkSpan(cmd.proposal.ctx, opName)
-		} else if cmd.raftCmd.TraceData != nil {
+			// We intentionally don't propagate the client's cancellation policy (in
+			// cmd.ctx) onto the request. See #75656.
+			propCtx := ctx // raft scheduler's ctx
+			var propSp *tracing.Span
+			// If the client has a trace, put a child into propCtx.
+			if sp := tracing.SpanFromContext(cmd.proposal.Context()); sp != nil {
+				propCtx, propSp = sp.Tracer().StartSpanCtx(
+					propCtx, "local proposal", tracing.WithParent(sp),
+				)
+			}
+			cmd.ctx, cmd.sp = propCtx, propSp
+		} else if cmd.Cmd.TraceData != nil {
 			// The proposal isn't local, and trace data is available. Extract
 			// the remote span and start a server-side span that follows from it.
 			spanMeta, err := d.r.AmbientContext.Tracer.ExtractMetaFrom(tracing.MapCarrier{
-				Map: cmd.raftCmd.TraceData,
+				Map: cmd.Cmd.TraceData,
 			})
 			if err != nil {
 				log.Errorf(ctx, "unable to extract trace data from raft command: %s", err)
@@ -152,14 +163,18 @@ func (d *replicaDecoder) createTracingSpans(ctx context.Context) {
 				cmd.ctx, cmd.sp = d.r.AmbientContext.Tracer.StartSpanCtx(
 					ctx,
 					opName,
-					// NB: we are lying here - we are not actually going to propagate
-					// the recording towards the root. That seems ok.
-					tracing.WithParentAndManualCollection(spanMeta),
+					// NB: Nobody is collecting the recording of this span; we have no
+					// mechanism for it.
+					tracing.WithRemoteParentFromSpanMeta(spanMeta),
 					tracing.WithFollowsFrom(),
 				)
 			}
 		} else {
-			cmd.ctx, cmd.sp = tracing.ForkSpan(ctx, opName)
+			cmd.ctx, cmd.sp = tracing.ChildSpan(ctx, opName)
+		}
+
+		if util.RaceEnabled && cmd.ctx.Done() != nil {
+			panic(fmt.Sprintf("cancelable context observed during raft application: %+v", cmd))
 		}
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -25,10 +20,16 @@ import (
 func TestRangeStatsInit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
+
+	// Lock the replica's Raft goroutine. We do this to avoid interference from
+	// any other moving parts on the Replica, whatever they may be.
+	tc.repl.raftMu.Lock()
+	defer tc.repl.raftMu.Unlock()
 	ms := enginepb.MVCCStats{
 		LiveBytes:       1,
 		KeyBytes:        2,
@@ -38,15 +39,15 @@ func TestRangeStatsInit(t *testing.T) {
 		KeyCount:        6,
 		ValCount:        7,
 		IntentCount:     8,
-		IntentAge:       9,
+		LockAge:         9,
 		GCBytesAge:      10,
 		LastUpdateNanos: 11,
 	}
 	rsl := stateloader.Make(tc.repl.RangeID)
-	if err := rsl.SetMVCCStats(context.Background(), tc.engine, &ms); err != nil {
+	if err := rsl.SetMVCCStats(ctx, tc.engine, &ms); err != nil {
 		t.Fatal(err)
 	}
-	loadMS, err := rsl.LoadMVCCStats(context.Background(), tc.engine)
+	loadMS, err := rsl.LoadMVCCStats(ctx, tc.engine)
 	if err != nil {
 		t.Fatal(err)
 	}

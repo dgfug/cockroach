@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
@@ -16,10 +11,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
@@ -48,7 +44,7 @@ type SampledRow struct {
 type SampleReservoir struct {
 	samples  []SampledRow
 	colTypes []*types.T
-	da       rowenc.DatumAlloc
+	da       tree.DatumAlloc
 	ra       rowenc.EncDatumRowAlloc
 	memAcc   *mon.BoundAccount
 
@@ -60,7 +56,7 @@ type SampleReservoir struct {
 	// sampleCols contains the ordinals of columns that should be sampled from
 	// each row. Note that the sampled rows still contain all columns, but
 	// any columns not part of this set are given a null value.
-	sampleCols util.FastIntSet
+	sampleCols intsets.Fast
 }
 
 var _ heap.Interface = &SampleReservoir{}
@@ -70,7 +66,7 @@ func (sr *SampleReservoir) Init(
 	numSamples, minNumSamples int,
 	colTypes []*types.T,
 	memAcc *mon.BoundAccount,
-	sampleCols util.FastIntSet,
+	sampleCols intsets.Fast,
 ) {
 	if minNumSamples < 1 || minNumSamples > numSamples {
 		minNumSamples = numSamples
@@ -165,7 +161,7 @@ func (sr *SampleReservoir) retryMaybeResize(ctx context.Context, op func() error
 // SampleRow returns an error (any type of error), no additional calls to
 // SampleRow should be made as the failed samples will have introduced bias.
 func (sr *SampleReservoir) SampleRow(
-	ctx context.Context, evalCtx *tree.EvalContext, row rowenc.EncDatumRow, rank uint64,
+	ctx context.Context, evalCtx *eval.Context, row rowenc.EncDatumRow, rank uint64,
 ) error {
 	return sr.retryMaybeResize(ctx, func() error {
 		if len(sr.samples) < cap(sr.samples) {
@@ -225,13 +221,13 @@ func (sr *SampleReservoir) GetNonNullDatums(
 		}
 		values = make(tree.Datums, 0, len(sr.samples))
 		for _, sample := range sr.samples {
-			ed := &sample.Row[colIdx]
-			if ed.Datum == nil {
+			d := sample.Row[colIdx].Datum
+			if d == nil {
 				values = nil
 				return errors.AssertionFailedf("value in column %d not decoded", colIdx)
 			}
-			if !ed.IsNull() {
-				values = append(values, ed.Datum)
+			if d != tree.DNull {
+				values = append(values, d)
 			}
 		}
 		return nil
@@ -240,7 +236,7 @@ func (sr *SampleReservoir) GetNonNullDatums(
 }
 
 func (sr *SampleReservoir) copyRow(
-	ctx context.Context, evalCtx *tree.EvalContext, dst, src rowenc.EncDatumRow,
+	ctx context.Context, evalCtx *eval.Context, dst, src rowenc.EncDatumRow,
 ) error {
 	for i := range src {
 		if !sr.sampleCols.Contains(i) {
@@ -258,13 +254,10 @@ func (sr *SampleReservoir) copyRow(
 		dst[i] = rowenc.DatumToEncDatum(sr.colTypes[i], src[i].Datum)
 		afterSize := dst[i].Size()
 
-		// If the datum is too large, truncate it (this also performs a copy).
-		// Otherwise, just perform a copy.
+		// If the datum is too large, truncate it.
 		if afterSize > uintptr(maxBytesPerSample) {
 			dst[i].Datum = truncateDatum(evalCtx, dst[i].Datum, maxBytesPerSample)
 			afterSize = dst[i].Size()
-		} else {
-			dst[i].Datum = deepCopyDatum(evalCtx, dst[i].Datum)
 		}
 
 		// Perform memory accounting.
@@ -285,7 +278,7 @@ const maxBytesPerSample = 400
 //
 // For example, if maxBytes=10, "Cockroach Labs" would be truncated to
 // "Cockroach ".
-func truncateDatum(evalCtx *tree.EvalContext, d tree.Datum, maxBytes int) tree.Datum {
+func truncateDatum(evalCtx *eval.Context, d tree.Datum, maxBytes int) tree.Datum {
 	switch t := d.(type) {
 	case *tree.DBitArray:
 		b := tree.DBitArray{BitArray: t.ToWidth(uint(maxBytes * 8))}
@@ -341,43 +334,6 @@ func truncateString(s string, maxBytes int) string {
 	// Copy the truncated string so that the memory from the longer string can
 	// be garbage collected.
 	b := make([]byte, last)
-	copy(b, s)
-	return string(b)
-}
-
-// deepCopyDatum performs a deep copy for datums such as DString to remove any
-// references to the kv batch and allow the batch to be garbage collected.
-// Note: this function is currently only called for key-encoded datums. Update
-// the calling function if there is a need to call this for value-encoded
-// datums as well.
-func deepCopyDatum(evalCtx *tree.EvalContext, d tree.Datum) tree.Datum {
-	switch t := d.(type) {
-	case *tree.DString:
-		return tree.NewDString(deepCopyString(string(*t)))
-
-	case *tree.DCollatedString:
-		return &tree.DCollatedString{
-			Contents: deepCopyString(t.Contents),
-			Locale:   t.Locale,
-			Key:      t.Key,
-		}
-
-	case *tree.DOidWrapper:
-		return &tree.DOidWrapper{
-			Wrapped: deepCopyDatum(evalCtx, t.Wrapped),
-			Oid:     t.Oid,
-		}
-
-	default:
-		// We do not collect stats on JSON, and other types do not require a deep
-		// copy (or they are already copied during decoding).
-		return d
-	}
-}
-
-// deepCopyString performs a deep copy of a string.
-func deepCopyString(s string) string {
-	b := make([]byte, len(s))
 	copy(b, s)
 	return string(b)
 }

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -90,12 +85,18 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.columns
 	case *zigzagJoinNode:
 		return n.columns
+	case *showTenantNode:
+		return n.columns
 	case *vTableLookupJoinNode:
 		return n.columns
 	case *invertedFilterNode:
 		return n.resultColumns
 	case *invertedJoinNode:
 		return n.columns
+	case *showFingerprintsNode:
+		return n.columns
+	case *callNode:
+		return n.getResultColumns()
 
 	// Nodes with a fixed schema.
 	case *scrubNode:
@@ -108,10 +109,10 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.getColumns(mut, colinfo.ExplainPlanColumns)
 	case *relocateNode:
 		return n.getColumns(mut, colinfo.AlterTableRelocateColumns)
+	case *relocateRange:
+		return n.getColumns(mut, colinfo.AlterRangeRelocateColumns)
 	case *scatterNode:
 		return n.getColumns(mut, colinfo.AlterTableScatterColumns)
-	case *showFingerprintsNode:
-		return n.getColumns(mut, colinfo.ShowFingerprintsColumns)
 	case *splitNode:
 		return n.getColumns(mut, colinfo.AlterTableSplitColumns)
 	case *unsplitNode:
@@ -124,6 +125,8 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.getColumns(mut, colinfo.SequenceSelectColumns)
 	case *exportNode:
 		return n.getColumns(mut, colinfo.ExportColumns)
+	case *completionsNode:
+		return n.getColumns(mut, colinfo.ShowCompletionsColumns)
 
 	// The columns in the hookFnNode are returned by the hook function; we don't
 	// know if they can be modified in place or not.
@@ -136,6 +139,8 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return getPlanColumns(n.plan, mut)
 	case *distinctNode:
 		return getPlanColumns(n.plan, mut)
+	case *fetchNode:
+		return n.cursor.Types()
 	case *filterNode:
 		return getPlanColumns(n.source.plan, mut)
 	case *max1RowNode:
@@ -163,6 +168,11 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		}
 	case *rowSourceToPlanNode:
 		return n.planCols
+	case *cdcValuesNode:
+		return n.resultColumns
+
+	case *identifySystemNode:
+		return n.getColumns(mut, colinfo.IdentifySystemColumns)
 	}
 
 	// Every other node has no columns in their results.

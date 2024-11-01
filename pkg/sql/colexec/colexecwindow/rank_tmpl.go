@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -180,11 +175,6 @@ func (r *_RANK_STRINGOp) Next() coldata.Batch {
 	// {{end}}
 	peersCol := batch.ColVec(r.peersColIdx).Bool()
 	rankVec := batch.ColVec(r.outputColIdx)
-	if rankVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		rankVec.Nulls().UnsetNulls()
-	}
 	rankCol := rankVec.Int64()
 	sel := batch.Selection()
 	if sel != nil {

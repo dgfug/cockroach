@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -30,15 +25,24 @@ var errRetryJobSentinel = errors.New("retriable job error")
 
 // MarkAsRetryJobError marks an error as a retriable job error which
 // indicates that the registry should retry the job.
+// Note that if a job is _not_ in the NonCancelable state, it will _only_ be
+// retried if the error has been marked as a retry job error.
 func MarkAsRetryJobError(err error) error {
 	return errors.Mark(err, errRetryJobSentinel)
+}
+
+// IsRetryJobError checks whether the given error is a job retry error.
+func IsRetryJobError(err error) bool {
+	return errors.Is(err, errRetryJobSentinel)
 }
 
 // Registry does not retry a job that fails due to a permanent error.
 var errJobPermanentSentinel = errors.New("permanent job error")
 
-// MarkAsPermanentJobError marks an error as a permanent job error, which indicates
-// Registry to not retry the job when it fails due to this error.
+// MarkAsPermanentJobError marks an error as a permanent job error, which
+// indicates Registry to not retry the job when it fails due to this error.
+// Note that if a job is in the NonCancelable state, it will always be retried
+// _unless_ the error has been marked as permanent job error.
 func MarkAsPermanentJobError(err error) error {
 	return errors.Mark(err, errJobPermanentSentinel)
 }
@@ -47,6 +51,30 @@ func MarkAsPermanentJobError(err error) error {
 func IsPermanentJobError(err error) bool {
 	return errors.Is(err, errJobPermanentSentinel)
 }
+
+// errPauseSelfSentinel exists so the errors returned from PauseRequestErr can
+// be marked with it.
+var errPauseSelfSentinel = errors.New("job requested it be paused")
+
+// MarkPauseRequestError marks an error as a pause request job error, which
+// indicates to the Registry that the job would like to be paused rather than
+// failing.
+func MarkPauseRequestError(reason error) error {
+	return errors.Mark(reason, errPauseSelfSentinel)
+}
+
+// IsPauseSelfError checks whether the given error is a
+// PauseRequestError.
+func IsPauseSelfError(err error) bool {
+	return errors.Is(err, errPauseSelfSentinel)
+}
+
+// PauseRequestExplained is a prose used to wrap and explain a pause-request error.
+const PauseRequestExplained = "pausing due to error; use RESUME JOB to try to proceed once the issue is resolved, or CANCEL JOB to rollback"
+
+// errJobLeaseNotHeld is a marker error for returning from a job execution if it
+// knows or finds out it no longer has a job lease.
+var errJobLeaseNotHeld = errors.New("job lease not held")
 
 // InvalidStatusError is the error returned when the desired operation is
 // invalid given the job's current status.

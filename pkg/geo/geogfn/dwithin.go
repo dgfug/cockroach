@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/s1"
 )
 
@@ -31,14 +27,14 @@ func DWithin(
 		return false, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
 	}
 	if distance < 0 {
-		return false, errors.Newf("dwithin distance cannot be less than zero")
+		return false, pgerror.Newf(pgcode.InvalidParameterValue, "dwithin distance cannot be less than zero")
 	}
-	spheroid, err := a.Spheroid()
+	spheroid, err := spheroidFromGeography(a)
 	if err != nil {
 		return false, err
 	}
 
-	angleToExpand := s1.Angle(distance / spheroid.SphereRadius)
+	angleToExpand := s1.Angle(distance / spheroid.SphereRadius())
 	if useSphereOrSpheroid == UseSpheroid {
 		angleToExpand *= (1 + SpheroidErrorFraction)
 	}

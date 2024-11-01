@@ -15,22 +15,6 @@ CREATE TABLE "family" (x INT8) -- literals removed
 CREATE TABLE _ (_ INT8) -- identifiers removed
 
 parse
-CREATE TABLE INDEX (x INT)
-----
-CREATE TABLE "index" (x INT8) -- normalized!
-CREATE TABLE "index" (x INT8) -- fully parenthesized
-CREATE TABLE "index" (x INT8) -- literals removed
-CREATE TABLE _ (_ INT8) -- identifiers removed
-
-parse
-CREATE TABLE NOTHING (x INT)
-----
-CREATE TABLE "nothing" (x INT8) -- normalized!
-CREATE TABLE "nothing" (x INT8) -- fully parenthesized
-CREATE TABLE "nothing" (x INT8) -- literals removed
-CREATE TABLE _ (_ INT8) -- identifiers removed
-
-parse
 CREATE TABLE MINVALUE (x INT)
 ----
 CREATE TABLE minvalue (x INT8) -- normalized!
@@ -192,23 +176,24 @@ CREATE TABLE foo(a CHAR(0))
                          ^
 
 parse
-CREATE TABLE a (b BIT VARYING(2), c BIT(1))
+CREATE TABLE a (b BIT VARYING(2), c BIT(1), c BIT, c BIT(0))
 ----
-CREATE TABLE a (b VARBIT(2), c BIT) -- normalized!
-CREATE TABLE a (b VARBIT(2), c BIT) -- fully parenthesized
-CREATE TABLE a (b VARBIT(2), c BIT) -- literals removed
-CREATE TABLE _ (_ VARBIT(2), _ BIT) -- identifiers removed
+CREATE TABLE a (b VARBIT(2), c BIT, c BIT, c BIT(0)) -- normalized!
+CREATE TABLE a (b VARBIT(2), c BIT, c BIT, c BIT(0)) -- fully parenthesized
+CREATE TABLE a (b VARBIT(2), c BIT, c BIT, c BIT(0)) -- literals removed
+CREATE TABLE _ (_ VARBIT(2), _ BIT, _ BIT, _ BIT(0)) -- identifiers removed
 
 error
 CREATE TABLE test (
-  foo BIT(0)
+  foo BIT(-1)
 )
 ----
-at or near ")": syntax error: length for type bit must be at least 1
+at or near "-": syntax error
 DETAIL: source SQL:
 CREATE TABLE test (
-  foo BIT(0)
-           ^
+  foo BIT(-1)
+          ^
+HINT: try \h CREATE TABLE
 
 
 parse
@@ -471,6 +456,24 @@ CREATE TABLE a (b "char") -- literals removed
 CREATE TABLE _ (_ "char") -- identifiers removed
 
 parse
+CREATE TABLE a (b
+"char")
+----
+CREATE TABLE a (b "char") -- normalized!
+CREATE TABLE a (b "char") -- fully parenthesized
+CREATE TABLE a (b "char") -- literals removed
+CREATE TABLE _ (_ "char") -- identifiers removed
+
+parse
+CREATE TABLE a ("b"
+"char")
+----
+CREATE TABLE a (b "char") -- normalized!
+CREATE TABLE a (b "char") -- fully parenthesized
+CREATE TABLE a (b "char") -- literals removed
+CREATE TABLE _ (_ "char") -- identifiers removed
+
+parse
 CREATE TABLE a (b INT8 NULL)
 ----
 CREATE TABLE a (b INT8 NULL)
@@ -566,6 +569,15 @@ CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN ((1)))) 
 CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (_))) -- literals removed
 CREATE TABLE _ (UNIQUE (_) PARTITION BY LIST (_) (PARTITION _ VALUES IN (1))) -- identifiers removed
 
+# Regression test for #95238
+parse
+CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (1)))
+----
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (1))) -- normalized!
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN ((1)))) -- fully parenthesized
+CREATE TABLE a (UNIQUE (b) PARTITION BY LIST ("c d") (PARTITION "e f" VALUES IN (_))) -- literals removed
+CREATE TABLE _ (UNIQUE (_) PARTITION BY LIST (_) (PARTITION _ VALUES IN (1))) -- identifiers removed
+
 parse
 CREATE TABLE a (b INT8 UNIQUE WITHOUT INDEX)
 ----
@@ -618,9 +630,9 @@ parse
 CREATE TABLE a (b INT8 DEFAULT now())
 ----
 CREATE TABLE a (b INT8 DEFAULT now())
-CREATE TABLE a (b INT8 DEFAULT ((now)())) -- fully parenthesized
+CREATE TABLE a (b INT8 DEFAULT (now())) -- fully parenthesized
 CREATE TABLE a (b INT8 DEFAULT now()) -- literals removed
-CREATE TABLE _ (_ INT8 DEFAULT now()) -- identifiers removed
+CREATE TABLE _ (_ INT8 DEFAULT _()) -- identifiers removed
 
 error
 CREATE TABLE test (
@@ -1928,7 +1940,7 @@ CREATE TABLE a AS VALUES ('one', 1), ('two', 2), ('three', 3)
 ----
 CREATE TABLE a AS VALUES ('one', 1), ('two', 2), ('three', 3)
 CREATE TABLE a AS VALUES (('one'), (1)), (('two'), (2)), (('three'), (3)) -- fully parenthesized
-CREATE TABLE a AS VALUES ('_', _), (__more2__) -- literals removed
+CREATE TABLE a AS VALUES ('_', _), (__more1_10__) -- literals removed
 CREATE TABLE _ AS VALUES ('one', 1), ('two', 2), ('three', 3) -- identifiers removed
 
 parse
@@ -1936,7 +1948,7 @@ CREATE TABLE IF NOT EXISTS a AS VALUES ('one', 1), ('two', 2), ('three', 3)
 ----
 CREATE TABLE IF NOT EXISTS a AS VALUES ('one', 1), ('two', 2), ('three', 3)
 CREATE TABLE IF NOT EXISTS a AS VALUES (('one'), (1)), (('two'), (2)), (('three'), (3)) -- fully parenthesized
-CREATE TABLE IF NOT EXISTS a AS VALUES ('_', _), (__more2__) -- literals removed
+CREATE TABLE IF NOT EXISTS a AS VALUES ('_', _), (__more1_10__) -- literals removed
 CREATE TABLE IF NOT EXISTS _ AS VALUES ('one', 1), ('two', 2), ('three', 3) -- identifiers removed
 
 parse
@@ -1944,7 +1956,7 @@ CREATE TABLE a (str, num) AS VALUES ('one', 1), ('two', 2), ('three', 3)
 ----
 CREATE TABLE a (str, num) AS VALUES ('one', 1), ('two', 2), ('three', 3)
 CREATE TABLE a (str, num) AS VALUES (('one'), (1)), (('two'), (2)), (('three'), (3)) -- fully parenthesized
-CREATE TABLE a (str, num) AS VALUES ('_', _), (__more2__) -- literals removed
+CREATE TABLE a (str, num) AS VALUES ('_', _), (__more1_10__) -- literals removed
 CREATE TABLE _ (_, _) AS VALUES ('one', 1), ('two', 2), ('three', 3) -- identifiers removed
 
 parse
@@ -1952,7 +1964,7 @@ CREATE TABLE IF NOT EXISTS a (str, num) AS VALUES ('one', 1), ('two', 2), ('thre
 ----
 CREATE TABLE IF NOT EXISTS a (str, num) AS VALUES ('one', 1), ('two', 2), ('three', 3)
 CREATE TABLE IF NOT EXISTS a (str, num) AS VALUES (('one'), (1)), (('two'), (2)), (('three'), (3)) -- fully parenthesized
-CREATE TABLE IF NOT EXISTS a (str, num) AS VALUES ('_', _), (__more2__) -- literals removed
+CREATE TABLE IF NOT EXISTS a (str, num) AS VALUES ('_', _), (__more1_10__) -- literals removed
 CREATE TABLE IF NOT EXISTS _ (_, _) AS VALUES ('one', 1), ('two', 2), ('three', 3) -- identifiers removed
 
 parse
@@ -2050,6 +2062,22 @@ CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT * FROM b
 CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT (*) FROM b -- fully parenthesized
 CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT * FROM b -- literals removed
 CREATE TABLE IF NOT EXISTS _ (_, _ FAMILY _) AS SELECT * FROM _ -- identifiers removed
+
+parse
+CREATE TABLE a WITH (fillfactor=100) AS SELECT * FROM b
+----
+CREATE TABLE a WITH ('fillfactor' = 100) AS SELECT * FROM b -- normalized!
+CREATE TABLE a WITH ('fillfactor' = (100)) AS SELECT (*) FROM b -- fully parenthesized
+CREATE TABLE a WITH ('fillfactor' = _) AS SELECT * FROM b -- literals removed
+CREATE TABLE _ WITH ('fillfactor' = 100) AS SELECT * FROM _ -- identifiers removed
+
+parse
+CREATE TABLE tbl (a INT) WITH ( 'string' = 'val' )
+----
+CREATE TABLE tbl (a INT8) WITH ('string' = 'val') -- normalized!
+CREATE TABLE tbl (a INT8) WITH ('string' = ('val')) -- fully parenthesized
+CREATE TABLE tbl (a INT8) WITH ('string' = '_') -- literals removed
+CREATE TABLE _ (_ INT8) WITH ('string' = 'val') -- identifiers removed
 
 error
 CREATE TABLE test (
@@ -2196,10 +2224,10 @@ CREATE TABLE _ (_ INT4) LOCALITY REGIONAL BY ROW AS _ -- identifiers removed
 parse
 CREATE TABLE a (b INT) WITH (fillfactor=100)
 ----
-CREATE TABLE a (b INT8) -- normalized!
-CREATE TABLE a (b INT8) -- fully parenthesized
-CREATE TABLE a (b INT8) -- literals removed
-CREATE TABLE _ (_ INT8) -- identifiers removed
+CREATE TABLE a (b INT8) WITH ('fillfactor' = 100) -- normalized!
+CREATE TABLE a (b INT8) WITH ('fillfactor' = (100)) -- fully parenthesized
+CREATE TABLE a (b INT8) WITH ('fillfactor' = _) -- literals removed
+CREATE TABLE _ (_ INT8) WITH ('fillfactor' = 100) -- identifiers removed
 
 parse
 CREATE TABLE arr_t (i STRING DEFAULT (('{' || 'a' || '}')::STRING[])[1]::STRING)
@@ -2222,7 +2250,7 @@ CREATE TABLE arr_t (i INT8 DEFAULT (ARRAY[1, 2, 3]::int[])[2])
 ----
 CREATE TABLE arr_t (i INT8 DEFAULT (ARRAY[1, 2, 3]::INT8[])[2]) -- normalized!
 CREATE TABLE arr_t (i INT8 DEFAULT (((((ARRAY[(1), (2), (3)])::INT8[])))[(2)])) -- fully parenthesized
-CREATE TABLE arr_t (i INT8 DEFAULT (ARRAY[_, _, __more1__]::INT8[])[_]) -- literals removed
+CREATE TABLE arr_t (i INT8 DEFAULT (ARRAY[_, _, __more1_10__]::INT8[])[_]) -- literals removed
 CREATE TABLE _ (_ INT8 DEFAULT (ARRAY[1, 2, 3]::INT8[])[2]) -- identifiers removed
 
 parse
@@ -2377,7 +2405,7 @@ CREATE TABLE generated_error (
   b VARCHAR(12) GENERATED ALWAYS AS IDENTITY
 )
 ----
-at or near ")": syntax error: identity column type must be INT, INT2, or INT4
+at or near ")": syntax error: identity column type must be an INT
 DETAIL: source SQL:
 CREATE TABLE generated_error (
   a INT,
@@ -2391,7 +2419,7 @@ CREATE TABLE generated_error (
   b VARCHAR(12) GENERATED BY DEFAULT AS IDENTITY
 )
 ----
-at or near ")": syntax error: identity column type must be INT, INT2, or INT4
+at or near ")": syntax error: identity column type must be an INT
 DETAIL: source SQL:
 CREATE TABLE generated_error (
   a INT,
@@ -2406,3 +2434,128 @@ CREATE TABLE visible (visible INT4)
 CREATE TABLE visible (visible INT4) -- fully parenthesized
 CREATE TABLE visible (visible INT4) -- literals removed
 CREATE TABLE _ (_ INT4) -- identifiers removed
+
+# The following test cases check parsing support for creating a not visible index.
+parse
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE)
+----
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE)
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- fully parenthesized
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- literals removed
+CREATE TABLE _ (_ INT8, _ STRING, INDEX (_ ASC, _ DESC) STORING (_) NOT VISIBLE) -- identifiers removed
+
+parse
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) INVISIBLE)
+----
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- normalized!
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- fully parenthesized
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) NOT VISIBLE) -- literals removed
+CREATE TABLE _ (_ INT8, _ STRING, INDEX (_ ASC, _ DESC) STORING (_) NOT VISIBLE) -- identifiers removed
+
+parse
+CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE c > 3 NOT VISIBLE)
+----
+CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE c > 3 NOT VISIBLE)
+CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE ((c) > (3)) NOT VISIBLE) -- fully parenthesized
+CREATE TABLE a (b INT8, c STRING, INVERTED INDEX (b ASC, c DESC) WHERE c > _ NOT VISIBLE) -- literals removed
+CREATE TABLE _ (_ INT8, _ STRING, INVERTED INDEX (_ ASC, _ DESC) WHERE _ > 3 NOT VISIBLE) -- identifiers removed
+
+parse
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) VISIBILITY 0.2)
+----
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) VISIBILITY 0.20) -- normalized!
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) VISIBILITY 0.20) -- fully parenthesized
+CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c) VISIBILITY 0.20) -- literals removed
+CREATE TABLE _ (_ INT8, _ STRING, INDEX (_ ASC, _ DESC) STORING (_) VISIBILITY 0.20) -- identifiers removed
+
+parse
+CREATE TABLE t (a INT, INDEX (a) VISIBILITY 7.379652426127388e-12)
+----
+CREATE TABLE t (a INT8, INDEX (a) VISIBILITY 0.00) -- normalized!
+CREATE TABLE t (a INT8, INDEX (a) VISIBILITY 0.00) -- fully parenthesized
+CREATE TABLE t (a INT8, INDEX (a) VISIBILITY 0.00) -- literals removed
+CREATE TABLE _ (_ INT8, INDEX (_) VISIBILITY 0.00) -- identifiers removed
+
+# Creating an invisible unique index inside a table definition is supported by
+# the grammar rule, but the parser will throw an error for the following
+# statement. This is because the parser is doing a round trip in
+# `pkg/testutils/sqlutils/pretty.go`. In sql.y, creating an unique index in a
+# CREATE TABLE statement returns a new structure tree.UniqueConstraintTableDef.
+# However, creating a unique constraint with not visible index is not supported by
+# the parser. When the parser does a round trip for the following statement, it
+# formats it to a pretty statement using the unique constraint definition. But
+# the parser does not support unique constraint with not visible index syntax. So
+# it will fail while parsing the pretty statement. Since logictest also performs
+# a roundtrip check in pkg/sql/logictest/logic.go, logictest would also fail.
+# But the following statement would still work in a cluster.
+# This is a known issue. See more details in
+# https://github.com/cockroachdb/cockroach/pull/65825.
+parse-no-verify
+CREATE TABLE a (b INT, UNIQUE INDEX foo (b) WHERE c > 3 NOT VISIBLE)
+----
+
+# The following test case makes sure that creating an invisible primary index is
+# not supported by the parser.
+error
+CREATE TABLE a (b INT8, c STRING, PRIMARY KEY (b, c, "0") NOT VISIBLE)
+----
+at or near "visible": syntax error
+DETAIL: source SQL:
+CREATE TABLE a (b INT8, c STRING, PRIMARY KEY (b, c, "0") NOT VISIBLE)
+                                                              ^
+HINT: try \h CREATE TABLE
+
+# The following test cases make sure that creating any constraints with
+# not visible index is not supported by the parser.
+error
+CREATE TABLE a (b INT8, c STRING, CONSTRAINT d UNIQUE (b, c) NOT VISIBLE)
+----
+at or near "visible": syntax error
+DETAIL: source SQL:
+CREATE TABLE a (b INT8, c STRING, CONSTRAINT d UNIQUE (b, c) NOT VISIBLE)
+                                                                 ^
+HINT: try \h CREATE TABLE
+
+error
+CREATE TABLE a (b INT8, c STRING, CONSTRAINT d UNIQUE WITHOUT INDEX (b, c) NOT VISIBLE)
+----
+at or near "visible": syntax error
+DETAIL: source SQL:
+CREATE TABLE a (b INT8, c STRING, CONSTRAINT d UNIQUE WITHOUT INDEX (b, c) NOT VISIBLE)
+                                                                               ^
+HINT: try \h CREATE TABLE
+
+# NOT VISIBLE here applies to the column, not the primary index, so it is
+# allowed.
+parse
+CREATE TABLE a (b INT8 PRIMARY KEY NOT VISIBLE)
+----
+CREATE TABLE a (b INT8 NOT VISIBLE PRIMARY KEY) -- normalized!
+CREATE TABLE a (b INT8 NOT VISIBLE PRIMARY KEY) -- fully parenthesized
+CREATE TABLE a (b INT8 NOT VISIBLE PRIMARY KEY) -- literals removed
+CREATE TABLE _ (_ INT8 NOT VISIBLE PRIMARY KEY) -- identifiers removed
+
+# Regression test for #95238
+parse
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (1))
+----
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (1))
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN ((1))) -- fully parenthesized
+ALTER TABLE a PARTITION ALL BY LIST ("a b", "c.d") (PARTITION "e.f" VALUES IN (_)) -- literals removed
+ALTER TABLE _ PARTITION ALL BY LIST (_, _) (PARTITION _ VALUES IN (1)) -- identifiers removed
+
+parse
+CREATE TABLE a (a VECTOR(3))
+----
+CREATE TABLE a (a VECTOR(3))
+CREATE TABLE a (a VECTOR(3)) -- fully parenthesized
+CREATE TABLE a (a VECTOR(3)) -- literals removed
+CREATE TABLE _ (_ VECTOR(3)) -- identifiers removed
+
+parse
+CREATE TABLE a (a VECTOR)
+----
+CREATE TABLE a (a VECTOR)
+CREATE TABLE a (a VECTOR) -- fully parenthesized
+CREATE TABLE a (a VECTOR) -- literals removed
+CREATE TABLE _ (_ VECTOR) -- identifiers removed

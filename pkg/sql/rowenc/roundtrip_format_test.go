@@ -1,16 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowenc_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -20,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -51,18 +48,19 @@ func TestRandParseDatumStringAs(t *testing.T) {
 	},
 		types.Scalar...)
 	for _, ty := range types.Scalar {
-		if ty != types.Jsonb {
+		if !ty.Identical(types.Jsonb) {
 			tests = append(tests, types.MakeArray(ty))
 		}
 	}
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	rng, _ := randutil.NewTestRand()
 	for _, typ := range tests {
 		const testsForTyp = 100
 		t.Run(typ.String(), func(t *testing.T) {
 			for i := 0; i < testsForTyp; i++ {
-				datum := randgen.RandDatumWithNullChance(rng, typ, 0)
+				datum := randgen.RandDatumWithNullChance(rng, typ, 0, /* nullChance */
+					false /* favorCommonData */, false /* targetColumnIsUnique */)
 				ds := tree.AsStringWithFlags(datum, tree.FmtExport)
 
 				// Because of how RandDatumWithNullChanceWorks, we might
@@ -95,11 +93,13 @@ func TestRandParseDatumStringAs(t *testing.T) {
 					t.Fatal(ds, err)
 				}
 
-				parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+				parsed, err := rowenc.ParseDatumStringAs(ctx, typ, ds, evalCtx, nil /* semaCtx */)
 				if err != nil {
 					t.Fatal(ds, err)
 				}
-				if parsed.Compare(evalCtx, datum) != 0 {
+				if cmp, err := parsed.Compare(ctx, evalCtx, datum); err != nil {
+					t.Fatal(err)
+				} else if cmp != 0 {
 					t.Fatal(ds, "expected", datum, "found", parsed)
 				}
 			}
@@ -285,13 +285,13 @@ func TestParseDatumStringAs(t *testing.T) {
 			uuid.MakeV4().String(),
 		},
 	}
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	for typ, exprs := range tests {
 		t.Run(typ.String(), func(t *testing.T) {
 			for _, s := range exprs {
 				t.Run(fmt.Sprintf("%q", s), func(t *testing.T) {
-					d, err := rowenc.ParseDatumStringAs(typ, s, evalCtx)
+					d, err := rowenc.ParseDatumStringAs(ctx, typ, s, evalCtx, nil /* semaCtx */)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -299,11 +299,13 @@ func TestParseDatumStringAs(t *testing.T) {
 						t.Fatalf("unexpected type: %s", d.ResolvedType())
 					}
 					ds := tree.AsStringWithFlags(d, tree.FmtExport)
-					parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+					parsed, err := rowenc.ParseDatumStringAs(ctx, typ, ds, evalCtx, nil /* semaCtx */)
 					if err != nil {
 						t.Fatal(err)
 					}
-					if parsed.Compare(evalCtx, d) != 0 {
+					if cmp, err := parsed.Compare(ctx, evalCtx, d); err != nil {
+						t.Fatal(err)
+					} else if cmp != 0 {
 						t.Fatal("expected", d, "found", parsed)
 					}
 				})

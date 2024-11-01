@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build gofuzz
 // +build gofuzz
@@ -16,7 +11,6 @@ package pgwire
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"net"
 	"time"
 
@@ -49,7 +43,7 @@ func FuzzServeConn(data []byte) int {
 	}()
 	go func() {
 		// Discard all data sent from the server.
-		_, _ = io.Copy(ioutil.Discard, client)
+		_, _ = io.Copy(io.Discard, client)
 	}()
 	err := s.ServeConn(context.Background(), srv)
 	if err != nil {

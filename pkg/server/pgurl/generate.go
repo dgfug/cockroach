@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgurl
 
@@ -96,6 +91,26 @@ func (u *URL) ToPQ() *url.URL {
 	case authnPassword, authnPasswordWithClientCert:
 		if u.hasPassword {
 			nu.User = url.UserPassword(u.username, u.password)
+		}
+	}
+
+	nu.RawQuery = opts.Encode()
+	return nu
+}
+
+// ToPQRedacted converts the URL to a connection string supported
+// by drivers using libpq or compatible, with the password redacted.
+func (u *URL) ToPQRedacted() *url.URL {
+	nu, opts := u.baseURL()
+
+	if u.username != "" {
+		nu.User = url.User(u.username)
+	}
+	switch u.authn {
+	case authnPassword, authnPasswordWithClientCert:
+		if u.hasPassword {
+			// Use '~' since it does not need to be escaped.
+			nu.User = url.UserPassword(u.username, "~~~~~~")
 		}
 	}
 

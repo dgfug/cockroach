@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ptcache
 
@@ -14,11 +9,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -30,12 +25,13 @@ import (
 )
 
 // Cache implements protectedts.Cache.
+// TODO(#119243): delete this in 24.2
 type Cache struct {
-	db       *kv.DB
-	storage  protectedts.Storage
+	db       isql.DB
+	storage  protectedts.Manager
 	stopper  *stop.Stopper
 	settings *cluster.Settings
-	sf       singleflight.Group
+	sf       *singleflight.Group
 	mu       struct {
 		syncutil.RWMutex
 
@@ -56,8 +52,8 @@ type Cache struct {
 
 // Config configures a Cache.
 type Config struct {
-	DB       *kv.DB
-	Storage  protectedts.Storage
+	DB       isql.DB
+	Storage  protectedts.Manager
 	Settings *cluster.Settings
 }
 
@@ -67,6 +63,7 @@ func New(config Config) *Cache {
 		db:       config.DB,
 		storage:  config.Storage,
 		settings: config.Settings,
+		sf:       singleflight.NewGroup("refresh-protectedts-cache", singleflight.NoTags),
 	}
 	c.mu.recordsByID = make(map[uuid.UUID]*ptpb.Record)
 	return c
@@ -113,17 +110,35 @@ const refreshKey = ""
 // Refresh is part of the protectedts.Cache interface.
 func (c *Cache) Refresh(ctx context.Context, asOf hlc.Timestamp) error {
 	for !c.upToDate(asOf) {
-		ch, _ := c.sf.DoChan(refreshKey, c.doSingleFlightUpdate)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case res := <-ch:
-			if res.Err != nil {
-				return res.Err
-			}
+		future, _ := c.sf.DoChan(ctx,
+			refreshKey,
+			singleflight.DoOpts{
+				Stop:               c.stopper,
+				InheritCancelation: false,
+			},
+			c.doSingleFlightUpdate,
+		)
+		res := future.WaitForResult(ctx)
+		if res.Err != nil {
+			return res.Err
 		}
 	}
 	return nil
+}
+
+// GetProtectionTimestamps is part of the spanconfig.ProtectedTSReader
+// interface.
+func (c *Cache) GetProtectionTimestamps(
+	ctx context.Context, sp roachpb.Span,
+) (protectionTimestamps []hlc.Timestamp, asOf hlc.Timestamp, err error) {
+	readAt := c.Iterate(ctx,
+		sp.Key,
+		sp.EndKey,
+		func(rec *ptpb.Record) (wantMore bool) {
+			protectionTimestamps = append(protectionTimestamps, rec.Timestamp)
+			return true
+		})
+	return protectionTimestamps, readAt, nil
 }
 
 // Start starts the periodic fetching of the Cache. A Cache must not be used
@@ -149,11 +164,11 @@ func (c *Cache) periodicallyRefreshProtectedtsCache(ctx context.Context) {
 		default:
 		}
 	})
-	timer := timeutil.NewTimer()
+	var timer timeutil.Timer
 	defer timer.Stop()
 	timer.Reset(0) // Read immediately upon startup
 	var lastReset time.Time
-	var doneCh <-chan singleflight.Result
+	var future singleflight.Future
 	// TODO(ajwerner): consider resetting the timer when the state is updated
 	// due to a call to Refresh.
 	for {
@@ -161,7 +176,14 @@ func (c *Cache) periodicallyRefreshProtectedtsCache(ctx context.Context) {
 		case <-timer.C:
 			// Let's not reset the timer until we get our response.
 			timer.Read = true
-			doneCh, _ = c.sf.DoChan(refreshKey, c.doSingleFlightUpdate)
+			future, _ = c.sf.DoChan(ctx,
+				refreshKey,
+				singleflight.DoOpts{
+					Stop:               c.stopper,
+					InheritCancelation: false,
+				},
+				c.doSingleFlightUpdate,
+			)
 		case <-settingChanged:
 			if timer.Read { // we're currently fetching
 				continue
@@ -172,12 +194,14 @@ func (c *Cache) periodicallyRefreshProtectedtsCache(ctx context.Context) {
 			nextUpdate := interval - timeutil.Since(lastReset)
 			timer.Reset(nextUpdate)
 			lastReset = timeutil.Now()
-		case res := <-doneCh:
+		case <-future.C():
+			res := future.WaitForResult(ctx)
 			if res.Err != nil {
 				if ctx.Err() == nil {
 					log.Errorf(ctx, "failed to refresh protected timestamps: %v", res.Err)
 				}
 			}
+			future.Reset()
 			timer.Reset(protectedts.PollInterval.Get(&c.settings.SV))
 			lastReset = timeutil.Now()
 		case <-c.stopper.ShouldQuiesce():
@@ -186,21 +210,13 @@ func (c *Cache) periodicallyRefreshProtectedtsCache(ctx context.Context) {
 	}
 }
 
-func (c *Cache) doSingleFlightUpdate() (interface{}, error) {
-	// TODO(ajwerner): add log tags to the context.
-	ctx, cancel := c.stopper.WithCancelOnQuiesce(context.Background())
-	defer cancel()
-	return nil, c.stopper.RunTaskWithErr(ctx,
-		"refresh-protectedts-cache", c.doUpdate)
-}
-
 func (c *Cache) getMetadata() ptpb.Metadata {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.mu.state.Metadata
 }
 
-func (c *Cache) doUpdate(ctx context.Context) error {
+func (c *Cache) doSingleFlightUpdate(ctx context.Context) (interface{}, error) {
 	// NB: doUpdate is only ever called underneath c.singleFlight and thus is
 	// never called concurrently. Due to the lack of concurrency there are no
 	// concerns about races as this is the only method which writes to the Cache's
@@ -211,29 +227,30 @@ func (c *Cache) doUpdate(ctx context.Context) error {
 		state          ptpb.State
 		ts             hlc.Timestamp
 	)
-	err := c.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+	err := c.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
 		// NB: because this is a read-only transaction, the commit will be a no-op;
 		// returning nil here means the transaction will commit and will never need
 		// to change its read timestamp.
 		defer func() {
 			if err == nil {
-				ts = txn.ReadTimestamp()
+				ts = txn.KV().ReadTimestamp()
 			}
 		}()
-		md, err := c.storage.GetMetadata(ctx, txn)
+		pts := c.storage.WithTxn(txn)
+		md, err := pts.GetMetadata(ctx)
 		if err != nil {
 			return errors.Wrap(err, "failed to fetch protectedts metadata")
 		}
 		if versionChanged = md.Version != prev.Version; !versionChanged {
 			return nil
 		}
-		if state, err = c.storage.GetState(ctx, txn); err != nil {
+		if state, err = pts.GetState(ctx); err != nil {
 			return errors.Wrap(err, "failed to fetch protectedts state")
 		}
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -245,10 +262,10 @@ func (c *Cache) doUpdate(ctx context.Context) error {
 		}
 		for i := range state.Records {
 			r := &state.Records[i]
-			c.mu.recordsByID[r.ID] = r
+			c.mu.recordsByID[r.ID.GetUUID()] = r
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // upToDate returns true if the lastUpdate for the cache is at least asOf.
@@ -259,8 +276,8 @@ func (c *Cache) upToDate(asOf hlc.Timestamp) bool {
 }
 
 func overlaps(r *ptpb.Record, sp roachpb.Span) bool {
-	for i := range r.Spans {
-		if r.Spans[i].Overlaps(sp) {
+	for i := range r.DeprecatedSpans {
+		if r.DeprecatedSpans[i].Overlaps(sp) {
 			return true
 		}
 	}

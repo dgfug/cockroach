@@ -76,16 +76,21 @@ SELECT pg_column_size(NULL::int)
 ----
 NULL
 
+subtest end
+
 statement ok
 CREATE TABLE is_visible(a int primary key);
 CREATE TYPE visible_type AS ENUM('a');
+CREATE FUNCTION visible_func() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE SCHEMA other;
 CREATE TABLE other.not_visible(a int primary key);
 CREATE TYPE other.not_visible_type AS ENUM('b');
+CREATE FUNCTION other.not_visible_func() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE DATABASE db2;
 SET DATABASE = db2;
 CREATE TABLE table_in_db2(a int primary key);
 CREATE TYPE type_in_db2 AS ENUM('c');
+CREATE FUNCTION func_in_db2() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 
 let $table_in_db2_id
 SELECT c.oid FROM pg_class c WHERE c.relname = 'table_in_db2';
@@ -93,16 +98,21 @@ SELECT c.oid FROM pg_class c WHERE c.relname = 'table_in_db2';
 let $type_in_db2_id
 SELECT t.oid FROM pg_type t WHERE t.typname = 'type_in_db2';
 
+let $func_in_db2_id
+SELECT p.oid FROM pg_proc p WHERE p.proname = 'func_in_db2';
+
 statement ok
 SET DATABASE = test;
 
 query TB rowsort
 SELECT c.relname, pg_table_is_visible(c.oid)
 FROM pg_class c
-WHERE c.relname IN ('is_visible', 'not_visible')
+WHERE c.relname IN ('is_visible', 'not_visible', 'is_visible_pkey', 'not_visible_pkey')
 ----
-is_visible   true
-not_visible  false
+is_visible        true
+is_visible_pkey   true
+not_visible       false
+not_visible_pkey  false
 
 # Looking up a table in a different database should return NULL.
 query B
@@ -148,6 +158,31 @@ SELECT pg_type_is_visible(NULL)
 ----
 NULL
 
+query TB rowsort
+SELECT p.proname, pg_function_is_visible(p.oid)
+FROM pg_proc p
+WHERE p.proname IN ('array_length', 'visible_func', 'not_visible_func')
+----
+array_length      true
+visible_func      true
+not_visible_func  false
+
+# Looking up a function in a different database should return NULL.
+query B
+SELECT pg_function_is_visible($func_in_db2_id)
+----
+NULL
+
+# Looking up a non-existent OID should return NULL.
+query B
+SELECT pg_function_is_visible(1010101010)
+----
+NULL
+
+query B
+SELECT pg_function_is_visible(NULL)
+----
+NULL
 
 query TT
 SELECT pg_get_partkeydef(1), pg_get_partkeydef(NULL)
@@ -172,47 +207,48 @@ WHERE c.relname IN ('is_updatable', 'is_updatable_view', 'pg_class')
 ORDER BY c.oid, a.attnum
 ----
 relname            attname              oid         attnum  pg_relation_is_updatable  pg_column_is_updatable
-is_updatable       a                    66          1       28                        true
-is_updatable       b                    66          2       28                        true
-is_updatable       c                    66          3       28                        false
-is_updatable_view  a                    67          1       0                         false
-is_updatable_view  b                    67          2       0                         false
-pg_class           oid                  4294967132  1       0                         false
-pg_class           relname              4294967132  2       0                         false
-pg_class           relnamespace         4294967132  3       0                         false
-pg_class           reltype              4294967132  4       0                         false
-pg_class           reloftype            4294967132  5       0                         false
-pg_class           relowner             4294967132  6       0                         false
-pg_class           relam                4294967132  7       0                         false
-pg_class           relfilenode          4294967132  8       0                         false
-pg_class           reltablespace        4294967132  9       0                         false
-pg_class           relpages             4294967132  10      0                         false
-pg_class           reltuples            4294967132  11      0                         false
-pg_class           relallvisible        4294967132  12      0                         false
-pg_class           reltoastrelid        4294967132  13      0                         false
-pg_class           relhasindex          4294967132  14      0                         false
-pg_class           relisshared          4294967132  15      0                         false
-pg_class           relpersistence       4294967132  16      0                         false
-pg_class           relistemp            4294967132  17      0                         false
-pg_class           relkind              4294967132  18      0                         false
-pg_class           relnatts             4294967132  19      0                         false
-pg_class           relchecks            4294967132  20      0                         false
-pg_class           relhasoids           4294967132  21      0                         false
-pg_class           relhaspkey           4294967132  22      0                         false
-pg_class           relhasrules          4294967132  23      0                         false
-pg_class           relhastriggers       4294967132  24      0                         false
-pg_class           relhassubclass       4294967132  25      0                         false
-pg_class           relfrozenxid         4294967132  26      0                         false
-pg_class           relacl               4294967132  27      0                         false
-pg_class           reloptions           4294967132  28      0                         false
-pg_class           relforcerowsecurity  4294967132  29      0                         false
-pg_class           relispartition       4294967132  30      0                         false
-pg_class           relispopulated       4294967132  31      0                         false
-pg_class           relreplident         4294967132  32      0                         false
-pg_class           relrewrite           4294967132  33      0                         false
-pg_class           relrowsecurity       4294967132  34      0                         false
-pg_class           relpartbound         4294967132  35      0                         false
-pg_class           relminmxid           4294967132  36      0                         false
+is_updatable       a                    123         1       28                        true
+is_updatable       b                    123         2       28                        true
+is_updatable       c                    123         3       28                        false
+is_updatable_view  a                    124         1       0                         false
+is_updatable_view  b                    124         2       0                         false
+pg_class           oid                  4294967085  1       0                         false
+pg_class           relname              4294967085  2       0                         false
+pg_class           relnamespace         4294967085  3       0                         false
+pg_class           reltype              4294967085  4       0                         false
+pg_class           reloftype            4294967085  5       0                         false
+pg_class           relowner             4294967085  6       0                         false
+pg_class           relam                4294967085  7       0                         false
+pg_class           relfilenode          4294967085  8       0                         false
+pg_class           reltablespace        4294967085  9       0                         false
+pg_class           relpages             4294967085  10      0                         false
+pg_class           reltuples            4294967085  11      0                         false
+pg_class           relallvisible        4294967085  12      0                         false
+pg_class           reltoastrelid        4294967085  13      0                         false
+pg_class           relhasindex          4294967085  14      0                         false
+pg_class           relisshared          4294967085  15      0                         false
+pg_class           relpersistence       4294967085  16      0                         false
+pg_class           relistemp            4294967085  17      0                         false
+pg_class           relkind              4294967085  18      0                         false
+pg_class           relnatts             4294967085  19      0                         false
+pg_class           relchecks            4294967085  20      0                         false
+pg_class           relhasoids           4294967085  21      0                         false
+pg_class           relhaspkey           4294967085  22      0                         false
+pg_class           relhasrules          4294967085  23      0                         false
+pg_class           relhastriggers       4294967085  24      0                         false
+pg_class           relhassubclass       4294967085  25      0                         false
+pg_class           relfrozenxid         4294967085  26      0                         false
+pg_class           relacl               4294967085  27      0                         false
+pg_class           reloptions           4294967085  28      0                         false
+pg_class           relforcerowsecurity  4294967085  29      0                         false
+pg_class           relispartition       4294967085  30      0                         false
+pg_class           relispopulated       4294967085  31      0                         false
+pg_class           relreplident         4294967085  32      0                         false
+pg_class           relrewrite           4294967085  33      0                         false
+pg_class           relrowsecurity       4294967085  34      0                         false
+pg_class           relpartbound         4294967085  35      0                         false
+pg_class           relminmxid           4294967085  36      0                         false
+
 
 # Check that the oid does not exist. If this test fail, change the oid here and in
 # the next test at 'relation does not exist' value.
@@ -266,6 +302,34 @@ SELECT current_setting('statement_timeout'), current_setting('search_path')
 # check error on nonexistent session var.
 query error unrecognized configuration parameter
 SELECT pg_catalog.current_setting('woo', false)
+
+# Check that current_setting handles custom settings correctly.
+query T
+SELECT current_setting('my.custom', true)
+----
+NULL
+
+statement ok
+PREPARE check_custom AS SELECT current_setting('my.custom', true)
+
+query T
+EXECUTE check_custom
+----
+NULL
+
+statement ok
+BEGIN;
+SET LOCAL my.custom = 'foo'
+
+# Check that the existence of my.custom is checked depending on the execution
+# context, and not at PREPARE time.
+query T
+EXECUTE check_custom
+----
+foo
+
+statement ok
+COMMIT
 
 # check error on unsupported session var.
 query error configuration setting.*not supported
@@ -335,6 +399,21 @@ SELECT pg_catalog.set_config('woo', 'woo', false)
 
 query error configuration setting.*not supported
 SELECT set_config('vacuum_cost_delay', '0', false)
+
+# Regression test for #117316. Setting an empty search_path should succeed.
+query T
+SELECT pg_catalog.set_config('search_path', '', false)
+----
+·
+
+query T
+SHOW search_path
+----
+·
+
+# Reset the search paths for subsequent tests.
+statement ok
+RESET search_path
 
 # pg_my_temp_schema
 #
@@ -442,7 +521,7 @@ ORDER BY t.oid
 ----
 text     25    -1
 float8   701   -1
-bpchar   1042  5
+bpchar   1042  -1
 varchar  1043  68
 bit      1560  1
 varbit   1562  16
@@ -460,7 +539,7 @@ ORDER BY t.oid
 ----
 text     NULL
 float8   NULL
-bpchar   1
+bpchar   NULL
 varchar  64
 bit      1
 varbit   16
@@ -479,7 +558,7 @@ ORDER BY t.oid
 ----
 text     NULL
 float8   NULL
-bpchar   1
+bpchar   NULL
 varchar  64
 bit      1
 varbit   16
@@ -578,3 +657,361 @@ h      float8   53  2   NULL
 i      numeric  12  10  2
 j      numeric  4   10  4
 rowid  int8     64  2   0
+
+statement error null array element not allowed in this context
+SELECT * FROM pg_options_to_table(array['b', NULL, 'a']::text[])
+
+query TT colnames
+SELECT * FROM pg_options_to_table(array[]::text[]);
+----
+option_name  option_value
+
+query TT colnames,nosort
+SELECT * FROM pg_options_to_table(array['a', 'b=c', '=d', 'e=f=g']::text[]);
+----
+option_name  option_value
+a            NULL
+b            c
+·            d
+e            f=g
+
+query TT colnames
+SELECT * FROM pg_options_to_table(null)
+----
+option_name  option_value
+
+query TT colnames,nosort
+SELECT * FROM pg_options_to_table('{a, b=c, =d, e=f=g}')
+----
+option_name  option_value
+a            NULL
+b            c
+·            d
+e            f=g
+
+
+statement ok
+CREATE TYPE test_type AS ENUM ('open', 'closed', 'inactive');
+
+statement ok
+CREATE ROLE test_role LOGIN;
+
+statement ok
+CREATE TABLE t1 (a int);
+
+query T
+SELECT to_regclass('pg_roles')
+----
+pg_roles
+
+query T
+SELECT to_regclass('4294967230')
+----
+NULL
+
+query T
+SELECT to_regclass('pg_policy')
+----
+pg_policy
+
+query T
+SELECT to_regclass('t1')
+----
+t1
+
+query T
+SELECT to_regnamespace('crdb_internal')
+----
+crdb_internal
+
+query T
+SELECT to_regnamespace('public')
+----
+public
+
+query T
+SELECT to_regnamespace('1330834471')
+----
+NULL
+
+query T
+SELECT to_regnamespace(' 1330834471')
+----
+NULL
+
+query T
+SELECT to_regproc('_st_contains')
+----
+_st_contains
+
+query T
+SELECT to_regproc('version')
+----
+version
+
+query T
+SELECT to_regproc('bit_in')
+----
+bit_in
+
+query T
+SELECT to_regprocedure('bit_in')
+----
+NULL
+
+query T
+SELECT to_regprocedure('bit_in(int)')
+----
+bit_in
+
+query T
+SELECT to_regprocedure('version')
+----
+NULL
+
+query T
+SELECT to_regprocedure('version()')
+----
+version
+
+query T
+SELECT to_regprocedure('961893967')
+----
+NULL
+
+query T
+SELECT to_regrole('admin')
+----
+admin
+
+query T
+SELECT to_regrole('test_role')
+----
+test_role
+
+query T
+SELECT to_regrole('foo')
+----
+NULL
+
+query T
+SELECT to_regrole('1546506610')
+----
+NULL
+
+query T
+SELECT to_regtype('interval')
+----
+interval
+
+query T
+SELECT to_regtype('integer')
+----
+bigint
+
+query T
+SELECT to_regtype('int_4')
+----
+NULL
+
+query T
+SELECT to_regtype('string')
+----
+text
+
+query T
+SELECT to_regtype('1186')
+----
+NULL
+
+query T
+SELECT to_regtype('test_type')
+----
+test_type
+
+# Test that pg_get_indexdef works for expression indexes.
+statement ok
+CREATE TABLE expr_idx_tbl (id string PRIMARY key, json JSON)
+
+statement ok
+CREATE INDEX expr_idx ON expr_idx_tbl (id, (json->>'bar'), (length(id)))
+
+query T
+SELECT pg_get_indexdef('expr_idx'::regclass::oid)
+----
+CREATE INDEX expr_idx ON test.public.expr_idx_tbl USING btree (id ASC, (json->>'bar'::STRING) ASC, length(id) ASC)
+
+query IT
+SELECT k, pg_get_indexdef('expr_idx'::regclass::oid, k, true) FROM generate_series(0,4) k ORDER BY k
+----
+0  CREATE INDEX expr_idx ON test.public.expr_idx_tbl USING btree (id ASC, (json->>'bar'::STRING) ASC, length(id) ASC)
+1  id
+2  (json->>'bar'::STRING)
+3  (length(id))
+4  ·
+
+# Regression test for #101357. The SQL implementations of pg_get_indexdef and
+# col_description should not have unqualified table names that can conflict with
+# a user tables.
+statement ok
+CREATE TABLE pg_indexes (i INT PRIMARY KEY);
+CREATE TABLE pg_attribute (i INT PRIMARY KEY)
+
+statement ok
+SET search_path TO public,pg_catalog
+
+statement ok
+SELECT i, pg_get_indexdef(0, 1, true) FROM pg_indexes
+
+statement ok
+DROP TABLE pg_indexes;
+DROP TABLE pg_attribute;
+RESET search_path
+
+statement ok
+CREATE SCHEMA system;
+CREATE TABLE system.comments (i INT)
+
+statement ok
+SELECT col_description(0, 0)
+
+statement
+DROP TABLE system.comments;
+DROP SCHEMA system
+
+subtest nameconcatoid
+
+query T
+select nameconcatoid('cat', 2);
+----
+cat_2
+
+# Test that the name is truncated such that the total length is at most 63 characters.
+query T
+select nameconcatoid(repeat('a', 58) || 'bbbbbbbbbb', 200);
+----
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab_200
+
+query T
+select nameconcatoid(repeat('a', 58) || 'bbbbbbbbbb', 2);
+----
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbb_2
+
+query TI
+select nameconcatoid(repeat('a', 62), 2), length(nameconcatoid(repeat('a', 62), 2))
+----
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_2  63
+
+subtest end
+
+subtest information_schema._pg_char_octet_length
+
+query I
+SELECT information_schema._pg_char_octet_length(25, -1)
+----
+1073741824
+
+query I
+SELECT information_schema._pg_char_octet_length(25, NULL)
+----
+NULL
+
+statement ok
+CREATE TYPE u AS (ufoo char, ubar int);
+
+query TTI colnames
+SELECT a.attname,
+       t.typname,
+       information_schema._pg_char_octet_length(a.atttypid,a.atttypmod)
+FROM pg_attribute a
+JOIN pg_type t
+ON a.atttypid = t.oid
+WHERE a.attname = 'ufoo'
+ORDER BY a.attname
+----
+attname  typname  information_schema._pg_char_octet_length
+ufoo     bpchar   4
+
+statement ok
+DROP TYPE u;
+
+subtest end
+
+subtest pg_encoding_max_length
+
+query I
+SELECT pg_encoding_max_length(6)
+----
+4
+
+query I
+SELECT pg_encoding_max_length(1)
+----
+NULL
+
+subtest end
+
+subtest information_schema._pg_datetime_precision
+
+query I
+select information_schema._pg_datetime_precision(1082, -1);
+----
+0
+
+query I
+select information_schema._pg_datetime_precision(1083, -1);
+----
+6
+
+query I
+select information_schema._pg_datetime_precision(1083, 5);
+----
+5
+
+query I
+select information_schema._pg_datetime_precision(1186, -1);
+----
+6
+
+query I
+select information_schema._pg_datetime_precision(1186, 5);
+----
+5
+
+query I
+select information_schema._pg_datetime_precision(1086, 5);
+----
+NULL
+
+query I
+select information_schema._pg_datetime_precision(1186, NULL);
+----
+NULL
+
+subtest end
+
+subtest information_schema._pg_interval_type
+
+query T
+SELECT information_schema._pg_interval_type(1, 0);
+----
+NULL
+
+statement ok
+CREATE TYPE u AS (ufoo interval, ubar interval HOUR TO MINUTE);
+
+query TTT colnames
+SELECT a.attname,
+       t.typname,
+       information_schema._pg_interval_type(a.atttypid, a.atttypmod)
+FROM pg_attribute a
+JOIN pg_type t
+ON a.atttypid = t.oid
+WHERE a.attname IN ('ufoo', 'ubar')
+ORDER BY a.attname
+----
+attname  typname   information_schema._pg_interval_type
+ubar     interval  NULL
+ufoo     interval  NULL
+
+subtest end

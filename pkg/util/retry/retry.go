@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package retry
 
@@ -23,10 +18,11 @@ import (
 
 // Options provides reusable configuration of Retry objects.
 type Options struct {
-	InitialBackoff      time.Duration   // Default retry backoff interval
-	MaxBackoff          time.Duration   // Maximum retry backoff interval
-	Multiplier          float64         // Default backoff constant
-	MaxRetries          int             // Maximum number of attempts (0 for infinite)
+	InitialBackoff time.Duration // Default retry backoff interval
+	MaxBackoff     time.Duration // Maximum retry backoff interval
+	Multiplier     float64       // Default backoff constant
+	// Maximum number of retries; attempts = MaxRetries + 1. (0 for infinite)
+	MaxRetries          int
 	RandomizationFactor float64         // Randomize the backoff interval by constant
 	Closer              <-chan struct{} // Optionally end retry loop channel close
 }
@@ -35,7 +31,7 @@ type Options struct {
 // backoff retry loop.
 type Retry struct {
 	opts           Options
-	ctxDoneChan    <-chan struct{}
+	ctx            context.Context
 	currentAttempt int
 	isReset        bool
 }
@@ -66,7 +62,7 @@ func StartWithCtx(ctx context.Context, opts Options) Retry {
 
 	var r Retry
 	r.opts = opts
-	r.ctxDoneChan = ctx.Done()
+	r.ctx = ctx
 	r.mustReset()
 	return r
 }
@@ -81,7 +77,7 @@ func (r *Retry) Reset() {
 	select {
 	case <-r.opts.Closer:
 		// When the closer has fired, you can't keep going.
-	case <-r.ctxDoneChan:
+	case <-r.ctx.Done():
 		// When the context was canceled, you can't keep going.
 	default:
 		r.mustReset()
@@ -125,13 +121,17 @@ func (r *Retry) Next() bool {
 	}
 
 	// Wait before retry.
+	d := r.retryIn()
+	if d > 0 {
+		log.VEventfDepth(r.ctx, 1 /* depth */, 2 /* level */, "will retry after %s", d)
+	}
 	select {
-	case <-time.After(r.retryIn()):
+	case <-time.After(d):
 		r.currentAttempt++
 		return true
 	case <-r.opts.Closer:
 		return false
-	case <-r.ctxDoneChan:
+	case <-r.ctx.Done():
 		return false
 	}
 }
@@ -158,26 +158,42 @@ func (r *Retry) NextCh() <-chan time.Time {
 	return time.After(r.retryIn())
 }
 
-// WithMaxAttempts is a helper that runs fn N times and collects the last err.
-// The function will terminate early if the provided context is canceled, but it
-// guarantees that fn will run at least once.
-func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
-	if n <= 0 {
-		return errors.Errorf("max attempts should not be 0 or below, got: %d", n)
-	}
+// CurrentAttempt returns the current attempt
+func (r *Retry) CurrentAttempt() int {
+	return r.currentAttempt
+}
 
-	opts.MaxRetries = n - 1
+// Do invokes the closure according to the retry options until it returns
+// success or no more retries are possible. Always returns an error unless the
+// return is prompted by a successful invocation of `fn`.
+func (opts Options) Do(ctx context.Context, fn func(ctx context.Context) error) error {
 	var err error
 	for r := StartWithCtx(ctx, opts); r.Next(); {
-		err = fn()
+		err = fn(ctx)
 		if err == nil {
 			return nil
 		}
 	}
 	if err == nil {
-		log.Fatal(ctx, "never ran function in WithMaxAttempts")
+		return errors.AssertionFailedf("never invoked function in Do")
 	}
 	return err
+}
+
+// WithMaxAttempts is a helper that runs fn N times and collects the last err.
+// The function will terminate early if the provided context is canceled, but it
+// guarantees that fn will run at least once.
+func WithMaxAttempts(ctx context.Context, opts Options, n int, fn func() error) error {
+	if n == 1 {
+		return fn()
+	}
+	if n <= 0 {
+		return errors.New("can't ask for zero attempts")
+	}
+	opts.MaxRetries = n - 1 // >= 1
+	return opts.Do(ctx, func(ctx context.Context) error {
+		return fn()
+	})
 }
 
 // ForDuration will retry the given function until it either returns

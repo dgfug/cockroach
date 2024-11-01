@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geotest"
 	"github.com/golang/geo/s1"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
@@ -270,13 +266,11 @@ func TestProject(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			projected, err := Project(tc.point, tc.distance, s1.Angle(tc.azimuth))
 			require.NoError(t, err)
-			require.Equalf(
+			geotest.RequireGeographyInEpsilon(
 				t,
 				tc.projected,
 				projected,
-				"expected %f, found %f",
-				&tc.projected,
-				projected,
+				geotest.Epsilon,
 			)
 		})
 	}

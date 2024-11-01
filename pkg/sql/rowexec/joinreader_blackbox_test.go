@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec_test
 
@@ -18,7 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -26,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,13 +31,13 @@ func TestJoinReaderUsesBatchLimit(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	recCh := make(chan tracing.Recording, 1)
+	recCh := make(chan tracingpb.Recording, 1)
 	joinQuery := "SELECT count(1) FROM (SELECT * FROM test.b NATURAL INNER LOOKUP JOIN test.a)"
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				// Get a recording for the join query.
-				WithStatementTrace: func(trace tracing.Recording, stmt string) {
+				WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 					if stmt == joinQuery {
 						recCh <- trace
 					}
@@ -55,6 +51,13 @@ func TestJoinReaderUsesBatchLimit(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
+
+	// Disable the usage of the streamer since this test is designed for the old
+	// non-streamer code path.
+	// TODO(yuzefovich): remove the test altogether when the corresponding
+	// cluster setting is removed (i.e. only the streamer code path remains).
+	_, err := sqlDB.Exec("SET streamer_enabled = false;")
+	require.NoError(t, err)
 
 	// We're going to create a table with enough rows to exceed a batch's memory
 	// limit. This table will represent the lookup side of a lookup join.
@@ -93,7 +96,7 @@ func TestJoinReaderUsesBatchLimit(t *testing.T) {
 	// were on the lookup side. We expect more than one of them (it would be only
 	// one if there was no limit on the size of results).
 	rec := <-recCh
-	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "a")
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "a")
 	tableID := desc.TableDesc().ID
 	sp, ok := rec.FindSpan("join reader")
 	require.True(t, ok)

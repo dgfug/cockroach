@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
@@ -20,7 +15,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -310,7 +304,7 @@ func TestSeedFuzzCorpus(t *testing.T) {
 	corpusDir := filepath.Join(".", "testdata", "corpus")
 	writeSeedFile := func(name, data string) error {
 		path := filepath.Join(corpusDir, name)
-		return ioutil.WriteFile(path, []byte(data), os.ModePerm)
+		return os.WriteFile(path, []byte(data), os.ModePerm)
 	}
 	for _, fst := range fromStringTests {
 		name := "seed_valid_" + fst.variant

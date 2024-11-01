@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "pgurl",
     srcs = [
+        "extended_options.go",
         "generate.go",
         "parse.go",
         "pgurl.go",
@@ -23,6 +24,7 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":pgurl"],
     deps = [
+        "//pkg/testutils/datapathutils",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",

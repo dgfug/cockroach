@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -21,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,9 +26,15 @@ import (
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildJoin(
-	join *tree.JoinTableExpr, locking lockingSpec, inScope *scope,
+	join *tree.JoinTableExpr, lockCtx lockingContext, inScope *scope,
 ) (outScope *scope) {
-	leftScope := b.buildDataSource(join.Left, nil /* indexFlags */, locking, inScope)
+	joinType := descpb.JoinTypeFromAstString(join.JoinType)
+	leftLockCtx := lockCtx
+	// Poison the lockCtx for the null-extended side(s) if this is an outer join.
+	if joinType == descpb.RightOuterJoin || joinType == descpb.FullOuterJoin {
+		leftLockCtx.isNullExtended = true
+	}
+	leftScope := b.buildDataSource(join.Left, nil /* indexFlags */, leftLockCtx, inScope)
 
 	inScopeRight := inScope
 	isLateral := b.exprIsLateral(join.Right)
@@ -45,12 +46,16 @@ func (b *Builder) buildJoin(
 		inScopeRight.context = exprKindLateralJoin
 	}
 
-	rightScope := b.buildDataSource(join.Right, nil /* indexFlags */, locking, inScopeRight)
+	rightLockCtx := lockCtx
+	// Poison the lockCtx for the null-extended side(s) if this is an outer join.
+	if joinType == descpb.LeftOuterJoin || joinType == descpb.FullOuterJoin {
+		rightLockCtx.isNullExtended = true
+	}
+	rightScope := b.buildDataSource(join.Right, nil /* indexFlags */, rightLockCtx, inScopeRight)
 
 	// Check that the same table name is not used on both sides.
 	b.validateJoinTableNames(leftScope, rightScope)
 
-	joinType := descpb.JoinTypeFromAstString(join.JoinType)
 	var flags memo.JoinFlags
 	switch join.Hint {
 	case "":
@@ -84,6 +89,10 @@ func (b *Builder) buildJoin(
 		telemetry.Inc(sqltelemetry.MergeJoinHintUseCounter)
 		flags = memo.AllowOnlyMergeJoin
 
+	case tree.AstStraight:
+		telemetry.Inc(sqltelemetry.StraightJoinHintUseCounter)
+		flags = memo.AllowAllJoinsIntoRight
+
 	default:
 		panic(pgerror.Newf(
 			pgcode.FeatureNotSupported, "join hint %s not supported", join.Hint,
@@ -115,7 +124,8 @@ func (b *Builder) buildJoin(
 		if on, ok := cond.(*tree.OnJoinCond); ok {
 			// Do not allow special functions in the ON clause.
 			b.semaCtx.Properties.Require(
-				exprKindOn.String(), tree.RejectGenerators|tree.RejectWindowApplications,
+				exprKindOn.String(),
+				tree.RejectGenerators|tree.RejectWindowApplications|tree.RejectProcedures,
 			)
 			outScope.context = exprKindOn
 			filter := b.buildScalar(
@@ -126,8 +136,8 @@ func (b *Builder) buildJoin(
 			filters = memo.TrueFilter
 		}
 
-		left := leftScope.expr.(memo.RelExpr)
-		right := rightScope.expr.(memo.RelExpr)
+		left := leftScope.expr
+		right := rightScope.expr
 		outScope.expr = b.constructJoin(
 			joinType, left, right, filters, &memo.JoinPrivate{Flags: flags}, isLateral,
 		)
@@ -171,12 +181,12 @@ func (b *Builder) validateJoinTableNames(leftScope, rightScope *scope) {
 	}
 }
 
-// findJoinColsToValidate creates a FastIntSet containing the ordinal of each
+// findJoinColsToValidate creates a Fast containing the ordinal of each
 // column that has a different table name than the previous column. This is a
 // fast way of reducing the set of columns that need to checked for duplicate
 // names by validateJoinTableNames.
-func (b *Builder) findJoinColsToValidate(scope *scope) util.FastIntSet {
-	var ords util.FastIntSet
+func (b *Builder) findJoinColsToValidate(scope *scope) intsets.Fast {
+	var ords intsets.Fast
 	for i := range scope.cols {
 		// Allow joins of sources that define columns with no
 		// associated table name. At worst, the USING/NATURAL
@@ -240,10 +250,11 @@ func (b *Builder) constructJoin(
 //
 // With NATURAL JOIN or JOIN USING (a,b,c,...), SQL allows us to refer to the
 // columns a,b,c directly; these columns have the following semantics:
-//   a = IFNULL(left.a, right.a)
-//   b = IFNULL(left.b, right.b)
-//   c = IFNULL(left.c, right.c)
-//   ...
+//
+//	a = IFNULL(left.a, right.a)
+//	b = IFNULL(left.b, right.b)
+//	c = IFNULL(left.c, right.c)
+//	...
 //
 // Furthermore, a star has to resolve the columns in the following order:
 // merged columns, non-equality columns from the left table, non-equality
@@ -259,37 +270,37 @@ func (b *Builder) constructJoin(
 //
 // Example:
 //
-//  left has columns (a,b,x)
-//  right has columns (a,b,y)
+//	left has columns (a,b,x)
+//	right has columns (a,b,y)
 //
-//  - SELECT * FROM left JOIN right USING(a,b)
+//	- SELECT * FROM left JOIN right USING(a,b)
 //
-//  join has columns:
-//    1: left.a
-//    2: left.b
-//    3: left.x
-//    4: right.a
-//    5: right.b
-//    6: right.y
+//	join has columns:
+//	  1: left.a
+//	  2: left.b
+//	  3: left.x
+//	  4: right.a
+//	  5: right.b
+//	  6: right.y
 //
-//  projection has columns and corresponding variable expressions:
-//    1: a aka left.a        @1
-//    2: b aka left.b        @2
-//    3: left.x              @3
-//    4: right.a (hidden)    @4
-//    5: right.b (hidden)    @5
-//    6: right.y             @6
+//	projection has columns and corresponding variable expressions:
+//	  1: a aka left.a        @1
+//	  2: b aka left.b        @2
+//	  3: left.x              @3
+//	  4: right.a (hidden)    @4
+//	  5: right.b (hidden)    @5
+//	  6: right.y             @6
 //
 // If the join was a FULL OUTER JOIN, the columns would be:
-//    1: a                   IFNULL(@1,@4)
-//    2: b                   IFNULL(@2,@5)
-//    3: left.a (hidden)     @1
-//    4: left.b (hidden)     @2
-//    5: left.x              @3
-//    6: right.a (hidden)    @4
-//    7: right.b (hidden)    @5
-//    8: right.y             @6
 //
+//	1: a                   IFNULL(@1,@4)
+//	2: b                   IFNULL(@2,@5)
+//	3: left.a (hidden)     @1
+//	4: left.b (hidden)     @2
+//	5: left.x              @3
+//	6: right.a (hidden)    @4
+//	7: right.b (hidden)    @5
+//	8: right.y             @6
 type usingJoinBuilder struct {
 	b          *Builder
 	joinType   descpb.JoinType
@@ -403,8 +414,8 @@ func (jb *usingJoinBuilder) finishBuild() {
 
 	jb.outScope.expr = jb.b.constructJoin(
 		jb.joinType,
-		jb.leftScope.expr.(memo.RelExpr),
-		jb.rightScope.expr.(memo.RelExpr),
+		jb.leftScope.expr,
+		jb.rightScope.expr,
 		jb.filters,
 		&memo.JoinPrivate{Flags: jb.joinFlags},
 		jb.isLateral,
@@ -421,7 +432,7 @@ func (jb *usingJoinBuilder) finishBuild() {
 			}
 		}
 
-		jb.outScope.expr = jb.b.constructProject(jb.outScope.expr.(memo.RelExpr), jb.outScope.cols)
+		jb.outScope.expr = jb.b.constructProject(jb.outScope.expr, jb.outScope.cols)
 	}
 }
 
@@ -465,7 +476,7 @@ func (jb *usingJoinBuilder) findUsingColumn(
 func (jb *usingJoinBuilder) addEqualityCondition(leftCol, rightCol *scopeColumn) {
 	// First, check if the comparison would even be valid.
 	if !leftCol.typ.Equivalent(rightCol.typ) {
-		if _, found := tree.FindEqualComparisonFunction(leftCol.typ, rightCol.typ); !found {
+		if !tree.EqualComparisonFunctionExists(leftCol.typ, rightCol.typ) {
 			name := leftCol.name.ReferenceName()
 			panic(pgerror.Newf(pgcode.DatatypeMismatch,
 				"JOIN/USING types %s for left and %s for right cannot be matched for column %q",

@@ -1,25 +1,25 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/errors"
 )
 
 type alterSequenceNode struct {
@@ -61,19 +61,61 @@ func (n *alterSequenceNode) ReadingOwnWrites() {}
 
 func (n *alterSequenceNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("sequence"))
-	desc := n.seqDesc
 
-	oldMinValue := desc.SequenceOpts.MinValue
-	oldMaxValue := desc.SequenceOpts.MaxValue
-
-	err := assignSequenceOptions(
-		desc.SequenceOpts, n.n.Options, false /* setDefaults */, &params, desc.GetID(), desc.ParentID,
-	)
-	if err != nil {
+	// Alter sequence with specified options.
+	// Does not override existing values if not specified.
+	if err := alterSequenceImpl(params, n.seqDesc, n.n.Options, n.n); err != nil {
 		return err
 	}
-	opts := desc.SequenceOpts
-	seqValueKey := params.p.ExecCfg().Codec.SequenceKey(uint32(desc.ID))
+
+	// Record this sequence alteration in the event log. This is an auditable log
+	// event and is recorded in the same transaction as the table descriptor
+	// update.
+	return params.p.logEvent(params.ctx,
+		n.seqDesc.ID,
+		&eventpb.AlterSequence{
+			SequenceName: params.p.ResolvedName(n.n.Name).FQString(),
+		})
+}
+
+// alterSequenceImpl applies given tree.SequenceOptions to the specified sequence descriptor.
+// Exisiting sequence options are not overridden with default values.
+func alterSequenceImpl(
+	params runParams,
+	seqDesc *tabledesc.Mutable,
+	seqOptions tree.SequenceOptions,
+	formatter tree.NodeFormatter,
+) error {
+	oldMinValue := seqDesc.SequenceOpts.MinValue
+	oldMaxValue := seqDesc.SequenceOpts.MaxValue
+
+	existingType := types.Int
+	if seqDesc.GetSequenceOpts().AsIntegerType != "" {
+		switch seqDesc.GetSequenceOpts().AsIntegerType {
+		case types.Int2.SQLString():
+			existingType = types.Int2
+		case types.Int4.SQLString():
+			existingType = types.Int4
+		case types.Int.SQLString():
+			// Already set.
+		default:
+			return errors.AssertionFailedf("sequence has unexpected type %s", seqDesc.GetSequenceOpts().AsIntegerType)
+		}
+	}
+	if err := assignSequenceOptions(
+		params.ctx,
+		params.p,
+		seqDesc.SequenceOpts,
+		seqOptions,
+		false, /* setDefaults */
+		seqDesc.GetID(),
+		seqDesc.ParentID,
+		existingType,
+	); err != nil {
+		return err
+	}
+	opts := seqDesc.SequenceOpts
+	seqValueKey := params.p.ExecCfg().Codec.SequenceKey(uint32(seqDesc.ID))
 
 	getSequenceValue := func() (int64, error) {
 		kv, err := params.p.txn.Get(params.ctx, seqValueKey)
@@ -93,7 +135,7 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 	// The code below handles the second case.
 
 	// The sequence is decreasing and the minvalue is being decreased.
-	if opts.Increment < 0 && desc.SequenceOpts.MinValue < oldMinValue {
+	if opts.Increment < 0 && seqDesc.SequenceOpts.MinValue < oldMinValue {
 		sequenceVal, err := getSequenceValue()
 		if err != nil {
 			return err
@@ -106,7 +148,7 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 				return err
 			}
 		}
-	} else if opts.Increment > 0 && desc.SequenceOpts.MaxValue > oldMaxValue {
+	} else if opts.Increment > 0 && seqDesc.SequenceOpts.MaxValue > oldMaxValue {
 		sequenceVal, err := getSequenceValue()
 		if err != nil {
 			return err
@@ -119,21 +161,43 @@ func (n *alterSequenceNode) startExec(params runParams) error {
 			}
 		}
 	}
+	var restartVal *int64
+	for _, option := range seqOptions {
+		if option.Name == tree.SeqOptRestart {
+			// If the RESTART option is present but without a value, then use the
+			// START WITH value.
+			if option.IntVal != nil {
+				restartVal = option.IntVal
+			} else {
+				restartVal = &opts.Start
+			}
+		} else if option.Name == tree.SeqOptCacheNode {
+			if !params.p.execCfg.Settings.Version.IsActive(params.ctx, clusterversion.V24_1) {
+				return pgerror.New(
+					pgcode.FeatureNotSupported,
+					`node-level cache not supported before V24.1`,
+				)
+			}
+		}
+	}
+	if restartVal != nil {
+		// Using RESTART on a sequence should always cause the operation to run
+		// in the current transaction. This is achieved by treating the sequence
+		// as if it were just created.
+		if err := params.p.createdSequences.addCreatedSequence(seqDesc.ID); err != nil {
+			return err
+		}
+		if err := params.p.SetSequenceValueByID(params.ctx, uint32(seqDesc.ID), *restartVal, false); err != nil {
+			return err
+		}
+	}
 
 	if err := params.p.writeSchemaChange(
-		params.ctx, n.seqDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+		params.ctx, seqDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(formatter, params.Ann()),
 	); err != nil {
 		return err
 	}
-
-	// Record this sequence alteration in the event log. This is an auditable log
-	// event and is recorded in the same transaction as the table descriptor
-	// update.
-	return params.p.logEvent(params.ctx,
-		n.seqDesc.ID,
-		&eventpb.AlterSequence{
-			SequenceName: params.p.ResolvedName(n.n.Name).FQString(),
-		})
+	return nil
 }
 
 func (n *alterSequenceNode) Next(runParams) (bool, error) { return false, nil }

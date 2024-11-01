@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -31,16 +26,21 @@ type replicaQueue interface {
 	// Start launches a goroutine to process the contents of the queue.
 	// The provided stopper is used to signal that the goroutine should exit.
 	Start(*stop.Stopper)
-	// MaybeAdd adds the replica to the queue if the replica meets
+	// MaybeAddAsync adds the replica to the queue if the replica meets
 	// the queue's inclusion criteria and the queue is not already
 	// too full, etc.
 	MaybeAddAsync(context.Context, replicaInQueue, hlc.ClockTimestamp)
+	// AddAsync adds the replica to the queue without checking whether the replica
+	// meets the queue's inclusion criteria.
+	AddAsync(context.Context, replicaInQueue, float64)
 	// MaybeRemove removes the replica from the queue if it is present.
 	MaybeRemove(roachpb.RangeID)
 	// Name returns the name of the queue.
 	Name() string
 	// NeedsLease returns whether the queue requires a replica to be leaseholder.
 	NeedsLease() bool
+	// SetDisabled turns queue processing off or on as directed.
+	SetDisabled(disabled bool)
 }
 
 // A replicaSet provides access to a sequence of replicas to consider

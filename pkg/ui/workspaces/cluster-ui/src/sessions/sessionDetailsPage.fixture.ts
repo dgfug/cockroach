@@ -1,25 +1,23 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { createMemoryHistory } from "history";
-import { SessionDetailsProps } from "./sessionDetails";
-import {
-  activeSession,
-  idleSession,
-  idleTransactionSession,
-} from "./sessionsPage.fixture";
-import { sessionAttr } from "src/util/constants";
+
 import {
   CancelSessionRequestMessage,
   CancelQueryRequestMessage,
 } from "src/api/terminateQueryApi";
+import { sessionAttr } from "src/util/constants";
+
+import { SessionDetailsProps } from "./sessionDetails";
+import {
+  activeSession,
+  closedSession,
+  idleSession,
+  idleTransactionSession,
+} from "./sessionsPage.fixture";
 
 const history = createMemoryHistory({ initialEntries: ["/sessions"] });
 
@@ -43,10 +41,10 @@ const sessionDetailsPropsBase: SessionDetailsProps = {
     isExact: true,
     params: { [sessionAttr]: "blah" },
   },
-
+  setTimeScale: () => {},
   refreshSessions: () => {},
-  cancelSession: (req: CancelSessionRequestMessage) => {},
-  cancelQuery: (req: CancelQueryRequestMessage) => {},
+  cancelSession: (_req: CancelSessionRequestMessage) => {},
+  cancelQuery: (_req: CancelQueryRequestMessage) => {},
   refreshNodes: () => {},
   refreshNodesLiveness: () => {},
   uiConfig: {
@@ -67,6 +65,11 @@ export const sessionDetailsActiveTxnPropsFixture: SessionDetailsProps = {
 export const sessionDetailsActiveStmtPropsFixture: SessionDetailsProps = {
   ...sessionDetailsPropsBase,
   session: activeSession,
+};
+
+export const sessionDetailsClosedPropsFixture: SessionDetailsProps = {
+  ...sessionDetailsPropsBase,
+  session: closedSession,
 };
 
 export const sessionDetailsNotFound: SessionDetailsProps = {

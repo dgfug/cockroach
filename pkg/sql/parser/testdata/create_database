@@ -180,6 +180,16 @@ CREATE DATABASE a PRIMARY REGION "us-west-1" -- fully parenthesized
 CREATE DATABASE a PRIMARY REGION "us-west-1" -- literals removed
 CREATE DATABASE _ PRIMARY REGION _ -- identifiers removed
 
+parse
+CREATE DATABASE a
+PRIMARY REGION 'us-west-1'
+REGIONS 'us-west-2'
+SUPER REGION uswest VALUES 'us-west-1', 'us-west-2'
+----
+CREATE DATABASE a PRIMARY REGION "us-west-1" REGIONS = "us-west-2" SUPER REGION uswest VALUES "us-west-1","us-west-2" -- normalized!
+CREATE DATABASE a PRIMARY REGION "us-west-1" REGIONS = "us-west-2" SUPER REGION uswest VALUES "us-west-1","us-west-2" -- fully parenthesized
+CREATE DATABASE a PRIMARY REGION "us-west-1" REGIONS = "us-west-2" SUPER REGION uswest VALUES "us-west-1","us-west-2" -- literals removed
+CREATE DATABASE _ PRIMARY REGION _ REGIONS = _ SUPER REGION _ VALUES _,_ -- identifiers removed
 
 parse
 CREATE DATABASE a PRIMARY REGION = "us-west-1"
@@ -196,6 +206,14 @@ ALTER DATABASE a PRIMARY REGION "us-west-1" -- normalized!
 ALTER DATABASE a PRIMARY REGION "us-west-1" -- fully parenthesized
 ALTER DATABASE a PRIMARY REGION "us-west-1" -- literals removed
 ALTER DATABASE _ PRIMARY REGION _ -- identifiers removed
+
+parse
+CREATE DATABASE a PRIMARY REGION "us-west-1" SUPER REGION "create" VALUES "us-west-1"
+----
+CREATE DATABASE a PRIMARY REGION "us-west-1" SUPER REGION "create" VALUES "us-west-1"
+CREATE DATABASE a PRIMARY REGION "us-west-1" SUPER REGION "create" VALUES "us-west-1" -- fully parenthesized
+CREATE DATABASE a PRIMARY REGION "us-west-1" SUPER REGION "create" VALUES "us-west-1" -- literals removed
+CREATE DATABASE _ PRIMARY REGION _ SUPER REGION _ VALUES _ -- identifiers removed
 
 
 parse

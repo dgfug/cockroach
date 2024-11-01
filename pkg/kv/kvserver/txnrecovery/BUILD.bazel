@@ -10,7 +10,8 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvpb",
+        "//pkg/roachpb",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/metric",
@@ -27,13 +28,15 @@ go_test(
     embed = [":txnrecovery"],
     deps = [
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/lock",
+        "//pkg/roachpb",
+        "//pkg/storage/enginepb",
         "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/stop",
-        "//pkg/util/tracing",
         "@com_github_stretchr_testify//assert",
     ],
 )

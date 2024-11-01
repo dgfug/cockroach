@@ -95,8 +95,35 @@ CREATE ROLE IF NOT EXISTS foo WITH CREATEROLE -- fully parenthesized
 CREATE ROLE IF NOT EXISTS foo WITH CREATEROLE -- literals removed
 CREATE ROLE IF NOT EXISTS _ WITH CREATEROLE -- identifiers removed
 
-parse
+error
 CREATE USER foo PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+CREATE USER foo PASSWORD bar
+                         ^
+HINT: try \h CREATE ROLE
+
+parse
+CREATE USER foo PASSWORD 'bar'
+----
+CREATE USER foo WITH PASSWORD '*****' -- normalized!
+CREATE USER foo WITH PASSWORD '*****' -- fully parenthesized
+CREATE USER foo WITH PASSWORD '*****' -- literals removed
+CREATE USER _ WITH PASSWORD '*****' -- identifiers removed
+CREATE USER foo WITH PASSWORD 'bar' -- passwords exposed
+
+error
+CREATE USER foo ENCRYPTED PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+CREATE USER foo ENCRYPTED PASSWORD bar
+                                   ^
+HINT: try \h CREATE ROLE
+
+parse
+CREATE USER foo ENCRYPTED PASSWORD 'bar'
 ----
 CREATE USER foo WITH PASSWORD '*****' -- normalized!
 CREATE USER foo WITH PASSWORD '*****' -- fully parenthesized
@@ -112,6 +139,24 @@ CREATE USER foo WITH PASSWORD '*****' -- fully parenthesized
 CREATE USER foo WITH PASSWORD '*****' -- literals removed
 CREATE USER _ WITH PASSWORD '*****' -- identifiers removed
 CREATE USER foo WITH PASSWORD NULL -- passwords exposed
+
+error
+CREATE USER foo WITH ENCRYPTED PASSWORD bar
+----
+at or near "bar": syntax error
+DETAIL: source SQL:
+CREATE USER foo WITH ENCRYPTED PASSWORD bar
+                                        ^
+HINT: try \h CREATE ROLE
+
+parse
+CREATE USER foo WITH ENCRYPTED PASSWORD 'bar'
+----
+CREATE USER foo WITH PASSWORD '*****' -- normalized!
+CREATE USER foo WITH PASSWORD '*****' -- fully parenthesized
+CREATE USER foo WITH PASSWORD '*****' -- literals removed
+CREATE USER _ WITH PASSWORD '*****' -- identifiers removed
+CREATE USER foo WITH PASSWORD 'bar' -- passwords exposed
 
 parse
 CREATE USER foo LOGIN VALID UNTIL NULL PASSWORD NULL
@@ -138,3 +183,27 @@ CREATE USER foo WITH VALID UNTIL '1970-01-01' -- normalized!
 CREATE USER foo WITH VALID UNTIL ('1970-01-01') -- fully parenthesized
 CREATE USER foo WITH VALID UNTIL '_' -- literals removed
 CREATE USER _ WITH VALID UNTIL '1970-01-01' -- identifiers removed
+
+parse
+CREATE USER foo REPLICATION
+----
+CREATE USER foo WITH REPLICATION -- normalized!
+CREATE USER foo WITH REPLICATION -- fully parenthesized
+CREATE USER foo WITH REPLICATION -- literals removed
+CREATE USER _ WITH REPLICATION -- identifiers removed
+
+parse
+CREATE USER foo NOREPLICATION
+----
+CREATE USER foo WITH NOREPLICATION -- normalized!
+CREATE USER foo WITH NOREPLICATION -- fully parenthesized
+CREATE USER foo WITH NOREPLICATION -- literals removed
+CREATE USER _ WITH NOREPLICATION -- identifiers removed
+
+parse
+CREATE ROLE foo WITH SUBJECT 'bar'
+----
+CREATE ROLE foo WITH SUBJECT 'bar'
+CREATE ROLE foo WITH SUBJECT ('bar') -- fully parenthesized
+CREATE ROLE foo WITH SUBJECT '_' -- literals removed
+CREATE ROLE _ WITH SUBJECT 'bar' -- identifiers removed

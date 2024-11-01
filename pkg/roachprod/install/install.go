@@ -1,98 +1,50 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
 	"sort"
+	"strings"
+
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/errors"
 )
 
 var installCmds = map[string]string{
-	"cassandra": `
-echo "deb http://www.apache.org/dist/cassandra/debian 311x main" | \
-	sudo tee -a /etc/apt/sources.list.d/cassandra.sources.list;
-curl https://www.apache.org/dist/cassandra/KEYS | sudo apt-key add -;
-sudo apt-get update;
-sudo apt-get install -y cassandra;
-sudo service cassandra stop;
-`,
-
-	"charybdefs": `
-  thrift_dir="/opt/thrift"
-
-  if [ ! -f "/usr/bin/thrift" ]; then
-	sudo apt-get update;
-	sudo apt-get install -qy automake bison flex g++ git libboost-all-dev libevent-dev libssl-dev libtool make pkg-config python-setuptools libglib2.0-dev python2 python-six
-
-    sudo mkdir -p "${thrift_dir}"
-    sudo chmod 777 "${thrift_dir}"
-    cd "${thrift_dir}"
-    curl "https://downloads.apache.org/thrift/0.13.0/thrift-0.13.0.tar.gz" | sudo tar xvz --strip-components 1
-    sudo ./configure --prefix=/usr
-    sudo make -j$(nproc)
-    sudo make install
-    (cd "${thrift_dir}/lib/py" && sudo python2 setup.py install)
-  fi
-
-  charybde_dir="/opt/charybdefs"
-  nemesis_path="${charybde_dir}/charybdefs-nemesis"
-
-  if [ ! -f "${nemesis_path}" ]; then
-    sudo apt-get install -qy build-essential cmake libfuse-dev fuse
-    sudo rm -rf "${charybde_dir}" "${nemesis_path}" /usr/local/bin/charybdefs{,-nemesis}
-    sudo mkdir -p "${charybde_dir}"
-    sudo chmod 777 "${charybde_dir}"
-    # TODO(bilal): Change URL back to scylladb/charybdefs once https://github.com/scylladb/charybdefs/pull/28 is merged.
-    git clone --depth 1 "https://github.com/itsbilal/charybdefs.git" "${charybde_dir}"
-
-    cd "${charybde_dir}"
-    thrift -r --gen cpp server.thrift
-    cmake CMakeLists.txt
-    make -j$(nproc)
-
-    sudo modprobe fuse
-    sudo ln -s "${charybde_dir}/charybdefs" /usr/local/bin/charybdefs
-    cat > "${nemesis_path}" <<EOF
-#!/bin/bash
-cd /opt/charybdefs/cookbook
-./recipes "\$@"
-EOF
-    chmod +x "${nemesis_path}"
-	sudo ln -s "${nemesis_path}" /usr/local/bin/charybdefs-nemesis
-fi
-`,
-
-	"confluent": `
-sudo apt-get update;
-sudo apt-get install -y default-jdk-headless;
-curl https://packages.confluent.io/archive/5.0/confluent-oss-5.0.0-2.11.tar.gz | sudo tar -C /usr/local -xz;
-sudo ln -s /usr/local/confluent-5.0.0 /usr/local/confluent;
-`,
-
 	"docker": `
+# Add Docker's official GPG key:
 sudo apt-get update;
 sudo apt-get install  -y \
-    apt-transport-https \
     ca-certificates \
     curl \
-    software-properties-common;
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -;
-sudo add-apt-repository \
-   "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
-   $(lsb_release -cs) \
-   stable";
+    gnupg;
+sudo install -m 0755 -d /etc/apt/keyrings;
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --no-tty --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg;
+sudo chmod a+r /etc/apt/keyrings/docker.gpg;
 
+# Add the repository to Apt sources:
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null;
 sudo apt-get update;
-sudo apt-get install  -y docker-ce;
+
+# Install
+sudo apt-get install -y docker-ce;
+sudo usermod -aG docker ubuntu;
+
+# Verify
+sudo docker run hello-world
 `,
 
 	"gcc": `
@@ -100,15 +52,9 @@ sudo apt-get update;
 sudo apt-get install -y gcc;
 `,
 
-	// graphviz and rlwrap are useful for pprof
 	"go": `
 sudo apt-get update;
-sudo apt-get install -y graphviz rlwrap;
-
-curl https://dl.google.com/go/go1.12.linux-amd64.tar.gz | sudo tar -C /usr/local -xz;
-echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh > /dev/null;
-sudo chmod +x /etc/profile.d/go.sh;
-`,
+sudo apt-get install -y golang-go;`,
 
 	"haproxy": `
 sudo apt-get update;
@@ -123,21 +69,8 @@ sudo apt-get install -y \
 `,
 
 	"sysbench": `
-curl -s https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash;
 sudo apt-get update;
 sudo apt-get install -y sysbench;
-`,
-
-	"tools": `
-sudo apt-get update;
-sudo apt-get install -y \
-  fio \
-  iftop \
-  iotop \
-  sysstat \
-  linux-tools-common \
-  linux-tools-4.10.0-35-generic \
-  linux-cloud-tools-4.10.0-35-generic;
 `,
 
 	"zfs": `
@@ -145,7 +78,44 @@ sudo apt-get update;
 sudo apt-get install -y \
   zfsutils-linux;
 `,
+
+	"postgresql": `
+sudo apt-get update;
+sudo apt-get install -y postgresql;
+`,
+
+	"fluent-bit": `
+curl -fsSL https://packages.fluentbit.io/fluentbit.key | sudo gpg --no-tty --batch --yes --dearmor -o /etc/apt/keyrings/fluent-bit.gpg;
+code_name="$(. /etc/os-release && echo "${VERSION_CODENAME}")";
+echo "deb [signed-by=/etc/apt/keyrings/fluent-bit.gpg] https://packages.fluentbit.io/ubuntu/${code_name} ${code_name} main" | \
+  sudo tee /etc/apt/sources.list.d/fluent-bit.list > /dev/null;
+sudo apt-get update;
+sudo apt-get install -y fluent-bit;
+`,
+
+	"opentelemetry": `
+sudo apt-get update;
+sudo apt-get install -y curl;
+curl -L -o /tmp/otelcol-contrib.deb https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.101.0/otelcol-contrib_0.101.0_linux_amd64.deb;
+sudo apt-get install -y /tmp/otelcol-contrib.deb;
+rm /tmp/otelcol-contrib.deb;
+`,
+
+	"side-eye": `
+	curl https://sh.side-eye.io/ | SIDE_EYE_API_TOKEN=%API_KEY% SIDE_EYE_ENVIRONMENT="%ROACHPROD_CLUSTER_NAME%" sh
+	`,
 }
+
+// installLocalCmds is a map from software name to a map of strings that
+// are replaced in the installCmd for that software with the stdout of executing
+// a command locally.
+var installLocalCmds = map[string]map[string]*exec.Cmd{
+	"side-eye": {
+		"%API_KEY%": sideEyeSecretCmd,
+	},
+}
+
+var sideEyeSecretCmd = exec.Command("gcloud", "secrets", "versions", "access", "latest", "--secret", "side-eye-key")
 
 // SortedCmds TODO(peter): document
 func SortedCmds() []string {
@@ -158,27 +128,56 @@ func SortedCmds() []string {
 }
 
 // Install TODO(peter): document
-func Install(c *SyncedCluster, args []string) error {
-	do := func(title, cmd string) error {
-		var buf bytes.Buffer
-		err := c.Run(&buf, &buf, c.Nodes, "installing "+title, cmd)
-		if err != nil {
-			fmt.Print(buf.String())
-		}
-		return err
-	}
-
+func Install(ctx context.Context, l *logger.Logger, c *SyncedCluster, args []string) error {
 	for _, arg := range args {
-		cmd, ok := installCmds[arg]
-		if !ok {
-			return fmt.Errorf("unknown tool %q", arg)
-		}
-
-		// Ensure that we early exit if any of the shell statements fail.
-		cmd = "set -exuo pipefail;" + cmd
-		if err := do(arg, cmd); err != nil {
+		var buf bytes.Buffer
+		if err := InstallTool(ctx, l, c, c.Nodes, arg, &buf, &buf); err != nil {
+			l.Printf(buf.String())
 			return err
 		}
 	}
 	return nil
+}
+
+func InstallTool(
+	ctx context.Context,
+	l *logger.Logger,
+	c *SyncedCluster,
+	nodes Nodes,
+	softwareName string,
+	stdout, stderr io.Writer,
+) error {
+	cmd, ok := installCmds[softwareName]
+	if !ok {
+		return fmt.Errorf("unknown tool %q", softwareName)
+	}
+	cmd = strings.ReplaceAll(cmd, "%ROACHPROD_CLUSTER_NAME%", c.Name)
+
+	for replace, localCmd := range installLocalCmds[softwareName] {
+		copy := *localCmd
+		copy.Stderr = os.Stderr
+		out, err := copy.Output()
+		if err != nil {
+			return errors.Wrapf(err, "running local command to derive install argument %s, command %s, failed", replace, copy.String())
+		}
+		cmd = strings.ReplaceAll(cmd, replace, string(out))
+	}
+
+	// Ensure that we early exit if any of the shell statements fail.
+	cmd = "set -exuo pipefail;" + cmd
+	if err := c.Run(ctx, l, stdout, stderr, WithNodes(nodes), "installing "+softwareName, cmd); err != nil {
+		return rperrors.TransientFailure(err, "install_flake")
+	}
+
+	return nil
+}
+
+func GetGcloudSideEyeSecret() string {
+	c := *sideEyeSecretCmd
+	c.Stderr = os.Stderr
+	out, err := c.Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }

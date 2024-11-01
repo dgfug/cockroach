@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -21,6 +16,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -31,15 +28,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func writeTxnRecord(ctx context.Context, tc *testContext, txn *roachpb.Transaction) error {
-	key := keys.TransactionKey(txn.Key, txn.ID)
-	return storage.MVCCPutProto(ctx, tc.store.Engine(), nil, key, hlc.Timestamp{}, nil, txn)
+func writeTxnRecord(ctx context.Context, tc *testContext, txnRecord *roachpb.Transaction) error {
+	key := keys.TransactionKey(txnRecord.Key, txnRecord.ID)
+	return storage.MVCCPutProto(ctx, tc.store.TODOEngine(), key, hlc.Timestamp{}, txnRecord, storage.MVCCWriteOptions{})
 }
 
 // createTxnForPushQueue creates a txn struct and writes a "fake"
@@ -50,8 +48,8 @@ func createTxnForPushQueue(ctx context.Context, tc *testContext) (*roachpb.Trans
 }
 
 type RespWithErr struct {
-	resp *roachpb.PushTxnResponse
-	pErr *roachpb.Error
+	resp *kvpb.PushTxnResponse
+	pErr *kvpb.Error
 }
 
 func checkAllGaugesZero(tc testContext) error {
@@ -74,12 +72,13 @@ func checkAllGaugesZero(tc testContext) error {
 func TestTxnWaitQueueEnableDisable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
-	txn, err := createTxnForPushQueue(context.Background(), &tc)
+	txn, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,15 +100,16 @@ func TestTxnWaitQueueEnableDisable(t *testing.T) {
 	assert.EqualValues(tc, 1, m.PusheeWaiting.Value())
 
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	retCh := make(chan RespWithErr, 1)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 
@@ -157,12 +157,12 @@ func TestTxnWaitQueueEnableDisable(t *testing.T) {
 		t.Fatal(err.Error())
 	}
 
-	q.UpdateTxn(context.Background(), txn)
+	q.UpdateTxn(ctx, txn)
 	if len(q.TrackedTxns()) != 0 {
 		t.Fatalf("expected update to silently fail since queue is disabled")
 	}
 
-	if resp, pErr := q.MaybeWaitForPush(context.Background(), &req); resp != nil || pErr != nil {
+	if resp, pErr := q.MaybeWaitForPush(ctx, &req, wp); resp != nil || pErr != nil {
 		t.Errorf("expected nil resp and err as queue is disabled; got %+v, %s", resp, pErr)
 	}
 	if err := checkAllGaugesZero(tc); err != nil {
@@ -173,21 +173,23 @@ func TestTxnWaitQueueEnableDisable(t *testing.T) {
 func TestTxnWaitQueueCancel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
-	txn, err := createTxnForPushQueue(context.Background(), &tc)
+	txn, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
@@ -199,10 +201,10 @@ func TestTxnWaitQueueCancel(t *testing.T) {
 	assert.EqualValues(tc, 1, m.PusheeWaiting.Value())
 	assert.EqualValues(tc, 0, m.PusherWaiting.Value())
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	retCh := make(chan RespWithErr, 1)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(ctx, &req)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 
@@ -237,24 +239,26 @@ func TestTxnWaitQueueCancel(t *testing.T) {
 func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
-	txn, err := createTxnForPushQueue(context.Background(), &tc)
+	txn, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pusher1 := newTransaction("pusher1", roachpb.Key("a"), 1, tc.Clock())
 	pusher2 := newTransaction("pusher2", roachpb.Key("a"), 1, tc.Clock())
-	req1 := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req1 := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher1,
 		PusheeTxn: txn.TxnMeta,
 	}
 	req2 := req1
 	req2.PusherTxn = *pusher2
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
@@ -264,7 +268,7 @@ func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 
 	retCh := make(chan RespWithErr, 2)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req1)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req1, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
@@ -288,7 +292,7 @@ func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 	})
 
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req2)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req2, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	testutils.SucceedsSoon(t, func() error {
@@ -310,7 +314,7 @@ func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 
 	updatedTxn := *txn
 	updatedTxn.Status = roachpb.COMMITTED
-	q.UpdateTxn(context.Background(), &updatedTxn)
+	q.UpdateTxn(ctx, &updatedTxn)
 	testutils.SucceedsSoon(tc.TB, func() error {
 		return checkAllGaugesZero(tc)
 	})
@@ -351,21 +355,22 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	tc.Start(t, stopper)
+	tc.Start(ctx, t, stopper)
 
 	txn, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
@@ -373,7 +378,7 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 
 	retCh := make(chan RespWithErr, 2)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), req)
+		resp, pErr := q.MaybeWaitForPush(context.Background(), req, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 
@@ -427,21 +432,23 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 func TestTxnWaitQueueUpdateNotPushedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
-	txn, err := createTxnForPushQueue(context.Background(), &tc)
+	txn, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
@@ -449,7 +456,7 @@ func TestTxnWaitQueueUpdateNotPushedTxn(t *testing.T) {
 
 	retCh := make(chan RespWithErr, 1)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 
@@ -463,7 +470,7 @@ func TestTxnWaitQueueUpdateNotPushedTxn(t *testing.T) {
 
 	updatedTxn := *txn
 	updatedTxn.WriteTimestamp = txn.WriteTimestamp.Add(1, 0)
-	q.UpdateTxn(context.Background(), &updatedTxn)
+	q.UpdateTxn(ctx, &updatedTxn)
 
 	respWithErr := <-retCh
 	if respWithErr.resp != nil {
@@ -484,38 +491,40 @@ func TestTxnWaitQueuePusheeExpires(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	var queryTxnCount int32
 
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	clock := hlc.NewClockForTesting(manual)
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
 	// Move the clock forward so that when the PushTxn is sent, the txn appears
 	// expired.
-	manual.Set(txnwait.TxnExpiration(txn).WallTime)
+	manual.MustAdvanceTo(txnwait.TxnExpiration(txn).GoTime())
 
 	tc := testContext{}
 	tsc := TestStoreConfig(clock)
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if qtReq, ok := filterArgs.Req.(*roachpb.QueryTxnRequest); ok && bytes.Equal(qtReq.Txn.Key, txn.Key) {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if qtReq, ok := filterArgs.Req.(*kvpb.QueryTxnRequest); ok && bytes.Equal(qtReq.Txn.Key, txn.Key) {
 				atomic.AddInt32(&queryTxnCount, 1)
 			}
 			return nil
 		}
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.StartWithStoreConfig(t, stopper, tsc)
+	defer stopper.Stop(ctx)
+	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 	pusher1 := newTransaction("pusher1", roachpb.Key("a"), 1, tc.Clock())
 	pusher2 := newTransaction("pusher2", roachpb.Key("a"), 1, tc.Clock())
-	req1 := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req1 := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher1,
 		PusheeTxn: txn.TxnMeta,
 	}
 	req2 := req1
 	req2.PusherTxn = *pusher2
+	wp := lock.WaitPolicy_Block
 
 	// Create a "fake" txn record.
-	if err := writeTxnRecord(context.Background(), &tc, txn); err != nil {
+	if err := writeTxnRecord(ctx, &tc, txn); err != nil {
 		t.Fatal(err)
 	}
 
@@ -525,11 +534,11 @@ func TestTxnWaitQueuePusheeExpires(t *testing.T) {
 
 	retCh := make(chan RespWithErr, 2)
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req1)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req1, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 	go func() {
-		resp, pErr := q.MaybeWaitForPush(context.Background(), &req2)
+		resp, pErr := q.MaybeWaitForPush(ctx, &req2, wp)
 		retCh <- RespWithErr{resp, pErr}
 	}()
 
@@ -582,18 +591,19 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 			{"above", pushEpoch + 1},
 		} {
 			t.Run(fmt.Sprintf("recordEpoch=%s", c.name), func(t *testing.T) {
+				ctx := context.Background()
 				tc := testContext{}
 				stopper := stop.NewStopper()
-				defer stopper.Stop(context.Background())
-				tc.Start(t, stopper)
+				defer stopper.Stop(ctx)
+				tc.Start(ctx, t, stopper)
 
-				txn, err := createTxnForPushQueue(context.Background(), &tc)
+				txn, err := createTxnForPushQueue(ctx, &tc)
 				if err != nil {
 					t.Fatal(err)
 				}
 				var pusher *roachpb.Transaction
 				if txnRecordExists {
-					pusher, err = createTxnForPushQueue(context.Background(), &tc)
+					pusher, err = createTxnForPushQueue(ctx, &tc)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -602,11 +612,12 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 				}
 				pusher.Epoch = pushEpoch
 
-				req := roachpb.PushTxnRequest{
-					PushType:  roachpb.PUSH_ABORT,
+				req := kvpb.PushTxnRequest{
+					PushType:  kvpb.PUSH_ABORT,
 					PusherTxn: *pusher,
 					PusheeTxn: txn.TxnMeta,
 				}
+				wp := lock.WaitPolicy_Block
 
 				q := tc.repl.concMgr.TestingTxnWaitQueue()
 				q.Enable(1 /* leaseSeq */)
@@ -614,7 +625,7 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 
 				retCh := make(chan RespWithErr, 1)
 				go func() {
-					resp, pErr := q.MaybeWaitForPush(context.Background(), &req)
+					resp, pErr := q.MaybeWaitForPush(ctx, &req, wp)
 					retCh <- RespWithErr{resp, pErr}
 				}()
 
@@ -636,10 +647,10 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 				pusherUpdate := *pusher
 				pusherUpdate.Epoch = c.recordEpoch
 				pusherUpdate.Status = roachpb.ABORTED
-				if err := writeTxnRecord(context.Background(), &tc, &pusherUpdate); err != nil {
+				if err := writeTxnRecord(ctx, &tc, &pusherUpdate); err != nil {
 					t.Fatal(err)
 				}
-				q.UpdateTxn(context.Background(), &pusherUpdate)
+				q.UpdateTxn(ctx, &pusherUpdate)
 
 				respWithErr := <-retCh
 				if respWithErr.resp != nil {
@@ -669,9 +680,9 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 }
 
 type ReqWithRespAndErr struct {
-	req  *roachpb.PushTxnRequest
-	resp *roachpb.PushTxnResponse
-	pErr *roachpb.Error
+	req  *kvpb.PushTxnRequest
+	resp *kvpb.PushTxnResponse
+	pErr *kvpb.Error
 }
 
 // TestTxnWaitQueueDependencyCycle verifies that if txn A pushes txn B
@@ -680,53 +691,55 @@ type ReqWithRespAndErr struct {
 func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
-	txnA, err := createTxnForPushQueue(context.Background(), &tc)
+	txnA, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	txnB, err := createTxnForPushQueue(context.Background(), &tc)
+	txnB, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	txnC, err := createTxnForPushQueue(context.Background(), &tc)
+	txnC, err := createTxnForPushQueue(ctx, &tc)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	reqA := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqA := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnB.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnA,
 		PusheeTxn: txnB.TxnMeta,
 	}
-	reqB := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqB := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnC.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnB,
 		PusheeTxn: txnC.TxnMeta,
 	}
-	reqC := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqC := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnA.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnC,
 		PusheeTxn: txnA.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for _, txn := range []*roachpb.Transaction{txnA, txnB, txnC} {
 		q.EnqueueTxn(txn)
@@ -734,11 +747,11 @@ func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 	m := tc.store.txnWaitMetrics
 	assert.EqualValues(tc, 0, m.DeadlocksTotal.Count())
 
-	reqs := []*roachpb.PushTxnRequest{reqA, reqB, reqC}
+	reqs := []*kvpb.PushTxnRequest{reqA, reqB, reqC}
 	retCh := make(chan ReqWithRespAndErr, len(reqs))
 	for _, req := range reqs {
-		go func(req *roachpb.PushTxnRequest) {
-			resp, pErr := q.MaybeWaitForPush(ctx, req)
+		go func(req *kvpb.PushTxnRequest) {
+			resp, pErr := q.MaybeWaitForPush(ctx, req, wp)
 			retCh <- ReqWithRespAndErr{req, resp, pErr}
 		}(req)
 	}
@@ -774,10 +787,11 @@ func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	tc.Start(ctx, t, stopper)
 
 	// Create txnA with a lower priority so it won't think it could push
 	// txnB without updating its priority.
@@ -787,33 +801,34 @@ func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 	// can in fact break the deadlock.
 	updatedTxnA := *txnA
 	updatedTxnA.Priority = 3
-	if err := writeTxnRecord(context.Background(), &tc, &updatedTxnA); err != nil {
+	if err := writeTxnRecord(ctx, &tc, &updatedTxnA); err != nil {
 		t.Fatal(err)
 	}
 	// Create txnB with priority=2, so txnA won't think it can push, but
 	// when we set up txnB as the pusher, the request will include txnA's
 	// updated priority, making txnB think it can't break a deadlock.
 	txnB := newTransaction("txn", roachpb.Key("a"), -2, tc.Clock())
-	if err := writeTxnRecord(context.Background(), &tc, txnB); err != nil {
+	if err := writeTxnRecord(ctx, &tc, txnB); err != nil {
 		t.Fatal(err)
 	}
 
-	reqA := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqA := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnB.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnA,
 		PusheeTxn: txnB.TxnMeta,
 	}
-	reqB := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqB := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnA.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnB,
 		PusheeTxn: updatedTxnA.TxnMeta,
 	}
+	wp := lock.WaitPolicy_Block
 
 	q := tc.repl.concMgr.TestingTxnWaitQueue()
 	q.Enable(1 /* leaseSeq */)
@@ -824,11 +839,11 @@ func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 	m := tc.store.txnWaitMetrics
 	assert.EqualValues(tc, 0, m.DeadlocksTotal.Count())
 
-	reqs := []*roachpb.PushTxnRequest{reqA, reqB}
+	reqs := []*kvpb.PushTxnRequest{reqA, reqB}
 	retCh := make(chan ReqWithRespAndErr, len(reqs))
 	for _, req := range reqs {
-		go func(req *roachpb.PushTxnRequest) {
-			resp, pErr := q.MaybeWaitForPush(context.Background(), req)
+		go func(req *kvpb.PushTxnRequest) {
+			resp, pErr := q.MaybeWaitForPush(ctx, req, wp)
 			retCh <- ReqWithRespAndErr{req, resp, pErr}
 		}(req)
 	}

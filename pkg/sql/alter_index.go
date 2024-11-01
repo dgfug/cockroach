@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -44,10 +39,16 @@ func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode,
 		return nil, err
 	}
 
-	tableDesc, index, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
+	_, tableDesc, index, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE, true /* skipCache */)
 	if err != nil {
 		return nil, err
 	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkSchemaChangeIsAllowed(tableDesc, n); err != nil {
+		return nil, err
+	}
+
 	return &alterIndexNode{n: n, tableDesc: tableDesc, index: index}, nil
 }
 
@@ -79,10 +80,16 @@ func (n *alterIndexNode) startExec(params runParams) error {
 					"cannot change the partitioning of an index if the table has PARTITION ALL BY defined",
 				)
 			}
-			if n.index.GetPartitioning().NumImplicitColumns() > 0 {
+			if n.index.ImplicitPartitioningColumnCount() > 0 {
 				return unimplemented.New(
 					"ALTER INDEX PARTITION BY",
 					"cannot ALTER INDEX PARTITION BY on an index which already has implicit column partitioning",
+				)
+			}
+			if n.index.IsSharded() {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot set explicit partitioning with ALTER INDEX PARTITION BY on a hash sharded index",
 				)
 			}
 			allowImplicitPartitioning := params.p.EvalContext().SessionData().ImplicitColumnPartitioningEnabled ||
@@ -119,12 +126,13 @@ func (n *alterIndexNode) startExec(params runParams) error {
 				descriptorChanged = true
 				if err := deleteRemovedPartitionZoneConfigs(
 					params.ctx,
-					params.p.txn,
+					params.p.InternalSQLTxn(),
 					n.tableDesc,
 					n.index.GetID(),
 					oldPartitioning,
 					n.index.GetPartitioning(),
 					params.extendedEvalCtx.ExecCfg,
+					params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 				); err != nil {
 					return err
 				}
@@ -136,7 +144,8 @@ func (n *alterIndexNode) startExec(params runParams) error {
 
 	}
 
-	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+	version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
+	if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
 		return err
 	}
 
@@ -147,7 +156,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	}
 	mutationID := descpb.InvalidMutationID
 	if addedMutations {
-		mutationID = n.tableDesc.ClusterVersion.NextMutationID
+		mutationID = n.tableDesc.ClusterVersion().NextMutationID
 	}
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),

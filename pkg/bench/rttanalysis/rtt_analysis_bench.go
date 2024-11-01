@@ -1,30 +1,26 @@
-// Copyright 2020 The Cockroach Authors.
+// Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/stretchr/testify/require"
 )
 
 // RoundTripBenchTestCase is a struct that holds the Name of a benchmark test
@@ -32,112 +28,206 @@ import (
 // Reset must drop any remaining objects after the current database is dropped
 // so Setup and Stmt can be run again.
 type RoundTripBenchTestCase struct {
-	Name  string
+	Name string
+	// Setup runs before Stmt. The round-trips are not counted. It can consist of
+	// multiple semicolon-separated statements, and they'll all be executed in a
+	// transaction.
 	Setup string
-	Stmt  string
-	Reset string
+	// SetupEx is like Setup, but allows the test to separate different statements
+	// in different transactions. This is commonly used to lease descriptors on
+	// new tables so that the test is not bothered by the lease acquisition. The
+	// lease acquisition cannot be done in the same transaction as the one
+	// creating the table.
+	SetupEx   []string
+	Stmt      string
+	StmtArgs  []interface{}
+	Reset     string
+	SkipIssue int
+	// NonAdminUser specifies that the test should be run as a user without admin
+	// privileges. The setup and reset portions of the test will still be run as
+	// an admin user.
+	NonAdminUser bool
 }
 
-// RunRoundTripBenchmark sets up a db run the RoundTripBenchTestCase test cases
-// and counts how many round trips the Stmt specified by the test case performs.
-func RunRoundTripBenchmark(b *testing.B, tests []RoundTripBenchTestCase) {
-	skip.UnderMetamorphic(b, "changes the RTTs")
-
+func runRoundTripBenchmark(b testingB, tests []RoundTripBenchTestCase, cc ClusterConstructor) {
 	for _, tc := range tests {
-		b.Run(tc.Name, func(b *testing.B) {
-			defer log.Scope(b).Close(b)
-			var stmtToKvBatchRequests sync.Map
-
-			beforePlan := func(trace tracing.Recording, stmt string) {
-				if _, ok := stmtToKvBatchRequests.Load(stmt); ok {
-					stmtToKvBatchRequests.Store(stmt, trace)
-				}
+		b.Run(tc.Name, func(b testingB) {
+			if tc.SkipIssue != 0 {
+				skip.WithIssue(b, tc.SkipIssue)
 			}
-
-			params := base.TestServerArgs{
-				UseDatabase: "bench",
-				Knobs: base.TestingKnobs{
-					SQLExecutor: &sql.ExecutorTestingKnobs{
-						WithStatementTrace: beforePlan,
-					},
-				},
-			}
-
-			s, db, _ := serverutils.StartServer(
-				b, params,
-			)
-			sql := sqlutils.MakeSQLRunner(db)
-
-			defer s.Stopper().Stop(context.Background())
-
-			ExecuteRoundTripTest(b, sql, &stmtToKvBatchRequests, tc)
+			executeRoundTripTest(b, tc, cc)
 		})
 	}
 }
 
-// ExecuteRoundTripTest executes a RoundTripBenchCase on with the provided SQL runner
-func ExecuteRoundTripTest(
-	b *testing.B, sql *sqlutils.SQLRunner, stmtToKvBatchRequests *sync.Map, tc RoundTripBenchTestCase,
+// RunRoundTripBenchmark sets up a db run the RoundTripBenchTestCase test cases
+// and counts how many round trips the Stmt specified by the test case performs.
+// It runs each leaf subtest numRuns times. It uses the limiter to limit
+// concurrency.
+func runRoundTripBenchmarkTest(
+	t *testing.T,
+	scope *log.TestLogScope,
+	results *resultSet,
+	tests []RoundTripBenchTestCase,
+	cc ClusterConstructor,
+	numRuns int,
+	limit *quotapool.IntPool,
 ) {
-	expData := readExpectationsFile(b)
+	skip.UnderMetamorphic(t, "changes the RTTs")
+	var wg sync.WaitGroup
+	for _, tc := range tests {
+		wg.Add(1)
+		go func(tc RoundTripBenchTestCase) {
+			defer wg.Done()
+			t.Run(tc.Name, func(t *testing.T) {
+				runRoundTripBenchmarkTestCase(t, scope, results, tc, cc, numRuns, limit)
+			})
+		}(tc)
+	}
+	wg.Wait()
+}
 
-	defer log.Scope(b).Close(b)
+func runRoundTripBenchmarkTestCase(
+	t *testing.T,
+	scope *log.TestLogScope,
+	results *resultSet,
+	tc RoundTripBenchTestCase,
+	cc ClusterConstructor,
+	numRuns int,
+	limit *quotapool.IntPool,
+) {
+	if tc.SkipIssue != 0 {
+		skip.WithIssue(t, tc.SkipIssue)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < numRuns; i++ {
+		alloc, err := limit.Acquire(context.Background(), 1)
+		require.NoError(t, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer alloc.Release()
+			executeRoundTripTest(tShim{
+				T: t, results: results, scope: scope,
+			}, tc, cc)
+		}()
+	}
+	wg.Wait()
+}
+
+// executeRoundTripTest executes a RoundTripBenchCase on with the provided SQL runner
+func executeRoundTripTest(b testingB, tc RoundTripBenchTestCase, cc ClusterConstructor) {
+	getDir, cleanup := b.logScope()
+	defer cleanup()
+
+	cluster := cc(b)
+	defer cluster.close()
+
+	adminSQL := sqlutils.MakeSQLRunner(cluster.adminConn())
+	sql := adminSQL
+	if tc.NonAdminUser {
+		sql = sqlutils.MakeSQLRunner(cluster.nonAdminConn())
+	}
+
+	expData := readExpectationsFile(b)
 
 	exp, haveExp := expData.find(strings.TrimPrefix(b.Name(), "Benchmark"))
 
 	roundTrips := 0
 	b.ResetTimer()
 	b.StopTimer()
-	var r tracing.Recording
-	for i := 0; i < b.N; i++ {
-		sql.Exec(b, "CREATE DATABASE bench;")
-		sql.Exec(b, tc.Setup)
-		stmtToKvBatchRequests.Store(tc.Stmt, nil)
+	var r tracingpb.Recording
+
+	// The statement trace records individual statements, but we may want to
+	// execute multiple SQL statements. Note that multi-statement traces won't
+	// count round trips correctly if there are duplicate statements.
+	statements, err := parser.Parse(tc.Stmt)
+	if err != nil {
+		require.NoError(b, err)
+	}
+
+	// Do an extra iteration and don't record it in order to deal with effects of
+	// running it the first time.
+	for i := 0; i < b.N()+1; i++ {
+		adminSQL.Exec(b, "CREATE DATABASE bench")
+		// Make sure the database descriptor is leased, so that tests don't count
+		// the leasing.
+		adminSQL.Exec(b, "USE bench")
+		// Also force a lease on the "public" schema too.
+		adminSQL.Exec(b, "CREATE TABLE bench.public.__dummy__()")
+		adminSQL.Exec(b, "SELECT 1 FROM bench.public.__dummy__")
+		adminSQL.Exec(b, "DROP TABLE bench.public.__dummy__")
+
+		adminSQL.Exec(b, tc.Setup)
+		for _, s := range tc.SetupEx {
+			adminSQL.Exec(b, s)
+		}
+		for _, statement := range statements {
+			cluster.clearStatementTrace(statement.SQL)
+		}
 
 		b.StartTimer()
-		sql.Exec(b, tc.Stmt)
+		sql.Exec(b, tc.Stmt, tc.StmtArgs...)
 		b.StopTimer()
-
-		out, _ := stmtToKvBatchRequests.Load(tc.Stmt)
 		var ok bool
-		if r, ok = out.(tracing.Recording); !ok {
-			b.Fatalf(
-				"could not find number of round trips for statement: %s",
-				tc.Stmt,
-			)
+
+		total := 0
+		for _, statement := range statements {
+			r, ok = cluster.getStatementTrace(statement.SQL)
+			if !ok {
+				b.Fatalf(
+					"could not find number of round trips for statement: %s",
+					statement.SQL,
+				)
+			}
+
+			// If there's a retry error then we're just going to throw away this
+			// run.
+			rt, hasRetry := countKvBatchRequestsInRecording(r)
+			if hasRetry {
+				i--
+				ok = false
+				break
+			} else if i > 0 { // skip the initial iteration
+				total += rt
+			}
+		}
+		if ok {
+			roundTrips += total
 		}
 
-		// If there's a retry error then we're just going to throw away this
-		// run.
-		rt, hasRetry := countKvBatchRequestsInRecording(r)
-		if hasRetry {
-			i--
-		} else {
-			roundTrips += rt
-		}
-
-		sql.Exec(b, "DROP DATABASE bench;")
-		sql.Exec(b, tc.Reset)
+		adminSQL.Exec(b, "DROP DATABASE bench;")
+		adminSQL.Exec(b, tc.Reset)
 	}
 
-	res := float64(roundTrips) / float64(b.N)
-	if haveExp && !exp.matches(int(res)) && *rewriteFlag == "" {
-		b.Fatalf(`got %v, expected %v. trace:
-%v
-(above trace from test %s. got %v, expected %v)
-`, res, exp, r, b.Name(), res, exp)
+	res := float64(roundTrips) / float64(b.N())
+
+	reportf := b.Errorf
+	if b.isBenchmark() {
+		reportf = b.Logf
 	}
-	b.ReportMetric(res, "roundtrips")
+	if haveExp && !exp.matches(int(res)) && !*rewriteFlag {
+		reportf(`%s: got %v, expected %v`, b.Name(), res, exp)
+		dir := getDir()
+		jaegerJSON, err := r.ToJaegerJSON(tc.Stmt, "", "n0")
+		require.NoError(b, err)
+		path := filepath.Join(dir, strings.Replace(b.Name(), "/", "_", -1)) + ".jaeger.json"
+		require.NoError(b, os.WriteFile(path, []byte(jaegerJSON), 0666))
+		reportf("wrote jaeger trace to %s", path)
+	}
+	b.ReportMetric(res, roundTripsMetric)
 }
+
+const roundTripsMetric = "roundtrips"
 
 // count the number of KvBatchRequests inside a recording, this is done by
 // counting each "txn coordinator send" operation.
-func countKvBatchRequestsInRecording(r tracing.Recording) (sends int, hasRetry bool) {
+func countKvBatchRequestsInRecording(r tracingpb.Recording) (sends int, hasRetry bool) {
 	root := r[0]
 	return countKvBatchRequestsInSpan(r, root)
 }
 
-func countKvBatchRequestsInSpan(r tracing.Recording, sp tracingpb.RecordedSpan) (int, bool) {
+func countKvBatchRequestsInSpan(r tracingpb.Recording, sp tracingpb.RecordedSpan) (int, bool) {
 	count := 0
 	// Count the number of OpTxnCoordSender operations while traversing the
 	// tree of spans.

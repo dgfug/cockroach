@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security_test
 
@@ -17,7 +12,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -26,6 +20,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -90,12 +86,12 @@ func TestCertNomenclature(t *testing.T) {
 
 func TestLoadEmbeddedCerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cl := security.NewCertificateLoader(security.EmbeddedCertsDir)
+	cl := security.NewCertificateLoader(certnames.EmbeddedCertsDir)
 	if err := cl.Load(); err != nil {
 		t.Error(err)
 	}
 
-	assets, err := securitytest.AssetReadDir(security.EmbeddedCertsDir)
+	assets, err := securitytest.AssetReadDir(certnames.EmbeddedCertsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,9 +122,17 @@ func countLoadedCertificates(certsDir string) (int, error) {
 	return len(cl.Certificates()), nil
 }
 
+func defaultExpiration() time.Time {
+	return timeutil.Now().Add(time.Hour)
+}
+
 // Generate a x509 cert with specific fields.
 func makeTestCert(
-	t *testing.T, commonName string, keyUsage x509.KeyUsage, extUsages []x509.ExtKeyUsage,
+	t *testing.T,
+	commonName string,
+	keyUsage x509.KeyUsage,
+	extUsages []x509.ExtKeyUsage,
+	expiration time.Time,
 ) (*x509.Certificate, []byte) {
 	// Make smallest rsa key possible: not saved.
 	key, err := rsa.GenerateKey(rand.Reader, 512)
@@ -143,7 +147,7 @@ func makeTestCert(
 			CommonName: commonName,
 		},
 		NotBefore: timeutil.Now().Add(-time.Hour),
-		NotAfter:  timeutil.Now().Add(time.Hour),
+		NotAfter:  expiration,
 		KeyUsage:  keyUsage,
 	}
 
@@ -186,16 +190,16 @@ func TestNamingScheme(t *testing.T) {
 	fullKeyUsage := x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature
 	// Build a few certificates. These are barebones since we only need to check our custom validation,
 	// not chain verification.
-	parsedCACert, caCert := makeTestCert(t, "", 0, nil)
+	parsedCACert, caCert := makeTestCert(t, "", 0, nil, defaultExpiration())
 
-	parsedGoodNodeCert, goodNodeCert := makeTestCert(t, "node", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
-	_, badUserNodeCert := makeTestCert(t, "notnode", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth})
+	parsedGoodNodeCert, goodNodeCert := makeTestCert(t, "node", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, defaultExpiration())
+	_, badUserNodeCert := makeTestCert(t, "notnode", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, defaultExpiration())
 
-	parsedGoodRootCert, goodRootCert := makeTestCert(t, "root", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
-	_, notRootCert := makeTestCert(t, "notroot", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	parsedGoodRootCert, goodRootCert := makeTestCert(t, "root", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, defaultExpiration())
+	_, notRootCert := makeTestCert(t, "notroot", fullKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, defaultExpiration())
 
 	// Do not use embedded certs.
-	security.ResetAssetLoader()
+	securityassets.ResetLoader()
 	defer ResetTest()
 
 	// Some test cases are skipped on windows due to non-UGO permissions.
@@ -211,15 +215,7 @@ func TestNamingScheme(t *testing.T) {
 	}
 
 	// Create directory.
-	certsDir, err := ioutil.TempDir("", "certs_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := os.RemoveAll(certsDir); err != nil {
-			t.Fatal(err)
-		}
-	}()
+	certsDir := t.TempDir()
 
 	type testFile struct {
 		name     string
@@ -299,8 +295,8 @@ func TestNamingScheme(t *testing.T) {
 				{"client.root.key", 0700, []byte{}},
 			},
 			certs: []security.CertInfo{
-				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
-					Error: errors.New(`client certificate has principals \["notroot"\], expected "root"`)},
+				{FileUsage: security.ClientPem, Filename: "client.root.crt", KeyFilename: "client.root.key",
+					Name: "root", FileContents: notRootCert, KeyFileContents: []byte{}},
 				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
 					FileContents: badUserNodeCert, KeyFileContents: []byte("node.key")},
 			},
@@ -372,7 +368,7 @@ func TestNamingScheme(t *testing.T) {
 		// Write all files.
 		for _, f := range data.files {
 			n := f.name
-			if err := ioutil.WriteFile(filepath.Join(certsDir, n), f.contents, f.mode); err != nil {
+			if err := os.WriteFile(filepath.Join(certsDir, n), f.contents, f.mode); err != nil {
 				t.Fatalf("#%d: could not write file %s: %v", testNum, n, err)
 			}
 		}

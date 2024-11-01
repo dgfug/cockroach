@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tscache
 
@@ -18,18 +13,22 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
-	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
+
+var ctx = context.Background()
 
 var cacheImplConstrs = []func(clock *hlc.Clock) Cache{
 	func(clock *hlc.Clock) Cache { return newTreeImpl(clock) },
@@ -37,12 +36,12 @@ var cacheImplConstrs = []func(clock *hlc.Clock) Cache{
 }
 
 func forEachCacheImpl(
-	t *testing.T, fn func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock),
+	t *testing.T, fn func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime),
 ) {
 	for _, constr := range cacheImplConstrs {
 		const baseTS = 100
-		manual := hlc.NewManualClock(baseTS)
-		clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+		manual := timeutil.NewManualTime(timeutil.Unix(0, baseTS))
+		clock := hlc.NewClockForTesting(manual)
 
 		tc := constr(clock)
 		tcName := reflect.TypeOf(tc).Elem().Name()
@@ -55,64 +54,64 @@ func forEachCacheImpl(
 func TestTimestampCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock) {
-		baseTS := manual.UnixNano()
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime) {
+		baseTS := manual.Now()
 
 		// First simulate a read of just "a" at time 50.
-		tc.Add(roachpb.Key("a"), nil, hlc.Timestamp{WallTime: 50}, noTxnID)
+		tc.Add(ctx, roachpb.Key("a"), nil, hlc.Timestamp{WallTime: 50}, noTxnID)
 		// Verify GetMax returns the lowWater mark.
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("a"), nil); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("a"), nil); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"a\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("notincache"), nil); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("notincache"), nil); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"notincache\"; txnID=%s", rTxnID)
 		}
 
 		// Advance the clock and verify same low water mark.
-		manual.Increment(100)
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("a"), nil); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		manual.Advance(100)
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("a"), nil); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"a\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("notincache"), nil); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("notincache"), nil); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"notincache\"; txnID=%s", rTxnID)
 		}
 
 		// Sim a read of "b"-"c" at a time above the low-water mark.
 		ts := clock.Now()
-		tc.Add(roachpb.Key("b"), roachpb.Key("c"), ts, noTxnID)
+		tc.Add(ctx, roachpb.Key("b"), roachpb.Key("c"), ts, noTxnID)
 
 		// Verify all permutations of direct and range access.
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("b"), nil); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("b"), nil); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"b\"; got %s; txnID=%s", rTS, rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("bb"), nil); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("bb"), nil); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"bb\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("c"), nil); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("c"), nil); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"c\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("b"), roachpb.Key("c")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("b"), roachpb.Key("c")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"b\"-\"c\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("bb"), roachpb.Key("bz")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("bb"), roachpb.Key("bz")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"bb\"-\"bz\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("a"), roachpb.Key("b")); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("a"), roachpb.Key("b")); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"a\"-\"b\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("a"), roachpb.Key("bb")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("a"), roachpb.Key("bb")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"a\"-\"bb\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("a"), roachpb.Key("d")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("a"), roachpb.Key("d")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"a\"-\"d\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("bz"), roachpb.Key("c")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("bz"), roachpb.Key("c")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"bz\"-\"c\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("bz"), roachpb.Key("d")); rTS != ts || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("bz"), roachpb.Key("d")); rTS != ts || rTxnID != noTxnID {
 			t.Errorf("expected current time for key \"bz\"-\"d\"; txnID=%s", rTxnID)
 		}
-		if rTS, rTxnID := tc.GetMax(roachpb.Key("c"), roachpb.Key("d")); rTS.WallTime != baseTS || rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, roachpb.Key("c"), roachpb.Key("d")); !baseTS.Equal(rTS.GoTime()) || rTxnID != noTxnID {
 			t.Errorf("expected baseTS for key \"c\"-\"d\"; txnID=%s", rTxnID)
 		}
 	})
@@ -141,7 +140,7 @@ func assertTS(
 	} else {
 		keys = fmt.Sprintf("%q-%q", start, end)
 	}
-	ts, txnID := tc.GetMax(start, end)
+	ts, txnID := tc.GetMax(ctx, start, end)
 	if ts != expectedTS {
 		t.Errorf("expected %s to have timestamp %v, found %v", keys, expectedTS, ts)
 	}
@@ -292,7 +291,7 @@ var layeredIntervalTestCase5 = layeredIntervalTestCase{
 func TestTimestampCacheLayeredIntervals(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock) {
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime) {
 		// Run each test case in several configurations.
 		for _, testCase := range []layeredIntervalTestCase{
 			layeredIntervalTestCase1,
@@ -338,7 +337,7 @@ func TestTimestampCacheLayeredIntervals(t *testing.T) {
 									txns[i].ts = now
 								}
 							} else {
-								manual.Increment(1)
+								manual.Advance(1)
 								for i := range txns {
 									txns[i].ts = clock.Now()
 								}
@@ -346,11 +345,11 @@ func TestTimestampCacheLayeredIntervals(t *testing.T) {
 
 							if reverse {
 								for i := len(testCase.spans) - 1; i >= 0; i-- {
-									tc.Add(testCase.spans[i].Key, testCase.spans[i].EndKey, txns[i].ts, txns[i].id)
+									tc.Add(ctx, testCase.spans[i].Key, testCase.spans[i].EndKey, txns[i].ts, txns[i].id)
 								}
 							} else {
 								for i := range testCase.spans {
-									tc.Add(testCase.spans[i].Key, testCase.spans[i].EndKey, txns[i].ts, txns[i].id)
+									tc.Add(ctx, testCase.spans[i].Key, testCase.spans[i].EndKey, txns[i].ts, txns[i].id)
 								}
 							}
 							testCase.validator(t, tc, txns)
@@ -365,13 +364,13 @@ func TestTimestampCacheLayeredIntervals(t *testing.T) {
 func TestTimestampCacheClear(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock) {
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime) {
 		key := roachpb.Key("a")
 
 		ts := clock.Now()
-		tc.Add(key, nil, ts, noTxnID)
+		tc.Add(ctx, key, nil, ts, noTxnID)
 
-		manual.Increment(5000000)
+		manual.Advance(5000000)
 
 		expTS := clock.Now()
 		// Clear the cache, which will reset the low water mark to
@@ -379,7 +378,7 @@ func TestTimestampCacheClear(t *testing.T) {
 		tc.clear(expTS)
 
 		// Fetching any keys should give current time.
-		if rTS, rTxnID := tc.GetMax(key, nil); rTxnID != noTxnID {
+		if rTS, rTxnID := tc.GetMax(ctx, key, nil); rTxnID != noTxnID {
 			t.Errorf("%s unexpectedly associated to txn %s", key, rTxnID)
 		} else if rTS != expTS {
 			t.Errorf("expected %s, got %s", rTS, expTS)
@@ -393,22 +392,22 @@ func TestTimestampCacheClear(t *testing.T) {
 func TestTimestampCacheEqualTimestamps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock) {
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime) {
 		txn1 := uuid.MakeV4()
 		txn2 := uuid.MakeV4()
 
 		// Add two non-overlapping transactions at the same timestamp.
 		ts1 := clock.Now()
-		tc.Add(roachpb.Key("a"), roachpb.Key("b"), ts1, txn1)
-		tc.Add(roachpb.Key("b"), roachpb.Key("c"), ts1, txn2)
+		tc.Add(ctx, roachpb.Key("a"), roachpb.Key("b"), ts1, txn1)
+		tc.Add(ctx, roachpb.Key("b"), roachpb.Key("c"), ts1, txn2)
 
 		// When querying either side separately, the transaction ID is returned.
-		if ts, txn := tc.GetMax(roachpb.Key("a"), roachpb.Key("b")); ts != ts1 {
+		if ts, txn := tc.GetMax(ctx, roachpb.Key("a"), roachpb.Key("b")); ts != ts1 {
 			t.Errorf("expected 'a'-'b' to have timestamp %s, but found %s", ts1, ts)
 		} else if txn != txn1 {
 			t.Errorf("expected 'a'-'b' to have txn id %s, but found %s", txn1, txn)
 		}
-		if ts, txn := tc.GetMax(roachpb.Key("b"), roachpb.Key("c")); ts != ts1 {
+		if ts, txn := tc.GetMax(ctx, roachpb.Key("b"), roachpb.Key("c")); ts != ts1 {
 			t.Errorf("expected 'b'-'c' to have timestamp %s, but found %s", ts1, ts)
 		} else if txn != txn2 {
 			t.Errorf("expected 'b'-'c' to have txn id %s, but found %s", txn2, txn)
@@ -416,7 +415,7 @@ func TestTimestampCacheEqualTimestamps(t *testing.T) {
 
 		// Querying a span that overlaps both returns a nil txn ID; neither
 		// can proceed here.
-		if ts, txn := tc.GetMax(roachpb.Key("a"), roachpb.Key("c")); ts != ts1 {
+		if ts, txn := tc.GetMax(ctx, roachpb.Key("a"), roachpb.Key("c")); ts != ts1 {
 			t.Errorf("expected 'a'-'c' to have timestamp %s, but found %s", ts1, ts)
 		} else if txn != (noTxnID) {
 			t.Errorf("expected 'a'-'c' to have zero txn id, but found %s", txn)
@@ -430,14 +429,14 @@ func TestTimestampCacheEqualTimestamps(t *testing.T) {
 func TestTimestampCacheLargeKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *hlc.ManualClock) {
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, clock *hlc.Clock, manual *timeutil.ManualTime) {
 		keyStart := roachpb.Key(make([]byte, 5*maximumSklPageSize))
 		keyEnd := keyStart.Next()
 		ts1 := clock.Now()
 		txn1 := uuid.MakeV4()
 
-		tc.Add(keyStart, keyEnd, ts1, txn1)
-		if ts, txn := tc.GetMax(keyStart, keyEnd); ts != ts1 {
+		tc.Add(ctx, keyStart, keyEnd, ts1, txn1)
+		if ts, txn := tc.GetMax(ctx, keyStart, keyEnd); ts != ts1 {
 			t.Errorf("expected key range to have timestamp %s, but found %s", ts1, ts)
 		} else if txn != txn1 {
 			t.Errorf("expected key range to have txn id %s, but found %s", txn1, txn)
@@ -457,7 +456,7 @@ func TestTimestampCacheImplsIdentical(t *testing.T) {
 	// simulating real conditions while the latter is good for testing timestamp
 	// collisions.
 	testutils.RunTrueAndFalse(t, "useClock", func(t *testing.T, useClock bool) {
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		clock := hlc.NewClockForTesting(nil)
 		caches := make([]Cache, len(cacheImplConstrs))
 		start := clock.Now()
 		for i, constr := range cacheImplConstrs {
@@ -545,7 +544,7 @@ func TestTimestampCacheImplsIdentical(t *testing.T) {
 						to = nil
 					}
 
-					ts := start.Add(int64(j), 100).WithSynthetic(false)
+					ts := start.Add(int64(j), 100)
 					if useClock {
 						ts = clock.Now()
 					}
@@ -554,7 +553,7 @@ func TestTimestampCacheImplsIdentical(t *testing.T) {
 					for _, tc := range caches {
 						// This is a lot of log output so only un-comment to debug.
 						// t.Logf("adding (%T) [%s,%s) = %s", tc, string(from), string(to), newVal)
-						tc.Add(from, to, ts, txnID)
+						tc.Add(ctx, from, to, ts, txnID)
 					}
 
 					// Return semaphore.
@@ -627,7 +626,7 @@ func identicalAndRatcheted(
 ) (cacheValue, error) {
 	var vals []cacheValue
 	for _, tc := range caches {
-		keyTS, keyTxnID := tc.GetMax(from, to)
+		keyTS, keyTxnID := tc.GetMax(ctx, from, to)
 		vals = append(vals, cacheValue{ts: keyTS, txnID: keyTxnID})
 	}
 
@@ -650,22 +649,321 @@ func identicalAndRatcheted(
 	return firstVal, nil
 }
 
+func TestTimestampCacheSerialize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	forEachCacheImpl(t, func(t *testing.T, tc Cache, _ *hlc.Clock, _ *timeutil.ManualTime) {
+		lowWater := tc.getLowWater()
+
+		// Verify no read spans before any reads.
+		seg := tc.Serialize(ctx, roachpb.KeyMin, roachpb.KeyMax)
+		expSeg := rspb.Segment{LowWater: lowWater}
+		require.Equal(t, expSeg, seg)
+
+		// Simulate a series of reads and verify the serialized spans.
+		ts1 := lowWater.Add(50, 1)
+		ts2 := ts1.Add(10, 1)
+		txnID1, txnID2 := uuid.MakeV4(), uuid.MakeV4()
+		tc.Add(ctx, roachpb.Key("a"), nil, ts1, noTxnID)
+		tc.Add(ctx, roachpb.Key("b"), nil, ts2, noTxnID)
+		tc.Add(ctx, roachpb.Key("b"), roachpb.Key("d"), ts1, txnID1)
+		tc.Add(ctx, roachpb.Key("b\x00"), nil, ts2, txnID2)
+		tc.Add(ctx, roachpb.Key("e"), nil, ts2, txnID1)
+		tc.Add(ctx, roachpb.Key("f"), roachpb.Key("h"), ts2, txnID2)
+
+		seg = tc.Serialize(ctx, roachpb.KeyMin, roachpb.KeyMax)
+		expSeg = rspb.Segment{
+			LowWater: lowWater,
+			ReadSpans: []rspb.ReadSpan{
+				{Key: roachpb.Key("a"), EndKey: nil, Timestamp: ts1, TxnID: noTxnID},
+				{Key: roachpb.Key("b"), EndKey: nil, Timestamp: ts2, TxnID: noTxnID},
+				{Key: roachpb.Key("b\x00"), EndKey: nil, Timestamp: ts2, TxnID: txnID2},
+				{Key: roachpb.Key("b\x00\x00"), EndKey: roachpb.Key("d"), Timestamp: ts1, TxnID: txnID1},
+				{Key: roachpb.Key("e"), EndKey: nil, Timestamp: ts2, TxnID: txnID1},
+				{Key: roachpb.Key("f"), EndKey: roachpb.Key("h"), Timestamp: ts2, TxnID: txnID2},
+			},
+		}
+		require.Equal(t, expSeg, seg)
+
+		// Test that the cache can be cleared, populated, and re-serialized again.
+		tc.clear(seg.LowWater)
+		for _, sp := range seg.ReadSpans {
+			tc.Add(ctx, sp.Key, sp.EndKey, sp.Timestamp, sp.TxnID)
+		}
+		seg2 := tc.Serialize(ctx, roachpb.KeyMin, roachpb.KeyMax)
+		require.Equal(t, expSeg, seg2)
+
+		// Test serialization over various key ranges.
+		testCases := []struct {
+			name        string
+			key, endKey roachpb.Key
+			expSeg      rspb.Segment
+		}{
+			{
+				name:   "half overlap, before",
+				key:    roachpb.KeyMin,
+				endKey: roachpb.Key("c"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("a"), EndKey: nil, Timestamp: ts1, TxnID: noTxnID},
+						{Key: roachpb.Key("b"), EndKey: nil, Timestamp: ts2, TxnID: noTxnID},
+						{Key: roachpb.Key("b\x00"), EndKey: nil, Timestamp: ts2, TxnID: txnID2},
+						{Key: roachpb.Key("b\x00\x00"), EndKey: roachpb.Key("c"), Timestamp: ts1, TxnID: txnID1},
+					},
+				},
+			},
+			{
+				name:   "half overlap, after",
+				key:    roachpb.Key("c"),
+				endKey: roachpb.Key("g"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("c"), EndKey: roachpb.Key("d"), Timestamp: ts1, TxnID: txnID1},
+						{Key: roachpb.Key("e"), EndKey: nil, Timestamp: ts2, TxnID: txnID1},
+						{Key: roachpb.Key("f"), EndKey: roachpb.Key("g"), Timestamp: ts2, TxnID: txnID2},
+					},
+				},
+			},
+			{
+				name:   "point, non-nil end key",
+				key:    roachpb.Key("b"),
+				endKey: roachpb.Key("b\x00"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("b"), EndKey: nil, Timestamp: ts2, TxnID: noTxnID},
+					},
+				},
+			},
+			{
+				name:   "point, nil end key",
+				key:    roachpb.Key("b"),
+				endKey: nil,
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("b"), EndKey: nil, Timestamp: ts2, TxnID: noTxnID},
+					},
+				},
+			},
+			{
+				name:   "range, start point, non-nil end key",
+				key:    roachpb.Key("f"),
+				endKey: roachpb.Key("f\x00"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("f"), EndKey: roachpb.Key("f\x00"), Timestamp: ts2, TxnID: txnID2},
+					},
+				},
+			},
+			{
+				name:   "range, start point, nil end key",
+				key:    roachpb.Key("f"),
+				endKey: nil,
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("f"), EndKey: roachpb.Key("f\x00"), Timestamp: ts2, TxnID: txnID2},
+					},
+				},
+			},
+			{
+				name:   "range, mid point, non-nil end key",
+				key:    roachpb.Key("g"),
+				endKey: roachpb.Key("g\x00"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("g"), EndKey: roachpb.Key("g\x00"), Timestamp: ts2, TxnID: txnID2},
+					},
+				},
+			},
+			{
+				name:   "range, mid point, nil end key",
+				key:    roachpb.Key("g"),
+				endKey: nil,
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("g"), EndKey: roachpb.Key("g\x00"), Timestamp: ts2, TxnID: txnID2},
+					},
+				},
+			},
+			{
+				name:   "range, contained",
+				key:    roachpb.Key("c"),
+				endKey: roachpb.Key("c2"),
+				expSeg: rspb.Segment{
+					LowWater: lowWater,
+					ReadSpans: []rspb.ReadSpan{
+						{Key: roachpb.Key("c"), EndKey: roachpb.Key("c2"), Timestamp: ts1, TxnID: txnID1},
+					},
+				},
+			},
+			{
+				name:   "empty, before",
+				key:    roachpb.KeyMin,
+				endKey: roachpb.Key("a"),
+				expSeg: rspb.Segment{
+					LowWater:  lowWater,
+					ReadSpans: nil,
+				},
+			},
+			{
+				name:   "empty, after",
+				key:    roachpb.Key("h"),
+				endKey: roachpb.KeyMax,
+				expSeg: rspb.Segment{
+					LowWater:  lowWater,
+					ReadSpans: nil,
+				},
+			},
+		}
+		for _, testCase := range testCases {
+			t.Run(testCase.name, func(t *testing.T) {
+				seg := tc.Serialize(ctx, testCase.key, testCase.endKey)
+				require.Equal(t, testCase.expSeg, seg)
+			})
+		}
+	})
+}
+
+func TestTimestampCacheSerializeRoundTrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	randTs := func() hlc.Timestamp {
+		return hlc.Timestamp{WallTime: int64(rng.Intn(1000))}
+	}
+	randTxnID := func() uuid.UUID {
+		return uuid.FromUint128(uint128.FromInts(0, uint64(rng.Intn(3))))
+	}
+
+	const iters = 10
+	for i := 0; i < iters; i++ {
+		const slots = 10000
+		const maxSpans = 1000
+		spans := make([]rspb.ReadSpan, rng.Intn(maxSpans))
+		padding := make([]byte, 8<<10)
+		for i := range spans {
+			from, _, to := randRange(rng, slots+1)
+			// Pad to create large keys, to test multiple intervalSkl pages.
+			from = append(padding, from...)
+			to = append(padding, to...)
+			// Randomly omit the end key to create point keys.
+			if rng.Intn(2) != 0 || bytes.Equal(from, to) {
+				to = nil
+			}
+			spans[i] = rspb.ReadSpan{
+				Key:       from,
+				EndKey:    to,
+				Timestamp: randTs(),
+				TxnID:     randTxnID(),
+			}
+		}
+		serFrom, _, serTo := randRange(rng, slots+1)
+		if bytes.Equal(serFrom, serTo) {
+			serTo = nil
+		}
+
+		// Preserve the serialized spans for each Cache implementation so we can
+		// compare them for equality.
+		type cacheSeg struct {
+			name string
+			seg  rspb.Segment
+		}
+		var segs []cacheSeg
+
+		forEachCacheImpl(t, func(t *testing.T, tc Cache, _ *hlc.Clock, _ *timeutil.ManualTime) {
+			// Insert spans into the cache.
+			for _, sp := range spans {
+				tc.Add(ctx, sp.Key, sp.EndKey, sp.Timestamp, sp.TxnID)
+			}
+
+			// Serialize the cache.
+			seg := tc.Serialize(ctx, serFrom, serTo)
+			segs = append(segs, cacheSeg{
+				name: fmt.Sprintf("%T", tc),
+				seg:  seg.Clone(),
+			})
+
+			// Clear the cache and re-populate it from the serialized spans.
+			tc.clear(seg.LowWater)
+			for _, sp := range seg.ReadSpans {
+				tc.Add(ctx, sp.Key, sp.EndKey, sp.Timestamp, sp.TxnID)
+			}
+
+			// Before comparing, normalize the ends keys of point keys when testing
+			// the treeImpl. This is necessary because the treeImpl will normalize the
+			// end key of point keys that were in the cache, but not point keys that
+			// were created by truncating read spans to the serialize boundaries. This
+			// is an unimportant implementation detail, so paper over it in testing.
+			if _, ok := tc.(*treeImpl); ok {
+				for i, sp := range seg.ReadSpans {
+					if roachpb.Key(sp.Key).IsPrev(sp.EndKey) {
+						seg.ReadSpans[i].EndKey = nil
+					}
+				}
+			}
+
+			// Serialize the cache again and verify that the serialized spans are
+			// identical.
+			seg2 := tc.Serialize(ctx, serFrom, serTo)
+			require.Equal(t, seg, seg2)
+
+			// Do the same thing, but this time serialize the entire cache without
+			// bounds. This should produce the same result.
+			seg3 := tc.Serialize(ctx, roachpb.KeyMin, roachpb.KeyMax)
+			require.Equal(t, seg, seg3)
+		})
+
+		// Verify that all Cache implementations produce the same serialized spans.
+		// Before doing so, normalize the segments to replace nil end keys and merge
+		// adjacent spans to eliminate any allowed implementation differences.
+		for i := range segs {
+			seg := &segs[i].seg
+			var res []rspb.ReadSpan
+			for _, next := range seg.ReadSpans {
+				if len(next.EndKey) == 0 {
+					next.EndKey = roachpb.Key(next.Key).Next()
+				}
+				if len(res) == 0 {
+					res = append(res, next)
+					continue
+				}
+				last := &res[len(res)-1]
+				if bytes.Equal(last.EndKey, next.Key) && last.Timestamp == next.Timestamp && last.TxnID == next.TxnID {
+					last.EndKey = next.EndKey
+				} else {
+					res = append(res, next)
+				}
+			}
+			seg.ReadSpans = res
+		}
+		for i := 1; i < len(segs); i++ {
+			require.Equal(t, segs[0].seg, segs[i].seg, "%s != %s", segs[0].name, segs[i].name)
+		}
+	}
+}
+
 func BenchmarkTimestampCacheInsertion(b *testing.B) {
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	tc := New(clock)
 
 	for i := 0; i < b.N; i++ {
 		cdTS := clock.Now()
-		tc.Add(roachpb.Key("c"), roachpb.Key("d"), cdTS, noTxnID)
+		tc.Add(ctx, roachpb.Key("c"), roachpb.Key("d"), cdTS, noTxnID)
 
 		beTS := clock.Now()
-		tc.Add(roachpb.Key("b"), roachpb.Key("e"), beTS, noTxnID)
+		tc.Add(ctx, roachpb.Key("b"), roachpb.Key("e"), beTS, noTxnID)
 
 		adTS := clock.Now()
-		tc.Add(roachpb.Key("a"), roachpb.Key("d"), adTS, noTxnID)
+		tc.Add(ctx, roachpb.Key("a"), roachpb.Key("d"), adTS, noTxnID)
 
 		cfTS := clock.Now()
-		tc.Add(roachpb.Key("c"), roachpb.Key("f"), cfTS, noTxnID)
+		tc.Add(ctx, roachpb.Key("c"), roachpb.Key("f"), cfTS, noTxnID)
 	}
 }

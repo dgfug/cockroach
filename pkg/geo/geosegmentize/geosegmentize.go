@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geosegmentize
 
@@ -16,7 +11,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -129,17 +125,18 @@ func Segmentize(
 		}
 		return segGeomCollection, nil
 	}
-	return nil, errors.Newf("unknown type: %T", geometry)
+	return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unknown type: %T", geometry)
 }
 
 // CheckSegmentizeValidNumPoints checks whether segmentize would break down into
 // too many points or NaN points.
 func CheckSegmentizeValidNumPoints(numPoints float64, a geom.Coord, b geom.Coord) error {
 	if math.IsNaN(numPoints) {
-		return errors.Newf("cannot segmentize into %f points", numPoints)
+		return pgerror.Newf(pgcode.InvalidParameterValue, "cannot segmentize into %f points", numPoints)
 	}
 	if numPoints > float64(geo.MaxAllowedSplitPoints) {
-		return errors.Newf(
+		return pgerror.Newf(
+			pgcode.InvalidParameterValue,
 			"attempting to segmentize into too many coordinates; need %s points between %v and %v, max %d",
 			strings.TrimRight(strconv.FormatFloat(numPoints, 'f', -1, 64), "."),
 			a,

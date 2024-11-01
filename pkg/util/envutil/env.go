@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package envutil
 
@@ -19,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -44,10 +38,9 @@ func init() {
 
 func checkVarName(name string) {
 	// Env vars must:
-	//  - start with COCKROACH_
 	//  - be uppercase
 	//  - only contain letters, digits, and _
-	valid := strings.HasPrefix(name, "COCKROACH_")
+	valid := true
 	for i := 0; valid && i < len(name); i++ {
 		c := name[i]
 		valid = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
@@ -57,15 +50,51 @@ func checkVarName(name string) {
 	}
 }
 
-// getEnv retrieves an environment variable, keeps track of where
+func checkInternalVarName(name string) {
+	// Env vars must:
+	//  - start with COCKROACH_
+	//  - pass basic validity checks in checkVarName
+	if !strings.HasPrefix(name, "COCKROACH_") {
+		panic("invalid env var name " + name)
+	}
+	checkVarName(name)
+}
+
+func checkExternalVarName(name string) {
+	// Env vars must:
+	//  - not start with COCKROACH_
+	//  - pass basic validity checks in checkVarName
+	if strings.HasPrefix(name, "COCKROACH_") {
+		panic("invalid env var name " + name)
+	}
+	checkVarName(name)
+}
+
+// getEnv performs all of the same actions as getAndCacheEnv but also includes
+// a validity check of the variable name.
+func getEnv(varName string, depth int) (string, bool) {
+	checkInternalVarName(varName)
+	return getAndCacheEnv(varName, depth+1)
+}
+
+// getExternalEnv performs all of the same actions as getEnv but also asserts
+// that the variable is not of the form of an internal environment variable,
+// eg. "COCKROACH_".
+func getExternalEnv(varName string, depth int) (string, bool) {
+	checkExternalVarName(varName)
+	return getAndCacheEnv(varName, depth+1)
+}
+
+// getAndCacheEnv retrieves an environment variable, keeps track of where
 // it was accessed, and checks that each environment variable is accessed
 // from at most one place.
 // The bookkeeping enables a report of all influential environment
 // variables with "cockroach debug env". To keep this report useful,
 // all relevant environment variables should be read during start up.
-func getEnv(varName string, depth int) (string, bool) {
+// This function should not be used directly; getEnv or getExternalEnv should
+// be used instead.
+func getAndCacheEnv(varName string, depth int) (string, bool) {
 	_, consumer, _, _ := runtime.Caller(depth + 1)
-	checkVarName(varName)
 
 	envVarRegistry.mu.Lock()
 	defer envVarRegistry.mu.Unlock()
@@ -152,10 +181,15 @@ func GetEnvVarsUsed() (result []redact.RedactableString) {
 // the name and the value safely: the value is known to never contain
 // sensitive information.
 var safeVarRegistry = map[redact.SafeString]struct{}{
+	// Go runtime.
 	"GOGC":        {},
 	"GODEBUG":     {},
 	"GOMAXPROCS":  {},
 	"GOTRACEBACK": {},
+	"GOMEMLIMIT":  {},
+	// gRPC.
+	"GRPC_GO_LOG_SEVERITY_LEVEL":  {},
+	"GRPC_GO_LOG_VERBOSITY_LEVEL": {},
 }
 
 // valueReportableUnsafeVarRegistry is the list of variables where we can
@@ -164,20 +198,19 @@ var safeVarRegistry = map[redact.SafeString]struct{}{
 // that users would be unhappy to see them enclosed within redaction
 // markers in log files.
 var valueReportableUnsafeVarRegistry = map[redact.SafeString]struct{}{
-	"DEBUG_HTTP2_GOROUTINES":      {},
-	"GRPC_GO_LOG_SEVERITY_LEVEL":  {},
-	"GRPC_GO_LOG_VERBOSITY_LEVEL": {},
-	"LANG":                        {},
-	"LC_ALL":                      {},
-	"LC_COLLATE":                  {},
-	"LC_CTYPE":                    {},
-	"LC_TIME":                     {},
-	"LC_NUMERIC":                  {},
-	"LC_MESSAGES":                 {},
-	"LS_METRICS_ENABLED":          {},
-	"TERM":                        {},
-	"TZ":                          {},
-	"ZONEINFO":                    {},
+	"DEBUG_HTTP2_GOROUTINES": {},
+	"HOST_IP":                {},
+	"LANG":                   {},
+	"LC_ALL":                 {},
+	"LC_COLLATE":             {},
+	"LC_CTYPE":               {},
+	"LC_TIME":                {},
+	"LC_NUMERIC":             {},
+	"LC_MESSAGES":            {},
+	"LS_METRICS_ENABLED":     {},
+	"TERM":                   {},
+	"TZ":                     {},
+	"ZONEINFO":               {},
 	// From the Go runtime.
 	"LOCALDOMAIN":    {},
 	"RES_OPTIONS":    {},
@@ -223,9 +256,6 @@ var nameReportableUnsafeVarRegistry = map[redact.SafeString]struct{}{
 	"GAE_MODULE_NAME":     {},
 	"GAE_PARTITION":       {},
 	"GAE_SERVICE":         {},
-	// gRPC.
-	"GRPC_GO_LOG_SEVERITY_LEVEL":  {},
-	"GRPC_GO_LOG_VERBOSITY_LEVEL": {},
 	// Kerberos.
 	"KRB5CCNAME": {},
 	// Pprof.
@@ -273,6 +303,16 @@ func EnvString(name string, depth int) (string, bool) {
 	return getEnv(name, depth+1)
 }
 
+// ExternalEnvString returns the value set by the specified environment
+// variable. Only non-CRDB environment variables should be accessed via this
+// method. CRDB specific variables should be accessed via EnvString. The depth
+// argument indicates the stack depth of the caller that should be associated
+// with the variable. The returned boolean flag indicates if the variable is
+// set.
+func ExternalEnvString(name string, depth int) (string, bool) {
+	return getExternalEnv(name, depth+1)
+}
+
 // EnvOrDefaultString returns the value set by the specified
 // environment variable, if any, otherwise the specified default
 // value.
@@ -285,6 +325,19 @@ func EnvOrDefaultString(name string, value string) string {
 
 // EnvOrDefaultBool returns the value set by the specified environment
 // variable, if any, otherwise the specified default value.
+//
+// N.B. EnvOrDefaultBool has the desired side-effect of populating envVarRegistry.cache.
+// It has to be invoked during (var) init; otherwise, cli/start.go:reportConfiguration will not report the
+// value of this environment variable in the server log, upon startup.
+//
+//	Correct Usage: var allowUpgradeToDev = envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
+//
+//	Incorrect Usage: func() {
+//											...
+//											var allowUpgradeToDev envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false)
+//										}
+//
+// N.B. The same rule applies to the remaining EnvOrDefaultXXX defined here.
 func EnvOrDefaultBool(name string, value bool) bool {
 	if str, present := getEnv(name, 1); present {
 		v, err := strconv.ParseBool(str)
@@ -363,9 +416,18 @@ func EnvOrDefaultDuration(name string, value time.Duration) time.Duration {
 	return value
 }
 
+// TB is a slimmed down version of testing.T for use below.
+// We would like to use testutils.TB but this is not possible
+// due to a dependency cycle.
+type TB interface {
+	Fatal(args ...interface{})
+	Helper()
+}
+
 // TestSetEnv sets an environment variable and the cleanup function
 // resets it to the original value.
-func TestSetEnv(t *testing.T, name string, value string) func() {
+func TestSetEnv(t TB, name string, value string) func() {
+	t.Helper()
 	ClearEnvCache()
 	before, exists := os.LookupEnv(name)
 
@@ -381,6 +443,26 @@ func TestSetEnv(t *testing.T, name string, value string) func() {
 			if err := os.Unsetenv(name); err != nil {
 				t.Fatal(err)
 			}
+		}
+		ClearEnvCache()
+	}
+}
+
+// TestUnsetEnv unsets an environment variable and the cleanup function
+// resets it to the original value.
+func TestUnsetEnv(t TB, name string) func() {
+	t.Helper()
+	ClearEnvCache()
+	before, exists := os.LookupEnv(name)
+	if !exists {
+		return func() {}
+	}
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := os.Setenv(name, before); err != nil {
+			t.Fatal(err)
 		}
 		ClearEnvCache()
 	}

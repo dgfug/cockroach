@@ -1,19 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat
 
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // Table is an interface to a database table, exposing only the information
@@ -27,7 +24,7 @@ import (
 // deletes are allowed. Finally, in the delete-only state, only deletes are
 // allowed. Further details about "online schema change" can be found in:
 //
-//   docs/RFCS/20151014_online_schema_change.md
+//	docs/RFCS/20151014_online_schema_change.md
 //
 // Calling code must take care to use the right collection of columns or
 // indexes. Usually this should be the public collections, since most usages are
@@ -40,6 +37,9 @@ type Table interface {
 	// constructs its rows "on the fly" when it's queried. An example is the
 	// information_schema tables.
 	IsVirtualTable() bool
+
+	// IsSystemTable returns true if this table is a special system table.
+	IsSystemTable() bool
 
 	// IsMaterializedView returns true if this table is actually a materialized
 	// view. Materialized views are the same as tables in all aspects, other than
@@ -133,18 +133,75 @@ type Table interface {
 	// Unique returns the ith unique constraint defined on this table, where
 	// i < UniqueCount.
 	Unique(i UniqueOrdinal) UniqueConstraint
+
+	// Zone returns a table's zone.
+	Zone() Zone
+
+	// IsPartitionAllBy returns true if this is a PARTITION ALL BY table. This
+	// includes REGIONAL BY ROW tables.
+	IsPartitionAllBy() bool
+
+	// IsRefreshViewRequired returns true if the table is a materialized view
+	// created with the NO DATA option and is yet to be refreshed. Accessing
+	// such a view prior to running refresh returns an error.
+	IsRefreshViewRequired() bool
+
+	// HomeRegion returns the home region of the table, if any, for example if
+	// a table is defined with LOCALITY REGIONAL BY TABLE.
+	HomeRegion() (region string, ok bool)
+
+	// IsGlobalTable returns true if the table is defined with LOCALITY GLOBAL.
+	IsGlobalTable() bool
+
+	// IsRegionalByRow returns true if the table is defined with LOCALITY REGIONAL
+	// BY ROW.
+	IsRegionalByRow() bool
+
+	// IsMultiregion returns true if the table is a Multiregion table, defined
+	// with one of the LOCALITY clauses.
+	IsMultiregion() bool
+
+	// HomeRegionColName returns the name of the crdb_internal_region column name
+	// specifying the home region of each row in the table, if this table is a
+	// REGIONAL BY ROW TABLE, otherwise "", false is returned.
+	// This column is name `crdb_region` by default, but may be overridden with a
+	// different name in a `REGIONAL BY ROW AS` DDL clause.
+	HomeRegionColName() (colName string, ok bool)
+
+	// GetDatabaseID returns the owning database id of the table, or zero, if the
+	// owning database could not be determined.
+	GetDatabaseID() descpb.ID
+
+	// IsHypothetical returns true if this is a hypothetical table (used when
+	// searching for index recommendations).
+	IsHypothetical() bool
+
+	// TriggerCount returns the number of triggers present on the table.
+	TriggerCount() int
+
+	// Trigger returns the ith trigger, where i < TriggerCount.
+	Trigger(i int) Trigger
 }
 
-// CheckConstraint contains the SQL text and the validity status for a check
-// constraint on a table. Check constraints are user-defined restrictions
-// on the content of each row in a table. For example, this check constraint
-// ensures that only values greater than zero can be inserted into the table:
+// CheckConstraint represents a check constraint on a table. Check constraints
+// are user-defined restrictions on the content of each row in a table. For
+// example, this check constraint ensures that only values greater than zero can
+// be inserted into the table:
 //
-//   CREATE TABLE a (a INT CHECK (a > 0))
-//
-type CheckConstraint struct {
-	Constraint string
-	Validated  bool
+//	CREATE TABLE a (a INT CHECK (a > 0))
+type CheckConstraint interface {
+	// Constraint contains the SQL text of this check constraint.
+	Constraint() string
+
+	// Validated returns true if this check constraint has been validated.
+	Validated() bool
+
+	// ColumnCount returns the number of columns in this constraint.
+	ColumnCount() int
+
+	// ColumnOrdinal returns the table column ordinal of the ith column in this
+	// constraint.
+	ColumnOrdinal(i int) int
 }
 
 // TableStatistic is an interface to a table statistic. Each statistic is
@@ -172,11 +229,35 @@ type TableStatistic interface {
 	// any column in the statistic.
 	NullCount() uint64
 
+	// AvgSize returns the estimated average number of bytes in all columns of
+	// the statistic.
+	AvgSize() uint64
+
 	// Histogram returns a slice of histogram buckets, sorted by UpperBound.
 	// It is only used for single-column stats (i.e., when ColumnCount() = 1),
 	// and it represents the distribution of values for that column.
 	// See HistogramBucket for more details.
 	Histogram() []HistogramBucket
+
+	// HistogramType returns the type that the histogram was created on. For
+	// inverted index histograms, this will always return types.Bytes.
+	HistogramType() *types.T
+
+	// IsPartial returns true if this statistic was collected with a where
+	// clause. (If the where clause was something like "WHERE 1 = 1" or "WHERE
+	// true" this could technically be a full statistic rather than a partial
+	// statistic, but this function does not check for this.)
+	IsPartial() bool
+
+	// IsMerged returns true if this statistic was created by merging a partial
+	// and a full statistic.
+	IsMerged() bool
+
+	// IsForecast returns true if this statistic was created by forecasting.
+	IsForecast() bool
+
+	// IsAuto returns true if this statistic was collected automatically.
+	IsAuto() bool
 }
 
 // HistogramBucket contains the data for a single histogram bucket. Note
@@ -203,7 +284,9 @@ type HistogramBucket struct {
 // ForeignKeyConstraint represents a foreign key constraint. A foreign key
 // constraint has an origin (or referencing) side and a referenced side. For
 // example:
-//   ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (a,b) REFERENCES r(a,b)
+//
+//	ALTER TABLE o ADD CONSTRAINT fk FOREIGN KEY (a,b) REFERENCES r(a,b)
+//
 // Here o is the origin table, r is the referenced table, and we have two pairs
 // of columns: (o.a,r.a) and (o.b,r.b).
 type ForeignKeyConstraint interface {
@@ -251,7 +334,9 @@ type ForeignKeyConstraint interface {
 // UniqueConstraint represents a uniqueness constraint. UniqueConstraints may
 // or may not be enforced with a unique index. For example, the following
 // statement creates a unique constraint on column a without a unique index:
-//   ALTER TABLE t ADD CONSTRAINT u UNIQUE WITHOUT INDEX (a);
+//
+//	ALTER TABLE t ADD CONSTRAINT u UNIQUE WITHOUT INDEX (a);
+//
 // In order to enforce this uniqueness constraint, the optimizer must add
 // a uniqueness check as a postquery to any query that inserts into or updates
 // column a.
@@ -278,12 +363,23 @@ type UniqueConstraint interface {
 	// WithoutIndex is true if this unique constraint is not enforced by an index.
 	WithoutIndex() bool
 
+	// CanUseTombstones is true if this unique constraint can be enforced by
+	// writing tombstones to all partitions.
+	CanUseTombstones() bool
+
 	// Validated is true if the constraint is validated (i.e. we know that the
 	// existing data satisfies the constraint). It is possible to set up a unique
 	// constraint on existing tables without validating it, in which case we
 	// cannot make any assumptions about the data. An unvalidated constraint still
 	// needs to be enforced on new mutations.
 	Validated() bool
+
+	// UniquenessGuaranteedByAnotherIndex returns true when WithoutIndex() returns
+	// true and the uniqueness of the constraint is guaranteed by another index.
+	// When true, the optimizer will always consider the constraint to be
+	// satisfied when building functional dependencies for the table. This enables
+	// additional optimizations, such as omission of uniqueness checks.
+	UniquenessGuaranteedByAnotherIndex() bool
 }
 
 // UniqueOrdinal identifies a unique constraint (in the context of a Table).

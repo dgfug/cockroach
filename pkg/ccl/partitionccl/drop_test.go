@@ -1,10 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package partitionccl
 
@@ -17,9 +14,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -51,18 +48,22 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 
 	asyncNotification := make(chan struct{})
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
+	params.DefaultTestTenant = base.TODOTestTenantDisabled
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
 			RunBeforeResume: func(_ jobspb.JobID) error {
 				<-asyncNotification
 				return nil
 			},
+			SkipWaitingForMVCCGC: true,
 		},
 	}
-	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	srv, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
-	defer s.Stopper().Stop(context.Background())
 
 	// Create a test table with a partitioned secondary index.
 	if err := tests.CreateKVTable(sqlDBRaw, "kv", numRows); err != nil {
@@ -72,12 +73,13 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		PARTITION p1 VALUES IN (1),
 		PARTITION p2 VALUES IN (2)
 	)`)
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	index, err := tableDesc.FindIndexWithName("i")
+	codec := s.Codec()
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
+	index, err := catalog.MustFindIndexByName(tableDesc, "i")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
+	indexSpan := tableDesc.IndexSpan(codec, index.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Set zone configs on the primary index, secondary index, and one partition
@@ -104,8 +106,8 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		partition string
 	}{
 		{1, ""},
-		{3, ""},
-		{3, "p2"},
+		{4, ""},
+		{4, "p2"},
 	}
 	for _, target := range subzones {
 		if exists := subzoneExists(cfg, target.index, target.partition); !exists {
@@ -119,8 +121,8 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 			t.Fatalf(`zone config for %s still exists`, target)
 		}
 	}
-	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	if _, err := tableDesc.FindIndexWithName("i"); err == nil {
+	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
+	if catalog.FindIndexByName(tableDesc, "i") != nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	close(asyncNotification)
@@ -157,7 +159,7 @@ func TestDropIndexPartitionedByUserDefinedTypeCCL(t *testing.T) {
 		t.Helper()
 		var id int
 		tdb.QueryRow(t, `
-SELECT job_id 
+SELECT job_id
   FROM crdb_internal.jobs
  WHERE description LIKE $1
 `, description).Scan(&id)
@@ -172,6 +174,12 @@ SELECT job_id
 			}
 			return nil
 		})
+	}
+
+	knobs := base.TestingKnobs{
+		GCJob: &sql.GCJobTestingKnobs{
+			SkipWaitingForMVCCGC: true,
+		},
 	}
 
 	// This is a regression test for a bug which was caused by not using hydrated
@@ -191,23 +199,28 @@ SELECT job_id
 
 		defer log.Scope(t).Close(t)
 		ctx := context.Background()
-		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				Knobs:             knobs,
+			},
+		})
 		defer tc.Stopper().Stop(ctx)
 
 		tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 
+		tdb.Exec(t, `CREATE TYPE typ AS ENUM ('a', 'b', 'c')`)
 		tdb.Exec(t, `
-	  CREATE TYPE typ AS ENUM ('a', 'b', 'c');
-	  CREATE TABLE t (e typ PRIMARY KEY) PARTITION BY LIST (e) (
+    CREATE TABLE t (e typ PRIMARY KEY) PARTITION BY LIST (e) (
 	              PARTITION a VALUES IN ('a'),
 	              PARTITION b VALUES IN ('b'),
 	              PARTITION c VALUES IN ('c')
-	  );
-	  CREATE INDEX idx ON t (e);
-	  ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, range_max_bytes = 654321;
-	  ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1;
-	  DROP INDEX t@idx;
-	  `)
+	  )`)
+		tdb.Exec(t, `CREATE INDEX idx ON t (e)`)
+		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, 
+range_max_bytes = 654321000`)
+		tdb.Exec(t, `ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1`)
+		tdb.Exec(t, `DROP INDEX t@idx`)
 
 		waitForJobDone(t, tdb, "GC for DROP INDEX%idx")
 	})
@@ -232,33 +245,41 @@ SELECT job_id
 
 		defer log.Scope(t).Close(t)
 		ctx := context.Background()
-		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				Knobs:             knobs,
+			},
+		})
 		defer tc.Stopper().Stop(ctx)
 
 		tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 
+		tdb.Exec(t, `CREATE TYPE typ AS ENUM ('a', 'b', 'c')`)
 		tdb.Exec(t, `
-	  CREATE TYPE typ AS ENUM ('a', 'b', 'c');
-	  CREATE TABLE t (e typ PRIMARY KEY) PARTITION BY LIST (e) (
+    CREATE TABLE t (e typ PRIMARY KEY) PARTITION BY LIST (e) (
 	              PARTITION a VALUES IN ('a'),
 	              PARTITION b VALUES IN ('b'),
 	              PARTITION c VALUES IN ('c')
-	  );
-	  CREATE INDEX idx
+	  )`)
+		tdb.Exec(t, `
+    CREATE INDEX idx
 	      ON t (e)
 	      PARTITION BY LIST (e)
 	          (
 	              PARTITION ai VALUES IN ('a'),
 	              PARTITION bi VALUES IN ('b'),
 	              PARTITION ci VALUES IN ('c')
-	          );
-	  ALTER PARTITION ai OF INDEX t@idx CONFIGURE ZONE USING range_min_bytes = 123456, range_max_bytes = 654321;
-	  ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, range_max_bytes = 654321;
-	  ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1;
-	  DROP INDEX t@idx;
-	  DROP TABLE t;
-	  DROP TYPE typ;
-	  `)
+	          )`,
+		)
+		tdb.Exec(t, `ALTER PARTITION ai OF INDEX t@idx CONFIGURE ZONE USING range_min_bytes = 123456,
+range_max_bytes = 654321000`)
+		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, 
+range_max_bytes = 654321000`)
+		tdb.Exec(t, `ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1`)
+		tdb.Exec(t, `DROP INDEX t@idx`)
+		tdb.Exec(t, `DROP TABLE t`)
+		tdb.Exec(t, `DROP TYPE typ`)
 
 		waitForJobDone(t, tdb, "GC for DROP INDEX%idx")
 		tdb.Exec(t, `ALTER RANGE default CONFIGURE ZONE USING gc.ttlseconds = 1`)

@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvfeed
 
@@ -12,8 +9,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/timers"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -22,31 +21,44 @@ import (
 // physicalFeedFactory constructs a physical feed which writes into sink and
 // runs until the group's context expires.
 type physicalFeedFactory interface {
-	Run(ctx context.Context, sink kvevent.Writer, cfg physicalConfig) error
+	Run(ctx context.Context, sink kvevent.Writer, cfg rangeFeedConfig) error
 }
 
-type physicalConfig struct {
-	Spans     []roachpb.Span
-	Timestamp hlc.Timestamp
-	WithDiff  bool
-	Knobs     TestingKnobs
+// rangeFeedConfig contains configuration options for creating a rangefeed.
+// It provides an abstraction over the actual rangefeed API.
+type rangeFeedConfig struct {
+	Frontier      hlc.Timestamp
+	Spans         []kvcoord.SpanTimePair
+	WithDiff      bool
+	WithFiltering bool
+	RangeObserver kvcoord.RangeObserver
+	Knobs         TestingKnobs
+	Timers        *timers.ScopedTimers
 }
 
+// rangefeedFactory is a function that creates and runs a rangefeed.
 type rangefeedFactory func(
 	ctx context.Context,
-	span roachpb.Span,
-	startFrom hlc.Timestamp,
-	withDiff bool,
-	eventC chan<- *roachpb.RangeFeedEvent,
+	spans []kvcoord.SpanTimePair,
+	eventCh chan<- kvcoord.RangeFeedMessage,
+	opts ...kvcoord.RangeFeedOption,
 ) error
 
+// rangefeed tracks a running rangefeed and facilitates conversion from
+// kvcoord.RangeFeedMessage's to kvevent.Event's.
 type rangefeed struct {
+	// memBuf is the buffer that converted kvevent.Event's will be written to.
 	memBuf kvevent.Writer
-	cfg    physicalConfig
-	eventC chan *roachpb.RangeFeedEvent
+	cfg    rangeFeedConfig
+	// eventCh is a receive-only channel corresponding to the send-only channel
+	// that the rangefeed uses to send event messages to.
+	eventCh <-chan kvcoord.RangeFeedMessage
+	knobs   TestingKnobs
+	st      *timers.ScopedTimers
 }
 
-func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg physicalConfig) error {
+// Run implements the physicalFeedFactory interface.
+func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg rangeFeedConfig) error {
 	// To avoid blocking raft, RangeFeed puts all entries in a server side
 	// buffer. But to keep things simple, it's a small fixed-sized buffer. This
 	// means we need to ingest everything we get back as quickly as possible, so
@@ -64,53 +76,98 @@ func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg phys
 	// `SchemaFeed` is responsible for detecting and enforcing these , but the
 	// after-KVFeed buffer doesn't have access to any of this state. A cleanup is
 	// in order.
+	eventCh := make(chan kvcoord.RangeFeedMessage, 128)
 	feed := rangefeed{
-		memBuf: sink,
-		cfg:    cfg,
-		eventC: make(chan *roachpb.RangeFeedEvent, 128),
+		memBuf:  sink,
+		cfg:     cfg,
+		eventCh: eventCh,
+		knobs:   cfg.Knobs,
+		st:      cfg.Timers,
 	}
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(feed.addEventsToBuffer)
-	for _, span := range cfg.Spans {
-		span := span
-		g.GoCtx(func(ctx context.Context) error {
-			return p(ctx, span, cfg.Timestamp, cfg.WithDiff, feed.eventC)
-		})
+	var rfOpts []kvcoord.RangeFeedOption
+	if cfg.WithDiff {
+		rfOpts = append(rfOpts, kvcoord.WithDiff())
 	}
+	if cfg.WithFiltering {
+		rfOpts = append(rfOpts, kvcoord.WithFiltering())
+	}
+	if cfg.RangeObserver != nil {
+		rfOpts = append(rfOpts, kvcoord.WithRangeObserver(cfg.RangeObserver))
+	}
+	if len(cfg.Knobs.RangefeedOptions) != 0 {
+		rfOpts = append(rfOpts, cfg.Knobs.RangefeedOptions...)
+	}
+
+	g.GoCtx(func(ctx context.Context) error {
+		return p(ctx, cfg.Spans, eventCh, rfOpts...)
+	})
 	return g.Wait()
 }
 
+// addEventsToBuffer consumes rangefeed events from `p.eventCh`, transforms
+// them to kvevent.Event's, and pushes them into `p.memBuf`.
 func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
-	var backfillTimestamp hlc.Timestamp
 	for {
 		select {
-		case e := <-p.eventC:
+		case e := <-p.eventCh:
 			switch t := e.GetValue().(type) {
-			case *roachpb.RangeFeedValue:
-				kv := roachpb.KeyValue{Key: t.Key, Value: t.Value}
-				var prevVal roachpb.Value
-				if p.cfg.WithDiff {
-					prevVal = t.PrevValue
+			case *kvpb.RangeFeedValue:
+				if p.cfg.Knobs.OnRangeFeedValue != nil {
+					if err := p.cfg.Knobs.OnRangeFeedValue(); err != nil {
+						return err
+					}
 				}
+				stop := p.st.RangefeedBufferValue.Start()
 				if err := p.memBuf.Add(
-					ctx,
-					kvevent.MakeKVEvent(kv, prevVal, backfillTimestamp),
+					ctx, kvevent.MakeKVEvent(e.RangeFeedEvent),
 				); err != nil {
 					return err
 				}
-			case *roachpb.RangeFeedCheckpoint:
-				if !t.ResolvedTS.IsEmpty() && t.ResolvedTS.Less(p.cfg.Timestamp) {
+				stop()
+			case *kvpb.RangeFeedCheckpoint:
+				if !t.ResolvedTS.IsEmpty() && t.ResolvedTS.Less(p.cfg.Frontier) {
 					// RangeFeed happily forwards any closed timestamps it receives as
 					// soon as there are no outstanding intents under them.
 					// Changefeeds don't care about these at all, so throw them out.
 					continue
 				}
+				if p.knobs.ShouldSkipCheckpoint != nil && p.knobs.ShouldSkipCheckpoint(t) {
+					continue
+				}
+				stop := p.st.RangefeedBufferCheckpoint.Start()
 				if err := p.memBuf.Add(
-					ctx,
-					kvevent.MakeResolvedEvent(t.Span, t.ResolvedTS, jobspb.ResolvedSpan_NONE),
+					ctx, kvevent.MakeResolvedEvent(e.RangeFeedEvent, jobspb.ResolvedSpan_NONE),
 				); err != nil {
 					return err
 				}
+				stop()
+			case *kvpb.RangeFeedSSTable:
+				// For now, we just error on SST ingestion, since we currently don't
+				// expect SST ingestion into spans with active changefeeds.
+				return errors.Errorf("unexpected SST ingestion: %v", t)
+
+			case *kvpb.RangeFeedDeleteRange:
+				// For now, we just ignore on MVCC range tombstones. These are currently
+				// only expected to be used by schema GC and IMPORT INTO, and such spans
+				// should not have active changefeeds across them, at least at the times
+				// of interest. A case where one will show up in a changefeed is when
+				// the primary index changes while we're watching it and then the old
+				// primary index is dropped. In this case, we'll get a schema event to
+				// restart into the new primary index, but the DeleteRange may come
+				// through before the schema event.
+				//
+				// TODO(erikgrinaker): Write an end-to-end test which verifies that an
+				// IMPORT INTO which gets rolled back using MVCC range tombstones will
+				// not be visible to a changefeed, neither when it was started before
+				// the import or when resuming from a timestamp before the import. The
+				// table decriptor should be marked as offline during the import, and
+				// catchup scans should detect that this happened and prevent reading
+				// anything in that timespan. See:
+				// https://github.com/cockroachdb/cockroach/issues/70433
+				continue
+
 			default:
 				return errors.Errorf("unexpected RangeFeedEvent variant %v", t)
 			}

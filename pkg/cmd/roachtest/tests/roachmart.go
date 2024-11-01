@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -15,16 +10,18 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 func registerRoachmart(r registry.Registry) {
 	runRoachmart := func(ctx context.Context, t test.Test, c cluster.Cluster, partition bool) {
-		c.Put(ctx, t.Cockroach(), "./cockroach")
+		// This test expects the workload binary on all nodes.
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-		c.Start(ctx)
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 		// TODO(benesch): avoid hardcoding this list.
 		nodes := []struct {
@@ -44,12 +41,14 @@ func registerRoachmart(r registry.Registry) {
 				"--orders=100",
 				fmt.Sprintf("--partition=%v", partition))
 
-			if err := c.RunE(ctx, c.Node(nodes[i].i), args...); err != nil {
+			if err := c.RunE(ctx, option.WithNodes(c.Node(nodes[i].i)), args...); err != nil {
 				t.Fatal(err)
 			}
 		}
 		t.Status("initializing workload")
-		roachmartRun(ctx, 0, "./workload", "init", "roachmart")
+
+		// See https://github.com/cockroachdb/cockroach/issues/94062 for the --data-loader.
+		roachmartRun(ctx, 0, "./workload", "init", "roachmart", "--data-loader=INSERT", "{pgurl:1}")
 
 		duration := " --duration=" + ifLocal(c, "10s", "10m")
 
@@ -58,7 +57,7 @@ func registerRoachmart(r registry.Registry) {
 		for i := range nodes {
 			i := i
 			m.Go(func(ctx context.Context) error {
-				roachmartRun(ctx, i, "./workload", "run", "roachmart", duration)
+				roachmartRun(ctx, i, "./workload", "run", "roachmart", duration, fmt.Sprintf("{pgurl%s}", c.Node(i+1)))
 				return nil
 			})
 		}
@@ -69,9 +68,13 @@ func registerRoachmart(r registry.Registry) {
 	for _, v := range []bool{true, false} {
 		v := v
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("roachmart/partition=%v", v),
-			Owner:   registry.OwnerKV,
-			Cluster: r.MakeClusterSpec(9, spec.Geo(), spec.Zones("us-central1-b,us-west1-b,europe-west2-b")),
+			Name:                       fmt.Sprintf("roachmart/partition=%v", v),
+			Owner:                      registry.OwnerKV,
+			Cluster:                    r.MakeClusterSpec(9, spec.Geo(), spec.GCEZones("us-central1-b,us-west1-b,europe-west2-b")),
+			CompatibleClouds:           registry.OnlyGCE,
+			Suites:                     registry.Suites(registry.Nightly),
+			Leases:                     registry.MetamorphicLeases,
+			RequiresDeprecatedWorkload: true, // uses roachmart
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runRoachmart(ctx, t, c, v)
 			},

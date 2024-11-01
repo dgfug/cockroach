@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -19,12 +14,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -97,7 +93,7 @@ type StmtBuf struct {
 		cond *sync.Cond
 
 		// data contains the elements of the buffer.
-		data ring.Buffer // []Command
+		data ring.Buffer[Command]
 
 		// startPos indicates the index of the first command currently in data
 		// relative to the start of the connection.
@@ -110,6 +106,10 @@ type StmtBuf struct {
 		// the buffer.
 		lastPos CmdPos
 	}
+
+	// PipelineCount, if non-nil, is a gauge that measures how many commands are
+	// in all client-facing StmtBuf instances.
+	PipelineCount *metric.Gauge
 }
 
 // Command is an interface implemented by all commands pushed by pgwire into the
@@ -119,6 +119,9 @@ type Command interface {
 	// command returns a string representation of the command type (e.g.
 	// "prepare stmt", "exec stmt").
 	command() string
+	// isExtendedProtocolCmd says whether the command is only send as part of the
+	// pgwire extended protocol.
+	isExtendedProtocolCmd() bool
 }
 
 // ExecStmt is the command for running a query sent through the "simple" pgwire
@@ -127,7 +130,7 @@ type ExecStmt struct {
 	// Information returned from parsing: AST, SQL, NumPlaceholders.
 	// Note that AST can be nil, in which case executing it should produce an
 	// "empty query response" message.
-	parser.Statement
+	statements.Statement[tree.Statement]
 
 	// TimeReceived is the time at which the exec message was received
 	// from the client. Used to compute the service latency.
@@ -136,10 +139,26 @@ type ExecStmt struct {
 	// stats reporting.
 	ParseStart time.Time
 	ParseEnd   time.Time
+
+	// LastInBatch indicates if this command contains the last query in a
+	// simple protocol Query message that contains a batch of 1 or more queries.
+	LastInBatch bool
+	// LastInBatchBeforeShowCommitTimestamp indicates that this command contains
+	// the second-to-last query in a simple protocol Query message that contains
+	// a batch of 2 or more queries and the last query is SHOW COMMIT TIMESTAMP.
+	// Detecting this case allows us to treat this command as the LastInBatch
+	// such that the SHOW COMMIT TIMESTAMP statement can return the timestamp of
+	// the transaction which applied to all the other statements in the batch.
+	// Note that SHOW COMMIT TIMESTAMP is not permitted in any other position in
+	// such a multi-statement implicit transaction.
+	LastInBatchBeforeShowCommitTimestamp bool
 }
 
 // command implements the Command interface.
 func (ExecStmt) command() string { return "exec stmt" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e ExecStmt) isExtendedProtocolCmd() bool { return false }
 
 func (e ExecStmt) String() string {
 	// We have the original SQL, but we still use String() because it obfuscates
@@ -163,10 +182,16 @@ type ExecPortal struct {
 	// TimeReceived is the time at which the exec message was received
 	// from the client. Used to compute the service latency.
 	TimeReceived time.Time
+	// FollowedBySync is true if the next command after this is a Sync. This is
+	// used to enable the 1PC txn fast path in the extended protocol.
+	FollowedBySync bool
 }
 
 // command implements the Command interface.
 func (ExecPortal) command() string { return "exec portal" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e ExecPortal) isExtendedProtocolCmd() bool { return true }
 
 func (e ExecPortal) String() string {
 	return fmt.Sprintf("ExecPortal name: %q", e.Name)
@@ -182,7 +207,7 @@ type PrepareStmt struct {
 	// Information returned from parsing: AST, SQL, NumPlaceholders.
 	// Note that AST can be nil, in which case executing it should produce an
 	// "empty query response" message.
-	parser.Statement
+	statements.Statement[tree.Statement]
 
 	TypeHints tree.PlaceholderTypes
 	// RawTypeHints is the representation of type hints exactly as specified by
@@ -194,6 +219,9 @@ type PrepareStmt struct {
 
 // command implements the Command interface.
 func (PrepareStmt) command() string { return "prepare stmt" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e PrepareStmt) isExtendedProtocolCmd() bool { return true }
 
 func (p PrepareStmt) String() string {
 	// We have the original SQL, but we still use String() because it obfuscates
@@ -211,12 +239,15 @@ var _ Command = PrepareStmt{}
 // DescribeStmt is the Command for producing info about a prepared statement or
 // portal.
 type DescribeStmt struct {
-	Name string
+	Name tree.Name
 	Type pgwirebase.PrepareType
 }
 
 // command implements the Command interface.
 func (DescribeStmt) command() string { return "describe stmt" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e DescribeStmt) isExtendedProtocolCmd() bool { return true }
 
 func (d DescribeStmt) String() string {
 	return fmt.Sprintf("Describe: %q", d.Name)
@@ -258,6 +289,9 @@ type BindStmt struct {
 // command implements the Command interface.
 func (BindStmt) command() string { return "bind stmt" }
 
+// isExtendedProtocolCmd implements the Command interface.
+func (e BindStmt) isExtendedProtocolCmd() bool { return true }
+
 func (b BindStmt) String() string {
 	return fmt.Sprintf("BindStmt: %q->%q", b.PreparedStatementName, b.PortalName)
 }
@@ -272,6 +306,9 @@ type DeletePreparedStmt struct {
 
 // command implements the Command interface.
 func (DeletePreparedStmt) command() string { return "delete stmt" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e DeletePreparedStmt) isExtendedProtocolCmd() bool { return false }
 
 func (d DeletePreparedStmt) String() string {
 	return fmt.Sprintf("DeletePreparedStmt: %q", d.Name)
@@ -288,10 +325,18 @@ var _ Command = DeletePreparedStmt{}
 // protocol variants. So, it doesn't strictly correspond to a pgwire sync
 // message - those are not sent in the simple protocol. We synthesize Sync
 // commands though because their handling matches the simple protocol too.
-type Sync struct{}
+type Sync struct {
+	// ExplicitFromClient specifies whether this Sync command was generated by the
+	// client during the extended protocol, or implicitly created to handle a
+	// simple protocol query.
+	ExplicitFromClient bool
+}
 
 // command implements the Command interface.
 func (Sync) command() string { return "sync" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e Sync) isExtendedProtocolCmd() bool { return false }
 
 func (Sync) String() string {
 	return "Sync"
@@ -306,6 +351,9 @@ type Flush struct{}
 // command implements the Command interface.
 func (Flush) command() string { return "flush" }
 
+// isExtendedProtocolCmd implements the Command interface.
+func (e Flush) isExtendedProtocolCmd() bool { return false }
+
 func (Flush) String() string {
 	return "Flush"
 }
@@ -314,23 +362,72 @@ var _ Command = Flush{}
 
 // CopyIn is the command for execution of the Copy-in pgwire subprotocol.
 type CopyIn struct {
-	Stmt *tree.CopyFrom
+	ParsedStmt statements.Statement[tree.Statement]
+	Stmt       *tree.CopyFrom
 	// Conn is the network connection. Execution of the CopyFrom statement takes
 	// control of the connection.
 	Conn pgwirebase.Conn
-	// CopyDone is decremented once execution finishes, signaling that control of
-	// the connection is being handed back to the network routine.
-	CopyDone *sync.WaitGroup
+	// CopyDone is used to signal that control of the connection is being handed
+	// back to the network routine.
+	CopyDone struct {
+		// WaitGroup is decremented once execution finishes.
+		*sync.WaitGroup
+		// Once is used to decrement the WaitGroup exactly once.
+		*sync.Once
+	}
+	// TimeReceived is the time at which the message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
 }
 
 // command implements the Command interface.
 func (CopyIn) command() string { return "copy" }
 
-func (CopyIn) String() string {
-	return "CopyIn"
+// isExtendedProtocolCmd implements the Command interface.
+func (e CopyIn) isExtendedProtocolCmd() bool { return false }
+
+func (c CopyIn) String() string {
+	s := "(empty)"
+	if c.Stmt != nil {
+		s = c.Stmt.String()
+	}
+	return fmt.Sprintf("CopyIn: %s", s)
 }
 
 var _ Command = CopyIn{}
+
+// CopyOut is the command for execution of the Copy-out pgwire subprotocol.
+type CopyOut struct {
+	ParsedStmt statements.Statement[tree.Statement]
+	Stmt       *tree.CopyTo
+	// TimeReceived is the time at which the message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
+}
+
+// command implements the Command interface.
+func (CopyOut) command() string { return "copy" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e CopyOut) isExtendedProtocolCmd() bool { return false }
+
+func (c CopyOut) String() string {
+	s := "(empty)"
+	if c.Stmt != nil {
+		s = c.Stmt.String()
+	}
+	return fmt.Sprintf("CopyOut: %s", s)
+}
+
+var _ Command = CopyOut{}
 
 // DrainRequest represents a notice that the server is draining and command
 // processing should stop soon.
@@ -340,6 +437,9 @@ type DrainRequest struct{}
 
 // command implements the Command interface.
 func (DrainRequest) command() string { return "drain" }
+
+// isExtendedProtocolCmd implements the Command interface.
+func (e DrainRequest) isExtendedProtocolCmd() bool { return false }
 
 func (DrainRequest) String() string {
 	return "Drain"
@@ -358,6 +458,9 @@ type SendError struct {
 // command implements the Command interface.
 func (SendError) command() string { return "send error" }
 
+// isExtendedProtocolCmd implements the Command interface.
+func (e SendError) isExtendedProtocolCmd() bool { return false }
+
 func (s SendError) String() string {
 	return fmt.Sprintf("SendError: %s", s.Err)
 }
@@ -365,9 +468,14 @@ func (s SendError) String() string {
 var _ Command = SendError{}
 
 // NewStmtBuf creates a StmtBuf.
-func NewStmtBuf() *StmtBuf {
+// - toReserve, if positive, indicates the initial capacity of the command
+// buffer.
+func NewStmtBuf(toReserve int) *StmtBuf {
 	var buf StmtBuf
 	buf.Init()
+	if toReserve > 0 {
+		buf.mu.data.Reserve(toReserve)
+	}
 	return &buf
 }
 
@@ -386,9 +494,9 @@ func (buf *StmtBuf) Init() {
 // Close() is idempotent.
 func (buf *StmtBuf) Close() {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	buf.mu.closed = true
 	buf.mu.cond.Signal()
-	buf.mu.Unlock()
 }
 
 // Push adds a Command to the end of the buffer. If a CurCmd() call was blocked
@@ -403,6 +511,9 @@ func (buf *StmtBuf) Push(ctx context.Context, cmd Command) error {
 	}
 	buf.mu.data.AddLast(cmd)
 	buf.mu.lastPos++
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Inc(1)
+	}
 
 	buf.mu.cond.Signal()
 	return nil
@@ -431,7 +542,7 @@ func (buf *StmtBuf) CurCmd() (Command, CmdPos, error) {
 		}
 		len := buf.mu.data.Len()
 		if cmdIdx < len {
-			return buf.mu.data.Get(cmdIdx).(Command), curPos, nil
+			return buf.mu.data.Get(cmdIdx), curPos, nil
 		}
 		if cmdIdx != len {
 			return nil, 0, errors.AssertionFailedf(
@@ -487,9 +598,12 @@ func (buf *StmtBuf) Ltrim(ctx context.Context, pos CmdPos) {
 // yet. The previous CmdPos is returned.
 func (buf *StmtBuf) AdvanceOne() CmdPos {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	prev := buf.mu.curPos
 	buf.mu.curPos++
-	buf.mu.Unlock()
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Dec(1)
+	}
 	return prev
 }
 
@@ -500,23 +614,31 @@ func (buf *StmtBuf) AdvanceOne() CmdPos {
 // a Sync command. If the cursor is positioned on a Sync when this is called,
 // that Sync will be skipped.
 //
+// If requireClientSync is true, then the Sync message must be from the client,
+// and the implicit Sync that is sent after simple queries is also ignored. This
+// flag is set if the error occurred during any extended protocol message
+// (PrepareStmt, DescribeStmt, BindStmt, or ExecPortal)
+//
 // This method blocks until a Sync command is pushed to the buffer.
 //
 // It is an error to start seeking when the cursor is positioned on an empty
 // slot.
-func (buf *StmtBuf) seekToNextBatch() error {
-	buf.mu.Lock()
-	curPos := buf.mu.curPos
-	cmdIdx, err := buf.translatePosLocked(curPos)
-	if err != nil {
-		buf.mu.Unlock()
+func (buf *StmtBuf) seekToNextBatch(requireClientSync bool) error {
+	if err := func() error {
+		buf.mu.Lock()
+		defer buf.mu.Unlock()
+		curPos := buf.mu.curPos
+		cmdIdx, err := buf.translatePosLocked(curPos)
+		if err != nil {
+			return err
+		}
+		if cmdIdx == buf.mu.data.Len() {
+			return errors.AssertionFailedf("invalid seek start point")
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
-	if cmdIdx == buf.mu.data.Len() {
-		buf.mu.Unlock()
-		return errors.AssertionFailedf("invalid seek start point")
-	}
-	buf.mu.Unlock()
 
 	var foundSync bool
 	for !foundSync {
@@ -525,18 +647,28 @@ func (buf *StmtBuf) seekToNextBatch() error {
 		if err != nil {
 			return err
 		}
-		buf.mu.Lock()
-		cmdIdx, err := buf.translatePosLocked(pos)
-		if err != nil {
-			buf.mu.Unlock()
+		if err := func() error {
+			buf.mu.Lock()
+			defer buf.mu.Unlock()
+			cmdIdx, err := buf.translatePosLocked(pos)
+			if err != nil {
+				return err
+			}
+
+			if syncCmd, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
+				if requireClientSync && syncCmd.ExplicitFromClient {
+					// If we're looking for a client sync, then we need to check
+					// that the Sync command explicitly came from the client.
+					foundSync = true
+				} else if !requireClientSync {
+					// Otherwise, any kind of Sync command will do.
+					foundSync = true
+				}
+			}
+			return nil
+		}(); err != nil {
 			return err
 		}
-
-		if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
-			foundSync = true
-		}
-
-		buf.mu.Unlock()
 	}
 	return nil
 }
@@ -547,6 +679,9 @@ func (buf *StmtBuf) Rewind(ctx context.Context, pos CmdPos) {
 	defer buf.mu.Unlock()
 	if pos < buf.mu.startPos {
 		log.Fatalf(ctx, "attempting to rewind below buffer start")
+	}
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Inc(int64(buf.mu.curPos - pos))
 	}
 	buf.mu.curPos = pos
 }
@@ -574,7 +709,7 @@ const (
 //
 // ClientComm is implemented by the pgwire connection.
 type ClientComm interface {
-	// createStatementResult creates a StatementResult for stmt.
+	// CreateStatementResult creates a StatementResult for stmt.
 	//
 	// descOpt specifies if result needs to inform the client about row schema. If
 	// it doesn't, a SetColumns call becomes a no-op.
@@ -597,6 +732,7 @@ type ClientComm interface {
 		limit int,
 		portalName string,
 		implicitTxn bool,
+		portalPausability PortalPausablity,
 	) CommandResult
 	// CreatePrepareResult creates a result for a PrepareStmt command.
 	CreatePrepareResult(pos CmdPos) ParseResult
@@ -616,11 +752,13 @@ type ClientComm interface {
 	// CreateEmptyQueryResult creates a result for an empty-string query.
 	CreateEmptyQueryResult(pos CmdPos) EmptyQueryResult
 	// CreateCopyInResult creates a result for a Copy-in command.
-	CreateCopyInResult(pos CmdPos) CopyInResult
+	CreateCopyInResult(cmd CopyIn, pos CmdPos) CopyInResult
+	// CreateCopyOutResult creates a result for a Copy-out command.
+	CreateCopyOutResult(cmd CopyOut, pos CmdPos) CopyOutResult
 	// CreateDrainResult creates a result for a Drain command.
 	CreateDrainResult(pos CmdPos) DrainResult
 
-	// lockCommunication ensures that no further results are delivered to the
+	// LockCommunication ensures that no further results are delivered to the
 	// client. The returned ClientLock can be queried to see what results have
 	// been already delivered to the client and to discard results that haven't
 	// been delivered.
@@ -699,6 +837,9 @@ type RestrictedCommandResult interface {
 	// This gets flushed only when the CommandResult is closed.
 	BufferNotice(notice pgnotice.Notice)
 
+	// SendNotice immediately flushes a notice to the client.
+	SendNotice(ctx context.Context, notice pgnotice.Notice) error
+
 	// SetColumns informs the client about the schema of the result. The columns
 	// can be nil.
 	//
@@ -709,6 +850,10 @@ type RestrictedCommandResult interface {
 	// result, from the original one set when the result was created trough
 	// ClientComm.createStatementResult.
 	ResetStmtType(stmt tree.Statement)
+
+	// GetFormatCode returns the format code that will be used to serialize the
+	// data in the provided column when sending messages to the client.
+	GetFormatCode(colIdx int) (pgwirebase.FormatCode, error)
 
 	// AddRow accumulates a result row.
 	//
@@ -728,12 +873,20 @@ type RestrictedCommandResult interface {
 	// AddBatch is undefined.
 	SupportsAddBatch() bool
 
-	// IncrementRowsAffected increments a counter by n. This is used for all
-	// result types other than tree.Rows.
-	IncrementRowsAffected(ctx context.Context, n int)
+	// BufferedResultsLen returns the length of the results buffer.
+	BufferedResultsLen() int
 
-	// RowsAffected returns either the number of times AddRow was called, or the
-	// sum of all n passed into IncrementRowsAffected.
+	// TruncateBufferedResults clears any results that have been buffered after
+	// given index, and returns true iff any results were actually truncated.
+	TruncateBufferedResults(idx int) bool
+
+	// SetRowsAffected sets RowsAffected counter to n. This is used for all
+	// result types other than tree.Rows.
+	SetRowsAffected(ctx context.Context, n int)
+
+	// RowsAffected returns either the number of times AddRow was called, total
+	// number of rows pushed via AddBatch, or the last value of n passed into
+	// SetRowsAffected.
 	RowsAffected() int
 
 	// DisableBuffering can be called during execution to ensure that
@@ -741,6 +894,20 @@ type RestrictedCommandResult interface {
 	// to this CommandResult, will be flushed immediately to the client.
 	// This is currently used for sinkless changefeeds.
 	DisableBuffering()
+
+	// GetBulkJobId returns the id of the job for the query, if the query is
+	// IMPORT, BACKUP or RESTORE.
+	GetBulkJobId() uint64
+
+	// ErrAllowReleased returns the error without asserting the result is not
+	// released yet. It should be used only in clean-up stages of a pausable
+	// portal.
+	ErrAllowReleased() error
+
+	// RevokePortalPausability is to make a portal un-pausable. It is called when
+	// we find the underlying query is not supported for a pausable portal.
+	// This method is implemented only by pgwire.limitedCommandResult.
+	RevokePortalPausability() error
 }
 
 // DescribeResult represents the result of a Describe command (for either
@@ -807,9 +974,29 @@ type EmptyQueryResult interface {
 }
 
 // CopyInResult represents the result of a CopyIn command. Closing this result
-// produces no output for the client.
+// sends a CommandComplete message to the client.
 type CopyInResult interface {
 	ResultBase
+
+	// SetRowsAffected sets the number of rows affected by the COPY.
+	SetRowsAffected(ctx context.Context, n int)
+}
+
+// CopyOutResult represents the result of a CopyOut command. Closing this result
+// sends a CommandComplete message to the client.
+type CopyOutResult interface {
+	ResultBase
+
+	// SendCopyOut sends the copy out response to the client.
+	SendCopyOut(
+		ctx context.Context, cols colinfo.ResultColumns, format pgwirebase.FormatCode,
+	) error
+
+	// SendCopyData adds a COPY data row to the result.
+	SendCopyData(ctx context.Context, copyData []byte, isHeader bool) error
+
+	// SendCopyDone sends the copy done response to the client.
+	SendCopyDone(ctx context.Context) error
 }
 
 // ClientLock is an interface returned by ClientComm.lockCommunication(). It
@@ -830,10 +1017,11 @@ type ClientLock interface {
 	// connection.
 	ClientPos() CmdPos
 
-	// RTrim iterates backwards through the results and drops all results with
-	// position >= pos.
-	// It is illegal to call rtrim with a position <= clientPos(). In other words,
-	// results can
+	// RTrim drops all results with position >= pos.
+	//
+	// It is illegal to call RTrim with a position <= ClientPos(). In other
+	// words, results can only be trimmed if they haven't been sent to the
+	// client.
 	RTrim(ctx context.Context, pos CmdPos)
 }
 
@@ -866,28 +1054,41 @@ func (rc *rewindCapability) close() {
 	rc.cl.Close()
 }
 
-type resCloseType bool
-
-const closed resCloseType = true
-const discarded resCloseType = false
-
 // streamingCommandResult is a CommandResult that streams rows on the channel
 // and can call a provided callback when closed.
 type streamingCommandResult struct {
+	pos CmdPos
+
 	// All the data (the rows and the metadata) are written into w. The
 	// goroutine writing into this streamingCommandResult might block depending
 	// on the synchronization strategy.
 	w ieResultWriter
 
+	// cannotRewind indicates whether this result has communicated some data
+	// (rows or metadata) such that the corresponding command cannot be rewound.
+	cannotRewind bool
+
 	err          error
 	rowsAffected int
 
-	// closeCallback, if set, is called when Close()/Discard() is called.
-	closeCallback func(*streamingCommandResult, resCloseType)
+	// closeCallback, if set, is called when Close() is called.
+	closeCallback func()
+	// discardCallback, if set, is called when Discard() is called.
+	discardCallback func()
 }
 
 var _ RestrictedCommandResult = &streamingCommandResult{}
 var _ CommandResultClose = &streamingCommandResult{}
+
+// ErrAllowReleased is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) ErrAllowReleased() error {
+	return r.err
+}
+
+// RevokePortalPausability is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) RevokePortalPausability() error {
+	return errors.AssertionFailedf("RevokePortalPausability is for limitedCommandResult only")
+}
 
 // SetColumns is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) SetColumns(ctx context.Context, cols colinfo.ResultColumns) {
@@ -896,32 +1097,51 @@ func (r *streamingCommandResult) SetColumns(ctx context.Context, cols colinfo.Re
 	if cols == nil {
 		cols = colinfo.ResultColumns{}
 	}
+	// NB: we do not set r.cannotRewind here because the correct columns will be
+	// set in rowsIterator.Next.
 	_ = r.w.addResult(ctx, ieIteratorResult{cols: cols})
 }
 
 // BufferParamStatusUpdate is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) BufferParamStatusUpdate(key string, val string) {
-	panic("unimplemented")
+	// Unimplemented: the internal executor does not support status updated.
 }
 
 // BufferNotice is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) BufferNotice(notice pgnotice.Notice) {
-	panic("unimplemented")
+	// Unimplemented: the internal executor does not support notices.
+}
+
+// SendNotice is part of the RestrictedCommandResult interface.
+func (r *streamingCommandResult) SendNotice(ctx context.Context, notice pgnotice.Notice) error {
+	// Unimplemented: the internal executor does not support notices.
+	return nil
 }
 
 // ResetStmtType is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) ResetStmtType(stmt tree.Statement) {
-	panic("unimplemented")
+	// This command result doesn't care about the stmt type since it doesn't
+	// produce pgwire messages.
+}
+
+// GetFormatCode is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) GetFormatCode(colIdx int) (pgwirebase.FormatCode, error) {
+	// Rows aren't serialized in the streamingCommandResult, so this format code
+	// doesn't really matter - return the default.
+	return pgwirebase.FormatText, nil
 }
 
 // AddRow is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) AddRow(ctx context.Context, row tree.Datums) error {
-	// AddRow() and IncrementRowsAffected() are never called on the same command
+	// AddRow() and SetRowsAffected() are never called on the same command
 	// result, so we will not double count the affected rows by an increment
 	// here.
 	r.rowsAffected++
 	rowCopy := make(tree.Datums, len(row))
 	copy(rowCopy, row)
+	// Once we add this row to the writer, it can be immediately consumed by the
+	// reader, so this result can no longer be rewound.
+	r.cannotRewind = true
 	return r.w.addResult(ctx, ieIteratorResult{row: rowCopy})
 }
 
@@ -933,6 +1153,19 @@ func (r *streamingCommandResult) AddBatch(context.Context, coldata.Batch) error 
 
 // SupportsAddBatch is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) SupportsAddBatch() bool {
+	return false
+}
+
+// BufferedResultsLen is part of the RestrictedCommandResult interface.
+func (r *streamingCommandResult) BufferedResultsLen() int {
+	// Since this implementation is streaming, we cannot truncate some buffered
+	// results. This is achieved by unconditionally returning false in
+	// TruncateBufferedResults, so this return value doesn't actually matter.
+	return 0
+}
+
+// TruncateBufferedResults is part of the RestrictedCommandResult interface.
+func (r *streamingCommandResult) TruncateBufferedResults(int) bool {
 	return false
 }
 
@@ -949,18 +1182,25 @@ func (r *streamingCommandResult) SetError(err error) {
 	// in execStmtInOpenState().
 }
 
+// GetBulkJobId is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) GetBulkJobId() uint64 {
+	return 0
+}
+
 // Err is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) Err() error {
 	return r.err
 }
 
-// IncrementRowsAffected is part of the RestrictedCommandResult interface.
-func (r *streamingCommandResult) IncrementRowsAffected(ctx context.Context, n int) {
-	r.rowsAffected += n
+// SetRowsAffected is part of the RestrictedCommandResult interface.
+func (r *streamingCommandResult) SetRowsAffected(ctx context.Context, n int) {
+	r.rowsAffected = n
 	// streamingCommandResult might be used outside of the internal executor
 	// (i.e. not by rowsIterator) in which case the channel is not set.
 	if r.w != nil {
-		_ = r.w.addResult(ctx, ieIteratorResult{rowsAffectedIncrement: &n})
+		// NB: we do not set r.cannotRewind here because rowsAffected value will
+		// be overwritten in rowsIterator.Next correctly if necessary.
+		_ = r.w.addResult(ctx, ieIteratorResult{rowsAffected: &n})
 	}
 }
 
@@ -972,14 +1212,14 @@ func (r *streamingCommandResult) RowsAffected() int {
 // Close is part of the CommandResultClose interface.
 func (r *streamingCommandResult) Close(context.Context, TransactionStatusIndicator) {
 	if r.closeCallback != nil {
-		r.closeCallback(r, closed)
+		r.closeCallback()
 	}
 }
 
 // Discard is part of the CommandResult interface.
 func (r *streamingCommandResult) Discard() {
-	if r.closeCallback != nil {
-		r.closeCallback(r, discarded)
+	if r.discardCallback != nil {
+		r.discardCallback()
 	}
 }
 
@@ -997,3 +1237,31 @@ func (r *streamingCommandResult) SetPortalOutput(
 	context.Context, colinfo.ResultColumns, []pgwirebase.FormatCode,
 ) {
 }
+
+// SendCopyOut is part of the sql.CopyOutResult interface.
+func (r *streamingCommandResult) SendCopyOut(
+	ctx context.Context, cols colinfo.ResultColumns, format pgwirebase.FormatCode,
+) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyOut")
+}
+
+// SendCopyData is part of the sql.CopyOutResult interface.
+func (r *streamingCommandResult) SendCopyData(
+	ctx context.Context, copyData []byte, isHeader bool,
+) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyData")
+}
+
+// SendCopyDone is part of the pgwirebase.Conn interface.
+func (r *streamingCommandResult) SendCopyDone(ctx context.Context) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyDone")
+}
+
+// BulkJobInfoKey are for keys stored in pgwire.commandResult.bulkJobInfo.
+type BulkJobInfoKey string
+
+const (
+	// BulkJobIdColName is the key for the job id for bulk jobs.
+	BulkJobIdColName BulkJobInfoKey = "BulkJobId"
+	NumRows          BulkJobInfoKey = "NumRows"
+)

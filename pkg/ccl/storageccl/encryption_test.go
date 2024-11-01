@@ -1,22 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storageccl
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
@@ -38,12 +36,12 @@ func TestEncryptDecrypt(t *testing.T) {
 				for _, chunkSize := range []int{1, 7, 64, 1 << 10, 1 << 20} {
 					encryptionChunkSizeV2 = chunkSize
 
-					t.Run("chunk="+humanizeutil.IBytes(int64(chunkSize)), func(t *testing.T) {
+					t.Run("chunk="+string(humanizeutil.IBytes(int64(chunkSize))), func(t *testing.T) {
 						ciphertext, err := EncryptFile(plaintext, key)
 						require.NoError(t, err)
 						require.True(t, AppearsEncrypted(ciphertext), "cipher text should appear encrypted")
 
-						decrypted, err := DecryptFile(ciphertext, key)
+						decrypted, err := DecryptFile(context.Background(), ciphertext, key, mon.NewStandaloneUnlimitedAccount())
 						require.NoError(t, err)
 						require.Equal(t, plaintext, decrypted)
 					})
@@ -53,7 +51,7 @@ func TestEncryptDecrypt(t *testing.T) {
 	})
 
 	t.Run("helpful error on bad input", func(t *testing.T) {
-		_, err := DecryptFile([]byte("a"), key)
+		_, err := DecryptFile(context.Background(), []byte("a"), key, mon.NewStandaloneUnlimitedAccount())
 		require.EqualError(t, err, "file does not appear to be encrypted")
 	})
 
@@ -162,7 +160,7 @@ func TestEncryptDecrypt(t *testing.T) {
 					plaintext := randutil.RandBytes(rng, rng.Intn(1024*32))
 					ciphertext, err := EncryptFile(plaintext, key)
 					require.NoError(t, err)
-					decrypted, err := DecryptFile(ciphertext, key)
+					decrypted, err := DecryptFile(context.Background(), ciphertext, key, mon.NewStandaloneUnlimitedAccount())
 					require.NoError(t, err)
 					if len(plaintext) == 0 {
 						require.Equal(t, len(plaintext), len(decrypted))
@@ -225,10 +223,10 @@ func BenchmarkEncryption(b *testing.B) {
 
 	b.Run("EncryptFile", func(b *testing.B) {
 		for _, plaintext := range [][]byte{plaintext1KB, plaintext100KB, plaintext1MB, plaintext64MB} {
-			b.Run(humanizeutil.IBytes(int64(len(plaintext))), func(b *testing.B) {
+			b.Run(string(humanizeutil.IBytes(int64(len(plaintext)))), func(b *testing.B) {
 				for _, chunkSize := range chunkSizes {
 					encryptionChunkSizeV2 = chunkSize
-					b.Run("chunk="+humanizeutil.IBytes(int64(chunkSize)), func(b *testing.B) {
+					b.Run("chunk="+string(humanizeutil.IBytes(int64(chunkSize))), func(b *testing.B) {
 						for i := 0; i < b.N; i++ {
 							_, err := EncryptFile(plaintext, key)
 							if err != nil {
@@ -258,11 +256,11 @@ func BenchmarkEncryption(b *testing.B) {
 	b.Run("DecryptFile", func(b *testing.B) {
 		for _, ciphertextOriginal := range [][][]byte{ciphertext1KB, ciphertext100KB, ciphertext1MB, ciphertext64MB} {
 			// Decrypt reuses/clobbers the original ciphertext slice.
-			b.Run(humanizeutil.IBytes(int64(len(ciphertextOriginal[0]))), func(b *testing.B) {
+			b.Run(string(humanizeutil.IBytes(int64(len(ciphertextOriginal[0])))), func(b *testing.B) {
 				for chunkSizeNum, chunkSize := range chunkSizes {
 					encryptionChunkSizeV2 = chunkSize
 
-					b.Run("chunk="+humanizeutil.IBytes(int64(chunkSize)), func(b *testing.B) {
+					b.Run("chunk="+string(humanizeutil.IBytes(int64(chunkSize))), func(b *testing.B) {
 						ciphertext := bytes.NewReader(ciphertextOriginal[chunkSizeNum])
 						for i := 0; i < b.N; i++ {
 							ciphertext.Reset(ciphertextOriginal[chunkSizeNum])
@@ -270,7 +268,7 @@ func BenchmarkEncryption(b *testing.B) {
 							if err != nil {
 								b.Fatal(err)
 							}
-							_, err = io.Copy(ioutil.Discard, r.(io.Reader))
+							_, err = io.Copy(io.Discard, r.(io.Reader))
 							if err != nil {
 								b.Fatal(err)
 							}

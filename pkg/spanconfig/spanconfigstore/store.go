@@ -1,13 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package spanconfigstore exposes utilities for storing and retrieving
+// SpanConfigs associated with a single span.
 package spanconfigstore
 
 import (
@@ -16,270 +13,357 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
-// EnabledSetting is a hidden cluster setting to enable the use of the span
-// configs infrastructure in KV. It switches each store in the cluster from
-// using the gossip backed system config span to instead using the span configs
-// infrastructure. It has no effect unless COCKROACH_EXPERIMENTAL_SPAN_CONFIGS
-// is set.
-var EnabledSetting = settings.RegisterBoolSetting(
-	"spanconfig.experimental_store.enabled",
-	`use the span config infrastructure in KV instead of the system config span`,
-	false,
-).WithSystemOnly()
+// FallbackConfigOverride is a hidden cluster setting to override the fallback
+// config used for ranges with no explicit span configs set.
+var FallbackConfigOverride = settings.RegisterProtobufSetting(
+	settings.SystemOnly,
+	"spanconfig.store.fallback_config_override",
+	"override the fallback used for ranges with no explicit span configs set",
+	&roachpb.SpanConfig{},
+)
 
-// Store is an in-memory data structure to store and retrieve span configs.
-// Internally it makes use of an interval tree to store non-overlapping span
-// configs. It's safe for concurrent use.
+// BoundsEnabled is a hidden cluster setting which controls whether
+// SpanConfigBounds should be consulted (to perform clamping of secondary tenant
+// span configurations) before serving span configs.
+var boundsEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"spanconfig.bounds.enabled",
+	"dictates whether span config bounds are consulted when serving span configs for secondary tenants",
+	true,
+	settings.WithPublic)
+
+// Store is an in-memory data structure to store, retrieve, and incrementally
+// update the span configuration state. Internally, it makes use of an interval
+// btree based spanConfigStore to store non-overlapping span configurations that
+// target keyspans. It's safe for concurrent use.
 type Store struct {
 	mu struct {
 		syncutil.RWMutex
-		tree    interval.Tree
-		idAlloc int64
+		spanConfigStore       *spanConfigStore
+		systemSpanConfigStore *systemSpanConfigStore
 	}
 
-	// TODO(irfansharif): We're using a static fall back span config here, we
-	// could instead have this track the host tenant's RANGE DEFAULT config, or
-	// go a step further and use the tenant's own RANGE DEFAULT instead if the
-	// key is within the tenant's keyspace. We'd have to thread that through the
-	// KVAccessor interface by reserving special keys for these default configs.
+	settings *cluster.Settings
 
 	// fallback is the span config we'll fall back on in the absence of
 	// something more specific.
+	//
+	// TODO(irfansharif): We're using a static[1] fallback span config here, we
+	// could instead have this directly track the host tenant's RANGE DEFAULT
+	// config, or go a step further and use the tenant's own RANGE DEFAULT
+	// instead if the key is within the tenant's keyspace. We'd have to thread
+	// that through the KVAccessor interface by reserving special keys for these
+	// default configs.
+	//
+	// [1]: Modulo the private spanconfig.store.fallback_config_override, which
+	//      applies globally.
 	fallback roachpb.SpanConfig
+
+	knobs *spanconfig.TestingKnobs
+
+	// boundsReader provides a handle to the global SpanConfigBounds state.
+	boundsReader BoundsReader
 }
 
 var _ spanconfig.Store = &Store{}
 
 // New instantiates a span config store with the given fallback.
-func New(fallback roachpb.SpanConfig) *Store {
-	s := &Store{fallback: fallback}
-	s.mu.tree = interval.NewTree(interval.ExclusiveOverlapper)
+func New(
+	fallback roachpb.SpanConfig,
+	settings *cluster.Settings,
+	boundsReader BoundsReader,
+	knobs *spanconfig.TestingKnobs,
+) *Store {
+	if knobs == nil {
+		knobs = &spanconfig.TestingKnobs{}
+	}
+	s := &Store{
+		settings:     settings,
+		fallback:     fallback,
+		boundsReader: boundsReader,
+		knobs:        knobs,
+	}
+	s.mu.spanConfigStore = newSpanConfigStore(settings, s.knobs)
+	s.mu.systemSpanConfigStore = newSystemSpanConfigStore()
 	return s
 }
 
 // NeedsSplit is part of the spanconfig.StoreReader interface.
-func (s *Store) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
-	return len(s.ComputeSplitKey(ctx, start, end)) > 0
+func (s *Store) NeedsSplit(ctx context.Context, start, end roachpb.RKey) (bool, error) {
+	splits, err := s.ComputeSplitKey(ctx, start, end)
+	if err != nil {
+		return false, err
+	}
+
+	return len(splits) > 0, nil
 }
 
 // ComputeSplitKey is part of the spanconfig.StoreReader interface.
-func (s *Store) ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) roachpb.RKey {
-	sp := roachpb.Span{Key: start.AsRawKey(), EndKey: end.AsRawKey()}
-
-	// We don't want to split within the system config span while we're still
-	// also using it to disseminate zone configs.
-	//
-	// TODO(irfansharif): Once we've fully phased out the system config span, we
-	// can get rid of this special handling.
-	if keys.SystemConfigSpan.Contains(sp) {
-		return nil
-	}
-	if keys.SystemConfigSpan.ContainsKey(sp.Key) {
-		return roachpb.RKey(keys.SystemConfigSpan.EndKey)
-	}
-
+func (s *Store) ComputeSplitKey(
+	ctx context.Context, start, end roachpb.RKey,
+) (roachpb.RKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	idx := 0
-	var splitKey roachpb.RKey = nil
-	s.mu.tree.DoMatching(func(i interval.Interface) (done bool) {
-		if idx > 0 {
-			splitKey = roachpb.RKey(i.(*storeEntry).Span.Key)
-			return true // we found our split key, we're done
-		}
-
-		idx++
-		return false // more
-	}, sp.AsRange())
-
-	return splitKey
+	return s.mu.spanConfigStore.computeSplitKey(ctx, start, end)
 }
 
 // GetSpanConfigForKey is part of the spanconfig.StoreReader interface.
 func (s *Store) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, error) {
-	sp := roachpb.Span{Key: key.AsRawKey(), EndKey: key.Next().AsRawKey()}
-
+) (roachpb.SpanConfig, roachpb.Span, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.getSpanConfigForKeyRLocked(ctx, key)
+}
 
-	var conf roachpb.SpanConfig
-	found := false
-	s.mu.tree.DoMatching(func(i interval.Interface) (done bool) {
-		conf = i.(*storeEntry).Config
-		found = true
-		return true
-	}, sp.AsRange())
-
+// getSpanConfigForKeyRLocked is like GetSpanConfigForKey but requires the
+// caller to hold the Store read lock.
+func (s *Store) getSpanConfigForKeyRLocked(
+	ctx context.Context, key roachpb.RKey,
+) (roachpb.SpanConfig, roachpb.Span, error) {
+	conf, confSpan, found := s.mu.spanConfigStore.getSpanConfigForKey(ctx, key)
 	if !found {
-		if log.ExpensiveLogEnabled(ctx, 1) {
-			log.Warningf(ctx, "span config not found for %s", key.String())
-		}
-		conf = s.fallback
+		conf = s.getFallbackConfig()
 	}
-	return conf, nil
+	var err error
+	conf, err = s.mu.systemSpanConfigStore.combine(key, conf)
+	if err != nil {
+		return roachpb.SpanConfig{}, roachpb.Span{}, err
+	}
+
+	// No need to perform clamping if SpanConfigBounds are not enabled.
+	if !boundsEnabled.Get(&s.settings.SV) {
+		return conf, confSpan, nil
+	}
+
+	_, tenID, err := keys.DecodeTenantPrefix(roachpb.Key(key))
+	if err != nil {
+		return roachpb.SpanConfig{}, roachpb.Span{}, err
+	}
+	if tenID.IsSystem() {
+		// SpanConfig bounds do not apply to the system tenant.
+		return conf, confSpan, nil
+	}
+
+	bounds, found := s.boundsReader.Bounds(tenID)
+	if !found {
+		return conf, confSpan, nil
+	}
+
+	clamped := bounds.Clamp(&conf)
+
+	if clamped {
+		log.VInfof(ctx, 3, "span config for tenant clamped to %v", conf)
+	}
+	return conf, confSpan, nil
+}
+
+func (s *Store) getFallbackConfig() roachpb.SpanConfig {
+	if conf := FallbackConfigOverride.Get(&s.settings.SV).(*roachpb.SpanConfig); !conf.IsEmpty() {
+		return *conf
+	}
+	if s.knobs != nil && s.knobs.OverrideFallbackConf != nil {
+		return s.knobs.OverrideFallbackConf(s.fallback)
+	}
+	return s.fallback
 }
 
 // Apply is part of the spanconfig.StoreWriter interface.
 func (s *Store) Apply(
-	ctx context.Context, update spanconfig.Update, dryrun bool,
-) (deleted []roachpb.Span, added []roachpb.SpanConfigEntry) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	ctx context.Context, updates ...spanconfig.Update,
+) (deleted []spanconfig.Target, added []spanconfig.Record) {
 
-	if !update.Span.Valid() || len(update.Span.EndKey) == 0 {
-		log.Fatalf(ctx, "invalid span")
-	}
-
-	entriesToDelete, entriesToAdd := s.accumulateOpsForLocked(update)
-
-	deleted = make([]roachpb.Span, len(entriesToDelete))
-	for i := range entriesToDelete {
-		entry := &entriesToDelete[i]
-		if !dryrun {
-			if err := s.mu.tree.Delete(entry, false); err != nil {
-				log.Fatalf(ctx, "%v", err)
-			}
+	// Log the potential span config changes.
+	for _, update := range updates {
+		err := s.maybeLogUpdate(ctx, &update)
+		if err != nil {
+			log.KvDistribution.Warningf(ctx, "attempted to log a spanconfig update to "+
+				"target:%+v, but got the following error:%+v", update.GetTarget(), err)
 		}
-		deleted[i] = entry.Span
 	}
 
-	added = make([]roachpb.SpanConfigEntry, len(entriesToAdd))
-	for i := range entriesToAdd {
-		entry := &entriesToAdd[i]
-		if !dryrun {
-			if err := s.mu.tree.Insert(entry, false); err != nil {
-				log.Fatalf(ctx, "%v", err)
-			}
-		}
-		added[i] = entry.SpanConfigEntry
+	deleted, added, err := s.applyInternal(ctx, updates...)
+	if err != nil {
+		log.Fatalf(ctx, "%v", err)
 	}
-
 	return deleted, added
 }
 
-// accumulateOpsForLocked returns the list of store entries that would be
-// deleted and added if the given update was to be applied. To apply a given
-// update, we want to find all overlapping spans and clear out just the
-// intersections. If the update is adding a new span config, we'll also want to
-// add it store entry after. We do this by deleting all overlapping spans in
-// their entirety and re-adding the non-overlapping portions, if any.
-// Pseudo-code:
-//
-// 	for entry in store.overlapping(update.span):
-// 		union, intersection = union(update.span, entry), intersection(update.span, entry)
-// 		pre, post = span{union.start_key, intersection.start_key}, span{intersection.end_key, union.end_key}
-//
-// 		delete entry
-// 		if entry.contains(update.span.start_key):
-// 			add pre=entry.conf
-// 		if entry.contains(update.span.end_key):
-// 			add post=entry.conf
-//
-//   if adding:
-//       add update.span=update.conf
-//
-func (s *Store) accumulateOpsForLocked(update spanconfig.Update) (toDelete, toAdd []storeEntry) {
-	for _, overlapping := range s.mu.tree.Get(update.Span.AsRange()) {
-		existing := overlapping.(*storeEntry)
-		var (
-			union = existing.Span.Combine(update.Span)
-			inter = existing.Span.Intersect(update.Span)
+// ForEachOverlappingSpanConfig is part of the spanconfig.Store interface.
+func (s *Store) ForEachOverlappingSpanConfig(
+	ctx context.Context, span roachpb.Span, f func(roachpb.Span, roachpb.SpanConfig) error,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var foundOverlapping bool
+	err := s.mu.spanConfigStore.forEachOverlapping(span, func(sp roachpb.Span, conf roachpb.SpanConfig) error {
+		foundOverlapping = true
+		config, _, err := s.getSpanConfigForKeyRLocked(ctx, roachpb.RKey(sp.Key))
+		if err != nil {
+			return err
+		}
+		return f(sp, config)
+	})
+	if err != nil {
+		return err
+	}
+	// For a span that doesn't overlap with any span configs, we use the fallback
+	// config combined with the system span configs that may be applicable to the
+	// span.
+	//
+	// For example, when a table is dropped and all of its data (including the
+	// range deletion tombstone installed by the drop) is GC'ed, the associated
+	// schema change GC job will delete the table's span config. In this case, we
+	// will not find any overlapping span configs for the table's span, but a
+	// system span config, such as a cluster wide protection policy, may still be
+	// applicable to the replica with the empty table span.
+	if !foundOverlapping {
+		log.VInfof(ctx, 3, "no overlapping span config found for span %s", span)
+		config, _, err := s.getSpanConfigForKeyRLocked(ctx, roachpb.RKey(span.Key))
+		if err != nil {
+			return err
+		}
+		return f(span, config)
+	}
+	return nil
+}
 
-			pre  = roachpb.Span{Key: union.Key, EndKey: inter.Key}
-			post = roachpb.Span{Key: inter.EndKey, EndKey: union.EndKey}
+// Clone returns a copy of the Store.
+func (s *Store) Clone() *Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clone := New(s.fallback, s.settings, s.boundsReader, s.knobs)
+	clone.mu.spanConfigStore = s.mu.spanConfigStore.clone()
+	clone.mu.systemSpanConfigStore = s.mu.systemSpanConfigStore.clone()
+	return clone
+}
+
+func (s *Store) applyInternal(
+	ctx context.Context, updates ...spanconfig.Update,
+) (deleted []spanconfig.Target, added []spanconfig.Record, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Accumulate all spanStoreUpdates. We do this because we want to apply
+	// a set of updates at once instead of individually, to correctly construct
+	// the deleted/added slices.
+	spanStoreUpdates := make([]spanconfig.Update, 0, len(updates))
+	systemSpanConfigStoreUpdates := make([]spanconfig.Update, 0, len(updates))
+	for _, update := range updates {
+		switch {
+		case update.GetTarget().IsSpanTarget():
+			spanStoreUpdates = append(spanStoreUpdates, update)
+		case update.GetTarget().IsSystemTarget():
+			systemSpanConfigStoreUpdates = append(systemSpanConfigStoreUpdates, update)
+		default:
+			return nil, nil, errors.AssertionFailedf("unknown target type")
+		}
+	}
+	deletedSpans, addedEntries, err := s.mu.spanConfigStore.apply(ctx, spanStoreUpdates...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, sp := range deletedSpans {
+		deleted = append(deleted, spanconfig.MakeTargetFromSpan(sp))
+	}
+
+	for _, entry := range addedEntries {
+		record, err := spanconfig.MakeRecord(
+			spanconfig.MakeTargetFromSpan(entry.span),
+			entry.conf(),
 		)
+		if err != nil {
+			return nil, nil, err
+		}
+		added = append(added, record)
+	}
 
-		// Delete the existing span in its entirety. Below we'll re-add the
-		// non-intersecting parts of the span.
-		toDelete = append(toDelete, *existing)
+	deletedSystemTargets, addedSystemSpanConfigRecords, err := s.mu.systemSpanConfigStore.apply(
+		systemSpanConfigStoreUpdates...,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, systemTarget := range deletedSystemTargets {
+		deleted = append(deleted, spanconfig.MakeTargetFromSystemTarget(systemTarget))
+	}
+	added = append(added, addedSystemSpanConfigRecords...)
 
-		if existing.Span.ContainsKey(update.Span.Key) { // existing entry contains the update span's start key
-			// ex:     [-----------------)
-			//
-			// up:         [-------)
-			// up:         [-------------)
-			// up:         [--------------
-			// up:     [-------)
-			// up:     [-----------------)
-			// up:     [------------------
+	return deleted, added, nil
+}
 
-			// Re-add the non-intersecting span, if any.
-			if pre.Valid() {
-				toAdd = append(toAdd, s.makeEntryLocked(pre, existing.Config))
+// Iterate iterates through all the entries in the Store in sorted order.
+func (s *Store) Iterate(f func(spanconfig.Record) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// System targets are considered to be less than span targets.
+	if err := s.mu.systemSpanConfigStore.iterate(f); err != nil {
+		return err
+	}
+	return s.mu.spanConfigStore.forEachOverlapping(
+		keys.EverythingSpan,
+		func(sp roachpb.Span, conf roachpb.SpanConfig) error {
+			record, err := spanconfig.MakeRecord(spanconfig.MakeTargetFromSpan(sp), conf)
+			if err != nil {
+				return err
 			}
-		}
+			return f(record)
+		})
+}
 
-		if existing.Span.ContainsKey(update.Span.EndKey) { // existing entry contains the update span's end key
-			// ex:     [-----------------)
-			//
-			// up:     -------------)
-			// up:     [------------)
-			// up:        [---------)
+// maybeLogUpdate logs the SpanConfig changes to the distribution channel. It
+// also logs changes to the span boundaries. It doesn't log the changes to the
+// SpanConfig for high churn fields like protected timestamps.
+func (s *Store) maybeLogUpdate(ctx context.Context, update *spanconfig.Update) error {
+	nextSC := update.GetConfig()
+	target := update.GetTarget()
 
-			// Re-add the non-intersecting span.
-			toAdd = append(toAdd, s.makeEntryLocked(post, existing.Config))
-		}
+	// Return early from SystemTarget updates because they correspond to PTS
+	// updates.
+	if !target.IsSpanTarget() {
+		return nil
 	}
 
-	if update.Addition() {
-		if len(toDelete) == 1 &&
-			toDelete[0].Span.Equal(update.Span) &&
-			toDelete[0].Config.Equal(update.Config) {
-			// We're deleting exactly what we're going to add, this is a no-op.
-			return nil, nil
-		}
-
-		// Add the update itself.
-		toAdd = append(toAdd, s.makeEntryLocked(update.Span, update.Config))
-
-		// TODO(irfansharif): If we're adding an entry, we could inspect the
-		// entries before and after and check whether either of them have the
-		// same config. If they do, we could coalesce them into a single span.
-		// Given that these boundaries determine where we split ranges, we'd be
-		// able to reduce the number of ranges drastically (think adjacent
-		// tables/indexes/partitions with the same config). This would be
-		// especially significant for secondary tenants, where we'd be able to
-		// avoid unconditionally splitting on table boundaries. We'd still want
-		// to split on tenant boundaries, so certain preconditions would need to
-		// hold. For performance reasons, we'd probably also want to offer
-		// a primitive to allow manually splitting on specific table boundaries.
+	rKey, err := keys.Addr(target.GetSpan().Key)
+	if err != nil {
+		return err
 	}
 
-	return toDelete, toAdd
-}
+	var curSpanConfig roachpb.SpanConfig
+	var curSpan roachpb.Span
+	var found bool
+	func() {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		curSpanConfig, curSpan, found = s.mu.spanConfigStore.getSpanConfigForKey(ctx, rKey)
+	}()
 
-func (s *Store) makeEntryLocked(sp roachpb.Span, conf roachpb.SpanConfig) storeEntry {
-	s.mu.idAlloc++
-	return storeEntry{
-		SpanConfigEntry: roachpb.SpanConfigEntry{Span: sp, Config: conf},
-		id:              s.mu.idAlloc,
+	// Check if the span bounds have changed.
+	if found &&
+		(!curSpan.Key.Equal(target.GetSpan().Key) ||
+			!curSpan.EndKey.Equal(target.GetSpan().EndKey)) {
+		log.KvDistribution.Infof(ctx,
+			"changing the span boundaries for span:%+v from:[%+v:%+v) to:[%+v:%+v) "+
+				"with config: %+v", target, curSpan.Key, curSpan.EndKey, target.GetSpan().Key,
+			target.GetSpan().EndKey, nextSC)
 	}
-}
 
-// storeEntry is the type used to store and sort values in the span config
-// store.
-type storeEntry struct {
-	roachpb.SpanConfigEntry
-	id int64
-}
-
-var _ interval.Interface = &storeEntry{}
-
-// Range implements interval.Interface.
-func (s *storeEntry) Range() interval.Range {
-	return s.Span.AsRange()
-}
-
-// ID implements interval.Interface.
-func (s *storeEntry) ID() uintptr {
-	return uintptr(s.id)
+	// Log if there is a SpanConfig change in any field other than
+	// ProtectedTimestamps to avoid logging PTS updates.
+	if found && curSpanConfig.HasConfigurationChange(nextSC) {
+		log.KvDistribution.Infof(ctx,
+			"changing the spanconfig for span:%+v from:%+v to:%+v",
+			target, curSpanConfig, nextSC)
+	}
+	return nil
 }

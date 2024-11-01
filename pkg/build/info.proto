@@ -1,16 +1,11 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto2";
 package cockroach.build;
-option go_package = "build";
+option go_package = "github.com/cockroachdb/cockroach/pkg/build";
 
 import "gogoproto/gogo.proto";
 
@@ -18,7 +13,9 @@ import "gogoproto/gogo.proto";
 message Info {
   // go_version is the version of the Go toolchain used to compile this executable.
   optional string go_version = 1 [(gogoproto.nullable) = false];
-  // tag is the git tag for the revision of the source code for this executable.
+  // tag is the binary version for the revision of the source code for
+  // this executable.  This used to be the git tag for the build, but
+  // has since moved to the contents of the `version.txt` file.
   optional string tag = 2 [(gogoproto.nullable) = false];
   // time is the time at which the build started.
   optional string time = 3 [(gogoproto.nullable) = false];
@@ -38,6 +35,8 @@ message Info {
   optional string channel = 9 [(gogoproto.nullable) = false];
   // env_channel identifies the product channel as overridden by the COCKROACH_CHANNEL environment variable.
   optional string env_channel = 11 [(gogoproto.nullable) = false];
+  // enabled_assertions returns the value of 'CrdbTestBuild' (true iff compiled with 'crdb_test' tag)
+  optional bool enabled_assertions = 12 [(gogoproto.nullable) = false];
 
   // dependencies exists to allow tests that run against old clusters
   // to unmarshal JSON containing this field. The tag is unimportant,

@@ -1,28 +1,32 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemadesc
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -38,6 +42,13 @@ type immutable struct {
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
+
+	// changed represents how the descriptor was changed after
+	// RunPostDeserializationChanges.
+	changes catalog.PostDeserializationChanges
+
+	// This is the raw bytes (tag + data) of the schema descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 func (desc *immutable) SchemaKind() catalog.ResolvedSchemaKind {
@@ -47,6 +58,74 @@ func (desc *immutable) SchemaKind() catalog.ResolvedSchemaKind {
 // SafeMessage makes immutable a SafeMessager.
 func (desc *immutable) SafeMessage() string {
 	return formatSafeMessage("schemadesc.immutable", desc)
+}
+
+func (desc *immutable) GetFunction(name string) (descpb.SchemaDescriptor_Function, bool) {
+	fn, found := desc.Functions[name]
+	return fn, found
+}
+
+// SkipNamespace implements the descriptor interface.
+func (desc *immutable) SkipNamespace() bool {
+	return false
+}
+
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (desc *immutable) GetRawBytesInStorage() []byte {
+	return desc.rawBytesInStorage
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	for _, f := range desc.Functions {
+		for _, sig := range f.Signatures {
+			for _, typ := range sig.ArgTypes {
+				if !catid.IsOIDUserDefined(typ.Oid()) {
+					continue
+				}
+				if err := fn(typ); err != nil {
+					return iterutil.Map(err)
+				}
+			}
+			for _, typ := range sig.OutParamTypes {
+				if !catid.IsOIDUserDefined(typ.Oid()) {
+					continue
+				}
+				if err := fn(typ); err != nil {
+					return iterutil.Map(err)
+				}
+			}
+			if !catid.IsOIDUserDefined(sig.ReturnType.Oid()) {
+				continue
+			}
+			if err := fn(sig.ReturnType); err != nil {
+				return iterutil.Map(err)
+			}
+		}
+	}
+	return nil
+}
+
+// MaybeRequiresTypeHydration implements the catalog.Descriptor interface.
+func (desc *immutable) MaybeRequiresTypeHydration() bool {
+	for _, f := range desc.Functions {
+		for _, sig := range f.Signatures {
+			if catid.IsOIDUserDefined(sig.ReturnType.Oid()) {
+				return true
+			}
+			for _, typ := range sig.ArgTypes {
+				if catid.IsOIDUserDefined(typ.Oid()) {
+					return true
+				}
+			}
+			for _, typ := range sig.OutParamTypes {
+				if catid.IsOIDUserDefined(typ.Oid()) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // SafeMessage makes Mutable a SafeMessager.
@@ -66,7 +145,7 @@ func formatSafeMessage(typeName string, desc catalog.SchemaDescriptor) string {
 //
 // Note: Today this isn't actually ever mutated but rather exists for a future
 // where we anticipate having a mutable copy of Schema descriptors. There's a
-// large amount of space to question this `Mutable|ImmutableCopy` version of each
+// large amount of space to question this version of each
 // descriptor type. Maybe it makes no sense but we're running with it for the
 // moment. This is an intermediate state on the road to descriptors being
 // handled outside of the catalog entirely as interfaces.
@@ -74,27 +153,9 @@ type Mutable struct {
 	immutable
 
 	ClusterVersion *immutable
-
-	// changed represents whether or not the descriptor was changed
-	// after RunPostDeserializationChanges.
-	changed bool
 }
 
 var _ redact.SafeMessager = (*immutable)(nil)
-
-// SetDrainingNames implements the MutableDescriptor interface.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
-	desc.DrainingNames = names
-}
-
-// AddDrainingName implements the MutableDescriptor interface.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
-	desc.DrainingNames = append(desc.DrainingNames, name)
-}
 
 // GetParentSchemaID implements the Descriptor interface.
 func (desc *immutable) GetParentSchemaID() descpb.ID {
@@ -150,31 +211,77 @@ func (desc *immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *immutable) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
+// GetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+//
+// It overrides the wrapper's implementation to deal with the fact that
+// mutable has overridden the definition of IsUncommittedVersion.
+func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
+	b := newBuilder(desc.SchemaDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
+}
+
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return NewBuilder(desc.SchemaDesc())
+	b := newBuilder(desc.SchemaDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // ValidateSelf implements the catalog.Descriptor interface.
 func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// Validate local properties of the descriptor.
-	vea.Report(catalog.ValidateName(desc.GetName(), "descriptor"))
+	vea.Report(catalog.ValidateName(desc))
 	if desc.GetID() == descpb.InvalidID {
 		vea.Report(fmt.Errorf("invalid schema ID %d", desc.GetID()))
 	}
 
 	// Validate the privilege descriptor.
-	vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Schema))
+	if desc.Privileges == nil {
+		vea.Report(errors.AssertionFailedf("privileges not set"))
+	} else {
+		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Schema))
+	}
+
+	if desc.GetDefaultPrivileges() != nil {
+		// Validate the default privilege descriptor.
+		vea.Report(catprivilege.ValidateDefaultPrivileges(*desc.GetDefaultPrivileges()))
+	}
+
+	for _, f := range desc.Functions {
+		for _, sig := range f.Signatures {
+			if sig.ID == descpb.InvalidID {
+				vea.Report(fmt.Errorf("invalid function ID %d", sig.ID))
+			}
+		}
+	}
 }
 
 // GetReferencedDescIDs returns the IDs of all descriptors referenced by
 // this descriptor, including itself.
 func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
-	return catalog.MakeDescriptorIDSet(desc.GetID(), desc.GetParentID()), nil
+	ret := catalog.MakeDescriptorIDSet(desc.GetID(), desc.GetParentID())
+	for _, f := range desc.Functions {
+		for _, sig := range f.Signatures {
+			ret.Add(sig.ID)
+		}
+	}
+	return ret, nil
 }
 
-// ValidateCrossReferences implements the catalog.Descriptor interface.
-func (desc *immutable) ValidateCrossReferences(
+// ValidateForwardReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateForwardReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
 	// Check schema parent reference.
@@ -183,35 +290,50 @@ func (desc *immutable) ValidateCrossReferences(
 		vea.Report(err)
 		return
 	}
+	if db.Dropped() {
+		vea.Report(errors.AssertionFailedf("parent database %q (%d) is dropped",
+			db.GetName(), db.GetID()))
+	}
+}
 
-	// Check that parent has correct entry in schemas mapping.
-	isInDBSchemas := false
-	_ = db.ForEachSchemaInfo(func(id descpb.ID, name string, isDropped bool) error {
-		if id == desc.GetID() {
-			if isDropped {
-				if name == desc.GetName() {
-					vea.Report(errors.AssertionFailedf("present in parent database [%d] schemas mapping but marked as dropped",
-						desc.GetParentID()))
+// ValidateBackReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateBackReferences(
+	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+) {
+	// Check that parent database has correct entry in schemas mapping.
+	if db, err := vdg.GetDatabaseDescriptor(desc.GetParentID()); err == nil {
+		isInDBSchemas := false
+		_ = db.ForEachSchema(func(id descpb.ID, name string) error {
+			if id == desc.GetID() {
+				if name != desc.GetName() {
+					vea.Report(errors.AssertionFailedf("present in parent database [%d] schemas mapping but under name %q",
+						desc.GetParentID(), errors.Safe(name)))
+					return nil
 				}
+				isInDBSchemas = true
 				return nil
 			}
-			if name != desc.GetName() {
-				vea.Report(errors.AssertionFailedf("present in parent database [%d] schemas mapping but under name %q",
-					desc.GetParentID(), errors.Safe(name)))
-				return nil
+			if name == desc.GetName() {
+				vea.Report(errors.AssertionFailedf("present in parent database [%d] schemas mapping but name maps to other schema [%d]",
+					desc.GetParentID(), id))
 			}
-			isInDBSchemas = true
 			return nil
+		})
+		if !isInDBSchemas {
+			vea.Report(errors.AssertionFailedf("not present in parent database [%d] schemas mapping",
+				desc.GetParentID()))
 		}
-		if name == desc.GetName() && !isDropped {
-			vea.Report(errors.AssertionFailedf("present in parent database [%d] schemas mapping but name maps to other schema [%d]",
-				desc.GetParentID(), id))
+	}
+
+	// Check that all functions exist.
+	for _, function := range desc.Functions {
+		for _, sig := range function.Signatures {
+			_, err := vdg.GetFunctionDescriptor(sig.ID)
+			if err != nil {
+				vea.Report(errors.AssertionFailedf("invalid function %d in schema %q (%d)",
+					sig.ID, desc.GetName(), desc.GetID()))
+			}
 		}
-		return nil
-	})
-	if !isInDBSchemas {
-		vea.Report(errors.AssertionFailedf("not present in parent database [%d] schemas mapping",
-			desc.GetParentID()))
 	}
 }
 
@@ -222,6 +344,35 @@ func (desc *immutable) ValidateTxnCommit(
 	// No-op.
 }
 
+// GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
+func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
+	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
+	if defaultPrivilegeDescriptor == nil {
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_SCHEMA)
+	}
+	return catprivilege.MakeDefaultPrivileges(defaultPrivilegeDescriptor)
+}
+
+// GetPostDeserializationChanges implements the Descriptor interface.
+func (desc *immutable) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return desc.changes
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (desc *immutable) HasConcurrentSchemaChanges() bool {
+	return desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID
+}
+
+// ConcurrentSchemaChangeJobIDs implements catalog.Descriptor.
+func (desc *immutable) ConcurrentSchemaChangeJobIDs() (ret []catpb.JobID) {
+	if desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID {
+		ret = append(ret, desc.DeclarativeSchemaChangerState.JobID)
+	}
+	return ret
+}
+
 // MaybeIncrementVersion implements the MutableDescriptor interface.
 func (desc *Mutable) MaybeIncrementVersion() {
 	// Already incremented, no-op.
@@ -229,6 +380,11 @@ func (desc *Mutable) MaybeIncrementVersion() {
 		return
 	}
 	desc.Version++
+	desc.ResetModificationTime()
+}
+
+// ResetModificationTime implements the catalog.MutableDescriptor interface.
+func (desc *Mutable) ResetModificationTime() {
 	desc.ModificationTime = hlc.Timestamp{}
 }
 
@@ -258,9 +414,7 @@ func (desc *Mutable) OriginalVersion() descpb.DescriptorVersion {
 
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	imm := NewBuilder(desc.SchemaDesc()).BuildImmutable()
-	imm.(*immutable).isUncommittedVersion = desc.IsUncommittedVersion()
-	return imm
+	return desc.NewBuilder().BuildImmutable()
 }
 
 // IsNew implements the MutableDescriptor interface.
@@ -296,10 +450,214 @@ func (desc *Mutable) IsUncommittedVersion() bool {
 	return desc.IsNew() || desc.GetVersion() != desc.ClusterVersion.GetVersion()
 }
 
-// HasPostDeserializationChanges returns if the MutableDescriptor was changed after running
-// RunPostDeserializationChanges.
-func (desc *Mutable) HasPostDeserializationChanges() bool {
-	return desc.changed
+// GetMutableDefaultPrivilegeDescriptor returns a catprivilege.Mutable.
+func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutable {
+	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
+	if defaultPrivilegeDescriptor == nil {
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_SCHEMA)
+	}
+	return catprivilege.NewMutableDefaultPrivileges(defaultPrivilegeDescriptor)
+}
+
+// SetDefaultPrivilegeDescriptor sets the default privilege descriptor
+// for the database.
+func (desc *Mutable) SetDefaultPrivilegeDescriptor(
+	defaultPrivilegeDescriptor *catpb.DefaultPrivilegeDescriptor,
+) {
+	desc.DefaultPrivileges = defaultPrivilegeDescriptor
+}
+
+// GetDeclarativeSchemaChangeState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangeState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
+// SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
+	desc.DeclarativeSchemaChangerState = state
+}
+
+// AddFunction adds a UDF overload signature to the schema descriptor.
+func (desc *Mutable) AddFunction(name string, f descpb.SchemaDescriptor_FunctionSignature) {
+	if desc.Functions == nil {
+		desc.Functions = make(map[string]descpb.SchemaDescriptor_Function)
+	}
+	if overloads, ok := desc.Functions[name]; !ok {
+		desc.Functions[name] = descpb.SchemaDescriptor_Function{Signatures: []descpb.SchemaDescriptor_FunctionSignature{f}}
+	} else {
+		newSigs := append(overloads.Signatures, f)
+		desc.Functions[name] = descpb.SchemaDescriptor_Function{Signatures: newSigs}
+	}
+}
+
+// RemoveFunction removes a UDF overload signature from the schema descriptor.
+func (desc *Mutable) RemoveFunction(name string, id descpb.ID) {
+	if fn, ok := desc.Functions[name]; ok {
+		var updated []descpb.SchemaDescriptor_FunctionSignature
+		for _, sig := range fn.Signatures {
+			if sig.ID != id {
+				updated = append(updated, sig)
+			}
+		}
+		if len(updated) == 0 {
+			delete(desc.Functions, name)
+			return
+		}
+		desc.Functions[name] = descpb.SchemaDescriptor_Function{
+			Name:       name,
+			Signatures: updated,
+		}
+	}
+}
+
+// ReplaceOverload updates the function signature that matches the existing
+// overload with the new one. An error is returned if the function doesn't exist
+// or a match is not found.
+//
+// DefaultExprs in existing are expected to have been type-checked.
+func (desc *Mutable) ReplaceOverload(
+	name string,
+	existing *tree.QualifiedOverload,
+	newSignature descpb.SchemaDescriptor_FunctionSignature,
+) error {
+	fn, ok := desc.Functions[name]
+	if !ok {
+		return errors.AssertionFailedf("unexpectedly didn't find a function %s", name)
+	}
+	for i := range fn.Signatures {
+		sig := fn.Signatures[i]
+		match := existing.Types.Length() == len(sig.ArgTypes) &&
+			len(existing.OutParamOrdinals) == len(sig.OutParamOrdinals) &&
+			len(existing.DefaultExprs) == len(sig.DefaultExprs)
+		for j := 0; match && j < len(sig.ArgTypes); j++ {
+			match = existing.Types.GetAt(j).Equivalent(sig.ArgTypes[j])
+		}
+		for j := 0; match && j < len(sig.OutParamOrdinals); j++ {
+			match = existing.OutParamOrdinals[j] == sig.OutParamOrdinals[j] &&
+				existing.OutParamTypes.GetAt(j).Equivalent(sig.OutParamTypes[j])
+		}
+		for j := 0; match && j < len(sig.DefaultExprs); j++ {
+			texpr, ok := existing.DefaultExprs[j].(tree.TypedExpr)
+			if !ok {
+				return errors.AssertionFailedf(
+					"expected DEFAULT expr %s to have been type-checked, found %T",
+					existing.DefaultExprs[j], existing.DefaultExprs[j],
+				)
+			}
+			match = tree.Serialize(texpr) == sig.DefaultExprs[j]
+		}
+		if match {
+			fn.Signatures[i] = newSignature
+			return nil
+		}
+	}
+	return errors.AssertionFailedf("unexpectedly didn't find overload match for function %s with types %v", name, existing.Types.Types())
+}
+
+// GetObjectType implements the Object interface.
+func (desc *immutable) GetObjectType() privilege.ObjectType {
+	return privilege.Schema
+}
+
+// GetObjectTypeString implements the Object interface.
+func (desc *immutable) GetObjectTypeString() string {
+	return string(privilege.Schema)
+}
+
+// GetResolvedFuncDefinition implements the SchemaDescriptor interface.
+// TODO(mgartner): This should not create tree.Overloads because it cannot fully
+// populated them.
+func (desc *immutable) GetResolvedFuncDefinition(
+	ctx context.Context, name string,
+) (*tree.ResolvedFunctionDefinition, bool) {
+	funcDescPb, found := desc.GetFunction(name)
+	if !found {
+		return nil, false
+	}
+	funcDef := &tree.ResolvedFunctionDefinition{
+		Name:      name,
+		Overloads: make([]tree.QualifiedOverload, 0, len(funcDescPb.Signatures)),
+	}
+	for i := range funcDescPb.Signatures {
+		sig := &funcDescPb.Signatures[i]
+		retType := sig.ReturnType
+		routineType := tree.UDFRoutine
+		if sig.IsProcedure {
+			routineType = tree.ProcedureRoutine
+		}
+		overload := &tree.Overload{
+			Oid: catid.FuncIDToOID(sig.ID),
+			ReturnType: func(args []tree.TypedExpr) *types.T {
+				return retType
+			},
+			Type:                     routineType,
+			UDFContainsOnlySignature: true,
+			OutParamOrdinals:         sig.OutParamOrdinals,
+		}
+		if funcDescPb.Signatures[i].ReturnSet {
+			overload.Class = tree.GeneratorClass
+		}
+		// There is no need to look at the parameter classes since ArgTypes
+		// already contains only parameters that are included into the
+		// signature of the overload.
+		paramTypes := make(tree.ParamTypes, 0, len(sig.ArgTypes))
+		for _, paramType := range sig.ArgTypes {
+			paramTypes = append(
+				paramTypes,
+				tree.ParamType{Typ: paramType},
+			)
+		}
+		overload.Types = paramTypes
+		if len(sig.OutParamTypes) > 0 {
+			outParamTypes := make(tree.ParamTypes, len(sig.OutParamTypes))
+			for j := range outParamTypes {
+				outParamTypes[j] = tree.ParamType{Typ: sig.OutParamTypes[j]}
+			}
+			overload.OutParamTypes = outParamTypes
+		}
+		if len(sig.DefaultExprs) > 0 {
+			overload.DefaultExprs = make(tree.Exprs, len(sig.DefaultExprs))
+			for j, expr := range sig.DefaultExprs {
+				var err error
+				overload.DefaultExprs[j], err = parser.ParseExpr(expr)
+				if err != nil {
+					// We should never get an error during parsing the default
+					// expr.
+					inputParamOrdinal := len(sig.ArgTypes) - (len(sig.DefaultExprs) - j)
+					log.Errorf(
+						ctx, "DEFAULT expr for input param %d for routine %s: %v",
+						inputParamOrdinal, name, err,
+					)
+					return nil, false
+				}
+			}
+		}
+		prefixedOverload := tree.MakeQualifiedOverload(desc.GetName(), overload)
+		funcDef.Overloads = append(funcDef.Overloads, prefixedOverload)
+	}
+
+	return funcDef, true
+}
+
+// ForEachFunctionSignature implements the SchemaDescriptor interface.
+func (desc *immutable) ForEachFunctionSignature(
+	fn func(sig descpb.SchemaDescriptor_FunctionSignature) error,
+) error {
+	for _, function := range desc.Functions {
+		for i := range function.Signatures {
+			if err := fn(function.Signatures[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// GetReplicatedPCRVersion is a part of the catalog.Descriptor
+func (desc *immutable) GetReplicatedPCRVersion() descpb.DescriptorVersion {
+	return desc.ReplicatedPCRVersion
 }
 
 // IsSchemaNameValid returns whether the input name is valid for a user defined

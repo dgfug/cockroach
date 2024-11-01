@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgdate_test
 
@@ -116,10 +111,12 @@ func (td timeData) expected(order pgdate.Order) (time.Time, bool) {
 	return td.exp, td.err
 }
 
-func (td timeData) testParseDate(t *testing.T, info string, order pgdate.Order) {
+func (td timeData) testParseDate(
+	t *testing.T, info string, order pgdate.Order, ph *pgdate.ParseHelper,
+) {
 	info = fmt.Sprintf("%s ParseDate", info)
 	exp, expErr := td.expected(order)
-	dt, _, err := pgdate.ParseDate(time.Time{}, pgdate.DateStyle{Order: order}, td.s)
+	dt, _, err := pgdate.ParseDate(time.Time{}, pgdate.DateStyle{Order: order}, td.s, ph)
 	res, _ := dt.ToTime()
 
 	// HACK: This is a format that parses as a date and timestamp,
@@ -138,15 +135,17 @@ func (td timeData) testParseDate(t *testing.T, info string, order pgdate.Order) 
 	td.crossCheck(t, info, "date", td.s, order, exp, expErr)
 }
 
-func (td timeData) testParseTime(t *testing.T, info string, order pgdate.Order) {
+func (td timeData) testParseTime(
+	t *testing.T, info string, order pgdate.Order, ph *pgdate.ParseHelper,
+) {
 	info = fmt.Sprintf("%s ParseTime", info)
 	exp, expErr := td.expected(order)
-	res, _, err := pgdate.ParseTime(time.Time{}, pgdate.DateStyle{Order: order}, td.s)
+	res, _, err := pgdate.ParseTime(time.Time{}, pgdate.DateStyle{Order: order}, td.s, ph)
 
 	// Weird times like 24:00:00 or 23:59:60 aren't allowed,
 	// unless there's also a date.
 	if td.isRolloverTime {
-		_, _, err := pgdate.ParseDate(time.Time{}, pgdate.DateStyle{Order: order}, td.s)
+		_, _, err := pgdate.ParseDate(time.Time{}, pgdate.DateStyle{Order: order}, td.s, ph)
 		expErr = err != nil
 	}
 
@@ -161,7 +160,7 @@ func (td timeData) testParseTime(t *testing.T, info string, order pgdate.Order) 
 func (td timeData) testParseTimestamp(t *testing.T, info string, order pgdate.Order) {
 	info = fmt.Sprintf("%s ParseTimestamp", info)
 	exp, expErr := td.expected(order)
-	res, _, err := pgdate.ParseTimestamp(time.Time{}, pgdate.DateStyle{Order: order}, td.s)
+	res, _, err := pgdate.ParseTimestamp(time.Time{}, pgdate.DateStyle{Order: order}, td.s, nil /* h */)
 
 	// HACK: This is a format that parses as a date and timestamp,
 	// but is not a time.
@@ -183,7 +182,7 @@ func (td timeData) testParseTimestampWithoutTimezone(
 ) {
 	info = fmt.Sprintf("%s ParseTimestampWithoutTimezone", info)
 	exp, expErr := td.expected(order)
-	res, _, err := pgdate.ParseTimestampWithoutTimezone(time.Time{}, pgdate.DateStyle{Order: order}, td.s)
+	res, _, err := pgdate.ParseTimestampWithoutTimezone(time.Time{}, pgdate.DateStyle{Order: order}, td.s, nil /* h */)
 
 	// HACK: This is a format that parses as a date and timestamp,
 	// but is not a time.
@@ -749,17 +748,19 @@ func TestMain(m *testing.M) {
 
 // TestParse does the following:
 // * For each parsing order:
-//   * Pick an example date input: 2018-01-01
-//   * Test ParseDate()
-//   * Pick an example time input: 12:34:56
-//     * Derive a timestamp from date + time
-//     * Test ParseTimestame()
-//     * Test ParseDate()
-//     * Test ParseTime()
-//   * Test one-off timestamp formats
+//   - Pick an example date input: 2018-01-01
+//   - Test ParseDate()
+//   - Pick an example time input: 12:34:56
+//   - Derive a timestamp from date + time
+//   - Test ParseTimestame()
+//   - Test ParseDate()
+//   - Test ParseTime()
+//   - Test one-off timestamp formats
+//
 // * Pick an example time input:
-//   * Test ParseTime()
+//   - Test ParseTime()
 func TestParse(t *testing.T) {
+	var ph pgdate.ParseHelper
 	for _, order := range []pgdate.Order{
 		pgdate.Order_YMD,
 		pgdate.Order_DMY,
@@ -767,14 +768,17 @@ func TestParse(t *testing.T) {
 	} {
 		t.Run(order.String(), func(t *testing.T) {
 			for _, dtc := range dateTestData {
-				dtc.testParseDate(t, dtc.s, order)
+				dtc.testParseDate(t, dtc.s, order, nil)
+				dtc.testParseDate(t, dtc.s, order, &ph)
 
 				// Combine times with dates to create timestamps.
 				for _, ttc := range timeTestData {
 					info := fmt.Sprintf("%s %s", dtc.s, ttc.s)
 					tstc := dtc.concatTime(ttc)
-					tstc.testParseDate(t, info, order)
-					tstc.testParseTime(t, info, order)
+					tstc.testParseDate(t, info, order, nil)
+					tstc.testParseDate(t, info, order, &ph)
+					tstc.testParseTime(t, info, order, nil)
+					tstc.testParseTime(t, info, order, &ph)
 					tstc.testParseTimestamp(t, info, order)
 					tstc.testParseTimestampWithoutTimezone(t, info, order)
 				}
@@ -783,14 +787,16 @@ func TestParse(t *testing.T) {
 			// Test some other timestamps formats we can't create
 			// by just concatenating a date + time string.
 			for _, ttc := range timestampTestData {
-				ttc.testParseTime(t, ttc.s, order)
+				ttc.testParseTime(t, ttc.s, order, nil)
+				ttc.testParseTime(t, ttc.s, order, &ph)
 			}
 		})
 	}
 
 	t.Run("ParseTime", func(t *testing.T) {
 		for _, ttc := range timeTestData {
-			ttc.testParseTime(t, ttc.s, 0 /* order */)
+			ttc.testParseTime(t, ttc.s, 0 /* order */, nil)
+			ttc.testParseTime(t, ttc.s, 0 /* order */, &ph)
 		}
 	})
 }
@@ -834,7 +840,7 @@ func bench(b *testing.B, layout string, s string, locationName string) {
 
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					if _, _, err := pgdate.ParseTimestamp(time.Time{}, pgdate.DateStyle{Order: pgdate.Order_MDY}, benchS); err != nil {
+					if _, _, err := pgdate.ParseTimestamp(time.Time{}, pgdate.DateStyle{Order: pgdate.Order_MDY}, benchS, nil /* h */); err != nil {
 						b.Fatal(err)
 					}
 					b.SetBytes(bytes)
@@ -1039,6 +1045,7 @@ func TestDependsOnContext(t *testing.T) {
 
 	now := time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", 18000))
 	order := pgdate.Order_YMD
+	var ph pgdate.ParseHelper
 	for _, tc := range testCases {
 		t.Run(tc.s, func(t *testing.T) {
 			toStr := func(result interface{}, depOnCtx bool, err error) string {
@@ -1057,16 +1064,43 @@ func TestDependsOnContext(t *testing.T) {
 					t.Errorf("%s: expected '%s', got '%s'", what, expected, actual)
 				}
 			}
-			check("ParseDate", tc.date, toStr(pgdate.ParseDate(now, pgdate.DateStyle{Order: order}, tc.s)))
-			check("ParseTime", tc.time, toStr(pgdate.ParseTime(now, pgdate.DateStyle{Order: order}, tc.s)))
+			check("ParseDate", tc.date, toStr(pgdate.ParseDate(now, pgdate.DateStyle{Order: order}, tc.s, nil)))
+			check("ParseDate", tc.date, toStr(pgdate.ParseDate(now, pgdate.DateStyle{Order: order}, tc.s, &ph)))
+			check("ParseTime", tc.time, toStr(pgdate.ParseTime(now, pgdate.DateStyle{Order: order}, tc.s, nil)))
+			check("ParseTime", tc.time, toStr(pgdate.ParseTime(now, pgdate.DateStyle{Order: order}, tc.s, &ph)))
 			check(
 				"ParseTimeWithoutTimezone", tc.timeNoTZ,
-				toStr(pgdate.ParseTimeWithoutTimezone(now, pgdate.DateStyle{Order: order}, tc.s)),
+				toStr(pgdate.ParseTimeWithoutTimezone(now, pgdate.DateStyle{Order: order}, tc.s, nil /* h */)),
 			)
-			check("ParseTimestamp", tc.timestamp, toStr(pgdate.ParseTimestamp(now, pgdate.DateStyle{Order: order}, tc.s)))
+			check("ParseTimestamp", tc.timestamp, toStr(pgdate.ParseTimestamp(now, pgdate.DateStyle{Order: order}, tc.s, nil /* h */)))
 			check("ParseTimestampWithoutTimezone",
-				tc.timestampNoTZ, toStr(pgdate.ParseTimestampWithoutTimezone(now, pgdate.DateStyle{Order: order}, tc.s)),
+				tc.timestampNoTZ, toStr(pgdate.ParseTimestampWithoutTimezone(now, pgdate.DateStyle{Order: order}, tc.s, nil /* h */)),
 			)
 		})
+	}
+}
+
+var benchDates = [...]string{
+	"1993-05-23",
+	"1993-04-03",
+	"1993-07-28",
+	"1993-04-19",
+	"1993-06-15",
+	"1998-10-22",
+	"1998-07-11",
+	"1998-07-31",
+}
+
+func BenchmarkParseDate(b *testing.B) {
+	var ph pgdate.ParseHelper
+	now := timeutil.Now()
+	ds := pgdate.DefaultDateStyle()
+	for i := 0; i < b.N; i++ {
+		for _, str := range benchDates {
+			_, _, err := pgdate.ParseDate(now, ds, str, &ph)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
 	}
 }

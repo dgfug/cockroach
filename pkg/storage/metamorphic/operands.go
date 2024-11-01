@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metamorphic
 
@@ -223,7 +218,7 @@ func (v *valueGenerator) closeAll() {
 }
 
 func (v *valueGenerator) toString(value []byte) string {
-	return fmt.Sprintf("%s", value)
+	return string(value)
 }
 
 func (v *valueGenerator) parse(input string) []byte {
@@ -345,6 +340,31 @@ func (t *txnGenerator) forEachConflict(
 	}
 }
 
+// truncateSpanForConflicts truncates [key, endKey) to a sub-span that does
+// not conflict with any in-flight writes. If no such span is found, an empty
+// span (i.e. key >= endKey) is returned. Callers are expected to handle that
+// case gracefully.
+func (t *txnGenerator) truncateSpanForConflicts(
+	w readWriterID, txn txnID, key, endKey roachpb.Key,
+) roachpb.Span {
+	// forEachConflict is guaranteed to iterate over conflicts in key order,
+	// with the lowest conflicting key first. Find the first conflict and
+	// truncate the span to that range.
+	t.forEachConflict(w, txn, key, endKey, func(conflict roachpb.Span) bool {
+		if conflict.ContainsKey(key) {
+			key = append([]byte(nil), conflict.EndKey...)
+			return true
+		}
+		endKey = conflict.Key
+		return false
+	})
+	result := roachpb.Span{
+		Key:    key,
+		EndKey: endKey,
+	}
+	return result
+}
+
 func (t *txnGenerator) addWrittenKeySpan(
 	w readWriterID, txn txnID, key roachpb.Key, endKey roachpb.Key,
 ) {
@@ -421,6 +441,10 @@ func (t *txnGenerator) addWrittenKeySpan(
 }
 
 func (t *txnGenerator) trackTransactionalWrite(w readWriterID, txn txnID, key, endKey roachpb.Key) {
+	if len(endKey) > 0 && key.Compare(endKey) >= 0 {
+		// No-op.
+		return
+	}
 	t.addWrittenKeySpan(w, txn, key, endKey)
 	if w == "engine" {
 		return

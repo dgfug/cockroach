@@ -13,7 +13,7 @@ get k
 
 savepoint x
 ----
-1 <noignore>
+2 <noignore>
 
 put k b
 ----
@@ -22,9 +22,13 @@ get k
 ----
 "k" -> b
 
+can-use x
+----
+true
+
 release x
 ----
-2 <noignore>
+3 <noignore>
 
 get k
 ----
@@ -62,7 +66,7 @@ get k
 
 savepoint x
 ----
-1 <noignore>
+2 <noignore>
 
 put k b
 ----
@@ -71,9 +75,13 @@ get k
 ----
 "k" -> b
 
+can-use x
+----
+true
+
 rollback x
 ----
-2 [2-2]
+4 [2-3]
 
 get k
 ----
@@ -106,28 +114,36 @@ put k ar
 
 savepoint x
 ----
-1 <noignore>
+2 <noignore>
 
 put k br
 ----
 
 savepoint y
 ----
-2 <noignore>
+4 <noignore>
 
 put k cr
 ----
 
+can-use y
+----
+true
+
 release y
 ----
-3 <noignore>
+5 <noignore>
 
 put k dr
 ----
 
+can-use x
+----
+true
+
 rollback x
 ----
-4 [2-4]
+7 [2-6]
 
 get k
 ----
@@ -163,28 +179,36 @@ put b d1
 
 savepoint x
 ----
-2 <noignore>
+3 <noignore>
 
 put a d2
 ----
 
+can-use x
+----
+true
+
 rollback x
 ----
-3 [3-3]
+5 [3-4]
 
 put c d1
 ----
 
 savepoint x
 ----
-4 [3-3]
+7 [3-4]
 
 put b 2
 ----
 
+can-use x
+----
+true
+
 rollback x
 ----
-5 [3-3][5-5]
+9 [3-4][7-8]
 
 put d 1
 ----
@@ -246,15 +270,23 @@ put k nop
 
 savepoint x
 ----
-1 <noignore>
+2 <noignore>
+
+can-use x
+----
+true
 
 rollback x
 ----
-1 <noignore>
+3 [2-2]
+
+can-use x
+----
+true
 
 release x
 ----
-1 <noignore>
+3 [2-2]
 
 commit
 ----
@@ -284,13 +316,17 @@ savepoint x
 put k da
 ----
 
-rollback x
+can-use x
 ----
-1 [1-1]
+true
 
 rollback x
 ----
-1 [1-1]
+2 [0-1]
+
+rollback x
+----
+3 [0-2]
 
 get k
 ----
@@ -299,9 +335,13 @@ get k
 put k db
 ----
 
+can-use x
+----
+true
+
 rollback x
 ----
-2 [1-2]
+5 [0-4]
 
 commit
 ----
@@ -333,9 +373,22 @@ retry
 synthetic error: TransactionRetryWithProtoRefreshError: forced retry
 epoch: 0 -> 1
 
+reset
+----
+txn error cleared
+txn id not changed
+
+can-use x
+----
+true
+
 release x
 ----
 0 <noignore>
+
+can-use x
+----
+true
 
 rollback x
 ----
@@ -358,11 +411,15 @@ savepoint x
 
 cput k v bogus_expected
 ----
-(*roachpb.ConditionFailedError) unexpected value
+(*kvpb.ConditionFailedError) unexpected value
+
+can-use x
+----
+true
 
 rollback x
 ----
-1 [1-1]
+1 <noignore>
 
 subtest end
 
@@ -391,7 +448,11 @@ savepoint x
 
 get conflict-key locking nowait
 ----
-(*roachpb.WriteIntentError) conflicting intents on "conflict-key" [reason=wait_policy]
+(*kvpb.WriteIntentError) conflicting locks on "conflict-key" [reason=wait_policy]
+
+can-use x
+----
+true
 
 rollback x
 ----
@@ -399,11 +460,15 @@ rollback x
 
 put conflict-key b nowait
 ----
-(*roachpb.WriteIntentError) conflicting intents on "conflict-key" [reason=wait_policy]
+(*kvpb.WriteIntentError) conflicting locks on "conflict-key" [reason=wait_policy]
+
+can-use x
+----
+true
 
 rollback x
 ----
-1 [1-1]
+1 <noignore>
 
 subtest end
 
@@ -432,7 +497,11 @@ savepoint x
 
 get conflict-key-2 lock-timeout
 ----
-(*roachpb.WriteIntentError) conflicting intents on "conflict-key-2" [reason=lock_timeout]
+(*kvpb.WriteIntentError) conflicting locks on "conflict-key-2" [reason=lock_timeout]
+
+can-use x
+----
+true
 
 rollback x
 ----
@@ -440,11 +509,15 @@ rollback x
 
 put conflict-key-2 b lock-timeout
 ----
-(*roachpb.WriteIntentError) conflicting intents on "conflict-key-2" [reason=lock_timeout]
+(*kvpb.WriteIntentError) conflicting locks on "conflict-key-2" [reason=lock_timeout]
+
+can-use x
+----
+true
 
 rollback x
 ----
-1 [1-1]
+1 <noignore>
 
 subtest end
 
@@ -464,6 +537,10 @@ savepoint x
 inject-error
 ----
 injected error
+
+can-use x
+----
+false
 
 rollback x
 ----
@@ -485,12 +562,25 @@ savepoint x
 
 abort
 ----
-(*roachpb.TransactionRetryWithProtoRefreshError)
+(*kvpb.TransactionRetryWithProtoRefreshError)
+txn id not changed
+
+reset
+----
+txn error cleared
 txn id changed
+
+can-use x
+----
+true
 
 release x
 ----
 0 <noignore>
+
+can-use x
+----
+true
 
 rollback x
 ----
@@ -510,15 +600,19 @@ put k a
 
 savepoint x
 ----
-1 <noignore>
+2 <noignore>
 
 retry
 ----
 synthetic error: TransactionRetryWithProtoRefreshError: forced retry
 epoch: 0 -> 1
 
+can-use x
+----
+false
+
 rollback x
 ----
-(*roachpb.TransactionRetryWithProtoRefreshError) TransactionRetryWithProtoRefreshError: cannot rollback to savepoint after a transaction restart
+(*kvpb.TransactionRetryWithProtoRefreshError) TransactionRetryWithProtoRefreshError: cannot rollback to savepoint after a transaction restart
 
 subtest end

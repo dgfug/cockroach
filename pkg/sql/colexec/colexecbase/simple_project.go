@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase
 
@@ -22,11 +17,10 @@ import (
 // simpleProjectOp is an operator that implements "simple projection" - removal of
 // columns that aren't needed by later operators.
 type simpleProjectOp struct {
-	colexecop.OneInputInitCloserHelper
 	colexecop.NonExplainable
-
+	batches map[coldata.Batch]*projectingBatch
+	colexecop.OneInputInitCloserHelper
 	projection []uint32
-	batches    map[coldata.Batch]*projectingBatch
 	// numBatchesLoggingThreshold is the threshold on the number of items in
 	// 'batches' map at which we will log a message when a new projectingBatch
 	// is created. It is growing exponentially.
@@ -45,7 +39,7 @@ type projectingBatch struct {
 	projection []uint32
 	// colVecs is a lazily populated slice of coldata.Vecs to support returning
 	// these in ColVecs().
-	colVecs []coldata.Vec
+	colVecs []*coldata.Vec
 }
 
 func newProjectionBatch(projection []uint32) *projectingBatch {
@@ -57,16 +51,16 @@ func newProjectionBatch(projection []uint32) *projectingBatch {
 	return p
 }
 
-func (b *projectingBatch) ColVec(i int) coldata.Vec {
+func (b *projectingBatch) ColVec(i int) *coldata.Vec {
 	return b.Batch.ColVec(int(b.projection[i]))
 }
 
-func (b *projectingBatch) ColVecs() []coldata.Vec {
+func (b *projectingBatch) ColVecs() []*coldata.Vec {
 	if b.Batch == coldata.ZeroBatch {
 		return nil
 	}
 	if b.colVecs == nil || len(b.colVecs) != len(b.projection) {
-		b.colVecs = make([]coldata.Vec, len(b.projection))
+		b.colVecs = make([]*coldata.Vec, len(b.projection))
 	}
 	for i := range b.colVecs {
 		b.colVecs[i] = b.Batch.ColVec(int(b.projection[i]))
@@ -78,12 +72,12 @@ func (b *projectingBatch) Width() int {
 	return len(b.projection)
 }
 
-func (b *projectingBatch) AppendCol(col coldata.Vec) {
+func (b *projectingBatch) AppendCol(col *coldata.Vec) {
 	b.Batch.AppendCol(col)
 	b.projection = append(b.projection, uint32(b.Batch.Width())-1)
 }
 
-func (b *projectingBatch) ReplaceCol(col coldata.Vec, idx int) {
+func (b *projectingBatch) ReplaceCol(col *coldata.Vec, idx int) {
 	b.Batch.ReplaceCol(col, int(b.projection[idx]))
 }
 

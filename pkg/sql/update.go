@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,7 +11,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -57,56 +51,6 @@ type updateRun struct {
 	// traceKV caches the current KV tracing flag.
 	traceKV bool
 
-	// computedCols are the columns that need to be (re-)computed as
-	// the result of updating some of the columns in updateCols.
-	computedCols []catalog.Column
-	// computeExprs are the expressions to evaluate to re-compute the
-	// columns in computedCols.
-	computeExprs []tree.TypedExpr
-	// iVarContainerForComputedCols is used as a temporary buffer that
-	// holds the updated values for every column in the source, to
-	// serve as input for indexed vars contained in the computeExprs.
-	iVarContainerForComputedCols schemaexpr.RowIndexedVarContainer
-
-	// sourceSlots is the helper that maps RHS expressions to LHS targets.
-	// This is necessary because there may be fewer RHS expressions than
-	// LHS targets. For example, SET (a, b) = (SELECT 1,2) has:
-	// - 2 targets (a, b)
-	// - 1 source slot, the subquery (SELECT 1, 2).
-	// Each call to extractValues() on a sourceSlot will return 1 or more
-	// datums suitable for assignments. In the example above, the
-	// method would return 2 values.
-	sourceSlots []sourceSlot
-
-	// updateValues will hold the new values for every column
-	// mentioned in the LHS of the SET expressions, in the
-	// order specified by those SET expressions (thus potentially
-	// a different order than the source).
-	updateValues tree.Datums
-
-	// During the update, the expressions provided by the source plan
-	// contain the columns that are being assigned in the order
-	// specified by the table descriptor.
-	//
-	// For example, with UPDATE kv SET v=3, k=2, the source plan will
-	// provide the values in the order k, v (assuming this is the order
-	// the columns are defined in kv's descriptor).
-	//
-	// Then during the update, the columns are updated in the order of
-	// the setExprs (or, equivalently, the order of the sourceSlots),
-	// for the example above that would be v, k. The results
-	// are stored in updateValues above.
-	//
-	// Then at the end of the update, the values need to be presented
-	// back to the TableRowUpdater in the order of the table descriptor
-	// again.
-	//
-	// updateVals is the buffer for this 2nd stage.
-	// updateColsIdx maps the order of the 2nd stage into the order of the 3rd stage.
-	// This provides the inverse mapping of sourceSlots.
-	//
-	updateColsIdx catalog.TableColMap
-
 	// rowIdxToRetIdx is the mapping from the columns in ru.FetchCols to the
 	// columns in the resultRowBuffer. A value of -1 is used to indicate
 	// that the column at that index is not part of the resultRowBuffer
@@ -118,6 +62,10 @@ type updateRun struct {
 	// columns of the target table being returned, that we must pass through
 	// from the input node.
 	numPassthrough int
+
+	// regionLocalInfo handles erroring out the UPDATE when the
+	// enforce_home_region setting is on.
+	regionLocalInfo regionLocalInfoType
 }
 
 func (u *updateNode) startExec(params runParams) error {
@@ -126,11 +74,11 @@ func (u *updateNode) startExec(params runParams) error {
 
 	if u.run.rowsNeeded {
 		u.run.tu.rows = rowcontainer.NewRowContainer(
-			params.EvalContext().Mon.MakeBoundAccount(),
+			params.p.Mon().MakeBoundAccount(),
 			colinfo.ColTypeInfoFromResCols(u.columns),
 		)
 	}
-	return u.run.tu.init(params.ctx, params.p.txn, params.EvalContext(), &params.EvalContext().Settings.SV)
+	return u.run.tu.init(params.ctx, params.p.txn, params.EvalContext())
 }
 
 // Next is required because batchedPlanNode inherits from planNode, but
@@ -220,69 +168,15 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	// expressions.
 	oldValues := sourceVals[:len(u.run.tu.ru.FetchCols)]
 
-	// valueIdx is used in the loop below to map sourceSlots to
-	// entries in updateValues.
-	valueIdx := 0
-
-	// Propagate the values computed for the RHS expressions into
-	// updateValues at the right positions. The positions in
-	// updateValues correspond to the columns named in the LHS
-	// operands for SET.
-	for _, slot := range u.run.sourceSlots {
-		for _, value := range slot.extractValues(sourceVals) {
-			u.run.updateValues[valueIdx] = value
-			valueIdx++
-		}
-	}
-
-	// At this point, we have populated updateValues with the result of
-	// computing the RHS for every assignment.
-	//
-
-	if len(u.run.computeExprs) > 0 {
-		// We now need to (re-)compute the computed column values, using
-		// the updated values above as input.
-		//
-		// This needs to happen in the context of a row containing all the
-		// table's columns as if they had been updated already. This is not
-		// yet reflected neither by oldValues (which contain non-updated values)
-		// nor updateValues (which contain only those columns mentioned in the SET LHS).
-		//
-		// So we need to construct a buffer that groups them together.
-		// iVarContainerForComputedCols does this.
-		copy(u.run.iVarContainerForComputedCols.CurSourceRow, oldValues)
-		for i := range u.run.tu.ru.UpdateCols {
-			id := u.run.tu.ru.UpdateCols[i].GetID()
-			idx := u.run.tu.ru.FetchColIDtoRowIndex.GetDefault(id)
-			u.run.iVarContainerForComputedCols.CurSourceRow[idx] = u.run.
-				updateValues[i]
-		}
-
-		// Now (re-)compute the computed columns.
-		// Note that it's safe to do this in any order, because we currently
-		// prevent computed columns from depending on other computed columns.
-		params.EvalContext().PushIVarContainer(&u.run.iVarContainerForComputedCols)
-		for i := range u.run.computedCols {
-			d, err := u.run.computeExprs[i].Eval(params.EvalContext())
-			if err != nil {
-				params.EvalContext().IVarContainer = nil
-				name := u.run.computedCols[i].GetName()
-				return errors.Wrapf(err, "computed column %s", tree.ErrString((*tree.Name)(&name)))
-			}
-			idx := u.run.updateColsIdx.GetDefault(u.run.computedCols[i].GetID())
-			u.run.updateValues[idx] = d
-		}
-		params.EvalContext().PopIVarContainer()
-	}
+	// The update values follow the fetch values and their order corresponds to the order of ru.UpdateCols.
+	numFetchCols := len(u.run.tu.ru.FetchCols)
+	numUpdateCols := len(u.run.tu.ru.UpdateCols)
+	updateValues := sourceVals[numFetchCols : numFetchCols+numUpdateCols]
 
 	// Verify the schema constraints. For consistency with INSERT/UPSERT
 	// and compatibility with PostgreSQL, we must do this before
 	// processing the CHECK constraints.
-	if err := enforceLocalColumnConstraints(
-		u.run.updateValues,
-		u.run.tu.ru.UpdateCols,
-		true, /* isUpdate */
-	); err != nil {
+	if err := enforceNotNullConstraints(updateValues, u.run.tu.ru.UpdateCols); err != nil {
 		return err
 	}
 
@@ -292,7 +186,8 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	if !u.run.checkOrds.Empty() {
 		checkVals := sourceVals[len(u.run.tu.ru.FetchCols)+len(u.run.tu.ru.UpdateCols)+u.run.numPassthrough:]
 		if err := checkMutationInput(
-			params.ctx, &params.p.semaCtx, params.p.SessionData(), u.run.tu.tableDesc(), u.run.checkOrds, checkVals,
+			params.ctx, params.EvalContext(), &params.p.semaCtx, params.p.SessionData(),
+			u.run.tu.tableDesc(), u.run.checkOrds, checkVals,
 		); err != nil {
 			return err
 		}
@@ -313,18 +208,23 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		}
 	}
 
+	// Error out the update if the enforce_home_region session setting is on and
+	// the row's locality doesn't match the gateway region.
+	if err := u.run.regionLocalInfo.checkHomeRegion(updateValues); err != nil {
+		return err
+	}
+
 	// Queue the insert in the KV batch.
-	newValues, err := u.run.tu.rowForUpdate(params.ctx, oldValues, u.run.updateValues, pm, u.run.traceKV)
+	newValues, err := u.run.tu.rowForUpdate(params.ctx, oldValues, updateValues, pm, u.run.traceKV)
 	if err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
 	if u.run.tu.rows != nil {
-		// The new values can include all columns, the construction of the
-		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
-		// values may contain additional columns for every newly added column
-		// not yet visible. We do not want them to be available for RETURNING.
+		// The new values can include all columns,  so the values may contain
+		// additional columns for every newly added column not yet visible. We do
+		// not want them to be available for RETURNING.
 		//
 		// MakeUpdater guarantees that the first columns of the new values
 		// are those specified u.columns.
@@ -383,53 +283,16 @@ func (u *updateNode) enableAutoCommit() {
 	u.run.tu.enableAutoCommit()
 }
 
-// sourceSlot abstracts the idea that our update sources can either be tuples
-// or scalars. Tuples are for cases such as SET (a, b) = (1, 2) or SET (a, b) =
-// (SELECT 1, 2), and scalars are for situations like SET a = b. A sourceSlot
-// represents how to extract and type-check the results of the right-hand side
-// of a single SET statement. We could treat everything as tuples, including
-// scalars as tuples of size 1, and eliminate this indirection, but that makes
-// the query plan more complex.
-type sourceSlot interface {
-	// extractValues returns a slice of the values this slot is responsible for,
-	// as extracted from the row of results.
-	extractValues(resultRow tree.Datums) tree.Datums
-	// checkColumnTypes compares the types of the results that this slot refers to to the types of
-	// the columns those values will be assigned to. It returns an error if those types don't match up.
-	checkColumnTypes(row []tree.TypedExpr) error
-}
-
-type scalarSlot struct {
-	column      catalog.Column
-	sourceIndex int
-}
-
-func (ss scalarSlot) extractValues(row tree.Datums) tree.Datums {
-	return row[ss.sourceIndex : ss.sourceIndex+1]
-}
-
-func (ss scalarSlot) checkColumnTypes(row []tree.TypedExpr) error {
-	renderedResult := row[ss.sourceIndex]
-	typ := renderedResult.ResolvedType()
-	return colinfo.CheckDatumTypeFitsColumnType(ss.column, typ)
-}
-
-// enforceLocalColumnConstraints asserts the column constraints that do not
-// require data validation from other sources than the row data itself. This
-// currently only includes checking for null values in non-nullable columns.
-func enforceLocalColumnConstraints(row tree.Datums, cols []catalog.Column, isUpdate bool) error {
+// enforceNotNullConstraints enforces NOT NULL column constraints. row and cols
+// must have the same length.
+func enforceNotNullConstraints(row tree.Datums, cols []catalog.Column) error {
+	if len(row) != len(cols) {
+		return errors.AssertionFailedf("expected length of row (%d) and columns (%d) to match",
+			len(row), len(cols))
+	}
 	for i, col := range cols {
 		if !col.IsNullable() && row[i] == tree.DNull {
 			return sqlerrors.NewNonNullViolationError(col.GetName())
-		}
-		if isUpdate {
-			// TODO(mgartner): Remove this once assignment casts are supported
-			// for UPSERTs and UPDATEs.
-			outVal, err := tree.AdjustValueToType(col.GetType(), row[i])
-			if err != nil {
-				return err
-			}
-			row[i] = outVal
 		}
 	}
 	return nil

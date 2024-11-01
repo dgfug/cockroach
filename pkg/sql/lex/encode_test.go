@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lex_test
 
@@ -15,19 +10,18 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 )
 
 func TestByteArrayDecoding(t *testing.T) {
 	const (
-		fmtHex = sessiondatapb.BytesEncodeHex
-		fmtEsc = sessiondatapb.BytesEncodeEscape
-		fmtB64 = sessiondatapb.BytesEncodeBase64
+		fmtHex = lex.BytesEncodeHex
+		fmtEsc = lex.BytesEncodeEscape
+		fmtB64 = lex.BytesEncodeBase64
 	)
 	testData := []struct {
 		in    string
 		auto  bool
-		inFmt sessiondatapb.BytesEncodeFormat
+		inFmt lex.BytesEncodeFormat
 		out   string
 		err   string
 	}{
@@ -65,7 +59,7 @@ func TestByteArrayDecoding(t *testing.T) {
 			if s.auto {
 				dec, err = lex.DecodeRawBytesToByteArrayAuto([]byte(s.in))
 			} else {
-				dec, err = lex.DecodeRawBytesToByteArray(s.in, s.inFmt)
+				dec, err = lex.DecodeRawBytesToByteArray([]byte(s.in), s.inFmt)
 			}
 			if s.err != "" {
 				if err == nil {
@@ -103,10 +97,10 @@ func TestByteArrayEncoding(t *testing.T) {
 
 	for _, s := range testData {
 		t.Run(s.in, func(t *testing.T) {
-			for _, format := range []sessiondatapb.BytesEncodeFormat{
-				sessiondatapb.BytesEncodeHex,
-				sessiondatapb.BytesEncodeEscape,
-				sessiondatapb.BytesEncodeBase64,
+			for _, format := range []lex.BytesEncodeFormat{
+				lex.BytesEncodeHex,
+				lex.BytesEncodeEscape,
+				lex.BytesEncodeBase64,
 			} {
 				t.Run(format.String(), func(t *testing.T) {
 					enc := lex.EncodeByteArrayToRawBytes(s.in, format, false)
@@ -116,7 +110,7 @@ func TestByteArrayEncoding(t *testing.T) {
 						t.Fatalf("encoded %q, expected %q", enc, expEnc)
 					}
 
-					if format == sessiondatapb.BytesEncodeHex {
+					if format == lex.BytesEncodeHex {
 						// Check that the \x also can be skipped.
 						enc2 := lex.EncodeByteArrayToRawBytes(s.in, format, true)
 						if enc[2:] != enc2 {
@@ -125,7 +119,7 @@ func TestByteArrayEncoding(t *testing.T) {
 						enc = enc[2:]
 					}
 
-					dec, err := lex.DecodeRawBytesToByteArray(enc, format)
+					dec, err := lex.DecodeRawBytesToByteArray([]byte(enc), format)
 					if err != nil {
 						t.Fatal(err)
 					}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -51,9 +46,9 @@ func (g *exprsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	}
 }
 
-// type SomeExpr struct {
-//   FieldName FieldType
-// }
+//	type SomeExpr struct {
+//	  FieldName FieldType
+//	}
 func (g *exprsGen) genExprType(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -79,9 +74,9 @@ func (g *exprsGen) genExprType(define *lang.DefineExpr) {
 	}
 }
 
-// func (e *SomeExpr) Op() Operator {
-//   return SomeOp
-// }
+//	func (e *SomeExpr) Op() Operator {
+//	  return SomeOp
+//	}
 func (g *exprsGen) genOpFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 	opType := fmt.Sprintf("%sOp", define.Name)
@@ -91,9 +86,9 @@ func (g *exprsGen) genOpFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) ChildCount() int {
-//   return 1
-// }
+//	func (e *SomeExpr) ChildCount() int {
+//	  return 1
+//	}
 func (g *exprsGen) genChildCountFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -109,13 +104,13 @@ func (g *exprsGen) genChildCountFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) Child(nth int) Expr {
-//   switch nth {
-//   case 0:
-//     return e.FieldName
-//   }
-//   panic(fmt.Sprintf("child index %d is out of range", nth))
-// }
+//	func (e *SomeExpr) Child(nth int) Expr {
+//	  switch nth {
+//	  case 0:
+//	    return e.FieldName
+//	  }
+//	  panic(fmt.Sprintf("child index %d is out of range", nth))
+//	}
 func (g *exprsGen) genChildFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -150,13 +145,13 @@ func (g *exprsGen) genChildFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) ChildName(nth int) string {
-//   switch nth {
-//   case 0:
-//     return "FieldName"
-//   }
-//   panic(fmt.Sprintf("child index %d is out of range", nth))
-// }
+//	func (e *SomeExpr) ChildName(nth int) string {
+//	  switch nth {
+//	  case 0:
+//	    return "FieldName"
+//	  }
+//	  panic(fmt.Sprintf("child index %d is out of range", nth))
+//	}
 func (g *exprsGen) genChildNameFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -176,9 +171,9 @@ func (g *exprsGen) genChildNameFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) Value() interface{} {
-//   return string(*e)
-// }
+//	func (e *SomeExpr) Value() interface{} {
+//	  return string(*e)
+//	}
 func (g *exprsGen) genValueFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -191,13 +186,13 @@ func (g *exprsGen) genValueFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) Visit(visit VisitFunc) Expr {
-//   children := visitChildren(e, visit)
-//   if children != nil {
-//     return &SomeExpr{FieldName: children[0].(*FieldType)}
-//   }
-//   return e
-// }
+//	func (e *SomeExpr) Visit(visit VisitFunc) Expr {
+//	  children := visitChildren(e, visit)
+//	  if children != nil {
+//	    return &SomeExpr{FieldName: children[0].(*FieldType)}
+//	  }
+//	  return e
+//	}
 func (g *exprsGen) genVisitFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -258,9 +253,9 @@ func (g *exprsGen) genVisitFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) Source() *SourceLoc {
-//   return e.Src
-// }
+//	func (e *SomeExpr) Source() *SourceLoc {
+//	  return e.Src
+//	}
 func (g *exprsGen) genSourceFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -273,9 +268,9 @@ func (g *exprsGen) genSourceFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) InferredType() DataType {
-//   return e.Typ
-// }
+//	func (e *SomeExpr) InferredType() DataType {
+//	  return e.Typ
+//	}
 func (g *exprsGen) genInferredType(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -290,11 +285,11 @@ func (g *exprsGen) genInferredType(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) String() string {
-//   var buf bytes.Buffer
-//   e.Format(&buf, 0)
-//   return buf.String()
-// }
+//	func (e *SomeExpr) String() string {
+//	  var buf bytes.Buffer
+//	  e.Format(&buf, 0)
+//	  return buf.String()
+//	}
 func (g *exprsGen) genStringFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 
@@ -305,9 +300,9 @@ func (g *exprsGen) genStringFunc(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
-// func (e *SomeExpr) Format(buf *bytes.Buffer, level int) {
-//   formatExpr(e, buf, level)
-// }
+//	func (e *SomeExpr) Format(buf *bytes.Buffer, level int) {
+//	  formatExpr(e, buf, level)
+//	}
 func (g *exprsGen) genFormatFunc(define *lang.DefineExpr) {
 	exprType := fmt.Sprintf("%sExpr", define.Name)
 

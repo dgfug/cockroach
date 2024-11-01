@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 Package service contains a gRPC service to be used for remote inflight
@@ -24,6 +19,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingservicepb"
 )
 
@@ -43,7 +39,7 @@ func New(tracer *tracing.Tracer) *Service {
 // GetSpanRecordings implements the tracingpb.TraceServer interface.
 //
 // This method iterates over all active root spans registered with the nodes'
-// local inflight span registry, and returns a tracing.Recording for each root
+// local inflight span registry, and returns a tracingpb.Recording for each root
 // span with a matching trace_id.
 func (s *Service) GetSpanRecordings(
 	_ context.Context, request *tracingservicepb.GetSpanRecordingsRequest,
@@ -53,7 +49,8 @@ func (s *Service) GetSpanRecordings(
 		if span.TraceID() != request.TraceID {
 			return nil
 		}
-		recording := span.GetRecording(tracing.RecordingVerbose)
+		trace := span.GetFullRecording(tracingpb.RecordingVerbose)
+		recording := trace.Flatten()
 		if recording != nil {
 			resp.Recordings = append(resp.Recordings,
 				tracingservicepb.GetSpanRecordingsResponse_Recording{RecordedSpans: recording})

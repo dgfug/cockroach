@@ -23,10 +23,10 @@ configurable logging directory.
 The configuration key under the `sinks` key in the YAML
 configuration is `file-groups`. Example configuration:
 
-    sinks:
-       file-groups:           # file group configurations start here
-          health:             # defines one group called "health"
-             channels: HEALTH
+//	sinks:
+//	   file-groups:           # file group configurations start here
+//	      health:             # defines one group called "health"
+//	         channels: HEALTH
 
 Each generated log file is prefixed by the name of the process,
 followed by the name of the group, separated by a hyphen. For example,
@@ -44,24 +44,23 @@ the configurations set in the `file-defaults` section.
 
 For example:
 
-     file-defaults:
-         redactable: false # default: disable redaction markers
-         dir: logs
-     sinks:
-       file-groups:
-         health:
-            channels: HEALTH
-            # This sink has redactable set to false,
-            # as the setting is inherited from file-defaults
-            # unless overridden here.
-            #
-            # Example override:
-            dir: health-logs # override the default 'logs'
+//	file-defaults:
+//	    redactable: false # default: disable redaction markers
+//	    dir: logs
+//	sinks:
+//	  file-groups:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from file-defaults
+//	       # unless overridden here.
+//	       #
+//	       # Example override:
+//	       dir: health-logs # override the default 'logs'
 
 {{site.data.alerts.callout_success}}
 Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 {{site.data.alerts.end}}
-
 
 
 Type-specific configuration options:
@@ -82,6 +81,7 @@ Configuration options shared across all sink types:
 |--|--|
 | `filter` | specifies the default minimum severity for log events to be emitted to this sink, when not otherwise specified by the 'channels' sink attribute. |
 | `format` | the entry format to use. |
+| `format-options` | additional options for the format. |
 | `redact` | whether to strip sensitive information before log events are emitted to this sink. |
 | `redactable` | whether to keep redaction markers in the sink's output. The presence of redaction markers makes it possible to strip sensitive data reliably. |
 | `exit-on-error` | whether the logging system should terminate the process if an error is encountered while writing to this sink. |
@@ -119,25 +119,25 @@ the logging event is dropped.
 The configuration key under the `sinks` key in the YAML
 configuration is `fluent-servers`. Example configuration:
 
-    sinks:
-       fluent-servers:        # fluent configurations start here
-          health:             # defines one sink called "health"
-             channels: HEALTH
-             address: 127.0.0.1:5170
+//	sinks:
+//	   fluent-servers:        # fluent configurations start here
+//	      health:             # defines one sink called "health"
+//	         channels: HEALTH
+//	         address: 127.0.0.1:5170
 
 Every new server sink configured automatically inherits the configurations set in the `fluent-defaults` section.
 
 For example:
 
-     fluent-defaults:
-         redactable: false # default: disable redaction markers
-     sinks:
-       fluent-servers:
-         health:
-            channels: HEALTH
-            # This sink has redactable set to false,
-            # as the setting is inherited from fluent-defaults
-            # unless overridden here.
+//	fluent-defaults:
+//	    redactable: false # default: disable redaction markers
+//	sinks:
+//	  fluent-servers:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from fluent-defaults
+//	       # unless overridden here.
 
 The default output format for Fluent sinks is
 `json-fluent-compact`. The `fluent` variants of the JSON formats
@@ -147,7 +147,6 @@ the non-`fluent` JSON [format variants](log-formats.html) do not include.
 {{site.data.alerts.callout_info}}
 Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 {{site.data.alerts.end}}
-
 
 
 Type-specific configuration options:
@@ -165,6 +164,7 @@ Configuration options shared across all sink types:
 |--|--|
 | `filter` | specifies the default minimum severity for log events to be emitted to this sink, when not otherwise specified by the 'channels' sink attribute. |
 | `format` | the entry format to use. |
+| `format-options` | additional options for the format. |
 | `redact` | whether to strip sensitive information before log events are emitted to this sink. |
 | `redactable` | whether to keep redaction markers in the sink's output. The presence of redaction markers makes it possible to strip sensitive data reliably. |
 | `exit-on-error` | whether the logging system should terminate the process if an error is encountered while writing to this sink. |
@@ -184,25 +184,25 @@ as requests to an HTTP server.
 The configuration key under the `sinks` key in the YAML
 configuration is `http-servers`. Example configuration:
 
-     sinks:
-        http-servers:
-           health:
-              channels: HEALTH
-              address: http://127.0.0.1
+//	sinks:
+//	   http-servers:
+//	      health:
+//	         channels: HEALTH
+//	         address: http://127.0.0.1
 
 Every new server sink configured automatically inherits the configuration set in the `http-defaults` section.
 
 For example:
 
-     http-defaults:
-         redactable: false # default: disable redaction markers
-     sinks:
-       http-servers:
-         health:
-            channels: HEALTH
-            # This sink has redactable set to false,
-            # as the setting is inherited from fluent-defaults
-            # unless overridden here.
+//	http-defaults:
+//	    redactable: false # default: disable redaction markers
+//	sinks:
+//	  http-servers:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from fluent-defaults
+//	       # unless overridden here.
 
 The default output format for HTTP sinks is
 `json-compact`. [Other supported formats.](log-formats.html)
@@ -210,7 +210,6 @@ The default output format for HTTP sinks is
 {{site.data.alerts.callout_info}}
 Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 {{site.data.alerts.end}}
-
 
 
 Type-specific configuration options:
@@ -223,6 +222,9 @@ Type-specific configuration options:
 | `unsafe-tls` | enables certificate authentication to be bypassed. Defaults to false. Inherited from `http-defaults.unsafe-tls` if not specified. |
 | `timeout` | the HTTP timeout. Defaults to 0 for no timeout. Inherited from `http-defaults.timeout` if not specified. |
 | `disable-keep-alives` | causes the logging sink to re-establish a new connection for every outgoing log message. This option is intended for testing only and can cause excessive network overhead in production systems. Inherited from `http-defaults.disable-keep-alives` if not specified. |
+| `headers` | a list of headers to attach to each HTTP request Inherited from `http-defaults.headers` if not specified. |
+| `file-based-headers` | a list of headers with filepaths whose contents are attached to each HTTP request Inherited from `http-defaults.file-based-headers` if not specified. |
+| `compression` | can be "none" or "gzip" to enable gzip compression. Set to "gzip" by default. Inherited from `http-defaults.compression` if not specified. |
 
 
 Configuration options shared across all sink types:
@@ -231,6 +233,7 @@ Configuration options shared across all sink types:
 |--|--|
 | `filter` | specifies the default minimum severity for log events to be emitted to this sink, when not otherwise specified by the 'channels' sink attribute. |
 | `format` | the entry format to use. |
+| `format-options` | additional options for the format. |
 | `redact` | whether to strip sensitive information before log events are emitted to this sink. |
 | `redactable` | whether to keep redaction markers in the sink's output. The presence of redaction markers makes it possible to strip sensitive data reliably. |
 | `exit-on-error` | whether the logging system should terminate the process if an error is encountered while writing to this sink. |
@@ -250,9 +253,9 @@ process.
 The configuration key under the `sinks` key in the YAML configuration
 is `stderr`. Example configuration:
 
-    sinks:
-       stderr:           # standard error sink configuration starts here
-          channels: DEV
+//	sinks:
+//	   stderr:           # standard error sink configuration starts here
+//	      channels: DEV
 
 {{site.data.alerts.callout_info}}
 The server start-up messages are still emitted at the start of the standard error
@@ -275,13 +278,12 @@ when `capture-stray-errors` is disabled, since the standard error stream can the
 contain an arbitrary interleaving of non-formatted error data.
 
 
-
 Type-specific configuration options:
 
 | Field | Description |
 |--|--|
 | `channels` | the list of logging channels that use this sink. See the [channel selection configuration](#channel-format) section for details.  |
-| `no-color` | forces the omission of VT color codes in the output even when stderr is a terminal. |
+| `no-color` | forces the omission of VT color codes in the output even when stderr is a terminal. This option is deprecated; its effects are equivalent to 'format-options: {colors: none}'. |
 
 
 Configuration options shared across all sink types:
@@ -290,6 +292,7 @@ Configuration options shared across all sink types:
 |--|--|
 | `filter` | specifies the default minimum severity for log events to be emitted to this sink, when not otherwise specified by the 'channels' sink attribute. |
 | `format` | the entry format to use. |
+| `format-options` | additional options for the format. |
 | `redact` | whether to strip sensitive information before log events are emitted to this sink. |
 | `redactable` | whether to keep redaction markers in the sink's output. The presence of redaction markers makes it possible to strip sensitive data reliably. |
 | `exit-on-error` | whether the logging system should terminate the process if an error is encountered while writing to this sink. |
@@ -384,26 +387,28 @@ etc.
 Buffering may be configured with the following fields. It may also be explicitly
 set to "NONE" to disable buffering. Example configuration:
 
-    file-defaults:
-       dir: logs
-       buffering:
-          max-staleness: 20s
-          flush-trigger-size: 25KB
-    sinks:
-       file-groups:
-          health:
-             channels: HEALTH
-             buffering:
-                max-staleness: 5s  # Override max-staleness for this sink.
-          ops:
-             channels: OPS
-             buffering: NONE  # Disable buffering for this sink.
+//	file-defaults:
+//	   dir: logs
+//	   buffering:
+//	      max-staleness: 20s
+//	      flush-trigger-size: 25KB
+//	      max-buffer-size: 10MB
+//	sinks:
+//	   file-groups:
+//	      health:
+//	         channels: HEALTH
+//	         buffering:
+//	            max-staleness: 5s  # Override max-staleness for this sink.
+//	      ops:
+//	         channels: OPS
+//	         buffering: NONE  # Disable buffering for this sink.
 
 
 | Field | Description |
 |--|--|
 | `max-staleness` | the maximum time a log message will sit in the buffer before a flush is triggered. |
 | `flush-trigger-size` | the number of bytes that will trigger the buffer to flush. |
-| `max-in-flight` | the maximum number of buffered flushes before messages start being dropped. |
+| `max-buffer-size` | the limit on the size of the messages that are buffered. If this limit is exceeded, messages are dropped. The limit is expected to be higher than FlushTriggerSize. A buffer is flushed as soon as FlushTriggerSize is reached, and a new buffer is created once the flushing is started. Only one flushing operation is active at a time. |
+| `format` | describes how the buffer output should be formatted. Currently 2 options: newline: default option - separates buffer entries with newline char json-array: separates entries with ',' and wraps buffer contents in square brackets |
 
 

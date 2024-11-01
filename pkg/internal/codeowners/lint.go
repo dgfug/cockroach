@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package codeowners
 
@@ -60,11 +55,15 @@ func LintEverythingIsOwned(
 	skip := map[string]struct{}{
 		filepath.Join("ccl", "ccl_init.go"): {},
 		filepath.Join("node_modules"):       {},
-		filepath.Join("yarn-vendor"):        {},
 		"Makefile":                          {},
 		"BUILD.bazel":                       {},
 		".gitignore":                        {},
 		"README.md":                         {},
+	}
+	skipGlobs := []string{
+		"#*#", // editor backup files.
+		"*~",  // editor backup files.
+		".*",  // .DS_Store, vim temp files, etc.
 	}
 
 	// Map of (unowned dir relative to walkRoot) -> (triggering file relative to walkRoot).
@@ -91,6 +90,7 @@ func LintEverythingIsOwned(
 			// the file itself as unowned, but most of the time we have
 			// one owner for the directory and also the failures get less
 			// noisy by tracking per-directory.
+			debug("found unowned file: %s", path)
 			parts := strings.Split(path, string(filepath.Separator))
 			var ok bool
 			for i := range parts {
@@ -102,7 +102,7 @@ func LintEverythingIsOwned(
 				}
 			}
 			if !ok {
-				debug("unowned: %s", path)
+				debug("adding unowned: %s", path)
 				unowned[filepath.Dir(path)] = path
 			}
 		}
@@ -125,20 +125,39 @@ func LintEverythingIsOwned(
 				return err
 			}
 
-			if _, ok := skip[relPath]; ok {
-				debug("skipping %s", relPath)
-				if info.IsDir() {
-					return filepath.SkipDir
+			if relPath != "." {
+				// We only apply filtering to relPath entries that are not ".".
+				// Directory-level matching for directory a/b is handled when entry "b"
+				// is matched inside directory "a".
+
+				if _, ok := skip[relPath]; ok {
+					debug("skipping %s", relPath)
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
 				}
-				return nil
-			}
-			fname := filepath.Base(relPath)
-			if _, ok := skip[fname]; ok {
-				debug("skipping %s", relPath)
-				if info.IsDir() {
-					return filepath.SkipDir
+				for _, g := range skipGlobs {
+					ok, err := filepath.Match(g, relPath)
+					if err != nil {
+						return err
+					}
+					if ok {
+						debug("skipping %s", relPath)
+						if info.IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
+					}
 				}
-				return nil
+				fname := filepath.Base(relPath)
+				if _, ok := skip[fname]; ok {
+					debug("skipping %s", relPath)
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
 			}
 
 			if info.IsDir() {

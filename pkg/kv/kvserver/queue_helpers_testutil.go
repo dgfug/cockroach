@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -26,11 +21,11 @@ func (bq *baseQueue) testingAdd(
 	return bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority)
 }
 
-func forceScanAndProcess(s *Store, q *baseQueue) error {
+func forceScanAndProcess(ctx context.Context, s *Store, q *baseQueue) error {
 	// Check that the system config is available. It is needed by many queues. If
 	// it's not available, some queues silently fail to process any replicas,
 	// which is undesirable for this method.
-	if _, err := s.GetConfReader(); err != nil {
+	if _, err := s.GetConfReader(ctx); err != nil {
 		return errors.Wrap(err, "unable to retrieve conf reader")
 	}
 
@@ -39,12 +34,12 @@ func forceScanAndProcess(s *Store, q *baseQueue) error {
 		return true
 	})
 
-	q.DrainQueue(s.stopper)
+	q.DrainQueue(ctx, s.stopper)
 	return nil
 }
 
 func mustForceScanAndProcess(ctx context.Context, s *Store, q *baseQueue) {
-	if err := forceScanAndProcess(s, q); err != nil {
+	if err := forceScanAndProcess(ctx, s, q); err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
 }
@@ -52,7 +47,7 @@ func mustForceScanAndProcess(ctx context.Context, s *Store, q *baseQueue) {
 // ForceReplicationScanAndProcess iterates over all ranges and
 // enqueues any that need to be replicated.
 func (s *Store) ForceReplicationScanAndProcess() error {
-	return forceScanAndProcess(s, s.replicateQueue.baseQueue)
+	return forceScanAndProcess(context.TODO(), s, s.replicateQueue.baseQueue)
 }
 
 // MustForceReplicaGCScanAndProcess iterates over all ranges and enqueues any that
@@ -70,7 +65,7 @@ func (s *Store) MustForceMergeScanAndProcess() {
 // ForceSplitScanAndProcess iterates over all ranges and enqueues any that
 // may need to be split.
 func (s *Store) ForceSplitScanAndProcess() error {
-	return forceScanAndProcess(s, s.splitQueue.baseQueue)
+	return forceScanAndProcess(context.TODO(), s, s.splitQueue.baseQueue)
 }
 
 // MustForceRaftLogScanAndProcess iterates over all ranges and enqueues any that
@@ -83,55 +78,67 @@ func (s *Store) MustForceRaftLogScanAndProcess() {
 // any that need time series maintenance, then processes the time series
 // maintenance queue.
 func (s *Store) ForceTimeSeriesMaintenanceQueueProcess() error {
-	return forceScanAndProcess(s, s.tsMaintenanceQueue.baseQueue)
+	return forceScanAndProcess(context.TODO(), s, s.tsMaintenanceQueue.baseQueue)
 }
 
 // ForceRaftSnapshotQueueProcess iterates over all ranges, enqueuing
 // any that need raft snapshots, then processes the raft snapshot
 // queue.
 func (s *Store) ForceRaftSnapshotQueueProcess() error {
-	return forceScanAndProcess(s, s.raftSnapshotQueue.baseQueue)
+	return forceScanAndProcess(context.TODO(), s, s.raftSnapshotQueue.baseQueue)
 }
 
 // ForceConsistencyQueueProcess runs all the ranges through the consistency
 // queue.
 func (s *Store) ForceConsistencyQueueProcess() error {
-	return forceScanAndProcess(s, s.consistencyQueue.baseQueue)
+	return forceScanAndProcess(context.TODO(), s, s.consistencyQueue.baseQueue)
+}
+
+// ForceLeaseQueueScanAndProcess iterates over all ranges and
+// enqueues any that need to have leases transfered.
+func (s *Store) ForceLeaseQueueProcess() error {
+	return forceScanAndProcess(context.TODO(), s, s.leaseQueue.baseQueue)
 }
 
 // The methods below can be used to control a store's queues. Stopping a queue
 // is only meant to happen in tests.
 
-func (s *Store) setGCQueueActive(active bool) {
-	s.gcQueue.SetDisabled(!active)
+func (s *Store) testingSetGCQueueActive(active bool) {
+	s.mvccGCQueue.SetDisabled(!active)
 }
-func (s *Store) setMergeQueueActive(active bool) {
+
+// TestingSetLeaseQueueActive controls activating the lease queue. Only intended for
+// tests.
+func (s *Store) TestingSetLeaseQueueActive(active bool) {
+	s.leaseQueue.SetDisabled(!active)
+}
+func (s *Store) testingSetMergeQueueActive(active bool) {
 	s.mergeQueue.SetDisabled(!active)
 }
-func (s *Store) setRaftLogQueueActive(active bool) {
+func (s *Store) testingSetRaftLogQueueActive(active bool) {
 	s.raftLogQueue.SetDisabled(!active)
 }
-func (s *Store) setReplicaGCQueueActive(active bool) {
+func (s *Store) testingSetReplicaGCQueueActive(active bool) {
 	s.replicaGCQueue.SetDisabled(!active)
 }
 
-// SetReplicateQueueActive controls the replication queue. Only
+// TestingSetReplicateQueueActive controls the replication queue. Only
 // intended for tests.
-func (s *Store) SetReplicateQueueActive(active bool) {
+func (s *Store) TestingSetReplicateQueueActive(active bool) {
 	s.replicateQueue.SetDisabled(!active)
 }
-func (s *Store) setSplitQueueActive(active bool) {
+func (s *Store) TestingSetSplitQueueActive(active bool) {
 	s.splitQueue.SetDisabled(!active)
 }
-func (s *Store) setTimeSeriesMaintenanceQueueActive(active bool) {
+func (s *Store) testingSetTimeSeriesMaintenanceQueueActive(active bool) {
 	s.tsMaintenanceQueue.SetDisabled(!active)
 }
-func (s *Store) setRaftSnapshotQueueActive(active bool) {
+func (s *Store) testingSetRaftSnapshotQueueActive(active bool) {
 	s.raftSnapshotQueue.SetDisabled(!active)
 }
-func (s *Store) setConsistencyQueueActive(active bool) {
+func (s *Store) testingSetConsistencyQueueActive(active bool) {
 	s.consistencyQueue.SetDisabled(!active)
 }
-func (s *Store) setScannerActive(active bool) {
+func (s *Store) testingSetScannerActive(active bool) {
 	s.scanner.SetDisabled(!active)
 }

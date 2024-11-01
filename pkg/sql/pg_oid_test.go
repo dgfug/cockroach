@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -29,18 +24,18 @@ func TestDefaultOid(t *testing.T) {
 	}{
 		{
 			1,
-			tree.NewDOid(tree.DInt(1)),
+			tree.NewDOid(1),
 		},
 		{
 			2,
-			tree.NewDOid(tree.DInt(2)),
+			tree.NewDOid(2),
 		},
 	}
 
 	for _, tc := range testCases {
 		oid := tableOid(tc.id)
-		if tc.oid.DInt != oid.DInt {
-			t.Fatalf("expected oid %d(%32b), got %d(%32b)", tc.oid.DInt, tc.oid.DInt, oid.DInt, oid.DInt)
+		if tc.oid.Oid != oid.Oid {
+			t.Fatalf("expected oid %d(%32b), got %d(%32b)", tc.oid.Oid, tc.oid.Oid, oid.Oid, oid.Oid)
 		}
 	}
 }

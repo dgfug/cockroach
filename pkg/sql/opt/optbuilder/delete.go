@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -28,18 +24,46 @@ import (
 // mutations are applied, or the order of any returned rows (i.e. it won't
 // become a physical property required of the Delete operator).
 func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope) {
-	// UX friendliness safeguard.
-	if del.Where == nil && b.evalCtx.SessionData().SafeUpdates {
-		panic(pgerror.DangerousStatementf("DELETE without WHERE clause"))
-	}
-
 	if del.OrderBy != nil && del.Limit == nil {
 		panic(pgerror.Newf(pgcode.Syntax,
 			"DELETE statement requires LIMIT when ORDER BY is used"))
 	}
 
+	// UX friendliness safeguard.
+	if del.Where == nil && del.Limit == nil && b.evalCtx.SessionData().SafeUpdates {
+		panic(pgerror.DangerousStatementf("DELETE without WHERE or LIMIT clause"))
+	}
+
+	batch := del.Batch
+	if batch != nil {
+		var hasSize bool
+		for i, param := range batch.Params {
+			switch param.(type) {
+			case *tree.SizeBatchParam:
+				if hasSize {
+					panic(pgerror.Newf(pgcode.Syntax, "invalid parameter at index %d, SIZE already specified", i))
+				}
+				hasSize = true
+			}
+		}
+		if hasSize {
+			// TODO(ecwall): remove when DELETE BATCH is supported
+			panic(pgerror.Newf(pgcode.Syntax,
+				"DELETE BATCH (SIZE <size>) not implemented"))
+		}
+		// TODO(ecwall): remove when DELETE BATCH is supported
+		panic(pgerror.Newf(pgcode.Syntax,
+			"DELETE BATCH not implemented"))
+	}
+
 	// Find which table we're working on, check the permissions.
 	tab, depName, alias, refColumns := b.resolveTableForMutation(del.Table, privilege.DELETE)
+
+	if tab.IsVirtualTable() {
+		panic(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot delete from view \"%s\"", tab.Name(),
+		))
+	}
 
 	if refColumns != nil {
 		panic(pgerror.Newf(pgcode.Syntax,
@@ -50,7 +74,7 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	b.checkPrivilege(depName, tab, privilege.SELECT)
 
 	// Check if this table has already been mutated in another subquery.
-	b.checkMultipleMutations(tab, false /* simpleInsert */)
+	b.checkMultipleMutations(tab, generalMutation)
 
 	var mb mutationBuilder
 	mb.init(b, "delete", tab, alias)
@@ -62,11 +86,14 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	//   ORDER BY <order-by> LIMIT <limit>
 	//
 	// All columns from the delete table will be projected.
-	mb.buildInputForDelete(inScope, del.Table, del.Where, del.Limit, del.OrderBy)
+	mb.buildInputForDelete(inScope, del.Table, del.Where, del.Using, del.Limit, del.OrderBy)
+
+	// Project row-level BEFORE triggers for DELETE.
+	mb.buildRowLevelBeforeTriggers(tree.TriggerEventDelete)
 
 	// Build the final delete statement, including any returned expressions.
 	if resultsNeeded(del.Returning) {
-		mb.buildDelete(*del.Returning.(*tree.ReturningExprs))
+		mb.buildDelete(del.Returning.(*tree.ReturningExprs))
 	} else {
 		mb.buildDelete(nil /* returning */)
 	}
@@ -76,13 +103,20 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 
 // buildDelete constructs a Delete operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildDelete(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildDelete(returning *tree.ReturningExprs) {
 	mb.buildFKChecksAndCascadesForDelete()
+
+	mb.buildRowLevelAfterTriggers(opt.DeleteOp)
 
 	// Project partial index DEL boolean columns.
 	mb.projectPartialIndexDelCols()
 
 	private := mb.makeMutationPrivate(returning != nil)
+	for _, col := range mb.extraAccessibleCols {
+		if col.id != 0 {
+			private.PassthroughCols = append(private.PassthroughCols, col.id)
+		}
+	}
 	mb.outScope.expr = mb.b.factory.ConstructDelete(
 		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
 	)

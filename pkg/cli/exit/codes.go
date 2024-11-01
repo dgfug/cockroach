@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package exit
 
@@ -61,6 +56,12 @@ func LoggingNetCollectorUnavailable() Code { return Code{9} }
 // DiskFull (10) indicates an emergency shutdown in response to a
 // store's full disk.
 func DiskFull() Code { return Code{10} }
+
+// Killed (138) indicates the server process was terminated with SIGUSR1.
+//
+// Orchestration code should handle this exit code the same way it would handle
+// the process being killed via SIGKILL.
+func Killed() Code { return Code{138} }
 
 // Codes that are specific to client commands follow. It's possible
 // for codes to be reused across separate client or server commands.

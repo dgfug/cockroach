@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -24,14 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/marusama/semaphore"
 	"github.com/stretchr/testify/require"
@@ -42,10 +35,11 @@ func TestExternalSort(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -95,20 +89,14 @@ func TestExternalSort(t *testing.T) {
 						if tc.k == 0 || tc.k >= uint64(len(tc.tuples)) {
 							semsToCheck = append(semsToCheck, sem)
 						}
-						// TODO(asubiotto): Pass in the testing.T of the caller to this
-						//  function and do substring matching on the test name to
-						//  conditionally explicitly call Close() on the sorter (through
-						//  result.ToClose) in cases where it is know the sorter will not
-						//  be drained.
 						sorter, closers, err := createDiskBackedSorter(
 							ctx, flowCtx, input, tc.typs, tc.ordCols, tc.matchLen, tc.k, func() {},
 							numForcedRepartitions, false /* delegateFDAcquisition */, queueCfg, sem,
 							&monitorRegistry,
 						)
-						// Check that the sort was added as a Closer.
-						// TODO(asubiotto): Explicitly Close when testing.T is passed into
-						//  this constructor and we do a substring match.
-						require.Equal(t, 1, len(closers))
+						// Check that the sort as well as the disk spiller were
+						// added as Closers.
+						require.Equal(t, 2, len(closers))
 						return sorter, err
 					})
 				for i, sem := range semsToCheck {
@@ -124,10 +112,11 @@ func TestExternalSortRandomized(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -207,7 +196,7 @@ func TestExternalSortRandomized(t *testing.T) {
 							)
 							// TODO(asubiotto): Explicitly Close when testing.T is passed into
 							//  this constructor and we do a substring match.
-							require.Equal(t, 1, len(closers))
+							require.Equal(t, 2, len(closers))
 							return sorter, err
 						})
 					for i, sem := range semsToCheck {
@@ -219,150 +208,16 @@ func TestExternalSortRandomized(t *testing.T) {
 	}
 }
 
-// TestExternalSortMemoryAccounting is a sanity check for the memory accounting
-// done throughout the external sort operation. At the moment there are a lot of
-// known problems with the memory accounting, so the test is not very strict.
-// The goal of the test is to make sure that the total maximum reported memory
-// usage (as would have been collected as stats) is within reasonable range. It
-// additionally checks that the number of partitions created is as expected too.
-//
-// It is impossible to come up with the exact numbers here due to the randomness
-// of appends (which happen when setting values on Bytes vectors) and due to the
-// randomization of coldata.BatchSize() value.
-func TestExternalSortMemoryAccounting(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderStress(t, "the test is very memory-intensive and is likely to OOM under stress")
-	ctx := context.Background()
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
-	defer evalCtx.Stop(ctx)
-	flowCtx := &execinfra.FlowCtx{
-		EvalCtx: &evalCtx,
-		Cfg: &execinfra.ServerConfig{
-			Settings: st,
-		},
-		DiskMonitor: testDiskMonitor,
-	}
-	rng, _ := randutil.NewTestRand()
-
-	// Use the Bytes type because we can control the size of values with it
-	// easily.
-	typs := []*types.T{types.Bytes}
-	ordCols := []execinfrapb.Ordering_Column{{ColIdx: 0}}
-
-	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
-	defer cleanup()
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
-	var monitorRegistry colexecargs.MonitorRegistry
-	defer monitorRegistry.Close(ctx)
-
-	numInMemoryBufferedBatches := 8 + rng.Intn(4)
-	// numNewPartitions determines the expected number of partitions created as
-	// a result of consuming the input (i.e. not as a result of the repeated
-	// merging).
-	numNewPartitions := 4 + rng.Intn(3)
-	numTotalBatches := numInMemoryBufferedBatches * numNewPartitions
-	batchLength := coldata.BatchSize()
-	batch := testAllocator.NewMemBatchWithFixedCapacity(typs, batchLength)
-	// Use such a size for a single value that the memory footprint of a single
-	// batch is relatively large.
-	singleTupleSize := mon.DefaultPoolAllocationSize
-	singleTupleValue := make([]byte, singleTupleSize)
-	for i := 0; i < batchLength; i++ {
-		batch.ColVec(0).Bytes().Set(i, singleTupleValue)
-	}
-	batch.SetLength(batchLength)
-	numFDs := colexecop.ExternalSorterMinPartitions + rng.Intn(3)
-	// The memory limit in the external sorter is divided as follows:
-	// - BufferSizeBytes for each of the disk queues is subtracted right away
-	// - the remaining part is divided evenly between the sorter and the merger
-	// - the sorter gives 80% of its half to the buffer.
-	bufferMemoryLimit := colmem.GetBatchMemSize(batch) * int64(numInMemoryBufferedBatches)
-	memoryLimit := int64(queueCfg.BufferSizeBytes*numFDs) + int64(float64(bufferMemoryLimit)/0.8*2)
-	flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
-	input := colexectestutils.NewFiniteBatchSource(testAllocator, batch, typs, numTotalBatches)
-
-	var spilled bool
-	// We multiply by 16 because the external sorter divides by this number.
-	sem := colexecop.NewTestingSemaphore(numFDs * 16)
-	sorter, closers, err := createDiskBackedSorter(
-		ctx, flowCtx, []colexecop.Operator{input}, typs, ordCols,
-		0 /* matchLen */, 0 /* k */, func() { spilled = true },
-		0 /* numForcedRepartitions */, false, /* delegateFDAcquisition */
-		queueCfg, sem, &monitorRegistry,
-	)
-	require.NoError(t, err)
-	require.Equal(t, 1, len(closers))
-
-	sorter.Init(ctx)
-	for b := sorter.Next(); b.Length() > 0; b = sorter.Next() {
-	}
-	for _, c := range closers {
-		require.NoError(t, c.Close())
-	}
-
-	require.True(t, spilled)
-	require.Zero(t, sem.GetCount(), "sem still reports open FDs")
-
-	externalSorter := MaybeUnwrapInvariantsChecker(sorter).(*diskSpillerBase).diskBackedOp.(*externalSorter)
-	numPartitionsCreated := externalSorter.currentPartitionIdx
-	// This maximum can be achieved when we have minimum required number of FDs
-	// as follows: we expect that each newly created partition contains about
-	// numInMemoryBufferedBatches number of batches with only the partition that
-	// is the result of the repeated merge growing with count as a multiple of
-	// numInMemoryBufferedBatches (first merge = 2x, second merge = 3x, third
-	// merge 4x, etc, so we expect 2*numNewPartitions-1 partitions).
-	expMaxTotalPartitionsCreated := 2*numNewPartitions - 1
-	// Because of the fact that we are creating partitions slightly larger than
-	// memoryLimit in size and because of our "after the fact" memory
-	// accounting, we might create less partitions than maximum defined above
-	// (e.g., if numNewPartitions is 4, then we will create 3 partitions when
-	// batch size is 3).
-	expMinTotalPartitionsCreated := numNewPartitions - 1
-	require.GreaterOrEqualf(t, numPartitionsCreated, expMinTotalPartitionsCreated,
-		"didn't create enough partitions: actual %d, min expected %d",
-		numPartitionsCreated, expMinTotalPartitionsCreated,
-	)
-	require.GreaterOrEqualf(t, expMaxTotalPartitionsCreated, numPartitionsCreated,
-		"created too many partitions: actual %d, max expected %d",
-		numPartitionsCreated, expMaxTotalPartitionsCreated,
-	)
-
-	monitors := monitorRegistry.GetMonitors()
-
-	// Check that the monitor for the in-memory sorter reports lower than
-	// memoryLimit max usage (the allocation that would put the monitor over the
-	// limit must have been denied with OOM error).
-	require.Greater(t, memoryLimit, monitors[0].MaximumBytes())
-
-	// Use the same calculation as we have when computing stats (maximums are
-	// summed).
-	var totalMaxMemUsage int64
-	for i := range monitors {
-		if monitors[i].Resource() == mon.MemoryResource {
-			totalMaxMemUsage += monitors[i].MaximumBytes()
-		}
-	}
-	// We cannot guarantee a fixed value, so we use an allowed range.
-	expMin := memoryLimit
-	expMax := int64(float64(memoryLimit) * 1.6)
-	require.GreaterOrEqualf(t, totalMaxMemUsage, expMin, "minimum memory bound not satisfied: "+
-		"actual %d, expected min %d", totalMaxMemUsage, expMin)
-	require.GreaterOrEqualf(t, expMax, totalMaxMemUsage, "maximum memory bound not satisfied: "+
-		"actual %d, expected max %d", totalMaxMemUsage, expMax)
-}
-
 func BenchmarkExternalSort(b *testing.B) {
 	defer leaktest.AfterTest(b)()
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -456,14 +311,12 @@ func createDiskBackedSorter(
 	sorterSpec := &execinfrapb.SorterSpec{
 		OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		OrderingMatchLen: uint32(matchLen),
+		Limit:            int64(k),
 	}
 	spec := &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: typs}},
 		Core: execinfrapb.ProcessorCoreUnion{
 			Sorter: sorterSpec,
-		},
-		Post: execinfrapb.PostProcessSpec{
-			Limit: k,
 		},
 		ResultTypes: typs,
 	}

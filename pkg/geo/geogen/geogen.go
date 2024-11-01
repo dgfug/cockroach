@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package geogen provides utilities for generating various geospatial types.
 package geogen
@@ -163,14 +158,14 @@ func RandomLineString(
 	if rng.Intn(10) == 0 {
 		return geom.NewLineString(layout).SetSRID(int(srid))
 	}
-	numCoords := 3 + rand.Intn(10)
+	numCoords := 3 + rng.Intn(10)
 	randCoords := RandomValidLinearRingCoords(rng, numCoords, randomBounds, layout)
 
 	// Extract a random substring from the LineString by truncating at the ends.
 	var minTrunc, maxTrunc int
 	// Ensure we always have at least two points.
 	for maxTrunc-minTrunc < 2 {
-		minTrunc, maxTrunc = rand.Intn(numCoords+1), rand.Intn(numCoords+1)
+		minTrunc, maxTrunc = rng.Intn(numCoords+1), rng.Intn(numCoords+1)
 		// Ensure maxTrunc >= minTrunc.
 		if minTrunc > maxTrunc {
 			minTrunc, maxTrunc = maxTrunc, minTrunc

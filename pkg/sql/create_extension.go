@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -35,7 +30,7 @@ func (n *createExtensionNode) unimplementedExtensionError(issue int) error {
 	name := n.CreateExtension.Name
 	return unimplemented.NewWithIssueDetailf(
 		issue,
-		"CREATE EXTENSION "+name,
+		"CREATE EXTENSION "+string(name),
 		"extension %q is not yet supported",
 		name,
 	)
@@ -43,13 +38,17 @@ func (n *createExtensionNode) unimplementedExtensionError(issue int) error {
 
 func (n *createExtensionNode) startExec(params runParams) error {
 	switch n.CreateExtension.Name {
-	case "postgis":
-		telemetry.Inc(sqltelemetry.CreateExtensionCounter(n.CreateExtension.Name))
+	case "postgis",
+		"pg_trgm",
+		"fuzzystrmatch",
+		"pgcrypto",
+		"uuid-ossp",
+		"vector":
+		telemetry.Inc(sqltelemetry.CreateExtensionCounter(string(n.CreateExtension.Name)))
 		return nil
 	case "postgis_raster",
 		"postgis_topology",
 		"postgis_sfcgal",
-		"fuzzystrmatch",
 		"address_standardizer",
 		"address_standardizer_data_us",
 		"postgis_tiger_geocoder":
@@ -63,8 +62,6 @@ func (n *createExtensionNode) startExec(params runParams) error {
 		return n.unimplementedExtensionError(41276)
 	case "postgres_fdw":
 		return n.unimplementedExtensionError(20249)
-	case "pg_trgm":
-		return n.unimplementedExtensionError(51137)
 	case "adminpack",
 		"amcheck",
 		"auth_delay",
@@ -85,7 +82,6 @@ func (n *createExtensionNode) startExec(params runParams) error {
 		"pageinspect",
 		"passwordcheck",
 		"pg_buffercache",
-		"pgcrypto",
 		"pg_freespacemap",
 		"pg_prewarm",
 		"pgrowlocks",
@@ -102,11 +98,10 @@ func (n *createExtensionNode) startExec(params runParams) error {
 		"tsm_system_rows",
 		"tsm_system_time",
 		"unaccent",
-		"uuid-ossp",
 		"xml2":
 		return n.unimplementedExtensionError(54516)
 	}
-	return pgerror.Newf(pgcode.UndefinedParameter, "unknown extension: %q", n.CreateExtension.Name)
+	return pgerror.Newf(pgcode.UndefinedParameter, "unknown extension: %s", n.CreateExtension.Name)
 }
 
 func (n *createExtensionNode) Next(params runParams) (bool, error) { return false, nil }

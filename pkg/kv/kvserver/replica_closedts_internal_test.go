@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -19,8 +14,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -29,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -49,7 +45,7 @@ func TestSideTransportClosed(t *testing.T) {
 		curSet     bool
 		nextSet    bool
 		recSet     bool
-		applied    ctpb.LAI
+		applied    kvpb.LeaseAppliedIndex
 		sufficient hlc.Timestamp
 
 		expClosed          hlc.Timestamp
@@ -441,10 +437,10 @@ func TestSideTransportClosedMonotonic(t *testing.T) {
 	for i := 0; i < observers; i++ {
 		g.Go(func() error {
 			var lastTS hlc.Timestamp
-			var lastLAI ctpb.LAI
+			var lastLAI kvpb.LeaseAppliedIndex
 			for atomic.LoadInt32(&done) == 0 {
 				// Determine which lease applied index to use.
-				var lai ctpb.LAI
+				var lai kvpb.LeaseAppliedIndex
 				switch rand.Intn(3) {
 				case 0:
 					lai = lastLAI
@@ -498,7 +494,7 @@ var _ sidetransportReceiver = &mockReceiver{}
 // GetClosedTimestamp is part of the sidetransportReceiver interface.
 func (r *mockReceiver) GetClosedTimestamp(
 	ctx context.Context, rangeID roachpb.RangeID, leaseholderNode roachpb.NodeID,
-) (hlc.Timestamp, ctpb.LAI) {
+) (hlc.Timestamp, kvpb.LeaseAppliedIndex) {
 	r.Lock()
 	defer r.Unlock()
 	return r.ts, r.lai
@@ -509,7 +505,8 @@ func (r *mockReceiver) HTML() string {
 	return ""
 }
 
-// Test that r.GetClosedTimestamp() mixes its sources of information correctly.
+// Test that r.GetCurrentClosedTimestamp() mixes its sources of information
+// correctly.
 func TestReplicaClosedTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -519,10 +516,10 @@ func TestReplicaClosedTimestamp(t *testing.T) {
 
 	for _, test := range []struct {
 		name                string
-		applied             ctpb.LAI
+		applied             kvpb.LeaseAppliedIndex
 		raftClosed          hlc.Timestamp
 		sidetransportClosed hlc.Timestamp
-		sidetransportLAI    ctpb.LAI
+		sidetransportLAI    kvpb.LeaseAppliedIndex
 		expClosed           hlc.Timestamp
 	}{
 		{
@@ -558,16 +555,21 @@ func TestReplicaClosedTimestamp(t *testing.T) {
 			r.ts = test.sidetransportClosed
 			r.lai = test.sidetransportLAI
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(123) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 123)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
 			cfg.TestingKnobs.DontCloseTimestamps = true
 			cfg.ClosedTimestampReceiver = &r
-			tc.StartWithStoreConfig(t, stopper, cfg)
+			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
+			tc.repl.raftMu.Lock()
 			tc.repl.mu.Lock()
-			tc.repl.mu.state.RaftClosedTimestamp = test.raftClosed
-			tc.repl.mu.state.LeaseAppliedIndex = uint64(test.applied)
-			tc.repl.mu.Unlock()
-			require.Equal(t, test.expClosed, tc.repl.GetClosedTimestamp(ctx))
+			defer tc.repl.mu.Unlock()
+			tc.repl.shMu.state.RaftClosedTimestamp = test.raftClosed
+			tc.repl.shMu.state.LeaseAppliedIndex = test.applied
+			tc.repl.raftMu.Unlock()
+			// NB: don't release the mutex to make this test a bit more resilient to
+			// problems that could arise should something propose a command to this
+			// replica whose LeaseAppliedIndex we've mutated.
+			require.Equal(t, test.expClosed, tc.repl.getCurrentClosedTimestampLocked(ctx, hlc.Timestamp{} /* sufficient */))
 		})
 	}
 }
@@ -651,21 +653,34 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 
 			// Create a single range.
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
 			cfg.TestingKnobs.DontCloseTimestamps = true
-			tc.StartWithStoreConfig(t, stopper, cfg)
+			// Make sure commands are visible by the time they are applied. Otherwise
+			// this test can be flaky because we might have a lease applied index
+			// assigned to a command that is committed but not applied yet. When we
+			// then "commit" a command out of band, and the stored command gets
+			// applied, their indexes will clash and cause a fatal error.
+			cfg.TestingKnobs.DisableCanAckBeforeApplication = true
+			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 			// Write an intent.
-			txn := roachpb.MakeTransaction("test", intentKey, 0, intentTS, 0)
-			pArgs := putArgs(intentKey, []byte("val"))
-			assignSeqNumsForReqs(&txn, &pArgs)
-			_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &pArgs)
-			require.Nil(t, pErr)
+			txn := roachpb.MakeTransaction("test", intentKey, 0, 0, intentTS, 0, 0, 0, false /* omitInRangefeeds */)
+			{
+				pArgs := putArgs(intentKey, []byte("val"))
+				assignSeqNumsForReqs(&txn, &pArgs)
+				_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), kvpb.Header{Txn: &txn}, &pArgs)
+				require.Nil(t, pErr)
+			}
+
+			// NB: the put is now visible, in particular it has applied, thanks
+			// to the testing knobs in this test.
 
 			// Inject a closed timestamp.
+			tc.repl.raftMu.Lock()
 			tc.repl.mu.Lock()
-			tc.repl.mu.state.RaftClosedTimestamp = test.closedTS
+			tc.repl.shMu.state.RaftClosedTimestamp = test.closedTS
+			tc.repl.raftMu.Unlock()
 			tc.repl.mu.Unlock()
 
 			// Issue a QueryResolvedTimestamp request.
@@ -690,32 +705,32 @@ func TestQueryResolvedTimestampResolvesAbandonedIntents(t *testing.T) {
 
 	// Create a single range.
 	var tc testContext
-	tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-	cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+	tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+	cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
 	cfg.TestingKnobs.DontCloseTimestamps = true
-	tc.StartWithStoreConfig(t, stopper, cfg)
+	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	// Write an intent.
 	key := roachpb.Key("a")
-	txn := roachpb.MakeTransaction("test", key, 0, ts10, 0)
+	txn := roachpb.MakeTransaction("test", key, 0, 0, ts10, 0, 0, 0, false /* omitInRangefeeds */)
 	pArgs := putArgs(key, []byte("val"))
 	assignSeqNumsForReqs(&txn, &pArgs)
-	_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &pArgs)
+	_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), kvpb.Header{Txn: &txn}, &pArgs)
 	require.Nil(t, pErr)
 
 	intentExists := func() bool {
 		t.Helper()
 		gArgs := getArgs(key)
 		assignSeqNumsForReqs(&txn, &gArgs)
-		resp, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &gArgs)
+		resp, pErr := kv.SendWrappedWith(ctx, tc.Sender(), kvpb.Header{Txn: &txn}, &gArgs)
 
-		abortErr, ok := pErr.GetDetail().(*roachpb.TransactionAbortedError)
-		if ok && abortErr.Reason == roachpb.ABORT_REASON_ABORT_SPAN {
+		abortErr, ok := pErr.GetDetail().(*kvpb.TransactionAbortedError)
+		if ok && abortErr.Reason == kvpb.ABORT_REASON_ABORT_SPAN {
 			// When the intent is resolved, it will be replaced by an abort span entry.
 			return false
 		}
 		require.Nil(t, pErr)
-		require.NotNil(t, resp.(*roachpb.GetResponse).Value)
+		require.NotNil(t, resp.(*kvpb.GetResponse).Value)
 		return true
 	}
 	require.True(t, intentExists())
@@ -726,9 +741,12 @@ func TestQueryResolvedTimestampResolvesAbandonedIntents(t *testing.T) {
 	require.Nil(t, pErr)
 	require.True(t, intentExists())
 
-	// Inject a closed timestamp.
+	// Bump the clock and inject a closed timestamp.
+	tc.manualClock.AdvanceTo(ts20.GoTime())
+	tc.repl.raftMu.Lock()
 	tc.repl.mu.Lock()
-	tc.repl.mu.state.RaftClosedTimestamp = ts20
+	tc.repl.shMu.state.RaftClosedTimestamp = ts20
+	tc.repl.raftMu.Unlock()
 	tc.repl.mu.Unlock()
 
 	// Issue a QueryResolvedTimestamp request. Should return resolved timestamp
@@ -786,7 +804,7 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 
 		for _, test := range []struct {
 			name           string
-			reqs           []roachpb.Request
+			reqs           []kvpb.Request
 			minTSBound     hlc.Timestamp
 			maxTSBound     hlc.Timestamp
 			withTS         bool // error case
@@ -798,19 +816,19 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 		}{
 			{
 				name:       "empty key, min bound below closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts20,
 				expRespTS:  ts30,
 			},
 			{
 				name:       "empty key, min bound equal to closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts30,
 				expRespTS:  ts30,
 			},
 			{
 				name:       "empty key, min bound above closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts40,
 				expRespTS:  ts40, // for !strict case
 				expErr: ifStrict(
@@ -820,127 +838,127 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 			},
 			{
 				name:       "intent key, min bound below intent ts, min bound below closed ts",
-				reqs:       []roachpb.Request{&getIntentKey},
+				reqs:       []kvpb.Request{&getIntentKey},
 				minTSBound: ts10,
 				expRespTS:  ts20.Prev(),
 			},
 			{
 				name:       "intent key, min bound equal to intent ts, min bound below closed ts",
-				reqs:       []roachpb.Request{&getIntentKey},
+				reqs:       []kvpb.Request{&getIntentKey},
 				minTSBound: ts20,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "intent key, min bound above intent ts, min bound equal to closed ts",
-				reqs:       []roachpb.Request{&getIntentKey},
+				reqs:       []kvpb.Request{&getIntentKey},
 				minTSBound: ts30,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "intent key, min bound above intent ts, min bound above closed ts",
-				reqs:       []roachpb.Request{&getIntentKey},
+				reqs:       []kvpb.Request{&getIntentKey},
 				minTSBound: ts40,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "empty and intent key, min bound below intent ts, min bound below closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey, &getIntentKey},
+				reqs:       []kvpb.Request{&getEmptyKey, &getIntentKey},
 				minTSBound: ts10,
 				expRespTS:  ts20.Prev(),
 			},
 			{
 				name:       "empty and intent key, min bound equal to intent ts, min bound below closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey, &getIntentKey},
+				reqs:       []kvpb.Request{&getEmptyKey, &getIntentKey},
 				minTSBound: ts20,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "empty and intent key, min bound above intent ts, min bound equal to closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey, &getIntentKey},
+				reqs:       []kvpb.Request{&getEmptyKey, &getIntentKey},
 				minTSBound: ts30,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "empty and intent key, min bound above intent ts, min bound above closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey, &getIntentKey},
+				reqs:       []kvpb.Request{&getEmptyKey, &getIntentKey},
 				minTSBound: ts40,
 				expErr: ifStrict(
 					"bounded staleness read .* could not be satisfied",
-					"conflicting intents on .*",
+					"conflicting locks on .*",
 				),
 			},
 			{
 				name:       "empty key, min and max bound below closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts10,
 				maxTSBound: ts20.Next(),
 				expRespTS:  ts20,
 			},
 			{
 				name:       "intent key, min and max bound below intent ts, min and max bound below closed ts",
-				reqs:       []roachpb.Request{&getIntentKey},
+				reqs:       []kvpb.Request{&getIntentKey},
 				minTSBound: ts10,
 				maxTSBound: ts10.Next(),
 				expRespTS:  ts10,
 			},
 			{
 				name:       "empty and intent key, min and max bound below intent ts, min and max bound below closed ts",
-				reqs:       []roachpb.Request{&getEmptyKey, &getIntentKey},
+				reqs:       []kvpb.Request{&getEmptyKey, &getIntentKey},
 				minTSBound: ts10,
 				maxTSBound: ts10.Next(),
 				expRespTS:  ts10,
 			},
 			{
 				name:   "req without min_timestamp_bound",
-				reqs:   []roachpb.Request{&getEmptyKey},
+				reqs:   []kvpb.Request{&getEmptyKey},
 				expErr: "MinTimestampBound must be set in batch",
 			},
 			{
 				name:       "req with equal min_timestamp_bound and max_timestamp_bound",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts10,
 				maxTSBound: ts10,
 				expErr:     "MaxTimestampBound, if set in batch, must be greater than MinTimestampBound",
 			},
 			{
 				name:       "req with inverted min_timestamp_bound and max_timestamp_bound",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts20,
 				maxTSBound: ts10,
 				expErr:     "MaxTimestampBound, if set in batch, must be greater than MinTimestampBound",
 			},
 			{
 				name:       "req with timestamp",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts20,
 				withTS:     true,
 				expErr:     "MinTimestampBound and Timestamp cannot both be set in batch",
 			},
 			{
 				name:       "req with transaction",
-				reqs:       []roachpb.Request{&getEmptyKey},
+				reqs:       []kvpb.Request{&getEmptyKey},
 				minTSBound: ts20,
 				withTxn:    true,
 				expErr:     "MinTimestampBound and Txn cannot both be set in batch",
 			},
 			{
 				name:           "req with wrong range",
-				reqs:           []roachpb.Request{&getEmptyKey},
+				reqs:           []kvpb.Request{&getEmptyKey},
 				minTSBound:     ts20,
 				withWrongRange: true,
 				expErr:         "r2 was not found on s1",
@@ -952,27 +970,30 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 
 				// Create a single range.
 				var tc testContext
-				tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-				cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+				tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+				cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
 				cfg.TestingKnobs.DontCloseTimestamps = true
-				tc.StartWithStoreConfig(t, stopper, cfg)
+				cfg.TestingKnobs.DisableCanAckBeforeApplication = true
+				tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 				// Write an intent.
-				txn := roachpb.MakeTransaction("test", intentKey, 0, intentTS, 0)
+				txn := roachpb.MakeTransaction("test", intentKey, 0, 0, intentTS, 0, 0, 0, false /* omitInRangefeeds */)
 				pArgs := putArgs(intentKey, []byte("val"))
 				assignSeqNumsForReqs(&txn, &pArgs)
-				_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{Txn: &txn}, &pArgs)
+				_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), kvpb.Header{Txn: &txn}, &pArgs)
 				require.Nil(t, pErr)
 
 				// Inject a closed timestamp.
+				tc.repl.raftMu.Lock()
 				tc.repl.mu.Lock()
-				tc.repl.mu.state.RaftClosedTimestamp = closedTS
+				tc.repl.shMu.state.RaftClosedTimestamp = closedTS
+				tc.repl.raftMu.Unlock()
 				tc.repl.mu.Unlock()
 
 				// Construct and issue the request.
-				var ba roachpb.BatchRequest
+				ba := &kvpb.BatchRequest{}
 				ba.RangeID = tc.rangeID
-				ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+				ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 					MinTimestampBound:       test.minTSBound,
 					MinTimestampBoundStrict: strict,
 					MaxTimestampBound:       test.maxTSBound,
@@ -1035,19 +1056,19 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 	setup := func(t *testing.T, tc *testContext) hlc.Timestamp {
 		// Write values and intents.
 		val := []byte("val")
-		send := func(h roachpb.Header, args roachpb.Request) {
+		send := func(h kvpb.Header, args kvpb.Request) {
 			_, pErr := kv.SendWrappedWith(ctx, tc.Sender(), h, args)
 			require.Nil(t, pErr)
 		}
 		writeValue := func(k string, ts int64) {
 			pArgs := putArgs(roachpb.Key(k), val)
-			send(roachpb.Header{Timestamp: makeTS(ts)}, &pArgs)
+			send(kvpb.Header{Timestamp: makeTS(ts)}, &pArgs)
 		}
 		writeIntent := func(k string, ts int64) {
-			txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, makeTS(ts), 0)
+			txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, 0, makeTS(ts), 0, 0, 0, false /* omitInRangefeeds */)
 			pArgs := putArgs(roachpb.Key(k), val)
 			assignSeqNumsForReqs(&txn, &pArgs)
-			send(roachpb.Header{Txn: &txn}, &pArgs)
+			send(kvpb.Header{Txn: &txn}, &pArgs)
 		}
 		writeValue("a", 9)
 		writeValue("b", 20)
@@ -1059,8 +1080,10 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 		writeValue("h", 7)
 
 		// Inject a closed timestamp.
+		tc.repl.raftMu.Lock()
 		tc.repl.mu.Lock()
-		tc.repl.mu.state.RaftClosedTimestamp = makeTS(30)
+		tc.repl.shMu.state.RaftClosedTimestamp = makeTS(30)
+		tc.repl.raftMu.Unlock()
 		tc.repl.mu.Unlock()
 
 		// Return the timestamp of the earliest intent.
@@ -1074,8 +1097,9 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 	//  get:  [g]
 	//  get:  [h]
 	//
-	makeReq := func(maxKeys int) (ba roachpb.BatchRequest) {
-		ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+	makeReq := func(maxKeys int) *kvpb.BatchRequest {
+		ba := &kvpb.BatchRequest{}
+		ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 			MinTimestampBound: makeTS(5),
 		}
 		ba.WaitPolicy = lock.WaitPolicy_Error
@@ -1129,10 +1153,11 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 
 			// Create a single range.
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
 			cfg.TestingKnobs.DontCloseTimestamps = true
-			tc.StartWithStoreConfig(t, stopper, cfg)
+			cfg.TestingKnobs.DisableCanAckBeforeApplication = true
+			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 			// Set up the test.
 			earliestIntentTS := setup(t, &tc)
@@ -1161,11 +1186,11 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 			for i, ru := range br.Responses {
 				req := ru.GetInner()
 				switch v := req.(type) {
-				case *roachpb.ScanResponse:
+				case *kvpb.ScanResponse:
 					for _, kv := range v.Rows {
 						respKeys = append(respKeys, string(kv.Key))
 					}
-				case *roachpb.GetResponse:
+				case *kvpb.GetResponse:
 					if v.Value.IsPresent() {
 						respKeys = append(respKeys, string(ba.Requests[i].GetGet().Key))
 					}

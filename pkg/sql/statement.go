@@ -1,27 +1,24 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // Statement contains a statement with optional expected result columns and metadata.
 type Statement struct {
-	parser.Statement
+	statements.Statement[tree.Statement]
 
 	StmtNoConstants string
 	StmtSummary     string
-	QueryID         ClusterWideID
+	QueryID         clusterunique.ID
 
 	ExpectedTypes colinfo.ResultColumns
 
@@ -38,16 +35,18 @@ type Statement struct {
 	Prepared *PreparedStatement
 }
 
-func makeStatement(parserStmt parser.Statement, queryID ClusterWideID) Statement {
+func makeStatement(
+	parserStmt statements.Statement[tree.Statement], queryID clusterunique.ID, fmtFlags tree.FmtFlags,
+) Statement {
 	return Statement{
 		Statement:       parserStmt,
-		StmtNoConstants: formatStatementHideConstants(parserStmt.AST),
-		StmtSummary:     formatStatementSummary(parserStmt.AST),
+		StmtNoConstants: formatStatementHideConstants(parserStmt.AST, fmtFlags),
+		StmtSummary:     formatStatementSummary(parserStmt.AST, fmtFlags),
 		QueryID:         queryID,
 	}
 }
 
-func makeStatementFromPrepared(prepared *PreparedStatement, queryID ClusterWideID) Statement {
+func makeStatementFromPrepared(prepared *PreparedStatement, queryID clusterunique.ID) Statement {
 	return Statement{
 		Statement:       prepared.Statement,
 		Prepared:        prepared,

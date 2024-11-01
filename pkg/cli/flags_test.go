@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -16,27 +11,31 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStdFlagToPflag(t *testing.T) {
@@ -52,29 +51,6 @@ func TestStdFlagToPflag(t *testing.T) {
 			t.Errorf("unable to find \"%s\"", f.Name)
 		}
 	})
-}
-
-func TestNoLinkForbidden(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Verify that the cockroach binary doesn't depend on certain packages.
-	buildutil.VerifyNoImports(t,
-		"github.com/cockroachdb/cockroach/pkg/cmd/cockroach", true,
-		[]string{
-			"testing",  // defines flags
-			"go/build", // probably not something we want in the main binary
-			"github.com/cockroachdb/cockroach/pkg/security/securitytest", // contains certificates
-		},
-		[]string{
-			"github.com/cockroachdb/cockroach/pkg/testutils", // meant for testing code only
-		},
-		// Sentry and the errors library use go/build to determine
-		// the list of source directories (used to strip the source prefix
-		// in stack trace reports).
-		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/sentry-go",
-		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/errors/withstack",
-	)
 }
 
 func TestCacheFlagValue(t *testing.T) {
@@ -138,51 +114,128 @@ func TestClusterNameFlag(t *testing.T) {
 	}
 }
 
-func TestSQLMemoryPoolFlagValue(t *testing.T) {
+func TestMemoryPoolFlagValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Avoid leaking configuration changes after the test ends.
-	defer initCLIDefaults()
-
-	f := startCmd.Flags()
-
-	// Check absolute values.
-	testCases := []struct {
-		value    string
-		expected int64
+	for _, tc := range []struct {
+		flag   string
+		config *int64
 	}{
-		{"100MB", 100 * 1000 * 1000},
-		{".5GiB", 512 * 1024 * 1024},
-		{"1.3", 1},
+		{flag: "--max-sql-memory", config: &serverCfg.MemoryPoolSize},
+		{flag: "--max-tsdb-memory", config: &serverCfg.TimeSeriesServerConfig.QueryMemoryMax},
+	} {
+		t.Run(tc.flag, func(t *testing.T) {
+			// Avoid leaking configuration changes after the test ends.
+			defer initCLIDefaults()
+
+			f := startCmd.Flags()
+
+			// Check absolute values.
+			testCases := []struct {
+				value    string
+				expected int64
+			}{
+				{"100MB", 100 * 1000 * 1000},
+				{".5GiB", 512 * 1024 * 1024},
+				{"1.3", 1},
+			}
+			for _, c := range testCases {
+				args := []string{tc.flag, c.value}
+				if err := f.Parse(args); err != nil {
+					t.Fatal(err)
+				}
+				if c.expected != *tc.config {
+					t.Errorf("expected %d, but got %d", c.expected, tc.config)
+				}
+			}
+
+			for _, c := range []string{".30", "0.3"} {
+				args := []string{tc.flag, c}
+				if err := f.Parse(args); err != nil {
+					t.Fatal(err)
+				}
+
+				// Check fractional values.
+				maxMem, err := status.GetTotalMemory(context.Background())
+				if err != nil {
+					t.Logf("total memory unknown: %v", err)
+					return
+				}
+				expectedLow := (maxMem * 28) / 100
+				expectedHigh := (maxMem * 32) / 100
+				if *tc.config < expectedLow || *tc.config > expectedHigh {
+					t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, *tc.config)
+				}
+			}
+		})
 	}
-	for _, c := range testCases {
-		args := []string{"--max-sql-memory", c.value}
-		if err := f.Parse(args); err != nil {
-			t.Fatal(err)
-		}
-		if c.expected != serverCfg.MemoryPoolSize {
-			t.Errorf("expected %d, but got %d", c.expected, serverCfg.MemoryPoolSize)
-		}
+}
+
+func TestGetDefaultGoMemLimitValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	maxMem, err := status.GetTotalMemory(context.Background())
+	if err != nil {
+		t.Logf("total memory unknown: %v", err)
+		return
+	}
+	if maxMem < 1<<30 /* 1GiB */ {
+		// The test assumes that it is running on a machine with at least 1GiB
+		// of RAM.
+		skip.IgnoreLint(t)
 	}
 
-	for _, c := range []string{".30", "0.3"} {
-		args := []string{"--max-sql-memory", c}
-		if err := f.Parse(args); err != nil {
-			t.Fatal(err)
-		}
+	// highCachePercentage is such that --cache would be set too high resulting
+	// in the upper bound on the goMemLimit becoming negative, so we'd use the
+	// lower bound.
+	highCachePercentage := defaultGoMemLimitMaxTotalSystemMemUsage/defaultGoMemLimitCacheSlopMultiple + 0.02
 
-		// Check fractional values.
-		maxMem, err := status.GetTotalMemory(context.Background())
-		if err != nil {
-			t.Logf("total memory unknown: %v", err)
-			return
-		}
-		expectedLow := (maxMem * 28) / 100
-		expectedHigh := (maxMem * 32) / 100
-		if serverCfg.MemoryPoolSize < expectedLow || serverCfg.MemoryPoolSize > expectedHigh {
-			t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, serverCfg.MemoryPoolSize)
-		}
+	for i, tc := range []struct {
+		maxSQLMemory string
+		cache        string
+		expected     int64
+	}{
+		{
+			maxSQLMemory: "100MiB",
+			cache:        "100MiB",
+			// The default calculation says 225MiB which is smaller than the
+			// lower bound, so we use the latter.
+			expected: defaultGoMemLimitMinValue,
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        "100MiB",
+			// The default 2.25x of --max-sql-memory.
+			expected: defaultGoMemLimitSQLMultiple * 200 << 20, /* 450MiB */
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        fmt.Sprintf("%.2f", highCachePercentage),
+			expected:     defaultGoMemLimitMinValue,
+		},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			// Avoid leaking configuration changes after the test ends.
+			defer initCLIDefaults()
+
+			f := startCmd.Flags()
+
+			args := []string{
+				"--max-sql-memory", tc.maxSQLMemory,
+				"--cache", tc.cache,
+			}
+			if err := f.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			limit := getDefaultGoMemLimit(context.Background())
+			// Allow for some imprecision since we're dealing with float
+			// arithmetic but the result is converted to integer.
+			if diff := tc.expected - limit; diff > 1 || diff < -1 {
+				t.Errorf("expected %d, but got %d", tc.expected, limit)
+			}
+		})
 	}
 }
 
@@ -194,23 +247,25 @@ func TestClockOffsetFlagValue(t *testing.T) {
 	defer initCLIDefaults()
 
 	f := startCmd.Flags()
-	testData := []struct {
-		args     []string
-		expected time.Duration
+	testCases := []struct {
+		args            []string
+		expectMax       time.Duration
+		expectTolerated time.Duration
 	}{
-		{nil, base.DefaultMaxClockOffset},
-		{[]string{"--max-offset", "200ms"}, 200 * time.Millisecond},
+		{nil, 500 * time.Millisecond, 400 * time.Millisecond},
+		{[]string{"--max-offset", "100ms"}, 100 * time.Millisecond, 80 * time.Millisecond},
+		{[]string{"--disable-max-offset-check"}, base.DefaultMaxClockOffset, 0},
+		{[]string{"--max-offset", "100ms", "--disable-max-offset-check"}, 100 * time.Millisecond, 0},
 	}
 
-	for i, td := range testData {
-		initCLIDefaults()
+	for _, tc := range testCases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			initCLIDefaults()
 
-		if err := f.Parse(td.args); err != nil {
-			t.Fatal(err)
-		}
-		if td.expected != time.Duration(serverCfg.MaxOffset) {
-			t.Errorf("%d. MaxOffset expected %v, but got %v", i, td.expected, serverCfg.MaxOffset)
-		}
+			require.NoError(t, f.Parse(tc.args))
+			require.Equal(t, tc.expectMax, time.Duration(serverCfg.MaxOffset))
+			require.Equal(t, tc.expectTolerated, serverCfg.ToleratedOffset())
+		})
 	}
 }
 
@@ -222,28 +277,23 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 	defer initCLIDefaults()
 
 	// Prepare a dummy default certificate directory.
-	defCertsDirPath, err := ioutil.TempDir("", "defCerts")
-	if err != nil {
-		t.Fatal(err)
-	}
+	defCertsDirPath := t.TempDir()
 	defCertsDirPath, _ = filepath.Abs(defCertsDirPath)
 	cleanup := securitytest.CreateTestCerts(defCertsDirPath)
 	defer func() { _ = cleanup() }()
 
 	// Prepare a custom certificate directory.
-	testCertsDirPath, err := ioutil.TempDir("", "customCerts")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testCertsDirPath := t.TempDir()
 	testCertsDirPath, _ = filepath.Abs(testCertsDirPath)
 	cleanup2 := securitytest.CreateTestCerts(testCertsDirPath)
 	defer func() { _ = cleanup2() }()
 
-	anyCmd := []string{"sql", "quit"}
-	anyNonSQL := []string{"quit", "init"}
+	anyCmd := []string{"sql", "node drain"}
+	anyClientNonSQLCmd := []string{"gen haproxy"}
+	anyNonSQL := []string{"node drain", "init"}
 	anySQL := []string{"sql"}
 	sqlShell := []string{"sql"}
-	anyNonSQLShell := []string{"quit"}
+	anyNonSQLShell := []string{"node drain"}
 	anyImportCmd := []string{"import db pgdump", "import table pgdump"}
 
 	testData := []struct {
@@ -266,7 +316,7 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyNonSQLShell, []string{"--url=postgresql://foo/bar"}, []string{"--host=foo" /*db ignored*/}, "", ""},
 
 		{anySQL, []string{"--url=postgresql://foo@"}, []string{"--user=foo"}, "", ""},
-		{anyNonSQL, []string{"--url=postgresql://foo@bar"}, []string{"--host=bar" /*user ignored*/}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo@bar"}, []string{"--user=foo", "--host=bar"}, "", ""},
 
 		{sqlShell, []string{"--url=postgresql://a@b:12345/d"}, []string{"--user=a", "--host=b", "--port=12345", "--database=d"}, "", ""},
 		{sqlShell, []string{"--url=postgresql://a@b:c/d"}, nil, `invalid port ":c" after host`, ""},
@@ -331,6 +381,15 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/loh.crt"}, nil, `invalid file name for "sslrootcert": expected .* got .*`, ""},
 		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslcert=blih/loh.crt"}, nil, `invalid file name for "sslcert": expected .* got .*`, ""},
 		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslkey=blih/loh.crt"}, nil, `invalid file name for "sslkey": expected .* got .*`, ""},
+		// Check that client commands take username into account when enforcing
+		// client cert names. Concretely, it's looking for 'timapples' in the client
+		// cert key file name, not 'root'.
+		{anyClientNonSQLCmd, []string{"--url=postgresql://timapples@foo?sslmode=verify-full&sslkey=/certs/client.roachprod.key"}, nil, `invalid file name for "sslkey": expected "client.timapples.key", got .*`, ""},
+
+		// Check that not specifying a certs dir will cause Go to use root trust store.
+		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo"}, "", ""},
+		{anySQL, []string{"--url=postgresql://foo?sslmode=verify-ca"}, []string{"--host=foo"}, "", ""},
+		{anySQL, []string{"--url=postgresql://foo?sslmode=require"}, []string{"--host=foo"}, "", ""},
 	}
 
 	type capturedFlags struct {
@@ -351,10 +410,10 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 		}
 		return capturedFlags{
 			insecure:     baseCfg.Insecure,
-			connUser:     cliCtx.sqlConnUser,
-			connDatabase: cliCtx.sqlConnDBName,
-			connHost:     cliCtx.clientConnHost,
-			connPort:     cliCtx.clientConnPort,
+			connUser:     cliCtx.clientOpts.User,
+			connDatabase: cliCtx.clientOpts.Database,
+			connHost:     cliCtx.clientOpts.ServerHost,
+			connPort:     cliCtx.clientOpts.ServerPort,
 			certsDir:     certsDir,
 		}
 	}
@@ -460,56 +519,44 @@ func TestServerConnSettings(t *testing.T) {
 		expectedAdvertiseAddr string
 		expSQLAddr            string
 		expSQLAdvAddr         string
-		expTenantAddr         string
-		expTenantAdvAddr      string
 	}{
 		{[]string{"start"},
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
-			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "192.168.0.111"},
-			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", ":"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":" + base.DefaultPort, ":" + base.DefaultPort,
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:"},
-			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", ":12345"},
 			":12345", ":12345",
 			":12345", ":12345",
-			":12345", ":12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345"},
-			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
 		},
 		{[]string{"start", "--listen-addr", "[::1]"},
 			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
 			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
-			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "[::1]:12345"},
 			"[::1]:12345", "[::1]:12345",
 			"[::1]:12345", "[::1]:12345",
-			"[::1]:12345", "[::1]:12345",
 		},
 		{[]string{"start", "--listen-addr", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
-			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
 		},
@@ -517,10 +564,8 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--listen-addr", "my.host.name"},
 			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
 			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
-			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "myhostname"},
-			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
 		},
@@ -529,89 +574,72 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--sql-addr", "127.0.0.1"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", ":1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			":1234", ":1234",
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "127.0.0.1:1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"127.0.0.1:1234", "127.0.0.1:1234",
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "[::2]"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 		{[]string{"start", "--sql-addr", "[::2]:1234"},
 			":" + base.DefaultPort, ":" + base.DefaultPort,
 			"[::2]:1234", "[::2]:1234",
-			":" + base.DefaultPort, ":" + base.DefaultPort,
 		},
 
 		// Configuring the components of the SQL address separately.
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.2:" + base.DefaultPort, "127.0.0.2:" + base.DefaultPort,
-			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", ":1234"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.1:1234", "127.0.0.1:1234",
-			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2:1234"},
 			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 			"127.0.0.2:1234", "127.0.0.2:1234",
-			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "[::2]", "--sql-addr", ":1234"},
 			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
 			"[::2]:1234", "[::2]:1234",
-			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
 		},
 
 		// --advertise-addr overrides.
 		{[]string{"start", "--advertise-addr", "192.168.0.111"},
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
-			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345"},
-			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111"},
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
-			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--advertise-addr", "192.168.0.111"},
-			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111:12345"},
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
-			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:54321", "--advertise-addr", "192.168.0.111:12345"},
-			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--listen-addr", ":12345"},
 			":12345", "192.168.0.111:12345",
 			":12345", "192.168.0.111:12345",
-			":12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--listen-addr", ":54321"},
-			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
 		},
@@ -621,7 +649,6 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", ":54321"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":54321", "192.168.0.111:54321",
-			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 
 		// Show that if the SQL address is overridden, its advertised form picks the
@@ -629,84 +656,76 @@ func TestServerConnSettings(t *testing.T) {
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1:54321"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:54321",
-			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1"},
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
-			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--sql-addr", "127.0.0.1:12345"},
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"127.0.0.1:12345", "192.168.0.111:12345",
-			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 
 		// Backward-compatibility flag combinations.
 		{[]string{"start", "--host", "192.168.0.111"},
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
-			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--port", "12345"},
-			":12345", ":12345",
 			":12345", ":12345",
 			":12345", ":12345",
 		},
 		{[]string{"start", "--advertise-host", "192.168.0.111"},
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
-			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
-			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--port", "12345"},
 			"127.0.0.1:12345", "127.0.0.1:12345",
 			"127.0.0.1:12345", "127.0.0.1:12345",
-			"127.0.0.1:12345", "127.0.0.1:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--port", "55555"},
 			"127.0.0.1:55555", "127.0.0.1:55555",
 			"127.0.0.1:55555", "127.0.0.1:55555",
-			"127.0.0.1:55555", "127.0.0.1:55555",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
-			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
-			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 			"127.0.0.1:12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
-			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
-			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 			"127.0.0.1:54321", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "12345"},
 			":12345", "192.168.0.111:12345",
 			":12345", "192.168.0.111:12345",
-			":12345", "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
-			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 			":" + base.DefaultPort, "192.168.0.111:12345",
 		},
 		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
 			":54321", "192.168.0.111:12345",
 			":54321", "192.168.0.111:12345",
-			":54321", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-sql-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
+			"127.0.0.1:54321", "127.0.0.1:12345",
+			"127.0.0.1:54321", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-sql-addr", "192.168.0.111:12345", "--port", "54321"},
+			"127.0.0.1:54321", "127.0.0.1:54321",
+			"127.0.0.1:54321", "192.168.0.111:12345",
 		},
 	}
 
@@ -848,6 +867,117 @@ func TestLocalityAdvAddrFlag(t *testing.T) {
 	}
 }
 
+func TestLocalityFileFlag(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	tmpDir, err := os.MkdirTemp("", "")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	// These files have leading and trailing whitespaces to test the logic where
+	// we trim those before parsing.
+
+	emptyLocalityFile, err := os.CreateTemp(tmpDir, "")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(emptyLocalityFile.Name(), []byte("  "), 0777))
+
+	invalidLocalityFile, err := os.CreateTemp(tmpDir, "")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(invalidLocalityFile.Name(), []byte("  invalid  "), 0777))
+
+	validLocalityFile, err := os.CreateTemp(tmpDir, "")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(validLocalityFile.Name(), []byte("  region=us-east1,az=1  \n"), 0777))
+
+	mtf := mtStartSQLCmd.Flags()
+	f := startCmd.Flags()
+	testData := []struct {
+		args        []string
+		expLocality roachpb.Locality
+		expError    string
+	}{
+		// Both flags are incompatible.
+		{
+			args:     []string{"start", "--locality=region=us-east1", "--locality-file=foo"},
+			expError: `--locality is incompatible with --locality-file`,
+		},
+		// File does not exist.
+		{
+			args:     []string{"start", "--locality-file=donotexist"},
+			expError: `invalid argument .* no such file or directory`,
+		},
+		// File is empty.
+		{
+			args:     []string{"start", fmt.Sprintf("--locality-file=%s", emptyLocalityFile.Name())},
+			expError: `invalid locality data "" .* can't have empty locality`,
+		},
+		// File is invalid.
+		{
+			args:     []string{"start", fmt.Sprintf("--locality-file=%s", invalidLocalityFile.Name())},
+			expError: `invalid locality data "invalid" .* tier must be in the form "key=value"`,
+		},
+		// mt start-sql with --locality-file and --tenant-id-file should defer.
+		{
+			args:        []string{"mt", "start-sql", "--tenant-id-file=tid", fmt.Sprintf("--locality-file=%s", validLocalityFile.Name())},
+			expLocality: roachpb.Locality{},
+		},
+		// mt start-sql with --locality-file.
+		{
+			args: []string{"mt", "start-sql", fmt.Sprintf("--locality-file=%s", validLocalityFile.Name())},
+			expLocality: roachpb.Locality{
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "us-east1"},
+					{Key: "az", Value: "1"},
+				},
+			},
+		},
+		// Only --locality.
+		{
+			args: []string{"start", "--locality=region=us-central1"},
+			expLocality: roachpb.Locality{
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "us-central1"},
+				},
+			},
+		},
+		// Only --locality-file.
+		{
+			args: []string{"start", fmt.Sprintf("--locality-file=%s", validLocalityFile.Name())},
+			expLocality: roachpb.Locality{
+				Tiers: []roachpb.Tier{
+					{Key: "region", Value: "us-east1"},
+					{Key: "az", Value: "1"},
+				},
+			},
+		},
+	}
+	for i, td := range testData {
+		t.Run(strings.Join(td.args, " "), func(t *testing.T) {
+			initCLIDefaults()
+			var err error
+			if td.args[0] == "start" {
+				require.NoError(t, f.Parse(td.args))
+				err = extraServerFlagInit(startCmd)
+			} else {
+				require.NoError(t, mtf.Parse(td.args))
+				err = extraServerFlagInit(mtStartSQLCmd)
+			}
+			if td.expError == "" {
+				require.NoError(t, err)
+				require.Equal(t, td.expLocality, serverCfg.Locality)
+			} else {
+				require.Regexp(t, td.expError, err.Error(),
+					"%d. expected '%s', but got '%s'. td.args was '%#v'.",
+					i, td.expError, err.Error(), td.args)
+			}
+		})
+	}
+}
+
 func TestServerJoinSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -899,89 +1029,39 @@ func TestServerJoinSettings(t *testing.T) {
 	}
 }
 
-func TestConnectJoinSettings(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Avoid leaking configuration changes after the tests end.
-	defer initCLIDefaults()
-
-	f := connectInitCmd.Flags()
-	testData := []struct {
-		args         []string
-		expectedJoin []string
-	}{
-		{[]string{"connect", "init", "--join=a"},
-			[]string{"a:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=a,b,c"},
-			[]string{"a:" + base.DefaultPort, "b:" + base.DefaultPort, "c:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=a", "--join=b"},
-			[]string{"a:" + base.DefaultPort, "b:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=127.0.0.1"},
-			[]string{"127.0.0.1:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=127.0.0.1:"},
-			[]string{"127.0.0.1:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=127.0.0.1,abc"},
-			[]string{"127.0.0.1:" + base.DefaultPort, "abc:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=[::1],[::2]"},
-			[]string{"[::1]:" + base.DefaultPort, "[::2]:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=[::1]:123,[::2]"},
-			[]string{"[::1]:123", "[::2]:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=[::1],127.0.0.1"},
-			[]string{"[::1]:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort}},
-		{[]string{"connect", "init", "--join=[::1]:123", "--join=[::2]"},
-			[]string{"[::1]:123", "[::2]:" + base.DefaultPort}},
-	}
-
-	for i, td := range testData {
-		initCLIDefaults()
-		if err := f.Parse(td.args); err != nil {
-			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
-		}
-
-		if err := extraClientFlagInit(); err != nil {
-			t.Fatal(err)
-		}
-
-		if !reflect.DeepEqual(td.expectedJoin, []string(serverCfg.JoinList)) {
-			t.Errorf("%d. serverCfg.JoinList expected %#v, but got %#v. td.args was '%#v'.",
-				i, td.expectedJoin, serverCfg.JoinList, td.args)
-		}
-	}
-}
-
 func TestClientConnSettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	// For some reason, when run under stress all these test cases fail due to the
 	// `--host` flag being unknown to quitCmd. Just skip this under stress.
+	// TODO(knz): Check if this skip still applies.
 	skip.UnderStress(t)
 
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
 
-	f := quitCmd.Flags()
+	f := drainNodeCmd.Flags()
 	testData := []struct {
 		args         []string
 		expectedAddr string
 	}{
-		{[]string{"quit"}, ":" + base.DefaultPort},
-		{[]string{"quit", "--host", "127.0.0.1"}, "127.0.0.1:" + base.DefaultPort},
-		{[]string{"quit", "--host", "192.168.0.111"}, "192.168.0.111:" + base.DefaultPort},
-		{[]string{"quit", "--host", ":12345"}, ":12345"},
-		{[]string{"quit", "--host", "127.0.0.1:12345"}, "127.0.0.1:12345"},
+		{[]string{"node", "drain"}, "localhost:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", "127.0.0.1"}, "127.0.0.1:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", "192.168.0.111"}, "192.168.0.111:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", ":12345"}, ":12345"},
+		{[]string{"node", "drain", "--host", "127.0.0.1:12345"}, "127.0.0.1:12345"},
 		// confirm hostnames will work
-		{[]string{"quit", "--host", "my.host.name"}, "my.host.name:" + base.DefaultPort},
-		{[]string{"quit", "--host", "myhostname"}, "myhostname:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", "my.host.name"}, "my.host.name:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", "myhostname"}, "myhostname:" + base.DefaultPort},
 		// confirm IPv6 works too
-		{[]string{"quit", "--host", "[::1]"}, "[::1]:" + base.DefaultPort},
-		{[]string{"quit", "--host", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
+		{[]string{"node", "drain", "--host", "[::1]"}, "[::1]:" + base.DefaultPort},
+		{[]string{"node", "drain", "--host", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
 			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort},
 
 		// Deprecated syntax.
-		{[]string{"quit", "--port", "12345"}, ":12345"},
-		{[]string{"quit", "--host", "127.0.0.1", "--port", "12345"}, "127.0.0.1:12345"},
+		{[]string{"node", "drain", "--port", "12345"}, "localhost:12345"},
+		{[]string{"node", "drain", "--host", "127.0.0.1", "--port", "12345"}, "127.0.0.1:12345"},
 	}
 
 	for i, td := range testData {
@@ -997,6 +1077,112 @@ func TestClientConnSettings(t *testing.T) {
 			t.Errorf("%d. serverCfg.Addr expected '%s', but got '%s'. td.args was '%#v'.",
 				i, td.expectedAddr, serverCfg.Addr, td.args)
 		}
+	}
+}
+
+func TestHttpAdvertiseAddrFlagValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	defer initCLIDefaults()
+
+	// Prepare some reference strings that will be checked in the
+	// test below.
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostAddr, err := base.LookupAddr(context.Background(), net.DefaultResolver, hostname)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(hostAddr, ":") {
+		hostAddr = "[" + hostAddr + "]"
+	}
+
+	f := startCmd.Flags()
+	for i, tc := range []struct {
+		args                        []string
+		expected                    string
+		expectedAfterAddrValidation string
+		expectedServerHTTPAddr      string
+		tlsEnabled                  bool
+	}{
+		{[]string{"start"},
+			":" + base.DefaultHTTPPort,
+			hostname + ":" + base.DefaultHTTPPort,
+			":" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--http-addr", hostAddr},
+			hostAddr + ":" + base.DefaultHTTPPort,
+			hostAddr + ":" + base.DefaultHTTPPort,
+			hostAddr + ":" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--advertise-addr", "adv.example.com", "--http-addr", "http.example.com"},
+			"adv.example.com:" + base.DefaultHTTPPort,
+			"adv.example.com:" + base.DefaultHTTPPort,
+			"http.example.com:" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--advertise-addr", "adv.example.com:2345", "--http-addr", "http.example.com:1234"},
+			"adv.example.com:1234",
+			"adv.example.com:1234",
+			"http.example.com:1234",
+			true},
+		{[]string{"start", "--advertise-addr", "example.com"},
+			"example.com:" + base.DefaultHTTPPort,
+			"example.com:" + base.DefaultHTTPPort,
+			":" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--advertise-http-addr", "example.com"},
+			"example.com:" + base.DefaultHTTPPort,
+			"example.com:" + base.DefaultHTTPPort,
+			":" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--http-addr", "http.example.com", "--advertise-http-addr", "example.com"},
+			"example.com:" + base.DefaultHTTPPort,
+			"example.com:" + base.DefaultHTTPPort,
+			"http.example.com:" + base.DefaultHTTPPort,
+			true},
+		{[]string{"start", "--advertise-addr", "adv.example.com", "--advertise-http-addr", "example.com"},
+			"example.com:" + base.DefaultHTTPPort,
+			"example.com:" + base.DefaultHTTPPort,
+			":" + base.DefaultHTTPPort,
+
+			true},
+		{[]string{"start", "--advertise-addr", "adv.example.com:1234", "--http-addr", "http.example.com:2345", "--advertise-http-addr", "example.com:3456"},
+			"example.com:3456",
+			"example.com:3456",
+			"http.example.com:2345",
+			true},
+	} {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			initCLIDefaults()
+			require.NoError(t, f.Parse(tc.args))
+
+			err := extraServerFlagInit(startCmd)
+			require.NoError(t, err)
+
+			exp := "http"
+			if tc.tlsEnabled {
+				exp = "https"
+			}
+			require.Equal(t, tc.expected, serverCfg.HTTPAdvertiseAddr,
+				"serverCfg.HTTPAdvertiseAddr expected '%s', but got '%s'. td.args was '%#v'.",
+				tc.expected, serverCfg.HTTPAdvertiseAddr, tc.args)
+			require.Equal(t, exp, serverCfg.HTTPRequestScheme(),
+				"TLS config expected %s, got %s. td.args was '%#v'.", exp, serverCfg.HTTPRequestScheme(), tc.args)
+
+			ctx := context.Background()
+			err = serverCfg.ValidateAddrs(ctx)
+			if err != nil {
+				// Don't care about resolution failures
+				if !strings.Contains(err.Error(), "invalid --http-addr") {
+					t.Errorf("unexpected error: %s", err)
+				}
+			}
+			require.Equal(t, tc.expectedAfterAddrValidation, serverCfg.HTTPAdvertiseAddr, "http advertise addr after validation")
+			require.Equal(t, tc.expectedServerHTTPAddr, serverCfg.HTTPAddr, "http addr after validation")
+		})
 	}
 }
 
@@ -1123,14 +1309,13 @@ func TestFlagUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	commandPrefix := "CockroachDB command-line interface and server.\n\n"
 	expUsage := `Usage:
   cockroach [command]
 
 Available Commands:
   start             start a node in a multi-node cluster
   start-single-node start a single-node cluster
-  connect           Create certificates for securely connecting with clusters
-
   init              initialize a cluster
   cert              create ca, node, and client certs
   sql               open a sql shell
@@ -1148,38 +1333,58 @@ Available Commands:
   debug             debugging commands
   sqlfmt            format SQL statements
   workload          generators for data and query loads
+  encode-uri        encode a CRDB connection URL
   help              Help about any command
 
 Flags:
-  -h, --help                     help for cockroach
-      --log <string>             
-                                  Logging configuration, expressed using YAML syntax. For example, you can
-                                  change the default logging directory with: --log='file-defaults: {dir: ...}'.
-                                  See the documentation for more options and details.  To preview how the log
-                                  configuration is applied, or preview the default configuration, you can use
-                                  the 'cockroach debug check-log-config' sub-command.
-                                 
-      --log-config-file <file>   
-                                  File name to read the logging configuration from. This has the same effect as
-                                  passing the content of the file via the --log flag.
-                                  (default <unset>)
-      --version                  version for cockroach
+  -h, --help                               help for cockroach
+      --log <string>                       
+                                            Logging configuration, expressed using YAML syntax. For example, you can
+                                            change the default logging directory with: --log='file-defaults: {dir: ...}'.
+                                            See the documentation for more options and details.  To preview how the log
+                                            configuration is applied, or preview the default configuration, you can use
+                                            the 'cockroach debug check-log-config' sub-command.
+                                           
+      --log-config-file <file>             
+                                            File name to read the logging configuration from. This has the same effect as
+                                            passing the content of the file via the --log flag.
+                                            (default <unset>)
+      --log-config-vars strings            
+                                            Environment variables that will be expanded if present in the body of the
+                                            logging configuration.
+                                           
+      --log-dir <string>                   
+                                            --log-dir=XXX is an alias for --log='file-defaults: {dir: XXX}'.
+                                           
+      --logtostderr <severity>[=DEFAULT]   
+                                            --logtostderr=XXX is an alias for --log='sinks: {stderr: {filter: XXX}}'. If
+                                            no value is specified, the default value for the command is inferred: INFO for
+                                            server commands, WARNING for client commands.
+                                            (default UNKNOWN)
+      --redactable-logs                    
+                                            --redactable-logs=XXX is an alias for --log='file-defaults: {redactable:
+                                            XXX}}'.
+                                           
+      --version                            version for cockroach
 
 Use "cockroach [command] --help" for more information about a command.
 `
-	helpExpected := fmt.Sprintf("CockroachDB command-line interface and server.\n\n%s",
-		// Due to a bug in spf13/cobra, 'cockroach help' does not include the --version
-		// flag. Strangely, 'cockroach --help' does, as well as usage error messages.
-		strings.ReplaceAll(expUsage, "      --version                  version for cockroach\n", ""))
+	// Due to a bug in spf13/cobra, 'cockroach help' does not include the --version
+	// flag *the first time the test runs*.
+	// (But it does if the test is run a second time.)
+	// Strangely, 'cockroach --help' does, as well as usage error messages.
+	helpExpected1 := commandPrefix + expUsage
+	helpExpected2 := strings.ReplaceAll(helpExpected1, "      --version                            version for cockroach\n", "")
 	badFlagExpected := fmt.Sprintf("%s\nError: unknown flag: --foo\n", expUsage)
 
 	testCases := []struct {
-		flags    []string
-		expErr   bool
-		expected string
+		flags         []string
+		expErr        bool
+		expectHelp    bool
+		expectBadFlag bool
 	}{
-		{[]string{"help"}, false, helpExpected},    // request help specifically
-		{[]string{"--foo"}, true, badFlagExpected}, // unknown flag
+		{[]string{"help"}, false, true, false}, // request help specifically
+		{[]string{"--foo"}, true, false, true}, // unknown flag
 	}
 	for _, test := range testCases {
 		t.Run(strings.Join(test.flags, ","), func(t *testing.T) {
@@ -1225,7 +1430,310 @@ Use "cockroach [command] --help" for more information about a command.
 			}
 			got := strings.Join(final, "\n")
 
-			assert.Equal(t, test.expected, got)
+			if test.expectBadFlag {
+				assert.Equal(t, badFlagExpected, got)
+			}
+			if test.expectHelp {
+				if got != helpExpected1 && got != helpExpected2 {
+					diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+						A:        difflib.SplitLines(strings.ReplaceAll(helpExpected1, "\n", "$\n")),
+						B:        difflib.SplitLines(strings.ReplaceAll(got, "\n", "$\n")),
+						FromFile: "Expected",
+						ToFile:   "Actual",
+						Context:  1,
+					})
+					t.Errorf("Diff:\n%s", diff)
+				}
+			}
 		})
 	}
+}
+
+func TestSQLPodStorageDefaults(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	defer initCLIDefaults()
+
+	expectedDefaultDir, err := base.GetAbsoluteFSPath("", "cockroach-data-tenant-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, td := range []struct {
+		args        []string
+		storePath   string
+		expectedErr string
+	}{
+		{
+			args:      []string{"mt", "start-sql", "--tenant-id", "9"},
+			storePath: expectedDefaultDir,
+		},
+		{
+			args:      []string{"mt", "start-sql", "--tenant-id", "9", "--store", "/tmp/data"},
+			storePath: "/tmp/data",
+		},
+		{
+			args:      []string{"mt", "start-sql", "--tenant-id-file", "foo", "--store", "/tmp/data"},
+			storePath: "/tmp/data",
+		},
+		{
+			args:        []string{"mt", "start-sql", "--tenant-id-file", "foo"},
+			expectedErr: "--store must be explicitly supplied when using --tenant-id-file",
+		},
+	} {
+		t.Run(strings.Join(td.args, ","), func(t *testing.T) {
+			initCLIDefaults()
+			f := mtStartSQLCmd.Flags()
+			require.NoError(t, f.Parse(td.args))
+			err := mtStartSQLCmd.PersistentPreRunE(mtStartSQLCmd, td.args)
+			if td.expectedErr == "" {
+				require.NoError(t, err)
+				assert.Equal(t, td.storePath, serverCfg.Stores.Specs[0].Path)
+				for _, s := range serverCfg.Stores.Specs {
+					assert.Zero(t, s.BallastSize.InBytes)
+					assert.Zero(t, s.BallastSize.Percent)
+				}
+			} else {
+				require.EqualError(t, err, td.expectedErr)
+			}
+		})
+	}
+}
+
+func TestTenantID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		name        string
+		arg         string
+		errContains string
+	}{
+		{"empty tenant id text", "", "invalid tenant ID: strconv.ParseUint"},
+		{"tenant id text not integer", "abc", "invalid tenant ID: strconv.ParseUint"},
+		{"tenant id is 0", "0", "invalid tenant ID"},
+		{"tenant id is valid", "2", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfgTenantID, err := tenantID(tt.arg)
+			if tt.errContains == "" {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.arg, cfgTenantID.String())
+			} else {
+				assert.ErrorContains(t, err, tt.errContains)
+				assert.Equal(t, roachpb.TenantID{}, cfgTenantID)
+			}
+		})
+	}
+}
+
+func TestTenantName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		name        string
+		arg         string
+		errContains string
+	}{
+		{"empty tenant name text", "", "invalid tenant name: \"\""},
+		{"tenant name not valid", "a+bc", "invalid tenant name: \"a+bc\""},
+		{"tenant name \"abc\" is valid", "abc", ""},
+		{"tenant name \"system\" is valid", "system", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tns := tenantNameSetter{tenantNames: &[]roachpb.TenantName{}}
+			err := tns.Set(tt.arg)
+			if tt.errContains == "" {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.arg, tns.String())
+			} else {
+				assert.True(t, strings.Contains(err.Error(), tt.errContains))
+			}
+		})
+	}
+}
+
+func TestTenantIDFromFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	createTempFileWithData := func(t *testing.T, data string) *os.File {
+		t.Helper()
+		// Put the file in a nested directory within the root temp directory.
+		// That way, we don't end up using the default root temp directory as
+		// the directory to watch as there will be lots of files created during
+		// a stress test, and this will slow down the watcher.
+		tmpDir, err := os.MkdirTemp("", "")
+		require.NoError(t, err)
+		file, err := os.CreateTemp(tmpDir, "")
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(file.Name(), []byte(data), 0777))
+		t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+		return file
+	}
+
+	writeFile := func(t *testing.T, filename, data string) {
+		t.Helper()
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
+		require.NoError(t, err)
+		defer file.Close()
+		_, err = file.WriteString(data)
+		require.NoError(t, err)
+	}
+
+	t.Run("unrelated files do not trigger a read",
+		func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "")
+			require.NoError(t, err)
+			defer func() { _ = os.RemoveAll(tmpDir) }()
+			// Two unrelated files, and one file of concern.
+			file1 := filepath.Join(tmpDir, "file1")
+			file2 := filepath.Join(tmpDir, "file2")
+			filename := filepath.Join(tmpDir, "TENANT_ID_FILE")
+
+			watcherWaitCount := atomic.Uint32{}
+			watcherEventCount := atomic.Uint32{}
+			watcherReadCount := atomic.Uint32{}
+			runSuccessfuly := atomic.Bool{}
+			go func() {
+				cfgTenantID, err := tenantIDFromFile(ctx, filename, &watcherWaitCount, &watcherEventCount, &watcherReadCount)
+				require.NoError(t, err)
+				require.EqualValues(t, 123, cfgTenantID.ToUint64())
+				runSuccessfuly.Store(true)
+			}()
+			require.Eventually(t, func() bool { return watcherWaitCount.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
+			require.EqualValues(t, 0, watcherEventCount.Load())
+			require.Equal(t, false, runSuccessfuly.Load())
+
+			// Create a temporary file, which we will swap into file3.
+			var tmpFile3, tmpTenantFile string
+			func() {
+				f := createTempFileWithData(t, "test contents\n")
+				defer f.Close()
+				tmpFile3 = f.Name()
+
+				tenantFile := createTempFileWithData(t, "123\n")
+				defer tenantFile.Close()
+				tmpTenantFile = tenantFile.Name()
+			}()
+
+			// Write to file1, file2, and file3.
+			writeFile(t, file1, "foo")
+			require.NoError(t, os.Rename(tmpFile3, filepath.Join(tmpDir, "file3")))
+			writeFile(t, file1, "bar")
+			writeFile(t, file2, "testing\n")
+			writeFile(t, file1, "\n")
+
+			// The watcher events may be in any order, so we'll make sure all
+			// the events for files 1-3 are received before writing the actual
+			// file which stops the watcher.
+			require.Eventually(t, func() bool { return watcherEventCount.Load() >= 3 }, 10*time.Second, 10*time.Millisecond)
+
+			// Finally, write to the actual file.
+			require.NoError(t, os.Rename(tmpTenantFile, filename))
+
+			// Check that there are at least 4 events, one for each file,
+			// and only two reads (one initial, and another during the CREATE
+			// event).
+			require.Eventually(t, func() bool { return watcherEventCount.Load() >= 4 }, 10*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return runSuccessfuly.Load() }, 10*time.Second, 10*time.Millisecond)
+			require.EqualValues(t, 2, watcherReadCount.Load())
+		})
+
+	t.Run("file does not exists, has incomplete first row, waits for it to complete and after completion reads valid tenant id",
+		func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "")
+			require.NoError(t, err)
+			defer func() { _ = os.RemoveAll(tmpDir) }()
+			filename := filepath.Join(tmpDir, "TENANT_ID_FILE")
+
+			watcherWaitCount := atomic.Uint32{}
+			watcherEventCount := atomic.Uint32{}
+			runSuccessfuly := atomic.Bool{}
+			go func() {
+				cfgTenantID, err := tenantIDFromFile(ctx, filename, &watcherWaitCount, &watcherEventCount, nil)
+				require.NoError(t, err)
+				require.EqualValues(t, 123, cfgTenantID.ToUint64())
+				runSuccessfuly.Store(true)
+			}()
+			require.Eventually(t, func() bool { return watcherWaitCount.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
+			require.EqualValues(t, 0, watcherEventCount.Load())
+			require.Equal(t, false, runSuccessfuly.Load())
+
+			// Write a file partially.
+			writeFile(t, filename, "12")
+			require.Eventually(t, func() bool { return watcherWaitCount.Load() >= 2 }, 10*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return watcherEventCount.Load() >= 1 }, 10*time.Second, 10*time.Millisecond)
+
+			// Complete the remaining of the file.
+			writeFile(t, filename, "3\n")
+			require.Eventually(t, func() bool { return watcherEventCount.Load() >= 2 }, 10*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return runSuccessfuly.Load() }, 10*time.Second, 10*time.Millisecond)
+		})
+
+	t.Run("file exists, has complete first row, but the value is an invalid tenant id",
+		func(t *testing.T) {
+			file := createTempFileWithData(t, "abc\n")
+			defer file.Close()
+			cfgTenantID, err := tenantIDFromFile(ctx, file.Name(), nil, nil, nil)
+			require.ErrorContains(t, err, "invalid tenant ID: strconv.ParseUint")
+			require.Equal(t, roachpb.TenantID{}, cfgTenantID)
+		})
+
+	t.Run("file exists, has incomplete first row, waits for it to complete and after completion with invalid tenant id fails",
+		func(t *testing.T) {
+			file := createTempFileWithData(t, "abc")
+			defer file.Close()
+			watcherWaitCount := atomic.Uint32{}
+			watcherEventCount := atomic.Uint32{}
+			generatedError := atomic.Bool{}
+			go func() {
+				cfgTenantID, err := tenantIDFromFile(ctx, file.Name(), &watcherWaitCount, &watcherEventCount, nil)
+				require.ErrorContains(t, err, "invalid tenant ID: strconv.ParseUint")
+				require.Equal(t, roachpb.TenantID{}, cfgTenantID)
+				generatedError.Store(true)
+			}()
+			require.Eventually(t, func() bool { return watcherWaitCount.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
+			require.EqualValues(t, 0, watcherEventCount.Load())
+			require.Equal(t, false, generatedError.Load())
+			require.NoError(t, os.WriteFile(file.Name(), []byte("abc\n"), 0777))
+			require.Eventually(t, func() bool { return watcherEventCount.Load() > 0 }, 10*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return generatedError.Load() }, 10*time.Second, 10*time.Millisecond)
+		})
+
+	t.Run("file exists, has complete first row, it has tenant id and it is set to valid value",
+		func(t *testing.T) {
+			file := createTempFileWithData(t, "123\n")
+			defer file.Close()
+			cfgTenantID, err := tenantIDFromFile(ctx, file.Name(), nil, nil, nil)
+			require.NoError(t, err)
+			require.EqualValues(t, 123, cfgTenantID.ToUint64())
+		})
+
+	t.Run("file exists, has incomplete first row, waits for it to complete and after completion reads valid tenant id",
+		func(t *testing.T) {
+			file := createTempFileWithData(t, "abc")
+			defer file.Close()
+			watcherWaitCount := atomic.Uint32{}
+			watcherEventCount := atomic.Uint32{}
+			runSuccessfuly := atomic.Bool{}
+			go func() {
+				cfgTenantID, err := tenantIDFromFile(ctx, file.Name(), &watcherWaitCount, &watcherEventCount, nil)
+				require.NoError(t, err)
+				require.EqualValues(t, 123, cfgTenantID.ToUint64())
+				runSuccessfuly.Store(true)
+			}()
+			require.Eventually(t, func() bool { return watcherWaitCount.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
+			require.EqualValues(t, 0, watcherEventCount.Load())
+			require.Equal(t, false, runSuccessfuly.Load())
+			require.NoError(t, os.WriteFile(file.Name(), []byte("123\n"), 0777))
+			require.Eventually(t, func() bool { return watcherEventCount.Load() > 0 }, 10*time.Second, 10*time.Millisecond)
+			require.Eventually(t, func() bool { return runSuccessfuly.Load() }, 10*time.Second, 10*time.Millisecond)
+		})
 }

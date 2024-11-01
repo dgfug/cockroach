@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
@@ -14,12 +9,11 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"testing"
 )
 
 // WriteProfile serialized the pprof profile with the given name to a file at
 // the given path.
-func WriteProfile(t testing.TB, name string, path string) {
+func WriteProfile(t TestFataler, name string, path string) {
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -36,14 +30,16 @@ func WriteProfile(t testing.TB, name string, path string) {
 // -memprofile does not.
 //
 // Example usage:
-//     setupCode()
-//     AllocProfileDiff(t, "mem.before", "mem.after", func() {
-//       interestingCode()
-//     })
+//
+//	setupCode()
+//	AllocProfileDiff(t, "mem.before", "mem.after", func() {
+//	  interestingCode()
+//	})
 //
 // The resulting profiles are then diffed via:
-//     go tool pprof -base mem.before mem.after
-func AllocProfileDiff(t testing.TB, beforePath, afterPath string, fn func()) {
+//
+//	go tool pprof -base mem.before mem.after
+func AllocProfileDiff(t TestFatalerLogger, beforePath, afterPath string, fn func()) {
 	// Use "allocs" instead of "heap" to match what -memprofile does. Also run
 	// runtime.GC immediately before grabbing the profile because the allocs
 	// profile is materialized on gc, so this makes sure we have the latest data.

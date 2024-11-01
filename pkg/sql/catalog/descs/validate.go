@@ -1,27 +1,45 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/errors"
 )
+
+// Validate returns any descriptor validation errors after validating using the
+// descriptor collection for retrieving referenced descriptors and namespace
+// entries, if applicable.
+func (tc *Collection) Validate(
+	ctx context.Context,
+	txn *kv.Txn,
+	telemetry catalog.ValidationTelemetry,
+	targetLevel catalog.ValidationLevel,
+	descriptors ...catalog.Descriptor,
+) (err error) {
+	if !tc.validationModeProvider.ValidateDescriptorsOnRead() && !tc.validationModeProvider.ValidateDescriptorsOnWrite() {
+		return nil
+	}
+	vd := tc.newValidationDereferencer(txn)
+	version := tc.settings.Version.ActiveVersion(ctx)
+	return validate.Validate(
+		ctx,
+		version,
+		vd,
+		telemetry,
+		targetLevel,
+		descriptors...).CombinedError()
+}
 
 // ValidateUncommittedDescriptors validates all uncommitted descriptors.
 // Validation includes cross-reference checks. Referenced descriptors are
@@ -29,148 +47,150 @@ import (
 // descriptor set. We purposefully avoid using leased descriptors as those may
 // be one version behind, in which case it's possible (and legitimate) that
 // those are missing back-references which would cause validation to fail.
-func (tc *Collection) ValidateUncommittedDescriptors(ctx context.Context, txn *kv.Txn) (err error) {
-	if tc.skipValidationOnWrite || !ValidateOnWriteEnabled.Get(&tc.settings.SV) {
+// Optionally, the zone config will be validated if validateZoneConfigs is
+// set to true.
+func (tc *Collection) ValidateUncommittedDescriptors(
+	ctx context.Context,
+	txn *kv.Txn,
+	validateZoneConfigs bool,
+	zoneConfigValidator ZoneConfigValidator,
+) (err error) {
+	if tc.skipValidationOnWrite || !tc.validationModeProvider.ValidateDescriptorsOnWrite() {
 		return nil
 	}
-
-	descs := tc.uncommitted.getUncommittedDescriptorsForValidation()
+	var descs []catalog.Descriptor
+	_ = tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
+		descs = append(descs, desc)
+		return nil
+	})
 	if len(descs) == 0 {
 		return nil
 	}
-
-	bdg := collectionBatchDescGetter{tc: tc, txn: txn}
-	return errors.CombineErrors(err, catalog.Validate(
-		ctx,
-		bdg,
-		catalog.ValidationWriteTelemetry,
-		catalog.ValidationLevelAllPreTxnCommit,
-		descs...,
-	).CombinedError())
+	if err := tc.Validate(ctx, txn, catalog.ValidationWriteTelemetry, validate.Write, descs...); err != nil {
+		return err
+	}
+	// Next validate any zone configs that may have been modified
+	// in the descriptor set, only if this type of validation is required.
+	// We only do this type of validation if region configs are modified.
+	if validateZoneConfigs {
+		if zoneConfigValidator == nil {
+			return errors.AssertionFailedf("zone config validator is required to " +
+				"validate zone configs")
+		}
+		for _, desc := range descs {
+			switch t := desc.(type) {
+			case catalog.DatabaseDescriptor:
+				if err = zoneConfigValidator.ValidateDbZoneConfig(ctx, t); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
-// collectionBatchDescGetter wraps a Collection to implement the
-// catalog.BatchDescGetter interface for validation.
-type collectionBatchDescGetter struct {
-	tc  *Collection
-	txn *kv.Txn
+func (tc *Collection) newValidationDereferencer(txn *kv.Txn) validate.ValidationDereferencer {
+	crvd := catkv.NewCatalogReaderBackedValidationDereferencer(tc.cr, txn, tc.validationModeProvider)
+	return &collectionBackedDereferencer{tc: tc, crvd: crvd}
 }
 
-var _ catalog.BatchDescGetter = &collectionBatchDescGetter{}
-
-func (c collectionBatchDescGetter) fallback() catalog.BatchDescGetter {
-	return catalogkv.NewOneLevelUncachedDescGetter(c.txn, c.tc.codec())
+// collectionBackedDereferencer wraps a Collection to implement the
+// validate.ValidationDereferencer interface for validation.
+type collectionBackedDereferencer struct {
+	tc   *Collection
+	crvd validate.ValidationDereferencer
 }
 
-// GetDescs implements the catalog.BatchDescGetter interface by leveraging the
-// collection's uncommitted descriptors.
-func (c collectionBatchDescGetter) GetDescs(
-	ctx context.Context, reqs []descpb.ID,
+var _ validate.ValidationDereferencer = &collectionBackedDereferencer{}
+
+// DereferenceDescriptors implements the validate.ValidationDereferencer
+// interface by leveraging the collection's uncommitted descriptors as well
+// as its storage cache.
+func (c collectionBackedDereferencer) DereferenceDescriptors(
+	ctx context.Context, version clusterversion.ClusterVersion, reqs []descpb.ID,
 ) (ret []catalog.Descriptor, _ error) {
 	ret = make([]catalog.Descriptor, len(reqs))
 	fallbackReqs := make([]descpb.ID, 0, len(reqs))
 	fallbackRetIndexes := make([]int, 0, len(reqs))
 	for i, id := range reqs {
-		desc, err := c.fastDescLookup(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if desc == nil {
+		if uc := c.tc.uncommitted.getUncommittedByID(id); uc == nil {
 			fallbackReqs = append(fallbackReqs, id)
 			fallbackRetIndexes = append(fallbackRetIndexes, i)
 		} else {
-			ret[i] = desc
+			ret[i] = uc
 		}
 	}
-	if len(fallbackReqs) > 0 {
-		fallbackRet, err := c.fallback().GetDescs(ctx, fallbackReqs)
-		if err != nil {
-			return nil, err
-		}
-		for j, desc := range fallbackRet {
-			ret[fallbackRetIndexes[j]] = desc
+	if len(fallbackReqs) == 0 {
+		return ret, nil
+	}
+	fallbackRet, err := c.crvd.DereferenceDescriptors(ctx, version, fallbackReqs)
+	if err != nil {
+		return nil, err
+	}
+	for j, desc := range fallbackRet {
+		ret[fallbackRetIndexes[j]] = desc
+		if c.tc.validationModeProvider.ValidateDescriptorsOnRead() {
+			c.tc.ensureValidationLevel(desc, catalog.ValidationLevelSelfOnly)
 		}
 	}
 	return ret, nil
 }
 
-func (c collectionBatchDescGetter) fastDescLookup(
-	ctx context.Context, id descpb.ID,
-) (catalog.Descriptor, error) {
-	leaseCacheEntry := c.tc.leased.cache.GetByID(id)
-	if leaseCacheEntry != nil {
-		return leaseCacheEntry.(lease.LeasedDescriptor).Underlying(), nil
-	}
-	return c.tc.uncommitted.getByID(id), nil
-}
-
-// GetNamespaceEntries implements the catalog.BatchDescGetter interface by
-// delegating to the fallback catalogkv implementation.
-func (c collectionBatchDescGetter) GetNamespaceEntries(
+// DereferenceDescriptorIDs implements the validate.ValidationDereferencer
+// interface by leveraging the collection's uncommitted descriptors as well
+// as its storage cache.
+func (c collectionBackedDereferencer) DereferenceDescriptorIDs(
 	ctx context.Context, reqs []descpb.NameInfo,
 ) (ret []descpb.ID, _ error) {
 	ret = make([]descpb.ID, len(reqs))
 	fallbackReqs := make([]descpb.NameInfo, 0, len(reqs))
 	fallbackRetIndexes := make([]int, 0, len(reqs))
-	for i, req := range reqs {
-		found, id, err := c.fastNamespaceLookup(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			ret[i] = id
-		} else {
-			fallbackReqs = append(fallbackReqs, req)
+	for i, ni := range reqs {
+		if uc := c.tc.uncommitted.getUncommittedByName(ni.ParentID, ni.ParentSchemaID, ni.Name); uc == nil {
+			fallbackReqs = append(fallbackReqs, ni)
 			fallbackRetIndexes = append(fallbackRetIndexes, i)
+		} else {
+			ret[i] = uc.GetID()
 		}
 	}
-	if len(fallbackReqs) > 0 {
-		fallbackRet, err := c.fallback().GetNamespaceEntries(ctx, fallbackReqs)
-		if err != nil {
-			return nil, err
-		}
-		for j, id := range fallbackRet {
-			ret[fallbackRetIndexes[j]] = id
-		}
+	if len(fallbackReqs) == 0 {
+		return ret, nil
+	}
+	fallbackRet, err := c.crvd.DereferenceDescriptorIDs(ctx, fallbackReqs)
+	if err != nil {
+		return nil, err
+	}
+	for j, id := range fallbackRet {
+		ret[fallbackRetIndexes[j]] = id
 	}
 	return ret, nil
 }
 
-func (c collectionBatchDescGetter) fastNamespaceLookup(
-	ctx context.Context, req descpb.NameInfo,
-) (found bool, id descpb.ID, err error) {
-	// Handle special cases.
-	// TODO(postamar): namespace lookups should go through Collection
-	switch req.ParentID {
-	case descpb.InvalidID:
-		if req.ParentSchemaID == descpb.InvalidID && req.Name == catconstants.SystemDatabaseName {
-			// Looking up system database ID, which is hard-coded.
-			return true, keys.SystemDatabaseID, nil
-		}
-	case keys.SystemDatabaseID:
-		// Looking up system database objects, which are cached.
-		id, err = lookupSystemDatabaseNamespaceCache(ctx, c.tc.codec(), req.ParentSchemaID, req.Name)
-		return id != descpb.InvalidID, id, err
+func (tc *Collection) ensureValidationLevel(
+	desc catalog.Descriptor, newLevel catalog.ValidationLevel,
+) {
+	if desc == nil {
+		return
 	}
-	return false, descpb.InvalidID, nil
+	if tc.validationLevels == nil {
+		tc.validationLevels = make(map[descpb.ID]catalog.ValidationLevel)
+	}
+	vl, ok := tc.validationLevels[desc.GetID()]
+	if ok && vl >= newLevel {
+		return
+	}
+	tc.validationLevels[desc.GetID()] = newLevel
 }
 
-// GetDesc implements the catalog.BatchDescGetter interface by delegating to
-// GetDescs.
-func (c collectionBatchDescGetter) GetDesc(
-	ctx context.Context, id descpb.ID,
-) (catalog.Descriptor, error) {
-	descs, err := c.GetDescs(ctx, []descpb.ID{id})
-	if err != nil {
-		return nil, err
+// ValidateSelf validates that the descriptor is internally consistent.
+// Validation may be skipped depending on mode.
+func ValidateSelf(
+	desc catalog.Descriptor,
+	version clusterversion.ClusterVersion,
+	dvmp DescriptorValidationModeProvider,
+) error {
+	if !dvmp.ValidateDescriptorsOnRead() && !dvmp.ValidateDescriptorsOnWrite() {
+		return nil
 	}
-	return descs[0], nil
-}
-
-// GetNamespaceEntry implements the catalog.BatchDescGetter interface by
-// delegating to GetNamespaceEntries.
-func (c collectionBatchDescGetter) GetNamespaceEntry(
-	ctx context.Context, parentID, parentSchemaID descpb.ID, name string,
-) (descpb.ID, error) {
-	return c.fallback().GetNamespaceEntry(ctx, parentID, parentSchemaID, name)
+	return validate.Self(version, desc)
 }

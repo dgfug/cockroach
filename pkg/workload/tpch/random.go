@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpch
 
@@ -125,13 +120,17 @@ const nPartNames = 5
 
 // randPartName concatenates 5 random unique strings from randPartNames, separated
 // by spaces.
-func randPartName(rng *rand.Rand, namePerm []int, a *bufalloc.ByteAllocator) []byte {
-	// do nPartNames iterations of rand.Perm, to get a random 5-subset of the
-	// indexes into randPartNames.
+func randPartName(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
+	namePerm := make([]int, len(randPartNames))
+	for i := range namePerm {
+		namePerm[i] = i
+	}
+	// Create a random 5-subset of the indexes into randPartNames using a modified
+	// Fisher–Yates shuffle.
 	for i := 0; i < nPartNames; i++ {
-		j := rng.Intn(i + 1)
-		namePerm[i] = namePerm[j]
-		namePerm[j] = i
+		// N.B. Correctness requires that i <= j < len(namePerm)
+		j := rng.Intn(len(namePerm)-i) + i
+		namePerm[i], namePerm[j] = namePerm[j], namePerm[i]
 	}
 	var buf []byte
 	*a, buf = a.Alloc(maxPartNameLen*nPartNames+nPartNames, 0)

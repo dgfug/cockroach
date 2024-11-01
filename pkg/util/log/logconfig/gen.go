@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build bazel
 // +build bazel
@@ -16,7 +11,7 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -115,7 +110,7 @@ func run() error {
 }
 
 func readInput(infos map[string]*sinkInfo) error {
-	fileData, err := ioutil.ReadAll(os.Stdin)
+	fileData, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
@@ -215,7 +210,7 @@ func readInput(infos map[string]*sinkInfo) error {
 			}
 			if strings.HasPrefix(comment, "indicates ") {
 				comment = strings.TrimPrefix(comment, "indicates ")
-			} else if strings.HasPrefix(comment, "is ") {
+			} else {
 				comment = strings.TrimPrefix(comment, "is ")
 			}
 

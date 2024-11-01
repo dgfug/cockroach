@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,12 +11,17 @@ import (
 	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 var pgjdbcReleaseTagRegex = regexp.MustCompile(`^REL(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGJDBCTag = "REL42.2.19"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var supportedPGJDBCTag = "REL42.7.3"
 
 // This test runs pgjdbc's full test suite against a single cockroach node.
 
@@ -36,15 +36,14 @@ func registerPgjdbc(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, c.All())
+		c.Start(ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB), install.MakeClusterSettings(), c.All())
 
-		version, err := fetchCockroachVersion(ctx, c, node[0])
+		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err := alterZoneConfigAndClusterSettings(ctx, version, c, node[0]); err != nil {
+		if err := alterZoneConfigAndClusterSettings(ctx, t, version, c, node[0]); err != nil {
 			t.Fatal(err)
 		}
 
@@ -66,14 +65,13 @@ func registerPgjdbc(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		// TODO(rafi): use openjdk-11-jdk-headless once we are off of Ubuntu 16.
 		if err := repeatRunE(
 			ctx,
 			t,
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install default-jre openjdk-8-jdk-headless gradle`,
+			`sudo apt-get -qq install default-jre openjdk-17-jdk-headless gradle`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -127,25 +125,24 @@ func registerPgjdbc(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		blocklistName, expectedFailures, ignorelistName, ignorelist := pgjdbcBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No pgjdbc blocklist defined for cockroach version %s", version)
-		}
-		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s", version, blocklistName)
-		if ignorelist != nil {
-			status = fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
-				version, blocklistName, ignorelistName)
-		}
+		const blocklistName = "pgjdbcBlockList"
+		const ignorelistName = "pgjdbcIgnorelist"
+		expectedFailures := pgjdbcBlockList
+		ignorelist := pgjdbcIgnoreList
+
+		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
+			version, blocklistName, ignorelistName)
+
 		t.L().Printf("%s", status)
 
 		t.Status("running pgjdbc test suite")
 		// Note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
-		_ = c.RunE(ctx, node,
+		_ = c.RunE(ctx, option.WithNodes(node),
 			`cd /mnt/data1/pgjdbc/pgjdbc/ && ../gradlew test`,
 		)
 
-		_ = c.RunE(ctx, node,
+		_ = c.RunE(ctx, option.WithNodes(node),
 			`mkdir -p ~/logs/report/pgjdbc-results`,
 		)
 
@@ -167,7 +164,7 @@ func registerPgjdbc(r registry.Registry) {
 
 		// Load the list of all test results files and parse them individually.
 		// Files are here: /mnt/data1/pgjdbc/pgjdbc-core/target/test-results/test
-		output, err := repeatRunWithBuffer(
+		result, err := repeatRunWithDetailsSingleNode(
 			ctx,
 			c,
 			t,
@@ -178,21 +175,24 @@ func registerPgjdbc(r registry.Registry) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(output) == 0 {
+
+		if len(result.Stdout) == 0 {
 			t.Fatal("could not find any test result files")
 		}
 
 		parseAndSummarizeJavaORMTestsResults(
-			ctx, t, c, node, "pgjdbc" /* ormName */, output,
+			ctx, t, c, node, "pgjdbc" /* ormName */, []byte(result.Stdout),
 			blocklistName, expectedFailures, ignorelist, version, supportedPGJDBCTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "pgjdbc",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `driver`},
+		Name:             "pgjdbc",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.Driver),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPgjdbc(ctx, t, c)
 		},
@@ -201,16 +201,16 @@ func registerPgjdbc(r registry.Registry) {
 
 const pgjdbcDatabaseParams = `
 server=localhost
-port=26257
+port={pgport:1}
 secondaryServer=localhost
 secondaryPort=5433
 secondaryServer2=localhost
 secondaryServerPort2=5434
 database=defaultdb
-username=root
-password=
-privilegedUser=root
-privilegedPassword=
+username=test_admin
+password=testpw
+privilegedUser=test_admin
+privilegedPassword=testpw
 sspiusername=testsspi
 preparethreshold=5
 loggerLevel=DEBUG

@@ -1,22 +1,19 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -24,15 +21,17 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.Migrate, declareKeysMigrate, Migrate)
+	RegisterReadWriteCommand(kvpb.Migrate, declareKeysMigrate, Migrate)
 }
 
 func declareKeysMigrate(
 	rs ImmutableRangeState,
-	_ roachpb.Header,
-	_ roachpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
-) {
+	_ *kvpb.Header,
+	_ kvpb.Request,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
+	_ time.Duration,
+) error {
 	// TODO(irfansharif): This will eventually grow to capture the super set of
 	// all keys accessed by all migrations defined here. That could get
 	// cumbersome. We could spruce up the migration type and allow authors to
@@ -41,6 +40,7 @@ func declareKeysMigrate(
 
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeVersionKey(rs.GetRangeID())})
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	return nil
 }
 
 // migrationRegistry is a global registry of all KV-level migrations. See
@@ -50,20 +50,12 @@ var migrationRegistry = make(map[roachpb.Version]migration)
 
 type migration func(context.Context, storage.ReadWriter, CommandArgs) (result.Result, error)
 
-func init() {
-	registerMigration(clusterversion.PostSeparatedIntentsMigration, postSeparatedIntentsMigration)
-}
-
-func registerMigration(key clusterversion.Key, migration migration) {
-	migrationRegistry[clusterversion.ByKey(key)] = migration
-}
-
 // Migrate executes the below-raft migration corresponding to the given version.
-// See roachpb.MigrateRequest for more details.
+// See kvpb.MigrateRequest for more details.
 func Migrate(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, _ roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, _ kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.MigrateRequest)
+	args := cArgs.Args.(*kvpb.MigrateRequest)
 	migrationVersion := args.Version
 
 	fn, ok := migrationRegistry[migrationVersion]
@@ -90,16 +82,6 @@ func Migrate(
 	// after it.
 	pd.Replicated.State.Version = &migrationVersion
 	return pd, nil
-}
-
-// postSeparatedIntentsMigration is the below-raft part of the migration for
-// interleaved to separated intents. It is a no-op as the only purpose of
-// running the Migrate command here is to clear out any orphaned replicas with
-// interleaved intents.
-func postSeparatedIntentsMigration(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs,
-) (result.Result, error) {
-	return result.Result{}, nil
 }
 
 // TestingRegisterMigrationInterceptor is used in tests to register an

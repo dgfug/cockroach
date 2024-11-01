@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqlstats is a subsystem that is responsible for tracking the
 // statistics of statements and transactions.
@@ -24,13 +19,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -46,42 +44,46 @@ const (
 
 // TestSQLStatsDataDriven runs the data-driven tests in
 // pkg/sql/sqlstats/persistedsqlstats/testdata. It has the following directives:
-// * exec-sql: executes SQL statements in the exec connection. This should be
-//             executed under a specific app_name in order to get deterministic
-//             results when testing for stmt/txn statistics. No output will be
-//             returned for SQL statements executed under this directive.
-// * observe-sql: executes SQL statements in the observer connection. This
-//                should be executed under a different app_name. This is used
-//                to test the statement/transaction statistics executed under
-//                exec-sql. Running them in different connection ensures that
-//                observing statements will not mess up the statistics of the
-//                statements that they are observing.
-// * sql-stats-flush: this triggers the SQL Statistics to be flushed into
-//                    system table.
-// * set-time: this changes the clock time perceived by SQL Stats subsystem.
-//             This is useful when unit tests need to manipulate times.
-// * should-sample-logical-plan: this checks if the given tuple of
-//                               (db, implicitTxn, fingerprint) will be sampled
-//                               next time it is being executed.
+//   - exec-sql: executes SQL statements in the exec connection. This should be
+//     executed under a specific app_name in order to get deterministic
+//     results when testing for stmt/txn statistics. No output will be
+//     returned for SQL statements executed under this directive.
+//   - observe-sql: executes SQL statements in the observer connection. This
+//     should be executed under a different app_name. This is used
+//     to test the statement/transaction statistics executed under
+//     exec-sql. Running them in different connection ensures that
+//     observing statements will not mess up the statistics of the
+//     statements that they are observing.
+//   - sql-stats-flush: this triggers the SQL Statistics to be flushed into
+//     system table.
+//   - set-time: this changes the clock time perceived by SQL Stats subsystem.
+//     This is useful when unit tests need to manipulate times.
+//   - should-sample: this checks if the given tuple of
+//     (db, implicitTxn, fingerprint) will be sampled
+//     next time it is being executed.
 func TestSQLStatsDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t)
 
 	stubTime := &stubTime{}
 	injector := newRuntimeKnobsInjector()
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).StubTimeNow = stubTime.Now
-	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).OnStmtStatsFlushFinished = injector.invokePostStmtStatsFlushCallback
-	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).OnTxnStatsFlushFinished = injector.invokePostTxnStatsFlushCallback
+	var params base.TestServerArgs
+	knobs := sqlstats.CreateTestingKnobs()
+	knobs.StubTimeNow = stubTime.Now
+	knobs.OnStmtStatsFlushFinished = injector.invokePostStmtStatsFlushCallback
+	knobs.OnTxnStatsFlushFinished = injector.invokePostTxnStatsFlushCallback
+	params.Knobs.SQLStatsKnobs = knobs
 
-	cluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
+	cluster := serverutils.StartCluster(t, 3 /* numNodes */, base.TestClusterArgs{
 		ServerArgs: params,
 	})
 	defer cluster.Stopper().Stop(ctx)
 
-	server := cluster.Server(0 /* idx */)
+	server := cluster.Server(0 /* idx */).ApplicationLayer()
 	sqlStats := server.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 
 	appStats := sqlStats.GetApplicationStats("app1")
@@ -92,16 +94,23 @@ func TestSQLStatsDataDriven(t *testing.T) {
 	observerConn := cluster.ServerConn(1 /* idx */)
 
 	observer := sqlutils.MakeSQLRunner(observerConn)
+	_, err := sqlConn.Exec(`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = true;`)
+	if err != nil {
+		t.Errorf("failed to enable plan collection due to %s", err.Error())
+	}
 
 	execDataDrivenTestCmd := func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "exec-sql":
 			stmts := strings.Split(d.Input, "\n")
 			for i := range stmts {
-				_, err := sqlConn.Exec(stmts[i])
-				if err != nil {
-					t.Errorf("failed to execute stmt %s due to %s", stmts[i], err.Error())
-				}
+				testutils.SucceedsSoon(t, func() error {
+					_, exSqlErr := sqlConn.Exec(stmts[i])
+					if exSqlErr != nil {
+						return errors.NewAssertionErrorWithWrappedErrf(exSqlErr, "failed to execute stmt %s", stmts[i])
+					}
+					return nil
+				})
 			}
 		case "observe-sql":
 			actual := observer.QueryStr(t, d.Input)
@@ -112,7 +121,7 @@ func TestSQLStatsDataDriven(t *testing.T) {
 			}
 			return strings.Join(rows, "\n")
 		case "sql-stats-flush":
-			sqlStats.Flush(ctx)
+			sqlStats.MaybeFlush(ctx, cluster.ApplicationLayer(0).AppStopper())
 		case "set-time":
 			mustHaveArgsOrFatal(t, d, timeArgs)
 
@@ -124,7 +133,7 @@ func TestSQLStatsDataDriven(t *testing.T) {
 			}
 			stubTime.setTime(tm)
 			return stubTime.Now().String()
-		case "should-sample-logical-plan":
+		case "should-sample":
 			mustHaveArgsOrFatal(t, d, fingerprintArgs, implicitTxnArgs, dbNameArgs)
 
 			var dbName string
@@ -140,19 +149,23 @@ func TestSQLStatsDataDriven(t *testing.T) {
 			// them.
 			fingerprint = strings.Replace(fingerprint, "%", " ", -1)
 
-			return fmt.Sprintf("%t",
-				appStats.ShouldSaveLogicalPlanDesc(
-					fingerprint,
-					implicitTxn,
-					dbName,
-				),
+			previouslySampled, savePlanForStats := appStats.ShouldSample(
+				fingerprint,
+				implicitTxn,
+				dbName,
 			)
+			return fmt.Sprintf("%t, %t", previouslySampled, savePlanForStats)
+		case "skip":
+			var issue int
+			d.ScanArgs(t, "issue-num", &issue)
+			skip.WithIssue(t, issue)
+			return ""
 		}
 
 		return ""
 	}
 
-	datadriven.Walk(t, "testdata/", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			if d.Cmd == "register-callback" {
 				mustHaveArgsOrFatal(

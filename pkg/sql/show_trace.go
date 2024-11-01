@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
@@ -59,8 +55,9 @@ func (p *planner) ShowTrace(ctx context.Context, n *tree.ShowTraceForSession) (p
 //
 // Args:
 // kvTracingEnabled: If set, the trace will also include "KV trace" messages -
-//   verbose messages around the interaction of SQL with KV. Some of the
-//   messages are per-row.
+//
+//	verbose messages around the interaction of SQL with KV. Some of the
+//	messages are per-row.
 func (p *planner) makeShowTraceNode(compact bool, kvTracingEnabled bool) *showTraceNode {
 	n := &showTraceNode{
 		kvTracingEnabled: kvTracingEnabled,
@@ -105,7 +102,7 @@ func (n *showTraceNode) Next(params runParams) (bool, error) {
 // This code must be careful not to overwrite traceRows,
 // because this is a shared slice which will be reused
 // by subsequent SHOW TRACE FOR SESSION statements.
-func (n *showTraceNode) processTraceRows(evalCtx *tree.EvalContext, traceRows []traceRow) {
+func (n *showTraceNode) processTraceRows(evalCtx *eval.Context, traceRows []traceRow) {
 	// Filter trace rows based on the message (in the SHOW KV TRACE case)
 	if n.kvTracingEnabled {
 		res := make([]traceRow, 0, len(traceRows))
@@ -165,6 +162,7 @@ var kvMsgRegexp = regexp.MustCompile(
 		"^Get ",
 		"^Scan ",
 		"^querying next range at ",
+		"^key:.*, desc: ",
 		"^output row: ",
 		"^rows affected: ",
 		"^execution failed after ",

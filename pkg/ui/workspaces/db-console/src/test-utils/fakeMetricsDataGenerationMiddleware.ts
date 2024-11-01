@@ -1,20 +1,17 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { Store, Action, Dispatch } from "redux";
+import clone from "lodash/clone";
 import Long from "long";
-import { clone } from "lodash";
-import { AdminUIState } from "src/redux/state";
-import { RECEIVE, RequestWithResponse, WithID } from "src/redux/metrics";
+import { Store, Action, Dispatch } from "redux";
+
 import { PayloadAction } from "src/interfaces/action";
 import { cockroach } from "src/js/protos";
+import { RECEIVE, RequestWithResponse, WithID } from "src/redux/metrics";
+import { AdminUIState } from "src/redux/state";
+
 import ITimeSeriesDatapoint = cockroach.ts.tspb.ITimeSeriesDatapoint;
 
 function fakeTimeSeriesDatapoint(timestamp?: Long): ITimeSeriesDatapoint {
@@ -31,54 +28,56 @@ function fakeTimeSeriesDatapoint(timestamp?: Long): ITimeSeriesDatapoint {
  * there is no available data for requested period, then missing datapoints will be randomly generated.
  * Note: it is only for testing purposes only.
  */
-export const fakeMetricsDataGenerationMiddleware = (
-  _store: Store<AdminUIState>,
-) => (next: Dispatch<Action>) => (action: Action) => {
-  if (action.type === RECEIVE) {
-    const originalAction = action as PayloadAction<WithID<RequestWithResponse>>;
-    const {
-      start_nanos,
-      end_nanos,
-      sample_nanos,
-    } = originalAction.payload.data.request;
-    const { results } = originalAction.payload.data.response;
-    const expectedDatapointsCount = end_nanos
-      .sub(start_nanos)
-      .divide(sample_nanos)
-      .toNumber();
+export const fakeMetricsDataGenerationMiddleware =
+  (_store: Store<AdminUIState>) =>
+  (next: Dispatch<Action>) =>
+  (action: Action) => {
+    if (action.type === RECEIVE) {
+      const originalAction = action as PayloadAction<
+        WithID<RequestWithResponse>
+      >;
+      const { start_nanos, end_nanos, sample_nanos } =
+        originalAction.payload.data.request;
+      const { results } = originalAction.payload.data.response;
+      const expectedDatapointsCount = end_nanos
+        .sub(start_nanos)
+        .divide(sample_nanos)
+        .toNumber();
 
-    const nextResults = results.map(res => {
-      const actualDatapointsCount = res.datapoints.length;
+      const nextResults = results.map(res => {
+        const actualDatapointsCount = res.datapoints.length;
 
-      if (actualDatapointsCount >= expectedDatapointsCount) {
-        return res;
-      }
+        if (actualDatapointsCount >= expectedDatapointsCount) {
+          return res;
+        }
 
-      const samplePoint =
-        actualDatapointsCount > 0
-          ? clone(res.datapoints[0])
-          : fakeTimeSeriesDatapoint(end_nanos);
+        const samplePoint =
+          actualDatapointsCount > 0
+            ? clone(res.datapoints[0])
+            : fakeTimeSeriesDatapoint(end_nanos);
 
-      const datapoints = Array(expectedDatapointsCount - actualDatapointsCount)
-        .fill(1)
-        .map<ITimeSeriesDatapoint>((_, idx) => ({
-          ...samplePoint,
-          timestamp_nanos: samplePoint.timestamp_nanos.subtract(
-            sample_nanos.multiply(idx + 1),
-          ),
-        }))
-        .reverse()
-        .concat(...res.datapoints);
+        const datapoints = Array(
+          expectedDatapointsCount - actualDatapointsCount,
+        )
+          .fill(1)
+          .map<ITimeSeriesDatapoint>((_, idx) => ({
+            ...samplePoint,
+            timestamp_nanos: samplePoint.timestamp_nanos.subtract(
+              sample_nanos.multiply(idx + 1),
+            ),
+          }))
+          .reverse()
+          .concat(...res.datapoints);
 
-      return {
-        ...res,
-        datapoints,
-      };
-    });
+        return {
+          ...res,
+          datapoints,
+        };
+      });
 
-    originalAction.payload.data.response.results = nextResults;
-    return next(originalAction);
-  } else {
-    return next(action);
-  }
-};
+      originalAction.payload.data.response.results = nextResults;
+      return next(originalAction);
+    } else {
+      return next(action);
+    }
+  };

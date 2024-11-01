@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowcontainer
 
@@ -25,30 +20,33 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
-// compareRows compares l and r according to a column ordering. Returns -1 if
+// compareEncRows compares l and r according to a column ordering. Returns -1 if
 // l < r, 0 if l == r, and 1 if l > r. If an error is returned the int returned
 // is invalid. Note that the comparison is only performed on the ordering
 // columns.
-func compareRows(
+func compareEncRows(
+	ctx context.Context,
 	lTypes []*types.T,
 	l, r rowenc.EncDatumRow,
-	e *tree.EvalContext,
-	d *rowenc.DatumAlloc,
+	e *eval.Context,
+	d *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
 ) (int, error) {
 	for _, orderInfo := range ordering {
 		col := orderInfo.ColIdx
-		cmp, err := l[col].Compare(lTypes[col], d, e, &r[orderInfo.ColIdx])
+		cmp, err := l[col].Compare(ctx, lTypes[col], d, e, &r[col])
 		if err != nil {
 			return 0, err
 		}
@@ -62,12 +60,67 @@ func compareRows(
 	return 0, nil
 }
 
+// compareRowToEncRow compares l and r according to a column ordering. Returns
+// -1 if l < r, 0 if l == r, and 1 if l > r. If an error is returned the int
+// returned is invalid. Note that the comparison is only performed on the
+// ordering columns.
+func compareRowToEncRow(
+	ctx context.Context,
+	lTypes []*types.T,
+	l tree.Datums,
+	r rowenc.EncDatumRow,
+	e *eval.Context,
+	d *tree.DatumAlloc,
+	ordering colinfo.ColumnOrdering,
+) (int, error) {
+	for _, orderInfo := range ordering {
+		col := orderInfo.ColIdx
+		if err := r[col].EnsureDecoded(lTypes[col], d); err != nil {
+			return 0, err
+		}
+		cmp, err := l[col].Compare(ctx, e, r[col].Datum)
+		if err != nil {
+			return 0, err
+		}
+		if cmp != 0 {
+			if orderInfo.Direction == encoding.Descending {
+				cmp = -cmp
+			}
+			return cmp, nil
+		}
+	}
+	return 0, nil
+}
+
+func getMemoryMonitor(st *cluster.Settings) *mon.BytesMonitor {
+	return mon.NewMonitor(mon.Options{
+		Name:     "test-mem",
+		Settings: st,
+	})
+}
+
+func getUnlimitedMemoryMonitor(st *cluster.Settings) *mon.BytesMonitor {
+	return mon.NewUnlimitedMonitor(context.Background(), mon.Options{
+		Name:     "test-mem",
+		Settings: st,
+	})
+}
+
+func getDiskMonitor(st *cluster.Settings) *mon.BytesMonitor {
+	return mon.NewMonitor(mon.Options{
+		Name:     "test-disk",
+		Res:      mon.DiskResource,
+		Settings: st,
+	})
+}
+
 func TestDiskRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,19 +157,12 @@ func TestDiskRowContainer(t *testing.T) {
 		},
 	}
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 
-	evalCtx := tree.MakeTestingEvalContext(st)
-	diskMonitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	evalCtx := eval.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	diskMonitor := getDiskMonitor(st)
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 	t.Run("EncodeDecode", func(t *testing.T) {
 		for i := 0; i < 100; i++ {
@@ -129,7 +175,7 @@ func TestDiskRowContainer(t *testing.T) {
 				}
 				row := randgen.RandEncDatumRowOfTypes(rng, typs)
 				func() {
-					d := MakeDiskRowContainer(diskMonitor, typs, ordering, tempEngine)
+					d, _ := MakeDiskRowContainer(ctx, diskMonitor, typs, ordering, tempEngine)
 					defer d.Close(ctx)
 					if err := d.AddRow(ctx, row); err != nil {
 						t.Fatal(err)
@@ -143,17 +189,17 @@ func TestDiskRowContainer(t *testing.T) {
 					} else if !ok {
 						t.Fatal("unexpectedly invalid")
 					}
-					readRow := make(rowenc.EncDatumRow, len(row))
+					readEncRow := make(rowenc.EncDatumRow, len(row))
 
-					temp, err := i.Row()
+					temp, err := i.EncRow()
 					if err != nil {
 						t.Fatal(err)
 					}
-					copy(readRow, temp)
+					copy(readEncRow, temp)
 
 					// Ensure the datum fields are set and no errors occur when
 					// decoding.
-					for i, encDatum := range readRow {
+					for i, encDatum := range readEncRow {
 						if err := encDatum.EnsureDecoded(typs[i], d.datumAlloc); err != nil {
 							t.Fatal(err)
 						}
@@ -161,10 +207,23 @@ func TestDiskRowContainer(t *testing.T) {
 
 					// Check equality of the row we wrote and the row we read.
 					for i := range row {
-						if cmp, err := readRow[i].Compare(typs[i], d.datumAlloc, &evalCtx, &row[i]); err != nil {
+						if cmp, err := readEncRow[i].Compare(ctx, typs[i], d.datumAlloc, &evalCtx, &row[i]); err != nil {
 							t.Fatal(err)
 						} else if cmp != 0 {
-							t.Fatalf("encoded %s but decoded %s", row.String(typs), readRow.String(typs))
+							t.Fatalf("encoded %s but decoded %s", row.String(typs), readEncRow.String(typs))
+						}
+					}
+
+					// Now check the tree.Datums row.
+					readRow, err := i.Row()
+					if err != nil {
+						t.Fatal(err)
+					}
+					for i := range row {
+						if cmp, err := readRow[i].Compare(ctx, &evalCtx, row[i].Datum); err != nil {
+							t.Fatal(err)
+						} else if cmp != 0 {
+							t.Fatalf("read %s but expected %s", readRow.String(), row.String(typs))
 						}
 					}
 				}()
@@ -179,7 +238,7 @@ func TestDiskRowContainer(t *testing.T) {
 			types := randgen.RandSortingTypes(rng, numCols)
 			rows := randgen.RandEncDatumRowsOfTypes(rng, numRows, types)
 			func() {
-				d := MakeDiskRowContainer(diskMonitor, types, ordering, tempEngine)
+				d, _ := MakeDiskRowContainer(ctx, diskMonitor, types, ordering, tempEngine)
 				defer d.Close(ctx)
 				for i := 0; i < len(rows); i++ {
 					if err := d.AddRow(ctx, rows[i]); err != nil {
@@ -209,7 +268,7 @@ func TestDiskRowContainer(t *testing.T) {
 					} else if !ok {
 						break
 					}
-					row, err := i.Row()
+					row, err := i.EncRow()
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -223,15 +282,17 @@ func TestDiskRowContainer(t *testing.T) {
 					}
 
 					// Check sorted order.
-					if cmp, err := compareRows(
-						types, sortedRows.EncRow(numKeysRead), row, &evalCtx, d.datumAlloc, ordering,
+					sortedRows.getEncRow(sortedRows.scratchEncRow, numKeysRead)
+					if cmp, err := compareEncRows(
+						ctx, types, sortedRows.scratchEncRow, row, &evalCtx, d.datumAlloc, ordering,
 					); err != nil {
 						t.Fatal(err)
 					} else if cmp != 0 {
+						sortedRows.getEncRow(sortedRows.scratchEncRow, numKeysRead)
 						t.Fatalf(
 							"expected %s to be equal to %s",
 							row.String(types),
-							sortedRows.EncRow(numKeysRead).String(types),
+							sortedRows.scratchEncRow.String(types),
 						)
 					}
 					numKeysRead++
@@ -259,7 +320,7 @@ func TestDiskRowContainer(t *testing.T) {
 		// Use random types and random rows.
 		types := randgen.RandSortingTypes(rng, numCols)
 		numRows, rows := makeUniqueRows(t, &evalCtx, rng, numRows, types, ordering)
-		d := MakeDiskRowContainer(diskMonitor, types, ordering, tempEngine)
+		d, _ := MakeDiskRowContainer(ctx, diskMonitor, types, ordering, tempEngine)
 		defer d.Close(ctx)
 		d.DoDeDuplicate()
 		addRowsRepeatedly := func() {
@@ -301,7 +362,7 @@ func TestDiskRowContainer(t *testing.T) {
 		types := randgen.RandSortingTypes(rng, numCols)
 		rows := randgen.RandEncDatumRowsOfTypes(rng, numRows, types)
 		// There are no ordering columns when using the numberedRowIterator.
-		d := MakeDiskRowContainer(diskMonitor, types, nil, tempEngine)
+		d, _ := MakeDiskRowContainer(ctx, diskMonitor, types, nil, tempEngine)
 		defer d.Close(ctx)
 		for i := 0; i < numRows; i++ {
 			require.NoError(t, d.AddRow(ctx, rows[i]))
@@ -314,7 +375,7 @@ func TestDiskRowContainer(t *testing.T) {
 			valid, err := iter.Valid()
 			require.True(t, valid)
 			require.NoError(t, err)
-			row, err := iter.Row()
+			row, err := iter.EncRow()
 			require.NoError(t, err)
 			require.Equal(t, rows[index].String(types), row.String(types))
 		}
@@ -335,7 +396,7 @@ func TestDiskRowContainer(t *testing.T) {
 // 0), hence it also returns the actual returned count (to remind the caller).
 func makeUniqueRows(
 	t *testing.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rng *rand.Rand,
 	numRows int,
 	types []*types.T,
@@ -343,15 +404,15 @@ func makeUniqueRows(
 ) (int, rowenc.EncDatumRows) {
 	rows := randgen.RandEncDatumRowsOfTypes(rng, numRows, types)
 	// It is possible there was some duplication, so remove duplicates.
-	var alloc rowenc.DatumAlloc
+	var alloc tree.DatumAlloc
 	sort.Slice(rows, func(i, j int) bool {
-		cmp, err := rows[i].Compare(types, &alloc, ordering, evalCtx, rows[j])
+		cmp, err := rows[i].Compare(context.Background(), types, &alloc, ordering, evalCtx, rows[j])
 		require.NoError(t, err)
 		return cmp < 0
 	})
 	deDupedRows := rows[:1]
 	for i := 1; i < len(rows); i++ {
-		cmp, err := rows[i].Compare(types, &alloc, ordering, evalCtx, deDupedRows[len(deDupedRows)-1])
+		cmp, err := rows[i].Compare(context.Background(), types, &alloc, ordering, evalCtx, deDupedRows[len(deDupedRows)-1])
 		require.NoError(t, err)
 		if cmp != 0 {
 			deDupedRows = append(deDupedRows, rows[i])
@@ -367,28 +428,22 @@ func makeUniqueRows(
 
 func TestDiskRowContainerDiskFull(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
 	// Make a monitor with no capacity.
-	monitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	monitor.Start(ctx, nil, mon.MakeStandaloneBudget(0 /* capacity */))
+	monitor := getDiskMonitor(st)
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(0 /* capacity */))
 
-	d := MakeDiskRowContainer(
+	d, _ := MakeDiskRowContainer(
+		ctx,
 		monitor,
 		[]*types.T{types.Int},
 		colinfo.ColumnOrdering{colinfo.ColumnOrderInfo{ColIdx: 0, Direction: encoding.Ascending}},
@@ -405,30 +460,23 @@ func TestDiskRowContainerDiskFull(t *testing.T) {
 
 func TestDiskRowContainerFinalIterator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	alloc := &rowenc.DatumAlloc{}
-	evalCtx := tree.MakeTestingEvalContext(st)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	alloc := &tree.DatumAlloc{}
+	evalCtx := eval.MakeTestingEvalContext(st)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
-	diskMonitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor := getDiskMonitor(st)
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
-	d := MakeDiskRowContainer(diskMonitor, types.OneIntCol, nil /* ordering */, tempEngine)
+	d, _ := MakeDiskRowContainer(ctx, diskMonitor, types.OneIntCol, nil /* ordering */, tempEngine)
 	defer d.Close(ctx)
 
 	const numCols = 1
@@ -443,7 +491,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 	// checkEqual checks that the given row is equal to otherRow.
 	checkEqual := func(row rowenc.EncDatumRow, otherRow rowenc.EncDatumRow) error {
 		for j, c := range row {
-			if cmp, err := c.Compare(types.Int, alloc, &evalCtx, &otherRow[j]); err != nil {
+			if cmp, err := c.Compare(ctx, types.Int, alloc, &evalCtx, &otherRow[j]); err != nil {
 				return err
 			} else if cmp != 0 {
 				return fmt.Errorf(
@@ -466,7 +514,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 			} else if !ok {
 				t.Fatalf("unexpectedly reached the end after %d rows read", rowsRead)
 			}
-			row, err := i.Row()
+			row, err := i.EncRow()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -487,7 +535,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 			} else if !ok {
 				break
 			}
-			row, err := i.Row()
+			row, err := i.EncRow()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -518,7 +566,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 		} else if !ok {
 			break
 		}
-		row, err := i.Row()
+		row, err := i.EncRow()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -535,27 +583,20 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 
 func TestDiskRowContainerUnsafeReset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
-	monitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	monitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	monitor := getDiskMonitor(st)
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 
-	d := MakeDiskRowContainer(monitor, types.OneIntCol, nil /* ordering */, tempEngine)
+	d, _ := MakeDiskRowContainer(ctx, monitor, types.OneIntCol, nil /* ordering */, tempEngine)
 	defer d.Close(ctx)
 
 	const (
@@ -589,7 +630,7 @@ func TestDiskRowContainerUnsafeReset(t *testing.T) {
 			if ok, err := i.Valid(); err != nil || !ok {
 				t.Fatalf("unexpected i.Valid() return values: ok=%t, err=%s", ok, err)
 			}
-			row, err := i.Row()
+			row, err := i.EncRow()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -616,7 +657,7 @@ func TestDiskRowContainerUnsafeReset(t *testing.T) {
 		} else if !ok {
 			break
 		}
-		_, err := i.Row()
+		_, err := i.EncRow()
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,17 +1,13 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colserde
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"os"
@@ -23,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	mmap "github.com/edsrzf/mmap-go"
 	flatbuffers "github.com/google/flatbuffers/go"
@@ -54,9 +51,11 @@ type FileSerializer struct {
 }
 
 // NewFileSerializer creates a FileSerializer for the given types. The caller is
-// responsible for closing the given writer.
-func NewFileSerializer(w io.Writer, typs []*types.T) (*FileSerializer, error) {
-	a, err := NewArrowBatchConverter(typs)
+// responsible for closing the given writer as well as the given memory account.
+func NewFileSerializer(
+	w io.Writer, typs []*types.T, memAcc *mon.BoundAccount,
+) (*FileSerializer, error) {
+	a, err := NewArrowBatchConverter(typs, BatchToArrowOnly, memAcc)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +103,10 @@ func (s *FileSerializer) Reset(w io.Writer) error {
 }
 
 // AppendBatch adds one batch of columnar data to the file.
-func (s *FileSerializer) AppendBatch(batch coldata.Batch) error {
+func (s *FileSerializer) AppendBatch(ctx context.Context, batch coldata.Batch) error {
 	offset := int64(s.w.written)
 
-	arrow, err := s.a.BatchToArrow(batch)
+	arrow, err := s.a.BatchToArrow(ctx, batch)
 	if err != nil {
 		return err
 	}
@@ -152,6 +151,11 @@ func (s *FileSerializer) Finish() error {
 	return err
 }
 
+// Close releases the resources of the serializer.
+func (s *FileSerializer) Close(ctx context.Context) {
+	s.a.Close(ctx)
+}
+
 // FileDeserializer decodes columnar data batches from files encoded according
 // to the arrow spec.
 type FileDeserializer struct {
@@ -166,7 +170,7 @@ type FileDeserializer struct {
 	a    *ArrowBatchConverter
 	rb   *RecordBatchSerializer
 
-	arrowScratch []*array.Data
+	arrowScratch []array.Data
 }
 
 // NewFileDeserializerFromBytes constructs a FileDeserializer for an in-memory
@@ -175,9 +179,9 @@ func NewFileDeserializerFromBytes(typs []*types.T, buf []byte) (*FileDeserialize
 	return newFileDeserializer(typs, buf, func() error { return nil })
 }
 
-// NewFileDeserializerFromPath constructs a FileDeserializer by reading it from
-// a file.
-func NewFileDeserializerFromPath(typs []*types.T, path string) (*FileDeserializer, error) {
+// NewTestFileDeserializerFromPath constructs a FileDeserializer by reading it
+// from a file. It is only used in tests.
+func NewTestFileDeserializerFromPath(typs []*types.T, path string) (*FileDeserializer, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, pgerror.Wrapf(err, pgcode.Io, `opening %s`, path)
@@ -208,19 +212,20 @@ func newFileDeserializer(
 	}
 	d.typs = typs
 
-	if d.a, err = NewArrowBatchConverter(typs); err != nil {
+	if d.a, err = NewArrowBatchConverter(typs, ArrowToBatchOnly, nil /* acc */); err != nil {
 		return nil, err
 	}
 	if d.rb, err = NewRecordBatchSerializer(typs); err != nil {
 		return nil, err
 	}
-	d.arrowScratch = make([]*array.Data, 0, len(typs))
+	d.arrowScratch = make([]array.Data, 0, len(typs))
 
 	return d, nil
 }
 
 // Close releases any resources held by this deserializer.
-func (d *FileDeserializer) Close() error {
+func (d *FileDeserializer) Close(ctx context.Context) error {
+	d.a.Close(ctx)
 	return d.bufCloseFn()
 }
 

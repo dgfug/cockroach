@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -24,6 +19,12 @@ import (
 func FormatWithContextTags(ctx context.Context, format string, args ...interface{}) string {
 	var buf strings.Builder
 	formatTags(ctx, true /* brackets */, &buf)
+	formatArgs(&buf, format, args...)
+	return buf.String()
+}
+
+func formatOnlyArgs(format string, args ...interface{}) string {
+	var buf strings.Builder
 	formatArgs(&buf, format, args...)
 	return buf.String()
 }

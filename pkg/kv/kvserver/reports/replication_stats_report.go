@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -20,8 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -88,7 +83,7 @@ func (r RangeReport) CountRange(zKey ZoneKey, status roachpb.RangeStatusReport) 
 }
 
 func (r *replicationStatsReportSaver) loadPreviousVersion(
-	ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn,
+	ctx context.Context, ex isql.Executor, txn *kv.Txn,
 ) error {
 	// The data for the previous save needs to be loaded if:
 	// - this is the first time that we call this method and lastUpdatedAt has never been set
@@ -121,7 +116,7 @@ func (r *replicationStatsReportSaver) loadPreviousVersion(
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		row := it.Cur()
 		key := ZoneKey{}
-		key.ZoneID = (config.SystemTenantObjectID)(*row[0].(*tree.DInt))
+		key.ZoneID = (config.ObjectID)(*row[0].(*tree.DInt))
 		key.SubzoneID = base.SubzoneID(*row[1].(*tree.DInt))
 		r.previousVersion[key] = zoneRangeStatus{
 			(int32)(*row[2].(*tree.DInt)),
@@ -134,7 +129,7 @@ func (r *replicationStatsReportSaver) loadPreviousVersion(
 }
 
 func (r *replicationStatsReportSaver) updateTimestamp(
-	ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn, reportTS time.Time,
+	ctx context.Context, ex isql.Executor, txn *kv.Txn, reportTS time.Time,
 ) error {
 	if !r.lastGenerated.IsZero() && reportTS == r.lastGenerated {
 		return errors.Errorf(
@@ -161,11 +156,7 @@ func (r *replicationStatsReportSaver) updateTimestamp(
 // takes ownership.
 // reportTS is the time that will be set in the updated_at column for every row.
 func (r *replicationStatsReportSaver) Save(
-	ctx context.Context,
-	report RangeReport,
-	reportTS time.Time,
-	db *kv.DB,
-	ex sqlutil.InternalExecutor,
+	ctx context.Context, report RangeReport, reportTS time.Time, db *kv.DB, ex isql.Executor,
 ) error {
 	r.lastUpdatedRowCount = 0
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -217,7 +208,7 @@ func (r *replicationStatsReportSaver) Save(
 
 // upsertStat upserts a row into system.replication_stats.
 func (r *replicationStatsReportSaver) upsertStats(
-	ctx context.Context, txn *kv.Txn, key ZoneKey, stats zoneRangeStatus, ex sqlutil.InternalExecutor,
+	ctx context.Context, txn *kv.Txn, key ZoneKey, stats zoneRangeStatus, ex isql.Executor,
 ) error {
 	var err error
 	previousStats, hasOldVersion := r.previousVersion[key]
@@ -255,11 +246,11 @@ type replicationStatsVisitor struct {
 	report   RangeReport
 	visitErr bool
 
-	// prevZoneKey and prevNumReplicas maintain state from one range to the next.
+	// prevZoneKey and prevNumVoters maintain state from one range to the next.
 	// This state can be reused when a range is covered by the same zone config as
 	// the previous one. Reusing it speeds up the report generation.
-	prevZoneKey     ZoneKey
-	prevNumReplicas int
+	prevZoneKey   ZoneKey
+	prevNumVoters int
 }
 
 var _ rangeVisitor = &replicationStatsVisitor{}
@@ -268,11 +259,12 @@ func makeReplicationStatsVisitor(
 	ctx context.Context, cfg *config.SystemConfig, nodeChecker nodeChecker,
 ) replicationStatsVisitor {
 	v := replicationStatsVisitor{
-		cfg:         cfg,
-		nodeChecker: nodeChecker,
-		report:      make(RangeReport),
+		cfg:           cfg,
+		nodeChecker:   nodeChecker,
+		report:        make(RangeReport),
+		prevNumVoters: -1,
 	}
-	v.reset(ctx)
+	v.init(ctx)
 	return v
 }
 
@@ -286,25 +278,17 @@ func (v *replicationStatsVisitor) Report() RangeReport {
 	return v.report
 }
 
-// reset is part of the rangeVisitor interface.
-func (v *replicationStatsVisitor) reset(ctx context.Context) {
-	*v = replicationStatsVisitor{
-		cfg:             v.cfg,
-		nodeChecker:     v.nodeChecker,
-		prevNumReplicas: -1,
-		report:          make(RangeReport, len(v.report)),
-	}
-
+func (v *replicationStatsVisitor) init(ctx context.Context) {
 	// Iterate through all the zone configs to create report entries for all the
 	// zones that have constraints. Otherwise, just iterating through the ranges
 	// wouldn't create entries for zones that don't apply to any ranges.
 	maxObjectID, err := v.cfg.GetLargestObjectID(
-		0 /* maxID - return the largest ID in the config */, keys.PseudoTableIDs,
+		0 /* maxReservedDescID - return the largest ID in the config */, keys.PseudoTableIDs,
 	)
 	if err != nil {
 		log.Fatalf(ctx, "unexpected failure to compute max object id: %s", err)
 	}
-	for i := config.SystemTenantObjectID(1); i <= maxObjectID; i++ {
+	for i := config.ObjectID(1); i <= maxObjectID; i++ {
 		zone, err := getZoneByID(i, v.cfg)
 		if err != nil {
 			log.Fatalf(ctx, "unexpected failure to compute max object id: %s", err)
@@ -335,14 +319,19 @@ func (v *replicationStatsVisitor) visitNewZone(
 	}()
 	var zKey ZoneKey
 	var zConfig *zonepb.ZoneConfig
-	var numReplicas int
+	// NumReplicas and NumVoters are not necessarily set in tandem so
+	// if NumVoters is not found there should be continual traversal to
+	// find it and otherwise defer to NumReplicas.
+	// Based on the above, desiredNumVoters is set to NumVoters or NumReplicas
+	// if NumVoters is not set.
+	var desiredNumVoters int
 
 	// Figure out the zone config for whose report the current range is to be
 	// counted. This is the lowest-level zone config covering the range that
 	// changes replication settings. We also need to figure out the replication
 	// factor this zone is configured with; the replication factor might be
 	// inherited from a higher-level zone config.
-	found, err := visitZones(ctx, r, v.cfg, ignoreSubzonePlaceholders,
+	_, err := visitZones(ctx, r, v.cfg, ignoreSubzonePlaceholders,
 		func(_ context.Context, zone *zonepb.ZoneConfig, key ZoneKey) bool {
 			if zConfig == nil {
 				if !zoneChangesReplication(zone) {
@@ -350,38 +339,45 @@ func (v *replicationStatsVisitor) visitNewZone(
 				}
 				zKey = key
 				zConfig = zone
-				if zone.NumReplicas != nil {
-					numReplicas = int(*zone.NumReplicas)
+				if zone.NumVoters != nil {
+					desiredNumVoters = int(*zone.NumVoters)
 					return true
 				}
-				// We need to continue upwards in search for the NumReplicas.
+				if zone.NumReplicas != nil && desiredNumVoters == 0 {
+					desiredNumVoters = int(*zone.NumReplicas)
+				}
+				// We need to continue upwards in search for NumVoters
+				// and, if the previous is not found, NumReplicas.
 				return false
 			}
-			// We had already found the zone to report to, but we're haven't found
-			// its NumReplicas yet.
-			if zone.NumReplicas != nil {
-				numReplicas = int(*zone.NumReplicas)
+			if zone.NumVoters != nil {
+				desiredNumVoters = int(*zone.NumVoters)
 				return true
 			}
+			if zone.NumReplicas != nil && desiredNumVoters == 0 {
+				desiredNumVoters = int(*zone.NumReplicas)
+			}
+			// We had already found the zone to report to, but we're haven't found
+			// its NumVoters and NumReplicas yet.
 			return false
 		})
 	if err != nil {
-		return errors.AssertionFailedf("unexpected error visiting zones for range %s: %s", r, err)
+		return errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error visiting zones for range %s", r)
 	}
-	v.prevZoneKey = zKey
-	v.prevNumReplicas = numReplicas
-	if !found {
+	if desiredNumVoters == 0 {
 		return errors.AssertionFailedf(
 			"no zone config with replication attributes found for range: %s", r)
 	}
+	v.prevZoneKey = zKey
+	v.prevNumVoters = desiredNumVoters
 
-	v.countRange(ctx, zKey, numReplicas, r)
+	v.countRange(ctx, zKey, desiredNumVoters, r)
 	return nil
 }
 
 // visitSameZone is part of the rangeVisitor interface.
 func (v *replicationStatsVisitor) visitSameZone(ctx context.Context, r *roachpb.RangeDescriptor) {
-	v.countRange(ctx, v.prevZoneKey, v.prevNumReplicas, r)
+	v.countRange(ctx, v.prevZoneKey, v.prevNumVoters, r)
 }
 
 func (v *replicationStatsVisitor) countRange(
@@ -389,7 +385,10 @@ func (v *replicationStatsVisitor) countRange(
 ) {
 	status := r.Replicas().ReplicationStatus(func(rDesc roachpb.ReplicaDescriptor) bool {
 		return v.nodeChecker(rDesc.NodeID)
-	}, replicationFactor)
+		// NB: this reporting code was written before ReplicationStatus reported
+		// on non-voting replicas. This code will also soon be removed in favor
+		// of something that works with multi-tenancy (#89987).
+	}, replicationFactor, -1 /* neededNonVoters */)
 	// Note that a range can be under-replicated and over-replicated at the same
 	// time if it has many replicas, but sufficiently many of them are on dead
 	// nodes.
@@ -404,5 +403,6 @@ func (v *replicationStatsVisitor) countRange(
 // the lowest ancestor for which this method returns true.
 func zoneChangesReplication(zone *zonepb.ZoneConfig) bool {
 	return (zone.NumReplicas != nil && *zone.NumReplicas != 0) ||
+		(zone.NumVoters != nil && *zone.NumVoters != 0) ||
 		zone.Constraints != nil
 }

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -50,8 +45,20 @@ func mergeRangeAddressing(b *kv.Batch, left, merged *roachpb.RangeDescriptor) er
 	return rangeAddressing(b, merged, putMeta)
 }
 
-// updateRangeAddressing overwrites the meta1 and meta2 range addressing
-// records for the descriptor.
+// updateRangeAddressing overwrites the meta1 and meta2 range addressing records
+// for the descriptor. These are copies of the range descriptor but keyed by the
+// EndKey (for historical reasons relating to ReverseScan not having been
+// available; we might use the StartKey if starting from scratch today). While
+// usually in sync with the main copy under RangeDescriptorKey(StartKey), after
+// loss-of-quorum recovery the Range-resident copy is the newer descriptor
+// (containing fewer replicas). This is why updateRangeAddressing uses Put over
+// ConditionalPut, thus allowing up-replication to "repair" the meta copies of
+// the descriptor as a by-product.
+//
+// Because the last meta2 range can extend past the meta2 keyspace, it has two
+// index entries, at Meta1KeyMax and RangeMetaKey(desc.EndKey). See #18998.
+//
+// See also kv.RangeLookup for more information on the meta ranges.
 func updateRangeAddressing(b *kv.Batch, desc *roachpb.RangeDescriptor) error {
 	return rangeAddressing(b, desc, putMeta)
 }
@@ -69,7 +76,7 @@ func updateRangeAddressing(b *kv.Batch, desc *roachpb.RangeDescriptor) error {
 //  3. If desc.EndKey is normal user key:
 //     - meta2(desc.EndKey)
 //     3a. If desc.StartKey is not normal user key:
-//         - meta1(KeyMax)
+//     - meta1(KeyMax)
 func rangeAddressing(b *kv.Batch, desc *roachpb.RangeDescriptor, action metaAction) error {
 	// 1. handle illegal case of start or end key being meta1.
 	if bytes.HasPrefix(desc.EndKey, keys.Meta1Prefix) ||

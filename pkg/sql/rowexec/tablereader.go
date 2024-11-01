@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -15,13 +10,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
@@ -49,18 +48,19 @@ type tableReader struct {
 	// fetcher wraps a row.Fetcher, allowing the tableReader to add a stat
 	// collection layer.
 	fetcher rowFetcher
-	alloc   rowenc.DatumAlloc
-
-	scanStats execinfra.ScanStats
+	alloc   tree.DatumAlloc
 
 	// rowsRead is the number of rows read and is tracked unconditionally.
-	rowsRead int64
+	rowsRead                  int64
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
 }
 
 var _ execinfra.Processor = &tableReader{}
 var _ execinfra.RowSource = &tableReader{}
-var _ execinfra.Releasable = &tableReader{}
-var _ execinfra.OpNode = &tableReader{}
+var _ execreleasable.Releasable = &tableReader{}
+var _ execopnode.OpNode = &tableReader{}
 
 const tableReaderProcName = "table reader"
 
@@ -72,11 +72,11 @@ var trPool = sync.Pool{
 
 // newTableReader creates a tableReader.
 func newTableReader(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*tableReader, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok && nodeID == 0 {
@@ -92,7 +92,7 @@ func newTableReader(
 	if !spec.Parallelize {
 		batchBytesLimit = rowinfra.BytesLimit(spec.BatchBytesLimit)
 		if batchBytesLimit == 0 {
-			batchBytesLimit = rowinfra.DefaultBatchBytesLimit
+			batchBytesLimit = rowinfra.GetDefaultBatchBytesLimit(flowCtx.EvalCtx.TestingKnobs.ForceProductionValues)
 		}
 	}
 
@@ -103,31 +103,30 @@ func newTableReader(
 	tr.batchBytesLimit = batchBytesLimit
 	tr.maxTimestampAge = time.Duration(spec.MaxTimestampAgeNanos)
 
-	tableDesc := spec.BuildTableDescriptor()
-	invertedColumn := tabledesc.FindInvertedColumn(tableDesc, spec.InvertedColumn)
-	cols := tableDesc.PublicColumns()
-	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
-		cols = tableDesc.DeletableColumns()
-	}
-	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
-	resultTypes := catalog.ColumnTypesWithInvertedCol(cols, invertedColumn)
-
-	// Add all requested system columns to the output.
-	if spec.HasSystemColumns {
-		for _, sysCol := range tableDesc.SystemColumns() {
-			resultTypes = append(resultTypes, sysCol.GetType())
-			columnIdxMap.Set(sysCol.GetID(), columnIdxMap.Len())
+	// Make sure the key column types are hydrated. The fetched column types
+	// will be hydrated in ProcessorBase.Init below.
+	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
+	for i := range spec.FetchSpec.KeyAndSuffixColumns {
+		if err := typedesc.EnsureTypeIsHydrated(
+			ctx, spec.FetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
+		); err != nil {
+			return nil, err
 		}
 	}
 
-	tr.ignoreMisplannedRanges = flowCtx.Local
+	resultTypes := make([]*types.T, len(spec.FetchSpec.FetchedColumns))
+	for i := range resultTypes {
+		resultTypes[i] = spec.FetchSpec.FetchedColumns[i].Type
+	}
+
+	tr.ignoreMisplannedRanges = flowCtx.Local || spec.IgnoreMisplannedRanges
 	if err := tr.Init(
+		ctx,
 		tr,
 		post,
 		resultTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// We don't pass tr.input as an inputToDrain; tr.input is just an adapter
@@ -141,25 +140,23 @@ func newTableReader(
 		return nil, err
 	}
 
-	neededColumns := tr.OutputHelper.NeededColumns()
-
 	var fetcher row.Fetcher
-	if _, _, err := initRowFetcher(
-		flowCtx,
-		&fetcher,
-		tableDesc,
-		int(spec.IndexIdx),
-		columnIdxMap,
-		spec.Reverse,
-		neededColumns,
-		spec.IsCheck,
-		flowCtx.EvalCtx.Mon,
-		&tr.alloc,
-		spec.Visibility,
-		spec.LockingStrength,
-		spec.LockingWaitPolicy,
-		spec.HasSystemColumns,
-		invertedColumn,
+	if err := fetcher.Init(
+		ctx,
+		row.FetcherInitArgs{
+			Txn:                        flowCtx.Txn,
+			Reverse:                    spec.Reverse,
+			LockStrength:               spec.LockingStrength,
+			LockWaitPolicy:             spec.LockingWaitPolicy,
+			LockDurability:             spec.LockingDurability,
+			LockTimeout:                flowCtx.EvalCtx.SessionData().LockTimeout,
+			DeadlockTimeout:            flowCtx.EvalCtx.SessionData().DeadlockTimeout,
+			Alloc:                      &tr.alloc,
+			MemMonitor:                 flowCtx.Mon,
+			Spec:                       &spec.FetchSpec,
+			TraceKV:                    flowCtx.TraceKV,
+			ForceProductionKVBatchSize: flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
+		},
 	); err != nil {
 		return nil, err
 	}
@@ -171,7 +168,7 @@ func newTableReader(
 		tr.MakeSpansCopy()
 	}
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		tr.fetcher = newRowFetcherStatCollector(&fetcher)
 		tr.ExecStatsForTrace = tr.execStatsForTrace
 	} else {
@@ -196,7 +193,10 @@ func (tr *tableReader) Start(ctx context.Context) {
 	}
 
 	// Keep ctx assignment so we remember StartInternal can make a new one.
-	ctx = tr.StartInternal(ctx, tableReaderProcName)
+	ctx = tr.StartInternal(
+		ctx, tableReaderProcName, &tr.contentionEventsListener,
+		&tr.scanStatsListener, &tr.tenantConsumptionListener,
+	)
 	// Appease the linter.
 	_ = ctx
 }
@@ -213,16 +213,13 @@ func (tr *tableReader) startScan(ctx context.Context) error {
 	var err error
 	if tr.maxTimestampAge == 0 {
 		err = tr.fetcher.StartScan(
-			ctx, tr.FlowCtx.Txn, tr.Spans, bytesLimit, tr.limitHint,
-			tr.FlowCtx.TraceKV,
-			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
+			ctx, tr.Spans, nil /* spanIDs */, bytesLimit, tr.limitHint,
 		)
 	} else {
 		initialTS := tr.FlowCtx.Txn.ReadTimestamp()
 		err = tr.fetcher.StartInconsistentScan(
-			ctx, tr.FlowCtx.Cfg.DB, initialTS, tr.maxTimestampAge, tr.Spans,
-			bytesLimit, tr.limitHint, tr.FlowCtx.TraceKV,
-			tr.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
+			ctx, tr.FlowCtx.Cfg.DB.KV(), initialTS, tr.maxTimestampAge, tr.Spans,
+			bytesLimit, tr.limitHint, tr.FlowCtx.EvalCtx.QualityOfService(),
 		)
 	}
 	tr.scanStarted = true
@@ -258,7 +255,7 @@ func TestingSetScannedRowProgressFrequency(val int64) func() {
 func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for tr.State == execinfra.StateRunning {
 		if !tr.scanStarted {
-			err := tr.startScan(tr.Ctx)
+			err := tr.startScan(tr.Ctx())
 			if err != nil {
 				tr.MoveToDraining(err)
 				break
@@ -273,7 +270,7 @@ func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 			return nil, meta
 		}
 
-		row, _, _, err := tr.fetcher.NextRow(tr.Ctx)
+		row, _, err := tr.fetcher.NextRow(tr.Ctx())
 		if row == nil || err != nil {
 			tr.MoveToDraining(err)
 			break
@@ -294,7 +291,7 @@ func (tr *tableReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 func (tr *tableReader) close() {
 	if tr.InternalClose() {
 		if tr.fetcher != nil {
-			tr.fetcher.Close(tr.Ctx)
+			tr.fetcher.Close(tr.Ctx())
 		}
 	}
 }
@@ -310,17 +307,21 @@ func (tr *tableReader) execStatsForTrace() *execinfrapb.ComponentStats {
 	if !ok {
 		return nil
 	}
-	tr.scanStats = execinfra.GetScanStats(tr.Ctx)
 	ret := &execinfrapb.ComponentStats{
 		KV: execinfrapb.KVStats{
-			BytesRead:      optional.MakeUint(uint64(tr.fetcher.GetBytesRead())),
-			TuplesRead:     is.NumTuples,
-			KVTime:         is.WaitTime,
-			ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(tr.Ctx)),
+			BytesRead:           optional.MakeUint(uint64(tr.fetcher.GetBytesRead())),
+			KVPairsRead:         optional.MakeUint(uint64(tr.fetcher.GetKVPairsRead())),
+			TuplesRead:          is.NumTuples,
+			KVTime:              is.WaitTime,
+			ContentionTime:      optional.MakeTimeValue(tr.contentionEventsListener.GetContentionTime()),
+			BatchRequestsIssued: optional.MakeUint(uint64(tr.fetcher.GetBatchRequestsIssued())),
+			KVCPUTime:           optional.MakeTimeValue(is.kvCPUTime),
 		},
 		Output: tr.OutputHelper.Stats(),
 	}
-	execinfra.PopulateKVMVCCStats(&ret.KV, &tr.scanStats)
+	ret.Exec.ConsumedRU = optional.MakeUint(tr.tenantConsumptionListener.GetConsumedRU())
+	scanStats := tr.scanStatsListener.GetScanStats()
+	execstats.PopulateKVMVCCStats(&ret.KV, &scanStats)
 	return ret
 }
 
@@ -329,13 +330,13 @@ func (tr *tableReader) generateMeta() []execinfrapb.ProducerMetadata {
 	if !tr.ignoreMisplannedRanges {
 		nodeID, ok := tr.FlowCtx.NodeID.OptionalNodeID()
 		if ok {
-			ranges := execinfra.MisplannedRanges(tr.Ctx, tr.SpansCopy, nodeID, tr.FlowCtx.Cfg.RangeCache)
+			ranges := execinfra.MisplannedRanges(tr.Ctx(), tr.SpansCopy, nodeID, tr.FlowCtx.Cfg.RangeCache)
 			if ranges != nil {
 				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 			}
 		}
 	}
-	if tfs := execinfra.GetLeafTxnFinalState(tr.Ctx, tr.FlowCtx.Txn); tfs != nil {
+	if tfs := execinfra.GetLeafTxnFinalState(tr.Ctx(), tr.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 
@@ -346,12 +347,12 @@ func (tr *tableReader) generateMeta() []execinfrapb.ProducerMetadata {
 	return append(trailingMeta, *meta)
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (tr *tableReader) ChildCount(bool) int {
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (tr *tableReader) Child(nth int, _ bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (tr *tableReader) Child(nth int, _ bool) execopnode.OpNode {
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

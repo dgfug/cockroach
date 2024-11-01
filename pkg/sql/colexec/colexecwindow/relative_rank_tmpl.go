@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -65,11 +60,12 @@ func NewRelativeRankOperator(
 			partitionColIdx: args.PartitionColIdx,
 			peersColIdx:     args.PeersColIdx,
 		},
-		memoryLimit:  args.MemoryLimit,
-		diskQueueCfg: args.QueueCfg,
-		fdSemaphore:  args.FdSemaphore,
-		inputTypes:   args.InputTypes,
-		diskAcc:      args.DiskAcc,
+		memoryLimit:     args.MemoryLimit,
+		diskQueueCfg:    args.QueueCfg,
+		fdSemaphore:     args.FdSemaphore,
+		inputTypes:      args.InputTypes,
+		diskAcc:         args.DiskAcc,
+		diskQueueMemAcc: args.DiskQueueMemAcc,
 	}
 	switch windowFn {
 	case execinfrapb.WindowerSpec_PERCENT_RANK:
@@ -206,7 +202,8 @@ type relativeRankInitFields struct {
 	fdSemaphore  semaphore.Semaphore
 	inputTypes   []*types.T
 
-	diskAcc *mon.BoundAccount
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
 }
 
 type relativeRankSizesState struct {
@@ -282,6 +279,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			DiskQueueMemAcc:    r.diskQueueMemAcc,
 		},
 	)
 	r.partitionsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -296,6 +294,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			DiskQueueMemAcc:    r.diskQueueMemAcc,
 		},
 	)
 	r.peerGroupsState.runningSizes = r.allocator.NewMemBatchWithFixedCapacity([]*types.T{types.Int}, coldata.BatchSize())
@@ -309,6 +308,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Init(ctx context.Context) {
 			DiskQueueCfg:       r.diskQueueCfg,
 			FDSemaphore:        r.fdSemaphore,
 			DiskAcc:            r.diskAcc,
+			DiskQueueMemAcc:    r.diskQueueMemAcc,
 		},
 	)
 	r.output = r.allocator.NewMemBatchWithFixedCapacity(append(r.inputTypes, types.Float), coldata.BatchSize())
@@ -576,7 +576,7 @@ func (r *_RELATIVE_RANK_STRINGOp) Next() coldata.Batch {
 			return r.output
 
 		case relativeRankFinished:
-			if err := r.Close(); err != nil {
+			if err := r.Close(r.Ctx); err != nil {
 				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
@@ -589,23 +589,21 @@ func (r *_RELATIVE_RANK_STRINGOp) Next() coldata.Batch {
 	}
 }
 
-func (r *_RELATIVE_RANK_STRINGOp) Close() error {
-	if !r.CloserHelper.Close() || r.Ctx == nil {
-		// Either Close() has already been called or Init() was never called. In
-		// both cases there is nothing to do.
+func (r *_RELATIVE_RANK_STRINGOp) Close(ctx context.Context) error {
+	if !r.CloserHelper.Close() {
 		return nil
 	}
 	var lastErr error
-	if err := r.bufferedTuples.Close(r.Ctx); err != nil {
+	if err := r.bufferedTuples.Close(ctx); err != nil {
 		lastErr = err
 	}
 	// {{if .HasPartition}}
-	if err := r.partitionsState.Close(r.Ctx); err != nil {
+	if err := r.partitionsState.Close(ctx); err != nil {
 		lastErr = err
 	}
 	// {{end}}
 	// {{if .IsCumeDist}}
-	if err := r.peerGroupsState.Close(r.Ctx); err != nil {
+	if err := r.peerGroupsState.Close(ctx); err != nil {
 		lastErr = err
 	}
 	// {{end}}

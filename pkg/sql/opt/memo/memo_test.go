@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo_test
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
@@ -24,8 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/datadriven"
@@ -33,38 +34,39 @@ import (
 
 func TestMemo(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideStats
-	runDataDrivenTest(t, "testdata/memo", flags)
+		memo.ExprFmtHideStats | memo.ExprFmtHideNotVisibleIndexInfo | memo.ExprFmtHideFastPathChecks
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "memo"), flags)
 }
 
 func TestFormat(t *testing.T) {
-	runDataDrivenTest(t, "testdata/format", memo.ExprFmtShowAll)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "format"), memo.ExprFmtShowAll|memo.ExprFmtHideFastPathChecks)
 }
 
 func TestLogicalProps(t *testing.T) {
-	flags := memo.ExprFmtHideCost | memo.ExprFmtHideQualifications | memo.ExprFmtHideStats
-	runDataDrivenTest(t, "testdata/logprops/", flags)
+	flags := memo.ExprFmtHideCost | memo.ExprFmtHideQualifications | memo.ExprFmtHideStats |
+		memo.ExprFmtHideNotVisibleIndexInfo | memo.ExprFmtHideFastPathChecks
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "logprops"), flags)
 }
 
 func TestStats(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideScalars
-	runDataDrivenTest(t, "testdata/stats/", flags)
+		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo | memo.ExprFmtHideFastPathChecks
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats"), flags)
 }
 
 func TestStatsQuality(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideScalars
-	runDataDrivenTest(t, "testdata/stats_quality/", flags)
+		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo | memo.ExprFmtHideFastPathChecks
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats_quality"), flags)
 }
 
 func TestCompositeSensitive(t *testing.T) {
-	datadriven.RunTest(t, "testdata/composite_sensitive", func(t *testing.T, d *datadriven.TestData) string {
-		semaCtx := tree.MakeSemaContext()
-		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
+		semaCtx := tree.MakeSemaContext(nil /* resolver */)
+		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		var f norm.Factory
-		f.Init(&evalCtx, nil /* catalog */)
+		f.Init(context.Background(), &evalCtx, nil /* catalog */)
 		md := f.Metadata()
 
 		if d.Cmd != "composite-sensitive" {
@@ -92,10 +94,11 @@ func TestCompositeSensitive(t *testing.T) {
 		}
 
 		b := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
-		if err := b.Build(expr); err != nil {
+		scalar, err := b.Build(expr)
+		if err != nil {
 			d.Fatalf(t, "error building: %v", err)
 		}
-		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(md, f.Memo().RootExpr()))
+		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(scalar))
 	})
 }
 
@@ -106,12 +109,12 @@ func TestMemoInit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	var o xform.Optimizer
 	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE $1=10")
 
-	o.Init(&evalCtx, catalog)
+	o.Init(context.Background(), &evalCtx, catalog)
 	if !o.Memo().IsEmpty() {
 		t.Fatal("memo should be empty")
 	}
@@ -128,7 +131,11 @@ func TestMemoInit(t *testing.T) {
 
 func TestMemoIsStale(t *testing.T) {
 	catalog := testcat.New()
-	_, err := catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
+	_, err := catalog.ExecuteDDL("CREATE TABLE xy (x INT PRIMARY KEY, y INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,17 +143,38 @@ func TestMemoIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = catalog.ExecuteDDL("CREATE FUNCTION one() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = catalog.ExecuteDDL("CREATE TYPE typ AS ENUM ('hello', 'hiya')")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Revoke access to the underlying table. The user should retain indirect
 	// access via the view.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).Revoked = true
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).Revoked = true
 
 	// Initialize context with starting values.
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	evalCtx.SessionData().Database = "t"
+	evalCtx.SessionData().SearchPath = sessiondata.MakeSearchPath([]string{"public"})
+	// MakeTestingEvalContext created a fake planner that can only provide the
+	// memory monitor and will encounter a nil-pointer error when other methods
+	// are accessed. In this test, GetDatabaseSurvivalGoal method will be called
+	// which can handle a case of nil planner but cannot a case when the
+	// planner's GetMultiregionConfig is nil, so we nil out the planner.
+	evalCtx.Planner = nil
+	evalCtx.StreamManagerFactory = nil
+
+	// Use a test query that references each schema object (apart table with
+	// restricted access) to help verify that the memo is not invalidated
+	// unnecessarily.
+	const query = "SELECT a, b+one(), 'hiya'::typ FROM abcview v, xy WHERE a = x AND c='foo'"
 
 	var o xform.Optimizer
-	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
+	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, query)
 	o.Memo().Metadata().AddSchema(catalog.Schema())
 
 	ctx := context.Background()
@@ -162,7 +190,7 @@ func TestMemoIsStale(t *testing.T) {
 		// tests as written still pass if the default value is 0. To detect this, we
 		// create a new memo with the changed setting and verify it's not stale.
 		var o2 xform.Optimizer
-		opttestutils.BuildQuery(t, &o2, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
+		opttestutils.BuildQuery(t, &o2, catalog, &evalCtx, query)
 
 		if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
 			t.Fatal(err)
@@ -194,6 +222,18 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().ZigzagJoinEnabled = false
 	notStale()
 
+	// Stale optimizer forecast usage enable.
+	evalCtx.SessionData().OptimizerUseForecasts = true
+	stale()
+	evalCtx.SessionData().OptimizerUseForecasts = false
+	notStale()
+
+	// Stale optimizer merged partial statistics usage enable.
+	evalCtx.SessionData().OptimizerUseMergedPartialStatistics = true
+	stale()
+	evalCtx.SessionData().OptimizerUseMergedPartialStatistics = false
+	notStale()
+
 	// Stale optimizer histogram usage enable.
 	evalCtx.SessionData().OptimizerUseHistograms = true
 	stale()
@@ -206,6 +246,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseMultiColStats = false
 	notStale()
 
+	// Stale optimizer not visible indexes usage enable.
+	evalCtx.SessionData().OptimizerUseNotVisibleIndexes = true
+	stale()
+	evalCtx.SessionData().OptimizerUseNotVisibleIndexes = false
+	notStale()
+
 	// Stale locality optimized search enable.
 	evalCtx.SessionData().LocalityOptimizedSearch = true
 	stale()
@@ -216,18 +262,6 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().SafeUpdates = true
 	stale()
 	evalCtx.SessionData().SafeUpdates = false
-	notStale()
-
-	// Stale intervalStyleEnabled.
-	evalCtx.SessionData().IntervalStyleEnabled = true
-	stale()
-	evalCtx.SessionData().IntervalStyleEnabled = false
-	notStale()
-
-	// Stale dateStyleEnabled.
-	evalCtx.SessionData().DateStyleEnabled = true
-	stale()
-	evalCtx.SessionData().DateStyleEnabled = false
 	notStale()
 
 	// Stale DateStyle.
@@ -266,15 +300,252 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().LargeFullScanRows = 0
 	notStale()
 
+	// Stale txn rows read error.
+	evalCtx.SessionData().TxnRowsReadErr = 1000
+	stale()
+	evalCtx.SessionData().TxnRowsReadErr = 0
+	notStale()
+
 	// Stale null ordered last.
 	evalCtx.SessionData().NullOrderedLast = true
 	stale()
 	evalCtx.SessionData().NullOrderedLast = false
 	notStale()
 
+	// Stale enable cost scans with default column size.
+	evalCtx.SessionData().CostScansWithDefaultColSize = true
+	stale()
+	evalCtx.SessionData().CostScansWithDefaultColSize = false
+	notStale()
+
+	// Stale unconstrained non-covering index scan enabled.
+	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = true
+	stale()
+	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = false
+	notStale()
+
+	// Stale enforce home region.
+	evalCtx.SessionData().EnforceHomeRegion = true
+	stale()
+	evalCtx.SessionData().EnforceHomeRegion = false
+	notStale()
+
+	// Stale inequality lookup joins enabled.
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	stale()
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = false
+	notStale()
+
+	// Stale use limit ordering for streaming group by.
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	stale()
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = false
+	notStale()
+
+	// Stale use improved split disjunction for joins.
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = false
+	notStale()
+
+	// Stale testing_optimizer_random_seed.
+	evalCtx.SessionData().TestingOptimizerRandomSeed = 100
+	stale()
+	evalCtx.SessionData().TestingOptimizerRandomSeed = 0
+	notStale()
+
+	// Stale testing_optimizer_cost_perturbation.
+	evalCtx.SessionData().TestingOptimizerCostPerturbation = 1
+	stale()
+	evalCtx.SessionData().TestingOptimizerCostPerturbation = 0
+	notStale()
+
+	// Stale testing_optimizer_disable_rule_probability.
+	evalCtx.SessionData().TestingOptimizerDisableRuleProbability = 1
+	stale()
+	evalCtx.SessionData().TestingOptimizerDisableRuleProbability = 0
+	notStale()
+
+	// Stale allow_ordinal_column_references.
+	evalCtx.SessionData().AllowOrdinalColumnReferences = true
+	stale()
+	evalCtx.SessionData().AllowOrdinalColumnReferences = false
+	notStale()
+
+	// Stale optimizer_use_improve_disjunction_stats.
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = false
+	notStale()
+
+	// Stale optimizer_always_use_histograms.
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
+	stale()
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = false
+	notStale()
+
+	// Stale optimizer_hoist_uncorrelated_equality_subqueries.
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = true
+	stale()
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = false
+	notStale()
+
+	// Stale optimizer_use_improved_computed_column_filters_derivation.
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = false
+	notStale()
+
+	// Stale optimizer_use_improved_join_elimination.
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = false
+	notStale()
+
+	// Stale enable_implicit_fk_locking_for_serializable.
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = false
+	notStale()
+
+	// Stale enable_durable_locking_for_serializable.
+	evalCtx.SessionData().DurableLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().DurableLockingForSerializable = false
+	notStale()
+
+	// Stale enable_shared_locking_for_serializable.
+	evalCtx.SessionData().SharedLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().SharedLockingForSerializable = false
+	notStale()
+
+	// Stale optimizer_use_lock_op_for_serializable.
+	evalCtx.SessionData().OptimizerUseLockOpForSerializable = true
+	stale()
+	evalCtx.SessionData().OptimizerUseLockOpForSerializable = false
+	notStale()
+
+	// Stale txn isolation level.
+	evalCtx.TxnIsoLevel = isolation.ReadCommitted
+	stale()
+	evalCtx.TxnIsoLevel = isolation.Serializable
+	notStale()
+
+	// Stale optimizer_use_provided_ordering_fix.
+	evalCtx.SessionData().OptimizerUseProvidedOrderingFix = true
+	stale()
+	evalCtx.SessionData().OptimizerUseProvidedOrderingFix = false
+	notStale()
+
+	// Stale plpgsql_use_strict_into.
+	evalCtx.SessionData().PLpgSQLUseStrictInto = true
+	stale()
+	evalCtx.SessionData().PLpgSQLUseStrictInto = false
+	notStale()
+
+	// Stale optimizer_merge_joins_enabled.
+	evalCtx.SessionData().OptimizerMergeJoinsEnabled = true
+	stale()
+	evalCtx.SessionData().OptimizerMergeJoinsEnabled = false
+	notStale()
+
+	// Stale optimizer_use_virtual_computed_column_stats.
+	evalCtx.SessionData().OptimizerUseVirtualComputedColumnStats = true
+	stale()
+	evalCtx.SessionData().OptimizerUseVirtualComputedColumnStats = false
+	notStale()
+
+	// Stale optimizer_use_trigram_similarity_optimization.
+	evalCtx.SessionData().OptimizerUseTrigramSimilarityOptimization = true
+	stale()
+	evalCtx.SessionData().OptimizerUseTrigramSimilarityOptimization = false
+	notStale()
+
+	// Stale optimizer_use_distinct_on_limit_hint_costing.
+	evalCtx.SessionData().OptimizerUseImprovedDistinctOnLimitHintCosting = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedDistinctOnLimitHintCosting = false
+	notStale()
+
+	// Stale optimizer_use_improved_trigram_similarity_selectivity.
+	evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity = false
+	notStale()
+
+	// Stale pg_trgm.similarity_threshold.
+	evalCtx.SessionData().TrigramSimilarityThreshold = 0.5
+	stale()
+	evalCtx.SessionData().TrigramSimilarityThreshold = 0
+
+	// Stale opt_split_scan_limit.
+	evalCtx.SessionData().OptSplitScanLimit = 100
+	stale()
+	evalCtx.SessionData().OptSplitScanLimit = 0
+	notStale()
+
+	// Stale optimizer_use_improved_zigzag_join_costing.
+	evalCtx.SessionData().OptimizerUseImprovedZigzagJoinCosting = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedZigzagJoinCosting = false
+	notStale()
+
+	// Stale optimizer_use_improved_multi_column_selectivity_estimate.
+	evalCtx.SessionData().OptimizerUseImprovedMultiColumnSelectivityEstimate = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedMultiColumnSelectivityEstimate = false
+	notStale()
+
+	// Stale optimizer_prove_implication_with_virtual_computed_columns.
+	evalCtx.SessionData().OptimizerProveImplicationWithVirtualComputedColumns = true
+	stale()
+	evalCtx.SessionData().OptimizerProveImplicationWithVirtualComputedColumns = false
+	notStale()
+
+	// Stale optimizer_push_offset_into_index_join.
+	evalCtx.SessionData().OptimizerPushOffsetIntoIndexJoin = true
+	stale()
+	evalCtx.SessionData().OptimizerPushOffsetIntoIndexJoin = false
+	notStale()
+
+	// Stale optimizer_use_polymorphic_parameter_fix.
+	evalCtx.SessionData().OptimizerUsePolymorphicParameterFix = true
+	stale()
+	evalCtx.SessionData().OptimizerUsePolymorphicParameterFix = false
+	notStale()
+
+	// Stale optimizer_push_limit_into_project_filtered_scan.
+	evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan = true
+	stale()
+	evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan = false
+	notStale()
+
+	// User no longer has access to view.
+	catalog.View(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abcview")).Revoked = true
+	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
+	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
+		t.Fatalf("expected %q error, but got %+v", exp, err)
+	}
+	catalog.View(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abcview")).Revoked = false
+	notStale()
+
+	// User no longer has execution privilege on a UDF.
+	catalog.RevokeExecution(catalog.Function("one").Oid)
+	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
+	if exp := "user does not have privilege to execute function"; !testutils.IsError(err, exp) {
+		t.Fatalf("expected %q error, but got %+v", exp, err)
+	}
+	catalog.GrantExecution(catalog.Function("one").Oid)
+	notStale()
+
 	// Stale data sources and schema. Create new catalog so that data sources are
 	// recreated and can be modified independently.
 	catalog = testcat.New()
+	_, err = catalog.ExecuteDDL("CREATE TABLE xy (x INT PRIMARY KEY, y INT)")
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = catalog.ExecuteDDL("CREATE TABLE abc (a INT PRIMARY KEY, b INT, c STRING, INDEX (c))")
 	if err != nil {
 		t.Fatal(err)
@@ -283,26 +554,31 @@ func TestMemoIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// User no longer has access to view.
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = true
-	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
-	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %+v", exp, err)
+	_, err = catalog.ExecuteDDL("CREATE FUNCTION one() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$")
+	if err != nil {
+		t.Fatal(err)
 	}
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = false
-	notStale()
+	_, err = catalog.ExecuteDDL("CREATE TYPE typ AS ENUM ('hello', 'hiya')")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Table ID changes.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabID = 1
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabID = 1
 	stale()
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabID = 53
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabID = 54
 	notStale()
 
-	// Table Version changes.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabVersion = 1
+	// Table version changes.
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabVersion = 1
 	stale()
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabVersion = 0
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabVersion = 0
+	notStale()
+
+	// Function version changes.
+	catalog.Function("one").Version = 1
+	stale()
+	catalog.Function("one").Version = 0
 	notStale()
 }
 
@@ -311,7 +587,7 @@ func TestMemoIsStale(t *testing.T) {
 // This test is here (instead of statistics_builder_test.go) to avoid import
 // cycles.
 func TestStatsAvailable(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	catalog := testcat.New()
 	if _, err := catalog.ExecuteDDL(
@@ -324,7 +600,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testNotAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if e.Relational().Stats.Available {
+			if e.Relational().Statistics().Available {
 				t.Fatal("stats should not be available")
 			}
 		})
@@ -362,7 +638,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if !e.Relational().Stats.Available {
+			if !e.Relational().Statistics().Available {
 				t.Fatal("stats should be available")
 			}
 		})
@@ -394,10 +670,11 @@ func traverseExpr(expr memo.RelExpr, f func(memo.RelExpr)) {
 }
 
 // runDataDrivenTest runs data-driven testcases of the form
-//   <command>
-//   <SQL statement>
-//   ----
-//   <expected results>
+//
+//	<command>
+//	<SQL statement>
+//	----
+//	<expected results>
 //
 // See OptTester.Handle for supported commands.
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {

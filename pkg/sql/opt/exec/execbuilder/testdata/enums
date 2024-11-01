@@ -20,9 +20,10 @@ scan t
  │    └── x:1 IN ('hello', 'howdy', 'hi') [outer=(1), constraints=(/1: [/'hello' - /'hello'] [/'howdy' - /'howdy'] [/'hi' - /'hi']; tight)]
  ├── cardinality: [0 - 3]
  ├── stats: [rows=3]
- ├── cost: 18.05
+ ├── cost: 22.05
  ├── key: (1)
  ├── fd: (1)-->(2)
+ ├── distribution: test
  └── prune: (1,2)
 
 query T
@@ -121,13 +122,15 @@ distinct-on
  ├── internal-ordering: +1
  ├── cardinality: [0 - 4]
  ├── stats: [rows=4, distinct(1)=4, null(1)=0]
- ├── cost: 1114.88
+ ├── cost: 1118.88
  ├── key: (1)
+ ├── distribution: test
  └── scan checks@checks_x_y_idx
       ├── columns: x:1
       ├── stats: [rows=1000, distinct(1)=4, null(1)=0]
-      ├── cost: 1104.82
+      ├── cost: 1108.82
       ├── ordering: +1
+      ├── distribution: test
       ├── prune: (1)
       └── interesting orderings: (+1)
 
@@ -141,19 +144,19 @@ EXPLAIN (opt) SELECT * FROM composite_key ORDER BY y LIMIT 5
 limit
  ├── union-all
  │    ├── union-all
- │    │    ├── union-all
- │    │    │    ├── scan composite_key
- │    │    │    │    ├── constraint: /6/7: [/'hello' - /'hello']
- │    │    │    │    └── limit: 5
- │    │    │    └── scan composite_key
- │    │    │         ├── constraint: /10/11: [/'howdy' - /'howdy']
- │    │    │         └── limit: 5
+ │    │    ├── scan composite_key
+ │    │    │    ├── constraint: /8/9: [/'hello' - /'hello']
+ │    │    │    └── limit: 5
  │    │    └── scan composite_key
- │    │         ├── constraint: /18/19: [/'hi' - /'hi']
+ │    │         ├── constraint: /14/15: [/'howdy' - /'howdy']
  │    │         └── limit: 5
- │    └── scan composite_key
- │         ├── constraint: /26/27: [/'cheers' - /'cheers']
- │         └── limit: 5
+ │    └── union-all
+ │         ├── scan composite_key
+ │         │    ├── constraint: /20/21: [/'hi' - /'hi']
+ │         │    └── limit: 5
+ │         └── scan composite_key
+ │              ├── constraint: /26/27: [/'cheers' - /'cheers']
+ │              └── limit: 5
  └── 5
 
 statement ok
@@ -164,54 +167,61 @@ query T
 EXPLAIN (OPT,VERBOSE) SELECT x FROM nulls WHERE y < 0 UNION SELECT x FROM nulls WHERE y > 10
 ----
 union
- ├── columns: x:11
+ ├── columns: x:15
  ├── left columns: nulls.x:1
- ├── right columns: nulls.x:6
- ├── internal-ordering: +11
+ ├── right columns: nulls.x:8
+ ├── internal-ordering: +15
  ├── cardinality: [0 - 5]
- ├── stats: [rows=5, distinct(11)=5, null(11)=1]
- ├── cost: 2276.86667
- ├── key: (11)
- ├── interesting orderings: (+11)
+ ├── stats: [rows=5, distinct(15)=5, null(15)=1]
+ ├── cost: 2284.86667
+ ├── key: (15)
+ ├── distribution: test
+ ├── interesting orderings: (+15)
  ├── project
  │    ├── columns: nulls.x:1
- │    ├── stats: [rows=333.333333, distinct(1)=5, null(1)=3.33333333]
- │    ├── cost: 1138.40333
+ │    ├── stats: [rows=333.3333, distinct(1)=5, null(1)=3.33333]
+ │    ├── cost: 1142.40333
  │    ├── ordering: +1
+ │    ├── distribution: test
  │    ├── interesting orderings: (+1)
  │    └── select
  │         ├── columns: nulls.x:1 y:2
- │         ├── stats: [rows=333.333333, distinct(1)=5, null(1)=3.33333333, distinct(2)=33.3333333, null(2)=0]
- │         ├── cost: 1135.05
+ │         ├── stats: [rows=333.3333, distinct(1)=5, null(1)=3.33333, distinct(2)=33.3333, null(2)=0]
+ │         ├── cost: 1139.05
  │         ├── ordering: +1
+ │         ├── distribution: test
  │         ├── interesting orderings: (+1,+2)
  │         ├── scan nulls@nulls_x_y_idx
  │         │    ├── columns: nulls.x:1 y:2
  │         │    ├── stats: [rows=1000, distinct(1)=5, null(1)=10, distinct(2)=100, null(2)=10]
- │         │    ├── cost: 1125.02
+ │         │    ├── cost: 1129.02
  │         │    ├── ordering: +1
+ │         │    ├── distribution: test
  │         │    ├── prune: (1,2)
  │         │    └── interesting orderings: (+1,+2)
  │         └── filters
  │              └── y:2 < 0 [outer=(2), constraints=(/2: (/NULL - /-1]; tight)]
  └── project
-      ├── columns: nulls.x:6
-      ├── stats: [rows=333.333333, distinct(6)=5, null(6)=3.33333333]
-      ├── cost: 1138.40333
-      ├── ordering: +6
-      ├── interesting orderings: (+6)
+      ├── columns: nulls.x:8
+      ├── stats: [rows=333.3333, distinct(8)=5, null(8)=3.33333]
+      ├── cost: 1142.40333
+      ├── ordering: +8
+      ├── distribution: test
+      ├── interesting orderings: (+8)
       └── select
-           ├── columns: nulls.x:6 y:7
-           ├── stats: [rows=333.333333, distinct(6)=5, null(6)=3.33333333, distinct(7)=33.3333333, null(7)=0]
-           ├── cost: 1135.05
-           ├── ordering: +6
-           ├── interesting orderings: (+6,+7)
+           ├── columns: nulls.x:8 y:9
+           ├── stats: [rows=333.3333, distinct(8)=5, null(8)=3.33333, distinct(9)=33.3333, null(9)=0]
+           ├── cost: 1139.05
+           ├── ordering: +8
+           ├── distribution: test
+           ├── interesting orderings: (+8,+9)
            ├── scan nulls@nulls_x_y_idx
-           │    ├── columns: nulls.x:6 y:7
-           │    ├── stats: [rows=1000, distinct(6)=5, null(6)=10, distinct(7)=100, null(7)=10]
-           │    ├── cost: 1125.02
-           │    ├── ordering: +6
-           │    ├── prune: (6,7)
-           │    └── interesting orderings: (+6,+7)
+           │    ├── columns: nulls.x:8 y:9
+           │    ├── stats: [rows=1000, distinct(8)=5, null(8)=10, distinct(9)=100, null(9)=10]
+           │    ├── cost: 1129.02
+           │    ├── ordering: +8
+           │    ├── distribution: test
+           │    ├── prune: (8,9)
+           │    └── interesting orderings: (+8,+9)
            └── filters
-                └── y:7 > 10 [outer=(7), constraints=(/7: [/11 - ]; tight)]
+                └── y:9 > 10 [outer=(9), constraints=(/9: [/11 - ]; tight)]

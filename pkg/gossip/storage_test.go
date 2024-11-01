@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip_test
 
@@ -18,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -96,8 +90,7 @@ func TestGossipStorage(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	defaultZoneConfig := zonepb.DefaultZoneConfigRef()
-	network := simulation.NewNetwork(stopper, 3, true, defaultZoneConfig)
+	network := simulation.NewNetwork(stopper, 3, true)
 
 	// Set storage for each of the nodes.
 	addresses := make(unresolvedAddrSlice, len(network.Nodes))
@@ -154,7 +147,7 @@ func TestGossipStorage(t *testing.T) {
 
 	// Create an unaffiliated gossip node with only itself as an address,
 	// leaving it no way to reach the gossip network.
-	node, err := network.CreateNode(defaultZoneConfig)
+	node, err := network.CreateNode()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +204,7 @@ func TestGossipStorageCleanup(t *testing.T) {
 	defer stopper.Stop(context.Background())
 
 	const numNodes = 3
-	network := simulation.NewNetwork(stopper, numNodes, false, zonepb.DefaultZoneConfigRef())
+	network := simulation.NewNetwork(stopper, numNodes, false)
 
 	const notReachableAddr = "localhost:0"
 	const invalidAddr = "10.0.0.1000:3333333"

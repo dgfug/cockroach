@@ -1,38 +1,29 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 type relocateNode struct {
 	optColumnsSlot
 
-	relocateLease     bool
-	relocateNonVoters bool
-	tableDesc         catalog.TableDescriptor
-	index             catalog.Index
-	rows              planNode
+	subjectReplicas tree.RelocateSubject
+	tableDesc       catalog.TableDescriptor
+	index           catalog.Index
+	rows            planNode
 
 	run relocateRun
 }
@@ -41,14 +32,9 @@ type relocateNode struct {
 // relocateNode during local execution.
 type relocateRun struct {
 	lastRangeStartKey []byte
-
-	// storeMap caches information about stores seen in relocation strings (to
-	// avoid looking them up for every row).
-	storeMap map[roachpb.StoreID]roachpb.NodeID
 }
 
 func (n *relocateNode) startExec(runParams) error {
-	n.run.storeMap = make(map[roachpb.StoreID]roachpb.NodeID)
 	return nil
 }
 
@@ -66,8 +52,15 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 
 	var relocationTargets []roachpb.ReplicationTarget
 	var leaseStoreID roachpb.StoreID
-	if n.relocateLease {
-		leaseStoreID = roachpb.StoreID(tree.MustBeDInt(data[0]))
+	execCfg := params.ExecCfg()
+	if n.subjectReplicas == tree.RelocateLease {
+		if !data[0].ResolvedType().Equivalent(types.Int) {
+			return false, errors.Errorf(
+				"expected int in the first EXPERIMENTAL_RELOCATE data column; got %s",
+				data[0].ResolvedType(),
+			)
+		}
+		leaseStoreID = roachpb.StoreID(*data[0].(*tree.DInt))
 		if leaseStoreID <= 0 {
 			return false, errors.Errorf("invalid target leaseholder store ID %d for EXPERIMENTAL_RELOCATE LEASE", leaseStoreID)
 		}
@@ -79,7 +72,7 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 			)
 		}
 		relocation := data[0].(*tree.DArray)
-		if !n.relocateNonVoters && len(relocation.Array) == 0 {
+		if n.subjectReplicas != tree.RelocateNonVoters && len(relocation.Array) == 0 {
 			// We cannot remove all voters.
 			return false, errors.Errorf("empty relocation array for EXPERIMENTAL_RELOCATE")
 		}
@@ -87,25 +80,15 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 		// Create an array of the desired replication targets.
 		relocationTargets = make([]roachpb.ReplicationTarget, len(relocation.Array))
 		for i, d := range relocation.Array {
-			storeID := roachpb.StoreID(*d.(*tree.DInt))
-			nodeID, ok := n.run.storeMap[storeID]
-			if !ok {
-				// Lookup the store in gossip.
-				var storeDesc roachpb.StoreDescriptor
-				gossipStoreKey := gossip.MakeStoreKey(storeID)
-				g, err := params.extendedEvalCtx.ExecCfg.Gossip.OptionalErr(54250)
-				if err != nil {
-					return false, err
-				}
-				if err := g.GetInfoProto(
-					gossipStoreKey, &storeDesc,
-				); err != nil {
-					return false, errors.Wrapf(err, "error looking up store %d", storeID)
-				}
-				nodeID = storeDesc.Node.NodeID
-				n.run.storeMap[storeID] = nodeID
+			if d == tree.DNull {
+				return false, errors.Errorf("NULL value in relocation array for EXPERIMENTAL_RELOCATE")
 			}
-			relocationTargets[i] = roachpb.ReplicationTarget{NodeID: nodeID, StoreID: storeID}
+			storeID := roachpb.StoreID(*d.(*tree.DInt))
+			storeDesc, err := execCfg.NodeDescs.GetStoreDescriptor(storeID)
+			if err != nil {
+				return false, err
+			}
+			relocationTargets[i] = roachpb.ReplicationTarget{NodeID: storeDesc.Node.NodeID, StoreID: storeID}
 		}
 	}
 
@@ -115,39 +98,57 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 	// TODO(a-robinson): Get the lastRangeStartKey via the ReturnRangeInfo option
 	// on the BatchRequest Header. We can't do this until v2.2 because admin
 	// requests don't respect the option on versions earlier than v2.1.
-	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, data[1:])
+	rowKey, err := getRowKey(execCfg.Codec, n.tableDesc, n.index, data[1:])
 	if err != nil {
 		return false, err
 	}
 	rowKey = keys.MakeFamilyKey(rowKey, 0)
 
-	rangeDesc, err := lookupRangeDescriptor(params.ctx, params.extendedEvalCtx.ExecCfg.DB, rowKey)
-	if err != nil {
-		return false, errors.Wrapf(err, "error looking up range descriptor")
+	rKey := keys.MustAddr(rowKey)
+	span := roachpb.Span{
+		Key:    rKey.AsRawKey(),
+		EndKey: rKey.PrefixEnd().AsRawKey(),
 	}
+	rangeDescIterator, err := execCfg.RangeDescIteratorFactory.NewIterator(params.ctx, span)
+	if err != nil {
+		return false, err
+	}
+	if !rangeDescIterator.Valid() {
+		return false, errors.Newf("range descriptor not found")
+	}
+	// Use first RangeDescriptor.
+	rangeDesc := rangeDescIterator.CurRangeDescriptor()
 	n.run.lastRangeStartKey = rangeDesc.StartKey.AsRawKey()
 
-	existingVoters := rangeDesc.Replicas().Voters().ReplicationTargets()
-	existingNonVoters := rangeDesc.Replicas().NonVoters().ReplicationTargets()
-	if n.relocateLease {
-		if err := params.p.ExecCfg().DB.AdminTransferLease(params.ctx, rowKey, leaseStoreID); err != nil {
-			return false, err
-		}
-	} else if n.relocateNonVoters {
-		if err := params.p.ExecCfg().DB.AdminRelocateRange(
-			params.ctx, rowKey, existingVoters, relocationTargets,
-		); err != nil {
-			return false, err
-		}
-	} else {
-		if err := params.p.ExecCfg().DB.AdminRelocateRange(
-			params.ctx, rowKey, relocationTargets, existingNonVoters,
-		); err != nil {
-			return false, err
-		}
+	switch n.subjectReplicas {
+	case tree.RelocateLease:
+		err = execCfg.DB.AdminTransferLease(params.ctx, rowKey, leaseStoreID)
+	case tree.RelocateNonVoters:
+		existingVoters := rangeDesc.Replicas().Voters().ReplicationTargets()
+		err = execCfg.DB.AdminRelocateRange(
+			params.ctx,
+			rowKey,
+			existingVoters,
+			relocationTargets,
+			true, /* transferLeaseToFirstVoter */
+		)
+	case tree.RelocateVoters:
+		existingNonVoters := rangeDesc.Replicas().NonVoters().ReplicationTargets()
+		err = execCfg.DB.AdminRelocateRange(
+			params.ctx,
+			rowKey,
+			relocationTargets,
+			existingNonVoters,
+			true, /* transferLeaseToFirstVoter */
+		)
+	default:
+		err = errors.AssertionFailedf("unknown relocate mode: %v", n.subjectReplicas)
 	}
-
-	return true, nil
+	// TODO(aayush): If the `AdminRelocateRange` call failed because it found that
+	// the range was already in the process of being rebalanced, we currently fail
+	// the statement. We should consider instead force-removing these learners
+	// when `AdminRelocateRange` calls are issued by SQL.
+	return err == nil, err
 }
 
 func (n *relocateNode) Values() tree.Datums {
@@ -159,26 +160,4 @@ func (n *relocateNode) Values() tree.Datums {
 
 func (n *relocateNode) Close(ctx context.Context) {
 	n.rows.Close(ctx)
-}
-
-func lookupRangeDescriptor(
-	ctx context.Context, db *kv.DB, rowKey []byte,
-) (roachpb.RangeDescriptor, error) {
-	startKey := keys.RangeMetaKey(keys.MustAddr(rowKey))
-	endKey := keys.Meta2Prefix.PrefixEnd()
-	kvs, err := db.Scan(ctx, startKey, endKey, 1)
-	if err != nil {
-		return roachpb.RangeDescriptor{}, err
-	}
-	if len(kvs) != 1 {
-		log.Fatalf(ctx, "expected 1 KV, got %v", kvs)
-	}
-	var desc roachpb.RangeDescriptor
-	if err := kvs[0].ValueProto(&desc); err != nil {
-		return roachpb.RangeDescriptor{}, err
-	}
-	if desc.EndKey.Equal(rowKey) {
-		log.Fatalf(ctx, "row key should not be valid range split point: %s", keys.PrettyPrint(nil /* valDirs */, rowKey))
-	}
-	return desc, nil
 }

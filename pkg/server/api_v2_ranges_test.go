@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -20,6 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
+	"github.com/cockroachdb/cockroach/pkg/server/rangetestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -29,14 +26,14 @@ import (
 func TestHotRangesV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ts := startServer(t)
+	ts := rangetestutils.StartServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
 	var hotRangesResp hotRangesResponse
-	client, err := ts.GetAdminAuthenticatedHTTPClient()
+	client, err := ts.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", ts.AdminURL()+apiV2Path+"ranges/hot/", nil)
+	req, err := http.NewRequest("GET", ts.AdminURL().WithPath(apiconstants.APIV2Path+"ranges/hot/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -46,25 +43,16 @@ func TestHotRangesV2(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&hotRangesResp))
 	require.NoError(t, resp.Body.Close())
 
-	if len(hotRangesResp.RangesByNodeID) == 0 {
+	if len(hotRangesResp.Ranges) == 0 {
 		t.Fatalf("didn't get hot range responses from any nodes")
 	}
 	if len(hotRangesResp.Errors) > 0 {
 		t.Errorf("got an error in hot range response from n%d: %v",
 			hotRangesResp.Errors[0].NodeID, hotRangesResp.Errors[0].ErrorMessage)
 	}
-
-	for nodeID, nodeResp := range hotRangesResp.RangesByNodeID {
-		if len(nodeResp) == 0 {
-			t.Fatalf("didn't get hot range response from node n%s", nodeID)
-		}
-		// We don't check for ranges being sorted by QPS, as this hot ranges
-		// report does not use that as its sort key (for stability across multiple
-		// pagination calls).
-		for _, r := range nodeResp {
-			if r.RangeID == 0 || (len(r.StartKey) == 0 && len(r.EndKey) == 0) {
-				t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r)
-			}
+	for _, r := range hotRangesResp.Ranges {
+		if r.RangeID == 0 || r.NodeID == 0 {
+			t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r)
 		}
 	}
 }
@@ -73,19 +61,19 @@ func TestNodeRangesV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ts := startServer(t)
+	ts := rangetestutils.StartServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
 	// Perform a scan to ensure that all the raft groups are initialized.
-	if _, err := ts.db.Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+	if _, err := ts.DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	var nodeRangesResp nodeRangesResponse
-	client, err := ts.GetAdminAuthenticatedHTTPClient()
+	client, err := ts.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", ts.AdminURL()+apiV2Path+"nodes/local/ranges/", nil)
+	req, err := http.NewRequest("GET", ts.AdminURL().WithPath(apiconstants.APIV2Path+"nodes/local/ranges/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -108,7 +96,9 @@ func TestNodeRangesV2(t *testing.T) {
 
 	// Take the first range ID, and call the ranges/ endpoint with it.
 	rangeID := nodeRangesResp.Ranges[0].Desc.RangeID
-	req, err = http.NewRequest("GET", fmt.Sprintf("%s%sranges/%d/", ts.AdminURL(), apiV2Path, rangeID), nil)
+	req, err = http.NewRequest(
+		"GET", ts.AdminURL().WithPath(fmt.Sprintf("%sranges/%d/", apiconstants.APIV2Path, rangeID)).String(), nil,
+	)
 	require.NoError(t, err)
 	resp, err = client.Do(req)
 	require.NoError(t, err)
@@ -132,17 +122,25 @@ func TestNodesV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			StoreSpecs: []base.StoreSpec{
+				base.DefaultTestStoreSpec,
+				base.DefaultTestStoreSpec,
+				base.DefaultTestStoreSpec,
+			},
+		},
+	})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
 	ts1 := testCluster.Server(0)
 
 	var nodesResp nodesResponse
-	client, err := ts1.GetAdminAuthenticatedHTTPClient()
+	client, err := ts1.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", ts1.AdminURL()+apiV2Path+"nodes/", nil)
+	req, err := http.NewRequest("GET", ts1.AdminURL().WithPath(apiconstants.APIV2Path+"nodes/").String(), nil)
 	require.NoError(t, err)
 	resp, err := client.Do(req)
 	require.NoError(t, err)
@@ -156,5 +154,6 @@ func TestNodesV2(t *testing.T) {
 	for _, n := range nodesResp.Nodes {
 		require.Greater(t, int(n.NodeID), 0)
 		require.Less(t, int(n.NodeID), 4)
+		require.Equal(t, len(n.StoreMetrics), 3)
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -29,6 +24,7 @@ func (g *execFactoryGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	g.w.write("package exec\n\n")
 
 	g.w.nestIndent("import (\n")
+	g.w.writeIndent("\"context\"\n\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb\"\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo\"\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/opt/cat\"\n")
@@ -79,10 +75,16 @@ func (g *execFactoryGen) genExecFactory() {
 	g.w.nestIndent("ConstructPlan(\n")
 	g.w.writeIndent("root Node,\n")
 	g.w.writeIndent("subqueries []Subquery,\n")
-	g.w.writeIndent("cascades []Cascade,\n")
+	g.w.writeIndent("cascades, triggers []PostQuery,\n")
 	g.w.writeIndent("checks []Node,\n")
 	g.w.writeIndent("rootRowCount int64,\n")
+	g.w.writeIndent("flags PlanFlags,\n")
 	g.w.unnest(") (Plan, error)\n")
+
+	g.w.write("\n")
+	g.w.nest("// Ctx returns the ctx of this execution.\n")
+	g.w.writeIndent("Ctx() context.Context\n")
+	g.w.unnest("\n")
 
 	for _, define := range g.compiled.Defines {
 		g.w.write("\n")
@@ -112,11 +114,17 @@ func (g *execFactoryGen) genStubFactory() {
 	g.w.nestIndent("func (StubFactory) ConstructPlan(\n")
 	g.w.writeIndent("root Node,\n")
 	g.w.writeIndent("subqueries []Subquery,\n")
-	g.w.writeIndent("cascades []Cascade,\n")
+	g.w.writeIndent("cascades, triggers []PostQuery,\n")
 	g.w.writeIndent("checks []Node,\n")
 	g.w.writeIndent("rootRowCount int64,\n")
+	g.w.writeIndent("flags PlanFlags,\n")
 	g.w.unnest(") (Plan, error) {\n")
 	g.w.nestIndent("return struct{}{}, nil\n")
+	g.w.unnest("}\n")
+
+	g.w.write("\n")
+	g.w.nest("func (StubFactory) Ctx() context.Context {\n")
+	g.w.writeIndent("return context.Background()\n")
 	g.w.unnest("}\n")
 
 	for _, define := range g.compiled.Defines {

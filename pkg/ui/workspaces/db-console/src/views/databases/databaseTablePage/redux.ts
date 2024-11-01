@@ -1,98 +1,107 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import {
+  DatabaseTablePageData,
+  util,
+  deriveIndexDetailsMemoized,
+  deriveTablePageDetailsMemoized,
+} from "@cockroachlabs/cluster-ui";
 import { RouteComponentProps } from "react-router";
-import { createSelector } from "reselect";
-import _ from "lodash";
-import { DatabaseTablePageData } from "@cockroachlabs/cluster-ui";
 
 import { cockroach } from "src/js/protos";
 import {
-  generateTableID,
   refreshTableDetails,
-  refreshTableStats,
   refreshNodes,
+  refreshIndexStats,
+  refreshSettings,
+  refreshUserSQLRoles,
 } from "src/redux/apiReducers";
-import { AdminUIState } from "src/redux/state";
-import { databaseNameAttr, tableNameAttr } from "src/util/constants";
-import { FixLong } from "src/util/fixLong";
-import { getMatchParamByName } from "src/util/query";
+import {
+  selectAutomaticStatsCollectionEnabled,
+  selectDropUnusedIndexDuration,
+  selectIndexRecommendationsEnabled,
+  selectIndexUsageStatsEnabled,
+} from "src/redux/clusterSettings";
+import { resetIndexUsageStatsAction } from "src/redux/indexUsageStats";
 import {
   nodeRegionsByIDSelector,
   selectIsMoreThanOneNode,
 } from "src/redux/nodes";
-import { getNodesByRegionString } from "../utils";
+import { AdminUIState } from "src/redux/state";
+import { selectHasAdminRole } from "src/redux/user";
+import { databaseNameAttr, tableNameAttr } from "src/util/constants";
+import { getMatchParamByName } from "src/util/query";
 
-const { TableDetailsRequest, TableStatsRequest } = cockroach.server.serverpb;
+const { TableIndexStatsRequest } = cockroach.server.serverpb;
 
-export const mapStateToProps = createSelector(
-  (_state: AdminUIState, props: RouteComponentProps): string =>
-    getMatchParamByName(props.match, databaseNameAttr),
-  (_state: AdminUIState, props: RouteComponentProps): string =>
-    getMatchParamByName(props.match, tableNameAttr),
+// Hardcoded isTenant value for db-console.
+const isTenant = false;
 
-  state => state.cachedData.tableDetails,
-  state => state.cachedData.tableStats,
-  state => nodeRegionsByIDSelector(state),
-  state => selectIsMoreThanOneNode(state),
+export const mapStateToProps = (
+  state: AdminUIState,
+  props: RouteComponentProps,
+): DatabaseTablePageData => {
+  const database = getMatchParamByName(props.match, databaseNameAttr);
+  const table = getMatchParamByName(props.match, tableNameAttr);
+  const tableDetails = state?.cachedData.tableDetails;
+  const details = tableDetails[util.generateTableID(database, table)];
+  const indexUsageStats = state?.cachedData.indexStats;
+  const indexStats = indexUsageStats[util.generateTableID(database, table)];
+  const lastReset = util.TimestampToMoment(
+    indexStats?.data?.last_reset,
+    util.minDate,
+  );
+  const nodeRegions = nodeRegionsByIDSelector(state);
+  const nodeStatuses = state?.cachedData.nodes.data;
 
-  (
-    database,
-    table,
-    tableDetails,
-    tableStats,
-    nodeRegions,
-    showNodeRegionsSection,
-  ): DatabaseTablePageData => {
-    const details = tableDetails[generateTableID(database, table)];
-    const stats = tableStats[generateTableID(database, table)];
-    const grants = _.flatMap(details?.data?.grants, grant =>
-      _.map(grant.privileges, privilege => {
-        return { user: grant.user, privilege };
-      }),
-    );
-    const nodes = stats?.data?.node_ids || [];
-
-    return {
-      databaseName: database,
-      name: table,
-      details: {
-        loading: !!details?.inFlight,
-        loaded: !!details?.valid,
-        createStatement: details?.data?.create_table_statement || "",
-        replicaCount: details?.data?.zone_config?.num_replicas || 0,
-        indexNames: _.uniq(_.map(details?.data?.indexes, index => index.name)),
-        grants: grants,
-      },
-      showNodeRegionsSection,
-      stats: {
-        loading: !!stats?.inFlight,
-        loaded: !!stats?.valid,
-        sizeInBytes: FixLong(
-          stats?.data?.approximate_disk_bytes || 0,
-        ).toNumber(),
-        rangeCount: FixLong(stats?.data?.range_count || 0).toNumber(),
-        nodesByRegionString: getNodesByRegionString(nodes, nodeRegions),
-      },
-    };
-  },
-);
+  return {
+    databaseName: database,
+    name: table,
+    schemaName: "",
+    details: deriveTablePageDetailsMemoized({
+      details,
+      nodeRegions,
+      isTenant,
+      nodeStatuses,
+    }),
+    showNodeRegionsSection: selectIsMoreThanOneNode(state) && !isTenant,
+    automaticStatsCollectionEnabled:
+      selectAutomaticStatsCollectionEnabled(state) || false,
+    hasAdminRole: selectHasAdminRole(state) || false,
+    showIndexRecommendations: selectIndexRecommendationsEnabled(state),
+    csIndexUnusedDuration: selectDropUnusedIndexDuration(state),
+    indexUsageStatsEnabled: selectIndexUsageStatsEnabled(state),
+    indexStats: {
+      loading: !!indexStats?.inFlight,
+      loaded: !!indexStats?.valid,
+      lastError: indexStats?.lastError,
+      stats: deriveIndexDetailsMemoized({ database, table, indexUsageStats }),
+      lastReset: lastReset,
+    },
+    isTenant,
+  };
+};
 
 export const mapDispatchToProps = {
-  refreshTableDetails: (database: string, table: string) => {
-    return refreshTableDetails(new TableDetailsRequest({ database, table }));
+  refreshTableDetails: (
+    database: string,
+    table: string,
+    csIndexUnusedDuration: string,
+  ) => {
+    return refreshTableDetails({
+      database,
+      table,
+      csIndexUnusedDuration,
+    });
   },
-
-  refreshTableStats: (database: string, table: string) => {
-    return refreshTableStats(new TableStatsRequest({ database, table }));
+  refreshIndexStats: (database: string, table: string) => {
+    return refreshIndexStats(new TableIndexStatsRequest({ database, table }));
   },
-
+  resetIndexUsageStats: resetIndexUsageStatsAction,
   refreshNodes,
+  refreshSettings,
+  refreshUserSQLRoles,
 };

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catalog
 
@@ -95,7 +90,9 @@ func (s *TableColMap) ForEach(f func(colID descpb.ColumnID, returnIndex int)) {
 }
 
 // String prints out the contents of the map in the following format:
-//   map[key1:val1 key2:val2 ...]
+//
+//	map[key1:val1 key2:val2 ...]
+//
 // The keys are in ascending order.
 func (s *TableColMap) String() string {
 	var buf bytes.Buffer

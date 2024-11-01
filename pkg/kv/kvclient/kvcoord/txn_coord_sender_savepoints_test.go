@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -20,10 +15,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,7 +38,7 @@ func TestSavepoints(t *testing.T) {
 	abortKey := roachpb.Key("abort")
 	errKey := roachpb.Key("injectErr")
 
-	datadriven.Walk(t, "testdata/savepoints", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "savepoints"), func(t *testing.T, path string) {
 		// We want to inject txn abort errors in some cases.
 		//
 		// We do this by injecting the error from "underneath" the
@@ -50,14 +47,14 @@ func TestSavepoints(t *testing.T) {
 		var doAbort int64
 		params.Knobs.Store = &kvserver.StoreTestingKnobs{
 			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-				TestingEvalFilter: func(args kvserverbase.FilterArgs) *roachpb.Error {
+				TestingEvalFilter: func(args kvserverbase.FilterArgs) *kvpb.Error {
 					key := args.Req.Header().Key
 					if atomic.LoadInt64(&doAbort) != 0 && key.Equal(abortKey) {
-						return roachpb.NewErrorWithTxn(
-							roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_UNKNOWN), args.Hdr.Txn)
+						return kvpb.NewErrorWithTxn(
+							kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_UNKNOWN), args.Hdr.Txn)
 					}
 					if key.Equal(errKey) {
-						return roachpb.NewErrorf("injected error")
+						return kvpb.NewErrorf("injected error")
 					}
 					return nil
 				},
@@ -93,13 +90,13 @@ func TestSavepoints(t *testing.T) {
 				ptxn()
 
 			case "commit":
-				if err := txn.CommitOrCleanup(ctx); err != nil {
+				if err := txn.Commit(ctx); err != nil {
 					fmt.Fprintf(&buf, "(%T) %v\n", err, err)
 				}
 
 			case "retry":
 				epochBefore := txn.Epoch()
-				retryErr := txn.GenerateForcedRetryableError(ctx, "forced retry")
+				retryErr := txn.GenerateForcedRetryableErr(ctx, "forced retry")
 				epochAfter := txn.Epoch()
 				fmt.Fprintf(&buf, "synthetic error: %v\n", retryErr)
 				fmt.Fprintf(&buf, "epoch: %d -> %d\n", epochBefore, epochAfter)
@@ -121,6 +118,18 @@ func TestSavepoints(t *testing.T) {
 				if prevID == txn.ID() {
 					changed = "not changed"
 				}
+				fmt.Fprintf(&buf, "txn id %s\n", changed)
+
+			case "reset":
+				prevID := txn.ID()
+				if err := txn.PrepareForRetry(ctx); err != nil {
+					t.Fatal(err)
+				}
+				changed := "changed"
+				if prevID == txn.ID() {
+					changed = "not changed"
+				}
+				fmt.Fprintf(&buf, "txn error cleared\n")
 				fmt.Fprintf(&buf, "txn id %s\n", changed)
 
 			case "put":
@@ -149,7 +158,7 @@ func TestSavepoints(t *testing.T) {
 					[]byte(td.CmdArgs[1].Key),
 					expVal,
 				); err != nil {
-					if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+					if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 						// Print an easier to match message.
 						fmt.Fprintf(&buf, "(%T) unexpected value\n", err)
 					} else {
@@ -160,7 +169,7 @@ func TestSavepoints(t *testing.T) {
 			case "get":
 				b := txn.NewBatch()
 				if td.HasArg("locking") {
-					b.GetForUpdate(td.CmdArgs[0].Key)
+					b.GetForUpdate(td.CmdArgs[0].Key, kvpb.BestEffort)
 				} else {
 					b.Get(td.CmdArgs[0].Key)
 				}
@@ -204,6 +213,15 @@ func TestSavepoints(t *testing.T) {
 					fmt.Fprintf(&buf, "(%T) %v\n", err, err)
 				} else {
 					ptxn()
+				}
+
+			case "can-use":
+				spn := td.CmdArgs[0].Key
+				spt := sp[spn]
+				if txn.CanUseSavepoint(ctx, spt) {
+					fmt.Fprintf(&buf, "true\n")
+				} else {
+					fmt.Fprintf(&buf, "false\n")
 				}
 
 			default:

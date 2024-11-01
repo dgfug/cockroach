@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -15,8 +10,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
 )
@@ -63,10 +60,9 @@ func (c *CustomFuncs) MergeProjections(
 // in the final Values operator, and Project synthesized columns are added to
 // it. Any unreferenced Values columns are discarded. For example:
 //
-//   SELECT column1, 3 FROM (VALUES (1, 2))
-//   =>
-//   (VALUES (1, 3))
-//
+//	SELECT column1, 3 FROM (VALUES (1, 2))
+//	=>
+//	(VALUES (1, 3))
 func (c *CustomFuncs) MergeProjectWithValues(
 	projections memo.ProjectionsExpr, passthrough opt.ColSet, input memo.RelExpr,
 ) memo.RelExpr {
@@ -102,8 +98,8 @@ func (c *CustomFuncs) MergeProjectWithValues(
 // CanUnnestTuplesFromValues returns true if the given single-column Values
 // operator has tuples that can be unfolded into multiple columns.
 // This is the case if:
-// 	1. The single output column is of type tuple.
-// 	2. All tuples in the single column are either TupleExpr's or ConstExpr's
+//  1. The single output column is of type tuple.
+//  2. All tuples in the single column are either TupleExpr's or ConstExpr's
 //     that wrap DTuples, as opposed to dynamically generated tuples.
 func (c *CustomFuncs) CanUnnestTuplesFromValues(values *memo.ValuesExpr) bool {
 	colTypeFam := c.mem.Metadata().ColumnMeta(values.Cols[0]).Type.Family()
@@ -176,14 +172,13 @@ func (c *CustomFuncs) MakeColsForUnnestTuples(tupleColID opt.ColumnID) opt.ColLi
 // Values operator with the tuple expanded out into the Values rows.
 // For example, these rows:
 //
-//   ((1, 2),)
-//   ((3, 4),)
+//	((1, 2),)
+//	((3, 4),)
 //
 // would be unnested as:
 //
-//   (1, 2)
-//   (3, 4)
-//
+//	(1, 2)
+//	(3, 4)
 func (c *CustomFuncs) UnnestTuplesFromValues(
 	values *memo.ValuesExpr, valuesCols opt.ColList,
 ) memo.RelExpr {
@@ -257,6 +252,7 @@ func (c *CustomFuncs) FoldTupleColumnAccess(
 //     within the JSON object can be referenced.
 //  2. All JSON keys referenced by the projections are present in the first row.
 //  3. All JSON keys present in the first row are present in all other rows.
+//
 // CanUnnestJSONFromValues should only be called if the Values operator has a
 // single column and at least one row.
 //
@@ -424,7 +420,7 @@ func (c *CustomFuncs) UnnestJSONFromValues(
 		tupleVals := make(memo.ScalarListExpr, len(newCols))
 		iter, err := firstJSON.ObjectIter()
 		if err != nil {
-			panic(errors.AssertionFailedf("failed to retrieve ObjectIter: %v", err))
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "failed to retrieve ObjectIter"))
 		}
 		// Iterate through the keys of the first row and use them to get the values
 		// from the current row. Add these values to the new Values rows.
@@ -432,7 +428,7 @@ func (c *CustomFuncs) UnnestJSONFromValues(
 		for iter.Next() {
 			jsonVal, err := rowExpr.(*memo.ConstExpr).Value.(*tree.DJSON).FetchValKey(iter.Key())
 			if err != nil {
-				panic(errors.AssertionFailedf("FetchValKey failed: %v", err))
+				panic(errors.NewAssertionErrorWithWrappedErrf(err, "FetchValKey failed"))
 			}
 			dJSON := tree.NewDJSON(jsonVal)
 			tupleVals[idx] = c.f.ConstructConstVal(dJSON, types.Jsonb)
@@ -451,10 +447,11 @@ func (c *CustomFuncs) UnnestJSONFromValues(
 // replaced by new Variables wrapping columns from the output of the given
 // ValuesExpr. Example:
 //
-//    SELECT j->'a' AS j_a FROM ...
-// =>
-//    SELECT j_a FROM ...
+//	SELECT j->'a' AS j_a FROM ...
 //
+// =>
+//
+//	SELECT j_a FROM ...
 func (c *CustomFuncs) FoldJSONFieldAccess(
 	projections memo.ProjectionsExpr,
 	newCols opt.ColList,
@@ -469,7 +466,7 @@ func (c *CustomFuncs) FoldJSONFieldAccess(
 	firstJSON := oldValues.Rows[0].(*memo.TupleExpr).Elems[0].(*memo.ConstExpr).Value.(*tree.DJSON)
 	iter, err := firstJSON.ObjectIter()
 	if err != nil {
-		panic(errors.AssertionFailedf("failed to retrieve ObjectIter: %v", err))
+		panic(errors.NewAssertionErrorWithWrappedErrf(err, "failed to retrieve ObjectIter"))
 	}
 	idx := 0
 	for iter.Next() {
@@ -517,7 +514,7 @@ func (c *CustomFuncs) MakeColsForUnnestJSON(
 	// Create a new column for each JSON key found in dJSON.
 	iter, err := dJSON.ObjectIter()
 	if err != nil {
-		panic(errors.AssertionFailedf("failed to retrieve ObjectIter: %v", err))
+		panic(errors.NewAssertionErrorWithWrappedErrf(err, "failed to retrieve ObjectIter"))
 	}
 	newColIDs := make(opt.ColList, 0, dJSON.Len())
 	for iter.Next() {
@@ -534,7 +531,6 @@ func (c *CustomFuncs) MakeColsForUnnestJSON(
 // 1. The ProjectionsItem remaps an output column from the given ValuesExpr.
 //
 // 2. The Values output column being remapped is not in the passthrough set.
-//
 func (c *CustomFuncs) CanPushColumnRemappingIntoValues(
 	projections memo.ProjectionsExpr, passthrough opt.ColSet, values *memo.ValuesExpr,
 ) bool {
@@ -556,22 +552,25 @@ func (c *CustomFuncs) CanPushColumnRemappingIntoValues(
 //
 // Example:
 // project
-//  ├── columns: x:2!null
-//  ├── values
-//  │    ├── columns: column1:1!null
-//  │    ├── cardinality: [2 - 2]
-//  │    ├── (1,)
-//  │    └── (2,)
-//  └── projections
-//       └── column1:1 [as=x:2, outer=(1)]
+//
+//	├── columns: x:2!null
+//	├── values
+//	│    ├── columns: column1:1!null
+//	│    ├── cardinality: [2 - 2]
+//	│    ├── (1,)
+//	│    └── (2,)
+//	└── projections
+//	     └── column1:1 [as=x:2, outer=(1)]
+//
 // =>
 // project
-//  ├── columns: x:2!null
-//  └── values
-//       ├── columns: x:2!null
-//       ├── cardinality: [2 - 2]
-//       ├── (1,)
-//       └── (2,)
+//
+//	├── columns: x:2!null
+//	└── values
+//	     ├── columns: x:2!null
+//	     ├── cardinality: [2 - 2]
+//	     ├── (1,)
+//	     └── (2,)
 //
 // This allows other rules to fire. In the above example, EliminateProject can
 // now remove the Project altogether.
@@ -666,17 +665,171 @@ func (c *CustomFuncs) PushColumnRemappingIntoValues(
 	return c.f.ConstructProject(newValues, newProjections, newPassthrough)
 }
 
+// AssignmentCastCols returns the set of column IDs that undergo an assignment
+// cast in the given projections, and are not referenced by any other projection.
+func (c *CustomFuncs) AssignmentCastCols(projections memo.ProjectionsExpr) opt.ColSet {
+	var castCols opt.ColSet
+	for i := range projections {
+		col, _, ok := extractAssignmentCastInputColAndTargetType(projections[i].Element)
+		if !ok {
+			continue
+		}
+		referencedInOtherProjection := false
+		for j := range projections {
+			if i != j && projections[j].ScalarProps().OuterCols.Contains(col) {
+				referencedInOtherProjection = true
+				break
+			}
+		}
+		if !referencedInOtherProjection {
+			castCols.Add(col)
+		}
+	}
+	return castCols
+}
+
+// PushAssignmentCastsIntoValues pushes assignment cast projections into Values
+// rows.
+//
+// Example:
+//
+// project
+//
+//	├── columns: x:2 y:3
+//	├── values
+//	│    ├── columns: column1:1
+//	│    ├── cardinality: [2 - 2]
+//	│    ├── (1,)
+//	│    └── (2,)
+//	└── projections
+//	     ├── assignment-cast: STRING [as=x:2]
+//	     │    └── column1:1
+//	     └── 'foo' [as=y:3]
+//
+// =>
+// project
+//
+//	├── columns: x:2 y:3
+//	├── values
+//	│    ├── columns: x:2
+//	│    ├── cardinality: [2 - 2]
+//	│    ├── tuple
+//	│    │    └── assignment-cast: STRING
+//	│    │        └── 1
+//	│    └── tuple
+//	│         └── assignment-cast: STRING
+//	│             └── 2
+//	└── projections
+//	     └── 'foo' [as=y:3]
+//
+// This allows other rules to fire, with the ultimate goal of eliminating the
+// project so that the insert fast-path optimization is used in more cases and
+// uniqueness checks for gen_random_uuid() values are eliminated in more cases.
+//
+// castCols is the set of columns produced by the values expression that undergo
+// an assignment cast in a projection. It must not include columns that are
+// referenced by more than one projection.
+func (c *CustomFuncs) PushAssignmentCastsIntoValues(
+	values *memo.ValuesExpr,
+	projections memo.ProjectionsExpr,
+	passthrough opt.ColSet,
+	castCols opt.ColSet,
+) memo.RelExpr {
+	// Create copies of the original passthrough columns, values columns, and
+	// values types.
+	newPassthrough := passthrough.Copy()
+	newValuesCols := make(opt.ColList, len(values.Cols))
+	newValuesTypes := make([]*types.T, len(values.Cols))
+	for i, col := range values.Cols {
+		newValuesCols[i] = col
+		newValuesTypes[i] = c.f.Metadata().ColumnMeta(col).Type
+	}
+
+	// Collect the list of new projections. Only projections that are assignment
+	// casts of columns output by the values expression will be altered. They
+	// will map a new column produced by the new values expression to their
+	// output column. castOrds tracks the column ordinals in the values
+	// expression to push assignment casts down to.
+	var castOrds intsets.Fast
+	newProjections := make(memo.ProjectionsExpr, 0, len(projections))
+	for i := range projections {
+		col, targetType, ok := extractAssignmentCastInputColAndTargetType(projections[i].Element)
+		if !ok || !castCols.Contains(col) {
+			// If the projection is not an assignment cast of a variable from
+			// the values expression, leave it unaltered.
+			newProjections = append(newProjections, projections[i])
+			continue
+		}
+
+		ord, ok := values.Cols.Find(col)
+		if !ok {
+			panic(errors.AssertionFailedf("could not find column %d", col))
+		}
+
+		// The projection column becomes an output column of the values
+		// expression and a passthrough column in the project.
+		newValuesCols[ord] = projections[i].Col
+		newValuesTypes[ord] = targetType
+		castOrds.Add(ord)
+		newPassthrough.Add(projections[i].Col)
+	}
+
+	// Build a list of the new rows with assignment casts pushed down to each
+	// datum.
+	newRowType := types.MakeTuple(newValuesTypes)
+	newRows := make(memo.ScalarListExpr, len(values.Rows))
+	for i := range values.Rows {
+		oldRow := values.Rows[i].(*memo.TupleExpr)
+		newRow := make(memo.ScalarListExpr, len(oldRow.Elems))
+		for ord := range newRow {
+			if castOrds.Contains(ord) {
+				// Wrap the original element in an assignment cast.
+				newRow[ord] = c.f.ConstructAssignmentCast(oldRow.Elems[ord], newValuesTypes[ord])
+			} else {
+				// If an assignment cast is not pushed into this values element,
+				// use the original element.
+				newRow[ord] = oldRow.Elems[ord]
+			}
+		}
+		newRows[i] = c.f.ConstructTuple(newRow, newRowType)
+	}
+
+	return c.f.ConstructProject(
+		c.f.ConstructValues(
+			newRows,
+			&memo.ValuesPrivate{Cols: newValuesCols, ID: c.f.Metadata().NextUniqueID()},
+		),
+		newProjections,
+		newPassthrough,
+	)
+}
+
+// extractAssignmentCastInputColAndType returns the column that the assignment
+// cast operates on and the target type of the assignment cast if the expression
+// is of the form (AssignmentCast (Variable ...)). If the expression is not of
+// this form, then ok=false is returned.
+func extractAssignmentCastInputColAndTargetType(
+	e opt.ScalarExpr,
+) (_ opt.ColumnID, _ *types.T, ok bool) {
+	if ac, ok := e.(*memo.AssignmentCastExpr); ok {
+		if v, ok := ac.Input.(*memo.VariableExpr); ok {
+			return v.Col, ac.Typ, true
+		}
+	}
+	return 0, nil, false
+}
+
 // IsStaticTuple returns true if the given ScalarExpr is either a TupleExpr or a
 // ConstExpr wrapping a DTuple. Expressions within a static tuple can be
 // determined during planning:
 //
-//   (1, 2)
-//   (x, y)
+//	(1, 2)
+//	(x, y)
 //
 // By contrast, expressions within a dynamic tuple can only be determined at
 // run-time:
 //
-//   SELECT (SELECT (x, y) FROM xy)
+//	SELECT (SELECT (x, y) FROM xy)
 //
 // Here, if there are 0 rows in xy, the tuple value will be NULL. Or, if there
 // is more than one row in xy, a dynamic error will be raised.
@@ -691,4 +844,88 @@ func (c *CustomFuncs) IsStaticTuple(expr opt.ScalarExpr) bool {
 		}
 	}
 	return false
+}
+
+// ProjectRemappedCols creates a projection for each column in the "from" set
+// that is not in the "to" set, mapping it to an equivalent column in the "to"
+// set. ProjectRemappedCols panics if this is not possible.
+func (c *CustomFuncs) ProjectRemappedCols(
+	from, to opt.ColSet, fds *props.FuncDepSet,
+) (projections memo.ProjectionsExpr) {
+	for col, ok := from.Next(0); ok; col, ok = from.Next(col + 1) {
+		if !to.Contains(col) {
+			toCol, ok := c.remapColWithIdenticalType(col, to, fds)
+			if !ok {
+				panic(errors.AssertionFailedf("cannot remap column %v", col))
+			}
+			projections = append(
+				projections,
+				c.f.ConstructProjectionsItem(c.f.ConstructVariable(toCol), col),
+			)
+		}
+	}
+	return projections
+}
+
+// RemapProjectionCols remaps column references in the given projections to
+// refer to the "to" set.
+func (c *CustomFuncs) RemapProjectionCols(
+	projections memo.ProjectionsExpr, to opt.ColSet, fds *props.FuncDepSet,
+) memo.ProjectionsExpr {
+	// Use the projection outer columns to filter out columns that are synthesized
+	// within the projections themselves (e.g. in a subquery).
+	outerCols := c.ProjectionOuterCols(projections)
+
+	// Replace any references to the "from" columns in the projections.
+	var replace ReplaceFunc
+	replace = func(e opt.Expr) opt.Expr {
+		if v, ok := e.(*memo.VariableExpr); ok && !to.Contains(v.Col) && outerCols.Contains(v.Col) {
+			// This variable needs to be remapped.
+			toCol, ok := c.remapColWithIdenticalType(v.Col, to, fds)
+			if !ok {
+				panic(errors.AssertionFailedf("cannot remap column %v", v.Col))
+			}
+			return c.f.ConstructVariable(toCol)
+		}
+		return c.f.Replace(e, replace)
+	}
+	return *(replace(&projections).(*memo.ProjectionsExpr))
+}
+
+// CanUseImprovedJoinElimination returns true if either no column remapping is
+// required in order to eliminate the join, or column remapping is enabled by
+// OptimizerUseImprovedJoinElimination.
+func (c *CustomFuncs) CanUseImprovedJoinElimination(from, to opt.ColSet) bool {
+	return c.f.evalCtx.SessionData().OptimizerUseImprovedJoinElimination || from.SubsetOf(to)
+}
+
+// FoldIsNullProjectionsItems folds all projections in the form "x IS NULL" if
+// "x" is known to be not null in the input relational expression.
+func (c *CustomFuncs) FoldIsNullProjectionsItems(
+	projections memo.ProjectionsExpr, input memo.RelExpr,
+) memo.ProjectionsExpr {
+	isNullColExpr := func(e opt.ScalarExpr) (opt.ColumnID, bool) {
+		is, ok := e.(*memo.IsExpr)
+		if !ok {
+			return 0, false
+		}
+		v, ok := is.Left.(*memo.VariableExpr)
+		if !ok {
+			return 0, false
+		}
+		if _, ok := is.Right.(*memo.NullExpr); !ok {
+			return 0, false
+		}
+		return v.Col, true
+	}
+	newProjections := make(memo.ProjectionsExpr, len(projections))
+	for i := range projections {
+		p := &projections[i]
+		if col, ok := isNullColExpr(p.Element); ok && c.IsColNotNull(col, input) {
+			newProjections[i] = c.f.ConstructProjectionsItem(memo.FalseSingleton, p.Col)
+		} else {
+			newProjections[i] = *p
+		}
+	}
+	return newProjections
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scmutationexec
 
@@ -14,103 +9,293 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/descriptorutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/errors"
 )
 
+func (i *immediateVisitor) getDescriptor(
+	ctx context.Context, id descpb.ID,
+) (catalog.Descriptor, error) {
+	if checkedOut := i.MaybeGetCheckedOutDescriptor(id); checkedOut != nil {
+		return checkedOut, nil
+	}
+	read, err := i.descriptorReader.MustReadImmutableDescriptors(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return read[0], nil
+}
+
+func (i *immediateVisitor) checkOutDescriptor(
+	ctx context.Context, id descpb.ID,
+) (catalog.MutableDescriptor, error) {
+	if checkedOut := i.MaybeGetCheckedOutDescriptor(id); checkedOut != nil {
+		return checkedOut, nil
+	}
+	mut, err := i.descriptorReader.MustReadMutableDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	i.AddToCheckedOutDescriptors(mut)
+	return mut, nil
+}
+
+func (i *immediateVisitor) checkOutTable(
+	ctx context.Context, id descpb.ID,
+) (*tabledesc.Mutable, error) {
+	desc, err := i.checkOutDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	mut, ok := desc.(*tabledesc.Mutable)
+	if !ok {
+		return nil, catalog.WrapTableDescRefErr(id, catalog.NewDescriptorTypeError(desc))
+	}
+	return mut, nil
+}
+
+func (i *immediateVisitor) checkOutDatabase(
+	ctx context.Context, id descpb.ID,
+) (*dbdesc.Mutable, error) {
+	desc, err := i.checkOutDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	mut, ok := desc.(*dbdesc.Mutable)
+	if !ok {
+		return nil, catalog.WrapDatabaseDescRefErr(id, catalog.NewDescriptorTypeError(desc))
+	}
+	return mut, nil
+}
+
+func (i *immediateVisitor) checkOutSchema(
+	ctx context.Context, id descpb.ID,
+) (*schemadesc.Mutable, error) {
+	desc, err := i.checkOutDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	mut, ok := desc.(*schemadesc.Mutable)
+	if !ok {
+		return nil, catalog.WrapSchemaDescRefErr(id, catalog.NewDescriptorTypeError(desc))
+	}
+	return mut, nil
+}
+
+// Stop the linter from complaining.
+var _ = ((*immediateVisitor)(nil)).checkOutSchema
+
+func (i *immediateVisitor) checkOutType(
+	ctx context.Context, id descpb.ID,
+) (*typedesc.Mutable, error) {
+	desc, err := i.checkOutDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	mut, ok := desc.(*typedesc.Mutable)
+	if !ok {
+		return nil, catalog.WrapTypeDescRefErr(id, catalog.NewDescriptorTypeError(desc))
+	}
+	return mut, nil
+}
+
+func (i *immediateVisitor) checkOutFunction(
+	ctx context.Context, id descpb.ID,
+) (*funcdesc.Mutable, error) {
+	desc, err := i.checkOutDescriptor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	mut, ok := desc.(*funcdesc.Mutable)
+	if !ok {
+		return nil, catalog.WrapTypeDescRefErr(id, catalog.NewDescriptorTypeError(desc))
+	}
+	return mut, nil
+}
+
+func (i *immediateVisitor) checkOutTrigger(
+	ctx context.Context, tableID descpb.ID, triggerID catid.TriggerID,
+) (*descpb.TriggerDescriptor, error) {
+	tbl, err := i.checkOutTable(ctx, tableID)
+	if err != nil {
+		return nil, err
+	}
+	trigger := catalog.FindTriggerByID(tbl, triggerID)
+	if trigger != nil {
+		return trigger, nil
+	}
+	panic(errors.AssertionFailedf("failed to find trigger with ID %d in table %q (%d)",
+		triggerID, tbl.GetName(), tbl.GetID()))
+}
+
 func mutationStateChange(
-	ctx context.Context,
-	table *tabledesc.Mutable,
-	f descriptorutils.MutationSelector,
+	tbl *tabledesc.Mutable,
+	f MutationSelector,
 	exp, next descpb.DescriptorMutation_State,
+	direction descpb.DescriptorMutation_Direction,
 ) error {
-	mut, err := descriptorutils.FindMutation(table, f)
+	mut, err := FindMutation(tbl, f)
 	if err != nil {
 		return err
 	}
-	m := &table.TableDesc().Mutations[mut.MutationOrdinal()]
+	m := &tbl.TableDesc().Mutations[mut.MutationOrdinal()]
 	if m.State != exp {
 		return errors.AssertionFailedf("update mutation for %d from %v to %v: unexpected state: %v",
-			table.GetID(), exp, m.State, table)
+			tbl.GetID(), exp, m.State, tbl)
 	}
 	m.State = next
+	m.Direction = direction
 	return nil
 }
 
-func removeMutation(
-	ctx context.Context,
-	table *tabledesc.Mutable,
-	f descriptorutils.MutationSelector,
-	exp descpb.DescriptorMutation_State,
+func RemoveMutation(
+	tbl *tabledesc.Mutable, f MutationSelector, exp ...descpb.DescriptorMutation_State,
 ) (descpb.DescriptorMutation, error) {
-	mut, err := descriptorutils.FindMutation(table, f)
+	mut, err := FindMutation(tbl, f)
 	if err != nil {
 		return descpb.DescriptorMutation{}, err
 	}
 	foundIdx := mut.MutationOrdinal()
-	cpy := table.Mutations[foundIdx]
-	if cpy.State != exp {
-		return descpb.DescriptorMutation{}, errors.AssertionFailedf(
-			"remove mutation from %d: unexpected state: got %v, expected %v: %v",
-			table.GetID(), cpy.State, exp, table,
-		)
-	}
-	table.Mutations = append(table.Mutations[:foundIdx], table.Mutations[foundIdx+1:]...)
-	return cpy, nil
-}
-
-// findFamilyOrdinalForColumnID finds a family which contains the needle column
-// id and returns its index in the families slice.
-func findFamilyOrdinalForColumnID(
-	table catalog.TableDescriptor, needle descpb.ColumnID,
-) (int, error) {
-	families := table.GetFamilies()
-	for i := range families {
-		for _, colID := range families[i].ColumnIDs {
-			if colID == needle {
-				return i, nil
-			}
-		}
-	}
-	return -1, errors.Errorf("failed to find column family for column %d in table %d: %v",
-		needle, table.GetID(), table)
-}
-
-// Suppress the linter.
-var _ = findFamilyOrdinalForColumnID
-
-func removeColumnFromFamily(table *tabledesc.Mutable, colID descpb.ColumnID) error {
-	famIdx, err := findFamilyOrdinalForColumnID(table, colID)
-	if err != nil {
-		return errors.WithAssertionFailure(err)
-	}
-	f := &table.Families[famIdx]
-	for i, id := range f.ColumnIDs {
-		if id == colID {
-			f.ColumnIDs = append(f.ColumnIDs[:i], f.ColumnIDs[i+1:]...)
-			f.ColumnNames = append(f.ColumnNames[:i], f.ColumnNames[i+1:]...)
+	cpy := tbl.Mutations[foundIdx]
+	var foundExpState bool
+	for _, s := range exp {
+		if cpy.State == s {
+			foundExpState = true
 			break
 		}
 	}
-	if len(f.ColumnIDs) == 0 {
-		table.Families = append(table.Families[:famIdx], table.Families[famIdx+1:]...)
+	if !foundExpState {
+		return descpb.DescriptorMutation{}, errors.AssertionFailedf(
+			"remove mutation from %d: unexpected state: got %v, expected %v: %v",
+			tbl.GetID(), cpy.State, exp, tbl,
+		)
 	}
+	tbl.Mutations = append(tbl.Mutations[:foundIdx], tbl.Mutations[foundIdx+1:]...)
+	return cpy, nil
+}
+
+// MutationSelector defines a predicate on a catalog.Mutation with no
+// side-effects.
+type MutationSelector func(mutation catalog.Mutation) (matches bool)
+
+// FindMutation returns the first mutation in table for which the selector
+// returns true.
+// Such a mutation is expected to exist, if none are found, an internal error
+// is returned.
+func FindMutation(
+	tbl catalog.TableDescriptor, selector MutationSelector,
+) (catalog.Mutation, error) {
+	for _, mut := range tbl.AllMutations() {
+		if selector(mut) {
+			return mut, nil
+		}
+	}
+	return nil, errors.AssertionFailedf("matching mutation not found in table %d", tbl.GetID())
+}
+
+// MakeIndexIDMutationSelector returns a MutationSelector which matches an
+// index mutation with the correct ID.
+func MakeIndexIDMutationSelector(indexID descpb.IndexID) MutationSelector {
+	return func(mut catalog.Mutation) bool {
+		if mut.AsIndex() == nil {
+			return false
+		}
+		return mut.AsIndex().GetID() == indexID
+	}
+}
+
+// MakeColumnIDMutationSelector returns a MutationSelector which matches a
+// column mutation with the correct ID.
+func MakeColumnIDMutationSelector(columnID descpb.ColumnID) MutationSelector {
+	return func(mut catalog.Mutation) bool {
+		if mut.AsColumn() == nil {
+			return false
+		}
+		return mut.AsColumn().GetID() == columnID
+	}
+}
+
+// enqueueNonIndexMutation enqueues a non-index mutation `m` (of generic type M)
+// with direction `dir` without increasing the next mutation ID.
+// The mutation state will be DELETE_ONLY if `dir=ADD` and WRITE_ONLY if `dir=DROP`.
+func enqueueNonIndexMutation[M any](
+	tbl *tabledesc.Mutable,
+	enqueueFunc func(M, descpb.DescriptorMutation_Direction),
+	m M,
+	dir descpb.DescriptorMutation_Direction,
+) {
+	enqueueFunc(m, dir)
+	tbl.NextMutationID--
+}
+
+// enqueueIndexMutation is like enqueueNonIndexMutation but allows caller to
+// specify the mutation's initial state.
+func enqueueIndexMutation(
+	tbl *tabledesc.Mutable,
+	idx *descpb.IndexDescriptor,
+	state descpb.DescriptorMutation_State,
+	dir descpb.DescriptorMutation_Direction,
+) error {
+	if err := tbl.AddIndexMutation(idx, dir, state); err != nil {
+		return err
+	}
+	tbl.NextMutationID--
 	return nil
 }
 
-// Suppress the linter.
-var _ = removeColumnFromFamily
-
-func columnNamesFromIDs(table *tabledesc.Mutable, columnIDs descpb.ColumnIDs) ([]string, error) {
-	storeColNames := make([]string, 0, len(columnIDs))
-	for _, colID := range columnIDs {
-		column, err := table.FindColumnWithID(colID)
-		if err != nil {
-			return nil, err
+func updateColumnExprSequenceUsage(d *descpb.ColumnDescriptor) error {
+	var all catalog.DescriptorIDSet
+	for _, expr := range [3]*string{d.ComputeExpr, d.DefaultExpr, d.OnUpdateExpr} {
+		if expr == nil {
+			continue
 		}
-		storeColNames = append(storeColNames, column.GetName())
+		ids, err := sequenceIDsInExpr(*expr)
+		if err != nil {
+			return err
+		}
+		ids.ForEach(all.Add)
 	}
-	return storeColNames, nil
+	d.UsesSequenceIds = all.Ordered()
+	d.OwnsSequenceIds = all.Ordered()
+	return nil
+}
+
+func updateColumnExprFunctionsUsage(d *descpb.ColumnDescriptor) error {
+	var all catalog.DescriptorIDSet
+	for _, expr := range [3]*string{d.ComputeExpr, d.DefaultExpr, d.OnUpdateExpr} {
+		if expr == nil {
+			continue
+		}
+		ids, err := schemaexpr.GetUDFIDsFromExprStr(*expr)
+		if err != nil {
+			return err
+		}
+		ids.ForEach(all.Add)
+	}
+	d.UsesFunctionIds = all.Ordered()
+	return nil
+}
+
+func sequenceIDsInExpr(expr string) (ids catalog.DescriptorIDSet, _ error) {
+	e, err := parser.ParseExpr(expr)
+	if err != nil {
+		return ids, err
+	}
+	seqIdents, err := seqexpr.GetUsedSequences(e)
+	if err != nil {
+		return ids, err
+	}
+	for _, si := range seqIdents {
+		ids.Add(descpb.ID(si.SeqID))
+	}
+	return ids, nil
 }

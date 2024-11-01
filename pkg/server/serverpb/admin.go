@@ -1,14 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package serverpb
+
+import (
+	context "context"
+	"sort"
+
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	io_prometheus_client "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc"
+)
 
 // Add adds values from ots to ts.
 func (ts *TableStatsResponse) Add(ots *TableStatsResponse) {
@@ -35,4 +39,69 @@ func (ts *TableStatsResponse) Add(ots *TableStatsResponse) {
 			ts.NodeCount--
 		}
 	}
+}
+
+func (r DecommissionPreCheckResponse_NodeReadiness) String() string {
+	switch r {
+	case DecommissionPreCheckResponse_UNKNOWN:
+		return "unknown"
+	case DecommissionPreCheckResponse_READY:
+		return "ready"
+	case DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED:
+		return "already decommissioned"
+	case DecommissionPreCheckResponse_ALLOCATION_ERRORS:
+		return "allocation errors"
+	default:
+		panic("unknown decommission node readiness")
+	}
+}
+
+type TenantAdminServer interface {
+	Liveness(context.Context, *LivenessRequest) (*LivenessResponse, error)
+}
+
+// Empty is true if there are no unavailable ranges and no error performing
+// healthcheck.
+func (r *RecoveryVerifyResponse_UnavailableRanges) Empty() bool {
+	return len(r.Ranges) == 0 && len(r.Error) == 0
+}
+
+// GetInternalTimeseriesNamesFromServer is a helper that uses the provided
+// ClientConn to query the AllMetricMetadata endpoint, and returns the set of
+// all possible internal metric names as a sorted slice.
+//
+// This is *not* the list of timeseries names. Instead, it is that list but
+// adding `cr.node.` and `cr.store.` prefixes (both copies are emitted, since we
+// can't tell what the true prefix for each metric is). Additionally, for histograms
+// we generate the names for the quantiles that are exported (internal TSDB does
+// not support full histograms).
+func GetInternalTimeseriesNamesFromServer(
+	ctx context.Context, conn *grpc.ClientConn,
+) ([]string, error) {
+	c := NewAdminClient(conn)
+	resp, err := c.AllMetricMetadata(ctx, &MetricMetadataRequest{})
+	if err != nil {
+		return nil, err
+	}
+	var sl []string
+	for name, meta := range resp.Metadata {
+		if meta.MetricType == io_prometheus_client.MetricType_HISTOGRAM {
+			// See usage of RecordHistogramQuantiles in pkg/server/status/recorder.go.
+			for _, q := range metric.RecordHistogramQuantiles {
+				sl = append(sl, name+q.Suffix)
+			}
+			sl = append(sl, name+"-avg")
+			sl = append(sl, name+"-count")
+		} else {
+			sl = append(sl, name)
+		}
+	}
+	out := make([]string, 0, 2*len(sl))
+	for _, prefix := range []string{"cr.node.", "cr.store."} {
+		for _, name := range sl {
+			out = append(out, prefix+name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

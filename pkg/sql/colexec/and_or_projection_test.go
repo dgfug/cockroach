@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -15,18 +10,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/stretchr/testify/require"
 )
 
 type andOrTestCase struct {
@@ -163,10 +155,11 @@ func TestAndOrOps(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -205,7 +198,7 @@ func TestAndOrOps(t *testing.T) {
 					func(input []colexecop.Operator) (colexecop.Operator, error) {
 						projOp, err := colexectestutils.CreateTestProjectingOperator(
 							ctx, flowCtx, input[0], []*types.T{types.Bool, types.Bool},
-							fmt.Sprintf("@1 %s @2", test.operation), false /* canFallbackToRowexec */, testMemAcc,
+							fmt.Sprintf("@1 %s @2", test.operation), testMemAcc,
 						)
 						if err != nil {
 							return nil, err
@@ -216,75 +209,5 @@ func TestAndOrOps(t *testing.T) {
 					})
 			}
 		})
-	}
-}
-
-func benchmarkLogicalProjOp(
-	b *testing.B, operation string, useSelectionVector bool, hasNulls bool,
-) {
-	defer log.Scope(b).Close(b)
-	ctx := context.Background()
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
-	defer evalCtx.Stop(ctx)
-	flowCtx := &execinfra.FlowCtx{
-		EvalCtx: &evalCtx,
-		Cfg: &execinfra.ServerConfig{
-			Settings: st,
-		},
-	}
-	rng, _ := randutil.NewTestRand()
-
-	batch := testAllocator.NewMemBatchWithMaxCapacity([]*types.T{types.Bool, types.Bool})
-	col1 := batch.ColVec(0).Bool()
-	col2 := batch.ColVec(0).Bool()
-	for i := 0; i < coldata.BatchSize(); i++ {
-		col1[i] = rng.Float64() < 0.5
-		col2[i] = rng.Float64() < 0.5
-	}
-	if hasNulls {
-		nulls1 := batch.ColVec(0).Nulls()
-		nulls2 := batch.ColVec(0).Nulls()
-		for i := 0; i < coldata.BatchSize(); i++ {
-			if rng.Float64() < nullProbability {
-				nulls1.SetNull(i)
-			}
-			if rng.Float64() < nullProbability {
-				nulls2.SetNull(i)
-			}
-		}
-	}
-	batch.SetLength(coldata.BatchSize())
-	if useSelectionVector {
-		batch.SetSelection(true)
-		sel := batch.Selection()
-		for i := 0; i < coldata.BatchSize(); i++ {
-			sel[i] = i
-		}
-	}
-	typs := []*types.T{types.Bool, types.Bool}
-	input := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
-	logicalProjOp, err := colexectestutils.CreateTestProjectingOperator(
-		ctx, flowCtx, input, typs,
-		fmt.Sprintf("@1 %s @2", operation), false /* canFallbackToRowexec */, testMemAcc,
-	)
-	require.NoError(b, err)
-	logicalProjOp.Init(ctx)
-
-	b.SetBytes(int64(8 * coldata.BatchSize()))
-	for i := 0; i < b.N; i++ {
-		logicalProjOp.Next()
-	}
-}
-
-func BenchmarkLogicalProjOp(b *testing.B) {
-	for _, operation := range []string{"AND", "OR"} {
-		for _, useSel := range []bool{true, false} {
-			for _, hasNulls := range []bool{true, false} {
-				b.Run(fmt.Sprintf("%s,useSel=%t,hasNulls=%t", operation, useSel, hasNulls), func(b *testing.B) {
-					benchmarkLogicalProjOp(b, operation, useSel, hasNulls)
-				})
-			}
-		}
 	}
 }

@@ -1,20 +1,17 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { CaretDown } from "@cockroachlabs/icons";
 import classnames from "classnames/bind";
+import React from "react";
+
+import { Button, ButtonProps } from "src/button";
 
 import { OutsideEventHandler } from "../outsideEventHandler";
+
 import styles from "./dropdown.module.scss";
-import { Button, ButtonProps } from "src/button";
-import { CaretDown } from "@cockroachlabs/icons";
 
 const cx = classnames.bind(styles);
 
@@ -35,7 +32,7 @@ export interface DropdownProps<T> {
   items: Array<DropdownOption<T>>;
   onChange: (item: DropdownOption<T>["value"]) => void;
   children?: React.ReactNode;
-  customToggleButton?: React.ReactNode;
+  customToggleButton?: React.ReactChild;
   customToggleButtonOptions?: Partial<ButtonProps>;
   menuPosition?: "left" | "right";
   className?: string;
@@ -53,7 +50,7 @@ interface DropdownButtonProps {
   customProps?: Partial<ButtonProps>;
 }
 
-const DropdownButton: React.FC<DropdownButtonProps> = ({
+export const DropdownButton: React.FC<DropdownButtonProps> = ({
   children,
   customProps = {},
 }) => {
@@ -96,29 +93,26 @@ export class Dropdown<T = string> extends React.Component<
     isOpen: false,
   };
 
-  handleMenuOpen = () => {
+  handleMenuOpen = (): void => {
     this.setState({
       isOpen: !this.state.isOpen,
     });
   };
 
-  changeMenuState = (nextState: boolean) => {
+  changeMenuState = (nextState: boolean): void => {
     this.setState({
       isOpen: nextState,
     });
   };
 
-  handleItemSelection = (value: T) => {
+  handleItemSelection = (value: T): void => {
     this.props.onChange(value);
     this.handleMenuOpen();
   };
 
-  renderDropdownToggleButton = () => {
-    const {
-      children,
-      customToggleButton,
-      customToggleButtonOptions,
-    } = this.props;
+  renderDropdownToggleButton = (): React.ReactChild => {
+    const { children, customToggleButton, customToggleButtonOptions } =
+      this.props;
     const { isOpen } = this.state;
 
     if (customToggleButton) {
@@ -132,7 +126,7 @@ export class Dropdown<T = string> extends React.Component<
     }
   };
 
-  render() {
+  render(): React.ReactElement {
     const {
       items,
       menuPosition = "left",

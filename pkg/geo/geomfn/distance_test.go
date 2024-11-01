@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -17,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
+	"github.com/cockroachdb/cockroach/pkg/geo/geotest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -983,9 +979,9 @@ func TestClosestPoint(t *testing.T) {
 			"POINT(1.5 1.5)",
 		},
 		{"Closest point between MULTIPOLYGON and MULTIPOINT",
-			"MULTIPOLYGON(((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 2,1 1)), ((-1 -1,-1 -2,-2 -2,-2 -1,-1 -1)))",
-			"MULTIPOINT((20 10),(10 10))",
-			"POINT(4 4)",
+			"SRID=4326;MULTIPOLYGON(((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 2,1 1)), ((-1 -1,-1 -2,-2 -2,-2 -1,-1 -1)))",
+			"SRID=4326;MULTIPOINT((20 10),(10 10))",
+			"SRID=4326;POINT(4 4)",
 		},
 	}
 
@@ -1001,7 +997,7 @@ func TestClosestPoint(t *testing.T) {
 			ret, err := ClosestPoint(gA, gB)
 			require.NoError(t, err)
 
-			requireGeometryWithinEpsilon(t, expected, ret, 2e-10)
+			geotest.RequireGeometryInEpsilon(t, expected, ret, 2e-10)
 		})
 	}
 

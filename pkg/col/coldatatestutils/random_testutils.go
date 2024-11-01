@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldatatestutils
 
 import (
 	"context"
+	crypto_rand "crypto/rand"
 	"math/rand"
 	"time"
 
@@ -19,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -57,7 +53,7 @@ type RandomVecArgs struct {
 	// Rand is the provided RNG.
 	Rand *rand.Rand
 	// Vec is the vector to be filled with random values.
-	Vec coldata.Vec
+	Vec *coldata.Vec
 	// N is the number of values to be generated.
 	N int
 	// NullProbability determines the probability of a single value being NULL.
@@ -92,19 +88,30 @@ func RandomVec(args RandomVecArgs) {
 		}
 	case types.BytesFamily:
 		bytes := args.Vec.Bytes()
-		isUUID := args.Vec.Type().Family() == types.UuidFamily
-		for i := 0; i < args.N; i++ {
-			bytesLen := args.BytesFixedLength
-			if bytesLen <= 0 {
-				bytesLen = args.Rand.Intn(maxVarLen)
+		if args.Vec.Type().Family() == types.EnumFamily {
+			enumMeta := args.Vec.Type().TypeMeta.EnumData
+			if enumMeta == nil {
+				colexecerror.InternalError(errors.AssertionFailedf("unexpectedly empty enum metadata in RandomVec"))
 			}
-			if isUUID {
-				bytesLen = uuid.Size
+			reps := enumMeta.PhysicalRepresentations
+			for i := 0; i < args.N; i++ {
+				bytes.Set(i, reps[args.Rand.Intn(len(reps))])
 			}
-			randBytes := make([]byte, bytesLen)
-			// Read always returns len(bytes[i]) and nil.
-			_, _ = rand.Read(randBytes)
-			bytes.Set(i, randBytes)
+		} else {
+			isUUID := args.Vec.Type().Family() == types.UuidFamily
+			for i := 0; i < args.N; i++ {
+				bytesLen := args.BytesFixedLength
+				if bytesLen <= 0 {
+					bytesLen = args.Rand.Intn(maxVarLen)
+				}
+				if isUUID {
+					bytesLen = uuid.Size
+				}
+				randBytes := make([]byte, bytesLen)
+				// Read always returns len(bytes[i]) and nil.
+				_, _ = crypto_rand.Read(randBytes)
+				bytes.Set(i, randBytes)
+			}
 		}
 	case types.DecimalFamily:
 		decs := args.Vec.Decimal()
@@ -210,13 +217,13 @@ func RandomVec(args RandomVecArgs) {
 
 // setNull sets ith element in vec to null and might set the actual value (which
 // should be ignored) to some garbage.
-func setNull(rng *rand.Rand, vec coldata.Vec, i int) {
+func setNull(rng *rand.Rand, vec *coldata.Vec, i int) {
 	vec.Nulls().SetNull(i)
 	switch vec.CanonicalTypeFamily() {
 	case types.DecimalFamily:
 		_, err := vec.Decimal()[i].SetFloat64(rng.Float64())
 		if err != nil {
-			colexecerror.InternalError(errors.AssertionFailedf("%v", err))
+			colexecerror.InternalError(errors.NewAssertionErrorWithWrappedErrf(err, "could not set decimal"))
 		}
 	case types.IntervalFamily:
 		vec.Interval()[i] = duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63())
@@ -224,27 +231,19 @@ func setNull(rng *rand.Rand, vec coldata.Vec, i int) {
 }
 
 // RandomBatch returns a batch with a capacity of capacity and a number of
-// random elements equal to length (capacity if length is 0). The values will be
-// null with a probability of nullProbability.
+// random elements equal to length (capacity if length is 0).
+// Note: args.Vec and args.N are ignored.
 func RandomBatch(
-	allocator *colmem.Allocator,
-	rng *rand.Rand,
-	typs []*types.T,
-	capacity int,
-	length int,
-	nullProbability float64,
+	allocator *colmem.Allocator, args RandomVecArgs, typs []*types.T, capacity int, length int,
 ) coldata.Batch {
 	batch := allocator.NewMemBatchWithFixedCapacity(typs, capacity)
 	if length == 0 {
 		length = capacity
 	}
+	args.N = length
 	for _, colVec := range batch.ColVecs() {
-		RandomVec(RandomVecArgs{
-			Rand:            rng,
-			Vec:             colVec,
-			N:               length,
-			NullProbability: nullProbability,
-		})
+		args.Vec = colVec
+		RandomVec(args)
 	}
 	batch.SetLength(length)
 	return batch
@@ -283,7 +282,7 @@ func RandomBatchWithSel(
 	nullProbability float64,
 	selProbability float64,
 ) coldata.Batch {
-	batch := RandomBatch(allocator, rng, typs, n, 0 /* length */, nullProbability)
+	batch := RandomBatch(allocator, RandomVecArgs{Rand: rng, NullProbability: nullProbability}, typs, n, 0 /* length */)
 	if selProbability != 0 {
 		sel := RandomSel(rng, n, 1-selProbability)
 		batch.SetSelection(true)
@@ -298,12 +297,12 @@ const (
 	defaultNumBatches      = 4
 )
 
-// RandomDataOpArgs are arguments passed in to RandomDataOp. All arguments are
+// RandomDataOpArgs are arguments passed in to randomDataOp. All arguments are
 // optional (refer to the constants above this struct definition for the
 // defaults). Bools are false by default.
 type RandomDataOpArgs struct {
 	// DeterministicTyps, if set, overrides MaxSchemaLength and disables type
-	// randomization, forcing the RandomDataOp to use this schema.
+	// randomization, forcing the randomDataOp to use this schema.
 	DeterministicTyps []*types.T
 	// MaxSchemaLength is the maximum length of the operator's schema, which will
 	// be at least one type.
@@ -322,9 +321,9 @@ type RandomDataOpArgs struct {
 	BatchAccumulator func(ctx context.Context, b coldata.Batch, typs []*types.T)
 }
 
-// RandomDataOp is an operator that generates random data according to
+// randomDataOp is an operator that generates random data according to
 // RandomDataOpArgs. Call GetBuffer to get all data that was returned.
-type RandomDataOp struct {
+type randomDataOp struct {
 	ctx              context.Context
 	allocator        *colmem.Allocator
 	batchAccumulator func(ctx context.Context, b coldata.Batch, typs []*types.T)
@@ -337,12 +336,12 @@ type RandomDataOp struct {
 	nulls            bool
 }
 
-var _ colexecop.Operator = &RandomDataOp{}
+var _ colexecop.Operator = &randomDataOp{}
 
-// NewRandomDataOp creates a new RandomDataOp.
+// NewRandomDataOp creates a new randomDataOp.
 func NewRandomDataOp(
 	allocator *colmem.Allocator, rng *rand.Rand, args RandomDataOpArgs,
-) *RandomDataOp {
+) (colexecop.Operator, []*types.T) {
 	var (
 		maxSchemaLength = defaultMaxSchemaLength
 		batchSize       = coldata.BatchSize()
@@ -366,7 +365,7 @@ func NewRandomDataOp(
 			typs[i] = randgen.RandType(rng)
 		}
 	}
-	return &RandomDataOp{
+	return &randomDataOp{
 		allocator:        allocator,
 		batchAccumulator: args.BatchAccumulator,
 		typs:             typs,
@@ -375,16 +374,16 @@ func NewRandomDataOp(
 		numBatches:       numBatches,
 		selection:        args.Selection,
 		nulls:            args.Nulls,
-	}
+	}, typs
 }
 
 // Init is part of the colexecop.Operator interface.
-func (o *RandomDataOp) Init(ctx context.Context) {
+func (o *randomDataOp) Init(ctx context.Context) {
 	o.ctx = ctx
 }
 
 // Next is part of the colexecop.Operator interface.
-func (o *RandomDataOp) Next() coldata.Batch {
+func (o *randomDataOp) Next() coldata.Batch {
 	if o.numReturned == o.numBatches {
 		// Done.
 		b := coldata.ZeroBatch
@@ -400,6 +399,13 @@ func (o *RandomDataOp) Next() coldata.Batch {
 	)
 	if o.selection {
 		selProbability = o.rng.Float64()
+		// Ensure a reasonable lower bound on the probability of selecting a
+		// tuple into the batch. If we don't do this, it might be possible for
+		// us to spin for very long time in the loop below before we get a
+		// non-zero length batch if this probability is tiny.
+		if selProbability < 0.01 {
+			selProbability = 0.01
+		}
 	}
 	if o.nulls && o.rng.Float64() > 0.1 {
 		// Even if nulls are desired, in 10% of cases create a batch with no
@@ -420,19 +426,14 @@ func (o *RandomDataOp) Next() coldata.Batch {
 	}
 }
 
-// ChildCount implements the execinfra.OpNode interface.
-func (o *RandomDataOp) ChildCount(verbose bool) int {
+// ChildCount implements the execopnode.OpNode interface.
+func (o *randomDataOp) ChildCount(verbose bool) int {
 	return 0
 }
 
-// Child implements the execinfra.OpNode interface.
-func (o *RandomDataOp) Child(nth int, verbose bool) execinfra.OpNode {
+// Child implements the execopnode.OpNode interface.
+func (o *randomDataOp) Child(nth int, verbose bool) execopnode.OpNode {
 	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
-}
-
-// Typs returns the output types of the RandomDataOp.
-func (o *RandomDataOp) Typs() []*types.T {
-	return o.typs
 }

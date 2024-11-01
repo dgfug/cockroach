@@ -1,16 +1,15 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package shuffle
 
-import "math/rand"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+)
 
 // Interface for shuffle. When it is satisfied, a collection can be shuffled by
 // the routines in this package. The methods require that the elements of the
@@ -23,10 +22,16 @@ type Interface interface {
 	Swap(i, j int)
 }
 
+var seedSource int64
+var randSyncPool = sync.Pool{
+	New: func() interface{} {
+		return rand.New(rand.NewSource(atomic.AddInt64(&seedSource, 1)))
+	},
+}
+
 // Shuffle randomizes the order of the array.
 func Shuffle(data Interface) {
-	n := data.Len()
-	for i := 1; i < n; i++ {
-		data.Swap(i, rand.Intn(i+1))
-	}
+	r := randSyncPool.Get().(*rand.Rand)
+	defer randSyncPool.Put(r)
+	r.Shuffle(data.Len(), data.Swap)
 }

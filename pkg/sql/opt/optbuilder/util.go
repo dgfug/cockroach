@@ -1,18 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -20,21 +14,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
+// TODO(michae2): Remove this when #70731 is fixed.
 var multipleModificationsOfTableEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
 	"sql.multiple_modifications_of_table.enabled",
 	"if true, allow statements containing multiple INSERT ON CONFLICT, UPSERT, UPDATE, or DELETE "+
 		"subqueries modifying the same table, at the risk of data corruption if the same row is "+
 		"modified multiple times by a single statement (multiple INSERT subqueries without ON "+
 		"CONFLICT cannot cause corruption and are always allowed)",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // windowAggregateFrame() returns a frame that any aggregate built as a window
 // can use.
@@ -59,9 +56,6 @@ func getTypedExprs(exprs []tree.Expr) []tree.TypedExpr {
 func (b *Builder) expandStar(
 	expr tree.Expr, inScope *scope,
 ) (aliases []string, exprs []tree.TypedExpr) {
-	if b.insideViewDef {
-		panic(unimplemented.NewWithIssue(10028, "views do not currently support * expressions"))
-	}
 	switch t := expr.(type) {
 	case *tree.TupleStar:
 		texpr := inScope.resolveType(t.Expr, types.Any)
@@ -188,10 +182,14 @@ func (b *Builder) expandStarAndResolveType(
 // example, the query `SELECT (x + 1) AS "x_incr" FROM t` has a projection with
 // a synthesized column "x_incr".
 //
-// scope  The scope is passed in so it can can be updated with the newly bound
-//        variable.
+// scope  The scope is passed in so it can be updated with the newly bound
+//
+//	variable.
+//
 // name   This is the name for the new column (e.g., if specified with
-//        the AS keyword).
+//
+//	the AS keyword).
+//
 // typ    The type of the column.
 // expr   The expression this column refers to (if any).
 // scalar The scalar expression associated with this column (if any).
@@ -214,6 +212,7 @@ func (b *Builder) synthesizeColumn(
 // populateSynthesizedColumn is similar to synthesizeColumn, but it fills in
 // the given existing column rather than allocating a new one.
 func (b *Builder) populateSynthesizedColumn(col *scopeColumn, scalar opt.ScalarExpr) {
+	col.typ = scalar.DataType()
 	colID := b.factory.Metadata().AddColumn(col.name.MetadataName(), col.typ)
 	col.id = colID
 	col.scalar = scalar
@@ -222,15 +221,15 @@ func (b *Builder) populateSynthesizedColumn(col *scopeColumn, scalar opt.ScalarE
 // projectColumn projects src by copying its column ID to dst. projectColumn
 // also copies src.name to dst if an alias is not already set in dst. No other
 // fields are copied, for the following reasons:
-// - We don't copy group, as dst becomes a pass-through column in the new
-//   scope. dst already has group=0, so keep it as-is.
-// - We don't copy hidden, because projecting a column makes it visible.
-//   dst already has hidden=false, so keep it as-is.
-// - We don't copy table, since the table becomes anonymous in the new scope.
-// - We don't copy descending, since we don't want to overwrite dst.descending
-//   if dst is an ORDER BY column.
-// - expr, exprStr and typ in dst already correspond to the expression and type
-//   of the src column.
+//   - We don't copy group, as dst becomes a pass-through column in the new
+//     scope. dst already has group=0, so keep it as-is.
+//   - We don't copy hidden, because projecting a column makes it visible.
+//     dst already has hidden=false, so keep it as-is.
+//   - We don't copy table, since the table becomes anonymous in the new scope.
+//   - We don't copy descending, since we don't want to overwrite dst.descending
+//     if dst is an ORDER BY column.
+//   - expr, exprStr and typ in dst already correspond to the expression and type
+//     of the src column.
 func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	if dst.name.IsAnonymous() {
 		dst.name = src.name
@@ -238,18 +237,33 @@ func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	dst.id = src.id
 }
 
-// shouldCreateDefaultColumn decides if we need to create a default
-// column and default label for a function expression.
-// Returns true if the function's return type is not an empty tuple and
-// doesn't declare any tuple labels.
+// shouldCreateDefaultColumn decides if we need to create a default column and
+// default label for a function expression. Returns true if the function's
+// return type is not an empty tuple and doesn't declare any tuple labels.
 func (b *Builder) shouldCreateDefaultColumn(texpr tree.TypedExpr) bool {
-	if texpr.ResolvedType() == types.EmptyTuple {
-		// This is only to support crdb_internal.unary_table().
-		return false
+	if funcExpr, ok := texpr.(*tree.FuncExpr); ok {
+		funcName := funcExpr.Func.FunctionReference.(*tree.ResolvedFunctionDefinition).Name
+		switch funcName {
+		case "unnest":
+			// Special case for unnest functions: we should create a default column in
+			// the case when there is one input argument, since this implies there
+			// will be one output column. This is necessary because the type of the
+			// single column output by unnest in this case may be a tuple with labels,
+			// which breaks the assumption made below.
+			return len(funcExpr.Exprs) == 1
+		case "crdb_internal.unary_table":
+			// Special case for crdb_internal.unary_table, which produces no columns.
+			return false
+		case "json_to_record", "jsonb_to_record", "json_to_recordset", "jsonb_to_recordset":
+			// Special case for functions that have a dynamic type which will be
+			// resolved later.
+			return false
+		}
 	}
 
-	// We need to create a default column with a default name when
-	// the function return type doesn't declare any return labels.
+	// We need to create a default column with a default name when the function
+	// return type doesn't declare any return labels. This logic assumes that any
+	// SRF that has a labeled tuple as a return type returns multiple columns.
 	return len(texpr.ResolvedType().TupleLabels()) == 0
 }
 
@@ -265,7 +279,9 @@ func (b *Builder) synthesizeResultColumns(scope *scope, cols colinfo.ResultColum
 // colIndex takes an expression that refers to a column using an integer,
 // verifies it refers to a valid target in the SELECT list, and returns the
 // corresponding column index. For example:
-//    SELECT a from T ORDER by 1
+//
+//	SELECT a from T ORDER by 1
+//
 // Here "1" refers to the first item in the SELECT list, "a". The returned
 // index is 0.
 func colIndex(numOriginalCols int, expr tree.Expr, context string) int {
@@ -452,12 +468,28 @@ func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) 
 	return name.SchemaName == catconstants.PgTempSchemaName || persistence.IsTemporary()
 }
 
+// resolveSchemaForCreateTable is the same as resolveSchemaForCreate but
+// specific for tables.
+func (b *Builder) resolveSchemaForCreateTable(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
+// resolveSchemaForCreateFunction is the same as resolveSchemaForCreate but
+// specific for functions.
+func (b *Builder) resolveSchemaForCreateFunction(
+	name *tree.RoutineName,
+) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
 // resolveSchemaForCreate returns the schema that will contain a newly created
 // catalog object with the given name. If the current user does not have the
 // CREATE privilege, then resolveSchemaForCreate raises an error.
-func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+func (b *Builder) resolveSchemaForCreate(
+	prefix *tree.ObjectNamePrefix, name tree.NodeFormatter,
+) (cat.Schema, cat.SchemaName) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.ObjectNamePrefix)
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, prefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.
@@ -473,31 +505,59 @@ func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.
 		panic(err)
 	}
 
-	if err := b.catalog.CheckPrivilege(b.ctx, sch, privilege.CREATE); err != nil {
+	if err := b.catalog.CheckPrivilege(b.ctx, sch, b.catalog.GetCurrentUser(), privilege.CREATE); err != nil {
 		panic(err)
 	}
 
 	return sch, resName
 }
 
-func (b *Builder) checkMultipleMutations(tab cat.Table, simpleInsert bool) {
-	if b.areAllTableMutationsSimpleInserts == nil {
-		b.areAllTableMutationsSimpleInserts = make(map[cat.StableID]bool)
-	}
-	allSimpleInserts, prevMutations := b.areAllTableMutationsSimpleInserts[tab.ID()]
-	if !prevMutations {
-		b.areAllTableMutationsSimpleInserts[tab.ID()] = simpleInsert
+func (b *Builder) checkMultipleMutations(tab cat.Table, typ mutationType) {
+	if multipleModificationsOfTableEnabled.Get(&b.evalCtx.Settings.SV) ||
+		b.evalCtx.SessionData().MultipleModificationsOfTable {
 		return
 	}
-	allSimpleInserts = allSimpleInserts && simpleInsert
-	b.areAllTableMutationsSimpleInserts[tab.ID()] = allSimpleInserts
-	if !allSimpleInserts && !multipleModificationsOfTableEnabled.Get(&b.evalCtx.Settings.SV) {
+	if !b.stmtTree.CanMutateTable(tab.ID(), typ, false /* isPostStmt */) {
 		panic(pgerror.Newf(
 			pgcode.FeatureNotSupported,
-			"multiple modification subqueries of the same table %q are not supported unless "+
-				"they all use INSERT without ON CONFLICT; this is to prevent data corruption, see "+
+			"multiple mutations of the same table %q are not supported unless they all "+
+				"use INSERT without ON CONFLICT; this is to prevent data corruption, see "+
 				"documentation of sql.multiple_modifications_of_table.enabled", tab.Name(),
 		))
+	}
+	if tab.InboundForeignKeyCount() > 0 {
+		var visited intsets.Fast
+		b.checkMultipleMutationsCascade(tab, typ, visited)
+	}
+}
+
+func (b *Builder) checkMultipleMutationsCascade(
+	tab cat.Table, typ mutationType, visited intsets.Fast,
+) {
+	// If this table references foreign keys that will also be mutated, then add
+	// them to the statement tree via a recursive call. We only need to check each
+	// table once even if there are multiple references to it.
+	for i := 0; i < tab.InboundForeignKeyCount(); i++ {
+		fk := tab.InboundForeignKey(i)
+		if (fk.DeleteReferenceAction() != tree.NoAction && fk.DeleteReferenceAction() != tree.Restrict && typ != simpleInsert) ||
+			(fk.UpdateReferenceAction() != tree.NoAction && fk.UpdateReferenceAction() != tree.Restrict) {
+			fkTab := resolveTable(b.ctx, b.catalog, fk.OriginTableID())
+			// If the origin table is still being added, it will be nil. It's safe to
+			// do the mutation in this case.
+			if fkTab == nil || visited.Contains(int(fkTab.ID())) {
+				continue
+			}
+			if !b.stmtTree.CanMutateTable(fkTab.ID(), typ, true /* isPostStmt */) {
+				panic(pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"multiple mutations of the same table %q are not supported unless they all "+
+						"use INSERT without ON CONFLICT; this is to prevent data corruption, see "+
+						"documentation of sql.multiple_modifications_of_table.enabled", fkTab.Name(),
+				))
+			}
+			visited.Add(int(fkTab.ID()))
+			b.checkMultipleMutationsCascade(fkTab, typ, visited)
+		}
 	}
 }
 
@@ -597,8 +657,9 @@ func (b *Builder) resolveDataSource(
 	tn *tree.TableName, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName, cat.DataSourceName) {
 	var flags cat.Flags
-	if b.insideViewDef {
-		// Avoid taking table leases when we're creating a view.
+	if b.insideViewDef || b.insideFuncDef || b.insideTriggerDef {
+		// Avoid taking descriptor leases when we're creating a view or a
+		// function.
 		flags.AvoidDescriptorCaches = true
 	}
 	ds, resName, err := b.catalog.ResolveDataSource(b.ctx, flags, tn)
@@ -624,8 +685,8 @@ func (b *Builder) resolveDataSourceRef(
 	ref *tree.TableRef, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName) {
 	var flags cat.Flags
-	if b.insideViewDef {
-		// Avoid taking table leases when we're creating a view.
+	if b.insideViewDef || b.insideFuncDef || b.insideTriggerDef {
+		// Avoid taking table leases when we're creating a view or a function.
 		flags.AvoidDescriptorCaches = true
 	}
 	ds, _, err := b.catalog.ResolveDataSourceByID(b.ctx, flags, cat.StableID(ref.TableID))
@@ -644,7 +705,7 @@ func (b *Builder) resolveDataSourceRef(
 // of the memo.
 func (b *Builder) checkPrivilege(name opt.MDDepName, ds cat.DataSource, priv privilege.Kind) {
 	if !(priv == privilege.SELECT && b.skipSelectPrivilegeChecks) {
-		err := b.catalog.CheckPrivilege(b.ctx, ds, priv)
+		err := b.catalog.CheckPrivilege(b.ctx, ds, b.checkPrivilegeUser, priv)
 		if err != nil {
 			panic(err)
 		}
@@ -669,7 +730,9 @@ func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals 
 		cnt := tab.ColumnCount()
 		for ord < cnt {
 			col := tab.Column(ord)
-			if col.ColID() == cat.StableID(c) && col.Visibility() != cat.Inaccessible {
+			// NOTE: Inverted columns cannot be referenced.
+			if col.Kind() != cat.Inverted && col.ColID() == cat.StableID(c) &&
+				col.Visibility() != cat.Inaccessible {
 				break
 			}
 			ord++
@@ -706,9 +769,6 @@ type columnKinds struct {
 
 	// If true, include inverted index columns.
 	includeInverted bool
-
-	// If true, include virtual computed columns.
-	includeVirtualComputed bool
 }
 
 // tableOrdinals returns a slice of ordinals that correspond to table columns of
@@ -725,9 +785,29 @@ func tableOrdinals(tab cat.Table, k columnKinds) []int {
 	ordinals := make([]int, 0, n)
 	for i := 0; i < n; i++ {
 		col := tab.Column(i)
-		if shouldInclude[col.Kind()] && (k.includeVirtualComputed || !col.IsVirtualComputed()) {
+		if shouldInclude[col.Kind()] {
 			ordinals = append(ordinals, i)
 		}
 	}
 	return ordinals
+}
+
+// addBarrier adds an optimization barrier to the given scope, in order to
+// prevent side effects from being duplicated, eliminated, or reordered.
+func (b *Builder) addBarrier(s *scope) {
+	s.expr = b.factory.ConstructBarrier(s.expr)
+}
+
+// projectColWithMetadataName projects a new anonymous column with the given
+// metadata name in the given scope. The other columns in the scope are passed
+// through. It returns the column ID of the new column.
+func (b *Builder) projectColWithMetadataName(
+	s *scope, name string, typ *types.T, scalar opt.ScalarExpr,
+) opt.ColumnID {
+	passThroughCols := s.colSet()
+	colName := scopeColName("").WithMetadataName(name)
+	col := b.synthesizeColumn(s, colName, typ, nil /* expr */, scalar /* scalar */)
+	proj := memo.ProjectionsExpr{b.factory.ConstructProjectionsItem(scalar, col.id)}
+	s.expr = b.factory.ConstructProject(s.expr, proj, passThroughCols)
+	return col.id
 }

@@ -1,23 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/clienturl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
-	"github.com/cockroachdb/cockroach/pkg/cli/clisqlshell"
-	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -53,23 +48,14 @@ func runTerm(cmd *cobra.Command, args []string) (resErr error) {
 		fmt.Print(welcomeMessage)
 	}
 
-	conn, err := makeSQLClient(catconstants.InternalSQLAppName, useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, catconstants.InternalSQLAppName, useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
-	sqlCtx.ShellCtx.ParseURL = makeURLParser(cmd)
-	return sqlCtx.Run(conn)
-}
-
-func makeURLParser(cmd *cobra.Command) clisqlshell.URLParser {
-	return func(url string) (*pgurl.URL, error) {
-		// Parse it as if --url was specified.
-		up := urlParser{cmd: cmd, cliCtx: &cliCtx}
-		if err := up.setInternal(url, false /* warn */); err != nil {
-			return nil, err
-		}
-		return cliCtx.sqlConnURL, nil
-	}
+	sqlCtx.ShellCtx.CertsDir = baseCfg.SSLCertsDir
+	sqlCtx.ShellCtx.ParseURL = clienturl.MakeURLParserFn(cmd, cliCtx.clientOpts)
+	return sqlCtx.Run(ctx, conn)
 }

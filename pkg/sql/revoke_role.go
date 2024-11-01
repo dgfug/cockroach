@@ -1,23 +1,21 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -25,15 +23,9 @@ import (
 // RevokeRoleNode removes entries from the system.role_members table.
 // This is called from REVOKE <ROLE>
 type RevokeRoleNode struct {
-	roles       []security.SQLUsername
-	members     []security.SQLUsername
+	roles       []username.SQLUsername
+	members     []username.SQLUsername
 	adminOption bool
-
-	run revokeRoleRun
-}
-
-type revokeRoleRun struct {
-	rowsAffected int
 }
 
 // RevokeRole represents a GRANT ROLE statement.
@@ -47,39 +39,48 @@ func (p *planner) RevokeRoleNode(ctx context.Context, n *tree.RevokeRole) (*Revo
 	ctx, span := tracing.ChildSpan(ctx, n.StatementTag())
 	defer span.Finish()
 
-	hasAdminRole, err := p.HasAdminRole(ctx)
+	hasCreateRolePriv, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEROLE)
 	if err != nil {
 		return nil, err
 	}
+
 	// check permissions on each role.
 	allRoles, err := p.MemberOfWithAdminOption(ctx, p.User())
 	if err != nil {
 		return nil, err
 	}
+	revokingRoleHasAdminOptionOnAdmin := allRoles[username.AdminRoleName()]
 
-	inputRoles, err := n.Roles.ToSQLUsernames()
+	inputRoles, err := decodeusername.FromNameList(n.Roles)
 	if err != nil {
 		return nil, err
 	}
-	inputMembers, err := n.Members.ToSQLUsernames(p.SessionData(), security.UsernameValidation)
+	inputMembers, err := decodeusername.FromRoleSpecList(
+		p.SessionData(), username.PurposeValidation, n.Members,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, r := range inputRoles {
-		// If the user is an admin, don't check if the user is allowed to add/drop
-		// roles in the role. However, if the role being modified is the admin role, then
-		// make sure the user is an admin with the admin option.
-		if hasAdminRole && !r.IsAdminRole() {
+		// If the current user has CREATEROLE, and the role being revoked is not an
+		// admin there is no need to check if the user is allowed to grant/revoke
+		// membership in the role. However, if the role being revoked is an admin,
+		// then make sure the current user also has the admin option for that role.
+		revokedRoleIsAdmin, err := p.UserHasAdminRole(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		if hasCreateRolePriv && !revokedRoleIsAdmin {
 			continue
 		}
-		if isAdmin, ok := allRoles[r]; !ok || !isAdmin {
-			if r.IsAdminRole() {
+		if hasAdminOption := allRoles[r]; !hasAdminOption && !revokingRoleHasAdminOptionOnAdmin {
+			if revokedRoleIsAdmin {
 				return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-					"%s is not a role admin for role %s", p.User(), r)
+					"%s must have admin option on role %q", p.User(), r)
 			}
 			return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-				"%s is not a superuser or role admin for role %s", p.User(), r)
+				"%s must have CREATEROLE or have admin option on role %q", p.User(), r)
 		}
 	}
 
@@ -93,13 +94,13 @@ func (p *planner) RevokeRoleNode(ctx context.Context, n *tree.RevokeRole) (*Revo
 
 	for _, r := range inputRoles {
 		if _, ok := roles[r]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", r)
+			return nil, sqlerrors.NewUndefinedUserError(r)
 		}
 	}
 
 	for _, m := range inputMembers {
 		if _, ok := roles[m]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", m)
+			return nil, sqlerrors.NewUndefinedUserError(m)
 		}
 	}
 
@@ -129,13 +130,13 @@ func (n *RevokeRoleNode) startExec(params runParams) error {
 				// We use CodeObjectInUseError which is what happens if you tried to delete the current user in pg.
 				return pgerror.Newf(pgcode.ObjectInUse,
 					"role/user %s cannot be removed from role %s or lose the ADMIN OPTION",
-					security.RootUser, security.AdminRole)
+					username.RootUser, username.AdminRole)
 			}
-			affected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+			affected, err := params.p.InternalSQLTxn().ExecEx(
 				params.ctx,
 				opName,
 				params.p.txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.NodeUserSessionDataOverride,
 				memberStmt,
 				r.Normalized(), m.Normalized(),
 			)
@@ -153,8 +154,6 @@ func (n *RevokeRoleNode) startExec(params runParams) error {
 			return err
 		}
 	}
-
-	n.run.rowsAffected += rowsAffected
 
 	return nil
 }

@@ -1,31 +1,33 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package colexeccmp exposes some comparison definitions for vectorized
+// operations.
 package colexeccmp
 
-import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+)
 
 // ComparisonExprAdapter is a utility interface that is implemented by several
 // structs that behave as an adapter from tree.ComparisonExpr to a vectorized
 // friendly model.
 type ComparisonExprAdapter interface {
-	Eval(left, right tree.Datum) (tree.Datum, error)
+	Eval(ctx context.Context, left, right tree.Datum) (tree.Datum, error)
 }
 
 // NewComparisonExprAdapter returns a new ComparisonExprAdapter for the provided
 // expression.
 func NewComparisonExprAdapter(
-	expr *tree.ComparisonExpr, evalCtx *tree.EvalContext,
+	expr *tree.ComparisonExpr, evalCtx *eval.Context,
 ) ComparisonExprAdapter {
 	base := cmpExprAdapterBase{
-		fn:      expr.Fn.Fn,
+		op:      expr.Op.EvalOp,
 		evalCtx: evalCtx,
 	}
 	op := expr.Operator
@@ -35,7 +37,7 @@ func NewComparisonExprAdapter(
 			expr:               expr,
 		}
 	}
-	nullable := expr.Fn.NullableArgs
+	nullable := expr.Op.CalledOnNullInput
 	_, _, _, flipped, negate := tree.FoldComparisonExpr(op, nil /* left */, nil /* right */)
 	if nullable {
 		if flipped {

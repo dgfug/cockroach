@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package idalloc_test
 
@@ -40,7 +35,7 @@ func newTestAllocator(t testing.TB) (*localtestcluster.LocalTestCluster, *idallo
 		DisableLivenessHeartbeat: true,
 		DontCreateSystemRanges:   true,
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), kvcoord.InitFactoryForLocalTestCluster)
+	s.Start(t, kvcoord.InitFactoryForLocalTestCluster)
 	idAlloc, err := idalloc.NewAllocator(idalloc.Options{
 		AmbientCtx:  s.Cfg.AmbientCtx,
 		Key:         keys.RangeIDGenerator,

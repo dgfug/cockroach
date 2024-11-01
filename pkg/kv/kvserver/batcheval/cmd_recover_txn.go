@@ -1,37 +1,42 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.RecoverTxn, declareKeysRecoverTransaction, RecoverTxn)
+	RegisterReadWriteCommand(kvpb.RecoverTxn, declareKeysRecoverTransaction, RecoverTxn)
 }
 
 func declareKeysRecoverTransaction(
-	rs ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
-) {
-	rr := req.(*roachpb.RecoverTxnRequest)
+	rs ImmutableRangeState,
+	_ *kvpb.Header,
+	req kvpb.Request,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
+	_ time.Duration,
+) error {
+	rr := req.(*kvpb.RecoverTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(rr.Txn.Key, rr.Txn.ID)})
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(rs.GetRangeID(), rr.Txn.ID)})
+	return nil
 }
 
 // RecoverTxn attempts to recover the specified transaction from an
@@ -45,11 +50,11 @@ func declareKeysRecoverTransaction(
 // result of the recovery should be committing the abandoned transaction or
 // aborting it.
 func RecoverTxn(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.RecoverTxnRequest)
+	args := cArgs.Args.(*kvpb.RecoverTxnRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.RecoverTxnResponse)
+	reply := resp.(*kvpb.RecoverTxnResponse)
 
 	if h.Txn != nil {
 		return result.Result{}, ErrTransactionUnsupported
@@ -69,7 +74,8 @@ func RecoverTxn(
 
 	// Fetch transaction record; if missing, attempt to synthesize one.
 	if ok, err := storage.MVCCGetProto(
-		ctx, readWriter, key, hlc.Timestamp{}, &reply.RecoveredTxn, storage.MVCCGetOptions{},
+		ctx, readWriter, key, hlc.Timestamp{}, &reply.RecoveredTxn,
+		storage.MVCCGetOptions{ReadCategory: fs.BatchEvalReadCategory},
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -211,7 +217,8 @@ func RecoverTxn(
 		reply.RecoveredTxn.Status = roachpb.ABORTED
 	}
 	txnRecord := reply.RecoveredTxn.AsRecord()
-	if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+	if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord,
+		storage.MVCCWriteOptions{Stats: cArgs.Stats, Category: fs.BatchEvalReadCategory}); err != nil {
 		return result.Result{}, err
 	}
 

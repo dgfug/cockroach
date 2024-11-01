@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package hba
 
@@ -15,47 +10,27 @@ import (
 	"net"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/rulebasedscanner"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
-// scannedInput represents the result of tokenizing the input
-// configuration data.
-//
-// Inspired from pg's source, file src/backend/libpq/hba.c,
-// function tokenize_file.
-//
-// The scanner tokenizes the input and stores the resulting data into
-// three lists: a list of lines, a list of line numbers, and a list of
-// raw line contents.
-type scannedInput struct {
-	// The list of lines is a triple-nested list structure.  Each line is a list of
-	// fields, and each field is a List of tokens.
-	lines   []hbaLine
-	linenos []int
-}
-
-type hbaLine struct {
-	input  string
-	tokens [][]String
-}
-
 // Parse parses the provided HBA configuration.
 func Parse(input string) (*Conf, error) {
-	tokens, err := tokenize(input)
+	tokens, err := rulebasedscanner.Tokenize(input)
 	if err != nil {
 		return nil, err
 	}
 
 	var entries []Entry
-	for i, line := range tokens.lines {
+	for i, line := range tokens.Lines {
 		entry, err := parseHbaLine(line)
 		if err != nil {
 			return nil, errors.Wrapf(
 				pgerror.WithCandidateCode(err, pgcode.ConfigFile),
-				"line %d", tokens.linenos[i])
+				"line %d", tokens.Linenos[i])
 		}
 		entries = append(entries, entry)
 	}
@@ -66,11 +41,11 @@ func Parse(input string) (*Conf, error) {
 // parseHbaLine parses one line of HBA configuration.
 //
 // Inspired from pg's src/backend/libpq/hba.c, parse_hba_line().
-func parseHbaLine(inputLine hbaLine) (entry Entry, err error) {
+func parseHbaLine(inputLine rulebasedscanner.Line) (entry Entry, err error) {
 	fieldIdx := 0
 
-	entry.Input = inputLine.input
-	line := inputLine.tokens
+	entry.Input = inputLine.Input
+	line := inputLine.Tokens
 	// Read the connection type.
 	if len(line[fieldIdx]) > 1 {
 		return entry, errors.WithHint(
@@ -133,7 +108,7 @@ func parseHbaLine(inputLine hbaLine) (entry Entry, err error) {
 					hostname = ""
 				}
 				if hostname != "" {
-					entry.Address = String{Value: addr, Quoted: token.Quoted}
+					entry.Address = rulebasedscanner.String{Value: addr, Quoted: token.Quoted}
 				} else {
 					// First field was an IP address.
 					fieldIdx++
@@ -177,10 +152,22 @@ func parseHbaLine(inputLine hbaLine) (entry Entry, err error) {
 
 	// Parse remaining arguments.
 	for fieldIdx++; fieldIdx < len(line); fieldIdx++ {
-		for _, tok := range line[fieldIdx] {
+		for tokenIdx := 0; tokenIdx < len(line[fieldIdx]); tokenIdx++ {
+			tok := line[fieldIdx][tokenIdx]
 			kv := strings.SplitN(tok.Value, "=", 2)
+			// 1. Handle the case where the option does not have equal operator.
+			// 2. Handle the case where token ends with equals operator and next token
+			// having the value for option is absent.
+			optionsError := errors.Newf("authentication option not in name=value format: %s", tok.Value)
 			if len(kv) != 2 {
-				return entry, errors.Newf("authentication option not in name=value format: %s", tok.Value)
+				return entry, optionsError
+			}
+			if len(kv[1]) == 0 {
+				if (tokenIdx + 1) == len(line[fieldIdx]) {
+					return entry, optionsError
+				}
+				kv[1], tok.Quoted = rulebasedscanner.Join(line[fieldIdx][tokenIdx+1:], ", "), true
+				tokenIdx = len(line[fieldIdx])
 			}
 			entry.Options = append(entry.Options, [2]string{kv[0], kv[1]})
 			entry.OptionQuotes = append(entry.OptionQuotes, tok.Quoted)
@@ -231,6 +218,8 @@ func ParseConnType(s string) (ConnType, error) {
 		return ConnHostSSL, nil
 	case "hostnossl":
 		return ConnHostNoSSL, nil
+	case "loopback":
+		return ConnInternalLoopback, nil
 	}
 	return 0, errors.Newf("unknown connection type: %q", s)
 }

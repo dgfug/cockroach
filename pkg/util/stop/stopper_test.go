@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stop_test
 
@@ -19,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -182,7 +177,7 @@ func TestStopperQuiesce(t *testing.T) {
 			// Wait until Quiesce() is called.
 			<-qc
 			err := thisStopper.RunTask(ctx, "inner", func(context.Context) {})
-			if !errors.HasType(err, (*roachpb.NodeUnavailableError)(nil)) {
+			if !errors.HasType(err, (*kvpb.NodeUnavailableError)(nil)) {
 				t.Error(err)
 			}
 			// Make the stoppers call Stop().
@@ -270,12 +265,13 @@ func TestStopperCloserConcurrent(t *testing.T) {
 func TestStopperNumTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	defer s.Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stop(ctx)
 	var tasks []chan bool
 	for i := 0; i < 3; i++ {
 		c := make(chan bool)
 		tasks = append(tasks, c)
-		if err := s.RunAsyncTask(context.Background(), "test", func(_ context.Context) {
+		if err := s.RunAsyncTask(ctx, "test", func(_ context.Context) {
 			// Wait for channel to close
 			<-c
 		}); err != nil {
@@ -295,46 +291,6 @@ func TestStopperNumTasks(t *testing.T) {
 			}
 			return nil
 		})
-	}
-}
-
-// TestStopperRunTaskPanic ensures that a panic handler can recover panicking
-// tasks, and that no tasks are leaked when they panic.
-func TestStopperRunTaskPanic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ch := make(chan interface{})
-	s := stop.NewStopper(stop.OnPanic(func(v interface{}) {
-		ch <- v
-	}))
-	defer s.Stop(context.Background())
-	// If RunTask were not panic-safe, Stop() would deadlock.
-	type testFn func()
-	explode := func(context.Context) { panic(ch) }
-	ctx := context.Background()
-	for i, test := range []testFn{
-		func() {
-			_ = s.RunTask(ctx, "test", explode)
-		},
-		func() {
-			_ = s.RunAsyncTask(ctx, "test", func(ctx context.Context) { explode(ctx) })
-		},
-		func() {
-			_ = s.RunAsyncTaskEx(
-				context.Background(),
-				stop.TaskOpts{
-					TaskName:   "test",
-					Sem:        quotapool.NewIntPool("test", 1),
-					WaitForSem: true,
-				},
-				func(ctx context.Context) { explode(ctx) },
-			)
-		},
-	} {
-		go test()
-		recovered := <-ch
-		if recovered != ch {
-			t.Errorf("%d: unexpected recovered value: %+v", i, recovered)
-		}
 	}
 }
 
@@ -687,12 +643,7 @@ func (cf closerFunc) Close() { cf() }
 // the ChildSpan option.
 func TestStopperRunAsyncTaskTracing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTestingKnobs(
-		tracing.TracerTestingKnobs{
-			// We want the tracer to generate real spans so that we can test that the
-			// RootSpan option produces a root span.
-			ForceRealSpans: true,
-		}))
+	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTracingMode(tracing.TracingModeActiveSpansRegistry))
 	s := stop.NewStopper(stop.WithTracer(tr))
 
 	ctx, getRecAndFinish := tracing.ContextWithRecordingSpan(context.Background(), tr, "parent")
@@ -728,13 +679,14 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 		},
 			func(ctx context.Context) {
 				log.Event(ctx, "async 3")
-				sp := tracing.SpanFromContext(ctx)
-				if sp == nil {
+				sp1 := tracing.SpanFromContext(ctx)
+				if sp1 == nil {
 					errC <- errors.Errorf("missing span")
 					return
 				}
-				sp = tr.StartSpan("child", tracing.WithParentAndAutoCollection(sp))
-				if sp.TraceID() == traceID {
+				sp2 := tr.StartSpan("child", tracing.WithParent(sp1))
+				defer sp2.Finish()
+				if sp2.TraceID() == traceID {
 					errC <- errors.Errorf("expected different trace")
 				}
 				close(errC)

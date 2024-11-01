@@ -1,20 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/errors"
 )
 
 // Relate returns the DE-9IM relation between A and B.
@@ -47,10 +43,10 @@ func RelatePattern(a geo.Geometry, b geo.Geometry, pattern string) (bool, error)
 // See: https://en.wikipedia.org/wiki/DE-9IM.
 func MatchesDE9IM(relation string, pattern string) (bool, error) {
 	if len(relation) != 9 {
-		return false, errors.Newf("relation %q should be of length 9", relation)
+		return false, pgerror.Newf(pgcode.InvalidParameterValue, "relation %q should be of length 9", relation)
 	}
 	if len(pattern) != 9 {
-		return false, errors.Newf("pattern %q should be of length 9", pattern)
+		return false, pgerror.Newf(pgcode.InvalidParameterValue, "pattern %q should be of length 9", pattern)
 	}
 	for i := 0; i < len(relation); i++ {
 		matches, err := relationByteMatchesPatternByte(relation[i], pattern[i])
@@ -67,12 +63,12 @@ func MatchesDE9IM(relation string, pattern string) (bool, error) {
 // relationByteMatchesPatternByte matches a single byte of a DE-9IM relation
 // against the DE-9IM pattern.
 // Pattern matches are as follows:
-// * '*': allow anything.
-// * '0' / '1' / '2': match exactly.
-// * 't'/'T': allow only if the relation is true. This means the relation must be
-//   '0' (point), '1' (line) or '2' (area) - which is the dimensionality of the
-//   intersection.
-// * 'f'/'F': allow only if relation is also false, which is of the form 'f'/'F'.
+//   - '*': allow anything.
+//   - '0' / '1' / '2': match exactly.
+//   - 't'/'T': allow only if the relation is true. This means the relation must be
+//     '0' (point), '1' (line) or '2' (area) - which is the dimensionality of the
+//     intersection.
+//   - 'f'/'F': allow only if relation is also false, which is of the form 'f'/'F'.
 func relationByteMatchesPatternByte(r byte, p byte) (bool, error) {
 	switch util.ToLowerSingleByte(p) {
 	case '*':
@@ -88,7 +84,7 @@ func relationByteMatchesPatternByte(r byte, p byte) (bool, error) {
 	case '0', '1', '2':
 		return r == p, nil
 	default:
-		return false, errors.Newf("unrecognized pattern character: %s", string(p))
+		return false, pgerror.Newf(pgcode.InvalidParameterValue, "unrecognized pattern character: %s", string(p))
 	}
 	return true, nil
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package pgdate contains parsing functions and types for dates and times
 // in a manner that is compatible with PostgreSQL.
@@ -141,6 +136,17 @@ func MakeDateFromPGEpoch(days int32) (Date, error) {
 	return Date{days: days}, nil
 }
 
+// MakeDateFromPGEpochClampFinite creates a Date from the number of days since
+// 2000-01-01, clamping to LowDate or HighDate if outside those bounds.
+func MakeDateFromPGEpochClampFinite(days int32) Date {
+	if days < lowDays {
+		return LowDate
+	} else if days > highDays {
+		return HighDate
+	}
+	return Date{days: days}
+}
+
 // ToTime returns d as a time.Time. Non finite dates return an error.
 func (d Date) ToTime() (time.Time, error) {
 	if d.days == math.MinInt32 || d.days == math.MaxInt32 {
@@ -165,6 +171,8 @@ func (d Date) Format(buf *bytes.Buffer) {
 		year, month, day := t.Date()
 		bc := year <= 0
 		if bc {
+			// For the ISO 8601 standard, the conversion from a negative year to BC changes the year value (ex. -2013 == 2014 BC).
+			// https://en.wikipedia.org/wiki/ISO_8601#Years
 			year = -year + 1
 		}
 		fmt.Fprintf(buf, "%04d-%02d-%02d", year, month, day)

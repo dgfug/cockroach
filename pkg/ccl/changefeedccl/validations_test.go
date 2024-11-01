@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -30,22 +27,22 @@ func TestCatchupScanOrdering(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	defer utilccl.TestingEnableEnterprise()()
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		t.Run("bank", func(t *testing.T) {
 			ctx := context.Background()
 			const numRows, numRanges, payloadBytes, maxTransfer = 10, 10, 10, 999
 			gen := bank.FromConfig(numRows, numRows, payloadBytes, numRanges)
 			var l workloadsql.InsertsDataLoader
-			if _, err := workloadsql.Setup(ctx, db, gen, l); err != nil {
+			if _, err := workloadsql.Setup(ctx, s.DB, gen, l); err != nil {
 				t.Fatal(err)
 			}
 
 			var nowString string
-			require.NoError(t, db.QueryRow("SELECT cluster_logical_timestamp()").Scan(&nowString))
+			require.NoError(t, s.DB.QueryRow("SELECT cluster_logical_timestamp()").Scan(&nowString))
 
 			existingChangeCount := 50
 			for i := 0; i < existingChangeCount; i++ {
-				if err := randomBankTransfer(numRows, maxTransfer, db); err != nil {
+				if err := randomBankTransfer(numRows, maxTransfer, s.DB); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -61,7 +58,7 @@ func TestCatchupScanOrdering(t *testing.T) {
 						return nil
 					}
 
-					if err := randomBankTransfer(numRows, maxTransfer, db); err != nil {
+					if err := randomBankTransfer(numRows, maxTransfer, s.DB); err != nil {
 						return err
 					}
 				}
@@ -98,12 +95,13 @@ func TestCatchupScanOrdering(t *testing.T) {
 			}
 		})
 	}
-	// Tenant tests skipped because of:
-	// validations_test.go:40: executing ALTER TABLE bank SPLIT AT
-	// VALUES (5): pq: unimplemented: operation is unsupported in
-	// multi-tenancy mode
-	t.Run(`sinkless`, sinklessTest(testFn, feedTestNoTenants))
-	t.Run(`enterprise`, enterpriseTest(testFn, feedTestNoTenants))
+	// Tenant tests disabled because ALTER TABLE .. SPLIT is not
+	// supported with cluster virtualization:
+	//
+	// nemeses_test.go:39: pq: unimplemented: operation is unsupported inside virtual clusters
+	//
+	// TODO(knz): This seems incorrect, see issue #109417.
+	cdcTest(t, testFn, feedTestNoTenants)
 }
 
 // TODO(dan): This bit is copied from the bank workload. It's

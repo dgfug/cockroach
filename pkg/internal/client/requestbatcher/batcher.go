@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package requestbatcher is a library to enable easy batching of roachpb
 // requests.
@@ -30,11 +25,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/redact"
 )
 
 // The motivating use case for this package are opportunities to perform cleanup
@@ -92,9 +88,11 @@ import (
 
 // Config contains the dependencies and configuration for a Batcher.
 type Config struct {
+	// AmbientCtx for the batcher, used for logging, tracing etc.
+	AmbientCtx log.AmbientContext
 
 	// Name of the batcher, used for logging, timeout errors, and the stopper.
-	Name string
+	Name redact.RedactableString
 
 	// Sender can round-trip a batch. Sender must not be nil.
 	Sender kv.Sender
@@ -117,6 +115,11 @@ type Config struct {
 	// request. If MaxKeysPerBatchReq <= 0 then no limit is enforced.
 	MaxKeysPerBatchReq int
 
+	// TargetBytesPerBatchReq is the desired TargetBytes assigned to the Header
+	// of each batch request. If TargetBytesPerBatchReq <= 0, then no TargetBytes
+	// is enforced.
+	TargetBytesPerBatchReq int64
+
 	// MaxWait is the maximum amount of time a message should wait in a batch
 	// before being sent. If MaxWait is <= 0 then no wait timeout is enforced.
 	// It is inadvisable to disable both MaxIdle and MaxWait.
@@ -128,6 +131,41 @@ type Config struct {
 	// enforced. It is inadvisable to disable both MaxIdle and MaxWait.
 	MaxIdle time.Duration
 
+	// MaxTimeout limits the amount of time that a BatchRequest can run for
+	// before timing out. When the work for a batch is paginated into multiple
+	// BatchRequests, due to MaxKeysPerBatchReq or TargetBytesPerBatchReq, this
+	// applies to each individual request. It is used to prevent batches from
+	// stalling indefinitely, for instance due to an unavailable range. If
+	// MaxTimeout is <= 0, then the BatchRequest timeout is derived from the
+	// requests' deadlines if they exist.
+	//
+	// Commentary on choice of per BatchRequest timeout:
+	//
+	// For ranged intent resolution we cannot predict the number of intents that
+	// will need to be resolved for each range. For point intent resolution we
+	// can predict the number of intents, because it is equal to
+	// MaxMsgsPerBatch, which constrains the size of a batch. But even for point
+	// intent resolution, the byte size of the work done during intent
+	// resolution cannot be predicted. This general lack of predictability of
+	// work size is fixed by pagination, where the callee returns when
+	// sufficient work is done. So it makes sense to set the timeout on each
+	// request. This is a change in behavior from
+	// https://github.com/cockroachdb/cockroach/commit/71f8575f2dc0d020c850b3a0fa1047c492b5f508
+	// which applied the timeout to processing of a whole batch of ranged intent
+	// resolution, which meant transactions with massive numbers of intents
+	// could exceed the deadline of intent resolution, leaving behind intents to
+	// be discovered by later transactions/backups/... (see
+	// https://github.com/cockroachdb/cockroach/issues/97108#issuecomment-1674127105)
+	// which is undesirable. Note that applying the timeout to paginated
+	// BatchRequests meets the goal of preventing partial unavailability in a
+	// cluster (say of a range) from consuming all available concurrency in the
+	// RequestBatcher -- a BatchRequest on that range will timeout, which will
+	// timeout and fail the entire batch.
+	//
+	// TODO(sumeer): once intent resolution is subject to admission control, we
+	// could have timeouts even though a range is available. Is that desirable?
+	MaxTimeout time.Duration
+
 	// InFlightBackpressureLimit is the number of batches in flight above which
 	// sending clients should experience backpressure. If the batcher has more
 	// requests than this in flight it will not accept new requests until the
@@ -136,10 +174,15 @@ type Config struct {
 	// batches which are queued to send but not yet in flight will still send.
 	// Note that values	less than or equal to zero will result in the use of
 	// DefaultInFlightBackpressureLimit.
-	InFlightBackpressureLimit int
+	InFlightBackpressureLimit func() int
 
-	// NowFunc is used to determine the current time. It defaults to timeutil.Now.
-	NowFunc func() time.Time
+	manualTime *timeutil.ManualTime // optional for testing
+	// This channel can be populated in tests with an unbuffered channel in
+	// which case the batcher will attempt to send itself over it, allowing
+	// tests to pause the batcher's goroutine and inspect state. Once the
+	// test is done it _must_ return the batcher on the channel to unblock
+	// the batcher's main loop again.
+	testingPeekCh chan *RequestBatcher
 }
 
 const (
@@ -169,9 +212,9 @@ type RequestBatcher struct {
 	pool pool
 	cfg  Config
 
-	// sendBatchOpName is the string passed to contextutil.RunWithTimeout when
+	// sendBatchOpName is the string passed to timeoututil.RunWithTimeout when
 	// sending a batch.
-	sendBatchOpName string
+	sendBatchOpName redact.RedactableString
 
 	batches batchQueue
 
@@ -182,7 +225,7 @@ type RequestBatcher struct {
 // Response is exported for use with the channel-oriented SendWithChan method.
 // At least one of Resp or Err will be populated for every sent Response.
 type Response struct {
-	Resp roachpb.Response
+	Resp kvpb.Response
 	Err  error
 }
 
@@ -196,8 +239,9 @@ func New(cfg Config) *RequestBatcher {
 		requestChan:  make(chan *request),
 		sendDoneChan: make(chan struct{}),
 	}
-	b.sendBatchOpName = b.cfg.Name + ".sendBatch"
-	if err := cfg.Stopper.RunAsyncTask(context.Background(), b.cfg.Name, b.run); err != nil {
+	b.sendBatchOpName = redact.Sprintf("%s.sendBatch", b.cfg.Name)
+	bgCtx := cfg.AmbientCtx.AnnotateCtx(context.Background())
+	if err := cfg.Stopper.RunAsyncTask(bgCtx, b.cfg.Name.StripMarkers(), b.run); err != nil {
 		panic(err)
 	}
 	return b
@@ -209,12 +253,38 @@ func validateConfig(cfg *Config) {
 	} else if cfg.Sender == nil {
 		panic("cannot construct a Batcher with a nil Sender")
 	}
-	if cfg.InFlightBackpressureLimit <= 0 {
-		cfg.InFlightBackpressureLimit = DefaultInFlightBackpressureLimit
+	if cfg.InFlightBackpressureLimit == nil {
+		cfg.InFlightBackpressureLimit = func() int {
+			return DefaultInFlightBackpressureLimit
+		}
 	}
-	if cfg.NowFunc == nil {
-		cfg.NowFunc = timeutil.Now
+}
+
+func normalizedInFlightBackPressureLimit(cfg *Config) int {
+	limit := cfg.InFlightBackpressureLimit()
+	if limit <= 0 {
+		limit = DefaultInFlightBackpressureLimit
 	}
+	return limit
+}
+
+func (b *RequestBatcher) now() time.Time {
+	if b.cfg.manualTime != nil {
+		return b.cfg.manualTime.Now()
+	}
+	return timeutil.Now()
+}
+
+func (b *RequestBatcher) newTimer() timeutil.TimerI {
+	if b.cfg.manualTime != nil {
+		return b.cfg.manualTime.NewTimer()
+	}
+	return (&timeutil.Timer{}).AsTimerI()
+}
+
+func (b *RequestBatcher) until(t time.Time) time.Duration {
+	return t.Sub(b.now())
+
 }
 
 // SendWithChan sends a request with a client provided response channel. The
@@ -223,10 +293,14 @@ func validateConfig(cfg *Config) {
 // insufficiently buffered channel can lead to deadlocks and unintended delays
 // processing requests inside the RequestBatcher.
 func (b *RequestBatcher) SendWithChan(
-	ctx context.Context, respChan chan<- Response, rangeID roachpb.RangeID, req roachpb.Request,
+	ctx context.Context,
+	respChan chan<- Response,
+	rangeID roachpb.RangeID,
+	req kvpb.Request,
+	admissionHeader kvpb.AdmissionHeader,
 ) error {
 	select {
-	case b.requestChan <- b.pool.newRequest(ctx, rangeID, req, respChan):
+	case b.requestChan <- b.pool.newRequest(ctx, rangeID, req, respChan, admissionHeader):
 		return nil
 	case <-b.cfg.Stopper.ShouldQuiesce():
 		return stop.ErrUnavailable
@@ -239,10 +313,10 @@ func (b *RequestBatcher) SendWithChan(
 // is canceled before the sending of the request completes. The context with
 // the latest deadline for a batch is used to send the underlying batch request.
 func (b *RequestBatcher) Send(
-	ctx context.Context, rangeID roachpb.RangeID, req roachpb.Request,
-) (roachpb.Response, error) {
+	ctx context.Context, rangeID roachpb.RangeID, req kvpb.Request,
+) (kvpb.Response, error) {
 	responseChan := b.pool.getResponseChan()
-	if err := b.SendWithChan(ctx, responseChan, rangeID, req); err != nil {
+	if err := b.SendWithChan(ctx, responseChan, rangeID, req, kvpb.AdmissionHeader{}); err != nil {
 		return nil, err
 	}
 	select {
@@ -269,30 +343,41 @@ func (b *RequestBatcher) sendDone(ba *batch) {
 func (b *RequestBatcher) sendBatch(ctx context.Context, ba *batch) {
 	if err := b.cfg.Stopper.RunAsyncTask(ctx, "send-batch", func(ctx context.Context) {
 		defer b.sendDone(ba)
-		var br *roachpb.BatchResponse
+		var batchRequest *kvpb.BatchRequest
+		var br *kvpb.BatchResponse
 		send := func(ctx context.Context) error {
-			var pErr *roachpb.Error
-			if br, pErr = b.cfg.Sender.Send(ctx, ba.batchRequest(&b.cfg)); pErr != nil {
+			batchRequest = ba.batchRequest(&b.cfg)
+			var pErr *kvpb.Error
+			if br, pErr = b.cfg.Sender.Send(ctx, batchRequest); pErr != nil {
 				return pErr.GoError()
 			}
 			return nil
 		}
-		if !ba.sendDeadline.IsZero() {
+		if b.cfg.MaxTimeout > 0 || !ba.latestRequestDeadline.IsZero() {
 			actualSend := send
-			send = func(context.Context) error {
-				return contextutil.RunWithTimeout(
-					ctx, b.sendBatchOpName, timeutil.Until(ba.sendDeadline), actualSend)
+			send = func(ctx context.Context) error {
+				var timeout time.Duration
+				if b.cfg.MaxTimeout > 0 {
+					timeout = b.cfg.MaxTimeout
+				}
+				if !ba.latestRequestDeadline.IsZero() {
+					reqTimeout := b.until(ba.latestRequestDeadline)
+					if timeout == 0 || reqTimeout < timeout {
+						timeout = reqTimeout
+					}
+				}
+				return timeutil.RunWithTimeout(ctx, b.sendBatchOpName, timeout, actualSend)
 			}
 		}
 		// Send requests in a loop to support pagination, which may be necessary
-		// if MaxKeysPerBatchReq is set. If so, partial responses with resume
-		// spans may be returned for requests, indicating that the limit was hit
-		// before they could complete and that they should be resumed over the
-		// specified key span. Requests in the batch are neither guaranteed to
-		// be ordered nor guaranteed to be non-overlapping, so we can make no
-		// assumptions about the requests that will result in full responses
-		// (with no resume spans) vs. partial responses vs. empty responses (see
-		// the comment on roachpb.Header.MaxSpanRequestKeys).
+		// if MaxKeysPerBatchReq or TargetBytesPerBatchReq is set. If so, partial
+		// responses with resume spans may be returned for requests, indicating
+		// that the limit was hit before they could complete and that they should
+		// be resumed over the specified key span. Requests in the batch are
+		// neither guaranteed to be ordered nor guaranteed to be non-overlapping,
+		// so we can make no assumptions about the requests that will result in
+		// full responses (with no resume spans) vs. partial responses vs. empty
+		// responses (see the comment on kvpb.Header.MaxSpanRequestKeys).
 		//
 		// To accommodate this, we keep track of all partial responses from
 		// previous iterations. After receiving a batch of responses during an
@@ -301,7 +386,7 @@ func (b *RequestBatcher) sendBatch(ctx context.Context, ba *batch) {
 		// resume spans are removed. Responses that have resume spans are
 		// updated appropriately and sent again in the next iteration. The loop
 		// proceeds until all requests have been run to completion.
-		var prevResps []roachpb.Response
+		var prevResps []kvpb.Response
 		for len(ba.reqs) > 0 {
 			err := send(ctx)
 			nextReqs, nextPrevResps := ba.reqs[:0], prevResps[:0]
@@ -311,7 +396,7 @@ func (b *RequestBatcher) sendBatch(ctx context.Context, ba *batch) {
 					resp := br.Responses[i].GetInner()
 					if prevResps != nil {
 						prevResp := prevResps[i]
-						if cErr := roachpb.CombineResponses(prevResp, resp); cErr != nil {
+						if cErr := kvpb.CombineResponses(ctx, prevResp, resp, batchRequest); cErr != nil {
 							log.Fatalf(ctx, "%v", cErr)
 						}
 						resp = prevResp
@@ -358,11 +443,11 @@ func addRequestToBatch(cfg *Config, now time.Time, ba *batch, r *request) (shoul
 	// If this is the first request or
 	if len(ba.reqs) == 0 ||
 		// there are already requests and there is a deadline and
-		(len(ba.reqs) > 0 && !ba.sendDeadline.IsZero() &&
+		(len(ba.reqs) > 0 && !ba.latestRequestDeadline.IsZero() &&
 			// this request either doesn't have a deadline or has a later deadline,
-			(!rHasDeadline || rDeadline.After(ba.sendDeadline))) {
+			(!rHasDeadline || rDeadline.After(ba.latestRequestDeadline))) {
 		// set the deadline to this request's deadline.
-		ba.sendDeadline = rDeadline
+		ba.latestRequestDeadline = rDeadline
 	}
 
 	ba.reqs = append(ba.reqs, r)
@@ -403,9 +488,12 @@ func (b *RequestBatcher) run(ctx context.Context) {
 		// inBackPressure indicates whether the reqChan is enabled.
 		// It becomes true when inFlight exceeds b.cfg.InFlightBackpressureLimit.
 		inBackPressure = false
+		// curInFlightBackpressureLimit is the current limit on in flight
+		// requests.
+		curInFlightBackpressureLimit = normalizedInFlightBackPressureLimit(&b.cfg)
 		// recoveryThreshold is the number of in flight requests below which the
-		// the inBackPressure state should exit.
-		recoveryThreshold = backpressureRecoveryThreshold(b.cfg.InFlightBackpressureLimit)
+		// inBackPressure state should exit.
+		recoveryThreshold = backpressureRecoveryThreshold(curInFlightBackpressureLimit)
 		// reqChan consults inBackPressure to determine whether the goroutine is
 		// accepting new requests.
 		reqChan = func() <-chan *request {
@@ -416,7 +504,11 @@ func (b *RequestBatcher) run(ctx context.Context) {
 		}
 		sendBatch = func(ba *batch) {
 			inFlight++
-			if inFlight >= b.cfg.InFlightBackpressureLimit {
+			// Sample the backpressure limit.
+			curInFlightBackpressureLimit = normalizedInFlightBackPressureLimit(&b.cfg)
+			recoveryThreshold = backpressureRecoveryThreshold(curInFlightBackpressureLimit)
+
+			if inFlight >= curInFlightBackpressureLimit {
 				inBackPressure = true
 			}
 			b.sendBatch(sendCtx, ba)
@@ -428,7 +520,7 @@ func (b *RequestBatcher) run(ctx context.Context) {
 			}
 		}
 		handleRequest = func(req *request) {
-			now := b.cfg.NowFunc()
+			now := b.now()
 			ba, existsInQueue := b.batches.get(req.rangeID)
 			if !existsInQueue {
 				ba = b.pool.newBatch(now)
@@ -442,35 +534,39 @@ func (b *RequestBatcher) run(ctx context.Context) {
 				b.batches.upsert(ba)
 			}
 		}
-		deadline      time.Time
-		timer         = timeutil.NewTimer()
-		maybeSetTimer = func() {
-			var nextDeadline time.Time
-			if next := b.batches.peekFront(); next != nil {
-				nextDeadline = next.deadline
-			}
-			if !deadline.Equal(nextDeadline) || timer.Read {
-				deadline = nextDeadline
-				if !deadline.IsZero() {
-					timer.Reset(timeutil.Until(deadline))
-				} else {
-					// Clear the current timer due to a sole batch already sent before
-					// the timer fired.
-					timer.Stop()
-					timer = timeutil.NewTimer()
-				}
+		deadline time.Time
+		timer    = b.newTimer()
+	)
+	defer timer.Stop()
+
+	maybeSetTimer := func(read bool) {
+		var nextDeadline time.Time
+		if next := b.batches.peekFront(); next != nil {
+			nextDeadline = next.deadline
+		}
+		if !deadline.Equal(nextDeadline) || read {
+			deadline = nextDeadline
+			if !deadline.IsZero() {
+				timer.Reset(b.until(deadline))
+			} else {
+				// Clear the current timer due to a sole batch already sent before
+				// the timer fired.
+				timer.Stop()
 			}
 		}
-	)
+	}
+
 	for {
 		select {
+		case b.cfg.testingPeekCh <- b:
+			<-b.cfg.testingPeekCh
 		case req := <-reqChan():
 			handleRequest(req)
-			maybeSetTimer()
-		case <-timer.C:
-			timer.Read = true
+			maybeSetTimer(false)
+		case <-timer.Ch():
+			timer.MarkRead()
 			sendBatch(b.batches.popFront())
-			maybeSetTimer()
+			maybeSetTimer(true)
 		case <-b.sendDoneChan:
 			handleSendDone()
 		case <-b.cfg.Stopper.ShouldQuiesce():
@@ -485,18 +581,20 @@ func (b *RequestBatcher) run(ctx context.Context) {
 
 type request struct {
 	ctx          context.Context
-	req          roachpb.Request
+	req          kvpb.Request
 	rangeID      roachpb.RangeID
 	responseChan chan<- Response
+	header       kvpb.AdmissionHeader
 }
 
 type batch struct {
 	reqs []*request
 	size int // bytes
 
-	// sendDeadline is the latest deadline reported by a request's context.
-	// It will be zero valued if any request does not contain a deadline.
-	sendDeadline time.Time
+	// latestRequestDeadline is the latest deadline reported by a request's
+	// context. It will be zero valued if any request does not contain a
+	// deadline.
+	latestRequestDeadline time.Time
 
 	// idx is the batch's index in the batchQueue.
 	idx int
@@ -517,17 +615,27 @@ func (b *batch) rangeID() roachpb.RangeID {
 	return b.reqs[0].rangeID
 }
 
-func (b *batch) batchRequest(cfg *Config) roachpb.BatchRequest {
-	req := roachpb.BatchRequest{
+func (b *batch) batchRequest(cfg *Config) *kvpb.BatchRequest {
+	req := &kvpb.BatchRequest{
 		// Preallocate the Requests slice.
-		Requests: make([]roachpb.RequestUnion, 0, len(b.reqs)),
+		Requests: make([]kvpb.RequestUnion, 0, len(b.reqs)),
 	}
-	for _, r := range b.reqs {
+	var admissionHeader kvpb.AdmissionHeader
+	for i, r := range b.reqs {
 		req.Add(r.req)
+		if i == 0 {
+			admissionHeader = r.header
+		} else {
+			admissionHeader = kv.MergeAdmissionHeaderForBatch(admissionHeader, r.header)
+		}
 	}
 	if cfg.MaxKeysPerBatchReq > 0 {
 		req.MaxSpanRequestKeys = int64(cfg.MaxKeysPerBatchReq)
 	}
+	if cfg.TargetBytesPerBatchReq > 0 {
+		req.TargetBytes = cfg.TargetBytesPerBatchReq
+	}
+	req.AdmissionHeader = admissionHeader
 	return req
 }
 
@@ -562,7 +670,11 @@ func (p *pool) putResponseChan(r chan Response) {
 }
 
 func (p *pool) newRequest(
-	ctx context.Context, rangeID roachpb.RangeID, req roachpb.Request, responseChan chan<- Response,
+	ctx context.Context,
+	rangeID roachpb.RangeID,
+	req kvpb.Request,
+	responseChan chan<- Response,
+	admissionHeader kvpb.AdmissionHeader,
 ) *request {
 	r := p.requestPool.Get().(*request)
 	*r = request{
@@ -570,6 +682,7 @@ func (p *pool) newRequest(
 		rangeID:      rangeID,
 		req:          req,
 		responseChan: responseChan,
+		header:       admissionHeader,
 	}
 	return r
 }
@@ -636,7 +749,6 @@ func (q *batchQueue) get(id roachpb.RangeID) (*batch, bool) {
 }
 
 func (q *batchQueue) remove(ba *batch) {
-	delete(q.byRange, ba.rangeID())
 	heap.Remove(q, ba.idx)
 }
 
@@ -675,6 +787,7 @@ func (q *batchQueue) Push(v interface{}) {
 
 func (q *batchQueue) Pop() interface{} {
 	ba := q.batches[len(q.batches)-1]
+	q.batches[len(q.batches)-1] = nil // for GC
 	q.batches = q.batches[:len(q.batches)-1]
 	delete(q.byRange, ba.rangeID())
 	ba.idx = -1

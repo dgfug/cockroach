@@ -1,21 +1,9 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
-
-var activeRecordBlocklists = blocklistsForVersion{
-	{"v20.2", "activeRecordBlockList20_2", activeRecordBlockList20_2, "activeRecordIgnoreList20_2", activeRecordIgnoreList20_2},
-	{"v21.1", "activeRecordBlockList21_1", activeRecordBlockList21_1, "activeRecordIgnoreList21_1", activeRecordIgnoreList21_1},
-	{"v21.2", "activeRecordBlockList21_2", activeRecordBlockList21_2, "activeRecordIgnoreList21_2", activeRecordIgnoreList21_2},
-	{"v22.1", "activeRecordBlockList22_1", activeRecordBlockList22_1, "activeRecordIgnoreList22_1", activeRecordIgnoreList22_1},
-}
 
 // These are lists of known activerecord test errors and failures.
 // When the activerecord test suite is run, the results are compared to this list.
@@ -28,33 +16,31 @@ var activeRecordBlocklists = blocklistsForVersion{
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blocklist should be available
 // in the test log.
-var activeRecordBlockList22_1 = blocklist{}
 
-var activeRecordBlockList21_2 = blocklist{}
-
-var activeRecordBlockList21_1 = blocklist{}
-
-var activeRecordBlockList20_2 = blocklist{}
-
-var activeRecordIgnoreList22_1 = activeRecordIgnoreList21_2
-
-var activeRecordIgnoreList21_2 = blocklist{
-	"ActiveRecord::CockroachDB::UnloggedTablesTest#test_gracefully_handles_temporary_tables": "modified to pass on 20.2",
-	"FixturesTest#test_create_fixtures":                "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_books_fixtures":   "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_parrots_fixtures": "flaky - FK constraint violated sometimes when loading all fixture data",
+var activeRecordBlocklist = blocklist{
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_string_to_date`:                                               "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_array`:                                              "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol`:                                             "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol_using_datetime`:                              "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol_using_datetime_with_timestamptz_as_default`:  "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol_using_timestamp_with_timestamptz_as_default`: "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol_with_timestamptz`:                            "unknown",
+	`ActiveRecord::CockroachDB::Migration::PGChangeSchemaTest#test_change_type_with_symbol_with_timestamptz_as_default`:                 "unknown",
+	`CompatibilityTest4_2#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest4_2#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest5_0#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest5_0#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest5_1#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest5_1#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest5_2#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest5_2#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest6_0#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest6_0#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest6_1#test_datetime_doesnt_set_precision_on_change_column`:                                                          "unknown",
+	`CompatibilityTest6_1#test_options_are_not_validated`:                                                                               "unknown",
+	`CompatibilityTest7_0#test_datetime_sets_precision_6_on_change_column`:                                                              "unknown",
+	`CompatibilityTest7_0#test_options_are_not_validated`:                                                                               "unknown",
+	`PostGISTest#test_point_to_json`:                                                                                                    "unknown",
 }
 
-var activeRecordIgnoreList21_1 = blocklist{
-	"ActiveRecord::CockroachDB::UnloggedTablesTest#test_gracefully_handles_temporary_tables": "modified to pass on 20.2",
-	"FixturesTest#test_create_fixtures":                "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_books_fixtures":   "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_parrots_fixtures": "flaky - FK constraint violated sometimes when loading all fixture data",
-}
-
-var activeRecordIgnoreList20_2 = blocklist{
-	"ActiveRecord::CockroachDB::UnloggedTablesTest#test_gracefully_handles_temporary_tables": "modified to pass on 20.2",
-	"FixturesTest#test_create_fixtures":                "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_books_fixtures":   "flaky - FK constraint violated sometimes when loading all fixture data",
-	"IgnoreFixturesTest#test_ignores_parrots_fixtures": "flaky - FK constraint violated sometimes when loading all fixture data",
-}
+var activeRecordIgnoreList = blocklist{}

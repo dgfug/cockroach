@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package zonepb
 
@@ -78,11 +73,11 @@ var _ yaml.Unmarshaler = &ConstraintsList{}
 //
 // We use two different formats here, dependent on whether per-replica
 // constraints are being used in ConstraintsList:
-// 1. A legacy format when there are 0 or 1 Constraints and NumReplicas is
-//    zero:
-//    [c1, c2, c3]
-// 2. A per-replica format when NumReplicas is non-zero:
-//    {"c1,c2,c3": numReplicas1, "c4,c5": numReplicas2}
+//  1. A legacy format when there are 0 or 1 Constraints and NumReplicas is
+//     zero:
+//     [c1, c2, c3]
+//  2. A per-replica format when NumReplicas is non-zero:
+//     {"c1,c2,c3": numReplicas1, "c4,c5": numReplicas2}
 func (c ConstraintsList) MarshalYAML() (interface{}, error) {
 	// If per-replica Constraints aren't in use, marshal everything into a list
 	// for compatibility with pre-2.0-style configs.

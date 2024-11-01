@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rsg
 
@@ -61,13 +56,15 @@ func (r *RSG) Generate(root string, depth int) string {
 	for i := 0; i < 100000; i++ {
 		s := strings.Join(r.generate(root, depth), " ")
 		if r.seen != nil {
-			r.lock.Lock()
-			if !r.seen[s] {
-				r.seen[s] = true
-			} else {
-				s = ""
-			}
-			r.lock.Unlock()
+			func() {
+				r.lock.Lock()
+				defer r.lock.Unlock()
+				if !r.seen[s] {
+					r.seen[s] = true
+				} else {
+					s = ""
+				}
+			}()
 		}
 		if s != "" {
 			s = strings.Replace(s, "_LA", "", -1)
@@ -177,9 +174,12 @@ func (r *RSG) GenerateRandomArg(typ *types.T) string {
 		return fmt.Sprintf("(SELECT NULL)::%s", typ)
 	}
 
-	r.lock.Lock()
-	datum := randgen.RandDatumWithNullChance(r.Rnd, typ, 0)
-	r.lock.Unlock()
+	datum := func() tree.Datum {
+		r.lock.Lock()
+		defer r.lock.Unlock()
+		return randgen.RandDatumWithNullChance(r.Rnd, typ, 0, /* nullChance */
+			false /* favorCommonData */, false /* targetColumnIsUnique */)
+	}()
 
 	return tree.Serialize(datum)
 }
@@ -192,20 +192,20 @@ type lockedSource struct {
 
 func (r *lockedSource) Int63() (n int64) {
 	r.lk.Lock()
+	defer r.lk.Unlock()
 	n = r.src.Int63()
-	r.lk.Unlock()
 	return
 }
 
 func (r *lockedSource) Uint64() (n uint64) {
 	r.lk.Lock()
+	defer r.lk.Unlock()
 	n = r.src.Uint64()
-	r.lk.Unlock()
 	return
 }
 
 func (r *lockedSource) Seed(seed int64) {
 	r.lk.Lock()
+	defer r.lk.Unlock()
 	r.src.Seed(seed)
-	r.lk.Unlock()
 }

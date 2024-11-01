@@ -1,22 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -48,8 +45,8 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// Node. We use the TestingEvalFilter to make sure that the second Node
 	// waits for the first.
 	testKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			et, ok := filterArgs.Req.(*roachpb.EndTxnRequest)
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			et, ok := filterArgs.Req.(*kvpb.EndTxnRequest)
 			if !ok || filterArgs.Sid != 2 {
 				return nil
 			}
@@ -89,7 +86,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	require.NoError(t, tc.WaitForVoters(k, tc.Target(1), tc.Target(2)))
 
 	ts := tc.Servers[1]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -98,7 +95,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 		repl1 := store.LookupReplica(roachpb.RKey(k))
 		require.NotNil(t, repl1)
 
-		eng := store.Engine()
+		eng := store.TODOEngine()
 
 		// Put some bogus sideloaded data on the replica which we're about to
 		// remove. Then, at the end of the test, check that that sideloaded
@@ -111,10 +108,10 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 		if dir == "" {
 			t.Fatal("no sideloaded directory")
 		}
-		if err := eng.MkdirAll(dir); err != nil {
+		if err := eng.Env().MkdirAll(dir, os.ModePerm); err != nil {
 			t.Fatal(err)
 		}
-		if err := fs.WriteFile(eng, filepath.Join(dir, "i1000000.t100000"), []byte("foo")); err != nil {
+		if err := fs.WriteFile(eng.Env(), filepath.Join(dir, "i1000000.t100000"), []byte("foo"), fs.UnspecifiedWriteCategory); err != nil {
 			t.Fatal(err)
 		}
 
@@ -125,10 +122,11 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 					repl1.RaftLock()
 					dir := repl1.SideloadedRaftMuLocked().Dir()
 					repl1.RaftUnlock()
-					_, err := eng.Stat(dir)
+					_, err := eng.Env().Stat(dir)
 					if oserror.IsNotExist(err) {
 						return nil
 					}
+					// nolint:errwrap
 					return errors.Errorf("replica still has sideloaded files despite GC: %v", err)
 				})
 			}
@@ -140,6 +138,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// Make sure the range is removed from the store.
 	testutils.SucceedsSoon(t, func() error {
 		if _, err := store.GetReplica(desc.RangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
+			// nolint:errwrap
 			return errors.Errorf("expected range removal: %v", err)
 		}
 		return nil
@@ -167,7 +166,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 
 	ts := tc.Servers[1]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -195,6 +194,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		store.MustForceReplicaGCScanAndProcess()
 		if _, err := store.GetReplica(desc.RangeID); !testutils.IsError(err, "r[0-9]+ was not found") {
+			// nolint:errwrap
 			return errors.Errorf("expected range removal: %v", err) // NB: errors.Wrapf(nil, ...) returns nil.
 		}
 		return nil

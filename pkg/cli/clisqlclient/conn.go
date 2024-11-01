@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
@@ -15,6 +10,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,15 +19,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
 	"github.com/cockroachdb/cockroach/pkg/security/pprompt"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq"
-	"github.com/lib/pq/auth/kerberos"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v4"
+	"github.com/otan/gopgkrb5"
 )
 
 func init() {
 	// Ensure that the CLI client commands can use GSSAPI authentication.
-	pq.RegisterGSSProvider(func() (pq.GSS, error) { return kerberos.NewGSS() })
+	pgconn.RegisterGSSProvider(func() (pgconn.GSS, error) { return gopgkrb5.NewGSS() })
 }
 
 type sqlConn struct {
@@ -41,13 +40,18 @@ type sqlConn struct {
 	connCtx *Context
 
 	url          string
-	conn         DriverConn
+	conn         *pgx.Conn
 	reconnecting bool
 
 	// passwordMissing is true iff the url is missing a password.
 	passwordMissing bool
 
-	pendingNotices []*pq.Error
+	// alwaysInferResultTypes is true iff the client should always use the
+	// underlying driver to infer result types. If it is true, multiple statements
+	// in a single string cannot be executed.
+	alwaysInferResultTypes bool
+
+	pendingNotices []*pgconn.Notice
 
 	// delayNotices, if set, makes notices accumulate for printing
 	// when the SQL execution completes. The default (false)
@@ -72,6 +76,16 @@ type sqlConn struct {
 	clusterID           string
 	clusterOrganization string
 
+	// virtualClusterName is the last known virtual cluster name from the
+	// server, used to report any changes upon (re)connects. Empty if no
+	// application VCs have been defined.
+	virtualClusterName string
+
+	// isSystemTenantUnderSecondaryTenants is true if the current
+	// connection is to the system tenant and there are secondary
+	// tenants defined.
+	isSystemTenantUnderSecondaryTenants bool
+
 	// infow and errw are the streams where informational, error and
 	// warning messages are printed.
 	// Echoed queries, if Echo is enabled, are printed to errw too.
@@ -81,6 +95,10 @@ type sqlConn struct {
 
 var _ Conn = (*sqlConn)(nil)
 
+// ErrConnectionClosed is returned when an operation fails because the
+// connection was closed.
+var ErrConnectionClosed = errors.New("connection closed unexpectedly")
+
 // wrapConnError detects TCP EOF errors during the initial SQL handshake.
 // These are translated to a message "perhaps this is not a CockroachDB node"
 // at the top level.
@@ -89,7 +107,10 @@ var _ Conn = (*sqlConn)(nil)
 // server.
 func wrapConnError(err error) error {
 	errMsg := err.Error()
-	if errMsg == "EOF" || errMsg == "unexpected EOF" {
+	// pgconn wraps some of these errors with the private connectError struct.
+	isPgconnConnectError := strings.HasPrefix(errMsg, "failed to connect to")
+	isEOF := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	if errMsg == "EOF" || errMsg == "unexpected EOF" || (isPgconnConnectError && isEOF) {
 		return &InitialSQLConnectionError{err}
 	}
 	return err
@@ -97,13 +118,13 @@ func wrapConnError(err error) error {
 
 func (c *sqlConn) flushNotices() {
 	for _, notice := range c.pendingNotices {
-		clierror.OutputError(c.errw, notice, true /*showSeverity*/, false /*verbose*/)
+		clierror.OutputError(c.errw, (*pgconn.PgError)(notice), true /*showSeverity*/, false /*verbose*/)
 	}
 	c.pendingNotices = nil
 	c.delayNotices = false
 }
 
-func (c *sqlConn) handleNotice(notice *pq.Error) {
+func (c *sqlConn) handleNotice(notice *pgconn.Notice) {
 	c.pendingNotices = append(c.pendingNotices, notice)
 	if !c.delayNotices {
 		c.flushNotices()
@@ -122,7 +143,11 @@ func (c *sqlConn) SetURL(url string) {
 
 // GetDriverConn implements the Conn interface.
 func (c *sqlConn) GetDriverConn() DriverConn {
-	return c.conn
+	return &driverConnAdapter{c}
+}
+
+func (c *sqlConn) Cancel(ctx context.Context) error {
+	return c.conn.PgConn().CancelRequest(ctx)
 }
 
 // SetCurrentDatabase implements the Conn interface.
@@ -135,61 +160,78 @@ func (c *sqlConn) SetMissingPassword(missing bool) {
 	c.passwordMissing = missing
 }
 
-// EnsureConn (re-)establishes the connection to the server.
-func (c *sqlConn) EnsureConn() error {
-	if c.conn == nil {
-		if c.reconnecting && c.connCtx.IsInteractive() {
-			fmt.Fprintf(c.errw, "warning: connection lost!\n"+
-				"opening new connection: all session settings will be lost\n")
-		}
-		base, err := pq.NewConnector(c.url)
-		if err != nil {
-			return wrapConnError(err)
-		}
-		// Add a notice handler - re-use the cliOutputError function in this case.
-		connector := pq.ConnectorWithNoticeHandler(base, func(notice *pq.Error) {
-			c.handleNotice(notice)
-		})
-		// TODO(cli): we can't thread ctx through ensureConn usages, as it needs
-		// to follow the gosql.DB interface. We should probably look at initializing
-		// connections only once instead. The context is only used for dialing.
-		conn, err := connector.Connect(context.TODO())
-		if err != nil {
-			// Connection failed: if the failure is due to a missing
-			// password, we're going to fill the password here.
-			//
-			// TODO(knz): CockroachDB servers do not properly fill SQLSTATE
-			// (28P01) for password auth errors, so we have to "make do"
-			// with a string match. This should be cleaned up by adding
-			// the missing code server-side.
-			errStr := strings.TrimPrefix(err.Error(), "pq: ")
-			if strings.HasPrefix(errStr, "password authentication failed") && c.passwordMissing {
-				if pErr := c.fillPassword(); pErr != nil {
-					return errors.CombineErrors(err, pErr)
-				}
-				// Recurse, once. We recurse to ensure that pq.NewConnector
-				// and ConnectorWithNoticeHandler get called with the new URL.
-				// The recursion only occurs once because fillPassword()
-				// resets c.passwordMissing, so we cannot get into this
-				// conditional a second time.
-				return c.EnsureConn()
-			}
-			// Not a password auth error, or password already set. Simply fail.
-			return wrapConnError(err)
-		}
-		if c.reconnecting && c.dbName != "" {
-			// Attempt to reset the current database.
-			if _, err := conn.(DriverConn).Exec(`SET DATABASE = $1`, []driver.Value{c.dbName}); err != nil {
-				fmt.Fprintf(c.errw, "warning: unable to restore current database: %v\n", err)
-			}
-		}
-		c.conn = conn.(DriverConn)
-		if err := c.checkServerMetadata(); err != nil {
-			err = errors.CombineErrors(err, c.Close())
-			return wrapConnError(err)
-		}
-		c.reconnecting = false
+// SetAlwaysInferResultTypes implements the Conn interface.
+func (c *sqlConn) SetAlwaysInferResultTypes(b bool) func() {
+	oldVal := c.alwaysInferResultTypes
+	c.alwaysInferResultTypes = b
+	return func() {
+		c.alwaysInferResultTypes = oldVal
 	}
+}
+
+// EnsureConn (re-)establishes the connection to the server.
+func (c *sqlConn) EnsureConn(ctx context.Context) error {
+	if c.conn != nil {
+		return nil
+	}
+
+	if c.reconnecting && c.connCtx.IsInteractive() {
+		fmt.Fprintf(c.errw, "warning: connection lost!\n"+
+			"opening new connection: all session settings will be lost\n")
+	}
+	base, err := pgx.ParseConfig(c.url)
+	if err != nil {
+		return wrapConnError(err)
+	}
+	// Add a notice handler - re-use the cliOutputError function in this case.
+	base.OnNotice = func(_ *pgconn.PgConn, notice *pgconn.Notice) {
+		c.handleNotice(notice)
+	}
+	// The default pgx dialer uses a KeepAlive of 5 minutes, which we don't want.
+	dialer := &net.Dialer{}
+	dialer.Timeout = 0
+	if base.ConnectTimeout > 0 {
+		dialer.Timeout = base.ConnectTimeout
+	}
+	base.DialFunc = dialer.DialContext
+	// Override LookupFunc to be a no-op, so that the Dialer is responsible for
+	// resolving hostnames. This fixes an issue where pgx would error out too
+	// quickly if using TLS when an ipv6 address is resolved, but the networking
+	// stack does not support ipv6.
+	base.LookupFunc = func(ctx context.Context, host string) (addrs []string, err error) {
+		return []string{host}, nil
+	}
+	conn, err := pgx.ConnectConfig(ctx, base)
+	if err != nil {
+		// Connection failed: if the failure is due to a missing
+		// password, we're going to fill the password here.
+		pgErr := (*pgconn.PgError)(nil)
+		if errors.As(err, &pgErr) && pgErr.Code == pgcode.InvalidPassword.String() && c.passwordMissing {
+			if pErr := c.fillPassword(); pErr != nil {
+				return errors.CombineErrors(err, pErr)
+			}
+			// Recurse, once. We recurse to ensure that pq.NewConnector
+			// and ConnectorWithNoticeHandler get called with the new URL.
+			// The recursion only occurs once because fillPassword()
+			// resets c.passwordMissing, so we cannot get into this
+			// conditional a second time.
+			return c.EnsureConn(ctx)
+		}
+		// Not a password auth error, or password already set. Simply fail.
+		return wrapConnError(err)
+	}
+	if c.reconnecting && c.dbName != "" {
+		// Attempt to reset the current database.
+		if _, err := conn.Exec(ctx, `SET DATABASE = $1`, c.dbName); err != nil {
+			fmt.Fprintf(c.errw, "warning: unable to restore current database: %v\n", err)
+		}
+	}
+	c.conn = conn
+	if err := c.checkServerMetadata(ctx); err != nil {
+		err = errors.CombineErrors(err, c.Close())
+		return wrapConnError(err)
+	}
+	c.reconnecting = false
 	return nil
 }
 
@@ -204,11 +246,11 @@ const (
 // tryEnableServerExecutionTimings attempts to check if the server supports the
 // SHOW LAST QUERY STATISTICS statements. This allows the CLI client to report
 // server side execution timings instead of timing on the client.
-func (c *sqlConn) tryEnableServerExecutionTimings() error {
+func (c *sqlConn) tryEnableServerExecutionTimings(ctx context.Context) error {
 	// Starting in v21.2 servers, clients can request an explicit set of
 	// values which makes them compatible with any post-21.2 column
 	// additions.
-	_, err := c.QueryRow("SHOW LAST QUERY STATISTICS RETURNING x", nil)
+	_, err := c.QueryRow(ctx, "SHOW LAST QUERY STATISTICS RETURNING x")
 	if err != nil && !clierror.IsSQLSyntaxError(err) {
 		return err
 	}
@@ -220,7 +262,7 @@ func (c *sqlConn) tryEnableServerExecutionTimings() error {
 	// Pre-21.2 servers may have SHOW LAST QUERY STATISTICS.
 	// Note: this branch is obsolete, remove it when compatibility
 	// with pre-21.2 servers is not required any more.
-	_, err = c.QueryRow("SHOW LAST QUERY STATISTICS", nil)
+	_, err = c.QueryRow(ctx, "SHOW LAST QUERY STATISTICS")
 	if err != nil && !clierror.IsSQLSyntaxError(err) {
 		return err
 	}
@@ -236,16 +278,48 @@ func (c *sqlConn) tryEnableServerExecutionTimings() error {
 	return nil
 }
 
-func (c *sqlConn) GetServerMetadata() (nodeID int32, version, clusterID string, err error) {
-	// Retrieve the node ID and server build info.
-	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
-	if errors.Is(err, driver.ErrBadConn) {
-		return 0, "", "", err
+func (c *sqlConn) GetServerMetadata(
+	ctx context.Context,
+) (nodeID int32, version, clusterID string, retErr error) {
+	c.isSystemTenantUnderSecondaryTenants = false
+	val, err := c.QueryRow(ctx, `
+	SELECT EXISTS (SELECT 1 FROM system.information_schema.tables WHERE table_name='tenants')`)
+	if c.conn.IsClosed() {
+		return 0, "", "", MarkWithConnectionClosed(err)
 	}
 	if err != nil {
 		return 0, "", "", err
 	}
-	defer func() { _ = rows.Close() }()
+	foundSecondaryTenants := false
+	// We use toString() instead of casting val[0] to string because we
+	// get either a go string or bool depending on the SQL driver in
+	// use.
+	if toString(val[0])[0] == 't' {
+		// There's always at least 1 row in the tenants table, for the
+		// system tenant.
+		val, err = c.QueryRow(ctx, `
+	SELECT (SELECT count(id) FROM system.public.tenants LIMIT 2)>1`)
+		if c.conn.IsClosed() {
+			return 0, "", "", MarkWithConnectionClosed(err)
+		}
+		if err != nil {
+			return 0, "", "", err
+		}
+		c.isSystemTenantUnderSecondaryTenants = toString(val[0])[0] == 't'
+		foundSecondaryTenants = c.isSystemTenantUnderSecondaryTenants
+	}
+
+	// Retrieve the node ID and server build info.
+	// Be careful to query against the empty database string, which avoids taking
+	// a lease against the current database (in case it's currently unavailable).
+	rows, err := c.Query(ctx, `SELECT * FROM "".crdb_internal.node_build_info`)
+	if c.conn.IsClosed() {
+		return 0, "", "", MarkWithConnectionClosed(err)
+	}
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer func() { retErr = errors.CombineErrors(retErr, rows.Close()) }()
 
 	// Read the node_build_info table as an array of strings.
 	rowVals, err := getServerMetadataRows(rows)
@@ -270,6 +344,17 @@ func (c *sqlConn) GetServerMetadata() (nodeID int32, version, clusterID string, 
 				return 0, "", "", errors.Wrap(err, "incorrect data while retrieving node id")
 			}
 			nodeID = int32(id)
+		case "VirtualClusterName":
+			vcName := row[2]
+			if vcName == catconstants.SystemTenantName {
+				if !foundSecondaryTenants {
+					// Skip setting the virtual cluster name if the current
+					// connection is to the system VC and there are no
+					// application VCs defined.
+					continue
+				}
+			}
+			c.virtualClusterName = vcName
 
 			// Fields for v1.0 compatibility.
 		case "Distribution":
@@ -292,6 +377,7 @@ func (c *sqlConn) GetServerMetadata() (nodeID int32, version, clusterID string, 
 		c.serverBuild = fmt.Sprintf("CockroachDB %s %s (%s, built %s, %s)",
 			v10fields[0], version, v10fields[2], v10fields[3], v10fields[4])
 	}
+
 	return nodeID, version, clusterID, nil
 }
 
@@ -332,7 +418,7 @@ func toString(v driver.Value) string {
 // upon the initial connection or if either has changed since
 // the last connection, based on the last known values in the sqlConn
 // struct.
-func (c *sqlConn) checkServerMetadata() error {
+func (c *sqlConn) checkServerMetadata(ctx context.Context) error {
 	if !c.connCtx.IsInteractive() {
 		// Version reporting is just noise if the user is not present to
 		// change their mind upon seeing the information.
@@ -344,13 +430,25 @@ func (c *sqlConn) checkServerMetadata() error {
 		return nil
 	}
 
-	_, newServerVersion, newClusterID, err := c.GetServerMetadata()
-	if errors.Is(err, driver.ErrBadConn) {
-		return err
+	// The checks below use statements that don't support being
+	// prepared. So disable result type inference for the duration
+	// of these checks.
+	defer func(prev bool) { c.alwaysInferResultTypes = prev }(c.alwaysInferResultTypes)
+	c.alwaysInferResultTypes = false
+
+	_, newServerVersion, newClusterID, err := c.GetServerMetadata(ctx)
+	if c.conn.IsClosed() {
+		return MarkWithConnectionClosed(err)
 	}
 	if err != nil {
 		// It is not an error that the server version cannot be retrieved.
 		fmt.Fprintf(c.errw, "warning: unable to retrieve the server's version: %s\n", err)
+	}
+
+	if c.isSystemTenantUnderSecondaryTenants {
+		fmt.Fprintln(c.infow, "#\n# ATTENTION: YOU ARE CONNECTED TO THE SYSTEM TENANT OF A MULTI-TENANT CLUSTER.\n"+
+			"# PROCEED WITH CAUTION. YOU ARE RESPONSIBLE FOR ENSURING THAT YOU DO NOT\n"+
+			"# PERFORM ANY OPERATIONS THAT COULD DAMAGE THE CLUSTER OR OTHER TENANTS.\n#")
 	}
 
 	// Report the server version only if it the revision has been
@@ -378,8 +476,8 @@ func (c *sqlConn) checkServerMetadata() error {
 			cv, err := version.Parse(client.Tag)
 			if err == nil {
 				if sv.Compare(cv) == -1 { // server ver < client ver
-					fmt.Fprintln(c.errw, "\nwarning: server version older than client! "+
-						"proceed with caution; some features may not be available.\n")
+					fmt.Fprint(c.errw, "\nwarning: server version older than client! "+
+						"proceed with caution; some features may not be available.\n\n")
 				}
 			}
 		}
@@ -388,51 +486,67 @@ func (c *sqlConn) checkServerMetadata() error {
 	// Report the cluster ID only if it it could be fetched
 	// successfully, and it has changed since the last connection.
 	if old := c.clusterID; newClusterID != c.clusterID {
-		c.clusterID = newClusterID
+		label := ""
 		if old != "" {
-			return errors.Errorf("the cluster ID has changed!\nPrevious ID: %s\nNew ID: %s",
-				old, newClusterID)
+			label = "New "
+			fmt.Fprintf(c.errw, "\nwarning: the cluster ID has changed!\n# Previous ID: %s\n", old)
 		}
 		c.clusterID = newClusterID
-		fmt.Fprintln(c.infow, "# Cluster ID:", c.clusterID)
+		fmt.Fprintf(c.infow, "# %sCluster ID: %v\n", label, c.clusterID)
 		if c.clusterOrganization != "" {
 			fmt.Fprintln(c.infow, "# Organization:", c.clusterOrganization)
 		}
 	}
 	// Try to enable server execution timings for the CLI to display if
 	// supported by the server.
-	return c.tryEnableServerExecutionTimings()
+	return c.tryEnableServerExecutionTimings(ctx)
+}
+
+// GetServerInfo returns a copy of the remote server details.
+func (c *sqlConn) GetServerInfo() ServerInfo {
+	return ServerInfo{
+		ServerExecutableVersion: c.serverBuild,
+		ClusterID:               c.clusterID,
+		Organization:            c.clusterOrganization,
+		VirtualClusterName:      c.virtualClusterName,
+	}
 }
 
 // GetServerValue retrieves the first driverValue returned by the
 // given sql query. If the query fails or does not return a single
 // column, `false` is returned in the second result.
-func (c *sqlConn) GetServerValue(what, sql string) (driver.Value, string, bool) {
-	rows, err := c.Query(sql, nil)
+func (c *sqlConn) GetServerValue(
+	ctx context.Context, what, sql string,
+) (retVal driver.Value, retOk bool) {
+	rows, err := c.Query(ctx, sql)
 	if err != nil {
 		fmt.Fprintf(c.errw, "warning: error retrieving the %s: %v\n", what, err)
-		return nil, "", false
+		return nil, false
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			fmt.Fprintf(c.errw, "warning: error retrieving the %s: %v\n", what, err)
+			retVal, retOk = nil, false
+		}
+	}()
 
 	if len(rows.Columns()) == 0 {
 		fmt.Fprintf(c.errw, "warning: cannot get the %s\n", what)
-		return nil, "", false
+		return nil, false
 	}
 
-	dbColType := rows.ColumnTypeDatabaseTypeName(0)
 	dbVals := make([]driver.Value, len(rows.Columns()))
 
-	err = rows.Next(dbVals[:])
+	err = rows.Next(dbVals)
 	if err != nil {
 		fmt.Fprintf(c.errw, "warning: invalid %s: %v\n", what, err)
-		return nil, "", false
+		return nil, false
 	}
 
-	return dbVals[0], dbColType, true
+	return dbVals[0], true
 }
 
-func (c *sqlConn) GetLastQueryStatistics() (results QueryStats, resErr error) {
+func (c *sqlConn) GetLastQueryStatistics(ctx context.Context) (results QueryStats, resErr error) {
 	if !c.connCtx.EnableServerExecutionTimings || c.lastQueryStatsMode == modeDisabled {
 		return results, nil
 	}
@@ -444,7 +558,7 @@ func (c *sqlConn) GetLastQueryStatistics() (results QueryStats, resErr error) {
 		stmt = `SHOW LAST QUERY STATISTICS`
 	}
 
-	vals, cols, err := c.queryRowInternal(stmt, nil)
+	vals, cols, err := c.queryRowInternal(ctx, stmt, nil)
 	if err != nil {
 		return results, err
 	}
@@ -488,58 +602,96 @@ func (c *sqlConn) GetLastQueryStatistics() (results QueryStats, resErr error) {
 //
 // NOTE: the supplied closure should not have external side
 // effects beyond changes to the database.
-func (c *sqlConn) ExecTxn(fn func(TxBoundConn) error) (err error) {
-	if err := c.Exec(`BEGIN`, nil); err != nil {
+func (c *sqlConn) ExecTxn(
+	ctx context.Context, fn func(context.Context, TxBoundConn) error,
+) (err error) {
+	if err := c.Exec(ctx, `BEGIN`); err != nil {
 		return err
 	}
-	return crdb.ExecuteInTx(context.TODO(), sqlTxnShim{c}, func() error {
-		return fn(c)
+	return crdb.ExecuteInTx(ctx, sqlTxnShim{c}, func() error {
+		return fn(ctx, c)
 	})
 }
 
-func (c *sqlConn) Exec(query string, args []driver.Value) error {
-	if err := c.EnsureConn(); err != nil {
-		return err
-	}
-	if c.connCtx.Echo {
-		fmt.Fprintln(c.errw, ">", query)
-	}
-	_, err := c.conn.Exec(query, args)
-	c.flushNotices()
-	if errors.Is(err, driver.ErrBadConn) {
-		c.reconnecting = true
-		c.silentClose()
-	}
+func (c *sqlConn) Exec(ctx context.Context, query string, args ...interface{}) error {
+	_, err := c.ExecWithRowsAffected(ctx, query, args...)
 	return err
 }
 
-func (c *sqlConn) Query(query string, args []driver.Value) (Rows, error) {
-	if err := c.EnsureConn(); err != nil {
+func (c *sqlConn) ExecWithRowsAffected(
+	ctx context.Context, query string, args ...interface{},
+) (int64, error) {
+	if err := c.EnsureConn(ctx); err != nil {
+		return 0, err
+	}
+	if c.connCtx.Echo {
+		fmt.Fprintln(c.errw, ">", query)
+	}
+	r, err := c.conn.Exec(ctx, query, args...)
+	c.flushNotices()
+	if c.conn.IsClosed() {
+		c.reconnecting = true
+		c.silentClose()
+		return r.RowsAffected(), MarkWithConnectionClosed(err)
+	}
+	return r.RowsAffected(), err
+}
+
+func (c *sqlConn) Query(ctx context.Context, query string, args ...interface{}) (Rows, error) {
+	if err := c.EnsureConn(ctx); err != nil {
 		return nil, err
 	}
 	if c.connCtx.Echo {
 		fmt.Fprintln(c.errw, ">", query)
 	}
-	rows, err := c.conn.Query(query, args)
-	if errors.Is(err, driver.ErrBadConn) {
+
+	// If there are placeholder args, then we must use a prepared statement,
+	// which is only possible using pgx.Conn.
+	// Or, if alwaysInferResultTypes is set, then we must use pgx.Conn so the
+	// result types are automatically inferred.
+	if len(args) > 0 || c.alwaysInferResultTypes {
+		rows, err := c.conn.Query(ctx, query, args...)
+		if c.conn.IsClosed() {
+			c.reconnecting = true
+			c.silentClose()
+			return nil, MarkWithConnectionClosed(err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &sqlRows{rows: rows, connInfo: c.conn.ConnInfo(), conn: c}, nil
+	}
+
+	// Otherwise, we use pgconn. This allows us to add support for multiple
+	// queries in a single string, which wouldn't be possible at the pgx level.
+	multiResultReader := c.conn.PgConn().Exec(ctx, query)
+	if c.conn.IsClosed() {
 		c.reconnecting = true
 		c.silentClose()
+		return nil, MarkWithConnectionClosed(multiResultReader.Close())
 	}
-	if err != nil {
+	rs := &sqlRowsMultiResultSet{
+		rows:     multiResultReader,
+		connInfo: c.conn.ConnInfo(),
+		conn:     c,
+	}
+	if _, err := rs.NextResultSet(); err != nil {
 		return nil, err
 	}
-	return &sqlRows{rows: rows.(sqlRowsI), conn: c}, nil
+	return rs, nil
 }
 
-func (c *sqlConn) QueryRow(query string, args []driver.Value) ([]driver.Value, error) {
-	results, _, err := c.queryRowInternal(query, args)
+func (c *sqlConn) QueryRow(
+	ctx context.Context, query string, args ...interface{},
+) ([]driver.Value, error) {
+	results, _, err := c.queryRowInternal(ctx, query, args)
 	return results, err
 }
 
 func (c *sqlConn) queryRowInternal(
-	query string, args []driver.Value,
+	ctx context.Context, query string, args []interface{},
 ) (vals []driver.Value, colNames []string, resErr error) {
-	rows, _, err := MakeQuery(query, args...)(c)
+	rows, _, err := MakeQuery(query, args...)(ctx, c)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -566,7 +718,7 @@ func (c *sqlConn) queryRowInternal(
 func (c *sqlConn) Close() error {
 	c.flushNotices()
 	if c.conn != nil {
-		err := c.conn.Close()
+		err := c.conn.Close(context.Background())
 		if err != nil {
 			return err
 		}
@@ -577,7 +729,7 @@ func (c *sqlConn) Close() error {
 
 func (c *sqlConn) silentClose() {
 	if c.conn != nil {
-		_ = c.conn.Close()
+		_ = c.conn.Close(context.Background())
 		c.conn = nil
 	}
 }
@@ -613,7 +765,7 @@ func (c *sqlConn) fillPassword() error {
 		connURL.Host,
 		connURL.User.Username())
 
-	pwd, err := pprompt.PromptForPassword()
+	pwd, err := pprompt.PromptForPassword("" /* prompt */)
 	if err != nil {
 		return err
 	}
@@ -621,4 +773,21 @@ func (c *sqlConn) fillPassword() error {
 	c.url = connURL.String()
 	c.passwordMissing = false
 	return nil
+}
+
+// MarkWithConnectionClosed is a mix of errors.CombineErrors() and errors.Mark().
+// If err is nil, the result is like errors.CombineErrors().
+// If err is non-nil, the result is that of errors.Mark(), with the error
+// message added as a prefix.
+//
+// In both cases, errors.Is(..., ErrConnectionClosed) returns true on the
+// result.
+func MarkWithConnectionClosed(err error) error {
+	if err == nil {
+		return ErrConnectionClosed
+	}
+	// Disable the linter since we are intentionally adding the error text.
+	// nolint:errwrap
+	errWithMsg := errors.WithMessagef(err, "%v", ErrConnectionClosed)
+	return errors.Mark(errWithMsg, ErrConnectionClosed)
 }

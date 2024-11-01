@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessiondata
 
@@ -15,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Tests the implied search path when no temporary schema has been created
@@ -45,7 +42,28 @@ func TestImpliedSearchPath(t *testing.T) {
 			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`pg_catalog`},
 		},
 		{
+			explicitSearchPath:                                             []string{`pg_catalog`, `pg_catalog`},
+			expectedSearchPath:                                             []string{`pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`pg_catalog`},
+		},
+		{
 			explicitSearchPath:                                             []string{`pg_catalog`, `pg_temp`},
+			expectedSearchPath:                                             []string{`pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{`pg_catalog`, testTempSchemaName},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`pg_catalog`, testTempSchemaName},
+		},
+		{
+			explicitSearchPath:                                             []string{`pg_catalog`, `pg_catalog`, `pg_temp`},
+			expectedSearchPath:                                             []string{`pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{`pg_catalog`, testTempSchemaName},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`pg_catalog`, testTempSchemaName},
+		},
+		{
+			explicitSearchPath:                                             []string{`pg_catalog`, `pg_temp`, `pg_temp`},
 			expectedSearchPath:                                             []string{`pg_catalog`},
 			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
 			expectedSearchPathWhenTemporarySchemaExists:                    []string{`pg_catalog`, testTempSchemaName},
@@ -59,7 +77,35 @@ func TestImpliedSearchPath(t *testing.T) {
 			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{testTempSchemaName, `pg_catalog`},
 		},
 		{
+			explicitSearchPath:                                             []string{`pg_temp`, `pg_temp`, `pg_catalog`},
+			expectedSearchPath:                                             []string{`pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{testTempSchemaName, `pg_catalog`},
+		},
+		{
+			explicitSearchPath:                                             []string{`pg_temp`, `pg_catalog`, `pg_catalog`},
+			expectedSearchPath:                                             []string{`pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{testTempSchemaName, `pg_catalog`},
+		},
+		{
 			explicitSearchPath:                                             []string{`foobar`, `pg_catalog`},
+			expectedSearchPath:                                             []string{`foobar`, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`, `pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `foobar`, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`, `pg_catalog`},
+		},
+		{
+			explicitSearchPath:                                             []string{`foobar`, `foobar`, `pg_catalog`},
+			expectedSearchPath:                                             []string{`foobar`, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`, `pg_catalog`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `foobar`, `pg_catalog`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`, `pg_catalog`},
+		},
+		{
+			explicitSearchPath:                                             []string{`foobar`, `pg_catalog`, `pg_catalog`},
 			expectedSearchPath:                                             []string{`foobar`, `pg_catalog`},
 			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`, `pg_catalog`},
 			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `foobar`, `pg_catalog`},
@@ -73,7 +119,28 @@ func TestImpliedSearchPath(t *testing.T) {
 			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`, testTempSchemaName},
 		},
 		{
+			explicitSearchPath:                                             []string{`foobar`, `foobar`, `pg_temp`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `foobar`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{`pg_catalog`, `foobar`, testTempSchemaName},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`, testTempSchemaName},
+		},
+		{
+			explicitSearchPath:                                             []string{`foobar`, `pg_temp`, `pg_temp`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `foobar`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{`pg_catalog`, `foobar`, testTempSchemaName},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`, testTempSchemaName},
+		},
+		{
 			explicitSearchPath:                                             []string{`foobar`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `foobar`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `foobar`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`foobar`},
+		},
+		{
+			explicitSearchPath:                                             []string{`foobar`, `foobar`},
 			expectedSearchPath:                                             []string{`pg_catalog`, `foobar`},
 			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`foobar`},
 			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `foobar`},
@@ -87,7 +154,28 @@ func TestImpliedSearchPath(t *testing.T) {
 			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`public`},
 		},
 		{
+			explicitSearchPath:                                             []string{`public`, `public`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `pg_extension`, `public`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`public`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `pg_extension`, `public`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`public`},
+		},
+		{
 			explicitSearchPath:                                             []string{`public`, `pg_extension`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `public`, `pg_extension`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`public`, `pg_extension`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `public`, `pg_extension`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`public`, `pg_extension`},
+		},
+		{
+			explicitSearchPath:                                             []string{`public`, `public`, `pg_extension`},
+			expectedSearchPath:                                             []string{`pg_catalog`, `public`, `pg_extension`},
+			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`public`, `pg_extension`},
+			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `public`, `pg_extension`},
+			expectedSearchPathWithoutImplicitPgSchemasWhenTempSchemaExists: []string{`public`, `pg_extension`},
+		},
+		{
+			explicitSearchPath:                                             []string{`public`, `pg_extension`, `pg_extension`},
 			expectedSearchPath:                                             []string{`pg_catalog`, `public`, `pg_extension`},
 			expectedSearchPathWithoutImplicitPgSchemas:                     []string{`public`, `pg_extension`},
 			expectedSearchPathWhenTemporarySchemaExists:                    []string{testTempSchemaName, `pg_catalog`, `public`, `pg_extension`},
@@ -102,6 +190,18 @@ func TestImpliedSearchPath(t *testing.T) {
 			iter := searchPath.Iter()
 			for p, ok := iter.Next(); ok; p, ok = iter.Next() {
 				actualSearchPath = append(actualSearchPath, p)
+			}
+			if !reflect.DeepEqual(tc.expectedSearchPath, actualSearchPath) {
+				t.Errorf(
+					`#%d: Expected search path to be %#v, but was %#v.`,
+					tcNum,
+					tc.expectedSearchPath,
+					actualSearchPath,
+				)
+			}
+			actualSearchPath = make([]string, 0)
+			for i, n := 0, searchPath.NumElements(); i < n; i++ {
+				actualSearchPath = append(actualSearchPath, searchPath.GetSchema(i))
 			}
 			if !reflect.DeepEqual(tc.expectedSearchPath, actualSearchPath) {
 				t.Errorf(
@@ -269,7 +369,50 @@ func TestSearchPathSpecialChar(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(strings.Join(testCase.searchPath, ", "), func(t *testing.T) {
 			sp := MakeSearchPath(testCase.searchPath)
-			assert.True(t, sp.SQLIdentifiers() == testCase.expectedSearchPathString)
+			assert.Equal(t, testCase.expectedSearchPathString, sp.String())
+		})
+	}
+}
+
+func TestRandomSearchPathRoundTrip(t *testing.T) {
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 10000; i++ {
+		searchPath := make([]string, 1+rng.Intn(10))
+		for j := range searchPath {
+			searchPath[j] = randutil.RandString(rng, rng.Intn(10), `ABCabcdef123_-,"\+$€😅`)
+		}
+		formatted := FormatSearchPaths(searchPath)
+		newSearchPath, err := ParseSearchPath(formatted)
+		require.NoError(t, err)
+		require.Equal(t, searchPath, newSearchPath)
+	}
+}
+
+func TestParseSearchPathEdgeCases(t *testing.T) {
+	testCases := []struct {
+		input       string
+		expected    []string
+		expectedErr bool
+	}{
+		{input: ``, expected: []string{}},
+		{input: `""`, expected: []string{""}},
+		{input: `  `, expectedErr: true},
+		{input: `a, `, expectedErr: true},
+		{input: `,a`, expectedErr: true},
+		{input: `a, ,b`, expectedErr: true},
+		{input: `a,😇`, expected: []string{"a", "😇"}},
+		{input: `a,\abc`, expected: []string{"a", `\abc`}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.input, func(t *testing.T) {
+			actual, err := ParseSearchPath(tc.input)
+			if tc.expectedErr {
+				require.ErrorContains(t, err, "invalid value for parameter")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expected, actual)
+			}
 		})
 	}
 }

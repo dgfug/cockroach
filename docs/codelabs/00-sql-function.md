@@ -77,7 +77,7 @@ var builtins = map[string]builtinDefinition{
     tree.Overload{
       Types:      tree.VariadicType{VarType: types.String},
       ReturnType: tree.FixedReturnType(types.String),
-      Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+      Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
         return tree.DNull, fmt.Errorf("nothing to see here")
       },
     },
@@ -90,9 +90,18 @@ takes a variable number of string arguments. The `ReturnType` field indicates
 our function returns a string. The implementation of our function is currently
 unfinished, so we’ll return an error for now.
 
-Go ahead and add the above code to `pkg/sql/sem/builtins/builtins.go`. If you’ve
-followed the instructions in [CONTRIBUTING.md], you should be able to build
-CockroachDB from source:
+Go ahead and add the above code to `pkg/sql/sem/builtins/builtins.go`.
+
+Now, we need to assign an OID for this built-in in `pkg/sql/sem/builtins/fixed_oids.go`
+by adding an entry to the end of the `builtinOidsArray []string` array with the index
+equal to the OID of the last current built-in + 1 (OIDs must be unique).
+
+``` go
+2413: whois(string...) -> string
+```
+this indicates that `whois` is the name of the built-in, it accepts a variable number of string arguments, and returns one string value.
+
+If you’ve followed the instructions in [CONTRIBUTING.md], you should be able to build CockroachDB from source:
 
 ```text
 ~/go/src/github.com/cockroachdb/cockroach$ make build
@@ -349,7 +358,7 @@ check your solution against ours.
       tree.Overload{
         Types:      tree.VariadicType{VarType: types.String},
         ReturnType: tree.FixedReturnType(types.String),
-        Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+        Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
           users := map[string]string{
             "bdarnell": "Ben Darnell",
             "pmattis":  "Peter Mattis",

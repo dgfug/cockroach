@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
@@ -23,7 +18,7 @@ type tripleDecl struct {
 	value     expr
 }
 
-func (f *tripleDecl) clause() {}
+func (f tripleDecl) clause() {}
 
 var _ Clause = (*tripleDecl)(nil)
 
@@ -39,7 +34,7 @@ type eqDecl struct {
 	expr expr
 }
 
-func (e *eqDecl) clause() {}
+func (e eqDecl) clause() {}
 
 // and is a useful conjunctive construct which exists primarily as a tool
 // for libraries to write functions which emit clauses. At build time, the
@@ -65,3 +60,10 @@ type filterDecl struct {
 }
 
 func (f filterDecl) clause() {}
+
+type ruleInvocation struct {
+	args []Var
+	rule *RuleDef
+}
+
+func (f ruleInvocation) clause() {}

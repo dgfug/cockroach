@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -14,7 +9,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -23,23 +19,7 @@ import (
 // value expressions can often be inlined into referencing expressions. Only
 // Project and Values operators synthesize constant value expressions.
 func (c *CustomFuncs) FindInlinableConstants(input memo.RelExpr) opt.ColSet {
-	var cols opt.ColSet
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if opt.IsConstValueOp(item.Element) {
-				cols.Add(item.Col)
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if opt.IsConstValueOp(scalar) {
-				cols.Add(values.Cols[i])
-			}
-		}
-	}
-	return cols
+	return memo.FindInlinableConstants(input)
 }
 
 // InlineProjectionConstants recursively searches each projection expression and
@@ -86,7 +66,7 @@ func (c *CustomFuncs) inlineConstants(
 		switch t := e.(type) {
 		case *memo.VariableExpr:
 			if constCols.Contains(t.Col) {
-				return c.extractColumn(input, t.Col)
+				return memo.ExtractColumnFromProjectOrValues(input, t.Col)
 			}
 			return t
 		}
@@ -95,33 +75,12 @@ func (c *CustomFuncs) inlineConstants(
 	return replace(e)
 }
 
-// extractColumn searches a Project or Values input expression for the column
-// having the given id. It returns the expression for that column.
-func (c *CustomFuncs) extractColumn(input memo.RelExpr, col opt.ColumnID) opt.ScalarExpr {
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if item.Col == col {
-				return item.Element
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if values.Cols[i] == col {
-				return scalar
-			}
-		}
-	}
-	panic(errors.AssertionFailedf("could not find column to extract"))
-}
-
 // HasDuplicateRefs returns true if the target projection expressions or
 // passthrough columns reference any column in the given target set more than
 // one time, or if the projection expressions contain a correlated subquery.
 // For example:
 //
-//   SELECT x+1, x+2, y FROM a
+//	SELECT x+1, x+2, y FROM a
 //
 // HasDuplicateRefs would be true, since the x column is referenced twice.
 //
@@ -226,9 +185,8 @@ func (c *CustomFuncs) VirtualColumns(scanPrivate *memo.ScanPrivate) opt.ColSet {
 // InlinableVirtualColumnFilters returns a new filters expression containing any
 // of the given filters that meet the criteria:
 //
-//   1. The filter has references to any of the columns in virtualColumns.
-//   2. The filter is not a correlated subquery.
-//
+//  1. The filter has references to any of the columns in virtualColumns.
+//  2. The filter is not a correlated subquery.
 func (c *CustomFuncs) InlinableVirtualColumnFilters(
 	filters memo.FiltersExpr, virtualColumns opt.ColSet,
 ) (inlinableFilters memo.FiltersExpr) {
@@ -346,22 +304,28 @@ func (c *CustomFuncs) extractVarEqualsConst(
 
 // CanInlineConstVar returns true if there is an opportunity in the filters to
 // inline a variable restricted to be a constant, as in:
-//   SELECT * FROM foo WHERE a = 4 AND a IN (1, 2, 3, 4).
+//
+//	SELECT * FROM foo WHERE a = 4 AND a IN (1, 2, 3, 4).
+//
 // =>
-//   SELECT * FROM foo WHERE a = 4 AND 4 IN (1, 2, 3, 4).
+//
+//	SELECT * FROM foo WHERE a = 4 AND 4 IN (1, 2, 3, 4).
 func (c *CustomFuncs) CanInlineConstVar(f memo.FiltersExpr) bool {
 	// usedIndices tracks the set of filter indices we've used to infer constant
 	// values, so we don't inline into them.
-	var usedIndices util.FastIntSet
+	var usedIndices intsets.Fast
 	// fixedCols is the set of columns that the filters restrict to be a constant
 	// value.
 	var fixedCols opt.ColSet
 	for i := range f {
-		if ok, l, _ := c.extractVarEqualsConst(f[i].Condition); ok {
+		if ok, l, e := c.extractVarEqualsConst(f[i].Condition); ok {
 			colType := c.mem.Metadata().ColumnMeta(l.Col).Type
 			if colinfo.CanHaveCompositeKeyEncoding(colType) {
 				// TODO(justin): allow inlining if the check we're doing is oblivious
 				// to composite-ness.
+				continue
+			}
+			if !e.Typ.Equivalent(colType) {
 				continue
 			}
 			if !fixedCols.Contains(l.Col) {
@@ -385,7 +349,7 @@ func (c *CustomFuncs) CanInlineConstVar(f memo.FiltersExpr) bool {
 func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 	// usedIndices tracks the set of filter indices we've used to infer constant
 	// values, so we don't inline into them.
-	var usedIndices util.FastIntSet
+	var usedIndices intsets.Fast
 	// fixedCols is the set of columns that the filters restrict to be a constant
 	// value.
 	var fixedCols opt.ColSet
@@ -396,6 +360,9 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 		if ok, v, e := c.extractVarEqualsConst(f[i].Condition); ok {
 			colType := c.mem.Metadata().ColumnMeta(v.Col).Type
 			if colinfo.CanHaveCompositeKeyEncoding(colType) {
+				continue
+			}
+			if !e.Typ.Equivalent(colType) {
 				continue
 			}
 			if _, ok := vals[v.Col]; !ok {
@@ -429,4 +396,150 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 		}
 	}
 	return result
+}
+
+// IsInlinableUDF returns true if the given UDF can be inlined as a subquery,
+// which requires all the following to be true:
+//
+//  1. It must be labeled as non-volatile, i.e., immutable, stable, or
+//     leak-proof.
+//  2. It has a single statement.
+//  3. It is not a set-returning function.
+//  4. Its arguments are only Variable or Const expressions.
+//  5. It is not a record-returning function.
+//  6. It does not recursively call itself.
+//
+// UDFs with mutations (INSERT, UPDATE, UPSERT, DELETE) cannot be inlined, but
+// we do not need an explicit check for this because immutable UDFs cannot
+// contain mutations.
+//
+// TODO(mgartner): We may be able to loosen (1). Subqueries are always
+// evaluated just once, so by converting a UDF to a subquery we effectively make
+// it and it's arguments non-volatile. So, if UDFs can be inlined in some other
+// way, or the subquery can be eliminated with normalization rules, we may be
+// able to inline volatile UDFs.
+//
+// TODO(mgarnter): We may be able to loosen (3), but we need a way to inline a
+// strict UDF that is not called when an argument is NULL. This presents a
+// challenge because we cannot wrap a set-returning function in a CASE
+// expression, like we do for strict, non-set-returning functions.
+//
+// TODO(mgartner): We may be able to loosen (4), but there are several
+// difficulties to overcome. We must take care not to inline UDFs with volatile
+// arguments used more than once in the function body. We should also be sure
+// not to inline when the arguments are computationally expensive and are
+// referenced in the UDF body more than once. Any argument that contains a
+// subquery and is referenced multiple times cannot be inlined, unless new
+// columns IDs for the entire subquery are generated (see #100915).
+//
+// TODO(harding): We could potentially loosen (5), since only record-returning
+// UDFs used as data sources return multiple columns. Other UDFs returning a
+// single column can be inlined since subqueries can only return a single
+// column.
+//
+// Note: Routines with an exception block or cursor declaration are volatile, so
+// there is no need to check those cases.
+func (c *CustomFuncs) IsInlinableUDF(args memo.ScalarListExpr, udfp *memo.UDFCallPrivate) bool {
+	if udfp.Def == nil {
+		panic(errors.AssertionFailedf("expected non-nil UDF definition"))
+	}
+	if udfp.Def.IsRecursive || udfp.Def.Volatility == volatility.Volatile ||
+		len(udfp.Def.Body) != 1 || udfp.Def.SetReturning || udfp.Def.MultiColDataSource {
+		return false
+	}
+	if !args.IsConstantsAndPlaceholdersAndVariables() {
+		return false
+	}
+	return true
+}
+
+// ConvertUDFToSubquery returns a subquery expression that is equivalent to the
+// given UDF and UDF arguments.
+func (c *CustomFuncs) ConvertUDFToSubquery(
+	args memo.ScalarListExpr, udfp *memo.UDFCallPrivate,
+) opt.ScalarExpr {
+	// argForParam returns the argument that can be substituted for the given
+	// column, if the column is a parameter of the UDF. It returns ok=false if
+	// the column is not a UDF parameter.
+	argForParam := func(col opt.ColumnID) (e opt.Expr, ok bool) {
+		for i := range udfp.Def.Params {
+			if udfp.Def.Params[i] == col {
+				return args[i], true
+			}
+		}
+		return nil, false
+	}
+
+	// replace substitutes variables that are UDF parameters with the
+	// corresponding argument from the invocation of the UDF.
+	var replace ReplaceFunc
+	replace = func(nd opt.Expr) opt.Expr {
+		if t, ok := nd.(*memo.VariableExpr); ok {
+			if arg, ok := argForParam(t.Col); ok {
+				return arg
+			}
+		}
+		return c.f.Replace(nd, replace)
+	}
+
+	// The presentation and ordering in the physical properties of the UDF
+	// statement must be preserved in the subquery to produce correct results.
+	// The presentation, which always contains a single column, is preserved
+	// with a Project expression. The ordering is preserved in the LIMIT 1
+	// expression that optbuilder wraps around the last statement in a UDF. The
+	// presence of the LIMIT 1 makes a Max1Row expression unnecessary for the
+	// subquery.
+	//
+	// TODO(mgartner): The ordering may need to be preserved in the
+	// SubqueryPrivate for SETOF UDFs.
+	stmt := udfp.Def.Body[0]
+	returnColID := udfp.Def.BodyProps[0].Presentation[0].ID
+	res := c.f.ConstructSubquery(
+		c.f.ConstructProject(
+			replace(stmt).(memo.RelExpr),
+			nil, /* projections */
+			opt.MakeColSet(returnColID),
+		),
+		&memo.SubqueryPrivate{},
+	)
+
+	// If the UDF is strict, it should not be invoked when any of the arguments
+	// are NULL. To achieve this, we wrap the UDF in a CASE expression like:
+	//
+	//   CASE
+	//     WHEN arg1 IS NULL OR arg2 IS NULL OR ... THEN NULL
+	//     ELSE <subquery>
+	//   END
+	//
+	if !udfp.Def.CalledOnNullInput && len(args) > 0 {
+		var anyArgIsNull opt.ScalarExpr
+		for i := range args {
+			// Note: We do NOT use a TupleIsNullExpr here if the argument is a
+			// tuple because a strict UDF will be called if an argument, T, is a
+			// tuple with all NULL elements, even though T IS NULL evaluates to
+			// true. For example:
+			//
+			//   SELECT strict_fn(1, (NULL, NULL)) -- the UDF will be called
+			//   SELECT (NULL, NULL) IS NULL       -- returns true
+			//
+			argIsNull := c.f.ConstructIs(args[i], memo.NullSingleton)
+			if anyArgIsNull == nil {
+				anyArgIsNull = argIsNull
+				continue
+			}
+			anyArgIsNull = c.f.ConstructOr(argIsNull, anyArgIsNull)
+		}
+		res = c.f.ConstructCase(
+			memo.TrueSingleton,
+			memo.ScalarListExpr{
+				c.f.ConstructWhen(
+					anyArgIsNull,
+					c.f.ConstructNull(udfp.Def.Typ),
+				),
+			},
+			res,
+		)
+	}
+
+	return res
 }

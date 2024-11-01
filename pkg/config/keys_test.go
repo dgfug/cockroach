@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package config_test
 
@@ -28,7 +23,7 @@ func TestDecodeSystemTenantObjectID(t *testing.T) {
 		key       roachpb.RKey
 		keySuffix []byte
 		success   bool
-		id        config.SystemTenantObjectID
+		id        config.ObjectID
 	}{
 		// Before the structured span.
 		{roachpb.RKeyMin, nil, false, 0},
@@ -43,7 +38,7 @@ func TestDecodeSystemTenantObjectID(t *testing.T) {
 	}
 
 	for tcNum, tc := range testCases {
-		id, keySuffix, success := config.DecodeSystemTenantObjectID(tc.key)
+		id, keySuffix, success := config.DecodeObjectID(keys.SystemSQLCodec, tc.key)
 		if success != tc.success {
 			t.Errorf("#%d: expected success=%t", tcNum, tc.success)
 			continue

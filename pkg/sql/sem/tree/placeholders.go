@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -18,17 +13,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // PlaceholderIdx is the 0-based index of a placeholder. Placeholder "$1"
 // has PlaceholderIdx=0.
 type PlaceholderIdx uint16
 
+var _ redact.SafeValue = PlaceholderIdx(0)
+
 // MaxPlaceholderIdx is the maximum allowed value of a PlaceholderIdx.
 // The pgwire protocol is limited to 2^16 placeholders, so we limit the IDs to
 // this range as well.
 const MaxPlaceholderIdx = math.MaxUint16
+
+// SafeValue implements the redact.SafeValue interface.
+func (idx PlaceholderIdx) SafeValue() {}
 
 // String returns the index as a placeholder string representation ($1, $2 etc).
 func (idx PlaceholderIdx) String() string {
@@ -102,7 +102,7 @@ type PlaceholderTypesInfo struct {
 // but there is a type hint, returns the type hint.
 func (p *PlaceholderTypesInfo) Type(idx PlaceholderIdx) (_ *types.T, ok bool, _ error) {
 	if len(p.Types) <= int(idx) {
-		return nil, false, makeNoValueProvidedForPlaceholderErr(idx)
+		return nil, false, NewNoValueProvidedForPlaceholderErr(idx)
 	}
 	t := p.Types[idx]
 	if t == nil && len(p.TypeHints) > int(idx) {
@@ -135,7 +135,12 @@ func (p *PlaceholderTypesInfo) SetType(idx PlaceholderIdx, typ *types.T) error {
 				pgcode.DatatypeMismatch,
 				"placeholder %s already has type %s, cannot assign %s", idx, t, typ)
 		}
-		return nil
+		// If `t` is not ambiguous or if `typ` is ambiguous, then we shouldn't
+		// change the type that's already set. Otherwise, we can use `typ` since
+		// it is more specific.
+		if !t.IsAmbiguous() || typ.IsAmbiguous() {
+			return nil
+		}
 	}
 	p.Types[idx] = typ
 	return nil
@@ -150,44 +155,36 @@ type PlaceholderInfo struct {
 
 // Init initializes a PlaceholderInfo structure appropriate for the given number
 // of placeholders, and with the given (optional) type hints.
-func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) error {
-	p.Types = make(PlaceholderTypes, numPlaceholders)
+func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) {
 	if typeHints == nil {
 		p.TypeHints = make(PlaceholderTypes, numPlaceholders)
+		p.Types = make(PlaceholderTypes, numPlaceholders)
 	} else {
-		if err := checkPlaceholderArity(len(typeHints), numPlaceholders); err != nil {
-			return err
-		}
+		p.Types = make(PlaceholderTypes, len(typeHints))
 		p.TypeHints = typeHints
 	}
 	p.Values = nil
-	return nil
 }
 
 // Assign resets the PlaceholderInfo to the contents of src.
 // If src is nil, a new structure is initialized.
-func (p *PlaceholderInfo) Assign(src *PlaceholderInfo, numPlaceholders int) error {
+func (p *PlaceholderInfo) Assign(src *PlaceholderInfo, numPlaceholders int) {
 	if src != nil {
-		if err := checkPlaceholderArity(len(src.Types), numPlaceholders); err != nil {
-			return err
-		}
 		*p = *src
-		return nil
+		return
 	}
-	return p.Init(numPlaceholders, nil /* typeHints */)
+	p.Init(numPlaceholders, nil /* typeHints */)
 }
 
-func checkPlaceholderArity(numTypes, numPlaceholders int) error {
-	if numTypes > numPlaceholders {
-		return errors.AssertionFailedf(
-			"unexpected placeholder types: got %d, expected %d",
-			numTypes, numPlaceholders)
-	} else if numTypes < numPlaceholders {
-		return pgerror.Newf(pgcode.UndefinedParameter,
-			"could not find types for all placeholders: got %d, expected %d",
-			numTypes, numPlaceholders)
+// MaybeExtendTypes is to fill the nil types with the type hints, if exists.
+func (p *PlaceholderInfo) MaybeExtendTypes() {
+	if len(p.TypeHints) >= len(p.Types) {
+		for i, t := range p.Types {
+			if t == nil {
+				p.Types[i] = p.TypeHints[i]
+			}
+		}
 	}
-	return nil
 }
 
 // Value returns the known value of a placeholder.  Returns false in
@@ -209,4 +206,12 @@ func (p *PlaceholderInfo) IsUnresolvedPlaceholder(expr Expr) bool {
 		return !(err == nil && res)
 	}
 	return false
+}
+
+// NewNoValueProvidedForPlaceholderErr constructs an error indicating a missing
+// placeholder value.
+func NewNoValueProvidedForPlaceholderErr(pIdx PlaceholderIdx) error {
+	return pgerror.Newf(pgcode.UndefinedParameter,
+		"no value provided for placeholder: $%d", pIdx+1,
+	)
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldataext
 
@@ -14,13 +9,14 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,16 +27,16 @@ type datumVec struct {
 	// data is the underlying data stored in datumVec.
 	data []tree.Datum
 	// evalCtx is required for most of the methods of tree.Datum interface.
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 
 	scratch []byte
-	da      rowenc.DatumAlloc
+	da      tree.DatumAlloc
 }
 
 var _ coldata.DatumVec = &datumVec{}
 
 // newDatumVec returns a datumVec struct with capacity of n.
-func newDatumVec(t *types.T, n int, evalCtx *tree.EvalContext) coldata.DatumVec {
+func newDatumVec(t *types.T, n int, evalCtx *eval.Context) coldata.DatumVec {
 	return &datumVec{
 		t:       t,
 		data:    make([]tree.Datum, n),
@@ -55,11 +51,17 @@ func newDatumVec(t *types.T, n int, evalCtx *tree.EvalContext) coldata.DatumVec 
 // Note that the method is named differently from "Compare" so that we do not
 // overload tree.Datum.Compare method.
 func CompareDatum(d, dVec, other interface{}) int {
-	return d.(tree.Datum).Compare(dVec.(*datumVec).evalCtx, convertToDatum(other))
+	// TODO(yuzefovich): use proper context after the execversion change lands
+	// (#119114).
+	res, err := d.(tree.Datum).Compare(context.TODO(), dVec.(*datumVec).evalCtx, convertToDatum(other))
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
+	return res
 }
 
 // Hash returns the hash of the datum as a byte slice.
-func Hash(d tree.Datum, da *rowenc.DatumAlloc) []byte {
+func Hash(d tree.Datum, da *tree.DatumAlloc) []byte {
 	ed := rowenc.EncDatum{Datum: convertToDatum(d)}
 	// We know that we have tree.Datum, so there will definitely be no need to
 	// decode ed for fingerprinting, so we pass in nil memory account.
@@ -82,7 +84,9 @@ func (dv *datumVec) Get(i int) coldata.Datum {
 // Set implements coldata.DatumVec interface.
 func (dv *datumVec) Set(i int, v coldata.Datum) {
 	datum := convertToDatum(v)
-	dv.assertValidDatum(datum)
+	if buildutil.CrdbTestBuild {
+		dv.assertValidDatum(datum)
+	}
 	dv.data[i] = datum
 }
 
@@ -98,21 +102,27 @@ func (dv *datumVec) Window(start, end int) coldata.DatumVec {
 // CopySlice implements coldata.DatumVec interface.
 func (dv *datumVec) CopySlice(src coldata.DatumVec, destIdx, srcStartIdx, srcEndIdx int) {
 	castSrc := src.(*datumVec)
-	dv.assertSameTypeFamily(castSrc.t)
+	if buildutil.CrdbTestBuild {
+		dv.assertSameTypeFamily(castSrc.t)
+	}
 	copy(dv.data[destIdx:], castSrc.data[srcStartIdx:srcEndIdx])
 }
 
 // AppendSlice implements coldata.DatumVec interface.
 func (dv *datumVec) AppendSlice(src coldata.DatumVec, destIdx, srcStartIdx, srcEndIdx int) {
 	castSrc := src.(*datumVec)
-	dv.assertSameTypeFamily(castSrc.t)
+	if buildutil.CrdbTestBuild {
+		dv.assertSameTypeFamily(castSrc.t)
+	}
 	dv.data = append(dv.data[:destIdx], castSrc.data[srcStartIdx:srcEndIdx]...)
 }
 
 // AppendVal implements coldata.DatumVec interface.
 func (dv *datumVec) AppendVal(v coldata.Datum) {
 	datum := convertToDatum(v)
-	dv.assertValidDatum(datum)
+	if buildutil.CrdbTestBuild {
+		dv.assertValidDatum(datum)
+	}
 	dv.data = append(dv.data, datum)
 }
 
@@ -134,15 +144,15 @@ func (dv *datumVec) Cap() int {
 // MarshalAt implements coldata.DatumVec interface.
 func (dv *datumVec) MarshalAt(appendTo []byte, i int) ([]byte, error) {
 	dv.maybeSetDNull(i)
-	return rowenc.EncodeTableValue(
-		appendTo, descpb.ColumnID(encoding.NoColumnID), dv.data[i], dv.scratch,
+	return valueside.Encode(
+		appendTo, valueside.NoColumnID, dv.data[i], dv.scratch,
 	)
 }
 
 // UnmarshalTo implements coldata.DatumVec interface.
 func (dv *datumVec) UnmarshalTo(i int, b []byte) error {
 	var err error
-	dv.data[i], _, err = rowenc.DecodeTableValue(&dv.da, dv.t, b)
+	dv.data[i], _, err = valueside.Decode(&dv.da, dv.t, b)
 	return err
 }
 
@@ -216,4 +226,14 @@ func convertToDatum(v coldata.Datum) tree.Datum {
 	colexecerror.InternalError(errors.AssertionFailedf("unexpected value: %v", v))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
+}
+
+// SetEvalCtx implements coldata.DatumVec interface.
+func (dv *datumVec) SetEvalCtx(evalCtx interface{}) {
+	dv.evalCtx = evalCtx.(*eval.Context)
+}
+
+// SetType implements coldata.DatumVec interface.
+func (dv *datumVec) SetType(t interface{}) {
+	dv.t = t.(*types.T)
 }

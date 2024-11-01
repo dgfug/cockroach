@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package screl
 
@@ -16,23 +11,22 @@ import (
 )
 
 // equalityAttrs are used to sort elements.
-var equalityAttrs = []rel.Attr{
-	rel.Type,
-	DescID,
-	ReferencedDescID,
-	ColumnID,
-	Name,
-	IndexID,
-	Direction,
-	Status,
-}
+var equalityAttrs = func() []rel.Attr {
+	s := make([]rel.Attr, 0, AttrMax)
+	s = append(s, rel.Type)
+	for a := Attr(1); a <= AttrMax; a++ {
+		// Do not compare on slice attributes.
+		if !Schema.IsSliceAttr(a) {
+			s = append(s, a)
+		}
+	}
+	return s
+}()
 
-// EqualElements returns true if the two elements are equal.
-func EqualElements(a, b scpb.Element) bool {
+// EqualElementKeys returns true if the two elements are equal over all of
+// their scalar attributes and have the same type. Note that two elements
+// which differ only in the contents of slice attributes will be considered
+// equal by this function.
+func EqualElementKeys(a, b scpb.Element) bool {
 	return Schema.EqualOn(equalityAttrs, a, b)
-}
-
-// CompareElements orders two elements.
-func CompareElements(a, b scpb.Element) (less, eq bool) {
-	return Schema.CompareOn(equalityAttrs, a, b)
 }

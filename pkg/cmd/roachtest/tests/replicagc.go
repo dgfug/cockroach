@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -29,9 +25,12 @@ import (
 func registerReplicaGC(r registry.Registry) {
 	for _, restart := range []bool{true, false} {
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("replicagc-changed-peers/restart=%t", restart),
-			Owner:   registry.OwnerKV,
-			Cluster: r.MakeClusterSpec(6),
+			Name:             fmt.Sprintf("replicagc-changed-peers/restart=%t", restart),
+			Owner:            registry.OwnerKV,
+			Cluster:          r.MakeClusterSpec(6),
+			CompatibleClouds: registry.AllExceptAWS,
+			Suites:           registry.Suites(registry.Nightly),
+			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runReplicaGCChangedPeers(ctx, t, c, restart)
 			},
@@ -40,6 +39,8 @@ func registerReplicaGC(r registry.Registry) {
 }
 
 var deadNodeAttr = "deadnode"
+
+const storeDeadTimeout = 60 * time.Second
 
 // runReplicaGCChangedPeers checks that when a node has all of its replicas
 // taken away in absentia restarts, without it being able to talk to any of its
@@ -59,26 +60,36 @@ func runReplicaGCChangedPeers(
 		t.Fatal("test needs to be run with 6 nodes")
 	}
 
-	args := option.StartArgs("--env=COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(1))
-	c.Start(ctx, args, c.Range(1, 3))
+	settings := install.MakeClusterSettings(install.EnvOption([]string{"COCKROACH_SCAN_MAX_IDLE_TIME=5ms"}))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Range(1, 3))
 
 	h := &replicagcTestHelper{c: c, t: t}
 
 	t.Status("waiting for full replication")
 	h.waitForFullReplication(ctx)
 
+	// Set dead store timeout to 1 minute to work around allocator issue mentioned
+	// in waitForZeroReplicasOnN3.
+	func() {
+		db := c.Conn(ctx, t.L(), 1)
+		defer db.Close()
+		if _, err := db.ExecContext(ctx,
+			"SET CLUSTER SETTING server.time_until_store_dead = $1", storeDeadTimeout.String(),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
 	// Fill in a bunch of data.
-	c.Run(ctx, c.Node(1), "./workload init kv {pgurl:1} --splits 100")
+	c.Run(ctx, option.WithNodes(c.Node(1)), "./cockroach workload init kv {pgurl:1} --splits 100")
 
 	// Kill the third node so it won't know that all of its replicas are moved
 	// elsewhere (we don't use the first because that's what roachprod will
 	// join new nodes to).
-	c.Stop(ctx, c.Node(3))
+	c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(3))
 
 	// Start three new nodes that will take over all data.
-	c.Start(ctx, args, c.Range(4, 6))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Range(4, 6))
 
 	// Decommission n1-3, with n3 in absentia, moving the replicas to n4-6.
 	if err := h.decommission(ctx, c.Range(1, 3), 2, "--wait=none"); err != nil {
@@ -99,10 +110,10 @@ func runReplicaGCChangedPeers(
 	//
 	// https://github.com/cockroachdb/cockroach/issues/67910#issuecomment-884856356
 	t.Status("waiting for zero replicas on n3")
-	waitForZeroReplicasOnN3(ctx, t, c.Conn(ctx, 1))
+	waitForZeroReplicasOnN3(ctx, t, c.Conn(ctx, t.L(), 1))
 
 	// Stop the remaining two old nodes, no replicas remaining there.
-	c.Stop(ctx, c.Range(1, 2))
+	c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Range(1, 2))
 
 	// Set up zone configs to isolate out nodes with the `deadNodeAttr`
 	// attribute. We'll later start n3 using this attribute to test GC replica
@@ -127,31 +138,28 @@ func runReplicaGCChangedPeers(
 		// rebalancing and repair attempts. Lacking this information it does not
 		// do that within the store dead interval (5m, i.e. too long for this
 		// test).
-		c.Stop(ctx, c.Range(4, 6))
-		c.Start(ctx, args, c.Range(4, 6))
+		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Range(4, 6))
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Range(4, 6))
 	}
 
 	// Restart n3. We have to manually tell it where to find a new node or it
 	// won't be able to connect. Give it the deadNodeAttr attribute that we've
 	// used as a negative constraint for "everything", which should prevent new
 	// replicas from being added to it.
-	internalAddrs, err := c.InternalAddr(ctx, c.Node(4))
+	internalAddrs, err := c.InternalAddr(ctx, t.L(), c.Node(4))
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Start(ctx, c.Node(3), option.StartArgs(
-		"--args=--join="+internalAddrs[0],
-		"--args=--attrs="+deadNodeAttr,
-		"--args=--vmodule=raft=5,replicate_queue=5,allocator=5",
-		"--env=COCKROACH_SCAN_MAX_IDLE_TIME=5ms",
-	))
+	startOpts := option.DefaultStartOpts()
+	startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--join="+internalAddrs[0], "--attrs="+deadNodeAttr)
+	c.Start(ctx, t.L(), startOpts, settings, c.Node(3))
 
 	// Loop for two metric sample intervals (10s) to make sure n3 doesn't see any
 	// underreplicated ranges.
 	h.waitForZeroReplicas(ctx, 3)
 
 	// Restart the remaining nodes to satisfy the dead node detector.
-	c.Start(ctx, c.Range(1, 2))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, 2))
 }
 
 type replicagcTestHelper struct {
@@ -160,7 +168,7 @@ type replicagcTestHelper struct {
 }
 
 func (h *replicagcTestHelper) waitForFullReplication(ctx context.Context) {
-	db := h.c.Conn(ctx, 1)
+	db := h.c.Conn(ctx, h.t.L(), 1)
 	defer func() {
 		_ = db.Close()
 	}()
@@ -181,7 +189,7 @@ func (h *replicagcTestHelper) waitForFullReplication(ctx context.Context) {
 }
 
 func (h *replicagcTestHelper) waitForZeroReplicas(ctx context.Context, targetNode int) {
-	db := h.c.Conn(ctx, targetNode)
+	db := h.c.Conn(ctx, h.t.L(), targetNode)
 	defer func() {
 		_ = db.Close()
 	}()
@@ -208,7 +216,7 @@ func (h *replicagcTestHelper) numReplicas(ctx context.Context, db *gosql.DB, tar
 	).Scan(&n); err != nil {
 		h.t.Fatal(err)
 	}
-	h.t.L().Printf("found %d replicas found on n%d\n", n, targetNode)
+	h.t.L().Printf("found %d replicas on n%d\n", n, targetNode)
 	return n
 }
 
@@ -245,7 +253,7 @@ func (h *replicagcTestHelper) recommission(
 // nodes started with deadNodeAttr. This can then be used as a negative
 // constraint for everything.
 func (h *replicagcTestHelper) isolateDeadNodes(ctx context.Context, runNode int) {
-	db := h.c.Conn(ctx, runNode)
+	db := h.c.Conn(ctx, h.t.L(), runNode)
 	defer func() {
 		_ = db.Close()
 	}()
@@ -259,32 +267,58 @@ func (h *replicagcTestHelper) isolateDeadNodes(ctx context.Context, runNode int)
 			h.t.Fatal(err)
 		}
 	}
+	// Wait to make sure the new constraints are read by all nodes.
+	time.Sleep(time.Minute)
 }
 
 func waitForZeroReplicasOnN3(ctx context.Context, t test.Test, db *gosql.DB) {
-	if err := retry.ForDuration(5*time.Minute, func() error {
-		const q = `select range_id, replicas from crdb_internal.ranges_no_leases where replicas @> ARRAY[3];`
-		rows, err := db.QueryContext(ctx, q)
-		if err != nil {
-			return err
-		}
-		m := make(map[int64]string)
-		for rows.Next() {
-			var rangeID int64
-			var replicas string
-			if err := rows.Scan(&rangeID, &replicas); err != nil {
+	var err error
+	// Note that deadline is a special case for dead node. Dead nodes are not
+	// reported as decommissioning internally and stay as
+	// livenesspb.NodeLivenessStatus_UNAVAILABLE. This is preventing allocator
+	// from eagerly moving replicas off the node. It will only do so when node
+	// will be marked livenesspb.NodeLivenessStatus_DEAD. To reach latter status
+	// it has to stay unavailable for server.time_until_store_dead (configured
+	// down from 5 to 1 min in this test). So resulting timeout for replicas to
+	// move is 1 min + how much allocator needs to move replicas. Since we set it
+	// to process queue aggressively, we give it one minute. In practice, it
+	// usually takes about 10 seconds.
+	deadline := timeutil.Now().Add(storeDeadTimeout + time.Minute)
+	// We don't use exponential backoff here because we don't expect it to succeed
+	// immediately.
+	for r := retry.StartWithCtx(ctx, retry.Options{
+		InitialBackoff: 10 * time.Second,
+		MaxBackoff:     10 * time.Second,
+	}); r.Next() && timeutil.Now().Before(deadline); {
+		err = func() error {
+			const q = `select range_id, replicas from crdb_internal.ranges_no_leases where replicas @> ARRAY[3];`
+			rows, err := db.QueryContext(ctx, q)
+			if err != nil {
 				return err
 			}
-			m[rangeID] = replicas
+			m := make(map[int64]string)
+			for rows.Next() {
+				var rangeID int64
+				var replicas string
+				if err := rows.Scan(&rangeID, &replicas); err != nil {
+					return err
+				}
+				m[rangeID] = replicas
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			t.L().Printf("found %d replicas on n3\n", len(m))
+			if len(m) == 0 {
+				return nil
+			}
+			return errors.Errorf("ranges remained on n3 (according to meta2): %+v", m)
+		}()
+		if err == nil {
+			break
 		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if len(m) == 0 {
-			return nil
-		}
-		return errors.Errorf("ranges remained on n3 (according to meta2): %+v", m)
-	}); err != nil {
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 }

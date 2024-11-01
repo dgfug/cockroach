@@ -331,6 +331,8 @@ NULL
 
 statement ok
 DROP TABLE IF EXISTS t1, t2;
+
+statement ok
 CREATE TABLE t1 (a INT[]);
 CREATE TABLE t2 (b INT[]);
 INSERT INTO t1 VALUES (ARRAY[1]), (ARRAY[2]), (NULL);
@@ -347,12 +349,18 @@ NULL
 # Allow UNION of hidden and non-hidden columns.
 statement ok
 CREATE TABLE ab (a INT, b INT);
+
+statement ok
 SELECT a, b, rowid FROM ab UNION VALUES (1, 2, 3);
+
+statement ok
 DROP TABLE ab;
 
 # Regression test for #59148.
 statement ok
 CREATE TABLE ab (a INT4, b INT8);
+
+statement ok
 INSERT INTO ab VALUES (1, 1), (1, 2), (2, 1), (2, 2);
 
 query I rowsort
@@ -374,6 +382,8 @@ DROP TABLE ab;
 # between NULL and a tuple (#59611).
 statement ok
 CREATE TABLE t59611 (a INT);
+
+statement ok
 INSERT INTO t59611 VALUES (1)
 
 query T
@@ -557,6 +567,8 @@ SELECT a FROM ab UNION ALL SELECT x AS a FROM xy
 statement ok
 TRUNCATE ab;
 TRUNCATE xy;
+
+statement ok
 INSERT INTO ab VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
 INSERT INTO xy VALUES (1, 1), (3, 3), (5, 5), (7, 7);
 
@@ -666,3 +678,25 @@ SELECT a, b AS b1, b AS b2 FROM abc INTERSECT SELECT a, c, b FROM abc ORDER by a
 1  1  1
 1  2  2
 2  2  2
+
+# Regression test for #127043 where eager cancellation of the parallel unordered
+# synchronizer was causing spurious errors on queries with LIMIT.
+statement ok
+CREATE TABLE t127043_1 (k1 INT, v1 INT, INDEX (k1));
+INSERT INTO t127043_1 VALUES (1, 1);
+CREATE TABLE t127043_2 (k2 INT, v2 INT, INDEX (k2));
+INSERT INTO t127043_2 VALUES (1, 1);
+CREATE TABLE t127043_3 (k3 INT, v3 INT, INDEX (k3));
+INSERT INTO t127043_3 VALUES (1, 1);
+CREATE VIEW v127043 (k, v) AS
+  SELECT
+    k1 AS k, v1 AS v FROM t127043_1@t127043_1_k1_idx
+  UNION SELECT
+    k2 AS k, v2 AS v FROM t127043_2@t127043_2_k2_idx
+  UNION SELECT
+    k3 AS k, v3 AS v FROM t127043_3@t127043_3_k3_idx;
+
+query II
+SELECT k, v FROM v127043 WHERE k = 1 LIMIT 1;
+----
+1  1

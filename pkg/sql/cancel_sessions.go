@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -49,7 +45,7 @@ func (n *cancelSessionsNode) Next(params runParams) (bool, error) {
 		return false, errors.AssertionFailedf("%q: expected *DString, found %T", datum, datum)
 	}
 
-	sessionID, err := StringToClusterWideID(string(sessionIDString))
+	sessionID, err := clusterunique.IDFromString(string(sessionIDString))
 	if err != nil {
 		return false, pgerror.Wrapf(err, pgcode.Syntax, "invalid session ID %s", datum)
 	}

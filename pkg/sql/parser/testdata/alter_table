@@ -193,6 +193,24 @@ ALTER TABLE a ADD COLUMN b INT8 -- literals removed
 ALTER TABLE _ ADD COLUMN _ INT8 -- identifiers removed
 
 parse
+ALTER TABLE a ADD COLUMN b
+"char"
+----
+ALTER TABLE a ADD COLUMN b "char" -- normalized!
+ALTER TABLE a ADD COLUMN b "char" -- fully parenthesized
+ALTER TABLE a ADD COLUMN b "char" -- literals removed
+ALTER TABLE _ ADD COLUMN _ "char" -- identifiers removed
+
+parse
+ALTER TABLE a ADD COLUMN "b"
+"char"
+----
+ALTER TABLE a ADD COLUMN b "char" -- normalized!
+ALTER TABLE a ADD COLUMN b "char" -- fully parenthesized
+ALTER TABLE a ADD COLUMN b "char" -- literals removed
+ALTER TABLE _ ADD COLUMN _ "char" -- identifiers removed
+
+parse
 ALTER TABLE a ADD IF NOT EXISTS b INT8
 ----
 ALTER TABLE a ADD COLUMN IF NOT EXISTS b INT8 -- normalized!
@@ -506,6 +524,14 @@ ALTER TABLE a ALTER COLUMN b SET ON UPDATE current_timestamp() -- literals remov
 ALTER TABLE _ ALTER COLUMN _ SET ON UPDATE current_timestamp() -- identifiers removed
 
 parse
+ALTER TABLE a ALTER b SET ON UPDATE c IS NOT DISTINCT FROM FALSE
+----
+ALTER TABLE a ALTER COLUMN b SET ON UPDATE c IS false -- normalized!
+ALTER TABLE a ALTER COLUMN b SET ON UPDATE ((c) IS (false)) -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET ON UPDATE c IS NOT DISTINCT FROM _ -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET ON UPDATE _ IS false -- identifiers removed
+
+parse
 ALTER TABLE a ALTER COLUMN b DROP ON UPDATE
 ----
 ALTER TABLE a ALTER COLUMN b DROP ON UPDATE
@@ -732,122 +758,122 @@ ALTER TABLE _._ UNSPLIT AT VALUES ('b', 2) -- identifiers removed
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1)
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1) -- normalized!
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1) -- identifiers removed
+ALTER TABLE a RELOCATE VOTERS VALUES (ARRAY[1], 1) -- normalized!
+ALTER TABLE a RELOCATE VOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
+ALTER TABLE a RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
+ALTER TABLE _ RELOCATE VOTERS VALUES (ARRAY[1], 1) -- identifiers removed
 
 parse
 EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE TABLE b
 ----
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b -- normalized!
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b -- fully parenthesized
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b -- literals removed
-EXPLAIN ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS TABLE _ -- identifiers removed
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- normalized!
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- fully parenthesized
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- literals removed
+EXPLAIN ALTER TABLE _ RELOCATE VOTERS TABLE _ -- identifiers removed
 
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE SELECT * FROM t
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM t -- normalized!
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT (*) FROM t -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM t -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM _ -- identifiers removed
+ALTER TABLE a RELOCATE VOTERS SELECT * FROM t -- normalized!
+ALTER TABLE a RELOCATE VOTERS SELECT (*) FROM t -- fully parenthesized
+ALTER TABLE a RELOCATE VOTERS SELECT * FROM t -- literals removed
+ALTER TABLE _ RELOCATE VOTERS SELECT * FROM _ -- identifiers removed
 
 parse
 ALTER TABLE d.a EXPERIMENTAL_RELOCATE VALUES (ARRAY[1, 2, 3], 'b', 2)
 ----
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- normalized!
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[_, _, __more1__], '_', _) -- literals removed
-ALTER TABLE _._ EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
+ALTER TABLE d.a RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- normalized!
+ALTER TABLE d.a RELOCATE VOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
+ALTER TABLE d.a RELOCATE VOTERS VALUES (ARRAY[_, _, __more1_10__], '_', _) -- literals removed
+ALTER TABLE _._ RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
 
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1)
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1)
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 1) -- identifiers removed
+ALTER TABLE a RELOCATE VOTERS VALUES (ARRAY[1], 1) -- normalized!
+ALTER TABLE a RELOCATE VOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
+ALTER TABLE a RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
+ALTER TABLE _ RELOCATE VOTERS VALUES (ARRAY[1], 1) -- identifiers removed
 
 parse
 EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b
 ----
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b -- fully parenthesized
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS TABLE b -- literals removed
-EXPLAIN ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS TABLE _ -- identifiers removed
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- normalized!
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- fully parenthesized
+EXPLAIN ALTER TABLE a RELOCATE VOTERS TABLE b -- literals removed
+EXPLAIN ALTER TABLE _ RELOCATE VOTERS TABLE _ -- identifiers removed
 
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM t
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM t
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT (*) FROM t -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM t -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE VOTERS SELECT * FROM _ -- identifiers removed
+ALTER TABLE a RELOCATE VOTERS SELECT * FROM t -- normalized!
+ALTER TABLE a RELOCATE VOTERS SELECT (*) FROM t -- fully parenthesized
+ALTER TABLE a RELOCATE VOTERS SELECT * FROM t -- literals removed
+ALTER TABLE _ RELOCATE VOTERS SELECT * FROM _ -- identifiers removed
 
 parse
 ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2)
 ----
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2)
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[_, _, __more1__], '_', _) -- literals removed
-ALTER TABLE _._ EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
+ALTER TABLE d.a RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- normalized!
+ALTER TABLE d.a RELOCATE VOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
+ALTER TABLE d.a RELOCATE VOTERS VALUES (ARRAY[_, _, __more1_10__], '_', _) -- literals removed
+ALTER TABLE _._ RELOCATE VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
 
 parse
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1], 1)
+ALTER TABLE a EXPERIMENTAL_RELOCATE NONVOTERS VALUES (ARRAY[1], 1)
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1], 1)
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[_], _) -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1], 1) -- identifiers removed
+ALTER TABLE a RELOCATE NONVOTERS VALUES (ARRAY[1], 1) -- normalized!
+ALTER TABLE a RELOCATE NONVOTERS VALUES ((ARRAY[(1)]), (1)) -- fully parenthesized
+ALTER TABLE a RELOCATE NONVOTERS VALUES (ARRAY[_], _) -- literals removed
+ALTER TABLE _ RELOCATE NONVOTERS VALUES (ARRAY[1], 1) -- identifiers removed
 
 parse
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS TABLE b
+EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE NONVOTERS TABLE b
 ----
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS TABLE b
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS TABLE b -- fully parenthesized
-EXPLAIN ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS TABLE b -- literals removed
-EXPLAIN ALTER TABLE _ EXPERIMENTAL_RELOCATE NON_VOTERS TABLE _ -- identifiers removed
+EXPLAIN ALTER TABLE a RELOCATE NONVOTERS TABLE b -- normalized!
+EXPLAIN ALTER TABLE a RELOCATE NONVOTERS TABLE b -- fully parenthesized
+EXPLAIN ALTER TABLE a RELOCATE NONVOTERS TABLE b -- literals removed
+EXPLAIN ALTER TABLE _ RELOCATE NONVOTERS TABLE _ -- identifiers removed
 
 parse
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS SELECT * FROM t
+ALTER TABLE a EXPERIMENTAL_RELOCATE NONVOTERS SELECT * FROM t
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS SELECT * FROM t
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS SELECT (*) FROM t -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE NON_VOTERS SELECT * FROM t -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE NON_VOTERS SELECT * FROM _ -- identifiers removed
+ALTER TABLE a RELOCATE NONVOTERS SELECT * FROM t -- normalized!
+ALTER TABLE a RELOCATE NONVOTERS SELECT (*) FROM t -- fully parenthesized
+ALTER TABLE a RELOCATE NONVOTERS SELECT * FROM t -- literals removed
+ALTER TABLE _ RELOCATE NONVOTERS SELECT * FROM _ -- identifiers removed
 
 parse
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2)
+ALTER TABLE d.a EXPERIMENTAL_RELOCATE NONVOTERS VALUES (ARRAY[1, 2, 3], 'b', 2)
 ----
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2)
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[_, _, __more1__], '_', _) -- literals removed
-ALTER TABLE _._ EXPERIMENTAL_RELOCATE NON_VOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
+ALTER TABLE d.a RELOCATE NONVOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- normalized!
+ALTER TABLE d.a RELOCATE NONVOTERS VALUES ((ARRAY[(1), (2), (3)]), ('b'), (2)) -- fully parenthesized
+ALTER TABLE d.a RELOCATE NONVOTERS VALUES (ARRAY[_, _, __more1_10__], '_', _) -- literals removed
+ALTER TABLE _._ RELOCATE NONVOTERS VALUES (ARRAY[1, 2, 3], 'b', 2) -- identifiers removed
 
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE VALUES (1, 1)
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE VALUES (1, 1)
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE VALUES ((1), (1)) -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE VALUES (_, _) -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE LEASE VALUES (1, 1) -- identifiers removed
+ALTER TABLE a RELOCATE LEASE VALUES (1, 1) -- normalized!
+ALTER TABLE a RELOCATE LEASE VALUES ((1), (1)) -- fully parenthesized
+ALTER TABLE a RELOCATE LEASE VALUES (_, _) -- literals removed
+ALTER TABLE _ RELOCATE LEASE VALUES (1, 1) -- identifiers removed
 
 parse
 ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE SELECT * FROM t
 ----
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE SELECT * FROM t
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE SELECT (*) FROM t -- fully parenthesized
-ALTER TABLE a EXPERIMENTAL_RELOCATE LEASE SELECT * FROM t -- literals removed
-ALTER TABLE _ EXPERIMENTAL_RELOCATE LEASE SELECT * FROM _ -- identifiers removed
+ALTER TABLE a RELOCATE LEASE SELECT * FROM t -- normalized!
+ALTER TABLE a RELOCATE LEASE SELECT (*) FROM t -- fully parenthesized
+ALTER TABLE a RELOCATE LEASE SELECT * FROM t -- literals removed
+ALTER TABLE _ RELOCATE LEASE SELECT * FROM _ -- identifiers removed
 
 parse
 ALTER TABLE d.a EXPERIMENTAL_RELOCATE LEASE VALUES (1, 'b', 2)
 ----
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE LEASE VALUES (1, 'b', 2)
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE LEASE VALUES ((1), ('b'), (2)) -- fully parenthesized
-ALTER TABLE d.a EXPERIMENTAL_RELOCATE LEASE VALUES (_, '_', __more1__) -- literals removed
-ALTER TABLE _._ EXPERIMENTAL_RELOCATE LEASE VALUES (1, 'b', 2) -- identifiers removed
+ALTER TABLE d.a RELOCATE LEASE VALUES (1, 'b', 2) -- normalized!
+ALTER TABLE d.a RELOCATE LEASE VALUES ((1), ('b'), (2)) -- fully parenthesized
+ALTER TABLE d.a RELOCATE LEASE VALUES (_, '_', __more1_10__) -- literals removed
+ALTER TABLE _._ RELOCATE LEASE VALUES (1, 'b', 2) -- identifiers removed
 
 parse
 ALTER TABLE a SCATTER
@@ -1106,6 +1132,54 @@ ALTER TABLE t EXPERIMENTAL_AUDIT SET OFF -- fully parenthesized
 ALTER TABLE t EXPERIMENTAL_AUDIT SET OFF -- literals removed
 ALTER TABLE _ EXPERIMENTAL_AUDIT SET OFF -- identifiers removed
 
+parse
+ALTER TABLE t SET (fillfactor = 100, autovacuum_enabled = false)
+----
+ALTER TABLE t SET ('fillfactor' = 100, 'autovacuum_enabled' = false) -- normalized!
+ALTER TABLE t SET ('fillfactor' = (100), 'autovacuum_enabled' = (false)) -- fully parenthesized
+ALTER TABLE t SET ('fillfactor' = _, 'autovacuum_enabled' = _) -- literals removed
+ALTER TABLE _ SET ('fillfactor' = 100, 'autovacuum_enabled' = false) -- identifiers removed
+
+parse
+ALTER TABLE t RESET (fillfactor)
+----
+ALTER TABLE t RESET ('fillfactor') -- normalized!
+ALTER TABLE t RESET ('fillfactor') -- fully parenthesized
+ALTER TABLE t RESET ('fillfactor') -- literals removed
+ALTER TABLE _ RESET ('fillfactor') -- identifiers removed
+
+parse
+ALTER TABLE t RESET (fillfactor, autovacuum_enabled)
+----
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled') -- normalized!
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled') -- fully parenthesized
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled') -- literals removed
+ALTER TABLE _ RESET ('fillfactor', 'autovacuum_enabled') -- identifiers removed
+
+parse
+ALTER TABLE t RESET (fillfactor, autovacuum_enabled, 'string')
+----
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled', 'string') -- normalized!
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled', 'string') -- fully parenthesized
+ALTER TABLE t RESET ('fillfactor', 'autovacuum_enabled', 'string') -- literals removed
+ALTER TABLE _ RESET ('fillfactor', 'autovacuum_enabled', 'string') -- identifiers removed
+
+parse
+ALTER TABLE t SET (exclude_data_from_backup = true)
+----
+ALTER TABLE t SET ('exclude_data_from_backup' = true) -- normalized!
+ALTER TABLE t SET ('exclude_data_from_backup' = (true)) -- fully parenthesized
+ALTER TABLE t SET ('exclude_data_from_backup' = _) -- literals removed
+ALTER TABLE _ SET ('exclude_data_from_backup' = true) -- identifiers removed
+
+parse
+ALTER TABLE t RESET (exclude_data_from_backup)
+----
+ALTER TABLE t RESET ('exclude_data_from_backup') -- normalized!
+ALTER TABLE t RESET ('exclude_data_from_backup') -- fully parenthesized
+ALTER TABLE t RESET ('exclude_data_from_backup') -- literals removed
+ALTER TABLE _ RESET ('exclude_data_from_backup') -- identifiers removed
+
 error
 ALTER PARTITION p OF TABLE tbl@idx CONFIGURE ZONE USING num_replicas = 1
 ----
@@ -1191,7 +1265,7 @@ ALTER TABLE a ADD COLUMN b INT GENERATED BY DEFAULT AS IDENTITY DEFAULT 1
 error
 ALTER TABLE a ADD COLUMN b VARCHAR(12) GENERATED ALWAYS AS IDENTITY
 ----
-at or near "EOF": syntax error: identity column type must be INT, INT2, or INT4
+at or near "EOF": syntax error: identity column type must be an INT
 DETAIL: source SQL:
 ALTER TABLE a ADD COLUMN b VARCHAR(12) GENERATED ALWAYS AS IDENTITY
                                                                    ^
@@ -1199,7 +1273,216 @@ ALTER TABLE a ADD COLUMN b VARCHAR(12) GENERATED ALWAYS AS IDENTITY
 error
 ALTER TABLE a ADD COLUMN b VARCHAR(12) GENERATED BY DEFAULT AS IDENTITY
 ----
-at or near "EOF": syntax error: identity column type must be INT, INT2, or INT4
+at or near "EOF": syntax error: identity column type must be an INT
 DETAIL: source SQL:
 ALTER TABLE a ADD COLUMN b VARCHAR(12) GENERATED BY DEFAULT AS IDENTITY
                                                                        ^
+
+parse
+ALTER TABLE a ALTER COLUMN b TYPE "A Nice Name For A Type 🌠"
+----
+ALTER TABLE a ALTER COLUMN b SET DATA TYPE "A Nice Name For A Type 🌠" -- normalized!
+ALTER TABLE a ALTER COLUMN b SET DATA TYPE "A Nice Name For A Type 🌠" -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET DATA TYPE "A Nice Name For A Type 🌠" -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET DATA TYPE _ -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY 
+----
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY -- literals removed
+ALTER TABLE _ ALTER COLUMN _ ADD GENERATED ALWAYS AS IDENTITY -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY
+----
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY -- literals removed
+ALTER TABLE _ ALTER COLUMN _ ADD GENERATED BY DEFAULT AS IDENTITY -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY (START WITH 10)
+----
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY ( START WITH 10 ) -- normalized!
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY ( START WITH 10 ) -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY ( START WITH 0 ) -- literals removed
+ALTER TABLE _ ALTER COLUMN _ ADD GENERATED ALWAYS AS IDENTITY ( START WITH 10 ) -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY (START WITH 10)
+----
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY ( START WITH 10 ) -- normalized!
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY ( START WITH 10 ) -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY ( START WITH 0 ) -- literals removed
+ALTER TABLE _ ALTER COLUMN _ ADD GENERATED BY DEFAULT AS IDENTITY ( START WITH 10 ) -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET GENERATED ALWAYS
+----
+ALTER TABLE a ALTER COLUMN b SET GENERATED ALWAYS
+ALTER TABLE a ALTER COLUMN b SET GENERATED ALWAYS -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET GENERATED ALWAYS -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET GENERATED ALWAYS -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET GENERATED BY DEFAULT
+----
+ALTER TABLE a ALTER COLUMN b SET GENERATED BY DEFAULT
+ALTER TABLE a ALTER COLUMN b SET GENERATED BY DEFAULT -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET GENERATED BY DEFAULT -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET GENERATED BY DEFAULT -- identifiers removed
+
+
+parse
+ALTER TABLE a ALTER COLUMN b RESTART
+----
+ALTER TABLE a ALTER COLUMN b RESTART
+ALTER TABLE a ALTER COLUMN b RESTART -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b RESTART -- literals removed
+ALTER TABLE _ ALTER COLUMN _ RESTART -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b RESTART 3
+----
+ALTER TABLE a ALTER COLUMN b RESTART 3
+ALTER TABLE a ALTER COLUMN b RESTART 3 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b RESTART 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ RESTART 3 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b RESTART WITH 3
+----
+ALTER TABLE a ALTER COLUMN b RESTART WITH 3
+ALTER TABLE a ALTER COLUMN b RESTART WITH 3 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b RESTART WITH 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ RESTART WITH 3 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET START 3
+----
+ALTER TABLE a ALTER COLUMN b SET START 3
+ALTER TABLE a ALTER COLUMN b SET START 3 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET START 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET START 3 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET START WITH 3
+----
+ALTER TABLE a ALTER COLUMN b SET START WITH 3
+ALTER TABLE a ALTER COLUMN b SET START WITH 3 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET START WITH 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET START WITH 3 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET INCREMENT 2
+----
+ALTER TABLE a ALTER COLUMN b SET INCREMENT 2
+ALTER TABLE a ALTER COLUMN b SET INCREMENT 2 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET INCREMENT 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET INCREMENT 2 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET INCREMENT BY 2
+----
+ALTER TABLE a ALTER COLUMN b SET INCREMENT BY 2
+ALTER TABLE a ALTER COLUMN b SET INCREMENT BY 2 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET INCREMENT BY 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET INCREMENT BY 2 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET MINVALUE 2
+----
+ALTER TABLE a ALTER COLUMN b SET MINVALUE 2
+ALTER TABLE a ALTER COLUMN b SET MINVALUE 2 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET MINVALUE 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET MINVALUE 2 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET NO MINVALUE
+----
+ALTER TABLE a ALTER COLUMN b SET NO MINVALUE
+ALTER TABLE a ALTER COLUMN b SET NO MINVALUE -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET NO MINVALUE -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET NO MINVALUE -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET MAXVALUE 2
+----
+ALTER TABLE a ALTER COLUMN b SET MAXVALUE 2
+ALTER TABLE a ALTER COLUMN b SET MAXVALUE 2 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET MAXVALUE 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET MAXVALUE 2 -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET CYCLE
+----
+ALTER TABLE a ALTER COLUMN b SET CYCLE
+ALTER TABLE a ALTER COLUMN b SET CYCLE -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET CYCLE -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET CYCLE -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET NO CYCLE
+----
+ALTER TABLE a ALTER COLUMN b SET NO CYCLE
+ALTER TABLE a ALTER COLUMN b SET NO CYCLE -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET NO CYCLE -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET NO CYCLE -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b SET CACHE 2
+----
+ALTER TABLE a ALTER COLUMN b SET CACHE 2
+ALTER TABLE a ALTER COLUMN b SET CACHE 2 -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b SET CACHE 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET CACHE 2 -- identifiers removed
+
+parse
+ALTER TABLE alter_opts_generated_as_identity ALTER COLUMN a SET MAXVALUE 40 RESTART WITH 2 SET CACHE 5 SET INCREMENT BY 2;
+----
+ALTER TABLE alter_opts_generated_as_identity ALTER COLUMN a SET MAXVALUE 40 RESTART WITH 2 SET CACHE 5 SET INCREMENT BY 2 -- normalized!
+ALTER TABLE alter_opts_generated_as_identity ALTER COLUMN a SET MAXVALUE 40 RESTART WITH 2 SET CACHE 5 SET INCREMENT BY 2 -- fully parenthesized
+ALTER TABLE alter_opts_generated_as_identity ALTER COLUMN a SET MAXVALUE 0 RESTART WITH 0 SET CACHE 0 SET INCREMENT BY 0 -- literals removed
+ALTER TABLE _ ALTER COLUMN _ SET MAXVALUE 40 RESTART WITH 2 SET CACHE 5 SET INCREMENT BY 2 -- identifiers removed
+
+error
+ALTER TABLE a ALTER COLUMN b SET RESTART
+----
+at or near "EOF": syntax error: sequence option "RESTART" not supported here
+DETAIL: source SQL:
+ALTER TABLE a ALTER COLUMN b SET RESTART
+                                        ^
+
+error
+ALTER TABLE a ALTER COLUMN b SET OWNED BY NONE
+----
+at or near "EOF": syntax error: sequence option "OWNED BY" not supported here
+DETAIL: source SQL:
+ALTER TABLE a ALTER COLUMN b SET OWNED BY NONE
+                                              ^
+
+error
+ALTER TABLE a ALTER COLUMN b SET AS INT8
+----
+at or near "EOF": syntax error: sequence option "AS" not supported here
+DETAIL: source SQL:
+ALTER TABLE a ALTER COLUMN b SET AS INT8
+                                        ^
+
+parse                                      
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY
+----
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY -- literals removed
+ALTER TABLE _ ALTER COLUMN _ DROP IDENTITY -- identifiers removed
+
+parse
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY IF EXISTS
+----
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY IF EXISTS
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY IF EXISTS -- fully parenthesized
+ALTER TABLE a ALTER COLUMN b DROP IDENTITY IF EXISTS -- literals removed
+ALTER TABLE _ ALTER COLUMN _ DROP IDENTITY IF EXISTS -- identifiers removed

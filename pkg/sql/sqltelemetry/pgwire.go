@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -19,7 +14,7 @@ import (
 
 // CancelRequestCounter is to be incremented every time a pgwire-level
 // cancel request is received from a client.
-var CancelRequestCounter = telemetry.GetCounterOnce("pgwire.unimplemented.cancel_request")
+var CancelRequestCounter = telemetry.GetCounterOnce("pgwire.cancel_request")
 
 // UnimplementedClientStatusParameterCounter is to be incremented
 // every time a client attempts to configure a status parameter
@@ -68,3 +63,21 @@ var CloseRequestCounter = telemetry.GetCounterOnce("pgwire.command.close")
 // FlushRequestCounter is to be incremented every time a flush request
 // is made.
 var FlushRequestCounter = telemetry.GetCounterOnce("pgwire.command.flush")
+
+// StmtsTriedWithPausablePortals is to be incremented every time there's a
+// not-internal statement executed with a pgwire portal and the session variable
+// multiple_active_portals_enabled has been set to true.
+// The statement might not satisfy the restriction for a pausable portal.
+var StmtsTriedWithPausablePortals = telemetry.GetCounterOnce("pgwire.pausable_portal_stmts")
+
+// NotReadOnlyStmtsTriedWithPausablePortals is to be incremented every time
+// there's a not-internal not-read-only statement executed with a pgwire portal
+// and the session variable multiple_active_portals_enabled has been set to true.
+// In this case the execution cannot be paused.
+var NotReadOnlyStmtsTriedWithPausablePortals = telemetry.GetCounterOnce("pgwire.pausable_portal_not_read_only_stmts")
+
+// SubOrPostQueryStmtsTriedWithPausablePortals is to be incremented every time
+// there's a not-internal statement with post or sub queries executed with a
+// pgwire portal and the session variable multiple_active_portals_enabled has
+// been set to true. In this case the execution cannot be paused.
+var SubOrPostQueryStmtsTriedWithPausablePortals = telemetry.GetCounterOnce("pgwire.pausable_portal_stmts_with_sub_or_post_queries")

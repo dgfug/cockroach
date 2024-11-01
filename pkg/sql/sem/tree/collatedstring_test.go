@@ -1,20 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-package tree
+package tree_test
 
 import (
 	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,20 +33,24 @@ func TestCastToCollatedString(t *testing.T) {
 	ctx := context.Background()
 	for _, cas := range cases {
 		t.Run("", func(t *testing.T) {
-			expr := &CastExpr{Expr: NewDString("test"), Type: cas.typ, SyntaxMode: CastShort}
-			semaCtx := MakeSemaContext()
+			expr := &tree.CastExpr{
+				Expr:       tree.NewDString("test"),
+				Type:       cas.typ,
+				SyntaxMode: tree.CastShort,
+			}
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
 			typedexpr, err := expr.TypeCheck(ctx, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatal(err)
 			}
-			evalCtx := NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			defer evalCtx.Stop(context.Background())
-			val, err := typedexpr.Eval(evalCtx)
+			val, err := eval.Expr(ctx, evalCtx, typedexpr)
 			if err != nil {
 				t.Fatal(err)
 			}
 			switch v := val.(type) {
-			case *DCollatedString:
+			case *tree.DCollatedString:
 				if v.Locale != cas.typ.Locale() {
 					t.Errorf("expected locale %q but got %q", cas.typ.Locale(), v.Locale)
 				}

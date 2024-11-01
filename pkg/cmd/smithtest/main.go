@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // smithtest is a tool to execute sqlsmith tests on cockroach demo
 // instances. Failures are tracked, de-duplicated, reduced. Issues are
@@ -66,7 +61,6 @@ func main() {
 		reduce:    *reduce,
 		github:    github.NewClient(nil),
 	}
-	rand.Seed(timeutil.Now().UnixNano())
 
 	setup.populateGitHubIssues(ctx)
 
@@ -204,8 +198,10 @@ func (s WorkerSetup) run(ctx context.Context, rnd *rand.Rand) error {
 	fmt.Println("worker started")
 
 	initSQL := sqlsmith.Setups[sqlsmith.RandSetup(rnd)](rnd)
-	if _, err := pgdb.Exec(ctx, initSQL); err != nil {
-		return errors.Wrap(err, "init")
+	for _, stmt := range initSQL {
+		if _, err := pgdb.Exec(ctx, stmt); err != nil {
+			return errors.Wrap(err, "init")
+		}
 	}
 
 	setting := sqlsmith.Settings[sqlsmith.RandSetting(rnd)](rnd)
@@ -288,7 +284,7 @@ func (s WorkerSetup) run(ctx context.Context, rnd *rand.Rand) error {
 // failure de-duplicates, reduces, and files errors. It generally returns nil
 // indicating that this was successfully filed and we should continue looking
 // for errors.
-func (s WorkerSetup) failure(ctx context.Context, initSQL, stmt string, err error) error {
+func (s WorkerSetup) failure(ctx context.Context, initSQL []string, stmt string, err error) error {
 	var message, stack string
 	var pqerr pgconn.PgError
 	if errors.As(err, &pqerr) {
@@ -315,7 +311,7 @@ func (s WorkerSetup) failure(ctx context.Context, initSQL, stmt string, err erro
 		return nil
 	}
 	fmt.Println("found", message)
-	input := fmt.Sprintf("%s\n\n%s;", initSQL, stmt)
+	input := fmt.Sprintf("%s\n\n%s;", strings.Join(initSQL, "\n"), stmt)
 	fmt.Printf("SQL:\n%s\n\n", input)
 
 	// Run reducer.

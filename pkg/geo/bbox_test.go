@@ -1,23 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geo
 
 import (
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/stretchr/testify/require"
-	"github.com/twpayne/go-geom"
+	geom "github.com/twpayne/go-geom"
 )
 
 func TestParseCartesianBoundingBox(t *testing.T) {
@@ -62,6 +59,9 @@ func TestParseCartesianBoundingBox(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, tc.expected, ret)
+				// Test Repr/AppendFormat round trip.
+				require.Equal(t, strings.ToUpper(tc.s), ret.Repr())
+				require.Equal(t, strings.ToUpper(tc.s), string(ret.AppendFormat(nil)))
 			}
 		})
 	}
@@ -184,6 +184,22 @@ func TestBoundingBoxFromGeomT(t *testing.T) {
 		t.Run(fmt.Sprintf("%s: %#v", tc.soType, tc.g), func(t *testing.T) {
 			bbox, err := boundingBoxFromGeomT(tc.g, tc.soType)
 			require.NoError(t, err)
+			// If bbox is within a small epsilon of expected, use the same values.
+			if bbox != nil && tc.expected != nil {
+				const epsilon = 0.000001
+				if math.Abs(bbox.LoX-tc.expected.LoX) < epsilon {
+					bbox.LoX = tc.expected.LoX
+				}
+				if math.Abs(bbox.HiX-tc.expected.HiX) < epsilon {
+					bbox.HiX = tc.expected.HiX
+				}
+				if math.Abs(bbox.LoY-tc.expected.LoY) < epsilon {
+					bbox.LoY = tc.expected.LoY
+				}
+				if math.Abs(bbox.HiY-tc.expected.HiY) < epsilon {
+					bbox.HiY = tc.expected.HiY
+				}
+			}
 			require.Equal(t, tc.expected, bbox)
 		})
 	}
@@ -326,6 +342,118 @@ func TestCartesianBoundingBoxCovers(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			require.Equal(t, tc.expected, tc.a.Covers(tc.b))
+		})
+	}
+}
+
+func TestCartesianBoundingBoxCompare(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		a        *CartesianBoundingBox
+		b        *CartesianBoundingBox
+		expected int
+	}{
+		{
+			desc:     "bounding box equals",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: 0,
+		},
+		{
+			desc:     "bounding box equals NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: math.NaN(), LoY: math.NaN(), HiY: math.NaN()}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: math.NaN(), LoY: math.NaN(), HiY: math.NaN()}},
+			expected: 0,
+		},
+		{
+			desc:     "left bounding box less",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: -1, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "right bounding box less",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 0.9, LoY: 1, HiY: 1}},
+			expected: 1,
+		},
+		{
+			desc:     "left bounding box all NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: math.NaN(), LoY: math.NaN(), HiY: math.NaN()}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "right bounding box all NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: math.NaN(), LoY: math.NaN(), HiY: math.NaN()}},
+			expected: 1,
+		},
+		{
+			desc:     "left bounding box LoX NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "left bounding box HiX NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: math.NaN(), LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "left bounding box LoY NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: math.NaN(), HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "left bounding box HiY NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: math.NaN()}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "right bounding box LoX NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: math.NaN(), HiX: 1, LoY: 0, HiY: 1}},
+			expected: 1,
+		},
+		{
+			desc:     "right bounding box HiX NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: math.NaN(), LoY: 0, HiY: 1}},
+			expected: 1,
+		},
+		{
+			desc:     "right bounding box LoY NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: math.NaN(), HiY: 1}},
+			expected: 1,
+		},
+		{
+			desc:     "right bounding box HiY NaN",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: math.NaN()}},
+			expected: 1,
+		},
+		{
+			desc:     "left bounding box neg inf",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: math.Inf(-1), HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			expected: -1,
+		},
+		{
+			desc:     "right bounding box pos inf",
+			a:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: 1}},
+			b:        &CartesianBoundingBox{BoundingBox: geopb.BoundingBox{LoX: 0, HiX: 1, LoY: 0, HiY: math.Inf(1)}},
+			expected: -1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			require.Equal(t, tc.expected, tc.a.Compare(tc.b))
 		})
 	}
 }

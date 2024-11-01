@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package util
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFastIntMap(t *testing.T) {
@@ -28,6 +24,7 @@ func TestFastIntMap(t *testing.T) {
 		{keyRange: 100, valRange: 100},
 	}
 	for _, tc := range cases {
+		tc := tc // necessary since the tests below run in parallel
 		t.Run(fmt.Sprintf("%d-%d", tc.keyRange, tc.valRange), func(t *testing.T) {
 			t.Parallel() // SAFE FOR TESTING (this comment is for the linter)
 			rng, _ := randutil.NewTestRand()
@@ -43,6 +40,9 @@ func TestFastIntMap(t *testing.T) {
 							"incorrect result for key %d: (%d, %t), expected (%d, %t)",
 							k, v, ok, expV, expOk,
 						)
+					}
+					if !ok {
+						require.Equal(t, -1, v)
 					}
 				}
 

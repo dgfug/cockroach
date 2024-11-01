@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // APIs for distributed SQL; see docs/RFCS/distributed_sql.md
 
@@ -15,7 +10,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "gogoproto/gogo.proto";
 import "google/protobuf/timestamp.proto";
@@ -24,11 +19,16 @@ import "roachpb/data.proto";
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors.proto";
 import "sql/sessiondatapb/session_data.proto";
+import "util/tracing/tracingpb/tracing.proto";
 
 message SetupFlowRequest {
   reserved 1, 2;
 
-  // LeafTxnInputState is the input parameter for the *client.Txn needed for
+  optional util.tracing.tracingpb.TraceInfo trace_info = 11;
+  // JobTag is only populated in distributed flows.
+  optional string job_tag = 13 [(gogoproto.nullable) = false];
+
+  // LeafTxnInputState is the input parameter for the *kv.Txn needed for
   // executing the flow.
   // If nil, the flow will not run in a higher-level transaction
   // (i.e. it is responsible for managing its own transactions, if any). Most
@@ -38,38 +38,46 @@ message SetupFlowRequest {
   // Version of distsqlrun protocol; a server accepts a certain range of
   // versions, up to its own version. See server.go for more details.
   optional uint32 version = 5 [(gogoproto.nullable) = false,
-                               (gogoproto.casttype) = "DistSQLVersion"];
+    (gogoproto.casttype) = "DistSQLVersion"];
 
   optional FlowSpec flow = 3 [(gogoproto.nullable) = false];
 
-  optional EvalContext evalContext = 6 [(gogoproto.nullable) = false];
+  // EvalContext contains a subset of the eval.Context that needs to be sent to
+  // remote nodes for proper execution.
+  optional EvalContext eval_context = 6 [(gogoproto.nullable) = false];
 
-  optional bool TraceKV = 8 [(gogoproto.nullable) = false];
+  optional bool trace_kv = 8 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "TraceKV"];
 
   // CollectStats specifies whether stats collection should be enabled for this
   // flow. Note that some form of tracing must be enabled for these stats to be
   // observed, since the resulting stats are added as structured data to a
   // trace.
-  optional bool CollectStats = 9 [(gogoproto.nullable) = false];
+  optional bool collect_stats = 9 [(gogoproto.nullable) = false];
+
+  // StatementSQL is the SQL statement for which this flow is executing. It
+  // is populated on a best effort basis.
+  optional string statement_sql = 10 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "StatementSQL"];
 }
 
 // FlowSpec describes a "flow" which is a subgraph of a distributed SQL
 // computation consisting of processors and streams.
 message FlowSpec {
   optional bytes flow_id = 1 [(gogoproto.nullable) = false,
-                              (gogoproto.customname) = "FlowID",
-                              (gogoproto.customtype) = "FlowID"];
-  // The NodeID of the gateway that planned this Flow. Used for debugging.
+    (gogoproto.customname) = "FlowID",
+    (gogoproto.customtype) = "FlowID"];
+  // The SQLInstanceID of the gateway that planned this Flow. Used for debugging.
   optional int32 gateway = 3 [(gogoproto.nullable) = false,
-                              (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
 
   repeated ProcessorSpec processors = 2 [(gogoproto.nullable) = false];
 }
 
 // EvalContext is used to marshall some planner.EvalContext members.
 message EvalContext {
-  optional int64 stmtTimestampNanos = 1 [(gogoproto.nullable) = false];
-  optional int64 txnTimestampNanos = 2 [(gogoproto.nullable) = false];
+  optional int64 stmt_timestamp_nanos = 1 [(gogoproto.nullable) = false];
+  optional int64 txn_timestamp_nanos = 2 [(gogoproto.nullable) = false];
   reserved 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14;
   optional sessiondatapb.SessionData session_data = 15 [(gogoproto.nullable) = false];
 }
@@ -116,25 +124,20 @@ message ConsumerHandshake {
   // dealine, this stream will be disconnected by the server-side.
   optional google.protobuf.Timestamp consumer_schedule_deadline = 2 [(gogoproto.stdtime) = true];
 
-  // The server's DistSQL version range.
-  optional uint32 version = 3 [(gogoproto.nullable) = false,
-                               (gogoproto.casttype) = "DistSQLVersion"];
-  optional uint32 min_accepted_version = 4 [(gogoproto.nullable) = false,
-                                            (gogoproto.casttype) = "DistSQLVersion"];
+  reserved 3, 4;
 }
 
-// CancelDeadFlowsRequest is a request to cancel some flows that have been
-// scheduled to run on the receiving node but haven't been started yet (i.e.
-// they are in the queue to be run). This request originates on the node that
-// performed SetupFlow RPC in order to setup flows mentioned in the request.
+// CancelDeadFlowsRequest is a request to cancel some flows that are running on
+// the receiving node. This request originates on the node that performed
+// SetupFlow RPC in order to setup flows mentioned in the request.
 message CancelDeadFlowsRequest {
   // FlowIDs is a list of IDs of flows to be canceled if they are currently in
   // the queue to be scheduled. If a particular flow is not found for any reason
   // in the queue (i.e. it has already completed or is currently running), such
   // flow is ignored.
   repeated bytes flow_ids = 1 [(gogoproto.nullable) = false,
-                              (gogoproto.customname) = "FlowIDs",
-                              (gogoproto.customtype) = "FlowID"];
+    (gogoproto.customname) = "FlowIDs",
+    (gogoproto.customtype) = "FlowID"];
 }
 
 service DistSQL {
@@ -142,10 +145,9 @@ service DistSQL {
   // computation) on the receiving node.
   rpc SetupFlow(SetupFlowRequest) returns (SimpleResponse) {}
 
-  // CancelDeadFlows cancels all specified flows that are currently scheduled to
-  // run on the receiving node but haven't been started yet because the flows
-  // are dead (the client of SetupFlow RPC has abandoned them). Flows that have
-  // been started aren't affected even if mentioned in the request.
+  // CancelDeadFlows cancels all specified flows that are currently running on
+  // the receiving node because the flows are dead (the client of SetupFlow RPC
+  // has encountered an error).
   //
   // This RPC is performed on a best effort basis, so any errors returned from
   // it should be ignored.

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package humanizeutil_test
 
@@ -42,11 +37,11 @@ func TestBytes(t *testing.T) {
 
 	for i, testCase := range testCases {
 		// Test IBytes.
-		if actual := humanizeutil.IBytes(testCase.value); actual != testCase.exp {
+		if actual := string(humanizeutil.IBytes(testCase.value)); actual != testCase.exp {
 			t.Errorf("%d: IBytes(%d) actual:%s does not match expected:%s", i, testCase.value, actual, testCase.exp)
 		}
 		// Test negative IBytes.
-		if actual := humanizeutil.IBytes(-testCase.value); actual != testCase.expNeg {
+		if actual := string(humanizeutil.IBytes(-testCase.value)); actual != testCase.expNeg {
 			t.Errorf("%d: IBytes(%d) actual:%s does not match expected:%s", i, -testCase.value, actual,
 				testCase.expNeg)
 		}

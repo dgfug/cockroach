@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package local
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
@@ -33,10 +29,12 @@ const ProviderName = config.Local
 // Node indexes start at 1.
 //
 // If the cluster name is "local", node 1 directory is:
-//   ${HOME}/local/1
+//
+//	${HOME}/local/1
 //
 // If the cluster name is "local-foo", node 1 directory is:
-//   ${HOME}/local/foo-1
+//
+//	${HOME}/local/foo-1
 //
 // WARNING: when we destroy a local cluster, we remove these directories so it's
 // important that this function never returns things like "" or "/".
@@ -53,11 +51,13 @@ func VMDir(clusterName string, nodeIdx int) string {
 }
 
 // Init initializes the Local provider and registers it into vm.Providers.
-func Init(storage VMStorage) {
+func Init(storage VMStorage) error {
 	vm.Providers[ProviderName] = &Provider{
-		clusters: make(cloud.Clusters),
-		storage:  storage,
+		clusters:    make(cloud.Clusters),
+		storage:     storage,
+		DNSProvider: NewDNSProvider(config.DNSDir, "local-zone"),
 	}
+	return nil
 }
 
 // AddCluster adds the metadata of a local cluster; used when loading the saved
@@ -69,26 +69,31 @@ func AddCluster(cluster *cloud.Cluster) {
 
 // DeleteCluster destroys a local cluster. It assumes that the cockroach
 // processes are stopped.
-func DeleteCluster(name string) error {
+func DeleteCluster(l *logger.Logger, name string) error {
 	p := vm.Providers[ProviderName].(*Provider)
 	c := p.clusters[name]
 	if c == nil {
 		return fmt.Errorf("local cluster %s does not exist", name)
 	}
-	fmt.Printf("Deleting local cluster %s\n", name)
+	l.Printf("Deleting local cluster %s\n", name)
 
 	for i := range c.VMs {
-		if err := os.RemoveAll(VMDir(c.Name, i+1)); err != nil {
+		path := VMDir(c.Name, i+1)
+		if err := os.RemoveAll(path); err != nil {
 			return err
 		}
 	}
 
-	if err := p.storage.DeleteCluster(name); err != nil {
+	if err := p.storage.DeleteCluster(l, name); err != nil {
 		return err
 	}
 
 	delete(p.clusters, name)
-	return nil
+
+	// Local clusters are expected to specifically use the local DNS provider
+	// implementation, and should clean up any DNS records in the local file
+	// system cache.
+	return p.DeleteRecordsBySubdomain(context.Background(), c.Name)
 }
 
 // Clusters returns a list of all known local clusters.
@@ -102,46 +107,147 @@ type VMStorage interface {
 	// SaveCluster saves the metadata for a local cluster. It is expected that
 	// when the program runs again, this same metadata will be reported via
 	// AddCluster.
-	SaveCluster(cluster *cloud.Cluster) error
+	SaveCluster(l *logger.Logger, cluster *cloud.Cluster) error
 
 	// DeleteCluster deletes the metadata for a local cluster.
-	DeleteCluster(name string) error
+	DeleteCluster(l *logger.Logger, name string) error
 }
 
 // A Provider is used to create stub VM objects.
 type Provider struct {
 	clusters cloud.Clusters
-
-	storage VMStorage
+	storage  VMStorage
+	vm.DNSProvider
 }
 
-// No-op implementation of ProviderFlags
-type emptyFlags struct{}
-
-// ConfigureCreateFlags is part of ProviderFlags.  This implementation is a no-op.
-func (o *emptyFlags) ConfigureCreateFlags(flags *pflag.FlagSet) {
+func (p *Provider) SupportsSpotVMs() bool {
+	return false
 }
 
-// ConfigureClusterFlags is part of ProviderFlags.  This implementation is a no-op.
-func (o *emptyFlags) ConfigureClusterFlags(*pflag.FlagSet, vm.MultipleProjectsOption) {
+func (p *Provider) GetPreemptedSpotVMs(
+	l *logger.Logger, vms vm.List, since time.Time,
+) ([]vm.PreemptedVM, error) {
+	return nil, nil
 }
 
-// ConfigureProviderOpts is part of ProviderFlags.  This implementation is a no-op.
-func (o *emptyFlags) ConfigureProviderOpts(newOpts interface{}) {
+func (p *Provider) GetHostErrorVMs(
+	l *logger.Logger, vms vm.List, since time.Time,
+) ([]string, error) {
+	return nil, nil
+}
+
+func (p *Provider) GetVMSpecs(
+	l *logger.Logger, vms vm.List,
+) (map[string]map[string]interface{}, error) {
+	return nil, nil
+}
+
+func (p *Provider) CreateVolumeSnapshot(
+	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
+) (vm.VolumeSnapshot, error) {
+	return vm.VolumeSnapshot{}, nil
+}
+
+func (p *Provider) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
+	return vm.Volume{}, nil
+}
+
+func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
+	return nil
+}
+
+func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
+	return vm.NonBootAttachedVolumes, nil
+}
+
+func (p *Provider) ListVolumeSnapshots(
+	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
+) ([]vm.VolumeSnapshot, error) {
+	return nil, nil
+}
+
+func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+	return nil
+}
+
+func (p *Provider) AttachVolume(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
+	return "", nil
+}
+
+// No-op implementation of vm.ProviderOpts
+type providerOpts struct{}
+
+// ConfigureCreateFlags is part of ProviderOpts.  This implementation is a no-op.
+func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
+}
+
+// ConfigureClusterFlags is part of ProviderOpts.  This implementation is a no-op.
+func (o *providerOpts) ConfigureClusterFlags(*pflag.FlagSet, vm.MultipleProjectsOption) {
+}
+
+// ConfigureClusterCleanupFlags is part of ProviderOpts. This implementation is a no-op.
+func (o *providerOpts) ConfigureClusterCleanupFlags(flags *pflag.FlagSet) {
 }
 
 // CleanSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) CleanSSH() error {
+func (p *Provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) ConfigSSH() error {
+func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	return nil
 }
 
+func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return nil
+}
+
+func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+	return nil
+}
+
+func (p *Provider) CreateLoadBalancer(*logger.Logger, vm.List, int) error {
+	return nil
+}
+
+func (p *Provider) DeleteLoadBalancer(*logger.Logger, vm.List, int) error {
+	return nil
+}
+
+func (p *Provider) ListLoadBalancers(*logger.Logger, vm.List) ([]vm.ServiceAddress, error) {
+	return nil, nil
+}
+
+func (p *Provider) createVM(clusterName string, index int, creationTime time.Time) (vm.VM, error) {
+	cVM := vm.VM{
+		Name:             "localhost",
+		CreatedAt:        creationTime,
+		Lifetime:         time.Hour,
+		PrivateIP:        "127.0.0.1",
+		Provider:         ProviderName,
+		DNSProvider:      ProviderName,
+		ProviderID:       ProviderName,
+		PublicIP:         "127.0.0.1",
+		PublicDNS:        "localhost",
+		RemoteUser:       config.OSUser.Username,
+		VPC:              ProviderName,
+		MachineType:      ProviderName,
+		Zone:             ProviderName,
+		LocalClusterName: clusterName,
+	}
+	path := VMDir(clusterName, index+1)
+	err := os.MkdirAll(path, 0755)
+	if err != nil {
+		return vm.VM{}, err
+	}
+	return cVM, nil
+}
+
 // Create just creates fake host-info entries in the local filesystem
-func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
+func (p *Provider) Create(
+	l *logger.Logger, names []string, opts vm.CreateOpts, unusedProviderOpts vm.ProviderOpts,
+) error {
 	now := timeutil.Now()
 	c := &cloud.Cluster{
 		Name:      opts.ClusterName,
@@ -154,87 +260,75 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		return errors.Errorf("'%s' is not a valid local cluster name", c.Name)
 	}
 
-	// We will need to assign ports to the nodes, and they must not conflict with
-	// any other local clusters.
-	var portsTaken util.FastIntSet
-	for _, c := range p.clusters {
-		for i := range c.VMs {
-			portsTaken.Add(c.VMs[i].SQLPort)
-			portsTaken.Add(c.VMs[i].AdminUIPort)
-		}
-	}
-	sqlPort := config.DefaultSQLPort
-	adminUIPort := config.DefaultAdminUIPort
-
-	// getPort returns the first available port (starting at *port), and modifies
-	// (*port) to be the following value.
-	getPort := func(port *int) int {
-		for portsTaken.Contains(*port) {
-			(*port)++
-		}
-		result := *port
-		portsTaken.Add(result)
-		(*port)++
-		return result
-	}
-
 	for i := range names {
-		c.VMs[i] = vm.VM{
-			Name:             "localhost",
-			CreatedAt:        now,
-			Lifetime:         time.Hour,
-			PrivateIP:        "127.0.0.1",
-			Provider:         ProviderName,
-			ProviderID:       ProviderName,
-			PublicIP:         "127.0.0.1",
-			RemoteUser:       config.OSUser.Username,
-			VPC:              ProviderName,
-			MachineType:      ProviderName,
-			Zone:             ProviderName,
-			SQLPort:          getPort(&sqlPort),
-			AdminUIPort:      getPort(&adminUIPort),
-			LocalClusterName: c.Name,
-		}
-
-		err := os.MkdirAll(VMDir(c.Name, i+1), 0755)
+		var err error
+		c.VMs[i], err = p.createVM(c.Name, i, now)
 		if err != nil {
 			return err
 		}
 	}
-	if err := p.storage.SaveCluster(c); err != nil {
+	if err := p.storage.SaveCluster(l, c); err != nil {
 		return err
 	}
 	p.clusters[c.Name] = c
 	return nil
 }
 
+func (p *Provider) Grow(l *logger.Logger, vms vm.List, clusterName string, names []string) error {
+	now := timeutil.Now()
+	offset := p.clusters[clusterName].VMs.Len()
+	for i := range names {
+		cVM, err := p.createVM(clusterName, i+offset, now)
+		if err != nil {
+			return err
+		}
+		p.clusters[clusterName].VMs = append(p.clusters[clusterName].VMs, cVM)
+	}
+	return p.storage.SaveCluster(l, p.clusters[clusterName])
+}
+
+func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
+	keepCount := p.clusters[clusterName].VMs.Len() - len(vmsToDelete)
+	for i := 0; i < p.clusters[clusterName].VMs.Len(); i++ {
+		if i < keepCount {
+			continue
+		}
+		path := VMDir(clusterName, i+1)
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	p.clusters[clusterName].VMs = p.clusters[clusterName].VMs[:keepCount]
+	return p.storage.SaveCluster(l, p.clusters[clusterName])
+}
+
 // Delete is part of the vm.Provider interface.
-func (p *Provider) Delete(vms vm.List) error {
+func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	panic("DeleteCluster should be used")
 }
 
 // Reset is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) Reset(vms vm.List) error {
+func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 	return nil
 }
 
 // Extend is part of the vm.Provider interface.  This implementation returns an error.
-func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
+func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	return errors.New("local clusters have unlimited lifetime")
 }
 
 // FindActiveAccount is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) FindActiveAccount() (string, error) {
+func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	return "", nil
 }
 
-// Flags is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) Flags() vm.ProviderFlags {
-	return &emptyFlags{}
+// CreateProviderOpts is part of the vm.Provider interface. This implementation is a no-op.
+func (p *Provider) CreateProviderOpts() vm.ProviderOpts {
+	return &providerOpts{}
 }
 
 // List reports all the local cluster "VM" instances.
-func (p *Provider) List() (vm.List, error) {
+func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
 	var result vm.List
 	for _, clusterName := range p.clusters.Names() {
 		c := p.clusters[clusterName]

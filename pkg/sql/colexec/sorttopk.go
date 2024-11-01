@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -47,15 +42,15 @@ func NewTopKSorter(
 		colexecerror.InternalError(errors.AssertionFailedf("invalid matchLen %v", matchLen))
 	}
 	base := &topKSorter{
-		allocator:             allocator,
-		OneInputNode:          colexecop.NewOneInputNode(input),
-		inputTypes:            inputTypes,
-		orderingCols:          orderingCols,
-		k:                     k,
-		hasPartialOrder:       matchLen > 0,
-		matchLen:              matchLen,
-		maxOutputBatchMemSize: maxOutputBatchMemSize,
+		allocator:       allocator,
+		OneInputNode:    colexecop.NewOneInputNode(input),
+		inputTypes:      inputTypes,
+		orderingCols:    orderingCols,
+		k:               k,
+		hasPartialOrder: matchLen > 0,
+		matchLen:        matchLen,
 	}
+	base.helper.Init(allocator, maxOutputBatchMemSize)
 	if base.hasPartialOrder {
 		base.heaper = &topKPartialOrderHeaper{base}
 		partialOrderCols := make([]uint32, matchLen)
@@ -93,7 +88,10 @@ const (
 type topKSorter struct {
 	colexecop.OneInputNode
 	colexecop.InitHelper
+	// allocator is used for the topK append-only buffered batch and the output
+	// batch (the latter via the helper).
 	allocator       *colmem.Allocator
+	helper          colmem.AccountingHelper
 	orderingCols    []execinfrapb.Ordering_Column
 	inputTypes      []*types.T
 	k               uint64
@@ -116,13 +114,13 @@ type topKSorter struct {
 	// sel is a selection vector which specifies an ordering on topK.
 	sel []int
 	// emitted is the count of rows which have been emitted so far.
-	emitted               int
-	output                coldata.Batch
-	maxOutputBatchMemSize int64
+	emitted int
+	output  coldata.Batch
 
 	exportedFromTopK  int
 	exportedFromBatch int
 	windowedBatch     coldata.Batch
+	exportComplete    bool
 
 	// orderState stores fields useful for computing top K for partially ordered inputs.
 	orderState struct {
@@ -148,10 +146,6 @@ func (t *topKSorter) Init(ctx context.Context) {
 	for i, typ := range t.inputTypes {
 		t.comparators[i] = GetVecComparator(typ, 2)
 	}
-	// TODO(yuzefovich): switch to calling this method on allocator. This will
-	// require plumbing unlimited allocator to work correctly in tests with
-	// memory limit of 1.
-	t.windowedBatch = coldata.NewMemBatchNoCols(t.inputTypes, coldata.BatchSize())
 	if t.hasPartialOrder {
 		t.orderState.distincter.Init(t.Ctx)
 		t.orderState.group = make([]int, t.k)
@@ -189,6 +183,9 @@ func (t *topKSorter) Reset(ctx context.Context) {
 	t.firstUnprocessedTupleIdx = 0
 	t.topK.ResetInternalBatch()
 	t.emitted = 0
+	t.exportedFromTopK = 0
+	t.exportedFromBatch = 0
+	t.exportComplete = false
 	if t.hasPartialOrder {
 		t.orderState.distincter.(colexecop.Resetter).Reset(t.Ctx)
 	}
@@ -200,7 +197,7 @@ func (t *topKSorter) emit() coldata.Batch {
 		// We're done.
 		return coldata.ZeroBatch
 	}
-	t.output, _ = t.allocator.ResetMaybeReallocate(t.inputTypes, t.output, toEmit, t.maxOutputBatchMemSize)
+	t.output, _ = t.helper.ResetMaybeReallocate(t.inputTypes, t.output, toEmit)
 	if toEmit > t.output.Capacity() {
 		toEmit = t.output.Capacity()
 	}
@@ -232,6 +229,15 @@ func (t *topKSorter) updateComparators(vecIdx int, batch coldata.Batch) {
 }
 
 func (t *topKSorter) ExportBuffered(colexecop.Operator) coldata.Batch {
+	if t.exportComplete {
+		return coldata.ZeroBatch
+	}
+	if t.windowedBatch == nil {
+		// TODO(yuzefovich): switch to calling this method on allocator. This
+		// will require plumbing unlimited allocator to work correctly in tests
+		// with memory limit of 1.
+		t.windowedBatch = coldata.NewMemBatchNoCols(t.inputTypes, coldata.BatchSize())
+	}
 	topKLen := t.topK.Length()
 	// First, we check whether we have exported all tuples from the topK vector.
 	if t.exportedFromTopK < topKLen {
@@ -257,7 +263,23 @@ func (t *topKSorter) ExportBuffered(colexecop.Operator) coldata.Batch {
 		t.exportedFromBatch = t.windowedBatch.Length()
 		return t.windowedBatch
 	}
+	t.exportComplete = true
 	return coldata.ZeroBatch
+}
+
+// ReleaseBeforeExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (t *topKSorter) ReleaseBeforeExport() {}
+
+// ReleaseAfterExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (t *topKSorter) ReleaseAfterExport(colexecop.Operator) {
+	if t.allocator == nil {
+		// Resources have already been released.
+		return
+	}
+	defer t.allocator.ReleaseAll()
+	*t = topKSorter{exportComplete: true}
 }
 
 // Len is part of heap.Interface and is only meant to be used internally.

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // zipper is the interface to the zip file stored on disk.
@@ -57,6 +53,7 @@ func (z *zipper) close() error {
 // responsible for locking the zipper beforehand.
 // Unsafe for concurrent use otherwise.
 func (z *zipper) createLocked(name string, mtime time.Time) (io.Writer, error) {
+	z.AssertHeld()
 	if mtime.IsZero() {
 		mtime = timeutil.Now()
 	}
@@ -88,12 +85,22 @@ func (z *zipper) createJSON(s *zipReporter, name string, m interface{}) (err err
 	if !strings.HasSuffix(name, ".json") {
 		return s.fail(errors.Errorf("%s does not have .json suffix", name))
 	}
-	s.progress("converting to JSON")
-	b, err := json.MarshalIndent(m, "", "  ")
+	s.progress("writing JSON output: %s", name)
+
+	z.Lock()
+	defer z.Unlock()
+	// Stream directly to file to avoid buffering large amounts of JSON in memory.
+	w, err := z.createLocked(name, time.Time{})
 	if err != nil {
 		return s.fail(err)
 	}
-	return z.createRaw(s, name, b)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(m); err != nil {
+		return s.fail(err)
+	}
+	s.done()
+	return nil
 }
 
 // createError reports an error payload.
@@ -299,7 +306,7 @@ var zipReportingMu syncutil.Mutex
 // progress messages for the zip command.
 type zipReporter struct {
 	// prefix is the string printed at the start of new lines.
-	prefix string
+	prefix redact.RedactableString
 
 	// flowing when set indicates the reporter should attempt to print
 	// progress about a single item of work on the same line of output.
@@ -314,12 +321,16 @@ type zipReporter struct {
 	// withPrefix(), start(), info() are only valid while inItem is false,
 	// whereas progress(), done() and fail() are only valid while inItem is true.
 	inItem bool
+
+	// The file name extension for SQL table contents
+	// retrieved via RunQueryAndFormatResults().
+	sqlOutputFilenameExtension string
 }
 
-func (zc *zipContext) newZipReporter(format string, args ...interface{}) *zipReporter {
+func (zc *zipContext) newZipReporter(prefix redact.RedactableString) *zipReporter {
 	return &zipReporter{
 		flowing: zc.concurrency == 1,
-		prefix:  "[" + fmt.Sprintf(format, args...) + "]",
+		prefix:  "[" + prefix + "]",
 		newline: true,
 		inItem:  false,
 	}
@@ -327,7 +338,7 @@ func (zc *zipContext) newZipReporter(format string, args ...interface{}) *zipRep
 
 // withPrefix creates a reported which adds the provided formatted
 // message as additional prefix at the start of new lines.
-func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporter {
+func (z *zipReporter) withPrefix(prefix redact.RedactableString) *zipReporter {
 	zipReportingMu.Lock()
 	defer zipReportingMu.Unlock()
 
@@ -337,7 +348,7 @@ func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporte
 
 	z.completeprevLocked()
 	return &zipReporter{
-		prefix:  z.prefix + " [" + fmt.Sprintf(format, args...) + "]",
+		prefix:  z.prefix + " [" + prefix + "]",
 		flowing: z.flowing,
 		newline: z.newline,
 	}
@@ -347,7 +358,7 @@ func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporte
 // specific to that unit of work. The caller can call .progress()
 // zero or more times, and complete with .done() / .fail() /
 // .result().
-func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
+func (z *zipReporter) start(description redact.RedactableString) *zipReporter {
 	zipReportingMu.Lock()
 	defer zipReportingMu.Unlock()
 
@@ -356,13 +367,13 @@ func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
 	}
 
 	z.completeprevLocked()
-	msg := z.prefix + " " + fmt.Sprintf(format, args...)
+	msg := z.prefix + " " + description
 	nz := &zipReporter{
 		prefix:  msg,
 		flowing: z.flowing,
 		inItem:  true,
 	}
-	fmt.Print(msg + "...")
+	fmt.Print(msg.StripMarkers() + "...")
 	nz.flowLocked()
 	return nz
 }
@@ -370,7 +381,7 @@ func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
 // flowLocked is used internally by the reporter when progress on a
 // unit of work can be followed with additional output.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) flowLocked() {
 	if !z.flowing {
 		// Prevent multi-line output.
@@ -383,10 +394,11 @@ func (z *zipReporter) flowLocked() {
 // resumeLocked is used internally by the reporter when progress
 // on a unit of work is resuming.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) resumeLocked() {
+	zipReportingMu.AssertHeld()
 	if !z.flowing || z.newline {
-		fmt.Print(z.prefix + ":")
+		fmt.Print(z.prefix.StripMarkers() + ":")
 	}
 	if z.flowing {
 		z.newline = false
@@ -397,8 +409,9 @@ func (z *zipReporter) resumeLocked() {
 // message that needs to stand out on its own is about to be printed,
 // to complete any ongoing output and start a new line.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) completeprevLocked() {
+	zipReportingMu.AssertHeld()
 	if z.flowing && !z.newline {
 		fmt.Println()
 		z.newline = true
@@ -408,8 +421,9 @@ func (z *zipReporter) completeprevLocked() {
 // endlLocked is used internally by the reported when
 // completing a message that needs to stand out on its own.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) endlLocked() {
+	zipReportingMu.AssertHeld()
 	fmt.Println()
 	if z.flowing {
 		z.newline = true
@@ -423,7 +437,7 @@ func (z *zipReporter) info(format string, args ...interface{}) {
 	defer zipReportingMu.Unlock()
 
 	z.completeprevLocked()
-	fmt.Print(z.prefix)
+	fmt.Print(z.prefix.StripMarkers())
 	fmt.Print(" ")
 	fmt.Printf(format, args...)
 	z.endlLocked()
@@ -454,7 +468,7 @@ func (z *zipReporter) shout(format string, args ...interface{}) {
 	defer zipReportingMu.Unlock()
 
 	z.completeprevLocked()
-	fmt.Print(z.prefix + ": ")
+	fmt.Print(z.prefix.StripMarkers() + ": ")
 	fmt.Printf(format, args...)
 	z.endlLocked()
 }
@@ -501,9 +515,10 @@ func (z *zipReporter) result(err error) error {
 // timestampValue is a wrapper around time.Time which supports the
 // pflag.Value interface and can be initialized from a command line flag.
 // It recognizes the following input formats:
-//    YYYY-MM-DD
-//    YYYY-MM-DD HH:MM
-//    YYYY-MM-DD HH:MM:SS
+//
+//	YYYY-MM-DD
+//	YYYY-MM-DD HH:MM
+//	YYYY-MM-DD HH:MM:SS
 type timestampValue time.Time
 
 // Type implements the pflag.Value interface.

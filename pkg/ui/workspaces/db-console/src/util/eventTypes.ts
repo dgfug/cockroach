@@ -1,20 +1,9 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // NOTE: This file is kept in sync manually with sql/event_log.go
-
-import _ from "lodash";
-
-import * as protos from "src/js/protos";
-
-type Event = protos.cockroach.server.serverpb.EventsResponse.Event;
 
 // Recorded when a database is created.
 export const CREATE_DATABASE = "create_database";
@@ -143,6 +132,11 @@ export const UNSAFE_DELETE_NAMESPACE_ENTRY = "unsafe_delete_namespace_entry";
 export const UNSAFE_UPSERT_DESCRIPTOR = "unsafe_upsert_descriptor";
 // Recorded when crdb_internal.unsafe_upsert_namespace_entry is executed.
 export const UNSAFE_UPSERT_NAMESPACE_ENTRY = "unsafe_upsert_namespace_entry";
+// Recorded when a disk slowness event is detected on a store.
+export const DISK_SLOWNESS_DETECTED = "disk_slowness_detected";
+// Recorded when a disk slowness event is no longer detected on a store
+// after having been detected and reported previously.
+export const DISK_SLOWNESS_CLEARED = "disk_slowness_cleared";
 
 // Node Event Types
 export const nodeEvents = [
@@ -151,6 +145,8 @@ export const nodeEvents = [
   NODE_DECOMMISSIONING,
   NODE_DECOMMISSIONED,
   NODE_RECOMMISSIONED,
+  DISK_SLOWNESS_DETECTED,
+  DISK_SLOWNESS_CLEARED,
 ];
 export const databaseEvents = [CREATE_DATABASE, DROP_DATABASE];
 export const tableEvents = [
@@ -180,29 +176,3 @@ export const allEvents = [
   ...settingsEvents,
   ...jobEvents,
 ];
-
-const nodeEventSet = _.invert(nodeEvents);
-const databaseEventSet = _.invert(databaseEvents);
-const tableEventSet = _.invert(tableEvents);
-const settingsEventSet = _.invert(settingsEvents);
-const jobsEventSet = _.invert(jobEvents);
-
-export function isNodeEvent(e: Event): boolean {
-  return !_.isUndefined(nodeEventSet[e.event_type]);
-}
-
-export function isDatabaseEvent(e: Event): boolean {
-  return !_.isUndefined(databaseEventSet[e.event_type]);
-}
-
-export function isTableEvent(e: Event): boolean {
-  return !_.isUndefined(tableEventSet[e.event_type]);
-}
-
-export function isSettingsEvent(e: Event): boolean {
-  return !_.isUndefined(settingsEventSet[e.event_type]);
-}
-
-export function isJobsEvent(e: Event): boolean {
-  return !_.isUndefined(jobsEventSet[e.event_type]);
-}

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geotest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -70,7 +66,7 @@ func TestGenerateRandomPoints(t *testing.T) {
 			rng := rand.New(rand.NewSource(tt.args.seed))
 			got, err := GenerateRandomPoints(tt.args.g, tt.args.nPoints, rng)
 			require.NoError(t, err)
-			require.Equal(t, tt.want, got)
+			geotest.RequireGeometryInEpsilon(t, tt.want, got, 1e-5)
 		})
 	}
 

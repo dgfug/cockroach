@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package idxconstraint_test
 
@@ -19,14 +14,19 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -35,31 +35,31 @@ import (
 //
 //   - index-constraints [arg | arg=val | arg=(val1,val2, ...)]...
 //
-//   Takes a scalar expression, builds a memo for it, and computes index
-//   constraints. Arguments:
+//     Takes a scalar expression, builds a memo for it, and computes index
+//     constraints. Arguments:
 //
-//     - vars=(<column> <type> [not null], ...)
+//   - vars=(<column> <type> [not null], ...)
 //
-//       Information about the columns.
+//     Information about the columns.
 //
-//     - index=(<column> [ascending|asc|descending|desc], ...)
+//   - index=(<column> [ascending|asc|descending|desc], ...)
 //
-//       Information for the index (used by index-constraints).
+//     Information for the index (used by index-constraints).
 //
-//     - nonormalize
+//   - nonormalize
 //
-//       Disable the optimizer normalization rules.
+//     Disable the optimizer normalization rules.
 //
-//     - semtree-normalize
+//   - semtree-normalize
 //
-//       Run TypedExpr normalization before building the memo.
-//
+//     Run TypedExpr normalization before building the memo.
 func TestIndexConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
-		semaCtx := tree.MakeSemaContext()
-		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	datadriven.Walk(t, tu.TestDataPath(t), func(t *testing.T, path string) {
+		ctx := context.Background()
+		semaCtx := tree.MakeSemaContext(nil /* resolver */)
+		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			var sv testutils.ScalarVars
@@ -67,8 +67,10 @@ func TestIndexConstraints(t *testing.T) {
 			var err error
 
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(ctx, &evalCtx, nil /* catalog */)
 			md := f.Metadata()
+
+			evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
 
 			for _, arg := range d.CmdArgs {
 				key, vals := arg.Key, arg.Vals
@@ -110,23 +112,31 @@ func TestIndexConstraints(t *testing.T) {
 				}
 
 				var computedCols map[opt.ColumnID]opt.ScalarExpr
+				var colsInComputedColsExpressions opt.ColSet
 				if sv.ComputedCols() != nil {
 					computedCols = make(map[opt.ColumnID]opt.ScalarExpr)
 					for col, expr := range sv.ComputedCols() {
 						b := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
-						if err := b.Build(expr); err != nil {
+						computedColExpr, err := b.Build(expr)
+						if err != nil {
 							d.Fatalf(t, "error building computed column expression: %v", err)
 						}
-						computedCols[col] = f.Memo().RootExpr().(opt.ScalarExpr)
+						computedCols[col] = computedColExpr
+						var sharedProps props.Shared
+						memo.BuildSharedProps(computedColExpr, &sharedProps, &evalCtx)
+						colsInComputedColsExpressions.UnionWith(sharedProps.OuterCols)
 					}
 				}
 
 				var ic idxconstraint.Instance
 				ic.Init(
-					filters, optionalFilters, indexCols, sv.NotNullCols(), computedCols,
-					true /* consolidate */, &evalCtx, &f,
+					ctx, filters, optionalFilters, indexCols, sv.NotNullCols(), computedCols,
+					colsInComputedColsExpressions,
+					true /* consolidate */, &evalCtx, &f, partition.PrefixSorter{},
+					func() {}, /* checkCancellation */
 				)
-				result := ic.Constraint()
+				var result constraint.Constraint
+				ic.Constraint(&result)
 				var buf bytes.Buffer
 				for i := 0; i < result.Spans.Count(); i++ {
 					fmt.Fprintf(&buf, "%s\n", result.Spans.Get(i))
@@ -134,8 +144,9 @@ func TestIndexConstraints(t *testing.T) {
 				remainingFilter := ic.RemainingFilters()
 				if !remainingFilter.IsTrue() {
 					execBld := execbuilder.New(
-						nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
-						&remainingFilter, &evalCtx, false, /* allowAutoCommit */
+						context.Background(), nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
+						&remainingFilter, &semaCtx, &evalCtx, false, /* allowAutoCommit */
+						false, /* isANSIDML */
 					)
 					expr, err := execBld.BuildScalar()
 					if err != nil {
@@ -214,13 +225,14 @@ func BenchmarkIndexConstraints(b *testing.B) {
 		testCases = append(testCases, tc)
 	}
 
-	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for _, tc := range testCases {
 		b.Run(tc.name, func(b *testing.B) {
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(ctx, &evalCtx, nil /* catalog */)
 			md := f.Metadata()
 			var sv testutils.ScalarVars
 			err := sv.Init(md, strings.Split(tc.vars, ", "))
@@ -238,11 +250,14 @@ func BenchmarkIndexConstraints(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				var ic idxconstraint.Instance
 				ic.Init(
-					filters, nil /* optionalFilters */, indexCols, sv.NotNullCols(),
-					nil /* computedCols */, true, /* consolidate */
-					&evalCtx, &f,
+					ctx, filters, nil /* optionalFilters */, indexCols, sv.NotNullCols(),
+					nil /* computedCols */, opt.ColSet{}, /* colsInComputedColsExpressions */
+					true, /* consolidate */
+					&evalCtx, &f, partition.PrefixSorter{},
+					func() {}, /* checkCancellation */
 				)
-				_ = ic.Constraint()
+				var result constraint.Constraint
+				ic.Constraint(&result)
 				_ = ic.RemainingFilters()
 			}
 		})
@@ -251,7 +266,8 @@ func BenchmarkIndexConstraints(b *testing.B) {
 
 // parseIndexColumns parses descriptions of index columns; each
 // string corresponds to an index column and is of the form:
-//   @id [ascending|asc|descending|desc] [not null]
+//
+//	@id [ascending|asc|descending|desc] [not null]
 func parseIndexColumns(tb testing.TB, md *opt.Metadata, colStrs []string) []opt.OrderingColumn {
 	findCol := func(alias string) opt.ColumnID {
 		for i := 0; i < md.NumColumns(); i++ {
@@ -288,7 +304,7 @@ func parseIndexColumns(tb testing.TB, md *opt.Metadata, colStrs []string) []opt.
 }
 
 func buildFilters(
-	input string, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, f *norm.Factory,
+	input string, semaCtx *tree.SemaContext, evalCtx *eval.Context, f *norm.Factory,
 ) (memo.FiltersExpr, error) {
 	if input == "" {
 		return memo.TrueFilter, nil
@@ -298,10 +314,10 @@ func buildFilters(
 		return memo.FiltersExpr{}, err
 	}
 	b := optbuilder.NewScalar(context.Background(), semaCtx, evalCtx, f)
-	if err := b.Build(expr); err != nil {
+	root, err := b.Build(expr)
+	if err != nil {
 		return memo.FiltersExpr{}, err
 	}
-	root := f.Memo().RootExpr().(opt.ScalarExpr)
 	if _, ok := root.(*memo.TrueExpr); ok {
 		return memo.TrueFilter, nil
 	}

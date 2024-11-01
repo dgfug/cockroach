@@ -1,15 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React from "react";
+
 import { Tooltip, Anchor } from "src/components";
+import { TooltipProps } from "src/components/tooltip/tooltip";
 import {
   keyValuePairs,
   writeIntents,
@@ -17,11 +14,12 @@ import {
   clusterStore,
   capacityMetrics,
 } from "src/util/docs";
-import { TooltipProps } from "src/components/tooltip/tooltip";
 
-export const LiveBytesTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export type CellTooltipProps = {
+  nodeName?: string;
+} & TooltipProps;
+
+export const LiveBytesTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -42,9 +40,7 @@ export const LiveBytesTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const KeyBytesTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const KeyBytesTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -60,9 +56,7 @@ export const KeyBytesTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const ValueBytesTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const ValueBytesTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -70,6 +64,40 @@ export const ValueBytesTooltip: React.FC<TooltipProps & {
       <div className="tooltip__table--title">
         <p>
           Number of bytes stored in values on node{" "}
+          {props.nodeName || "NodeName"}.
+        </p>
+      </div>
+    }
+  >
+    {props.children}
+  </Tooltip>
+);
+
+export const MVCCRangeKeyBytesTooltip: React.FC<CellTooltipProps> = props => (
+  <Tooltip
+    {...props}
+    placement="bottom"
+    title={
+      <div className="tooltip__table--title">
+        <p>
+          Number of bytes stored in MVCC range keys on node{" "}
+          {props.nodeName || "NodeName"}.
+        </p>
+      </div>
+    }
+  >
+    {props.children}
+  </Tooltip>
+);
+
+export const MVCCRangeValueBytesTooltip: React.FC<CellTooltipProps> = props => (
+  <Tooltip
+    {...props}
+    placement="bottom"
+    title={
+      <div className="tooltip__table--title">
+        <p>
+          Number of bytes stored in MVCC range values on node{" "}
           {props.nodeName || "NodeName"}.
         </p>
       </div>
@@ -99,9 +127,7 @@ export const IntentBytesTooltip: React.FC<TooltipProps> = props => (
   </Tooltip>
 );
 
-export const SystemBytesTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const SystemBytesTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -121,9 +147,7 @@ export const SystemBytesTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const NodeUsedCapacityTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const NodeUsedCapacityTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -144,9 +168,9 @@ export const NodeUsedCapacityTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const NodeAvailableCapacityTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const NodeAvailableCapacityTooltip: React.FC<
+  CellTooltipProps
+> = props => (
   <Tooltip
     {...props}
     placement="bottom"
@@ -163,9 +187,7 @@ export const NodeAvailableCapacityTooltip: React.FC<TooltipProps & {
   </Tooltip>
 );
 
-export const NodeMaximumCapacityTooltip: React.FC<TooltipProps & {
-  nodeName: string;
-}> = props => (
+export const NodeMaximumCapacityTooltip: React.FC<CellTooltipProps> = props => (
   <Tooltip
     {...props}
     placement="bottom"

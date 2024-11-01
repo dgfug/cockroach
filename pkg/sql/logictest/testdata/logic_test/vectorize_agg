@@ -55,3 +55,33 @@ NULL NULL
 1    1
 22   22
 33   33
+
+# Regression test for incorrect handling of non-scalar GROUP BY with no
+# aggregate functions (#87619).
+statement ok
+CREATE TABLE t87619 (b) AS SELECT true;
+SET testing_optimizer_random_seed = 3164997759865821235;
+SET testing_optimizer_disable_rule_probability = 0.500000;
+
+query B
+SELECT true FROM t87619 GROUP BY b HAVING b
+----
+true
+
+statement ok
+RESET testing_optimizer_random_seed;
+RESET testing_optimizer_disable_rule_probability;
+
+# Regression test for releasing the memory of datums in the datum-backed vector
+# from the incorrect memory account (#97603).
+statement ok
+CREATE TABLE t97603 (id PRIMARY KEY) AS SELECT generate_series(1, 50000);
+
+# The important bits are to use an aggregate function that is not supported
+# natively in the vectorized engine and to have a projection operator that is
+# producing a datum-backed vector (constant OID projection).
+statement ok
+SELECT
+     var_pop(crdb_internal_mvcc_timestamp::DECIMAL),
+     1:::OID
+FROM t97603 GROUP BY id HAVING bool_or(true)

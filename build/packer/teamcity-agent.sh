@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euxo pipefail
 
 write_teamcity_config() {
@@ -14,76 +20,116 @@ EOF
 
 # Avoid saving any Bash history.
 HISTSIZE=0
+ARCH=$(uname -m)
 
 # Add third-party APT repositories.
 apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0EBFCD88
 cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb https://download.docker.com/linux/ubuntu bionic stable
+deb https://download.docker.com/linux/ubuntu focal stable
 EOF
-# Git 2.7, which ships with Xenial, has a bug where submodule metadata sometimes
-# uses absolute paths instead of relative paths, which means the affected
-# submodules cannot be mounted in Docker containers. Use the latest version of
-# Git until we upgrade to a newer Ubuntu distribution.
+
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+echo 'deb https://packages.cloud.google.com/apt cloud-sdk main' > /etc/apt/sources.list.d/gcloud.list
+
+curl -sLS https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | apt-key add -
+echo "deb https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/azure-cli.list
+
+# Some images come with apt autoupgrade job running at start, let's give it a few minutes to finish to avoid races.
+echo "Sleeping for 3 minutes to allow apt daily cronjob to finish..."
+sleep 3m
+
 add-apt-repository ppa:git-core/ppa
-apt-get update --yes
+apt-get update
 
-# Install the sudo version patched for CVE-2021-3156
-apt-get install --yes sudo
-
+# Installing gnome-keyring prevents the error described in
+# https://github.com/moby/moby/issues/34048
 apt-get install --yes \
   autoconf \
+  azure-cli \
   bison \
   build-essential \
   curl \
   docker-ce \
   docker-compose \
   flex \
-  gnome-keyring \
-  gnupg2 \
   git \
+  gnome-keyring \
+  google-cloud-sdk \
+  google-cloud-cli-gke-gcloud-auth-plugin \
+  gnupg2 \
   jq \
   openjdk-11-jre-headless \
   pass \
-  unzip
+  python2 \
+  python3 \
+  sudo \
+  unzip \
+  zip
 
-curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-3.20.3-linux-x86_64.tar.gz -o /tmp/cmake.tar.gz
+# Enable support for executing binaries of all architectures via qemu emulation
+# (necessary for building arm64 Docker images)
+apt-get install --yes qemu binfmt-support qemu-user-static
+
+# Verify that both of the platforms we support Docker for can be built.
+if [[ $ARCH = x86_64 ]]; then
+    docker run --attach=stdout --attach=stderr --platform=linux/amd64 --rm --pull=always registry.access.redhat.com/ubi9/ubi-minimal uname -p
+    docker run --attach=stdout --attach=stderr --platform=linux/arm64 --rm --pull=always registry.access.redhat.com/ubi9/ubi-minimal uname -p
+fi
+
+case $ARCH in
+    x86_64) WHICH=x86_64; SHASUM=97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6 ;;
+    aarch64) WHICH=aarch64; SHASUM=77620f99e9d5f39cf4a49294c6a68c89a978ecef144894618974b9958efe3c2a ;;
+esac
+curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-3.20.3-linux-$WHICH.tar.gz -o /tmp/cmake.tar.gz
 sha256sum -c - <<EOF
-97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6 /tmp/cmake.tar.gz
+$SHASUM /tmp/cmake.tar.gz
 EOF
 tar --strip-components=1 -C /usr -xzf /tmp/cmake.tar.gz
 rm -f /tmp/cmake.tar.gz
 
-curl -fsSL https://dl.google.com/go/go1.16.6.linux-amd64.tar.gz > /tmp/go.tgz
-sha256sum -c - <<EOF
-be333ef18b3016e9d7cb7b1ff1fdb0cac800ca0be4cf2290fe613b3d069dfe0d /tmp/go.tgz
+# NB: The Go version should match up to the version required by managed-service.
+# CRDB builds use Bazel and therefore have no dependency on the globally-installed Go CLI.
+if [[ $ARCH = x86_64 ]]; then
+    curl -fsSL https://dl.google.com/go/go1.21.3.linux-amd64.tar.gz > /tmp/go.tgz
+    sha256sum -c - <<EOF
+1241381b2843fae5a9707eec1f8fb2ef94d827990582c7c7c32f5bdfbfd420c8  /tmp/go.tgz
 EOF
-tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
+    tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
+    # Explicitly symlink the pinned version to /usr/bin.
+    for f in /usr/local/go/bin/*; do
+        ln -s "$f" /usr/bin
+    done
+fi
 
-# Install the older version in parallel in order to run the acceptance test on older branches
-# TODO: Remove this when 21.1 is EOL
-curl -fsSL https://dl.google.com/go/go1.15.14.linux-amd64.tar.gz > /tmp/go_old.tgz
-sha256sum -c - <<EOF
-6f5410c113b803f437d7a1ee6f8f124100e536cc7361920f7e640fedf7add72d /tmp/go_old.tgz
-EOF
-mkdir -p /usr/local/go1.15
-tar -C /usr/local/go1.15 --strip-components=1 -zxf /tmp/go_old.tgz && rm /tmp/go_old.tgz
-
-# Explicitly symlink the pinned version to /usr/bin.
-for f in `ls /usr/local/go/bin`; do
-    ln -s /usr/local/go/bin/$f /usr/bin
-done
+case $ARCH in
+    x86_64) WHICH=amd64; SHASUM=4cb534c52cdd47a6223d4596d530e7c9c785438ab3b0a49ff347e991c210b2cd ;;
+    aarch64) WHICH=arm64; SHASUM=c1de6860dd4f8d5e2ec270097bd46d6a211b971a0b8b38559784bd051ea950a1 ;;
+esac
 
 # Install Bazelisk.
-# Keep this in sync with `build/bazelbuilder/Dockerfile`.
-curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/bazelisk-linux-amd64 > /tmp/bazelisk
+# Keep this in sync with `build/bazelbuilder/Dockerfile` and `build/bootstrap/bootstrap-debian.sh`.
+curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/bazelisk-linux-$WHICH > /tmp/bazelisk
 sha256sum -c - <<EOF
-4cb534c52cdd47a6223d4596d530e7c9c785438ab3b0a49ff347e991c210b2cd /tmp/bazelisk
+$SHASUM /tmp/bazelisk
 EOF
 chmod +x /tmp/bazelisk
 mv /tmp/bazelisk /usr/bin/bazel
 
-# Installing gnome-keyring prevents the error described in
-# https://github.com/moby/moby/issues/34048
+# Install protoc.
+case $ARCH in
+    x86_64) WHICH=x86_64; SHASUM=ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50 ;;
+    aarch64) WHICH=aarch_64; SHASUM=99975a8c11b83cd65c3e1151ae1714bf959abc0521acb659bf720524276ab0c8 ;;
+esac
+
+curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-$WHICH.zip > /tmp/protoc.zip
+sha256sum -c - <<EOF
+$SHASUM /tmp/protoc.zip
+EOF
+unzip /tmp/protoc.zip -d /tmp/protoc
+rm /tmp/protoc.zip
+mv /tmp/protoc/bin/protoc /usr/bin/protoc
+mv /tmp/protoc/include/google /usr/include/google
+rm -rf /tmp/protoc
 
 # Add a user for the TeamCity agent if it doesn't exist already.
 id -u agent &>/dev/null 2>&1 || adduser agent --disabled-password
@@ -96,12 +142,18 @@ usermod -a -G docker agent
 su - agent <<'EOF'
 set -euxo pipefail
 
+ARCH=$(uname -m)
+
 # Set the default branch name for git. (Out of an abundance of caution because
 # I don't know how well TC handles having a different default branch name, stick
 # with "master".)
 git config --global init.defaultBranch master
 
-echo 'export GOPATH="$HOME"/work/.go' >> .profile && source .profile
+if [ $ARCH = x86_64 ]; then
+    echo 'export GOPATH="$HOME"/work/.go' >> .profile && source .profile
+else
+    GOPATH="$HOME"/work/.go
+fi
 
 wget https://teamcity.cockroachdb.com/update/buildAgent.zip
 unzip buildAgent.zip
@@ -123,26 +175,20 @@ EOS
 # containers.
 repo="$GOPATH"/src/github.com/cockroachdb/cockroach
 git clone --shared system/git/cockroach.git "$repo"
-cd "$repo"
-# Work around a bug in the builder's git version (at the time of writing)
-# which would corrupt the submodule defs. Probably good to remove once the
-# builder uses Ubuntu 18.04 or higher.
-git submodule update --init --recursive
-for branch in $(git branch --all --list --sort=-committerdate 'origin/release-*' | head -n1) master
-do
-  # Clean out all non-checked-in files. This is because of the check-in of
-  # the generated execgen files. Once we are no longer building 20.1 builds,
-  # the `git clean -dxf` line can be removed.
-  git clean -dxf
-
-  git checkout "$branch"
-  # Stupid submodules.
-  rm -rf vendor; git checkout vendor; git submodule update --init --recursive
-  COCKROACH_BUILDER_CCACHE=1 build/builder.sh make test testrace TESTTIMEOUT=45m TESTS=-
-  # TODO(benesch): store the acceptanceversion somewhere more accessible.
-  docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
-done
-cd -
+if [ $ARCH = x86_64 ]; then
+    cd "$repo"
+    # Work around a bug in the builder's git version (at the time of writing)
+    # which would corrupt the submodule defs. Probably good to remove once the
+    # builder uses Ubuntu 18.04 or higher.
+    git submodule update --init --recursive
+    for branch in $(git branch --all --list --sort=-committerdate 'origin/release-*' | head -n2) master
+    do
+        git checkout "$branch"
+        # TODO(benesch): store the acceptanceversion somewhere more accessible.
+        docker pull $(git grep us-east1-docker.pkg.dev/crl-ci-images/cockroach/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
+    done
+    cd -
+fi
 EOF
 write_teamcity_config
 

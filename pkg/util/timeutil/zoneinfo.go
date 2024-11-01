@@ -1,17 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
 import (
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	// embed tzdata in case system tzdata is not available.
 	_ "time/tzdata"
@@ -43,4 +40,19 @@ func LoadLocation(name string) (*time.Location, error) {
 		}
 	}
 	return time.LoadLocation(name)
+}
+
+var tzsOnce sync.Once
+var tzs []string
+
+// TimeZones lists all supported timezones.
+func TimeZones() []string {
+	tzsOnce.Do(func() {
+		tzs = make([]string, 0, len(lowercaseTimezones))
+		for _, tz := range lowercaseTimezones {
+			tzs = append(tzs, tz)
+		}
+		sort.Strings(tzs)
+	})
+	return tzs
 }

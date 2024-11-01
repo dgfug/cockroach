@@ -1,68 +1,57 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import Long from "long";
+
 import {
   Filters,
   getTimeValueInSeconds,
   calculateActiveFilters,
 } from "../queryFilter";
 import { AggregateStatistics } from "../statementsTable";
-import Long from "long";
-import _ from "lodash";
 import {
-  addExecStats,
-  aggregateNumericStats,
-  FixLong,
   longToInt,
-  TimestampToNumber,
   addStatementStats,
   flattenStatementStats,
-  DurationToNumber,
   computeOrUseStmtSummary,
   transactionScopedStatementKey,
+  unset,
 } from "../util";
 
-type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-type Transaction = protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
-type Timestamp = protos.google.protobuf.ITimestamp;
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type Transaction =
+  protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
 
 export const getTrxAppFilterOptions = (
   transactions: Transaction[],
   prefix: string,
 ): string[] => {
-  const defaultAppFilters = [prefix];
   const uniqueAppNames = new Set(
-    transactions
-      .filter(t => !t.stats_data.app.startsWith(prefix))
-      .map(t => (t.stats_data.app ? t.stats_data.app : "(unset)")),
+    transactions.map(t =>
+      t.stats_data.app
+        ? t.stats_data.app.startsWith(prefix)
+          ? prefix
+          : t.stats_data.app
+        : unset,
+    ),
   );
 
-  return defaultAppFilters.concat(Array.from(uniqueAppNames));
+  return Array.from(uniqueAppNames).sort();
 };
-
 export const collectStatementsText = (statements: Statement[]): string =>
   statements.map(s => s.key.key_data.query).join("\n");
 
-export const getStatementsByFingerprintIdAndTime = (
+export const getStatementsByFingerprintId = (
   statementFingerprintIds: Long[],
-  timestamp: Timestamp | null,
   statements: Statement[],
 ): Statement[] => {
-  return statements.filter(
-    s =>
-      (timestamp == null ||
-        (s.key?.aggregated_ts != null &&
-          timestamp.seconds.eq(s.key.aggregated_ts.seconds))) &&
-      statementFingerprintIds.some(id => id.eq(s.id)),
+  return (
+    statements?.filter(s => statementFingerprintIds.some(id => id.eq(s.id))) ||
+    []
   );
 };
 
@@ -100,12 +89,14 @@ export const aggregateStatements = (
     const key = transactionScopedStatementKey(s);
     if (!(key in statsKey)) {
       statsKey[key] = {
+        aggregatedFingerprintID: s.statement_fingerprint_id?.toString(),
+        aggregatedFingerprintHexID: s.statement_fingerprint_id?.toString(16),
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
-        aggregationInterval: s.aggregation_interval,
         implicitTxn: s.implicit_txn,
         database: s.database,
+        applicationName: s.app,
         fullScan: s.full_scan,
         stats: s.stats,
       };
@@ -121,21 +112,39 @@ export const searchTransactionsData = (
   transactions: Transaction[],
   statements: Statement[],
 ): Transaction[] => {
+  let searchTerms = search?.split(" ");
+  // If search term is wrapped by quotes, do the exact search term.
+  if (search?.startsWith('"') && search?.endsWith('"')) {
+    searchTerms = [search.substring(1, search.length - 1)];
+  }
+
+  if (!search) {
+    return transactions;
+  }
+
   return transactions.filter((t: Transaction) =>
-    search.split(" ").every(val =>
-      collectStatementsText(
-        getStatementsByFingerprintIdAndTime(
-          t.stats_data.statement_fingerprint_ids,
-          t.stats_data.aggregated_ts,
-          statements,
-        ),
-      )
-        .toLowerCase()
-        .includes(val.toLowerCase()),
-    ),
+    searchTerms.every(val => {
+      if (
+        collectStatementsText(
+          getStatementsByFingerprintId(
+            t.stats_data.statement_fingerprint_ids,
+            statements,
+          ),
+        )
+          .toLowerCase()
+          .includes(val.toLowerCase())
+      ) {
+        return true;
+      }
+
+      return t.stats_data.transaction_fingerprint_id
+        ?.toString(16)
+        ?.includes(val);
+    }),
   );
 };
 
+// TODO(todd): Remove unused nodeRegions parameter.
 export const filterTransactions = (
   data: Transaction[],
   filters: Filters,
@@ -150,8 +159,8 @@ export const filterTransactions = (
       activeFilters: 0,
     };
   const timeValue = getTimeValueInSeconds(filters);
-  const regions = filters.regions.length > 0 ? filters.regions.split(",") : [];
-  const nodes = filters.nodes.length > 0 ? filters.nodes.split(",") : [];
+  const regions = filters.regions?.length > 0 ? filters.regions.split(",") : [];
+  const nodes = filters.nodes?.length > 0 ? filters.nodes.split(",") : [];
 
   const activeFilters = calculateActiveFilters(filters);
 
@@ -161,68 +170,88 @@ export const filterTransactions = (
   // Current filters: app, service latency, nodes and regions.
   const filteredTransactions = data
     .filter((t: Transaction) => {
-      const isInternal = (t: Transaction) =>
-        t.stats_data.app.startsWith(internalAppNamePrefix);
+      const app = t.stats_data.app;
+      const isInternal = app.startsWith(internalAppNamePrefix);
 
-      if (filters.app && filters.app != "All") {
+      if (filters.app && filters.app !== "All") {
         const apps = filters.app.split(",");
         let showInternal = false;
         if (apps.includes(internalAppNamePrefix)) {
           showInternal = true;
         }
-        if (apps.includes("(unset)")) {
+        if (apps.includes(unset)) {
           apps.push("");
         }
 
         return (
-          (showInternal && isInternal(t)) ||
-          t.stats_data.app === filters.app ||
-          apps.includes(t.stats_data.app)
+          (showInternal && isInternal) ||
+          app === filters.app ||
+          apps.includes(app)
         );
       } else {
-        // We don't want to show internal transactions by default.
-        return !isInternal(t);
+        return true;
       }
     })
     .filter(
       (t: Transaction) =>
-        t.stats_data.stats.service_lat.mean >= timeValue ||
-        timeValue === "empty",
+        timeValue === "empty" ||
+        t.stats_data.stats.service_lat.mean >= Number(timeValue),
     )
     .filter((t: Transaction) => {
-      // The transaction must contain at least one value of the nodes
-      // and regions list (if the list is not empty).
-      if (regions.length == 0 && nodes.length == 0) return true;
-      // If the cluster is a tenant cluster we don't care
-      // about node/regions.
-      if (isTenant) return true;
-      let foundRegion: boolean = regions.length == 0;
-      let foundNode: boolean = nodes.length == 0;
+      // The transaction must contain at least one value of the regions list
+      // (if the list is not empty).
+      if (regions.length === 0) return true;
 
-      getStatementsByFingerprintIdAndTime(
+      return getStatementsByFingerprintId(
         t.stats_data.statement_fingerprint_ids,
-        t.stats_data.aggregated_ts,
         statements,
-      ).some(stmt => {
-        stmt.stats.nodes &&
-          stmt.stats.nodes.some(node => {
-            if (foundRegion || regions.includes(nodeRegions[node.toString()])) {
-              foundRegion = true;
-            }
-            if (foundNode || nodes.includes("n" + node)) {
-              foundNode = true;
-            }
-            if (foundNode && foundRegion) return true;
-          });
-      });
+      ).some(stmt =>
+        stmt.stats.regions?.some(region => regions.includes(region)),
+      );
+    })
+    .filter((t: Transaction) => {
+      // The transaction must contain at least one value of the nodes list
+      // (if the list is not empty).
+      if (nodes.length === 0) return true;
 
-      return foundRegion && foundNode;
+      // If the cluster is a tenant cluster we don't care about nodes.
+      if (isTenant) return true;
+
+      return getStatementsByFingerprintId(
+        t.stats_data.statement_fingerprint_ids,
+        statements,
+      ).some(stmt =>
+        stmt.stats.nodes?.some(node => nodes.includes("n" + node)),
+      );
     });
 
   return {
     transactions: filteredTransactions,
     activeFilters,
   };
+};
+
+/**
+ * For each transaction, generate the list of regions all
+ * its statements were executed on.
+ * E.g. of one element of the list: `gcp-us-east1`
+ * @param transaction: list of transactions.
+ * @param statements: list of all statements collected.
+ */
+export const generateRegion = (
+  transaction: Transaction,
+  statements: Statement[],
+): string[] => {
+  const regions: Set<string> = new Set<string>();
+
+  getStatementsByFingerprintId(
+    transaction.stats_data.statement_fingerprint_ids,
+    statements,
+  ).forEach(stmt => {
+    stmt.stats.regions?.forEach(region => regions.add(region));
+  });
+
+  return Array.from(regions).sort();
 };
 
 /**
@@ -244,9 +273,8 @@ export const generateRegionNode = (
   // nodes and regions of all the statements to a single list of `region: nodes`
   // for the transaction.
   // E.g. {"gcp-us-east1" : [1,3,4]}
-  getStatementsByFingerprintIdAndTime(
+  getStatementsByFingerprintId(
     transaction.stats_data.statement_fingerprint_ids,
-    transaction.stats_data.aggregated_ts,
     statements,
   ).forEach(stmt => {
     stmt.stats.nodes &&
@@ -275,113 +303,4 @@ export const generateRegionNode = (
     );
   });
   return regionNodes;
-};
-
-type TransactionWithFingerprint = Transaction & { fingerprint: string };
-
-// withFingerprint adds the concatenated statement fingerprints to the Transaction object since it
-// only comes with statement_fingerprint_ids
-const withFingerprint = function(
-  t: Transaction,
-  stmts: Statement[],
-): TransactionWithFingerprint {
-  return {
-    ...t,
-    fingerprint: statementFingerprintIdsToText(
-      t.stats_data.statement_fingerprint_ids,
-      stmts,
-    ),
-  };
-};
-
-// addTransactionStats adds together two stat objects into one using their counts to compute a new
-// average for the numeric statistics. It's modeled after the similar `addStatementStats` function
-function addTransactionStats(
-  a: TransactionStats,
-  b: TransactionStats,
-): Required<TransactionStats> {
-  const countA = FixLong(a.count).toInt();
-  const countB = FixLong(b.count).toInt();
-  return {
-    count: a.count.add(b.count),
-    max_retries: a.max_retries.greaterThan(b.max_retries)
-      ? a.max_retries
-      : b.max_retries,
-    num_rows: aggregateNumericStats(a.num_rows, b.num_rows, countA, countB),
-    service_lat: aggregateNumericStats(
-      a.service_lat,
-      b.service_lat,
-      countA,
-      countB,
-    ),
-    retry_lat: aggregateNumericStats(a.retry_lat, b.retry_lat, countA, countB),
-    commit_lat: aggregateNumericStats(
-      a.commit_lat,
-      b.commit_lat,
-      countA,
-      countB,
-    ),
-    rows_read: aggregateNumericStats(a.rows_read, b.rows_read, countA, countB),
-    rows_written: aggregateNumericStats(
-      a.rows_written,
-      b.rows_written,
-      countA,
-      countB,
-    ),
-    bytes_read: aggregateNumericStats(
-      a.bytes_read,
-      b.bytes_read,
-      countA,
-      countB,
-    ),
-    exec_stats: addExecStats(a.exec_stats, b.exec_stats),
-  };
-}
-
-function combineTransactionStats(
-  txnStats: TransactionStats[],
-): TransactionStats {
-  return _.reduce(txnStats, addTransactionStats);
-}
-
-// mergeTransactionStats takes a list of transactions (assuming they're all for the same fingerprint
-// and returns a copy of the first element with its `stats_data.stats` object replaced with a
-// merged stats object that aggregates statistics from every copy of the fingerprint in the list
-// provided
-const mergeTransactionStats = function(txns: Transaction[]): Transaction {
-  if (txns.length === 0) {
-    return null;
-  }
-  const txn = { ...txns[0] };
-  txn.stats_data.stats = combineTransactionStats(
-    txns.map(t => t.stats_data.stats),
-  );
-  return txn;
-};
-
-// aggregateAcrossNodeIDs takes a list of transactions and a list of statements that those
-// transactions reference and returns a list of transactions that have been grouped by their
-// fingerprints and had their statistics aggregated across copies of the transaction. This is used
-// to deduplicate identical copies of the transaction that are run on different nodes. CRDB returns
-// different objects to represent those transactions.
-//
-// The function uses the fingerprint and the `app` that ran the transaction as the key to group the
-// transactions when deduping.
-//
-export const aggregateAcrossNodeIDs = function(
-  t: Transaction[],
-  stmts: Statement[],
-): Transaction[] {
-  return _.chain(t)
-    .map(t => withFingerprint(t, stmts))
-    .groupBy(
-      t =>
-        t.fingerprint +
-        t.stats_data.app +
-        TimestampToNumber(t.stats_data.aggregated_ts) +
-        DurationToNumber(t.stats_data.aggregation_interval),
-    )
-    .mapValues(mergeTransactionStats)
-    .values()
-    .value();
 };

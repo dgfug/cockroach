@@ -1,40 +1,66 @@
-init
+reconfigure
+limit: 1000000000
 rate: 1000
 ----
-Current RUs: 0
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 0
+Average Tokens: 0
 
 update
 1s
 ----
-Current RUs: 1000
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 1000
+Average Tokens: 0
 
 update
 0s
 ----
-Current RUs: 1000
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 1000
+Average Tokens: 0
 
 update
 -5s
 ----
-Current RUs: 1000
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 1000
+Average Tokens: 0
 
 update
 10s
 ----
-Current RUs: 11000
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 11000
+Average Tokens: 0
 
 update
 72h
 ----
-Current RUs: 259211000
+Burst Limit: 1000000000
+Refill Rate: 1000
+Current Tokens: 259211000
+Average Tokens: 0
 
-init
-initial: 1234
+reconfigure
+limit: 10000
 rate: 10
+current: 1234
 ----
-Current RUs: 1234
+Burst Limit: 10000
+Refill Rate: 10
+Current Tokens: 1234
+Average Tokens: 0
 
 update
 10s
 ----
-Current RUs: 1334
+Burst Limit: 10000
+Refill Rate: 10
+Current Tokens: 1334
+Average Tokens: 0

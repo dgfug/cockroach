@@ -1,18 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 
 	"github.com/cockroachdb/errors"
@@ -31,7 +26,7 @@ func extractGroups(path string) ([]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := ioutil.ReadAll(file)
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +88,7 @@ func main() {
 			prelude := "# GENERATED FILE - DO NOT EDIT\n"
 			outBytes = append([]byte(prelude), outBytes...)
 
-			return ioutil.WriteFile(outFile, outBytes, 0666)
+			return os.WriteFile(outFile, outBytes, 0666)
 		},
 	}
 	rootCmd.Flags().StringVarP(&outFile, "out", "o", "", "The output file")

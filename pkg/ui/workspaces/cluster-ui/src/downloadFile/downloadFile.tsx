@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React, {
   useRef,
@@ -15,16 +10,13 @@ import React, {
   useImperativeHandle,
 } from "react";
 
-type FileTypes = "text/plain" | "application/json";
-
 export interface DownloadAsFileProps {
   fileName?: string;
-  fileType?: FileTypes;
-  content?: string;
+  content?: Blob;
 }
 
 export interface DownloadFileRef {
-  download: (name: string, type: FileTypes, body: string) => void;
+  download: (name: string, body: Blob) => void;
 }
 
 /*
@@ -58,13 +50,12 @@ export interface DownloadFileRef {
 // tslint:disable-next-line:variable-name
 export const DownloadFile = forwardRef<DownloadFileRef, DownloadAsFileProps>(
   (props, ref) => {
-    const { children, fileName, fileType, content } = props;
+    const { children, fileName, content } = props;
     const anchorRef = useRef<HTMLAnchorElement>();
 
-    const bootstrapFile = (name: string, type: FileTypes, body: string) => {
+    const bootstrapFile = (name: string, body: Blob) => {
       const anchorElement = anchorRef.current;
-      const file = new Blob([body], { type });
-      anchorElement.href = URL.createObjectURL(file);
+      anchorElement.href = URL.createObjectURL(body);
       anchorElement.download = name;
     };
 
@@ -72,12 +63,12 @@ export const DownloadFile = forwardRef<DownloadFileRef, DownloadAsFileProps>(
       if (content === undefined) {
         return;
       }
-      bootstrapFile(fileName, fileType, content);
-    }, [fileName, fileType, content]);
+      bootstrapFile(fileName, content);
+    }, [fileName, content]);
 
     useImperativeHandle(ref, () => ({
-      download: (name: string, type: FileTypes, body: string) => {
-        bootstrapFile(name, type, body);
+      download: (name: string, body: Blob) => {
+        bootstrapFile(name, body);
         anchorRef.current.click();
       },
     }));

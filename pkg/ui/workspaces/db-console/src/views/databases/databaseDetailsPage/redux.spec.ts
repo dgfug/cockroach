@@ -1,29 +1,25 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import assert from "assert";
-import { createMemoryHistory } from "history";
-import _ from "lodash";
-import Long from "long";
-import { RouteComponentProps } from "react-router-dom";
-import { bindActionCreators, Store } from "redux";
 import {
   DatabaseDetailsPageActions,
   DatabaseDetailsPageData,
-  DatabaseDetailsPageDataTableDetails,
-  DatabaseDetailsPageDataTableStats,
+  DatabaseDetailsPageDataTable,
+  defaultFilters,
+  ViewMode,
+  api as clusterUiApi,
 } from "@cockroachlabs/cluster-ui";
+import { createMemoryHistory } from "history";
+import moment from "moment-timezone";
+import { RouteComponentProps } from "react-router-dom";
+import { bindActionCreators, Store } from "redux";
 
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
-import { databaseNameAttr } from "src/util/constants";
+import { databaseNameAttr, indexUnusedDuration } from "src/util/constants";
 import * as fakeApi from "src/util/fakeApi";
+
 import { mapStateToProps, mapDispatchToProps } from "./redux";
 
 function fakeRouteComponentProps(
@@ -53,7 +49,10 @@ class TestDriver {
   private readonly actions: DatabaseDetailsPageActions;
   private readonly properties: () => DatabaseDetailsPageData;
 
-  constructor(store: Store<AdminUIState>, private readonly database: string) {
+  constructor(
+    store: Store<AdminUIState>,
+    private readonly database: string,
+  ) {
     this.actions = bindActionCreators(
       mapDispatchToProps,
       store.dispatch.bind(store),
@@ -66,117 +65,196 @@ class TestDriver {
   }
 
   assertProperties(expected: DatabaseDetailsPageData) {
-    assert.deepEqual(this.properties(), expected);
+    expect(this.properties()).toEqual(expected);
   }
 
-  assertTableDetails(
-    name: string,
-    expected: DatabaseDetailsPageDataTableDetails,
-  ) {
-    assert.deepEqual(this.findTable(name).details, expected);
+  assertTableDetails(name: string, expected: DatabaseDetailsPageDataTable) {
+    // We destructure the expected and actual payloads to extract the field
+    // with Moment type. Moment types cannot be compared using toEqual or toBe,
+    // we need to use moment's isSame function.
+    const {
+      details: { statsLastUpdated, ...restDetails },
+      ...table
+    } = this.findTable(name);
+    const {
+      details: {
+        statsLastUpdated: expectedStatsLastUpdated,
+        ...expectedRestDetails
+      },
+      ...expectedTable
+    } = expected;
+    // Expect table data to be equal (name/loading/loaded/lastError).
+    expect(table).toEqual(expectedTable);
+    // Expect remaining details fields to be equal.
+    expect(restDetails).toEqual(expectedRestDetails);
+    // Expect Moment type field to be equal.
+    expect(
+      // Moments are the same
+      moment(statsLastUpdated.stats_last_created_at).isSame(
+        expectedStatsLastUpdated.stats_last_created_at,
+      ) ||
+        // Moments are null.
+        (statsLastUpdated.stats_last_created_at ===
+          expectedStatsLastUpdated.stats_last_created_at &&
+          statsLastUpdated.stats_last_created_at === null),
+    ).toBe(true);
   }
 
   assertTableRoles(name: string, expected: string[]) {
-    assert.deepEqual(this.findTable(name).details.roles, expected);
+    expect(this.findTable(name).details.grants.roles).toEqual(expected);
   }
 
   assertTableGrants(name: string, expected: string[]) {
-    assert.deepEqual(this.findTable(name).details.grants, expected);
-  }
-
-  assertTableStats(name: string, expected: DatabaseDetailsPageDataTableStats) {
-    assert.deepEqual(this.findTable(name).stats, expected);
+    expect(this.findTable(name).details.grants.privileges).toEqual(expected);
   }
 
   async refreshDatabaseDetails() {
-    return this.actions.refreshDatabaseDetails(this.database);
+    return this.actions.refreshDatabaseDetails(
+      this.database,
+      indexUnusedDuration,
+    );
   }
 
   async refreshTableDetails(table: string) {
-    return this.actions.refreshTableDetails(this.database, table);
+    return this.actions.refreshTableDetails(
+      this.database,
+      table,
+      indexUnusedDuration,
+    );
   }
 
-  async refreshTableStats(table: string) {
-    return this.actions.refreshTableStats(this.database, table);
+  async refreshNodes() {
+    return this.actions.refreshNodes();
   }
 
   private findTable(name: string) {
-    return _.find(this.properties().tables, { name });
+    return this.properties().tables.find(
+      t => t.name.qualifiedNameWithSchemaAndTable === name,
+    );
   }
 }
 
-describe("Database Details Page", function() {
+describe("Database Details Page", function () {
   let driver: TestDriver;
 
-  beforeEach(function() {
+  beforeEach(function () {
     driver = new TestDriver(
       createAdminUIStore(createMemoryHistory()),
       "things",
     );
   });
 
-  afterEach(function() {
+  afterEach(function () {
     fakeApi.restore();
   });
 
-  it("starts in a pre-loading state", function() {
+  it("starts in a pre-loading state", function () {
     driver.assertProperties({
       loading: false,
       loaded: false,
+      requestError: undefined,
+      queryError: undefined,
       name: "things",
+      search: null,
+      filters: defaultFilters,
+      nodeRegions: {},
+      isTenant: false,
       showNodeRegionsColumn: false,
+      viewMode: ViewMode.Tables,
+      sortSettingTables: { ascending: true, columnTitle: "name" },
+      sortSettingGrants: { ascending: true, columnTitle: "name" },
       tables: [],
+      showIndexRecommendations: false,
+      csIndexUnusedDuration: indexUnusedDuration,
     });
   });
 
-  it("makes a row for each table", async function() {
-    fakeApi.stubDatabaseDetails("things", {
-      table_names: ["foo", "bar"],
-    });
+  it("makes a row for each table", async function () {
+    fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
+      [
+        // Id
+        { rows: [] },
+        // Grants
+        { rows: [] },
+        // Tables
+        {
+          rows: [
+            { table_schema: "public", table_name: "foo" },
+            { table_schema: "public", table_name: "bar" },
+          ],
+        },
+      ],
+    );
 
     await driver.refreshDatabaseDetails();
-
     driver.assertProperties({
       loading: false,
       loaded: true,
+      requestError: null,
+      queryError: undefined,
       name: "things",
+      search: null,
+      filters: defaultFilters,
+      nodeRegions: {},
+      isTenant: false,
       showNodeRegionsColumn: false,
+      showIndexRecommendations: false,
+      csIndexUnusedDuration: indexUnusedDuration,
+      viewMode: ViewMode.Tables,
+      sortSettingTables: { ascending: true, columnTitle: "name" },
+      sortSettingGrants: { ascending: true, columnTitle: "name" },
       tables: [
         {
-          name: "foo",
-          details: {
-            loading: false,
-            loaded: false,
-            columnCount: 0,
-            indexCount: 0,
-            userCount: 0,
-            roles: [],
-            grants: [],
+          name: {
+            schema: "public",
+            table: "foo",
+            qualifiedNameWithSchemaAndTable: `"public"."foo"`,
           },
-          stats: {
-            loading: false,
-            loaded: false,
-            replicationSizeInBytes: 0,
-            rangeCount: 0,
+          qualifiedDisplayName: `public.foo`,
+          loading: false,
+          loaded: false,
+          requestError: undefined,
+          queryError: undefined,
+          details: {
+            schemaDetails: undefined,
+            grants: {
+              error: undefined,
+              roles: [],
+              privileges: [],
+            },
+            statsLastUpdated: undefined,
+            indexStatRecs: undefined,
+            spanStats: undefined,
+            nodes: [],
             nodesByRegionString: "",
           },
         },
         {
-          name: "bar",
-          details: {
-            loading: false,
-            loaded: false,
-            columnCount: 0,
-            indexCount: 0,
-            userCount: 0,
-            roles: [],
-            grants: [],
+          name: {
+            schema: "public",
+            table: "bar",
+            qualifiedNameWithSchemaAndTable: `"public"."bar"`,
           },
-          stats: {
-            loading: false,
-            loaded: false,
-            replicationSizeInBytes: 0,
-            rangeCount: 0,
+          qualifiedDisplayName: `public.bar`,
+          loading: false,
+          loaded: false,
+          requestError: undefined,
+          queryError: undefined,
+          details: {
+            schemaDetails: undefined,
+            grants: {
+              error: undefined,
+              roles: [],
+              privileges: [],
+            },
+            statsLastUpdated: undefined,
+            indexStatRecs: undefined,
+            spanStats: undefined,
+            nodes: [],
             nodesByRegionString: "",
           },
         },
@@ -184,77 +262,275 @@ describe("Database Details Page", function() {
     });
   });
 
-  it("loads table details", async function() {
-    fakeApi.stubDatabaseDetails("things", {
-      table_names: ["foo", "bar"],
-    });
-
-    fakeApi.stubTableDetails("things", "foo", {
-      grants: [
-        { user: "admin", privileges: ["CREATE"] },
-        { user: "public", privileges: ["SELECT"] },
+  it("loads table details", async function () {
+    fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
+      [
+        // Id
+        { rows: [] },
+        // Grants
+        { rows: [] },
+        // Tables
+        {
+          rows: [
+            { table_schema: "public", table_name: "foo" },
+            { table_schema: "public", table_name: "bar" },
+          ],
+        },
       ],
-      // The actual contents below don't matter to us; we just count them.
-      columns: [{}, {}, {}, {}, {}],
-      indexes: [{}, {}, {}],
-    });
+    );
+    const mockStatsLastCreatedTimestamp = moment();
 
-    fakeApi.stubTableDetails("things", "bar", {
-      grants: [
-        { user: "root", privileges: ["ALL"] },
-        { user: "app", privileges: ["INSERT"] },
-        { user: "data", privileges: ["SELECT"] },
+    fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
+      [
+        // Table ID query
+        { rows: [{ table_id: "1" }] },
+        // Table grants query
+        {
+          rows: [
+            { user: "admin", privileges: ["CREATE"] },
+            { user: "public", privileges: ["SELECT"] },
+          ],
+        },
+        // Table schema details query
+        { rows: [{ columns: ["a", "b", "c"], indexes: ["d", "e"] }] },
+        // Table create statement query
+        {},
+        // Table zone config statement query
+        {},
+        // Table heuristics query
+        { rows: [{ stats_last_created_at: mockStatsLastCreatedTimestamp }] },
+        // Table span stats query
+        {
+          rows: [
+            {
+              approximate_disk_bytes: 100,
+              live_bytes: 200,
+              total_bytes: 400,
+              range_count: 400,
+              live_percentage: 0.5,
+            },
+          ],
+        },
+        // Table index usage statistics query
+        {
+          rows: [
+            {
+              last_read: new Date().toISOString(),
+              created_at: new Date().toISOString(),
+              unused_threshold: "1m",
+            },
+          ],
+        },
+        // Table zone config query
+        {},
+        // Table replicas query
+        {
+          rows: [{ store_ids: [1, 2, 3], replica_count: 5 }],
+        },
       ],
-      // The actual contents below don't matter to us; we just count them.
-      columns: [{}, {}, {}, {}],
-      indexes: [{}, {}],
+    );
+
+    fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."bar"`,
+        indexUnusedDuration,
+      ),
+      [
+        // Table ID query
+        { rows: [{ table_id: "2" }] },
+        // Table grants query
+        {
+          rows: [
+            { user: "root", privileges: ["ALL"] },
+            { user: "app", privileges: ["INSERT"] },
+            { user: "data", privileges: ["SELECT"] },
+          ],
+        },
+        // Table schema details query
+        { rows: [{ columns: ["a", "b"], indexes: ["c", "d", "e", "f"] }] },
+        // Table create statement query
+        {},
+        // Table zone config statement query
+        {},
+        // Table heuristics query
+        { rows: [{ stats_last_created_at: null }] },
+        // Table span stats query
+        {
+          rows: [
+            {
+              approximate_disk_bytes: 10,
+              live_bytes: 100,
+              total_bytes: 100,
+              range_count: 50,
+              live_percentage: 1,
+            },
+          ],
+        },
+        // Table index usage statistics query
+        {
+          rows: [],
+        },
+        // Table zone config query
+        {},
+        // Table replicas query
+        {
+          rows: [{ store_ids: [1, 2, 3, 4, 5], replica_count: 5 }],
+        },
+      ],
+    );
+
+    fakeApi.stubNodesUI({
+      nodes: [...Array(5).keys()].map(node_id => {
+        return {
+          desc: {
+            node_id: node_id + 1, // 1-index offset.
+            locality: {
+              tiers: [
+                {
+                  key: "region",
+                  value: "gcp-us-east1",
+                },
+              ],
+            },
+          },
+          store_statuses: [{ desc: { store_id: node_id + 1 } }],
+        };
+      }),
     });
 
     await driver.refreshDatabaseDetails();
-    await driver.refreshTableDetails("foo");
-    await driver.refreshTableDetails("bar");
+    await driver.refreshTableDetails(`"public"."foo"`);
+    await driver.refreshTableDetails(`"public"."bar"`);
+    await driver.refreshNodes();
 
-    driver.assertTableDetails("foo", {
+    driver.assertTableDetails(`"public"."foo"`, {
+      name: {
+        schema: "public",
+        table: "foo",
+        qualifiedNameWithSchemaAndTable: `"public"."foo"`,
+      },
+      qualifiedDisplayName: `public.foo`,
       loading: false,
       loaded: true,
-      columnCount: 5,
-      indexCount: 3,
-      userCount: 2,
-      roles: ["admin", "public"],
-      grants: ["CREATE", "SELECT"],
+      requestError: null,
+      queryError: undefined,
+      details: {
+        schemaDetails: {
+          columns: ["a", "b", "c"],
+          indexes: ["d", "e"],
+        },
+        grants: {
+          error: undefined,
+          roles: ["admin", "public"],
+          privileges: ["CREATE", "SELECT"],
+        },
+        statsLastUpdated: {
+          stats_last_created_at: mockStatsLastCreatedTimestamp,
+        },
+        indexStatRecs: { has_index_recommendations: true },
+        spanStats: {
+          approximate_disk_bytes: 100,
+          live_bytes: 200,
+          total_bytes: 400,
+          range_count: 400,
+          live_percentage: 0.5,
+        },
+        nodes: [1, 2, 3],
+        nodesByRegionString: "gcp-us-east1(n1,n2,n3)",
+      },
     });
 
-    driver.assertTableDetails("bar", {
+    driver.assertTableDetails(`"public"."bar"`, {
+      name: {
+        schema: "public",
+        table: "bar",
+        qualifiedNameWithSchemaAndTable: `"public"."bar"`,
+      },
+      qualifiedDisplayName: `public.bar`,
       loading: false,
       loaded: true,
-      columnCount: 4,
-      indexCount: 2,
-      userCount: 3,
-      roles: ["root", "app", "data"],
-      grants: ["ALL", "SELECT", "INSERT"],
+      requestError: null,
+      queryError: undefined,
+      details: {
+        schemaDetails: {
+          columns: ["a", "b"],
+          indexes: ["c", "d", "e", "f"],
+        },
+        grants: {
+          error: undefined,
+          roles: ["root", "app", "data"],
+          privileges: ["ALL", "SELECT", "INSERT"],
+        },
+        statsLastUpdated: { stats_last_created_at: null },
+        indexStatRecs: { has_index_recommendations: false },
+        spanStats: {
+          live_percentage: 1,
+          live_bytes: 100,
+          total_bytes: 100,
+          range_count: 50,
+          approximate_disk_bytes: 10,
+        },
+        nodes: [1, 2, 3, 4, 5],
+        nodesByRegionString: "gcp-us-east1(n1,n2,n3,n4,n5)",
+      },
     });
   });
 
-  it("sorts roles meaningfully", async function() {
-    fakeApi.stubDatabaseDetails("things", {
-      table_names: ["foo"],
-    });
-
-    fakeApi.stubTableDetails("things", "foo", {
-      grants: [
-        { user: "bzuckercorn", privileges: ["ALL"] },
-        { user: "bloblaw", privileges: ["ALL"] },
-        { user: "jwweatherman", privileges: ["ALL"] },
-        { user: "admin", privileges: ["ALL"] },
-        { user: "public", privileges: ["ALL"] },
-        { user: "root", privileges: ["ALL"] },
+  it("sorts roles meaningfully", async function () {
+    fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
+      [
+        // Id
+        { rows: [] },
+        // Grants
+        { rows: [] },
+        // Tables
+        {
+          rows: [{ table_schema: "public", table_name: "foo" }],
+        },
       ],
-    });
+    );
+
+    fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
+      [
+        // Table ID query
+        {},
+        // Table grants query
+        {
+          rows: [
+            { user: "bzuckercorn", privileges: ["ALL"] },
+            { user: "bloblaw", privileges: ["ALL"] },
+            { user: "jwweatherman", privileges: ["ALL"] },
+            { user: "admin", privileges: ["ALL"] },
+            { user: "public", privileges: ["ALL"] },
+            { user: "root", privileges: ["ALL"] },
+          ],
+        },
+      ],
+    );
 
     await driver.refreshDatabaseDetails();
-    await driver.refreshTableDetails("foo");
+    await driver.refreshTableDetails(`"public"."foo"`);
 
-    driver.assertTableRoles("foo", [
+    driver.assertTableRoles(`"public"."foo"`, [
       "root",
       "admin",
       "public",
@@ -264,28 +540,53 @@ describe("Database Details Page", function() {
     ]);
   });
 
-  it("sorts grants meaningfully", async function() {
-    fakeApi.stubDatabaseDetails("things", {
-      table_names: ["foo"],
-    });
-
-    fakeApi.stubTableDetails("things", "foo", {
-      grants: [
+  it("sorts grants meaningfully", async function () {
+    fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
+      [
+        // Id
+        { rows: [] },
+        // Grants
+        { rows: [] },
+        // Tables
         {
-          user: "admin",
-          privileges: ["ALL", "CREATE", "DELETE", "DROP", "GRANT"],
-        },
-        {
-          user: "public",
-          privileges: ["DROP", "GRANT", "INSERT", "SELECT", "UPDATE"],
+          rows: [{ table_schema: "public", table_name: "foo" }],
         },
       ],
-    });
+    );
+
+    fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
+      [
+        // Table ID query
+        {},
+        // Table grants query
+        {
+          rows: [
+            {
+              user: "admin",
+              privileges: ["ALL", "CREATE", "DELETE", "DROP", "GRANT"],
+            },
+            {
+              user: "public",
+              privileges: ["DROP", "GRANT", "INSERT", "SELECT", "UPDATE"],
+            },
+          ],
+        },
+      ],
+    );
 
     await driver.refreshDatabaseDetails();
-    await driver.refreshTableDetails("foo");
+    await driver.refreshTableDetails(`"public"."foo"`);
 
-    driver.assertTableGrants("foo", [
+    driver.assertTableGrants(`"public"."foo"`, [
       "ALL",
       "CREATE",
       "DROP",
@@ -295,41 +596,5 @@ describe("Database Details Page", function() {
       "UPDATE",
       "DELETE",
     ]);
-  });
-
-  it("loads table stats", async function() {
-    fakeApi.stubDatabaseDetails("things", {
-      table_names: ["foo", "bar"],
-    });
-
-    fakeApi.stubTableStats("things", "foo", {
-      range_count: new Long(4200),
-      approximate_disk_bytes: new Long(44040192),
-    });
-
-    fakeApi.stubTableStats("things", "bar", {
-      range_count: new Long(1023),
-      approximate_disk_bytes: new Long(8675309),
-    });
-
-    await driver.refreshDatabaseDetails();
-    await driver.refreshTableStats("foo");
-    await driver.refreshTableStats("bar");
-
-    driver.assertTableStats("foo", {
-      loading: false,
-      loaded: true,
-      replicationSizeInBytes: 44040192,
-      rangeCount: 4200,
-      nodesByRegionString: "",
-    });
-
-    driver.assertTableStats("bar", {
-      loading: false,
-      loaded: true,
-      replicationSizeInBytes: 8675309,
-      rangeCount: 1023,
-      nodesByRegionString: "",
-    });
   });
 });

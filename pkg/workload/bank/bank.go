@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package bank
 
@@ -42,11 +37,12 @@ const (
 	maxTransfer         = 999
 )
 
+var RandomSeed = workload.NewUint64RandomSeed()
+
 type bank struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed                 uint64
 	rows, batchSize      int
 	payloadBytes, ranges int
 }
@@ -56,21 +52,21 @@ func init() {
 }
 
 var bankMeta = workload.Meta{
-	Name:         `bank`,
-	Description:  `Bank models a set of accounts with currency balances`,
-	Version:      `1.0.0`,
-	PublicFacing: true,
+	Name:        `bank`,
+	Description: `Bank models a set of accounts with currency balances.`,
+	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &bank{}
 		g.flags.FlagSet = pflag.NewFlagSet(`bank`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
 			`batch-size`: {RuntimeOnly: true},
 		}
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.rows, `rows`, defaultRows, `Initial number of accounts in bank table.`)
 		g.flags.IntVar(&g.batchSize, `batch-size`, defaultBatchSize, `Number of rows in each batch of initial data.`)
 		g.flags.IntVar(&g.payloadBytes, `payload-bytes`, defaultPayloadBytes, `Size of the payload field in each initial row.`)
 		g.flags.IntVar(&g.ranges, `ranges`, defaultRanges, `Initial number of ranges in bank table.`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -106,6 +102,9 @@ func (*bank) Meta() workload.Meta { return bankMeta }
 // Flags implements the Flagser interface.
 func (b *bank) Flags() workload.Flags { return b.flags }
 
+// ConnFlags implements the ConnFlagser interface.
+func (b *bank) ConnFlags() *workload.ConnFlags { return b.connFlags }
+
 // Hooks implements the Hookser interface.
 func (b *bank) Hooks() workload.Hooks {
 	return workload.Hooks{
@@ -138,7 +137,7 @@ func (b *bank) Tables() []workload.Table {
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numBatches,
 			FillBatch: func(batchIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator) {
-				rng := rand.NewSource(b.seed + uint64(batchIdx))
+				rng := rand.NewSource(RandomSeed.Seed() + uint64(batchIdx))
 
 				rowBegin, rowEnd := batchIdx*b.batchSize, (batchIdx+1)*b.batchSize
 				if rowEnd > b.rows {
@@ -153,9 +152,7 @@ func (b *bank) Tables() []workload.Table {
 				for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
 					var payload []byte
 					*a, payload = a.Alloc(b.payloadBytes, 0 /* extraCap */)
-					const initialPrefix = `initial-`
-					copy(payload[:len(initialPrefix)], []byte(initialPrefix))
-					randStringLetters(rng, payload[len(initialPrefix):])
+					randStringLetters(rng, payload)
 
 					rowOffset := rowIdx - rowBegin
 					idCol[rowOffset] = int64(rowIdx)
@@ -180,10 +177,6 @@ func (b *bank) Tables() []workload.Table {
 func (b *bank) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(b, b.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -199,12 +192,16 @@ func (b *bank) Ops(
 		WHERE id IN ($1, $2)
 	`)
 	if err != nil {
-		return workload.QueryLoad{}, err
+		return workload.QueryLoad{}, errors.CombineErrors(err, db.Close())
 	}
 
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{
+		Close: func(_ context.Context) error {
+			return db.Close()
+		},
+	}
 	for i := 0; i < b.connFlags.Concurrency; i++ {
-		rng := rand.New(rand.NewSource(b.seed))
+		rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 		hists := reg.GetHandle()
 		workerFn := func(ctx context.Context) error {
 			from := rng.Intn(b.rows)

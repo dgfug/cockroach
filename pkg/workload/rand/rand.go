@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rand
 
@@ -15,11 +10,14 @@ import (
 	"context"
 	gosql "database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"reflect"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -32,13 +30,15 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// NOTE: the caller is expected to pass the same seed on `init` and
+// `run` when using this workload.
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type random struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
 	batchSize int
-
-	seed int64
 
 	tableName string
 
@@ -55,6 +55,7 @@ func init() {
 var randMeta = workload.Meta{
 	Name:        `rand`,
 	Description: `random writes to table`,
+	RandomSeed:  RandomSeed,
 	Version:     `1.0.0`,
 	New: func() workload.Generator {
 		g := &random{}
@@ -66,19 +67,25 @@ var randMeta = workload.Meta{
 		g.flags.StringVar(&g.tableName, `table`, ``, `Table to write to`)
 		g.flags.IntVar(&g.batchSize, `batch`, 1, `Number of rows to insert in a single SQL statement`)
 		g.flags.StringVar(&g.method, `method`, `upsert`, `Choice of DML name: insert, upsert, ioc-update (insert on conflict update), ioc-nothing (insert on conflict no nothing)`)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.StringVar(&g.primaryKey, `primary-key`, ``, `ioc-update and ioc-nothing require primary key`)
 		g.flags.IntVar(&g.nullPct, `null-percent`, 5, `Percent random nulls`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
+
 		return g
 	},
 }
 
 // Meta implements the Generator interface.
-func (*random) Meta() workload.Meta { return randMeta }
+func (w *random) Meta() workload.Meta {
+	return randMeta
+}
 
 // Flags implements the Flagser interface.
 func (w *random) Flags() workload.Flags { return w.flags }
+
+// ConnFlags implements the ConnFlagser interface.
+func (w *random) ConnFlags() *workload.ConnFlags { return w.connFlags }
 
 // Hooks implements the Hookser interface.
 func (w *random) Hooks() workload.Hooks {
@@ -88,13 +95,13 @@ func (w *random) Hooks() workload.Hooks {
 // Tables implements the Generator interface.
 func (w *random) Tables() []workload.Table {
 	tables := make([]workload.Table, w.tables)
-	rng := rand.New(rand.NewSource(w.seed))
+	rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 	for i := 0; i < w.tables; i++ {
-		createTable := randgen.RandCreateTable(rng, "table", rng.Int())
+		createTable := randgen.RandCreateTable(context.Background(), rng, "table", rng.Int(), randgen.TableOptNone)
 		ctx := tree.NewFmtCtx(tree.FmtParsable)
 		createTable.FormatBody(ctx)
 		tables[i] = workload.Table{
-			Name:   createTable.Table.String(),
+			Name:   string(createTable.Table.ObjectName),
 			Schema: ctx.CloseAndGetString(),
 		}
 	}
@@ -111,14 +118,35 @@ type col struct {
 	isComputed    bool
 }
 
+// typeForOid returns the *types.T struct associated with the given
+// OID. Note that for columns of type `BIT` and `CHAR`, the width is
+// not recorded on the T struct itself; instead, we query the
+// `information_schema.columns` view to get that information. When the
+// `character_maximum_length` column is NULL, it means the column has
+// variable width and we set the width of the type to 0, which will
+// cause the random data generator to generate data with random width.
+func typeForOid(db *gosql.DB, typeOid oid.Oid, tableName, columnName string) (*types.T, error) {
+	datumType := *types.OidToType[typeOid]
+	if typeOid == oid.T_bit || typeOid == oid.T_char {
+		var width int32
+		if err := db.QueryRow(
+			`SELECT IFNULL(character_maximum_length, 0)
+			FROM information_schema.columns
+			WHERE table_name = $1 AND column_name = $2`,
+			tableName, columnName).Scan(&width); err != nil {
+			return nil, err
+		}
+
+		datumType.InternalType.Width = width
+	}
+
+	return &datumType, nil
+}
+
 // Ops implements the Opser interface.
 func (w *random) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (ql workload.QueryLoad, retErr error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -133,7 +161,8 @@ func (w *random) Ops(
 	}
 
 	var relid int
-	if err := db.QueryRow(fmt.Sprintf("SELECT '%s'::REGCLASS::OID", tableName)).Scan(&relid); err != nil {
+	sqlName := tree.Name(tableName)
+	if err := db.QueryRow("SELECT $1::REGCLASS::OID", sqlName.String()).Scan(&relid); err != nil {
 		return workload.QueryLoad{}, err
 	}
 
@@ -160,8 +189,10 @@ WHERE attrelid=$1`, relid)
 		if err := rows.Scan(&c.name, &typOid, &c.cdefault, &c.isNullable, &c.isComputed); err != nil {
 			return workload.QueryLoad{}, err
 		}
-		datumType := types.OidToType[oid.Oid(typOid)]
-		c.dataType = datumType
+		c.dataType, err = typeForOid(db, oid.Oid(typOid), tableName, c.name)
+		if err != nil {
+			return workload.QueryLoad{}, err
+		}
 		if c.cdefault.String == "unique_rowid()" { // skip
 			continue
 		}
@@ -201,9 +232,9 @@ AND    i.indisprimary`, relid)
 				return workload.QueryLoad{}, err
 			}
 			if w.primaryKey != "" {
-				w.primaryKey += "," + colname
+				w.primaryKey += "," + tree.NameString(colname)
 			} else {
-				w.primaryKey += colname
+				w.primaryKey += tree.NameString(colname)
 			}
 		}
 		if err = rows.Err(); err != nil {
@@ -238,7 +269,7 @@ AND    i.indisprimary`, relid)
 			if i > 0 {
 				dmlSuffix.WriteString(",")
 			}
-			dmlSuffix.WriteString(fmt.Sprintf("%s=EXCLUDED.%s", c.name, c.name))
+			dmlSuffix.WriteString(fmt.Sprintf("%s=EXCLUDED.%s", tree.NameString(c.name), tree.NameString(c.name)))
 		}
 	default:
 		return workload.QueryLoad{}, errors.Errorf("%s DML method not valid", w.primaryKey)
@@ -251,12 +282,12 @@ AND    i.indisprimary`, relid)
 		}
 	}
 
-	fmt.Fprintf(&buf, `%s INTO %s.%s (`, dmlMethod, sqlDatabase, tableName)
+	fmt.Fprintf(&buf, `%s INTO %s (`, dmlMethod, tree.NameString(tableName))
 	for i, c := range nonComputedCols {
 		if i > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(c.name)
+		buf.WriteString(tree.NameString(c.name))
 	}
 	buf.WriteString(`) VALUES `)
 
@@ -282,7 +313,7 @@ AND    i.indisprimary`, relid)
 		return workload.QueryLoad{}, err
 	}
 
-	ql = workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql = workload.QueryLoad{}
 
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		op := randOp{
@@ -290,7 +321,7 @@ AND    i.indisprimary`, relid)
 			hists:     reg.GetHandle(),
 			db:        db,
 			cols:      nonComputedCols,
-			rng:       rand.New(rand.NewSource(w.seed + int64(i))),
+			rng:       rand.New(rand.NewSource(RandomSeed.Seed() + int64(i))),
 			writeStmt: writeStmt,
 		}
 		ql.WorkerFns = append(ql.WorkerFns, op.run)
@@ -307,9 +338,36 @@ type randOp struct {
 	writeStmt *gosql.Stmt
 }
 
+// sqlArray implements the driver.Valuer interface and abstracts away
+// the differences between arrays of geographic/geometric data and
+// other arrays: the former use ':' as separator, while the latter
+// uses ','
+type sqlArray struct {
+	array     []interface{}
+	paramType *types.T
+}
+
+func (sa sqlArray) Value() (driver.Value, error) {
+	family := sa.paramType.Family()
+	if family == types.GeographyFamily || family == types.GeometryFamily {
+		var repr strings.Builder
+		repr.WriteString("{")
+		var sep string
+		for _, elt := range sa.array {
+			repr.WriteString(fmt.Sprintf(`%s"%s"`, sep, string(elt.(geopb.EWKT))))
+			sep = ": "
+		}
+
+		repr.WriteString("}")
+		return repr.String(), nil
+	}
+
+	return pq.Array(sa.array).Value()
+}
+
 // DatumToGoSQL converts a datum to a Go type.
 func DatumToGoSQL(d tree.Datum) (interface{}, error) {
-	d = tree.UnwrapDatum(nil, d)
+	d = tree.UnwrapDOidWrapper(d)
 	if d == tree.DNull {
 		return nil, nil
 	}
@@ -319,7 +377,7 @@ func DatumToGoSQL(d tree.Datum) (interface{}, error) {
 	case *tree.DString:
 		return string(*d), nil
 	case *tree.DBytes:
-		return string(*d), nil
+		return fmt.Sprintf(`x'%s'`, hex.EncodeToString([]byte(*d))), nil
 	case *tree.DDate, *tree.DTime:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	case *tree.DTimestamp:
@@ -333,11 +391,13 @@ func DatumToGoSQL(d tree.Datum) (interface{}, error) {
 	case *tree.DInt:
 		return int64(*d), nil
 	case *tree.DOid:
-		return int(d.DInt), nil
+		return uint32(d.Oid), nil
 	case *tree.DFloat:
 		return float64(*d), nil
 	case *tree.DDecimal:
-		return d.Float64()
+		// use string representation here since randgen might generate
+		// decimals that don't fit into a float64
+		return d.String(), nil
 	case *tree.DArray:
 		arr := make([]interface{}, len(d.Array))
 		for i := range d.Array {
@@ -350,19 +410,34 @@ func DatumToGoSQL(d tree.Datum) (interface{}, error) {
 			}
 			arr[i] = elt
 		}
-		return pq.Array(arr), nil
+		return sqlArray{arr, d.ParamTyp}, nil
 	case *tree.DUuid:
 		return d.UUID, nil
 	case *tree.DIPAddr:
 		return d.IPAddr.String(), nil
 	case *tree.DJSON:
 		return d.JSON.String(), nil
+	case *tree.DTimeTZ:
+		return d.TimeTZ.String(), nil
+	case *tree.DBox2D:
+		return d.CartesianBoundingBox.Repr(), nil
+	case *tree.DGeography:
+		return geo.SpatialObjectToEWKT(d.Geography.SpatialObject(), 2)
+	case *tree.DGeometry:
+		return geo.SpatialObjectToEWKT(d.Geometry.SpatialObject(), 2)
+	case *tree.DPGLSN:
+		return d.LSN.String(), nil
+	case *tree.DTSQuery:
+		return d.String(), nil
+	case *tree.DTSVector:
+		return d.String(), nil
+	case *tree.DPGVector:
+		return d.String(), nil
 	}
 	return nil, errors.Errorf("unhandled datum type: %s", reflect.TypeOf(d))
 }
 
-type nullVal struct {
-}
+type nullVal struct{}
 
 func (nullVal) Value() (driver.Value, error) {
 	return nil, nil
@@ -377,7 +452,8 @@ func (o *randOp) run(ctx context.Context) (err error) {
 			if c.isNullable && o.config.nullPct > 0 {
 				nullPct = 100 / o.config.nullPct
 			}
-			d := randgen.RandDatumWithNullChance(o.rng, c.dataType, nullPct)
+			d := randgen.RandDatumWithNullChance(o.rng, c.dataType, nullPct, /* nullChance */
+				false /* favorCommonData */, false /* targetColumnIsUnique */)
 			params[k], err = DatumToGoSQL(d)
 			if err != nil {
 				return err
@@ -387,6 +463,8 @@ func (o *randOp) run(ctx context.Context) (err error) {
 	}
 	start := timeutil.Now()
 	_, err = o.writeStmt.ExecContext(ctx, params...)
-	o.hists.Get(`write`).Record(timeutil.Since(start))
+	if o.hists != nil {
+		o.hists.Get(`write`).Record(timeutil.Since(start))
+	}
 	return err
 }

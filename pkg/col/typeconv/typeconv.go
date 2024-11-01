@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package typeconv
 
@@ -14,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -36,7 +31,13 @@ func TypeFamilyToCanonicalTypeFamily(family types.Family) types.Family {
 	switch family {
 	case types.BoolFamily:
 		return types.BoolFamily
-	case types.BytesFamily, types.StringFamily, types.UuidFamily:
+	case types.BytesFamily, types.StringFamily, types.UuidFamily, types.EncodedKeyFamily, types.EnumFamily:
+		// Note that by using Bytes family as the canonical one for other type
+		// families we allow the execution engine to evaluate invalid operations
+		// (e.g. the concat binary operation between a UUID and an enum "has"
+		// the execution engine support). However, it's not a big deal since the
+		// type-checking for validity of operations is done before the query
+		// reaches the execution engine.
 		return types.BytesFamily
 	case types.DecimalFamily:
 		return types.DecimalFamily

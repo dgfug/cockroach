@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package dbdesc contains the concrete implementations of
 // catalog.DatabaseDescriptor.
@@ -15,12 +10,18 @@ package dbdesc
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
@@ -39,6 +40,13 @@ type immutable struct {
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
+
+	// changed represents whether or not the descriptor was changed
+	// after RunPostDeserializationChanges.
+	changes catalog.PostDeserializationChanges
+
+	// This is the raw bytes (tag + data) of the database descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 // Mutable wraps a database descriptor and provides methods
@@ -46,10 +54,6 @@ type immutable struct {
 type Mutable struct {
 	immutable
 	ClusterVersion *immutable
-
-	// changed represents whether or not the descriptor was changed
-	// after RunPostDeserializationChanges.
-	changed bool
 }
 
 // SafeMessage makes immutable a SafeMessager.
@@ -78,13 +82,6 @@ func (desc *immutable) DescriptorType() catalog.DescriptorType {
 // DatabaseDesc implements the Descriptor interface.
 func (desc *immutable) DatabaseDesc() *descpb.DatabaseDescriptor {
 	return &desc.DatabaseDescriptor
-}
-
-// SetDrainingNames implements the MutableDescriptor interface.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
-	desc.DrainingNames = names
 }
 
 // GetParentID implements the Descriptor interface.
@@ -137,9 +134,26 @@ func (desc *immutable) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// ByteSize implements the Descriptor interface.
+func (desc *immutable) ByteSize() int64 {
+	return int64(desc.Size())
+}
+
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return NewBuilder(desc.DatabaseDesc())
+	b := newBuilder(desc.DatabaseDesc(), hlc.Timestamp{}, desc.isUncommittedVersion, desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
+}
+
+// NewBuilder implements the catalog.Descriptor interface.
+//
+// It overrides the wrapper's implementation to deal with the fact that
+// mutable has overridden the definition of IsUncommittedVersion.
+func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
+	b := newBuilder(desc.DatabaseDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // IsMultiRegion implements the DatabaseDescriptor interface.
@@ -148,7 +162,7 @@ func (desc *immutable) IsMultiRegion() bool {
 }
 
 // PrimaryRegionName implements the DatabaseDescriptor interface.
-func (desc *immutable) PrimaryRegionName() (descpb.RegionName, error) {
+func (desc *immutable) PrimaryRegionName() (catpb.RegionName, error) {
 	if !desc.IsMultiRegion() {
 		return "", errors.AssertionFailedf(
 			"can not get the primary region of a non multi-region database")
@@ -170,32 +184,11 @@ func (desc *Mutable) SetName(name string) {
 	desc.Name = name
 }
 
-// ForEachSchemaInfo implements the DatabaseDescriptor interface.
-func (desc *immutable) ForEachSchemaInfo(
-	f func(id descpb.ID, name string, isDropped bool) error,
-) error {
+// ForEachSchema implements the DatabaseDescriptor interface.
+func (desc *immutable) ForEachSchema(f func(id descpb.ID, name string) error) error {
 	for name, info := range desc.Schemas {
-		if err := f(info.ID, name, info.Dropped); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
-		}
-	}
-	return nil
-}
-
-// ForEachNonDroppedSchema implements the DatabaseDescriptor interface.
-func (desc *immutable) ForEachNonDroppedSchema(f func(id descpb.ID, name string) error) error {
-	for name, info := range desc.Schemas {
-		if info.Dropped {
-			continue
-		}
 		if err := f(info.ID, name); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -204,16 +197,27 @@ func (desc *immutable) ForEachNonDroppedSchema(f func(id descpb.ID, name string)
 // GetSchemaID implements the DatabaseDescriptor interface.
 func (desc *immutable) GetSchemaID(name string) descpb.ID {
 	info := desc.Schemas[name]
-	if info.Dropped {
-		return descpb.InvalidID
-	}
 	return info.ID
 }
 
-// GetNonDroppedSchemaName implements the DatabaseDescriptor interface.
+// HasPublicSchemaWithDescriptor returns if the database has a public schema
+// with a descriptor.
+// If descs.Schemas has an explicit entry for "public", then it has a descriptor
+// otherwise it is an implicit public schema.
+func (desc *immutable) HasPublicSchemaWithDescriptor() bool {
+	// The system database does not have a public schema backed by a descriptor.
+	if desc.ID == keys.SystemDatabaseID {
+		return false
+	}
+	_, found := desc.Schemas[catconstants.PublicSchemaName]
+	return found
+}
+
+// GetNonDroppedSchemaName returns the name in the schema mapping entry for the
+// given ID, if it's not marked as dropped, empty string otherwise.
 func (desc *immutable) GetNonDroppedSchemaName(schemaID descpb.ID) string {
 	for name, info := range desc.Schemas {
-		if !info.Dropped && info.ID == schemaID {
+		if info.ID == schemaID {
 			return name
 		}
 	}
@@ -225,13 +229,18 @@ func (desc *immutable) GetNonDroppedSchemaName(schemaID descpb.ID) string {
 // is at least one read and write user.
 func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// Validate local properties of the descriptor.
-	vea.Report(catalog.ValidateName(desc.GetName(), "descriptor"))
+	vea.Report(catalog.ValidateName(desc))
 	if desc.GetID() == descpb.InvalidID {
 		vea.Report(fmt.Errorf("invalid database ID %d", desc.GetID()))
 	}
 
 	// Validate the privilege descriptor.
-	vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Database))
+	if desc.Privileges == nil {
+		vea.Report(errors.AssertionFailedf("privileges not set"))
+	} else {
+		vea.Report(catprivilege.Validate(*desc.Privileges, desc, privilege.Database))
+	}
+
 	// The DefaultPrivilegeDescriptor may be nil.
 	if desc.GetDefaultPrivileges() != nil {
 		// Validate the default privilege descriptor.
@@ -241,6 +250,8 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	if desc.IsMultiRegion() {
 		desc.validateMultiRegion(vea)
 	}
+
+	desc.maybeValidateSystemDatabaseSchemaVersion(vea)
 }
 
 // validateMultiRegion performs checks specific to multi-region DBs.
@@ -248,6 +259,60 @@ func (desc *immutable) validateMultiRegion(vea catalog.ValidationErrorAccumulato
 	if desc.RegionConfig.PrimaryRegion == "" {
 		vea.Report(errors.AssertionFailedf(
 			"primary region unset on a multi-region db %d", desc.GetID()))
+	}
+	if desc.RegionConfig.PrimaryRegion == desc.RegionConfig.SecondaryRegion {
+		vea.Report(errors.AssertionFailedf(
+			"primary region is same as secondary region on multi-region db %d", desc.GetID()))
+	}
+}
+
+// Prior to 24.2, the SystemDatabaseSchemaBootstrapVersion for each release does
+// not match the final cluster version for that release; instead it matches the
+// internal version for the last upgrade which modified the system schema. This
+// constant holds the schema version for the clusterversion.MinSupported
+// release; it is the value of SystemDatabaseSchemaBootstrapVersion in the
+// corresponding branch.
+//
+// Note that the version here should never have a dev offset.
+//
+// TODO(radu): when we no longer support 24.1, this mechanism should not be
+// necessary anymore (in 24.2+ we do a final bump to the release version).
+var minSupportedDatabaseSchemaVersion = roachpb.Version{
+	Major: 23, Minor: 2, Internal: 14, // V24_1_SessionBasedLeasingUpgradeDescriptor
+}
+
+func (desc *immutable) maybeValidateSystemDatabaseSchemaVersion(
+	vea catalog.ValidationErrorAccumulator,
+) {
+	maybeSV := desc.GetSystemDatabaseSchemaVersion()
+	if maybeSV == nil {
+		return
+	}
+	sv := clusterversion.RemoveDevOffset(*maybeSV)
+
+	if id := desc.GetID(); id != keys.SystemDatabaseID {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version for non-system database descriptor (%d)`,
+			id,
+		))
+	}
+
+	if sv.Less(minSupportedDatabaseSchemaVersion) {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version to version lower than the minimum supported version (%#v): %#v`,
+			minSupportedDatabaseSchemaVersion,
+			sv,
+		))
+	}
+
+	// TODO(radu): this should really be SystemDatabaseSchemaBootstrapVersion.
+	latestVersion := clusterversion.RemoveDevOffset(clusterversion.Latest.Version())
+	if latestVersion.Less(sv) {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version to version higher than the latest version (%#v): %#v`,
+			latestVersion,
+			sv,
+		))
 	}
 }
 
@@ -268,11 +333,14 @@ func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	return ids, nil
 }
 
-// ValidateCrossReferences implements the catalog.Descriptor interface.
-func (desc *immutable) ValidateCrossReferences(
+// ValidateForwardReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateForwardReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
 	// Check multi-region enum type.
+	if !desc.IsMultiRegion() {
+		return
+	}
 	if enumID, err := desc.MultiRegionEnumID(); err == nil {
 		report := func(err error) {
 			vea.Report(errors.Wrap(err, "multi-region enum"))
@@ -282,6 +350,9 @@ func (desc *immutable) ValidateCrossReferences(
 			report(err)
 			return
 		}
+		if typ.Dropped() {
+			report(errors.Errorf("type descriptor is dropped"))
+		}
 		if typ.GetParentID() != desc.GetID() {
 			report(errors.Errorf("parentID is actually %d", typ.GetParentID()))
 		}
@@ -289,17 +360,12 @@ func (desc *immutable) ValidateCrossReferences(
 	}
 }
 
-// ValidateTxnCommit implements the catalog.Descriptor interface.
-func (desc *immutable) ValidateTxnCommit(
+// ValidateBackReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateBackReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
 	// Check schema references.
-	// This could be done in ValidateCrossReferences but it can be quite expensive
-	// so we do it here instead.
 	for schemaName, schemaInfo := range desc.Schemas {
-		if schemaInfo.Dropped {
-			continue
-		}
 		report := func(err error) {
 			vea.Report(errors.Wrapf(err, "schema mapping entry %q (%d)",
 				errors.Safe(schemaName), schemaInfo.ID))
@@ -315,7 +381,18 @@ func (desc *immutable) ValidateTxnCommit(
 		if schemaDesc.GetParentID() != desc.GetID() {
 			report(errors.Errorf("schema parentID is actually %d", schemaDesc.GetParentID()))
 		}
+		if schemaDesc.Dropped() {
+			report(errors.Errorf("back-referenced schema %q (%d) is dropped",
+				schemaDesc.GetName(), schemaDesc.GetID()))
+		}
 	}
+}
+
+// ValidateTxnCommit implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateTxnCommit(
+	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+) {
+	// No-op.
 }
 
 // MaybeIncrementVersion implements the MutableDescriptor interface.
@@ -325,6 +402,11 @@ func (desc *Mutable) MaybeIncrementVersion() {
 		return
 	}
 	desc.Version++
+	desc.ResetModificationTime()
+}
+
+// ResetModificationTime implements the catalog.MutableDescriptor interface.
+func (desc *Mutable) ResetModificationTime() {
 	desc.ModificationTime = hlc.Timestamp{}
 }
 
@@ -354,9 +436,7 @@ func (desc *Mutable) OriginalVersion() descpb.DescriptorVersion {
 
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	imm := NewBuilder(desc.DatabaseDesc()).BuildImmutableDatabase()
-	imm.(*immutable).isUncommittedVersion = desc.IsUncommittedVersion()
-	return imm
+	return desc.NewBuilder().BuildImmutable()
 }
 
 // IsNew implements the MutableDescriptor interface.
@@ -385,14 +465,6 @@ func (desc *Mutable) SetDropped() {
 func (desc *Mutable) SetOffline(reason string) {
 	desc.State = descpb.DescriptorState_OFFLINE
 	desc.OfflineReason = reason
-}
-
-// AddDrainingName adds a draining name to the DatabaseDescriptor's slice of
-// draining names.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
-	desc.DrainingNames = append(desc.DrainingNames, name)
 }
 
 // UnsetMultiRegionConfig removes the stored multi-region config from the
@@ -431,17 +503,32 @@ func (desc *Mutable) SetPlacement(placement descpb.DataPlacement) {
 	desc.RegionConfig.Placement = placement
 }
 
-// HasPostDeserializationChanges returns if the MutableDescriptor was changed after running
+// GetPostDeserializationChanges returns if the MutableDescriptor was changed after running
 // RunPostDeserializationChanges.
-func (desc *Mutable) HasPostDeserializationChanges() bool {
-	return desc.changed
+func (desc *immutable) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return desc.changes
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (desc *immutable) HasConcurrentSchemaChanges() bool {
+	return desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID
+}
+
+// ConcurrentSchemaChangeJobIDs implements catalog.Descriptor.
+func (desc *immutable) ConcurrentSchemaChangeJobIDs() (ret []catpb.JobID) {
+	if desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID {
+		ret = append(ret, desc.DeclarativeSchemaChangerState.JobID)
+	}
+	return ret
 }
 
 // GetDefaultPrivilegeDescriptor returns a DefaultPrivilegeDescriptor.
 func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeDescriptor {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeNewDefaultPrivilegeDescriptor()
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.MakeDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -450,7 +537,7 @@ func (desc *immutable) GetDefaultPrivilegeDescriptor() catalog.DefaultPrivilegeD
 func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutable {
 	defaultPrivilegeDescriptor := desc.GetDefaultPrivileges()
 	if defaultPrivilegeDescriptor == nil {
-		defaultPrivilegeDescriptor = catprivilege.MakeNewDefaultPrivilegeDescriptor()
+		defaultPrivilegeDescriptor = catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE)
 	}
 	return catprivilege.NewMutableDefaultPrivileges(defaultPrivilegeDescriptor)
 }
@@ -458,9 +545,68 @@ func (desc *Mutable) GetMutableDefaultPrivilegeDescriptor() *catprivilege.Mutabl
 // SetDefaultPrivilegeDescriptor sets the default privilege descriptor
 // for the database.
 func (desc *Mutable) SetDefaultPrivilegeDescriptor(
-	defaultPrivilegeDescriptor *descpb.DefaultPrivilegeDescriptor,
+	defaultPrivilegeDescriptor *catpb.DefaultPrivilegeDescriptor,
 ) {
 	desc.DefaultPrivileges = defaultPrivilegeDescriptor
+}
+
+// AddSchemaToDatabase adds a schemaName and schemaInfo entry into the
+// database's Schemas map. If the map is nil, then we create a map before
+// adding the entry.
+// If there is an existing entry in the map with schemaName as the key,
+// it will be overridden.
+func (desc *Mutable) AddSchemaToDatabase(
+	schemaName string, schemaInfo descpb.DatabaseDescriptor_SchemaInfo,
+) {
+	if desc.Schemas == nil {
+		desc.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
+	}
+	desc.Schemas[schemaName] = schemaInfo
+}
+
+// GetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
+// SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
+	desc.DeclarativeSchemaChangerState = state
+}
+
+// GetObjectType implements the Object interface.
+func (desc *immutable) GetObjectType() privilege.ObjectType {
+	return privilege.Database
+}
+
+// GetObjectTypeString implements the Object interface.
+func (desc *immutable) GetObjectTypeString() string {
+	return string(privilege.Database)
+}
+
+// SkipNamespace implements the descriptor interface.
+func (desc *immutable) SkipNamespace() bool {
+	return false
+}
+
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (desc *immutable) GetRawBytesInStorage() []byte {
+	return desc.rawBytesInStorage
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	return nil
+}
+
+// MaybeRequiresTypeHydration implements the catalog.Descriptor interface.
+func (desc *immutable) MaybeRequiresTypeHydration() bool { return false }
+
+// GetReplicatedPCRVersion is a part of the catalog.Descriptor
+func (desc *immutable) GetReplicatedPCRVersion() descpb.DescriptorVersion {
+	return desc.ReplicatedPCRVersion
 }
 
 // maybeRemoveDroppedSelfEntryFromSchemas removes an entry in the Schemas map corresponding to the

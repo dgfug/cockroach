@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanset
 
@@ -46,6 +41,9 @@ func (a SpanAccess) String() string {
 	}
 }
 
+// SafeValue implements the redact.SafeValue interface.
+func (SpanAccess) SafeValue() {}
+
 // SpanScope divides access types into local and global keys.
 type SpanScope int
 
@@ -68,6 +66,9 @@ func (a SpanScope) String() string {
 	}
 }
 
+// SafeValue implements the redact.SafeValue interface.
+func (SpanScope) SafeValue() {}
+
 // Span is used to represent a keyspan accessed by a request at a given
 // timestamp. A zero timestamp indicates it's a non-MVCC access.
 type Span struct {
@@ -82,7 +83,8 @@ type Span struct {
 // The Span slice for a particular access and scope contains non-overlapping
 // spans in increasing key order after calls to SortAndDedup.
 type SpanSet struct {
-	spans [NumSpanAccess][NumSpanScope][]Span
+	spans           [NumSpanAccess][NumSpanScope][]Span
+	allowUndeclared bool
 }
 
 var spanSetPool = sync.Pool{
@@ -111,6 +113,7 @@ func (s *SpanSet) Release() {
 			s.spans[sa][ss] = recycle
 		}
 	}
+	s.allowUndeclared = false
 	spanSetPool.Put(s)
 }
 
@@ -152,6 +155,7 @@ func (s *SpanSet) Copy() *SpanSet {
 			n.spans[sa][ss] = append(n.spans[sa][ss], s.spans[sa][ss]...)
 		}
 	}
+	n.allowUndeclared = s.allowUndeclared
 	return n
 }
 
@@ -204,6 +208,7 @@ func (s *SpanSet) Merge(s2 *SpanSet) {
 			s.spans[sa][ss] = append(s.spans[sa][ss], s2.spans[sa][ss]...)
 		}
 	}
+	s.allowUndeclared = s2.allowUndeclared
 	s.SortAndDedup()
 }
 
@@ -335,6 +340,12 @@ func (s *SpanSet) CheckAllowedAt(
 func (s *SpanSet) checkAllowed(
 	access SpanAccess, span roachpb.Span, check func(SpanAccess, Span) bool,
 ) error {
+	if s.allowUndeclared {
+		// If the request has specified that undeclared spans are allowed, do
+		// nothing.
+		return nil
+	}
+
 	scope := SpanGlobal
 	if (span.Key != nil && keys.IsLocal(span.Key)) ||
 		(span.EndKey != nil && keys.IsLocal(span.EndKey)) {
@@ -386,4 +397,11 @@ func (s *SpanSet) Validate() error {
 	}
 
 	return nil
+}
+
+// DisableUndeclaredAccessAssertions disables the assertions that prevent
+// undeclared access to spans. This is generally set by requests that rely on
+// other forms of synchronization for correctness (e.g. GCRequest).
+func (s *SpanSet) DisableUndeclaredAccessAssertions() {
+	s.allowUndeclared = true
 }

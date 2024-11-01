@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -24,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -40,10 +35,11 @@ func TestExternalHashJoiner(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -76,25 +72,20 @@ func TestExternalHashJoiner(t *testing.T) {
 					// allNullsInjection test for now.
 					tc.skipAllNullsInjection = true
 				}
-				runHashJoinTestCase(t, tc, func(sources []colexecop.Operator) (colexecop.Operator, error) {
-					sem := colexecop.NewTestingSemaphore(externalHJMinPartitions)
+				runHashJoinTestCase(t, tc, rng, func(sources []colexecop.Operator) (colexecop.Operator, error) {
+					sem := colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions)
 					semsToCheck = append(semsToCheck, sem)
 					spec := createSpecForHashJoiner(tc)
-					// TODO(asubiotto): Pass in the testing.T of the caller to this
-					//  function and do substring matching on the test name to
-					//  conditionally explicitly call Close() on the hash joiner
-					//  (through result.ToClose) in cases where it is known the sorter
-					//  will not be drained.
 					hjOp, closers, err := createDiskBackedHashJoiner(
 						ctx, flowCtx, spec, sources, func() {}, queueCfg,
 						numForcedRepartitions, delegateFDAcquisitions, sem,
 						&monitorRegistry,
 					)
-					// Expect three closers. These are the external hash joiner, and
-					// one external sorter for each input.
-					// TODO(asubiotto): Explicitly Close when testing.T is passed into
-					//  this constructor and we do a substring match.
-					require.Equal(t, 3, len(closers))
+					// Expect six closers:
+					// - 1 for the disk spiller
+					// - 1 for the external hash joiner
+					// - 2 for each of the external sorts (4 total here).
+					require.Equal(t, 6, len(closers))
 					return hjOp, err
 				})
 				for i, sem := range semsToCheck {
@@ -115,10 +106,11 @@ func TestExternalHashJoinerFallbackToSortMergeJoin(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 			TestingKnobs: execinfra.TestingKnobs{
@@ -150,7 +142,7 @@ func TestExternalHashJoinerFallbackToSortMergeJoin(t *testing.T) {
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
-	sem := colexecop.NewTestingSemaphore(externalHJMinPartitions)
+	sem := colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions)
 	// Ignore closers since the sorter should close itself when it is drained of
 	// all tuples. We assert this by checking that the semaphore reports a count
 	// of 0.
@@ -176,15 +168,32 @@ func TestExternalHashJoinerFallbackToSortMergeJoin(t *testing.T) {
 	require.Equal(t, 0, sem.GetCount())
 }
 
-// newIntColumns returns nCols columns of types.Int with increasing values
-// starting at 0.
-func newIntColumns(nCols int, length int) []coldata.Vec {
-	cols := make([]coldata.Vec, nCols)
+// newIntColumns returns nCols columns of types.Int with non-decreasing values
+// starting at 0. dupCount controls the number of duplicates for each row
+// (including the row itself), use dupCount=1 for distinct tuples.
+func newIntColumns(nCols int, length int, dupCount int) []*coldata.Vec {
+	cols := make([]*coldata.Vec, nCols)
 	for colIdx := 0; colIdx < nCols; colIdx++ {
-		cols[colIdx] = testAllocator.NewMemColumn(types.Int, length)
+		cols[colIdx] = testAllocator.NewVec(types.Int, length)
 		col := cols[colIdx].Int64()
 		for i := 0; i < length; i++ {
-			col[i] = int64(i)
+			col[i] = int64(i / dupCount)
+		}
+	}
+	return cols
+}
+
+// newBytesColumns returns nCols columns of types.Bytes with non-decreasing
+// values of 8 byte size, starting at '00000000'. dupCount controls the number
+// of duplicates for each row (including the row itself), use dupCount=1 for
+// distinct tuples.
+func newBytesColumns(nCols int, length int, dupCount int) []*coldata.Vec {
+	cols := make([]*coldata.Vec, nCols)
+	for colIdx := 0; colIdx < nCols; colIdx++ {
+		cols[colIdx] = testAllocator.NewVec(types.Bytes, length)
+		col := cols[colIdx].Bytes()
+		for i := 0; i < length; i++ {
+			col.Set(i, []byte(fmt.Sprintf("%08d", i/dupCount)))
 		}
 	}
 	return cols
@@ -194,19 +203,15 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 		DiskMonitor: testDiskMonitor,
-	}
-	nCols := 4
-	sourceTypes := make([]*types.T, nCols)
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		sourceTypes[colIdx] = types.Int
 	}
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
@@ -214,48 +219,60 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
 
-	for _, spillForced := range []bool{false, true} {
-		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
-		for _, nRows := range []int{1, 1 << 4, 1 << 8, 1 << 12, 1 << 16, 1 << 20} {
-			if spillForced && nRows < coldata.BatchSize() {
-				// Forcing spilling to disk on very small input size doesn't
-				// provide a meaningful signal, so we skip such config.
-				continue
-			}
-			cols := newIntColumns(nCols, nRows)
-			for _, fullOuter := range []bool{false, true} {
-				joinType := descpb.InnerJoin
-				if fullOuter {
-					joinType = descpb.FullOuterJoin
+	nCols := 4
+	for _, typ := range []*types.T{types.Int, types.Bytes} {
+		sourceTypes := make([]*types.T, nCols)
+		for colIdx := 0; colIdx < nCols; colIdx++ {
+			sourceTypes[colIdx] = typ
+		}
+		for _, spillForced := range []bool{false, true} {
+			flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
+			for _, nRows := range []int{1, 1 << 4, 1 << 8, 1 << 12, 1 << 16, 1 << 20} {
+				if spillForced && nRows < coldata.BatchSize() {
+					// Forcing spilling to disk on very small input size doesn't
+					// provide a meaningful signal, so we skip such config.
+					continue
 				}
-				tc := &joinTestCase{
-					joinType:     joinType,
-					leftTypes:    sourceTypes,
-					leftOutCols:  []uint32{0, 1},
-					leftEqCols:   []uint32{0, 2},
-					rightTypes:   sourceTypes,
-					rightOutCols: []uint32{2, 3},
-					rightEqCols:  []uint32{0, 1},
+				var cols []*coldata.Vec
+				if typ.Identical(types.Int) {
+					cols = newIntColumns(nCols, nRows, 1 /* dupCount */)
+				} else {
+					cols = newBytesColumns(nCols, nRows, 1 /* dupCount */)
 				}
-				tc.init()
-				spec := createSpecForHashJoiner(tc)
-				b.Run(fmt.Sprintf("spillForced=%t/rows=%d/fullOuter=%t", spillForced, nRows, fullOuter), func(b *testing.B) {
-					b.SetBytes(int64(8 * nRows * nCols * 2))
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, cols, nRows)
-						rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, cols, nRows)
-						hj, _, err := createDiskBackedHashJoiner(
-							ctx, flowCtx, spec, []colexecop.Operator{leftSource, rightSource},
-							func() {}, queueCfg, 0 /* numForcedRepartitions */, false, /* delegateFDAcquisitions */
-							colexecop.NewTestingSemaphore(VecMaxOpenFDsLimit), &monitorRegistry,
-						)
-						require.NoError(b, err)
-						hj.Init(ctx)
-						for b := hj.Next(); b.Length() > 0; b = hj.Next() {
-						}
+				for _, fullOuter := range []bool{false, true} {
+					joinType := descpb.InnerJoin
+					if fullOuter {
+						joinType = descpb.FullOuterJoin
 					}
-				})
+					tc := &joinTestCase{
+						joinType:     joinType,
+						leftTypes:    sourceTypes,
+						leftOutCols:  []uint32{0, 1},
+						leftEqCols:   []uint32{0, 2},
+						rightTypes:   sourceTypes,
+						rightOutCols: []uint32{2, 3},
+						rightEqCols:  []uint32{0, 1},
+					}
+					tc.init()
+					spec := createSpecForHashJoiner(tc)
+					b.Run(fmt.Sprintf("%s/spillForced=%t/rows=%d/fullOuter=%t", typ, spillForced, nRows, fullOuter), func(b *testing.B) {
+						b.SetBytes(int64(8 * nRows * nCols * 2))
+						b.ResetTimer()
+						for i := 0; i < b.N; i++ {
+							leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, cols, nRows)
+							rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, cols, nRows)
+							hj, _, err := createDiskBackedHashJoiner(
+								ctx, flowCtx, spec, []colexecop.Operator{leftSource, rightSource},
+								func() {}, queueCfg, 0 /* numForcedRepartitions */, false, /* delegateFDAcquisitions */
+								colexecop.NewTestingSemaphore(VecMaxOpenFDsLimit), &monitorRegistry,
+							)
+							require.NoError(b, err)
+							hj.Init(ctx)
+							for b := hj.Next(); b.Length() > 0; b = hj.Next() {
+							}
+						}
+					})
+				}
 			}
 		}
 	}

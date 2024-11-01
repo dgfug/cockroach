@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -19,21 +14,50 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
 func (ex *connExecutor) execPrepare(
 	ctx context.Context, parseCmd PrepareStmt,
 ) (fsm.Event, fsm.EventPayload) {
-
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
 		return ex.makeErrEvent(err, parseCmd.AST)
 	}
+
+	// Preparing needs a transaction because it needs to retrieve db/table
+	// descriptors for type checking. This implicit txn will be open until
+	// the Sync message is handled.
+	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
+		// The one exception is that we must not open a new transaction when
+		// preparing SHOW COMMIT TIMESTAMP. If we did, it would destroy the
+		// information about the previous transaction. We expect to execute
+		// this command in NoTxn.
+		if _, ok := parseCmd.AST.(*tree.ShowCommitTimestamp); !ok {
+			return ex.beginImplicitTxn(ctx, parseCmd.AST, ex.QualityOfService())
+		}
+	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
+		if !ex.isAllowedInAbortedTxn(parseCmd.AST) {
+			return retErr(sqlerrors.NewTransactionAbortedError("" /* customMsg */))
+		}
+	}
+
+	// Check if we need to auto-commit the transaction due to DDL.
+	if ev, payload := ex.maybeAutoCommitBeforeDDL(ctx, parseCmd.AST); ev != nil {
+		return ev, payload
+	}
+
+	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "prepare stmt")
+	defer sp.Finish()
 
 	// The anonymous statement can be overwritten.
 	if parseCmd.Name != "" {
@@ -49,8 +73,9 @@ func (ex *connExecutor) execPrepare(
 		ex.deletePreparedStmt(ctx, "")
 	}
 
-	stmt := makeStatement(parseCmd.Statement, ex.generateID())
-	ps, err := ex.addPreparedStmt(
+	stmt := makeStatement(parseCmd.Statement, ex.server.cfg.GenerateID(),
+		tree.FmtFlags(queryFormattingForFingerprintsMask.Get(ex.server.cfg.SV())))
+	_, err := ex.addPreparedStmt(
 		ctx,
 		parseCmd.Name,
 		stmt,
@@ -62,28 +87,6 @@ func (ex *connExecutor) execPrepare(
 		return retErr(err)
 	}
 
-	// Convert the inferred SQL types back to an array of pgwire Oids.
-	if len(ps.TypeHints) > pgwirebase.MaxPreparedStatementArgs {
-		return retErr(
-			pgwirebase.NewProtocolViolationErrorf(
-				"more than %d arguments to prepared statement: %d",
-				pgwirebase.MaxPreparedStatementArgs, len(ps.TypeHints)))
-	}
-	inferredTypes := make([]oid.Oid, len(ps.Types))
-	copy(inferredTypes, parseCmd.RawTypeHints)
-
-	for i := range ps.Types {
-		// OID to Datum is not a 1-1 mapping (for example, int4 and int8
-		// both map to TypeInt), so we need to maintain the types sent by
-		// the client.
-		if inferredTypes[i] == 0 || inferredTypes[i] == oid.T_unknown {
-			t, _ := ps.ValueType(tree.PlaceholderIdx(i))
-			inferredTypes[i] = t.Oid()
-		}
-	}
-	// Remember the inferred placeholder types so they can be reported on
-	// Describe.
-	ps.InferredTypes = inferredTypes
 	return nil, nil
 }
 
@@ -104,7 +107,10 @@ func (ex *connExecutor) addPreparedStmt(
 	origin PreparedStatementOrigin,
 ) (*PreparedStatement, error) {
 	if _, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[name]; ok {
-		panic(errors.AssertionFailedf("prepared statement already exists: %q", name))
+		return nil, pgerror.Newf(
+			pgcode.DuplicatePreparedStatement,
+			"prepared statement %q already exists", name,
+		)
 	}
 
 	// Prepare the query. This completes the typing of placeholders.
@@ -113,64 +119,114 @@ func (ex *connExecutor) addPreparedStmt(
 		return nil, err
 	}
 
+	if len(prepared.TypeHints) > pgwirebase.MaxPreparedStatementArgs {
+		prepared.memAcc.Close(ctx)
+		return nil, pgwirebase.NewProtocolViolationErrorf(
+			"more than %d arguments to prepared statement: %d",
+			pgwirebase.MaxPreparedStatementArgs, len(prepared.TypeHints))
+	}
+
 	if err := prepared.memAcc.Grow(ctx, int64(len(name))); err != nil {
+		prepared.memAcc.Close(ctx)
 		return nil, err
 	}
 	ex.extraTxnState.prepStmtsNamespace.prepStmts[name] = prepared
+	ex.extraTxnState.prepStmtsNamespace.addLRUEntry(name, prepared.memAcc.Allocated())
+
+	// Check if we're over prepared_statements_cache_size.
+	cacheSize := ex.sessionData().PreparedStatementsCacheSize
+	if cacheSize != 0 {
+		lru := ex.extraTxnState.prepStmtsNamespace.prepStmtsLRU
+		// While we're over the cache size, deallocate the LRU prepared statement.
+		for tail := lru[prepStmtsLRUTail]; tail.prev != prepStmtsLRUHead && tail.prev != name; tail = lru[prepStmtsLRUTail] {
+			if ex.extraTxnState.prepStmtsNamespace.prepStmtsLRUAlloc <= cacheSize {
+				break
+			}
+			log.VEventf(
+				ctx, 1,
+				"prepared statements are using more than prepared_statements_cache_size (%s), "+
+					"automatically deallocating %s", string(humanizeutil.IBytes(cacheSize)), tail.prev,
+			)
+			ex.deletePreparedStmt(ctx, tail.prev)
+		}
+	}
+
+	// Remember the inferred placeholder types so they can be reported on
+	// Describe. First, try to preserve the hints sent by the client.
+	prepared.InferredTypes = make([]oid.Oid, len(prepared.Types))
+	copy(prepared.InferredTypes, rawTypeHints)
+	for i, it := range prepared.InferredTypes {
+		// If the client did not provide an OID type hint, then infer the OID.
+		if it == 0 || it == oid.T_unknown {
+			if t, ok := prepared.ValueType(tree.PlaceholderIdx(i)); ok {
+				prepared.InferredTypes[i] = t.Oid()
+			}
+		}
+	}
+
 	return prepared, nil
 }
 
-// prepare prepares the given statement.
+// prepare prepares the given statement. This is used to create the plan in the
+// "extended" pgwire protocol.
 //
 // placeholderHints may contain partial type information for placeholders.
 // prepare will populate the missing types. It can be nil.
-//
-// The PreparedStatement is returned (or nil if there are no results). The
-// returned PreparedStatement needs to be close()d once its no longer in use.
 func (ex *connExecutor) prepare(
 	ctx context.Context,
 	stmt Statement,
 	placeholderHints tree.PlaceholderTypes,
 	rawTypeHints []oid.Oid,
 	origin PreparedStatementOrigin,
-) (*PreparedStatement, error) {
+) (_ *PreparedStatement, retErr error) {
 
 	prepared := &PreparedStatement{
-		memAcc:   ex.sessionMon.MakeBoundAccount(),
+		memAcc:   ex.sessionPreparedMon.MakeBoundAccount(),
 		refCount: 1,
 
 		createdAt: timeutil.Now(),
 		origin:    origin,
 	}
-	// NB: if we start caching the plan, we'll want to keep around the memory
-	// account used for the plan, rather than clearing it.
-	defer prepared.memAcc.Clear(ctx)
+	defer func() {
+		// Make sure to close the memory account if an error is returned.
+		if retErr != nil {
+			prepared.memAcc.Close(ctx)
+		}
+	}()
 
 	if stmt.AST == nil {
 		return prepared, nil
 	}
 
-	// Preparing needs a transaction because it needs to retrieve db/table
-	// descriptors for type checking. If we already have an open transaction for
-	// this planner, use it. Using the user's transaction here is critical for
-	// proper deadlock detection. At the time of writing, it is the case that any
-	// data read on behalf of this transaction is not cached for use in other
-	// transactions. It's critical that this fact remain true but nothing really
-	// enforces it. If we create a new transaction (newTxn is true), we'll need to
-	// finish it before we return.
+	origNumPlaceholders := stmt.NumPlaceholders
+	switch stmt.AST.(type) {
+	case *tree.Prepare, *tree.CopyTo:
+		// Special cases:
+		// - We're preparing a SQL-level PREPARE using the
+		// wire protocol. There's an ambiguity from the perspective of this code:
+		// any placeholders that are inside of the statement that we're preparing
+		// shouldn't be treated as placeholders to the PREPARE statement. So, we
+		// edit the NumPlaceholders field to be 0 here.
+		// - We're preparing a COPY ... TO statement. We match the Postgres
+		// behavior, which is to treat the statement as if it had no placeholders.
+		stmt.NumPlaceholders = 0
+	}
 
 	var flags planFlags
 	prepare := func(ctx context.Context, txn *kv.Txn) (err error) {
-		ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 		p := &ex.planner
-		if origin != PreparedStatementOriginSQL {
-			// If the PREPARE command was issued as a SQL statement, then we
-			// have already reset the planner at the very beginning of the
-			// execution (in execStmtInOpenState). We might have also
-			// instrumented the planner to collect execution statistics, and
-			// resetting the planner here would break the assumptions of the
-			// instrumentation.
-			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+		if origin == PreparedStatementOriginWire {
+			// If the PREPARE command was issued as a SQL statement or through
+			// deserialize_session, then we have already reset the planner at the very
+			// beginning of the execution (in execStmtInOpenState). We might have also
+			// instrumented the planner to collect execution statistics, and resetting
+			// the planner here would break the assumptions of the instrumentation.
+			ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
+			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime())
+		}
+
+		if err := ex.maybeUpgradeToSerializable(ctx, stmt); err != nil {
+			return err
 		}
 
 		if placeholderHints == nil {
@@ -181,11 +237,7 @@ func (ex *connExecutor) prepare(
 			for i := range placeholderHints {
 				if placeholderHints[i] == nil {
 					if i >= len(rawTypeHints) {
-						return pgwirebase.NewProtocolViolationErrorf(
-							"expected %d arguments, got %d",
-							len(placeholderHints),
-							len(rawTypeHints),
-						)
+						break
 					}
 					if types.IsOIDUserDefinedType(rawTypeHints[i]) {
 						var err error
@@ -201,9 +253,13 @@ func (ex *connExecutor) prepare(
 		prepared.PrepareMetadata = querycache.PrepareMetadata{
 			PlaceholderTypesInfo: tree.PlaceholderTypesInfo{
 				TypeHints: placeholderHints,
+				Types:     placeholderHints,
 			},
 		}
 		prepared.Statement = stmt.Statement
+		// When we set our prepared statement, we need to make sure to propagate
+		// the original NumPlaceholders if we're preparing a PREPARE.
+		prepared.Statement.NumPlaceholders = origNumPlaceholders
 		prepared.StatementNoConstants = stmt.StmtNoConstants
 		prepared.StatementSummary = stmt.StmtSummary
 
@@ -211,32 +267,29 @@ func (ex *connExecutor) prepare(
 		// preparation.
 		stmt.Prepared = prepared
 
-		if err := tree.ProcessPlaceholderAnnotations(&ex.planner.semaCtx, stmt.AST, placeholderHints); err != nil {
-			return err
+		if stmt.NumPlaceholders > 0 {
+			if err := tree.ProcessPlaceholderAnnotations(&ex.planner.semaCtx, stmt.AST, placeholderHints); err != nil {
+				return err
+			}
 		}
 
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
-		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p)
+		p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
+		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p, origin)
 		return err
 	}
 
-	if txn := ex.state.mu.txn; txn != nil && txn.IsOpen() {
-		// Use the existing transaction.
-		if err := prepare(ctx, txn); err != nil {
+	// Use the existing transaction.
+	if err := prepare(ctx, ex.state.mu.txn); err != nil {
+		if origin != PreparedStatementOriginSessionMigration {
 			return nil, err
+		} else {
+			f := tree.NewFmtCtx(tree.FmtMarkRedactionNode | tree.FmtSimple)
+			f.FormatNode(stmt.AST)
+			redactableStmt := redact.SafeString(f.CloseAndGetString())
+			log.Warningf(ctx, "could not prepare statement during session migration (%s): %v", redactableStmt, err)
 		}
-	} else {
-		// Use a new transaction. This will handle retriable errors here rather
-		// than bubbling them up to the connExecutor state machine.
-		if err := ex.server.cfg.DB.Txn(ctx, prepare); err != nil {
-			return nil, err
-		}
-		// Prepare with an implicit transaction will end up creating
-		// a new transaction. Once this transaction is complete,
-		// we can safely release the leases, otherwise we will
-		// incorrectly hold leases for later operations.
-		ex.extraTxnState.descCollection.ReleaseAll(ctx)
 	}
 
 	// Account for the memory used by this prepared statement.
@@ -250,7 +303,11 @@ func (ex *connExecutor) prepare(
 // populatePrepared analyzes and type-checks the query and populates
 // stmt.Prepared.
 func (ex *connExecutor) populatePrepared(
-	ctx context.Context, txn *kv.Txn, placeholderHints tree.PlaceholderTypes, p *planner,
+	ctx context.Context,
+	txn *kv.Txn,
+	placeholderHints tree.PlaceholderTypes,
+	p *planner,
+	origin PreparedStatementOrigin,
 ) (planFlags, error) {
 	if before := ex.server.cfg.TestingKnobs.BeforePrepare; before != nil {
 		if err := before(ctx, ex.planner.stmt.String(), txn); err != nil {
@@ -258,21 +315,17 @@ func (ex *connExecutor) populatePrepared(
 		}
 	}
 	stmt := &p.stmt
-	if err := p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints); err != nil {
-		return 0, err
-	}
-	p.extendedEvalCtx.PrepareOnly = true
 
-	asOf, err := p.isAsOf(ctx, stmt.AST)
-	if err != nil {
-		return 0, err
-	}
-	if asOf != nil {
-		p.extendedEvalCtx.AsOfSystemTime = asOf
-		if !asOf.BoundedStaleness {
-			if err := txn.SetFixedTimestamp(ctx, asOf.Timestamp); err != nil {
-				return 0, err
-			}
+	p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints)
+	p.extendedEvalCtx.PrepareOnly = true
+	// If the statement is being prepared by a session migration, then we should
+	// not evaluate the AS OF SYSTEM TIME timestamp. During session migration,
+	// there is no way for the statement being prepared to be executed in this
+	// transaction, so there's no need to fix the timestamp, unlike how we must
+	// for pgwire- or SQL-level prepared statements.
+	if origin != PreparedStatementOriginSessionMigration {
+		if err := ex.handleAOST(ctx, p.stmt.AST); err != nil {
+			return 0, err
 		}
 	}
 
@@ -280,11 +333,10 @@ func (ex *connExecutor) populatePrepared(
 	// only allows SELECT, INSERT, UPDATE, DELETE and VALUES statements to be
 	// prepared.
 	// See: https://www.postgresql.org/docs/current/static/sql-prepare.html
-	// However, we allow a large number of additional statements.
-	// As of right now, the optimizer only works on SELECT statements and will
-	// fallback for all others, so this should be safe for the foreseeable
-	// future.
-	flags, err := p.prepareUsingOptimizer(ctx)
+	// However, we must be able to handle every type of statement below because
+	// the Postgres extended protocol requires running statements via the prepare
+	// and execute paths.
+	flags, err := p.prepareUsingOptimizer(ctx, origin)
 	if err != nil {
 		log.VEventf(ctx, 1, "optimizer prepare failed: %v", err)
 		return 0, err
@@ -297,9 +349,45 @@ func (ex *connExecutor) populatePrepared(
 func (ex *connExecutor) execBind(
 	ctx context.Context, bindCmd BindStmt,
 ) (fsm.Event, fsm.EventPayload) {
-
+	var ps *PreparedStatement
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
+		if bindCmd.PreparedStatementName != "" {
+			err = errors.WithDetailf(err, "statement name %q", bindCmd.PreparedStatementName)
+		}
+		if bindCmd.PortalName != "" {
+			err = errors.WithDetailf(err, "portal name %q", bindCmd.PortalName)
+		}
+		if ps != nil && ps.StatementSummary != "" {
+			err = errors.WithDetailf(err, "statement summary %q", ps.StatementSummary)
+		}
 		return eventNonRetriableErr{IsCommit: fsm.False}, eventNonRetriableErrPayload{err: err}
+	}
+
+	var ok bool
+	ps, ok = ex.extraTxnState.prepStmtsNamespace.prepStmts[bindCmd.PreparedStatementName]
+	if !ok {
+		return retErr(newPreparedStmtDNEError(ex.sessionData(), bindCmd.PreparedStatementName))
+	}
+
+	ex.extraTxnState.prepStmtsNamespace.touchLRUEntry(bindCmd.PreparedStatementName)
+
+	// We need to make sure type resolution happens within a transaction.
+	// Otherwise, for user-defined types we won't take the correct leases and
+	// will get back out of date type information.
+	// This code path is only used by the wire-level Bind command. The
+	// SQL EXECUTE command (which also needs to bind and resolve types) is
+	// handled separately in conn_executor_exec.
+	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
+		// The one critical exception is that we must not open a transaction when
+		// executing SHOW COMMIT TIMESTAMP as it would destroy the information
+		// about the previously committed transaction.
+		if _, ok := ps.AST.(*tree.ShowCommitTimestamp); !ok {
+			return ex.beginImplicitTxn(ctx, ps.AST, ex.QualityOfService())
+		}
+	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
+		if !ex.isAllowedInAbortedTxn(ps.AST) {
+			return retErr(sqlerrors.NewTransactionAbortedError("" /* customMsg */))
+		}
 	}
 
 	portalName := bindCmd.PortalName
@@ -309,16 +397,13 @@ func (ex *connExecutor) execBind(
 			return retErr(pgerror.Newf(
 				pgcode.DuplicateCursor, "portal %q already exists", portalName))
 		}
+		if cursor := ex.getCursorAccessor().getCursor(tree.Name(portalName)); cursor != nil {
+			return retErr(pgerror.Newf(
+				pgcode.DuplicateCursor, "portal %q already exists as cursor", portalName))
+		}
 	} else {
 		// Deallocate the unnamed portal, if it exists.
 		ex.deletePortal(ctx, "")
-	}
-
-	ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[bindCmd.PreparedStatementName]
-	if !ok {
-		return retErr(pgerror.Newf(
-			pgcode.InvalidSQLStatementName,
-			"unknown prepared statement %q", bindCmd.PreparedStatementName))
 	}
 
 	numQArgs := uint16(len(ps.InferredTypes))
@@ -369,19 +454,16 @@ func (ex *connExecutor) execBind(
 		if len(bindCmd.Args) != int(numQArgs) {
 			return retErr(
 				pgwirebase.NewProtocolViolationErrorf(
-					"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
+					"bind message supplies %d parameters, but requires %d", len(bindCmd.Args), numQArgs))
 		}
 
-		// We need to make sure type resolution happens within a transaction.
-		// Otherwise, for user-defined types we won't take the correct leases and
-		// will get back out of date type information.
-		// This code path is only used by the wire-level Bind command. The
-		// SQL EXECUTE command (which also needs to bind and resolve types) is
-		// handled separately in conn_executor_exec.
 		resolve := func(ctx context.Context, txn *kv.Txn) (err error) {
 			ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 			p := &ex.planner
 			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+			if err := ex.handleAOST(ctx, ps.AST); err != nil {
+				return err
+			}
 
 			for i, arg := range bindCmd.Args {
 				k := tree.PlaceholderIdx(i)
@@ -392,17 +474,29 @@ func (ex *connExecutor) execBind(
 				} else {
 					typ, ok := types.OidToType[t]
 					if !ok {
-						var err error
-						typ, err = ex.planner.ResolveTypeByOID(ctx, t)
-						if err != nil {
-							return err
+						// These special cases for json, json[] is here so we can
+						// support decoding parameters with oid=json/json[] without
+						// adding full support for these type.
+						// TODO(sql-exp): Remove this if we support JSON.
+						if t == oid.T_json {
+							typ = types.Json
+						} else if t == oid.T__json {
+							typ = types.JSONArrayForDecodingOnly
+						} else {
+							var err error
+							typ, err = ex.planner.ResolveTypeByOID(ctx, t)
+							if err != nil {
+								return err
+							}
 						}
 					}
 					d, err := pgwirebase.DecodeDatum(
+						ctx,
 						ex.planner.EvalContext(),
 						typ,
 						qArgFormatCodes[i],
 						arg,
+						p.datumAlloc,
 					)
 					if err != nil {
 						return pgerror.Wrapf(err, pgcode.ProtocolViolation, "error in argument for %s", k)
@@ -413,30 +507,22 @@ func (ex *connExecutor) execBind(
 			return nil
 		}
 
-		if txn := ex.state.mu.txn; txn != nil && txn.IsOpen() {
-			// Use the existing transaction.
-			if err := resolve(ctx, txn); err != nil {
-				return retErr(err)
-			}
-		} else {
-			// Use a new transaction. This will handle retriable errors here rather
-			// than bubbling them up to the connExecutor state machine.
-			if err := ex.server.cfg.DB.Txn(ctx, resolve); err != nil {
-				return retErr(err)
-			}
-			// Bind with an implicit transaction will end up creating
-			// a new transaction. Once this transaction is complete,
-			// we can safely release the leases, otherwise we will
-			// incorrectly hold leases for later operations.
-			ex.extraTxnState.descCollection.ReleaseAll(ctx)
+		// Use the existing transaction.
+		if err := resolve(ctx, ex.state.mu.txn); err != nil {
+			return retErr(err)
 		}
 	}
 
 	numCols := len(ps.Columns)
 	if (len(bindCmd.OutFormats) > 1) && (len(bindCmd.OutFormats) != numCols) {
-		return retErr(pgwirebase.NewProtocolViolationErrorf(
+		err := pgwirebase.NewProtocolViolationErrorf(
 			"expected 1 or %d for number of format codes, got %d",
-			numCols, len(bindCmd.OutFormats)))
+			numCols, len(bindCmd.OutFormats))
+		// A user is hitting this error unexpectedly and rarely, dump extra info,
+		// should be okay since this should be a very rare error.
+		log.Infof(ctx, "%s outformats: %v, AST: %T, prepared statements: %s", err.Error(),
+			bindCmd.OutFormats, ps.AST, ex.extraTxnState.prepStmtsNamespace.String())
+		return retErr(err)
 	}
 
 	columnFormatCodes := bindCmd.OutFormats
@@ -446,15 +532,6 @@ func (ex *connExecutor) execBind(
 		for i := 0; i < numCols; i++ {
 			columnFormatCodes[i] = bindCmd.OutFormats[0]
 		}
-	}
-
-	// This is a huge kludge to deal with the fact that we're resolving types
-	// using a planner with a committed transaction. This ends up being almost
-	// okay because the execution is going to re-acquire leases on these types.
-	// Regardless, holding this lease is worse than not holding it. Users might
-	// expect to get type mismatch errors if a rename of the type occurred.
-	if ex.getTransactionState() == NoTxnStateStr {
-		ex.planner.Descriptors().ReleaseAll(ctx)
 	}
 
 	// Create the new PreparedPortal.
@@ -484,6 +561,9 @@ func (ex *connExecutor) addPortal(
 	if _, ok := ex.extraTxnState.prepStmtsNamespace.portals[portalName]; ok {
 		panic(errors.AssertionFailedf("portal already exists: %q", portalName))
 	}
+	if cursor := ex.getCursorAccessor().getCursor(tree.Name(portalName)); cursor != nil {
+		panic(errors.AssertionFailedf("portal already exists as cursor: %q", portalName))
+	}
 
 	portal, err := ex.makePreparedPortal(ctx, portalName, stmt, qargs, outFormats)
 	if err != nil {
@@ -510,8 +590,10 @@ func (ex *connExecutor) deletePreparedStmt(ctx context.Context, name string) {
 	if !ok {
 		return
 	}
+	alloc := ps.memAcc.Allocated()
 	ps.decRef(ctx)
 	delete(ex.extraTxnState.prepStmtsNamespace.prepStmts, name)
+	ex.extraTxnState.prepStmtsNamespace.delLRUEntry(name, alloc)
 }
 
 func (ex *connExecutor) deletePortal(ctx context.Context, name string) {
@@ -556,38 +638,103 @@ func (ex *connExecutor) execDescribe(
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
 		return eventNonRetriableErr{IsCommit: fsm.False}, eventNonRetriableErrPayload{err: err}
 	}
+	_, isAbortedTxn := ex.machine.CurState().(stateAborted)
 
 	switch descCmd.Type {
 	case pgwirebase.PrepareStatement:
-		ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[descCmd.Name]
+		ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[string(descCmd.Name)]
 		if !ok {
-			return retErr(pgerror.Newf(
-				pgcode.InvalidSQLStatementName,
-				"unknown prepared statement %q", descCmd.Name))
+			return retErr(newPreparedStmtDNEError(ex.sessionData(), string(descCmd.Name)))
 		}
+		// Not currently counting this as an LRU touch on prepStmtsLRU for
+		// prepared_statements_cache_size (but maybe we should?).
 
+		ast := ps.AST
+		if execute, ok := ast.(*tree.Execute); ok {
+			// If we're describing an EXECUTE, we need to look up the statement type
+			// of the prepared statement that the EXECUTE refers to, or else we'll
+			// return the wrong information for describe.
+			innerPs, found := ex.extraTxnState.prepStmtsNamespace.prepStmts[string(execute.Name)]
+			if !found {
+				return retErr(newPreparedStmtDNEError(ex.sessionData(), string(execute.Name)))
+			}
+			ast = innerPs.AST
+		}
+		if isAbortedTxn && !ex.isAllowedInAbortedTxn(ast) {
+			return retErr(sqlerrors.NewTransactionAbortedError("" /* customMsg */))
+		}
 		res.SetInferredTypes(ps.InferredTypes)
-
-		if stmtHasNoData(ps.AST) {
+		if stmtHasNoData(ast) {
 			res.SetNoDataRowDescription()
 		} else {
 			res.SetPrepStmtOutput(ctx, ps.Columns)
 		}
 	case pgwirebase.PreparePortal:
-		portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[descCmd.Name]
+		// TODO(rimadeodhar): prepStmtsNamespace should also be updated to use tree.Name instead of string
+		// for indexing internal maps.
+		portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[string(descCmd.Name)]
 		if !ok {
-			return retErr(pgerror.Newf(
-				pgcode.InvalidCursorName, "unknown portal %q", descCmd.Name))
+			// Check SQL-level cursors.
+			cursor := ex.getCursorAccessor().getCursor(descCmd.Name)
+			if cursor == nil {
+				return retErr(pgerror.Newf(
+					pgcode.InvalidCursorName, "unknown portal %q", descCmd.Name))
+			}
+			if isAbortedTxn {
+				return retErr(sqlerrors.NewTransactionAbortedError("" /* customMsg */))
+			}
+			// Sending a nil formatCodes is equivalent to sending all text format
+			// codes.
+			res.SetPortalOutput(ctx, cursor.Rows.Types(), nil /* formatCodes */)
+			return nil, nil
 		}
 
-		if stmtHasNoData(portal.Stmt.AST) {
+		ast := portal.Stmt.AST
+		if isAbortedTxn && !ex.isAllowedInAbortedTxn(ast) {
+			return retErr(sqlerrors.NewTransactionAbortedError("" /* customMsg */))
+		}
+		if stmtHasNoData(ast) {
 			res.SetNoDataRowDescription()
 		} else {
 			res.SetPortalOutput(ctx, portal.Stmt.Columns, portal.OutFormats)
 		}
 	default:
-		return retErr(errors.AssertionFailedf(
-			"unknown describe type: %s", errors.Safe(descCmd.Type)))
+		return retErr(pgerror.Newf(
+			pgcode.ProtocolViolation,
+			"invalid DESCRIBE message subtype %d", errors.Safe(byte(descCmd.Type)),
+		))
 	}
 	return nil, nil
+}
+
+// isAllowedInAbortedTxn returns true if the statement is allowed to be
+// prepared and executed inside of an aborted transaction.
+func (ex *connExecutor) isAllowedInAbortedTxn(ast tree.Statement) bool {
+	switch s := ast.(type) {
+	case *tree.CommitTransaction, *tree.RollbackTransaction, *tree.RollbackToSavepoint:
+		return true
+	case *tree.Savepoint:
+		if ex.isCommitOnReleaseSavepoint(s.Name) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// newPreparedStmtDNEError creates an InvalidSQLStatementName error for when a
+// prepared statement does not exist.
+func newPreparedStmtDNEError(sd *sessiondata.SessionData, name string) error {
+	err := pgerror.Newf(
+		pgcode.InvalidSQLStatementName, "prepared statement %q does not exist", name,
+	)
+	cacheSize := sd.PreparedStatementsCacheSize
+	if cacheSize != 0 {
+		err = errors.WithHintf(
+			err, "note that prepared_statements_cache_size is set to %s",
+			string(humanizeutil.IBytes(cacheSize)),
+		)
+	}
+	return err
 }

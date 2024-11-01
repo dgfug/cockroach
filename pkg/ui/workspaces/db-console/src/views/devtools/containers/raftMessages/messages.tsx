@@ -1,25 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
 import React from "react";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
-import {
-  Metric,
-  Axis,
-  AxisUnits,
-} from "src/views/shared/components/metricQuery";
-
+import LineGraph from "src/views/cluster/components/linegraph";
 import { GraphDashboardProps } from "src/views/cluster/containers/nodeGraphs/dashboards/dashboardUtils";
+import { Metric, Axis } from "src/views/shared/components/metricQuery";
 
-export default function(props: GraphDashboardProps) {
+export default function (props: GraphDashboardProps) {
   const { nodeSources, tooltipSelection } = props;
 
   return [

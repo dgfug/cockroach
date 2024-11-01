@@ -7,22 +7,12 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
 package tree
-
-import (
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-)
 
 // DropBehavior represents options for dropping schema elements.
 type DropBehavior int
@@ -133,15 +123,6 @@ func (node *DropView) Format(ctx *FmtCtx) {
 	}
 }
 
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *DropView) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeDropCounter(
-		GetTableType(
-			false /* isSequence */, true, /* isView */
-			node.IsMaterialized))
-}
-
 // DropSequence represents a DROP SEQUENCE statement.
 type DropSequence struct {
 	Names        TableNames
@@ -229,5 +210,43 @@ func (node *DropSchema) Format(ctx *FmtCtx) {
 	if node.DropBehavior != DropDefault {
 		ctx.WriteString(" ")
 		ctx.WriteString(node.DropBehavior.String())
+	}
+}
+
+// DropExternalConnection represents a DROP EXTERNAL CONNECTION statement.
+type DropExternalConnection struct {
+	ConnectionLabel Expr
+}
+
+var _ Statement = &DropExternalConnection{}
+
+// Format implements the Statement interface.
+func (node *DropExternalConnection) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP EXTERNAL CONNECTION")
+
+	if node.ConnectionLabel != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(node.ConnectionLabel)
+	}
+}
+
+// DropTenant represents a DROP VIRTUAL CLUSTER command.
+type DropTenant struct {
+	TenantSpec *TenantSpec
+	IfExists   bool
+	Immediate  bool
+}
+
+var _ Statement = &DropTenant{}
+
+// Format implements the NodeFormatter interface.
+func (node *DropTenant) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP VIRTUAL CLUSTER ")
+	if node.IfExists {
+		ctx.WriteString("IF EXISTS ")
+	}
+	ctx.FormatNode(node.TenantSpec)
+	if node.Immediate {
+		ctx.WriteString(" IMMEDIATE")
 	}
 }

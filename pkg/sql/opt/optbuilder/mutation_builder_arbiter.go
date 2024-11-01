@@ -1,18 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -21,13 +18,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
 // findArbiters returns a set of arbiters for an INSERT ON CONFLICT statement.
-// Both unique indexes and unique constraints can be arbiters. This function
-// panics if no arbiters are found.
+// Both unique indexes and unique constraints can be arbiters. Arbiters may be
+// selected either by explicitly passing a named constraint (the ON CONFLICT ON
+// CONSTRAINT form) or by passing a list of columns on which to resolve
+// conflicts. This function panics if no arbiters are found.
 //
 // Arbiter constraints ensure that the columns designated by conflictOrds
 // reference at most one target row of a UNIQUE index or constraint. Using ANTI
@@ -35,17 +34,97 @@ import (
 // (otherwise result cardinality could increase). This is also a Postgres
 // requirement.
 //
+// When inferring arbiters from a list of columns, there are rules about which
+// index or constraint may be returned.
+//
 // An arbiter index:
 //
-//   1. Must have lax key columns that match the columns in conflictOrds.
-//   2. If it is a partial index, its predicate must be implied by the
-//      arbiterPredicate supplied by the user.
+//  1. Must have lax key columns that match the columns in the ON CONFLICT
+//     clause.
+//  2. If it is a partial index, its predicate must be implied by the
+//     arbiter predicate supplied by the user.
 //
 // An arbiter constraint:
 //
-//   1. Must have columns that match the columns in conflictOrds.
-//   2. If it is a partial constraint, its predicate must be implied by the
-//      arbiterPredicate supplied by the user.
+//  1. Must have columns that match the columns in the ON CONFLICT clause.
+//  2. If it is a partial constraint, its predicate must be implied by the
+//     arbiter predicate supplied by the user.
+func (mb *mutationBuilder) findArbiters(onConflict *tree.OnConflict) arbiterSet {
+	if onConflict == nil {
+		// No on conflict constraint means that we're in the UPSERT case, which should
+		// use the primary constraint as the arbiter.
+		primaryOrds := getExplicitPrimaryKeyOrdinals(mb.tab)
+		return mb.inferArbitersFromConflictOrds(primaryOrds, nil /* arbiterPredicate */)
+	} else if onConflict.Constraint != "" {
+		// We have a constraint explicitly named, so we can set the arbiter to use
+		// it directly.
+		for i, ic := 0, mb.tab.IndexCount(); i < ic; i++ {
+			index := mb.tab.Index(i)
+			if !index.IsUnique() {
+				continue
+			}
+			if index.Name() == onConflict.Constraint {
+				if _, partial := index.Predicate(); partial {
+					panic(partialIndexArbiterError(onConflict, mb.tab.Name()))
+
+				}
+				return makeSingleIndexArbiterSet(mb, i)
+			}
+		}
+		for i, uc := 0, mb.tab.UniqueCount(); i < uc; i++ {
+			constraint := mb.tab.Unique(i)
+			if constraint.Name() == string(onConflict.Constraint) {
+				if _, partial := constraint.Predicate(); partial {
+					panic(partialIndexArbiterError(onConflict, mb.tab.Name()))
+				}
+				return makeSingleUniqueConstraintArbiterSet(mb, i)
+			}
+		}
+		// Found nothing, we have to return an error.
+		panic(pgerror.Newf(
+			pgcode.UndefinedObject,
+			"constraint %q for table %q does not exist",
+			onConflict.Constraint, mb.tab.Name(),
+		))
+	}
+	// We have to infer an arbiter set.
+	var ords intsets.Fast
+	for _, name := range onConflict.Columns {
+		found := false
+		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+			tabCol := mb.tab.Column(i)
+			if tabCol.ColName() == name && !tabCol.IsMutation() && tabCol.Kind() != cat.System {
+				ords.Add(i)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			panic(colinfo.NewUndefinedColumnError(string(name)))
+		}
+	}
+	return mb.inferArbitersFromConflictOrds(ords, onConflict.ArbiterPredicate)
+}
+
+func partialIndexArbiterError(onConflict *tree.OnConflict, tableName tree.Name) error {
+	return errors.WithHint(
+		pgerror.Newf(
+			pgcode.WrongObjectType,
+			"unique constraint %q for table %q is partial, "+
+				"so it cannot be used as an arbiter via the ON CONSTRAINT syntax",
+			onConflict.Constraint,
+			tableName,
+		),
+		"use the ON CONFLICT (columns...) WHERE <predicate> form "+
+			"to select this partial unique constraint as an arbiter",
+	)
+}
+
+// inferArbitersFromConflictOrds is a helper function for findArbiters that
+// infers a set of conflict arbiters from a list of column ordinals that a
+// user specified in an ON CONFLICT clause. See the comment above findArbiters
+// for more information about what arbiters are.
 //
 // If conflictOrds is empty then all unique indexes and unique without index
 // constraints are returned as arbiters. This is required to support a
@@ -63,19 +142,19 @@ import (
 // constraints are returned so that uniqueness is guaranteed on the respective
 // subsets of rows. In summary, if conflictOrds is non-empty, this function:
 //
-//   1. Returns a single non-partial or pseudo-partial arbiter index, if found.
-//   2. Return a single non-partial or pseudo-partial arbiter constraint, if
-//      found.
-//   3. Otherwise, returns all partial arbiter indexes and constraints.
-//
-func (mb *mutationBuilder) findArbiters(
-	conflictOrds util.FastIntSet, arbiterPredicate tree.Expr,
+//  1. Returns a single non-partial or pseudo-partial arbiter index, if found.
+//  2. Return a single non-partial or pseudo-partial arbiter constraint, if
+//     found.
+//  3. Otherwise, returns all partial arbiter indexes and constraints.
+func (mb *mutationBuilder) inferArbitersFromConflictOrds(
+	conflictOrds intsets.Fast, arbiterPredicate tree.Expr,
 ) arbiterSet {
-	arbiters := makeArbiterSet(mb)
-
 	// If conflictOrds is empty, then all unique indexes and unique without
 	// index constraints are arbiters.
 	if conflictOrds.Empty() {
+		// Use a minArbiterSet which automatically removes arbiter indexes that
+		// are made redundant by arbiter unique constraints.
+		arbiters := makeMinArbiterSet(mb)
 		for idx, idxCount := 0, mb.tab.IndexCount(); idx < idxCount; idx++ {
 			if mb.tab.Index(idx).IsUnique() {
 				arbiters.AddIndex(idx)
@@ -86,9 +165,10 @@ func (mb *mutationBuilder) findArbiters(
 				arbiters.AddUniqueConstraint(uc)
 			}
 		}
-		return arbiters
+		return arbiters.ArbiterSet()
 	}
 
+	arbiters := makeArbiterSet(mb)
 	h := &mb.arbiterPredicateHelper
 	h.init(mb, arbiterPredicate)
 	for idx, idxCount := 0, mb.tab.IndexCount(); idx < idxCount; idx++ {
@@ -140,10 +220,6 @@ func (mb *mutationBuilder) findArbiters(
 			continue
 		}
 
-		if uniqueConstraint.ColumnCount() != conflictOrds.Len() {
-			continue
-		}
-
 		// Determine whether the conflict columns match the columns in the
 		// unique constraint. If not, the constraint cannot be an arbiter. We
 		// check the number of columns first to avoid unnecessarily collecting
@@ -192,28 +268,67 @@ func (mb *mutationBuilder) findArbiters(
 // anti-join wraps the current mb.outScope.expr (which produces the insert rows)
 // and removes rows that would conflict with existing rows.
 //
-// 	 - conflictOrds is the set of table column ordinals that the arbiter
+//   - texpr is the target table for the insert.
+//   - conflictOrds is the set of table column ordinals that the arbiter
 //     guarantees uniqueness of.
-// 	 - pred is the partial index or constraint predicate. If the arbiter is
+//   - pred is the partial index or constraint predicate. If the arbiter is
 //     not a partial index or constraint, pred is nil.
-//
 func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
-	inScope *scope, conflictOrds util.FastIntSet, pred tree.Expr,
+	inScope *scope,
+	texpr tree.TableExpr,
+	conflictOrds intsets.Fast,
+	pred tree.Expr,
+	uniqueWithoutIndex bool,
+	uniqueOrd int,
 ) {
+	locking := noRowLocking
+	// If we're using a weaker isolation level, we must lock the right side of the
+	// anti-join to prevent concurrent inserts from other transactions from
+	// violating the unique constraint. This is only necessary when a unique check
+	// is necessary. (That is, when there is no index directly enforcing the
+	// unique constraint. With an index directly enforcing the unique constraint,
+	// concurrent transactions will always conflict on the same KV key.)
+	if mb.b.evalCtx.TxnIsoLevel != isolation.Serializable && uniqueWithoutIndex && uniqueOrd >= 0 {
+		// Use uniqueCheckHelper to determine if a unique check is necessary.
+		h := &mb.uniqueCheckHelper
+		if h.init(mb, uniqueOrd) {
+			locking = lockingSpec{
+				&lockingItem{
+					item: &tree.LockingItem{
+						// TODO(michae2): Change this to ForKeyShare when it is supported.
+						// Actually, for INSERT ON CONFLICT DO NOTHING, I think this could
+						// be ForNone if we supported predicate locking at that
+						// strength. I'm pretty sure we don't need to lock existing rows at
+						// *any* locking strength, only need to prevent insertion of new
+						// non-existing rows.
+						Strength:   tree.ForShare,
+						Targets:    []tree.TableName{tree.MakeUnqualifiedTableName(mb.tab.Name())},
+						WaitPolicy: tree.LockWaitBlock,
+					},
+				},
+			}
+		}
+	}
+
+	var indexFlags *tree.IndexFlags
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok {
+		indexFlags = source.IndexFlags
+	}
+
 	// Build the right side of the anti-join. Use a new metadata instance
 	// of the mutation table so that a different set of column IDs are used for
 	// the two tables in the self-join.
 	fetchScope := mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations:       false,
-			includeSystem:          false,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: false,
+			includeSystem:    false,
+			includeInverted:  false,
 		}),
-		nil, /* indexFlags */
-		noRowLocking,
+		indexFlags,
+		locking,
 		inScope,
+		true, /* disableNotVisibleIndex */
 	)
 
 	// If the index is a unique partial index, then rows that are not in the
@@ -258,12 +373,22 @@ func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
 		on = append(on, mb.b.factory.ConstructFiltersItem(predScalar))
 	}
 
+	joinPrivate := memo.EmptyJoinPrivate
+	// If we're using a weaker isolation level, the anti-joined scan needs to
+	// obtain predicate locks. We must use a lookup anti-join for predicate locks
+	// to work.
+	if mb.b.evalCtx.TxnIsoLevel != isolation.Serializable && uniqueWithoutIndex {
+		joinPrivate = &memo.JoinPrivate{
+			Flags: memo.PreferLookupJoinIntoRight,
+		}
+	}
+
 	// Construct the anti-join.
 	mb.outScope.expr = mb.b.factory.ConstructAntiJoin(
 		mb.outScope.expr,
 		fetchScope.expr,
 		on,
-		memo.EmptyJoinPrivate,
+		joinPrivate,
 	)
 }
 
@@ -272,6 +397,7 @@ func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
 // left-joins each insert row to the target table, using the given conflict
 // columns as the join condition.
 //
+//   - texpr is the target table for the upsert.
 //   - conflictOrds is the set of table column ordinals that the arbiter
 //     guarantees uniqueness of.
 //   - pred is the partial index predicate. If the arbiter is not a partial
@@ -279,10 +405,46 @@ func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
 //   - partialIndexDistinctCol is a column that allows the UpsertDistinctOn to
 //     only de-duplicate insert rows that satisfy the partial index predicate.
 //     If the arbiter is not a partial index, partialIndexDistinctCol is nil.
-//
+//   - uniqueWithoutIndex is true if the arbiter is a unique constraint without
+//     an enforcing index.
 func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
-	inScope *scope, conflictOrds util.FastIntSet, pred tree.Expr,
+	inScope *scope,
+	texpr tree.TableExpr,
+	conflictOrds intsets.Fast,
+	pred tree.Expr,
+	uniqueWithoutIndex bool,
+	uniqueOrd int,
 ) {
+	locking := noRowLocking
+	// If we're using a weaker isolation level, we must lock the right side of the
+	// left join to prevent concurrent inserts from other transactions from
+	// violating the unique constraint. This is only necessary when a unique check
+	// is necessary. (That is, when there is no index directly enforcing the
+	// unique constraint. With an index directly enforcing the unique constraint,
+	// concurrent transactions will always conflict on the same KV key.)
+	if mb.b.evalCtx.TxnIsoLevel != isolation.Serializable && uniqueWithoutIndex && uniqueOrd >= 0 {
+		// Use uniqueCheckHelper to determine if a unique check is necessary.
+		h := &mb.uniqueCheckHelper
+		if h.init(mb, uniqueOrd) {
+			locking = lockingSpec{
+				&lockingItem{
+					item: &tree.LockingItem{
+						// If the row exists, we're about to update it, so take an exclusive
+						// lock to prevent a lock promotion.
+						Strength:   tree.ForUpdate,
+						Targets:    []tree.TableName{tree.MakeUnqualifiedTableName(mb.tab.Name())},
+						WaitPolicy: tree.LockWaitBlock,
+					},
+				},
+			}
+		}
+	}
+
+	var indexFlags *tree.IndexFlags
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok {
+		indexFlags = source.IndexFlags
+	}
+
 	// Build the right side of the left outer join. Use a different instance of
 	// table metadata so that col IDs do not overlap.
 	//
@@ -292,14 +454,14 @@ func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
 	mb.fetchScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations:       true,
-			includeSystem:          true,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: true,
+			includeSystem:    true,
+			includeInverted:  false,
 		}),
-		nil, /* indexFlags */
-		noRowLocking,
+		indexFlags,
+		locking,
 		inScope,
+		true, /* disableNotVisibleIndex */
 	)
 	// Set fetchColIDs to reference the columns created for the fetch values.
 	mb.setFetchColIDs(mb.fetchScope.cols)
@@ -349,12 +511,22 @@ func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
 	// mutationBuilder, and which are no longer needed for any other purpose.
 	mb.outScope.appendColumnsFromScope(mb.fetchScope)
 
+	joinPrivate := memo.EmptyJoinPrivate
+	// If we're using a weaker isolation level, the left-joined scan needs to
+	// obtain predicate locks. We must use a lookup left-join for predicate locks
+	// to work.
+	if mb.b.evalCtx.TxnIsoLevel != isolation.Serializable && uniqueWithoutIndex {
+		joinPrivate = &memo.JoinPrivate{
+			Flags: memo.PreferLookupJoinIntoRight,
+		}
+	}
+
 	// Construct the left join.
 	mb.outScope.expr = mb.b.factory.ConstructLeftJoin(
 		mb.outScope.expr,
 		mb.fetchScope.expr,
 		on,
-		memo.EmptyJoinPrivate,
+		joinPrivate,
 	)
 }
 
@@ -370,10 +542,9 @@ func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
 //     constraint, partialArbiterDistinctCol is nil.
 //   - errorOnDup indicates whether multiple rows in the same distinct group
 //     should trigger an error. If empty, no error is triggered.
-//
 func (mb *mutationBuilder) buildDistinctOnForArbiter(
 	insertColScope *scope,
-	conflictOrds util.FastIntSet,
+	conflictOrds intsets.Fast,
 	partialArbiterDistinctCol *scopeColumn,
 	errorOnDup string,
 ) {
@@ -409,8 +580,8 @@ func (mb *mutationBuilder) buildDistinctOnForArbiter(
 // partial index or unique constraint predicate should be de-duplicated. For
 // example:
 //
-//   CREATE TABLE t (a INT, b INT, UNIQUE INDEX (a) WHERE b > 0)
-//   INSERT INTO t VALUES (1, 1), (1, 2), (1, -1), (1, -10) ON CONFLICT DO NOTHING
+//	CREATE TABLE t (a INT, b INT, UNIQUE INDEX (a) WHERE b > 0)
+//	INSERT INTO t VALUES (1, 1), (1, 2), (1, -1), (1, -10) ON CONFLICT DO NOTHING
 //
 // The rows (1, 1), (1, -1), and (1, -10) should be inserted. (1, -1)
 // and (1, -10) should not be removed from the input set. Even though
@@ -423,10 +594,10 @@ func (mb *mutationBuilder) buildDistinctOnForArbiter(
 // and NULL otherwise. For the example above, the projected column would
 // be (b > 0) OR NULL. The values of the projected rows would be:
 //
-//   (1, 1)   -> (1, 1, true)
-//   (1, 2)   -> (1, 2, true)
-//   (1, -1)  -> (1, -1, NULL)
-//   (1, -10) -> (1, -10, NULL)
+//	(1, 1)   -> (1, 1, true)
+//	(1, 2)   -> (1, 2, true)
+//	(1, -1)  -> (1, -1, NULL)
+//	(1, -10) -> (1, -10, NULL)
 //
 // The set of conflict columns to be used for de-duplication includes a and the
 // newly projected column. The UpsertDistinctOn considers NULL values as unique,
@@ -490,7 +661,7 @@ func (h *arbiterPredicateHelper) init(mb *mutationBuilder, arbiterPredicate tree
 		tabMeta:          mb.md.TableMeta(mb.tabID),
 		arbiterPredicate: arbiterPredicate,
 	}
-	h.im.Init(mb.b.factory, mb.md, mb.b.evalCtx)
+	h.im.Init(mb.b.ctx, mb.b.factory, mb.md, mb.b.evalCtx)
 }
 
 // tableScope returns a scope that can be used to build predicate expressions.
@@ -500,14 +671,14 @@ func (h *arbiterPredicateHelper) tableScope() *scope {
 	if h.tableScopeLazy == nil {
 		h.tableScopeLazy = h.mb.b.buildScan(
 			h.tabMeta, tableOrdinals(h.tabMeta.Table, columnKinds{
-				includeMutations:       false,
-				includeSystem:          false,
-				includeInverted:        false,
-				includeVirtualComputed: true,
+				includeMutations: false,
+				includeSystem:    false,
+				includeInverted:  false,
 			}),
 			nil, /* indexFlags */
 			noRowLocking,
 			h.mb.b.allocScope(),
+			false, /* disableNotVisibleIndex */
 		)
 	}
 	return h.tableScopeLazy
@@ -581,6 +752,8 @@ func (h *arbiterPredicateHelper) predicateIsImpliedByArbiterPredicate(pred memo.
 		return false
 	}
 
-	_, ok = h.im.FiltersImplyPredicate(arbiterFilters, pred)
+	// TODO(mgartner): Determine if we should pass the computed columns map
+	// here.
+	_, ok = h.im.FiltersImplyPredicate(arbiterFilters, pred, nil /* computedCols */)
 	return ok
 }

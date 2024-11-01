@@ -1,15 +1,10 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import * as React from "react";
 import classNames from "classnames";
+import * as React from "react";
 
 import "./userAvatar.styl";
 
@@ -25,7 +20,10 @@ export default function UserAvatar(props: UserAvatarProps) {
     "user-avatar--disabled": disabled,
   });
 
-  const nameAbbreviation = userName[0].toUpperCase();
+  const nameAbbreviation =
+    typeof userName[0] == "undefined" || userName[0] == null
+      ? ""
+      : userName[0].toUpperCase();
 
   return (
     <div className={classes}>

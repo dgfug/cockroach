@@ -1,38 +1,34 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
 import (
 	"context"
+	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
 // We don't need this monitor to run very frequent. Normally, the schedule
 // should remain in the system table once it is created. However, some operations
 // such as RESTORE would wipe the system table and populate it with the data
-// from BAKCUP. In this case, it would be nice for us to preemptively check
+// from BACKUP. In this case, it would be nice for us to preemptively check
 // for the abnormal state of the schedule and restore it.
 var defaultScanInterval = time.Hour * 6
 
@@ -57,68 +53,84 @@ var longIntervalWarningThreshold = time.Hour * 24
 
 // jobMonitor monitors the system.scheduled_jobs table to ensure that we would
 // always have one sql stats scheduled compaction job running.
-// It immediately performs this check upon start() and runs the check
+// It performs this check immediately upon start() and runs the check
 // periodically every scanInterval (subject to jittering).
 type jobMonitor struct {
 	st           *cluster.Settings
-	ie           sqlutil.InternalExecutor
-	db           *kv.DB
+	clusterID    func() uuid.UUID
+	db           isql.DB
 	scanInterval time.Duration
 	jitterFn     func(time.Duration) time.Duration
+	testingKnobs struct {
+		updateCheckInterval time.Duration
+	}
 }
 
-func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
-	j.ensureSchedule(ctx)
-	j.registerClusterSettingHook()
+func (j *jobMonitor) start(
+	ctx context.Context, stopper *stop.Stopper, drain chan struct{}, tasksWG *sync.WaitGroup,
+) {
+	tasksWG.Add(1)
+	err := stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
+		defer tasksWG.Done()
 
-	_ = stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
-		for timer := timeutil.NewTimer(); ; timer.Reset(j.jitterFn(j.scanInterval)) {
+		nextJobScheduleCheck := timeutil.Now()
+		currentRecurrence := SQLStatsCleanupRecurrence.Get(&j.st.SV)
+
+		stopCtx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+
+		var timer timeutil.Timer
+		// Ensure schedule at startup.
+		timer.Reset(0)
+		defer timer.Stop()
+
+		updateCheckInterval := time.Minute
+		if j.testingKnobs.updateCheckInterval != 0 {
+			updateCheckInterval = j.testingKnobs.updateCheckInterval
+		}
+
+		// This loop runs every minute to check if we need to update the job schedule.
+		// We only hit the jobs table if the schedule needs to be updated due to a
+		// change in the recurrence cluster setting or as a scheduled check to
+		// ensure the schedule exists, which defaults to every 6 hours.
+		for {
 			select {
 			case <-timer.C:
 				timer.Read = true
-			case <-stopper.ShouldQuiesce():
+			case <-drain:
+				// Graceful shutdown.
+				return
+			case <-stopCtx.Done():
+				// Expedited shutdown.
 				return
 			}
-			j.ensureSchedule(ctx)
-		}
-	})
-}
 
-func (j *jobMonitor) registerClusterSettingHook() {
-	SQLStatsCleanupRecurrence.SetOnChange(&j.st.SV, func(ctx context.Context) {
-		if !j.isVersionCompatible(ctx) {
-			return
-		}
-		j.ensureSchedule(ctx)
-		if err := j.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			sj, err := j.getSchedule(ctx, txn)
-			if err != nil {
-				return err
+			// Read the config once to avoid race condition if config is changed during
+			// the update process.
+			newRecurrence := SQLStatsCleanupRecurrence.Get(&j.st.SV)
+			if newRecurrence != currentRecurrence || nextJobScheduleCheck.Before(timeutil.Now()) {
+				j.updateSchedule(stopCtx, newRecurrence)
+				nextJobScheduleCheck = timeutil.Now().Add(j.jitterFn(j.scanInterval))
+				currentRecurrence = newRecurrence
 			}
-			cronExpr := SQLStatsCleanupRecurrence.Get(&j.st.SV)
-			if err = sj.SetSchedule(cronExpr); err != nil {
-				return err
-			}
-			if err = CheckScheduleAnomaly(sj); err != nil {
-				log.Warningf(ctx, "schedule anomaly detected, disabled sql stats compaction may cause performance impact: %s", err)
-			}
-			return sj.Update(ctx, j.ie, txn)
-		}); err != nil {
-			log.Errorf(ctx, "unable to find sqlstats clean up schedule: %s", err)
+
+			timer.Reset(updateCheckInterval)
 		}
 	})
+	if err != nil {
+		tasksWG.Done()
+		log.Warningf(ctx, "error starting sql stats scheduled compaction job monitor: %v", err)
+	}
 }
 
 func (j *jobMonitor) getSchedule(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn isql.Txn,
 ) (sj *jobs.ScheduledJob, _ error) {
-	row, err := j.ie.QueryRowEx(
+	row, err := txn.QueryRowEx(
 		ctx,
 		"load-sql-stats-scheduled-job",
-		txn,
-		sessiondata.InternalExecutorOverride{
-			User: security.NodeUserName(),
-		},
+		txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT schedule_id FROM system.scheduled_jobs WHERE schedule_name = $1",
 		compactionScheduleName,
 	)
@@ -130,9 +142,9 @@ func (j *jobMonitor) getSchedule(
 		return nil, errScheduleNotFound
 	}
 
-	scheduledJobID := int64(tree.MustBeDInt(row[0]))
+	scheduledJobID := jobspb.ScheduleID(tree.MustBeDInt(row[0]))
 
-	sj, err = jobs.LoadScheduledJob(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID, j.ie, txn)
+	sj, err = jobs.ScheduledJobTxn(txn).Load(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID)
 	if err != nil {
 		return nil, err
 	}
@@ -140,41 +152,50 @@ func (j *jobMonitor) getSchedule(
 	return sj, nil
 }
 
-func (j *jobMonitor) ensureSchedule(ctx context.Context) {
-	if !j.isVersionCompatible(ctx) {
-		log.Infof(ctx, "cannot create sql stats scheduled compaction job because current cluster version is too low")
-		return
-	}
-
+func (j *jobMonitor) updateSchedule(ctx context.Context, cronExpr string) {
 	var sj *jobs.ScheduledJob
 	var err error
-	if err = j.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		// We check if we can get load the schedule, if the schedule cannot be
-		// loaded because it's not found, we recreate the schedule.
-		sj, err = j.getSchedule(ctx, txn)
-		if err != nil {
-			if !jobs.HasScheduledJobNotFoundError(err) && !errors.Is(err, errScheduleNotFound) {
-				return err
-			}
-			sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, j.ie, txn, j.st)
+	retryOptions := retry.Options{
+		InitialBackoff: time.Second,
+		MaxBackoff:     10 * time.Minute,
+	}
+	for r := retry.StartWithCtx(ctx, retryOptions); r.Next(); {
+		if err = j.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			// We check if we can get load the schedule, if the schedule cannot be
+			// loaded because it's not found, we recreate the schedule.
+			sj, err = j.getSchedule(ctx, txn)
+
 			if err != nil {
+				if !jobs.HasScheduledJobNotFoundError(err) && !errors.Is(err, errScheduleNotFound) {
+					return err
+				}
+				sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, j.st, j.clusterID())
+				if err != nil {
+					return err
+				}
+			}
+
+			if sj.ScheduleExpr() == cronExpr {
+				return nil
+			}
+			if err := sj.SetSchedule(cronExpr); err != nil {
 				return err
 			}
+			sj.SetScheduleStatus(string(jobs.StatusPending))
+			return jobs.ScheduledJobTxn(txn).Update(ctx, sj)
+		}); err != nil && ctx.Err() == nil {
+			log.Errorf(ctx, "failed to update stats scheduled compaction job: %s", err)
+		} else {
+			break
 		}
-		return nil
-	}); err != nil {
-		log.Errorf(ctx, "fail to ensure sql stats scheduled compaction job is created: %s", err)
-		return
 	}
 
-	if err = CheckScheduleAnomaly(sj); err != nil {
-		log.Warningf(ctx, "schedule anomaly detected: %s", err)
+	if ctx.Err() == nil {
+		if err = CheckScheduleAnomaly(sj); err != nil {
+			log.Warningf(ctx, "schedule anomaly detected, disabling sql stats compaction may cause performance impact: %s", err)
+		}
 	}
-}
 
-func (j *jobMonitor) isVersionCompatible(ctx context.Context) bool {
-	clusterVersion := j.st.Version.ActiveVersionOrEmpty(ctx)
-	return clusterVersion.IsActive(clusterversion.SQLStatsCompactionScheduledJob)
 }
 
 // CheckScheduleAnomaly checks a given schedule to see if it is either paused

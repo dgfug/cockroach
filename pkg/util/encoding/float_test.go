@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package encoding
 
@@ -104,6 +99,12 @@ func TestEncodeFloatOrdered(t *testing.T) {
 			if math.IsNaN(c.Value) {
 				if !math.IsNaN(dec) {
 					t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)
+				}
+			} else if c.Value == 0 {
+				// Both -0 and +0 should decode as +0. We need to check bit-for-bit
+				// equality to confirm this.
+				if math.Float64bits(dec) != math.Float64bits(0) {
+					t.Errorf("unexpected mismatch for %v, should be +0. got %v", c.Value, dec)
 				}
 			} else if dec != c.Value {
 				t.Errorf("unexpected mismatch for %v. got %v", c.Value, dec)

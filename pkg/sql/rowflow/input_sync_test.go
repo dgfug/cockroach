@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowflow
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -113,9 +109,12 @@ func TestOrderedSync(t *testing.T) {
 			rowBuf := distsqlutils.NewRowBuffer(types.ThreeIntCols, srcRows, distsqlutils.RowBufferArgs{})
 			sources = append(sources, rowBuf)
 		}
-		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
-		src, err := makeSerialSync(c.ordering, evalCtx, sources)
+		src, err := makeSerialSync(c.ordering, evalCtx, sources,
+			0,   /* serialSrcIndexExclusiveUpperBound */
+			nil, /* exceedsSrcIndexExclusiveUpperBoundErrorFunc */
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,9 +152,12 @@ func TestOrderedSyncDrainBeforeNext(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
-	o, err := makeSerialSync(colinfo.ColumnOrdering{}, evalCtx, sources)
+	o, err := makeSerialSync(colinfo.ColumnOrdering{}, evalCtx, sources,
+		0,   /* serialSrcIndexExclusiveUpperBound */
+		nil, /* exceedsSrcIndexExclusiveUpperBoundErrorFunc */
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

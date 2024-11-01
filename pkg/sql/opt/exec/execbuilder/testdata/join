@@ -179,7 +179,6 @@ vectorized: true
 ·
 • project
 │ columns: (y)
-│ estimated row count: 9,801 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (x, x, y)
@@ -206,7 +205,6 @@ vectorized: true
 ·
 • project
 │ columns: (y)
-│ estimated row count: 9,801 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (x, x, y)
@@ -233,7 +231,6 @@ vectorized: true
 ·
 • project
 │ columns: (x)
-│ estimated row count: 326,700 (missing stats)
 │
 └── • cross join (inner)
     │ columns: (x, y)
@@ -260,7 +257,6 @@ vectorized: true
 ·
 • render
 │ columns: (x, two, plus1)
-│ estimated row count: 10,000 (missing stats)
 │ render x: COALESCE(x, x)
 │ render two: two
 │ render plus1: plus1
@@ -272,7 +268,6 @@ vectorized: true
     │
     ├── • render
     │   │ columns: (two, x)
-    │   │ estimated row count: 1,000 (missing stats)
     │   │ render two: 2
     │   │ render x: x
     │   │
@@ -284,7 +279,6 @@ vectorized: true
     │
     └── • render
         │ columns: (plus1, x)
-        │ estimated row count: 1,000 (missing stats)
         │ render plus1: y + 1
         │ render x: x
         │
@@ -304,13 +298,11 @@ vectorized: true
 ·
 • sort
 │ columns: (k, u, w)
-│ ordering: +u
 │ estimated row count: 2
 │ order: +column1
 │
 └── • project
     │ columns: (column1, column2, column2)
-    │ estimated row count: 2
     │
     └── • hash join (inner)
         │ columns: (column1, column2, column1, column2)
@@ -409,13 +401,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (pktable_cat, update_rule, delete_rule, deferrability, nspname, relname, attname, nspname, relname, attname, conname, generate_series, relname)
-    │ ordering: +nspname,+relname,+conname,+generate_series
     │ estimated row count: 110,908 (missing stats)
     │ order: +nspname,+relname,+conname,+generate_series
     │
     └── • render
         │ columns: (pktable_cat, update_rule, delete_rule, deferrability, nspname, relname, attname, nspname, relname, attname, conname, generate_series, relname)
-        │ estimated row count: 110,908 (missing stats)
         │ render pktable_cat: CAST(NULL AS STRING)
         │ render update_rule: CASE confupdtype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 ELSE CAST(NULL AS INT8) END
         │ render delete_rule: CASE confdeltype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 ELSE CAST(NULL AS INT8) END
@@ -431,120 +421,115 @@ vectorized: true
         │ render relname: relname
         │
         └── • hash join (inner)
-            │ columns: (attrelid, attname, attnum, attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series, oid, relname, relnamespace, oid, nspname, objid, refobjid, oid, relname, relkind)
+            │ columns: (oid, nspname, oid, relname, relnamespace, attrelid, attname, attnum, attrelid, attname, attnum, objid, refobjid, oid, relname, relkind, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series)
             │ estimated row count: 110,908 (missing stats)
-            │ equality: (oid) = (objid)
+            │ equality: (oid) = (attrelid)
             │
             ├── • hash join (inner)
-            │   │ columns: (attrelid, attname, attnum, attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series, oid, relname, relnamespace, oid, nspname)
-            │   │ estimated row count: 114,302 (missing stats)
-            │   │ equality: (relnamespace) = (oid)
+            │   │ columns: (oid, nspname, oid, relname, relnamespace)
+            │   │ estimated row count: 9,801 (missing stats)
+            │   │ equality: (oid) = (relnamespace)
             │   │
-            │   ├── • hash join (inner)
-            │   │   │ columns: (attrelid, attname, attnum, attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series, oid, relname, relnamespace)
-            │   │   │ estimated row count: 11,557 (missing stats)
-            │   │   │ equality: (attrelid) = (oid)
-            │   │   │ pred: attnum = confkey[generate_series]
-            │   │   │
-            │   │   ├── • hash join (inner)
-            │   │   │   │ columns: (attrelid, attname, attnum, attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series)
-            │   │   │   │ estimated row count: 3,502 (missing stats)
-            │   │   │   │ equality: (attrelid) = (confrelid)
-            │   │   │   │
-            │   │   │   ├── • virtual table
-            │   │   │   │     columns: (attrelid, attname, attnum)
-            │   │   │   │     estimated row count: 1,000 (missing stats)
-            │   │   │   │     table: pg_attribute@primary
-            │   │   │   │
-            │   │   │   └── • cross join (inner)
-            │   │   │       │ columns: (attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series)
-            │   │   │       │ estimated row count: 354 (missing stats)
-            │   │   │       │ pred: attnum = conkey[generate_series]
-            │   │   │       │
-            │   │   │       ├── • hash join (inner)
-            │   │   │       │   │ columns: (attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname)
-            │   │   │       │   │ estimated row count: 107 (missing stats)
-            │   │   │       │   │ equality: (relnamespace) = (oid)
-            │   │   │       │   │
-            │   │   │       │   ├── • merge join (inner)
-            │   │   │       │   │   │ columns: (attrelid, attname, attnum, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace)
-            │   │   │       │   │   │ estimated row count: 105 (missing stats)
-            │   │   │       │   │   │ equality: (attrelid) = (oid)
-            │   │   │       │   │   │ merge ordering: +"(attrelid=oid)"
-            │   │   │       │   │   │
-            │   │   │       │   │   ├── • virtual table
-            │   │   │       │   │   │     columns: (attrelid, attname, attnum)
-            │   │   │       │   │   │     ordering: +attrelid
-            │   │   │       │   │   │     estimated row count: 1,000 (missing stats)
-            │   │   │       │   │   │     table: pg_attribute@pg_attribute_attrelid_idx
-            │   │   │       │   │   │
-            │   │   │       │   │   └── • virtual table lookup join (inner)
-            │   │   │       │   │       │ columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace)
-            │   │   │       │   │       │ ordering: +conrelid
-            │   │   │       │   │       │ estimated row count: 10 (missing stats)
-            │   │   │       │   │       │ table: pg_class@pg_class_oid_idx
-            │   │   │       │   │       │ equality: (conrelid) = (oid)
-            │   │   │       │   │       │ pred: relname = 'orders'
-            │   │   │       │   │       │
-            │   │   │       │   │       └── • filter
-            │   │   │       │   │           │ columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey)
-            │   │   │       │   │           │ ordering: +conrelid
-            │   │   │       │   │           │ estimated row count: 10 (missing stats)
-            │   │   │       │   │           │ filter: contype = 'f'
-            │   │   │       │   │           │
-            │   │   │       │   │           └── • virtual table
-            │   │   │       │   │                 columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey)
-            │   │   │       │   │                 ordering: +conrelid
-            │   │   │       │   │                 estimated row count: 1,000 (missing stats)
-            │   │   │       │   │                 table: pg_constraint@pg_constraint_conrelid_idx
-            │   │   │       │   │
-            │   │   │       │   └── • filter
-            │   │   │       │       │ columns: (oid, nspname)
-            │   │   │       │       │ estimated row count: 10 (missing stats)
-            │   │   │       │       │ filter: nspname = 'public'
-            │   │   │       │       │
-            │   │   │       │       └── • virtual table
-            │   │   │       │             columns: (oid, nspname)
-            │   │   │       │             estimated row count: 1,000 (missing stats)
-            │   │   │       │             table: pg_namespace@primary
-            │   │   │       │
-            │   │   │       └── • project set
-            │   │   │           │ columns: (generate_series)
-            │   │   │           │ estimated row count: 10
-            │   │   │           │ render 0: generate_series(1, 32)
-            │   │   │           │
-            │   │   │           └── • emptyrow
-            │   │   │                 columns: ()
-            │   │   │
-            │   │   └── • virtual table
-            │   │         columns: (oid, relname, relnamespace)
-            │   │         estimated row count: 1,000 (missing stats)
-            │   │         table: pg_class@primary
+            │   ├── • virtual table
+            │   │     columns: (oid, nspname)
+            │   │     estimated row count: 1,000 (missing stats)
+            │   │     table: pg_namespace@primary
             │   │
             │   └── • virtual table
-            │         columns: (oid, nspname)
+            │         columns: (oid, relname, relnamespace)
             │         estimated row count: 1,000 (missing stats)
-            │         table: pg_namespace@primary
+            │         table: pg_class@primary
             │
             └── • hash join (inner)
-                │ columns: (objid, refobjid, oid, relname, relkind)
-                │ estimated row count: 99 (missing stats)
-                │ equality: (refobjid) = (oid)
+                │ columns: (attrelid, attname, attnum, attrelid, attname, attnum, objid, refobjid, oid, relname, relkind, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series)
+                │ estimated row count: 1,779 (missing stats)
+                │ equality: (attrelid) = (oid)
+                │ pred: attnum = conkey[generate_series]
                 │
                 ├── • virtual table
-                │     columns: (objid, refobjid)
+                │     columns: (attrelid, attname, attnum)
                 │     estimated row count: 1,000 (missing stats)
-                │     table: pg_depend@primary
+                │     table: pg_attribute@primary
                 │
-                └── • filter
-                    │ columns: (oid, relname, relkind)
-                    │ estimated row count: 10 (missing stats)
-                    │ filter: relkind = 'i'
+                └── • cross join (inner)
+                    │ columns: (attrelid, attname, attnum, objid, refobjid, oid, relname, relkind, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname, generate_series)
+                    │ estimated row count: 539 (missing stats)
+                    │ pred: attnum = confkey[generate_series]
                     │
-                    └── • virtual table
-                          columns: (oid, relname, relkind)
-                          estimated row count: 1,000 (missing stats)
-                          table: pg_class@primary
+                    ├── • hash join (inner)
+                    │   │ columns: (attrelid, attname, attnum, objid, refobjid, oid, relname, relkind, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname)
+                    │   │ estimated row count: 163 (missing stats)
+                    │   │ equality: (attrelid) = (confrelid)
+                    │   │
+                    │   ├── • virtual table
+                    │   │     columns: (attrelid, attname, attnum)
+                    │   │     estimated row count: 1,000 (missing stats)
+                    │   │     table: pg_attribute@primary
+                    │   │
+                    │   └── • hash join (inner)
+                    │       │ columns: (objid, refobjid, oid, relname, relkind, oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname)
+                    │       │ estimated row count: 17 (missing stats)
+                    │       │ equality: (objid) = (oid)
+                    │       │
+                    │       ├── • hash join (inner)
+                    │       │   │ columns: (objid, refobjid, oid, relname, relkind)
+                    │       │   │ estimated row count: 99 (missing stats)
+                    │       │   │ equality: (refobjid) = (oid)
+                    │       │   │
+                    │       │   ├── • virtual table
+                    │       │   │     columns: (objid, refobjid)
+                    │       │   │     estimated row count: 1,000 (missing stats)
+                    │       │   │     table: pg_depend@primary
+                    │       │   │
+                    │       │   └── • filter
+                    │       │       │ columns: (oid, relname, relkind)
+                    │       │       │ estimated row count: 10 (missing stats)
+                    │       │       │ filter: relkind = 'i'
+                    │       │       │
+                    │       │       └── • virtual table
+                    │       │             columns: (oid, relname, relkind)
+                    │       │             estimated row count: 1,000 (missing stats)
+                    │       │             table: pg_class@primary
+                    │       │
+                    │       └── • hash join (inner)
+                    │           │ columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace, oid, nspname)
+                    │           │ estimated row count: 11 (missing stats)
+                    │           │ equality: (relnamespace) = (oid)
+                    │           │
+                    │           ├── • virtual table lookup join (inner)
+                    │           │   │ columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey, oid, relname, relnamespace)
+                    │           │   │ estimated row count: 10 (missing stats)
+                    │           │   │ table: pg_class@pg_class_oid_idx
+                    │           │   │ equality: (conrelid) = (oid)
+                    │           │   │ pred: relname = 'orders'
+                    │           │   │
+                    │           │   └── • filter
+                    │           │       │ columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey)
+                    │           │       │ estimated row count: 10 (missing stats)
+                    │           │       │ filter: contype = 'f'
+                    │           │       │
+                    │           │       └── • virtual table
+                    │           │             columns: (oid, conname, contype, condeferrable, condeferred, conrelid, confrelid, confupdtype, confdeltype, conkey, confkey)
+                    │           │             estimated row count: 1,000 (missing stats)
+                    │           │             table: pg_constraint@primary
+                    │           │
+                    │           └── • filter
+                    │               │ columns: (oid, nspname)
+                    │               │ estimated row count: 10 (missing stats)
+                    │               │ filter: nspname = 'public'
+                    │               │
+                    │               └── • virtual table
+                    │                     columns: (oid, nspname)
+                    │                     estimated row count: 1,000 (missing stats)
+                    │                     table: pg_namespace@primary
+                    │
+                    └── • project set
+                        │ columns: (generate_series)
+                        │ estimated row count: 10
+                        │ render 0: generate_series(1, 32)
+                        │
+                        └── • emptyrow
+                              columns: ()
 
 # Ensure that left joins on non-null foreign keys turn into inner joins
 statement ok
@@ -556,18 +541,11 @@ EXPLAIN SELECT * FROM cards LEFT OUTER JOIN customers ON customers.id = cards.cu
 distribution: local
 vectorized: true
 ·
-• merge join
-│ equality: (cust) = (id)
-│ right cols are key
-│
-├── • scan
-│     missing stats
-│     table: cards@cards_cust_idx
-│     spans: FULL SCAN
+• render
 │
 └── • scan
       missing stats
-      table: customers@customers_pkey
+      table: cards@cards_pkey
       spans: FULL SCAN
 
 # Tests for filter propagation through joins.
@@ -608,17 +586,15 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, n, sq)
-│ estimated row count: 990 (missing stats)
 │
 └── • hash join (inner)
-    │ columns: (column10, a, b, n, sq)
+    │ columns: (column14, a, b, n, sq)
     │ estimated row count: 990 (missing stats)
-    │ equality: (column10) = (sq)
+    │ equality: (column14) = (sq)
     │
     ├── • render
-    │   │ columns: (column10, a, b)
-    │   │ estimated row count: 1,000 (missing stats)
-    │   │ render column10: a + b
+    │   │ columns: (column14, a, b)
+    │   │ render column14: a + b
     │   │ render a: a
     │   │ render b: b
     │   │
@@ -644,7 +620,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, n, sq)
-│ estimated row count: 990 (missing stats)
 │
 └── • filter
     │ columns: (div, a, b, n, sq)
@@ -653,7 +628,6 @@ vectorized: true
     │
     └── • render
         │ columns: (div, a, b, n, sq)
-        │ estimated row count: 1,000,000 (missing stats)
         │ render div: (a * b) / 2
         │ render a: a
         │ render b: b
@@ -685,17 +659,15 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, n, sq)
-│ estimated row count: 1,000 (missing stats)
 │
 └── • hash join (full outer)
-    │ columns: (column10, a, b, n, sq)
+    │ columns: (column14, a, b, n, sq)
     │ estimated row count: 1,000 (missing stats)
-    │ equality: (column10) = (sq)
+    │ equality: (column14) = (sq)
     │
     ├── • render
-    │   │ columns: (column10, a, b)
-    │   │ estimated row count: 1,000 (missing stats)
-    │   │ render column10: a + b
+    │   │ columns: (column14, a, b)
+    │   │ render column14: a + b
     │   │ render a: a
     │   │ render b: b
     │   │
@@ -719,22 +691,20 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, n, sq)
-│ estimated row count: 333 (missing stats)
 │
 └── • filter
-    │ columns: (column10, a, b, n, sq)
+    │ columns: (column14, a, b, n, sq)
     │ estimated row count: 333 (missing stats)
     │ filter: (b % 2) != (sq % 2)
     │
     └── • hash join (full outer)
-        │ columns: (column10, a, b, n, sq)
+        │ columns: (column14, a, b, n, sq)
         │ estimated row count: 1,000 (missing stats)
-        │ equality: (column10) = (sq)
+        │ equality: (column14) = (sq)
         │
         ├── • render
-        │   │ columns: (column10, a, b)
-        │   │ estimated row count: 1,000 (missing stats)
-        │   │ render column10: a + b
+        │   │ columns: (column14, a, b)
+        │   │ render column14: a + b
         │   │ render a: a
         │   │ render b: b
         │   │
@@ -763,7 +733,7 @@ vectorized: true
 ·
 • filter
 │ columns: (a, b, n, sq)
-│ estimated row count: 115 (missing stats)
+│ estimated row count: 116 (missing stats)
 │ filter: ((n IS NULL) OR (n > 1)) AND ((n IS NULL) OR (a < sq))
 │
 └── • hash join (left outer)
@@ -805,7 +775,7 @@ vectorized: true
 ·
 • filter
 │ columns: (a, b, n, sq)
-│ estimated row count: 42 (missing stats)
+│ estimated row count: 44 (missing stats)
 │ filter: ((a IS NULL) OR (a > 2)) AND ((a IS NULL) OR (a < sq))
 │
 └── • hash join (left outer)
@@ -848,7 +818,7 @@ vectorized: true
 │
 ├── • filter
 │   │ columns: (a, b)
-│   │ estimated row count: 111 (missing stats)
+│   │ estimated row count: 113 (missing stats)
 │   │ filter: ((a > 1) AND ((a IS NULL) OR (a > 2))) AND ((a IS NULL) OR (a < b))
 │   │
 │   └── • scan
@@ -879,7 +849,6 @@ vectorized: true
 ·
 • project
 │ columns: (x)
-│ estimated row count: 96 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (x, y, y, x)
@@ -944,7 +913,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, c, d)
-│ estimated row count: 0 (missing stats)
 │
 └── • merge join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
@@ -969,33 +937,30 @@ vectorized: true
           spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAC AS r USING(a, b, c)
+EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAC AS r USING(a, b)
 ----
 distribution: local
 vectorized: true
 ·
 • project
-│ columns: (a, b, c, d, d)
-│ estimated row count: 1 (missing stats)
+│ columns: (a, b, c, d, c, d)
 │
 └── • merge join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
-    │ estimated row count: 1 (missing stats)
-    │ equality: (b, a, c) = (b, a, c)
-    │ left cols are key
-    │ right cols are key
-    │ merge ordering: +"(b=b)",+"(a=a)",+"(c=c)"
+    │ estimated row count: 100 (missing stats)
+    │ equality: (b, a) = (b, a)
+    │ merge ordering: +"(b=b)",+"(a=a)"
     │
     ├── • scan
     │     columns: (a, b, c, d)
-    │     ordering: +b,+a,+c
+    │     ordering: +b,+a
     │     estimated row count: 1,000 (missing stats)
     │     table: pkbac@pkbac_pkey
     │     spans: FULL SCAN
     │
     └── • scan
           columns: (a, b, c, d)
-          ordering: +b,+a,+c
+          ordering: +b,+a
           estimated row count: 1,000 (missing stats)
           table: pkbac@pkbac_pkey
           spans: FULL SCAN
@@ -1095,7 +1060,6 @@ vectorized: true
 ·
 • render
 │ columns: (s, s, s)
-│ estimated row count: 10,000 (missing stats)
 │ render s: COALESCE(s, s)
 │ render s: s
 │ render s: s
@@ -1125,7 +1089,6 @@ vectorized: true
 ·
 • render
 │ columns: (s, s, s)
-│ estimated row count: 10,000 (missing stats)
 │ render s: COALESCE(s, s)
 │ render s: s
 │ render s: s
@@ -1157,7 +1120,6 @@ vectorized: true
 ·
 • render
 │ columns: (a, s)
-│ estimated row count: 1,000 (missing stats)
 │ render s: COALESCE(s, s)
 │ render a: a
 │
@@ -1198,7 +1160,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 34 (missing stats)
 │
 └── • merge join (inner)
     │ columns: (x, y, u, x, y, v)
@@ -1228,7 +1189,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 333 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (x, y, u, x, y, v)
@@ -1258,7 +1218,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 333 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (x, y, v, x, y, u)
@@ -1293,7 +1252,6 @@ vectorized: true
 │
 └── • render
     │ columns: (x, y, u, v)
-    │ estimated row count: 1,900 (missing stats)
     │ render x: COALESCE(x, x)
     │ render y: COALESCE(y, y)
     │ render u: u
@@ -1435,7 +1393,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 333 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (x, y, u, x, y, v)
@@ -1465,7 +1422,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 333 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (x, y, v, x, y, u)
@@ -1500,7 +1456,6 @@ vectorized: true
 │
 └── • render
     │ columns: (x, y, u, v)
-    │ estimated row count: 1,900 (missing stats)
     │ render x: COALESCE(x, x)
     │ render y: COALESCE(y, y)
     │ render u: u
@@ -1587,7 +1542,6 @@ vectorized: true
 ·
 • project
 │ columns: (x, y, u, v)
-│ estimated row count: 33 (missing stats)
 │
 └── • merge join (inner)
     │ columns: (x, y, v, x, y, u)
@@ -1628,7 +1582,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b1, b2)
-│ estimated row count: 1 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (a, b1, a, b2)
@@ -1684,7 +1637,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b1, b2)
-│ estimated row count: 1 (missing stats)
 │
 └── • merge join (left outer)
     │ columns: (a, b2, a, b1)
@@ -1798,7 +1750,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, c, d)
-│ estimated row count: 0 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
@@ -1827,7 +1778,6 @@ vectorized: true
 ·
 • project
 │ columns: (b, a, c, d, a, c, d)
-│ estimated row count: 9,801 (missing stats)
 │
 └── • cross join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
@@ -1855,7 +1805,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, c, d, c, d)
-│ estimated row count: 96 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
@@ -1884,7 +1833,6 @@ vectorized: true
 ·
 • project
 │ columns: (a, b, c, d, d)
-│ estimated row count: 1 (missing stats)
 │
 └── • hash join (inner)
     │ columns: (a, b, c, d, a, b, c, d)
@@ -2089,7 +2037,7 @@ vectorized: true
   left columns: (a, b)
   left fixed values: 1 column
   right table: zigzag@c_idx
-  right columns: (c)
+  right columns: (a, c)
   right fixed values: 1 column
 
 
@@ -2111,7 +2059,7 @@ vectorized: true
       left columns: (a, b)
       left fixed values: 1 column
       right table: zigzag@c_idx
-      right columns: (c)
+      right columns: (a, c)
       right fixed values: 1 column
 
 # Zigzag join nested inside a lookup, with an on condition on lookup join.
@@ -2133,7 +2081,7 @@ vectorized: true
       left columns: (a, b)
       left fixed values: 1 column
       right table: zigzag@c_idx
-      right columns: (c)
+      right columns: (a, c)
       right fixed values: 1 column
 
 
@@ -2166,6 +2114,10 @@ vectorized: true
           missing stats
           table: zigzag2@a_b_idx
           spans: [/1/2 - /1/2]
+
+# Reset zigzag joins to its default setting.
+statement ok
+RESET enable_zigzag_join
 
 # Test that we can force a merge join.
 query T
@@ -2261,16 +2213,134 @@ EXPLAIN SELECT * FROM cards LEFT OUTER HASH JOIN customers ON customers.id = car
 distribution: local
 vectorized: true
 ·
-• hash join
-│ equality: (cust) = (id)
-│ right cols are key
-│
-├── • scan
-│     missing stats
-│     table: cards@cards_pkey
-│     spans: FULL SCAN
+• render
 │
 └── • scan
       missing stats
-      table: customers@customers_pkey
+      table: cards@cards_pkey
       spans: FULL SCAN
+
+# Test that STRAIGHT JOIN is not as strong a hint as LOOKUP JOIN when exploring.
+
+statement ok
+CREATE TABLE t119035 (
+  k INT PRIMARY KEY,
+  a INT,
+  b INT,
+  INDEX (a, b)
+)
+
+query T
+EXPLAIN (OPT, MEMO)
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) as v(x, y)
+INNER STRAIGHT JOIN t119035 ON a > x
+----
+memo (optimized, ~10KB, required=[presentation: info:10] [distribution: test])
+ ├── G1: (explain G2 [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test])
+ │    └── [presentation: info:10] [distribution: test]
+ │         ├── best: (explain G2="[presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test]" [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test])
+ │         └── cost: 1196.99
+ ├── G2: (inner-join G3 G4 G5)
+ │    ├── [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test]
+ │    │    ├── best: (inner-join G3="[distribution: test]" G4="[distribution: test]" G5)
+ │    │    └── cost: 1196.97
+ │    └── []
+ │         ├── best: (inner-join G3 G4 G5)
+ │         └── cost: 1196.97
+ ├── G3: (values G6 id=v1)
+ │    ├── [distribution: test]
+ │    │    ├── best: (values G6 id=v1)
+ │    │    └── cost: 0.04
+ │    └── []
+ │         ├── best: (values G6 id=v1)
+ │         └── cost: 0.04
+ ├── G4: (scan t119035,cols=(3-5)) (scan t119035@t119035_a_b_idx,cols=(3-5))
+ │    ├── [distribution: test]
+ │    │    ├── best: (scan t119035,cols=(3-5))
+ │    │    └── cost: 1149.22
+ │    └── []
+ │         ├── best: (scan t119035,cols=(3-5))
+ │         └── cost: 1149.22
+ ├── G5: (filters G7)
+ ├── G6: (scalar-list G8 G9 G10)
+ ├── G7: (gt G11 G12)
+ ├── G8: (tuple G13)
+ ├── G9: (tuple G14)
+ ├── G10: (tuple G15)
+ ├── G11: (variable a)
+ ├── G12: (variable column1)
+ ├── G13: (scalar-list G16 G17)
+ ├── G14: (scalar-list G18 G19)
+ ├── G15: (scalar-list G20 G21)
+ ├── G16: (const 1)
+ ├── G17: (const 10)
+ ├── G18: (const 2)
+ ├── G19: (const 20)
+ ├── G20: (const 3)
+ └── G21: (const 30)
+inner-join (cross)
+ ├── flags: disallow hash join (store left side) and lookup join (into left side) and inverted join (into left side)
+ ├── values
+ │    ├── (1, 10)
+ │    ├── (2, 20)
+ │    └── (3, 30)
+ ├── scan t119035
+ └── filters
+      └── a > column1
+
+query T
+EXPLAIN (OPT, MEMO)
+SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) as v(x, y)
+INNER LOOKUP JOIN t119035 ON a > x
+----
+memo (optimized, ~11KB, required=[presentation: info:10] [distribution: test])
+ ├── G1: (explain G2 [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test])
+ │    └── [presentation: info:10] [distribution: test]
+ │         ├── best: (explain G2="[presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test]" [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test])
+ │         └── cost: 2172.81
+ ├── G2: (inner-join G3 G4 G5) (lookup-join G3 G6 t119035@t119035_a_b_idx,outCols=(1-5))
+ │    ├── [presentation: x:1,y:2,k:3,a:4,b:5] [distribution: test]
+ │    │    ├── best: (lookup-join G3="[distribution: test]" G6 t119035@t119035_a_b_idx,outCols=(1-5))
+ │    │    └── cost: 2172.79
+ │    └── []
+ │         ├── best: (lookup-join G3 G6 t119035@t119035_a_b_idx,outCols=(1-5))
+ │         └── cost: 2172.79
+ ├── G3: (values G7 id=v1)
+ │    ├── [distribution: test]
+ │    │    ├── best: (values G7 id=v1)
+ │    │    └── cost: 0.04
+ │    └── []
+ │         ├── best: (values G7 id=v1)
+ │         └── cost: 0.04
+ ├── G4: (scan t119035,cols=(3-5)) (scan t119035@t119035_a_b_idx,cols=(3-5))
+ │    ├── [distribution: test]
+ │    │    ├── best: (scan t119035,cols=(3-5))
+ │    │    └── cost: 1149.22
+ │    └── []
+ │         ├── best: (scan t119035,cols=(3-5))
+ │         └── cost: 1149.22
+ ├── G5: (filters G8)
+ ├── G6: (filters)
+ ├── G7: (scalar-list G9 G10 G11)
+ ├── G8: (gt G12 G13)
+ ├── G9: (tuple G14)
+ ├── G10: (tuple G15)
+ ├── G11: (tuple G16)
+ ├── G12: (variable a)
+ ├── G13: (variable column1)
+ ├── G14: (scalar-list G17 G18)
+ ├── G15: (scalar-list G19 G20)
+ ├── G16: (scalar-list G21 G22)
+ ├── G17: (const 1)
+ ├── G18: (const 10)
+ ├── G19: (const 2)
+ ├── G20: (const 20)
+ ├── G21: (const 3)
+ └── G22: (const 30)
+inner-join (lookup t119035@t119035_a_b_idx)
+ ├── flags: force lookup join (into right side)
+ ├── values
+ │    ├── (1, 10)
+ │    ├── (2, 20)
+ │    └── (3, 30)
+ └── filters (true)

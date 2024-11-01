@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgdate
 
@@ -53,9 +48,6 @@ type fieldExtract struct {
 	// Provides a time for evaluating relative dates as well as a
 	// timezone. Should only be used via the now() and location() accessors.
 	currentTime time.Time
-	// currentTimeUsed is set if we consulted currentTime (indicating if the
-	// result depends on the context).
-	currentTimeUsed bool
 
 	// location is set to the timezone specified by the timestamp (if any).
 	location *time.Location
@@ -66,17 +58,28 @@ type fieldExtract struct {
 	// Stores a reference to one of the sentinel values, to be returned
 	// by the makeDateTime() functions
 	sentinel *time.Time
-	// This indicates that the value in the year field was only
-	// two digits and should be adjusted to make it recent.
-	tweakYear bool
 	// Tracks the sign of the timezone offset.  We need to track
 	// this separately from the sign of the tz1 value in case
 	// we're trying to store a (nonsensical) value like -0030.
 	tzSign int
 	// Tracks the fields that we want to extract.
 	wanted fieldSet
+
+	textChunksScratch [fieldMaximum]stringChunk
+	numbersScratch    [fieldMaximum]numberChunk
+
+	// This indicates that the value in the year field was only
+	// two digits and should be adjusted to make it recent.
+	tweakYear bool
+	// currentTimeUsed is set if we consulted currentTime (indicating if the
+	// result depends on the context).
+	currentTimeUsed bool
 	// Tracks whether the current timestamp is of db2 format.
 	isDB2 bool
+
+	// skipErrorAnnotation, if set, indicates that we should avoid allocating
+	// objects for error annotations as much as possible.
+	skipErrorAnnotation bool
 }
 
 func (fe *fieldExtract) now() time.Time {
@@ -96,8 +99,8 @@ func (fe *fieldExtract) getLocation() *time.Location {
 // string into a collection of date/time fields in order to populate a
 // fieldExtract.
 func (fe *fieldExtract) Extract(s string) error {
+	textChunks := fe.textChunksScratch[:fieldMaximum]
 	// Break the string into alphanumeric chunks.
-	textChunks := make([]stringChunk, fieldMaximum)
 	count, _ := chunk(s, textChunks)
 
 	if count < 0 {
@@ -107,7 +110,7 @@ func (fe *fieldExtract) Extract(s string) error {
 	}
 
 	// Create a place to store extracted numeric info.
-	numbers := make([]numberChunk, 0, fieldMaximum)
+	numbers := fe.numbersScratch[:0]
 
 	appendNumber := func(prefix, number string) error {
 		v, err := strconv.Atoi(number)
@@ -682,9 +685,12 @@ func (fe *fieldExtract) MakeTimeWithoutTimezone() time.Time {
 
 // stropTimezone converts the given time to a time that looks the same but is in
 // UTC, e.g. from
-//   2020-06-26 01:02:03 +0200 CEST
+//
+//	2020-06-26 01:02:03 +0200 CEST
+//
 // to
-//   2020-06-27 01:02:03 +0000 UTC.
+//
+//	2020-06-27 01:02:03 +0000 UTC.
 //
 // Note that the two times don't represent the same time instant.
 func stripTimezone(t time.Time) time.Time {
@@ -710,7 +716,7 @@ func (fe *fieldExtract) MakeTimestamp() time.Time {
 	return time.Date(year, time.Month(month), day, hour, min, sec, nano, fe.MakeLocation())
 }
 
-// MakeTimestampWIthoutTimezone returns a time.Time containing all extracted
+// MakeTimestampWithoutTimezone returns a time.Time containing all extracted
 // information, minus any timezone information (which is stripped). The returned
 // time always has UTC location. See ParseTimestampWithoutTimezone.
 func (fe *fieldExtract) MakeTimestampWithoutTimezone() time.Time {
@@ -782,6 +788,9 @@ func (fe *fieldExtract) Set(field field, v int) error {
 
 // decorateError adds context to an error object.
 func (fe *fieldExtract) decorateError(err error) error {
+	if fe.skipErrorAnnotation {
+		return err
+	}
 	return errors.WithDetailf(err,
 		"Wanted: %v\nAlready found in input: %v", &fe.wanted, &fe.has)
 }
@@ -858,7 +867,7 @@ func (fe *fieldExtract) SetDayOfYear(chunk numberChunk) error {
 	if !ok {
 		return errors.AssertionFailedf("year must be set before day of year")
 	}
-	y, m, d := julianDayToDate(dateToJulianDay(y, 1, 1) + chunk.v - 1)
+	y, m, d := julianDayToDate(DateToJulianDay(y, 1, 1) + chunk.v - 1)
 	if err := fe.Reset(fieldYear, y); err != nil {
 		return err
 	}
@@ -881,20 +890,26 @@ func (fe *fieldExtract) SafeFormat(w redact.SafePrinter, _ rune) {
 
 func (fe *fieldExtract) String() string { return redact.StringWithoutMarkers(fe) }
 
+var (
+	missingRequiredDateFieldsErr    = inputErrorf("missing required date fields")
+	missingRequiredTimeFieldsErr    = inputErrorf("missing required time fields")
+	missingRequiredFieldsInInputErr = inputErrorf("missing required fields in input")
+)
+
 // validate ensures that the data in the extract is reasonable. It also
 // performs some field fixups, such as converting two-digit years
 // to actual values and adjusting for AM/PM.
 func (fe *fieldExtract) validate() error {
 	// If we have any of the required fields, we must have all of the required fields.
 	if fe.has.HasAny(dateRequiredFields) && !fe.has.HasAll(dateRequiredFields) {
-		return fe.decorateError(inputErrorf("missing required date fields"))
+		return fe.decorateError(missingRequiredDateFieldsErr)
 	}
 
 	if (fe.isDB2 && !fe.has.HasAll(db2TimeRequiredFields)) || (fe.has.HasAny(timeRequiredFields) && !fe.has.HasAll(timeRequiredFields)) {
-		return fe.decorateError(inputErrorf("missing required time fields"))
+		return fe.decorateError(missingRequiredTimeFieldsErr)
 	}
 	if !fe.has.HasAll(fe.required) {
-		return fe.decorateError(inputErrorf("missing required fields in input"))
+		return fe.decorateError(missingRequiredFieldsInInputErr)
 	}
 
 	if year, ok := fe.Get(fieldYear); ok {

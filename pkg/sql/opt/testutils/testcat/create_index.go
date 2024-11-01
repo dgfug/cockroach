@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -21,13 +16,17 @@ func (tc *Catalog) CreateIndex(stmt *tree.CreateIndex, version descpb.IndexDescr
 	tn := stmt.Table
 	// Update the table name to include catalog and schema if not provided.
 	tc.qualifyTableName(&tn)
-	tab := tc.Table(&tn)
-
-	for _, idx := range tab.Indexes {
-		in := stmt.Name.String()
-		if idx.IdxName == in {
-			panic(errors.Newf(`relation "%s" already exists`, in))
+	tab, err := tc.LookupTable(&tn)
+	var view *View
+	if err == nil {
+		for _, idx := range tab.Indexes {
+			in := stmt.Name.String()
+			if idx.IdxName == in {
+				panic(errors.Newf(`relation "%s" already exists`, in))
+			}
 		}
+	} else {
+		view = tc.View(&tn)
 	}
 
 	// Convert stmt to a tree.IndexTableDef so that Table.addIndex can be used
@@ -40,6 +39,7 @@ func (tc *Catalog) CreateIndex(stmt *tree.CreateIndex, version descpb.IndexDescr
 		Inverted:         stmt.Inverted,
 		PartitionByIndex: stmt.PartitionByIndex,
 		Predicate:        stmt.Predicate,
+		Invisibility:     stmt.Invisibility,
 	}
 
 	idxType := nonUniqueIndex
@@ -47,5 +47,9 @@ func (tc *Catalog) CreateIndex(stmt *tree.CreateIndex, version descpb.IndexDescr
 		idxType = uniqueIndex
 
 	}
-	tab.addIndexWithVersion(indexTableDef, idxType, version)
+	if tab != nil {
+		tab.addIndexWithVersion(indexTableDef, idxType, version)
+	} else if view != nil {
+		view.addIndex(indexTableDef)
+	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -36,6 +31,7 @@ func (g *explorerGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	g.w.nestIndent("import (\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/opt\"\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/opt/memo\"\n")
+	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical\"\n")
 	g.w.writeIndent("\"github.com/cockroachdb/cockroach/pkg/sql/sem/tree\"\n")
 	g.w.unnest(")\n\n")
 
@@ -47,27 +43,27 @@ func (g *explorerGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 // for each define statement that has an explore rule defined. The code is
 // similar to this:
 //
-//   func (_e *explorer) exploreGroupMember(
-//     state *exploreState,
-//     member memo.RelExpr,
-//     ordinal int,
-//   ) (_fullyExplored bool) {
-//     switch t := member.(type) {
-//       case *memo.ScanNode:
-//         return _e.exploreScan(state, t, ordinal)
-//       case *memo.SelectNode:
-//         return _e.exploreSelect(state, t, ordinal)
-//     }
+//	func (_e *explorer) exploreGroupMember(
+//	  state *exploreState,
+//	  member memo.RelExpr,
+//	  ordinal int,
+//	) (_fullyExplored bool) {
+//	  switch t := member.(type) {
+//	    case *memo.ScanNode:
+//	      return _e.exploreScan(state, t, ordinal)
+//	    case *memo.SelectNode:
+//	      return _e.exploreSelect(state, t, ordinal)
+//	  }
 //
-//     // No rules for other operator types.
-//     return true
-//   }
-//
+//	  // No rules for other operator types.
+//	  return true
+//	}
 func (g *explorerGen) genDispatcher() {
 	g.w.nestIndent("func (_e *explorer) exploreGroupMember(\n")
 	g.w.writeIndent("state *exploreState,\n")
 	g.w.writeIndent("member memo.RelExpr,\n")
 	g.w.writeIndent("ordinal int,\n")
+	g.w.writeIndent("required *physical.Required,\n")
 	g.w.unnest(") (_fullyExplored bool)")
 	g.w.nest(" {\n")
 	g.w.writeIndent("switch t := member.(type) {\n")
@@ -77,7 +73,7 @@ func (g *explorerGen) genDispatcher() {
 		rules := g.compiled.LookupMatchingRules(string(define.Name)).WithTag("Explore")
 		if len(rules) > 0 {
 			opTyp := g.md.typeOf(define)
-			format := "case *%s: return _e.explore%s(state, t, ordinal)\n"
+			format := "case *%s: return _e.explore%s(state, t, ordinal, required)\n"
 			g.w.writeIndent(format, opTyp.name, define.Name)
 		}
 	}
@@ -91,18 +87,18 @@ func (g *explorerGen) genDispatcher() {
 // genRuleFuncs generates a method for each operator that has at least one
 // explore rule defined. The code is similar to this:
 //
-//   func (_e *explorer) exploreScan(
-//     _rootState *exploreState,
-//     _root *memo.ScanNode,
-//     _rootOrd int,
-//   ) (_fullyExplored bool) {
-//     _fullyExplored = true
+//	func (_e *explorer) exploreScan(
+//	  _rootState *exploreState,
+//	  _root *memo.ScanNode,
+//	  _rootOrd int,
+//	  _required *physical.Required,
+//	) (_fullyExplored bool) {
+//	  _fullyExplored = true
 //
-//     ... exploration rule code goes here ...
+//	  ... exploration rule code goes here ...
 //
-//     return _fullyExplored
-//   }
-//
+//	  return _fullyExplored
+//	}
 func (g *explorerGen) genRuleFuncs() {
 	for _, define := range g.compiled.Defines {
 		rules := g.compiled.LookupMatchingRules(string(define.Name)).WithTag("Explore")
@@ -116,8 +112,10 @@ func (g *explorerGen) genRuleFuncs() {
 		g.w.writeIndent("_rootState *exploreState,\n")
 		g.w.writeIndent("_root *%s,\n", opTyp.name)
 		g.w.writeIndent("_rootOrd int,\n")
+		g.w.writeIndent("_required *physical.Required,\n")
 		g.w.unnest(") (_fullyExplored bool)")
 		g.w.nest(" {\n")
+		g.w.writeIndent("opt.MaybeInjectOptimizerTestingPanic(_e.ctx, _e.evalCtx)\n")
 		g.w.writeIndent("_fullyExplored = true\n\n")
 
 		sortRulesByPriority(rules)

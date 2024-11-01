@@ -1,19 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
 import (
 	"reflect"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -24,18 +21,66 @@ type evalContext struct {
 	db *Database
 	ri ResultIterator
 
-	facts      []fact
-	depth, cur int
-	slots      []slot
+	facts []fact
+
+	// depth and cur relate to the join depth in the entities list.
+	depth, cur queryDepth
+
+	// Keeps track of stats for the query. Is reset each time a new query is run.
+	stats QueryStats
+
+	slots             []slot
+	slotResetCount    []int8 // Keeps track of the number of times a slot has been reset
+	filterSliceCaches map[int][]reflect.Value
+	curSubQuery       int
+}
+
+type QueryStats struct {
+	// StartTime is the timestamp when the query started.
+	StartTime time.Time
+	// ResultsFound tracks the number of results returned by the query.
+	ResultsFound int
+	// FirstUnsatisfiedClause is the index of the first clause in the query that
+	// wasn't satisfied. This is set when a query runs and no results are found
+	// (ResultsFound is zero). The index refers to an entry in []Query.clauses.
+	FirstUnsatisfiedClause int
+	// FiltersCheckStarted indicates whether the query completed all slots and
+	// began applying filters.
+	FiltersCheckStarted bool
+	// LastFilterChecked is the index of the last filter applied. This is valid
+	// only if FiltersCheckStarted is true.
+	LastFilterChecked int
 }
 
 func newEvalContext(q *Query) *evalContext {
 	return &evalContext{
-		q:     q,
-		depth: len(q.entities),
-		slots: append(make([]slot, 0, len(q.slots)), q.slots...),
-		facts: q.facts,
+		q:              q,
+		depth:          queryDepth(len(q.entities)),
+		slots:          cloneSlots(q.slots),
+		slotResetCount: make([]int8, len(q.slots)),
+		facts:          q.facts,
 	}
+}
+
+// cloneSlots clones the slots of a query for use in an evalContext.
+func cloneSlots(slots []slot) []slot {
+	clone := append(make([]slot, 0, len(slots)), slots...)
+	for i := range clone {
+		// If there are any slots which map to a set of allowed values, we need
+		// to clone those values because during query evaluation, we'll fill in
+		// inline values in the context of the current entity set. This matters
+		// in particular for constraints related to entities or strings; their
+		// inline values depend on the entitySet.
+		if clone[i].any != nil {
+			vals := clone[i].any
+			clone[i].any = append(make([]typedValue, 0, len(vals)), vals...)
+		}
+		if clone[i].not != nil {
+			cloned := *clone[i].not
+			clone[i].not = &cloned
+		}
+	}
+	return clone
 }
 
 type evalResult evalContext
@@ -71,13 +116,21 @@ func (ec *evalContext) Iterate(db *Database, ri ResultIterator) error {
 // filters and pass along the result or that we need to go on and
 // join the next entity.
 func (ec *evalContext) iterateNext() error {
-
+	nextSubQuery, done, err := ec.maybeVisitSubqueries()
+	if done || err != nil {
+		return err
+	}
+	if curSubQuery := ec.curSubQuery; nextSubQuery != curSubQuery {
+		defer func() { ec.curSubQuery = curSubQuery }()
+		ec.curSubQuery = nextSubQuery
+	}
 	// We're at the bottom of the iteration, check if all conditions have
 	// been satisfied, and then invoke the iterator.
 	if ec.cur == ec.depth {
 		if ec.haveUnboundSlots() || ec.checkFilters() {
 			return nil
 		}
+		ec.stats.ResultsFound++
 		return ec.ri((*evalResult)(ec))
 	}
 
@@ -90,28 +143,42 @@ func (ec *evalContext) iterateNext() error {
 	// If there exists an any clause, which forms a disjunction, over some
 	// attribute for the next entity, iterate independently over each of the
 	// values.
-	where, anyAttr, anyValues := ec.buildWhere()
-	defer putValues(where)
+	where, hasAttrs, anyAttr, anyValues, err := ec.buildWhere()
+	if err != nil {
+		return err
+	}
 	if len(anyValues) > 0 {
-		for _, v := range anyValues {
-			where.add(anyAttr, v.value)
-			if err := ec.db.iterate(where, ec); err != nil {
+		for i := range anyValues {
+			// Interact with the slice directly in order to potentially set
+			// the inline value.
+			v := &anyValues[i]
+			iv, err := v.inlineValue(&ec.db.entitySet, anyAttr)
+			if err != nil {
+				return err
+			}
+			if !where.add(anyAttr, iv) {
+				return errors.AssertionFailedf(
+					"failed to create predicate with more than %d attributes", numAttrs,
+				)
+			}
+			if err := ec.db.iterate(where, hasAttrs, ec); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	// If there's no anyValues, directly iterate the database.
-	return ec.db.iterate(where, ec)
+	return ec.db.iterate(where, hasAttrs, ec)
 }
 
-func (ec *evalContext) visit(e *entity) error {
+func (ec *evalContext) visit(e entity) error {
 	// Keep track of which slots were filled as part of this step in the
 	// evaluation and then unset them when we pop out of this stack frame.
-	var slotsFilled util.FastIntSet
+	var slotsFilled intsets.Fast
 	defer func() {
 		slotsFilled.ForEach(func(i int) {
-			ec.slots[i].typedValue = typedValue{}
+			ec.slotResetCount[i]++
+			ec.slots[i].reset()
 		})
 	}()
 
@@ -121,8 +188,8 @@ func (ec *evalContext) visit(e *entity) error {
 	if foundContradiction := maybeSet(
 		ec.slots, ec.q.entities[ec.cur],
 		typedValue{
-			typ:   e.getTypeInfo(ec.db.Schema()).typ,
-			value: e.getComparableValue(ec.db.schema, Self),
+			typ:   e.getTypeInfo(&ec.db.entitySet).typ,
+			value: e.getSelf(&ec.db.entitySet),
 		},
 		&slotsFilled,
 	); foundContradiction {
@@ -139,7 +206,7 @@ func (ec *evalContext) visit(e *entity) error {
 				continue
 			}
 
-			tv, ok := e.getTypedValue(ec.db.schema, f.attr)
+			tv, ok := e.getTypedValue(&ec.db.entitySet, f.attr)
 			if !ok {
 				return true // we have no value for this attribute, contradiction
 			}
@@ -182,45 +249,63 @@ func (ec *evalContext) haveUnboundSlots() bool {
 }
 
 func (ec *evalContext) checkFilters() (done bool) {
-	for _, f := range ec.q.filters {
-		// TODO(ajwerner): Catch panics here and convert them to errors.
-		ins := make([]reflect.Value, len(f.input))
-		insI := make([]interface{}, len(f.input))
-		for i, idx := range f.input {
-			inI := ec.slots[idx].typedValue.toInterface()
-			in := reflect.ValueOf(inI)
-			// Note that this will enforce that the type of the input to the filter
-			// matches the expectation by omitting results of the wrong type. This
-			// may or may not be the right behavior.
-			//
-			// TODO(ajwerner): Enforce the typing at a lower layer. See the TODO
-			// where this filter was built.
-			inType := f.predicate.Type().In(i)
-			if in.Type() != inType {
-				if in.Type().ConvertibleTo(inType) {
-					in = in.Convert(inType)
-				} else {
-					return true
-				}
-			}
-			ins[i] = in
-			insI[i] = inI
-		}
-		outs := f.predicate.Call(ins)
-		if !outs[0].Bool() {
+	ec.stats.FiltersCheckStarted = true
+	ec.stats.LastFilterChecked = 0
+	for i := range ec.q.filters {
+		if done = ec.checkFilter(i); done {
 			return true
 		}
+		ec.stats.LastFilterChecked++
 	}
 	return false
+}
+
+func (ec *evalContext) checkFilter(i int) bool {
+	f := ec.q.filters[i]
+	ins := ec.getFilterInput(i)
+	defer func() {
+		for i := range f.input {
+			ins[i] = reflect.Value{}
+		}
+	}()
+	for i, idx := range f.input {
+		inI := ec.slots[idx].typedValue.toInterface()
+		in := reflect.ValueOf(inI)
+		// Note that this will enforce that the type of the input to the filter
+		// matches the expectation by omitting results of the wrong type. This
+		// may or may not be the right behavior.
+		//
+		// TODO(ajwerner): Enforce the typing at a lower layer. See the TODO
+		// where this filter was built.
+		inType := f.predicate.Type().In(i)
+		if in.Type() != inType {
+			if in.Type().ConvertibleTo(inType) {
+				in = in.Convert(inType)
+			} else {
+				return true
+			}
+		}
+		ins[i] = in
+	}
+	// TODO(ajwerner): Catch panics here and convert them to errors.
+	outs := f.predicate.Call(ins)
+	return !outs[0].Bool()
 }
 
 // Construct a where clause with all the bound values known for the next
 // entity in the join. In the face of an existing any clause for the current
 // entity, the corresponding attribute and values will be returned for use
 // breaking the disjunction into separate indexed searches for each value.
-func (ec *evalContext) buildWhere() (where *valuesMap, anyAttr ordinal, anyValues []typedValue) {
-	where = getValues()
-
+func (ec *evalContext) buildWhere() (
+	where values,
+	hasAttrs ordinalSet,
+	anyAttr ordinal,
+	anyValues []typedValue,
+	_ error,
+) {
+	hasAttrs = hasAttrs.
+		add(ec.db.schema.typeOrdinal).
+		add(ec.db.schema.selfOrdinal)
 	// The logic here is that if there's an any for a slotIdx with a fact for the
 	// current entity, maybe we want to use it to bound our search. In general,
 	// it will help if we have an index that covers the current facts plus this
@@ -233,18 +318,26 @@ func (ec *evalContext) buildWhere() (where *valuesMap, anyAttr ordinal, anyValue
 		if f.variable != ec.q.entities[ec.cur] {
 			continue
 		}
-		s := ec.slots[f.value]
-		if !s.empty() {
-			where.add(f.attr, s.value)
+		hasAttrs = hasAttrs.add(f.attr)
+		if s := &ec.slots[f.value]; !s.empty() {
+			p, err := s.inlineValue(&ec.db.entitySet, f.attr)
+			if err != nil {
+				return values{}, 0, 0, nil, err
+			}
+			if !where.add(f.attr, p) {
+				return values{}, 0, 0, nil, errors.AssertionFailedf(
+					"failed to create predicate with more than %d attributes", numAttrs,
+				)
+			}
 		} else if anyValues == nil && s.any != nil {
 			anyAttr, anyValues = f.attr, s.any
 		}
 	}
-	return where, anyAttr, anyValues
+	return where, hasAttrs, anyAttr, anyValues, nil
 }
 
 // unify is like unifyReturningContradiction but it does not return the fact.
-func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionFound bool) {
+func unify(facts []fact, s []slot, slotsFilled *intsets.Fast) (contradictionFound bool) {
 	contradictionFound, _ = unifyReturningContradiction(facts, s, slotsFilled)
 	return contradictionFound
 }
@@ -254,7 +347,7 @@ func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionF
 // contradiction is returned. Any slots set in the process of unification
 // are recorded into the set.
 func unifyReturningContradiction(
-	facts []fact, s []slot, slotsFilled *util.FastIntSet,
+	facts []fact, s []slot, slotsFilled *intsets.Fast,
 ) (contradictionFound bool, contradicted fact) {
 	// TODO(ajwerner): As we unify we could determine that some facts are no
 	// longer relevant. When we do that we could move them to the front and keep
@@ -316,7 +409,7 @@ func (ec *evalContext) maybeVisitAlreadyBoundEntity() (done bool, _ error) {
 	if s.empty() {
 		return false, nil
 	}
-	e, ok := ec.db.entities[s.value]
+	eid, ok := ec.db.hash[s.value]
 
 	// This is the case where we've somehow bound the entity to a
 	// value that does not exist in the database. This could happen
@@ -327,5 +420,113 @@ func (ec *evalContext) maybeVisitAlreadyBoundEntity() (done bool, _ error) {
 	if !ok {
 		return true, nil // contradiction
 	}
-	return true, ec.visit(e)
+	return true, ec.visit(ec.db.entities[eid])
+}
+
+func (ec *evalContext) getFilterInput(i int) (ins []reflect.Value) {
+	if ec.filterSliceCaches == nil {
+		ec.filterSliceCaches = make(map[int][]reflect.Value)
+	}
+	c, ok := ec.filterSliceCaches[i]
+	if !ok {
+		c = make([]reflect.Value, len(ec.q.filters[i].input))
+		ec.filterSliceCaches[i] = c
+	}
+	return c
+}
+
+func (ec *evalContext) maybeVisitSubqueries() (nextSubQuery int, done bool, error error) {
+	nextSubQuery = ec.curSubQuery
+	for nextSubQuery < len(ec.q.notJoins) &&
+		ec.q.notJoins[nextSubQuery].depth <= ec.cur {
+		if done, err := ec.visitSubquery(nextSubQuery); done || err != nil {
+			return ec.curSubQuery, done, err
+		}
+		nextSubQuery++
+	}
+	return nextSubQuery, false, nil
+}
+
+func (ec *evalContext) visitSubquery(query int) (done bool, _ error) {
+	sub := ec.q.notJoins[query]
+	sec := sub.query.getEvalContext()
+	defer sub.query.putEvalContext(sec)
+	defer func() { // reset the slots populated to run the subquery
+		sub.inputSlotMappings.ForEach(func(_, subSlot int) {
+			sec.slotResetCount[subSlot]++
+			sec.slots[subSlot].reset()
+		})
+	}()
+	if err := ec.bindSubQuerySlots(sub.inputSlotMappings, sec); err != nil {
+		return false, err
+	}
+	err := sec.Iterate(ec.db, func(r Result) error {
+		return errResultSetNotEmpty
+	})
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, errResultSetNotEmpty):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+func (ec *evalContext) bindSubQuerySlots(mapping util.FastIntMap, sec *evalContext) (err error) {
+	mapping.ForEach(func(src, dst int) {
+		if err != nil {
+			return
+		}
+		if ec.slots[src].empty() {
+			// TODO(ajwerner): Find a way to prove statically that this cannot
+			// happen and make it an assertion failure.
+			err = errors.Errorf(
+				"subquery invocation references unbound variable %q",
+				ec.findSlotVariable(src),
+			)
+		}
+		sec.slots[dst].typedValue = ec.slots[src].typedValue
+	})
+	return err
+}
+
+func (ec *evalContext) findSlotVariable(src int) Var {
+	for v, slot := range ec.q.variableSlots {
+		if src == int(slot) {
+			return v
+		}
+	}
+	return ""
+}
+
+var errResultSetNotEmpty = errors.New("result set not empty")
+
+// findFirstClauseNotSatisfied returns a clause that wasn't satisfied in the
+// last query. There could be multiple clauses unsatisfied, this function
+// returns the earliest one, which should be investigated first when debugging
+// the rule. The index of the clause is returned, which can be used to lookup in
+// Query.Clauses().
+func (ec *evalContext) findFirstClauseNotSatisfied() (int, error) {
+	minUnsatisfiedClauseInx := len(ec.q.clauses)
+	for i := range ec.slots {
+		if ec.slots[i].empty() && ec.slotResetCount[i] == 0 {
+			minUnsatisfiedClauseInx = min(minUnsatisfiedClauseInx, ec.q.clauseIDs[i])
+		}
+	}
+
+	if minUnsatisfiedClauseInx < len(ec.q.clauses) {
+		return minUnsatisfiedClauseInx, nil
+	}
+
+	// If we found satisfied entries in all slots, it indicates that the filters,
+	// which are evaluated at the end, did not satisfy the query. Locate the last
+	// filter that was applied.
+	if !ec.stats.FiltersCheckStarted || ec.stats.LastFilterChecked >= len(ec.q.filters) {
+		return -1,
+			errors.AssertionFailedf("cound not find a clause that was not satisfied: "+
+				"FiltesCheckStarted=%t, LastFilterChecked=%d, len(filters)=%d",
+				ec.stats.FiltersCheckStarted, ec.stats.LastFilterChecked, len(ec.q.filters))
+	}
+	return ec.q.filters[ec.stats.LastFilterChecked].clauseID, nil
 }

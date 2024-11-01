@@ -1,24 +1,79 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { createAction } from "@reduxjs/toolkit";
+
 import { DOMAIN_NAME } from "../utils";
 
 type Page =
+  | "Databases"
+  | "Database Details"
+  | "Index Details"
+  | "Jobs"
+  | "Schema Insights"
+  | "Sessions"
+  | "Sessions Details"
   | "Statements"
   | "Statement Details"
-  | "Sessions"
-  | "Sessions Details";
+  | "Statement Insight Details"
+  | "Transactions"
+  | "Transaction Details"
+  | "Transaction Insight Details"
+  | "Workload Insights - Statement"
+  | "Workload Insights - Transaction";
+
+type ApplySearchCriteriaEvent = {
+  name: "Apply Search Criteria";
+  page: Page;
+  tsValue: string;
+  limitValue: number;
+  sortValue: string;
+};
+
+type BackButtonClick = {
+  name: "Back Clicked";
+  page: Page;
+};
+
+type ColumnsChangeEvent = {
+  name: "Columns Selected change";
+  page: Page;
+  value: string;
+};
+
+type FilterEvent = {
+  name: "Filter Clicked";
+  page: Page;
+  filterName: string;
+  value: string;
+};
+
+type JobTypeEvent = {
+  name: "Job Type Selected";
+  page: Page;
+  value: string;
+};
+
+type ResetStats = {
+  name: "Reset Index Usage" | "Reset Stats";
+  page: Page;
+};
 
 type SearchEvent = {
   name: "Keyword Searched";
+  page: Page;
+};
+
+type SessionActionsClicked = {
+  name: "Session Actions Clicked";
+  page: Page;
+  action: "Cancel Statement" | "Cancel Session";
+};
+
+type SessionClicked = {
+  name: "Session Clicked";
   page: Page;
 };
 
@@ -29,10 +84,15 @@ type SortingEvent = {
   columnName: string;
 };
 
+type StatementClicked = {
+  name: "Statement Clicked";
+  page: Page;
+};
+
 type StatementDiagnosticEvent = {
   name: "Statement Diagnostics Clicked";
   page: Page;
-  action: "Activated" | "Downloaded";
+  action: "Activated" | "Downloaded" | "Cancelled";
 };
 
 type TabChangedEvent = {
@@ -41,50 +101,53 @@ type TabChangedEvent = {
   page: Page;
 };
 
-type BackButtonClick = {
-  name: "Back Clicked";
+type TimeScaleChangeEvent = {
+  name: "TimeScale changed";
   page: Page;
-};
-
-type StatementClicked = {
-  name: "Statement Clicked";
-  page: Page;
-};
-
-type SessionClicked = {
-  name: "Session Clicked";
-  page: Page;
-};
-
-type SessionActionsClicked = {
-  name: "Session Actions Clicked";
-  page: Page;
-  action: "Terminate Statement" | "Terminate Session";
-};
-
-type FilterEvent = {
-  name: "Filter Clicked";
-  page: Page;
-  filterName: string;
   value: string;
 };
 
+type ViewModeEvent = {
+  name: "View Mode Clicked";
+  page: Page;
+  value: string;
+};
+
+type AutoRefreshEvent = {
+  name: "Auto Refresh Toggle";
+  page: Page;
+  value: boolean;
+};
+
+type ManualRefreshEvent = {
+  name: "Manual Refresh";
+  page: Page;
+};
+
 type AnalyticsEvent =
-  | SortingEvent
-  | StatementDiagnosticEvent
-  | SearchEvent
-  | TabChangedEvent
+  | ApplySearchCriteriaEvent
   | BackButtonClick
+  | ColumnsChangeEvent
   | FilterEvent
-  | StatementClicked
+  | JobTypeEvent
+  | ResetStats
+  | SearchEvent
+  | SessionActionsClicked
   | SessionClicked
-  | SessionActionsClicked;
+  | SortingEvent
+  | StatementClicked
+  | StatementDiagnosticEvent
+  | TabChangedEvent
+  | TimeScaleChangeEvent
+  | ViewModeEvent
+  | AutoRefreshEvent
+  | ManualRefreshEvent;
 
 const PREFIX = `${DOMAIN_NAME}/analytics`;
 
 /**
  * actions accept payload with "page" field which specifies the page where
- * action occurs and a value expected expected by specific action.
+ * action occurs and a value expected by specific action.
  */
 export const actions = {
   track: createAction(`${PREFIX}/track`, (event: AnalyticsEvent) => ({

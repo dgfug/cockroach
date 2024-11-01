@@ -1,19 +1,13 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -25,10 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,13 +32,14 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	// Trick to get the init() for the builtins package to run.
-	_ = builtins.AllBuiltinNames
+	_ = builtins.AllBuiltinNames()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -72,6 +69,42 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 			inputTypes:   []*types.T{types.String},
 			outputTuples: colexectestutils.Tuples{{"Hello", 5}, {"The", 3}},
 		},
+		{
+			desc:      "Substr",
+			expr:      "substr(@1, @2, @3)",
+			inputCols: []int{0},
+			inputTuples: colexectestutils.Tuples{
+				{"Hello", 1, 4},
+				{"Hello", 4, 2},
+				{"Hello", 3, 1},
+				{"Hello", -2, 10},
+				{"Hello", -2, 4},
+				{"Hello", 5, 2},
+				{"你好吗", 1, 2},
+				{"你好吗", 2, 1},
+				{"你好吗", 2, 2},
+				{"你好吗", 3, 4},
+				{"hi你好吗", 1, 2},
+				{"hi你好吗", 3, 3},
+				{"hi你好吗ciao", 6, 4},
+			},
+			inputTypes: []*types.T{types.String, types.Int, types.Int},
+			outputTuples: colexectestutils.Tuples{
+				{"Hello", 1, 4, "Hell"},
+				{"Hello", 4, 2, "lo"},
+				{"Hello", 3, 1, "l"},
+				{"Hello", -2, 10, "Hello"},
+				{"Hello", -2, 4, "H"},
+				{"Hello", 5, 2, "o"},
+				{"你好吗", 1, 2, "你好"},
+				{"你好吗", 2, 1, "好"},
+				{"你好吗", 2, 2, "好吗"},
+				{"你好吗", 3, 4, "吗"},
+				{"hi你好吗", 1, 2, "hi"},
+				{"hi你好吗", 3, 3, "你好吗"},
+				{"hi你好吗ciao", 6, 4, "ciao"},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -79,31 +112,31 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 		colexectestutils.RunTests(t, testAllocator, []colexectestutils.Tuples{tc.inputTuples}, tc.outputTuples, colexectestutils.OrderedVerifier,
 			func(input []colexecop.Operator) (colexecop.Operator, error) {
 				return colexectestutils.CreateTestProjectingOperator(
-					ctx, flowCtx, input[0], tc.inputTypes,
-					tc.expr, false /* canFallbackToRowexec */, testMemAcc,
+					ctx, flowCtx, input[0], tc.inputTypes, tc.expr, testMemAcc,
 				)
 			})
 	}
 }
 
 func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls bool) {
-	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 	}
+	rng, _ := randutil.NewTestRand()
 
 	batch := testAllocator.NewMemBatchWithMaxCapacity([]*types.T{types.Int})
 	col := batch.ColVec(0).Int64()
 
 	for i := 0; i < coldata.BatchSize(); i++ {
-		if float64(i) < float64(coldata.BatchSize())*selectivity {
+		if float64(i) < float64(coldata.BatchSize())*0.5 {
 			col[i] = -1
 		} else {
 			col[i] = 1
@@ -112,7 +145,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 
 	if hasNulls {
 		for i := 0; i < coldata.BatchSize(); i++ {
-			if rand.Float64() < nullProbability {
+			if rng.Float64() < 0.1 {
 				batch.ColVec(0).Nulls().SetNull(i)
 			}
 		}
@@ -131,8 +164,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 	typs := []*types.T{types.Int}
 	source := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 	op, err := colexectestutils.CreateTestProjectingOperator(
-		ctx, flowCtx, source, typs,
-		"abs(@1)" /* projectingExpr */, false /* canFallbackToRowexec */, testMemAcc,
+		ctx, flowCtx, source, typs, "abs(@1)" /* projectingExpr */, testMemAcc,
 	)
 	require.NoError(b, err)
 	op.Init(ctx)
@@ -145,7 +177,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 }
 
 func BenchmarkBuiltinFunctions(b *testing.B) {
-	_ = builtins.AllBuiltinNames
+	_ = builtins.AllBuiltinNames()
 	for _, useSel := range []bool{true, false} {
 		for _, hasNulls := range []bool{true, false} {
 			b.Run(fmt.Sprintf("useSel=%t,hasNulls=%t", useSel, hasNulls), func(b *testing.B) {
@@ -160,7 +192,7 @@ func BenchmarkBuiltinFunctions(b *testing.B) {
 func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 
 	typs := []*types.T{types.String, types.Int, types.Int}
@@ -186,7 +218,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	}
 	inputCols := []int{0, 1, 2}
 	p := &colexectestutils.MockTypeContext{Typs: typs}
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	semaCtx.IVarContainer = p
 	typedExpr, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 	if err != nil {

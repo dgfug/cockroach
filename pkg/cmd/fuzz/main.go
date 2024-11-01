@@ -1,23 +1,21 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // fuzz builds and executes fuzz tests.
 //
 // Fuzz tests can be added to CockroachDB by adding a function of the form:
-//   func FuzzXXX(data []byte) int
+//
+//	func FuzzXXX(data []byte) int
+//
 // To help the fuzzer increase coverage, this function should return 1 on
 // interesting input (for example, a parse succeeded) and 0 otherwise. Panics
 // will be detected and reported.
 //
 // To exclude this file except during fuzzing, tag it with:
-//   // +build gofuzz
+//
+//	// +build gofuzz
 package main
 
 import (
@@ -25,7 +23,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -200,7 +197,7 @@ var fuzzFuncRE = regexp.MustCompile(`(?m)^func (Fuzz\w*)\(\w+ \[\]byte\) int {$`
 func findFuncs(pkg *packages.Package) ([]string, error) {
 	var ret []string
 	for _, file := range pkg.GoFiles {
-		content, err := ioutil.ReadFile(file)
+		content, err := os.ReadFile(file)
 		if err != nil {
 			return nil, err
 		}

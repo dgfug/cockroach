@@ -1,24 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -93,7 +89,7 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 }
 
 func (n *alterTypeNode) startExec(params runParams) error {
-	telemetry.Inc(n.n.Cmd.TelemetryCounter())
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("type", n.n.Cmd.TelemetryName()))
 
 	typeName := tree.AsStringWithFQNames(n.n.Type, params.p.Ann())
 	eventLogDone := false
@@ -117,7 +113,9 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		// See https://github.com/cockroachdb/cockroach/issues/57741
 		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
 	case *tree.AlterTypeOwner:
-		owner, err := t.Owner.ToSQLUsername(params.SessionData(), security.UsernameValidation)
+		owner, err := decodeusername.FromRoleSpec(
+			params.SessionData(), username.PurposeValidation, t.Owner,
+		)
 		if err != nil {
 			return err
 		}
@@ -215,10 +213,10 @@ func (p *planner) dropEnumValue(
 }
 
 func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName string) error {
-	err := catalogkv.CheckObjectCollision(
+	err := descs.CheckObjectNameCollision(
 		ctx,
+		p.Descriptors(),
 		p.txn,
-		p.ExecCfg().Codec,
 		n.desc.ParentID,
 		n.desc.ParentSchemaID,
 		tree.NewUnqualifiedTypeName(newName),
@@ -242,7 +240,7 @@ func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName stri
 	newArrayName, err := findFreeArrayTypeName(
 		ctx,
 		p.txn,
-		p.ExecCfg().Codec,
+		p.Descriptors(),
 		n.desc.ParentID,
 		n.desc.ParentSchemaID,
 		newName,
@@ -250,7 +248,7 @@ func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName stri
 	if err != nil {
 		return err
 	}
-	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, n.desc.ArrayTypeID)
+	arrayDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, n.desc.ArrayTypeID)
 	if err != nil {
 		return err
 	}
@@ -287,7 +285,9 @@ func (p *planner) performRenameTypeDesc(
 
 	// Populate the namespace update batch.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, desc); err != nil {
+		return err
+	}
 
 	// Write the updated type descriptor.
 	if err := p.writeTypeSchemaChange(ctx, desc, jobDesc); err != nil {
@@ -368,7 +368,7 @@ func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema st
 		return err
 	}
 
-	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, n.desc.ArrayTypeID)
+	arrayDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, n.desc.ArrayTypeID)
 	if err != nil {
 		return err
 	}
@@ -387,22 +387,20 @@ func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema st
 	return p.logEvent(ctx,
 		desiredSchemaID,
 		&eventpb.SetSchema{
-			CommonEventDetails:    eventpb.CommonEventDetails{},
-			CommonSQLEventDetails: eventpb.CommonSQLEventDetails{},
-			DescriptorName:        oldName.FQString(),
-			NewDescriptorName:     newName.FQString(),
-			DescriptorType:        "type",
+			DescriptorName:    oldName.FQString(),
+			NewDescriptorName: newName.FQString(),
+			DescriptorType:    "type",
 		},
 	)
 }
 
 func (p *planner) alterTypeOwner(
-	ctx context.Context, n *alterTypeNode, newOwner security.SQLUsername,
+	ctx context.Context, n *alterTypeNode, newOwner username.SQLUsername,
 ) error {
 	typeDesc := n.desc
 	oldOwner := typeDesc.GetPrivileges().Owner()
 
-	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
+	arrayDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeDesc.ArrayTypeID)
 	if err != nil {
 		return err
 	}
@@ -450,7 +448,7 @@ func (p *planner) setNewTypeOwner(
 	arrayTypeDesc *typedesc.Mutable,
 	typeName tree.TypeName,
 	arrayTypeName tree.TypeName,
-	newOwner security.SQLUsername,
+	newOwner username.SQLUsername,
 ) error {
 	privs := typeDesc.GetPrivileges()
 	privs.SetOwner(newOwner)
@@ -480,14 +478,6 @@ func (n *alterTypeNode) Close(ctx context.Context)           {}
 func (n *alterTypeNode) ReadingOwnWrites()                   {}
 
 func (p *planner) canModifyType(ctx context.Context, desc *typedesc.Mutable) error {
-	hasAdmin, err := p.HasAdminRole(ctx)
-	if err != nil {
-		return err
-	}
-	if hasAdmin {
-		return nil
-	}
-
 	hasOwnership, err := p.HasOwnership(ctx, desc)
 	if err != nil {
 		return err

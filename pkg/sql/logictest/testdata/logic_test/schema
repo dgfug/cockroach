@@ -37,6 +37,9 @@ CREATE SCHEMA information_schema
 statement error pq: unacceptable schema name \"pg_temp\"
 CREATE SCHEMA pg_temp
 
+statement error role/user "bob" does not exist
+CREATE SCHEMA sc AUTHORIZATION bob
+
 # Create some tables and types in a user defined schema, and resolve them.
 statement ok
 CREATE SCHEMA myschema;
@@ -51,9 +54,9 @@ SELECT
 FROM crdb_internal.tables
 WHERE database_name = 'test'
 ----
-test  52  myschema  54  tb  55
-test  52  myschema  54  v   58
-test  52  myschema  54  s   59
+test  104  myschema  107  tb  108
+test  104  myschema  107  v   111
+test  104  myschema  107  s   112
 
 query I
 SELECT * FROM myschema.tb
@@ -103,20 +106,34 @@ SELECT * FROM myschema.tb2
 statement ok
 SET search_path TO public
 
+# We should be able to alter the public schema owner.
+statement ok
+ALTER SCHEMA public OWNER TO testuser
+
+query TT
+SELECT schema_name, owner FROM [SHOW SCHEMAS] WHERE schema_name = 'public'
+----
+public  testuser
+
 # Try to create a temp table in a user defined schema.
-statement error pq: cannot create temporary relation in non-temporary schema
+statement error pgcode 42P16 pq: cannot create temporary relation in non-temporary schema
 CREATE TEMP TABLE myschema.tmp (x int)
 
 # We should error out trying to modify any virtual schemas.
-statement error pq: schema cannot be modified: "pg_catalog"
+statement error pgcode 42501 pq: schema cannot be modified: "pg_catalog"
 CREATE TABLE pg_catalog.bad (x int)
 
-# We shouldn't be able to alter virtual or public schemas.
-statement error pq: cannot modify schema "public"
+# We shouldn't be able to rename the public schema. In the future, we may
+# want to support this.
+statement error pgcode 3F000 pq: cannot rename schema "public"
 ALTER SCHEMA public RENAME TO private
 
-statement error pq: cannot modify schema "pg_catalog"
+# We shouldn't be able to alter virtual schemas.
+statement error pgcode 3F000 pq: cannot modify schema "pg_catalog"
 ALTER SCHEMA pg_catalog RENAME TO mysql_catalog
+
+statement error pgcode 3F000 pq: cannot modify schema "pg_catalog"
+ALTER SCHEMA pg_catalog OWNER TO root
 
 # We can't rename a schema to a pg_temp prefixed name.
 statement error pq: unacceptable schema name "pg_temp_not_temp"
@@ -132,24 +149,31 @@ CREATE SCHEMA yourschema
 statement error pq: schema "yourschema" already exists
 ALTER SCHEMA myschema RENAME TO yourschema
 
-statement ok
+statement error cannot rename schema because relation "test.myschema.v" depends on relation "test.myschema.tb"
 ALTER SCHEMA myschema RENAME TO myschema2
+
+statement ok
+CREATE SCHEMA myschema2;
+CREATE TABLE myschema2.tb2 (a INT PRIMARY KEY);
+
+statement ok
+ALTER SCHEMA myschema2 RENAME TO myschema3
 
 # We should be able to resolve objects under the new schema name.
 query T
-SELECT * FROM myschema2.tb2
+SELECT * FROM myschema3.tb2
 ----
 
 # The names should be drained after executing, so we should be able
 # to make another schema with the old name.
 statement ok
-CREATE SCHEMA myschema
+CREATE SCHEMA myschema2
 
 statement ok
-BEGIN
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 statement ok
-ALTER SCHEMA myschema RENAME TO another_schema
+ALTER SCHEMA myschema2 RENAME TO another_schema
 
 statement ok
 ALTER SCHEMA another_schema RENAME TO another_one
@@ -163,47 +187,51 @@ CREATE SCHEMA empty;
 DROP SCHEMA empty
 
 let $schema_id
-SELECT id FROM system.namespace WHERE name = 'myschema'
+SELECT id FROM system.namespace WHERE name = 'myschema2'
 
-# Create some objects under myschema, and have them reference some objects
+# Create some objects under myschema2, and have them reference some objects
 # in other schemas.
 statement ok
-CREATE TABLE myschema.myschema_t1 (x INT);
-CREATE TABLE myschema.myschema_t2 (x INT);
-CREATE SEQUENCE myschema.myschema_seq1;
-CREATE TABLE myschema.myschema_t3 (x INT DEFAULT nextval('myschema.myschema_seq1'));
-CREATE TYPE myschema.myschema_ty1 AS ENUM ('schema');
+CREATE TABLE myschema2.myschema_t1 (x INT);
+CREATE TABLE myschema2.myschema_t2 (x INT);
+CREATE SEQUENCE myschema2.myschema_seq1;
+CREATE TABLE myschema2.myschema_t3 (x INT DEFAULT nextval('myschema2.myschema_seq1'));
+CREATE TYPE myschema2.myschema_ty1 AS ENUM ('schema');
 CREATE SCHEMA otherschema;
-CREATE VIEW otherschema.otherschema_v1 AS SELECT x FROM myschema.myschema_t1;
+CREATE VIEW otherschema.otherschema_v1 AS SELECT x FROM myschema2.myschema_t1;
 CREATE TABLE otherschema.otherschema_t1 (x INT);
-CREATE SEQUENCE otherschema.otherschema_seq1 OWNED BY myschema.myschema_t1.x;
+CREATE SEQUENCE otherschema.otherschema_seq1 OWNED BY myschema2.myschema_t1.x;
 
-statement error pq: schema "myschema" is not empty and CASCADE was not specified
-DROP SCHEMA myschema
+statement error pq: schema "myschema2" is not empty and CASCADE was not specified
+DROP SCHEMA myschema2
 
 # Now drop with cascade.
 statement ok
-DROP SCHEMA myschema CASCADE
+DROP SCHEMA myschema2 CASCADE
 
 query T
-SELECT table_name FROM [SHOW TABLES] WHERE table_name LIKE 'myschema%' OR table_name LIKE 'otherschema%'
+SELECT table_name FROM [SHOW TABLES] WHERE table_name LIKE 'myschema2%' OR table_name LIKE 'otherschema%'
 ----
 otherschema_t1
 
 query T
-SELECT name FROM [SHOW ENUMS] WHERE name LIKE 'myschema%'
+SELECT name FROM [SHOW ENUMS] WHERE name LIKE 'myschema2%'
+----
 
 # The schema should be gone.
 query I
-SELECT id FROM system.namespace WHERE name = 'myschema'
+SELECT id FROM system.namespace WHERE name = 'myschema2'
+----
 
 query IT
 SELECT * FROM system.descriptor WHERE id = $schema_id
 
 # We can't resolve a schema dropped in the same transaction.
 statement ok
-CREATE SCHEMA dropped;
-BEGIN
+CREATE SCHEMA dropped
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 statement ok
 DROP SCHEMA dropped
@@ -423,7 +451,7 @@ CREATE TYPE privs.denied AS ENUM ('denied')
 statement error pq: must be owner of schema "privs"
 ALTER SCHEMA privs RENAME TO denied
 
-statement error pq: permission denied to drop schema "privs"
+statement error must be owner of schema privs
 DROP SCHEMA privs
 
 # Test the usage privilege.
@@ -545,6 +573,9 @@ CREATE USER user1;
 statement ok
 CREATE SCHEMA AUTHORIZATION user1
 
+statement error pq: role/user "typo" does not exist
+CREATE SCHEMA AUTHORIZATION typo
+
 statement error pq: schema "user1" already exists
 CREATE SCHEMA AUTHORIZATION user1
 
@@ -555,7 +586,7 @@ statement ok
 CREATE SCHEMA user1_schema AUTHORIZATION user1
 
 # The created schemas should both be owned by user1.
-query TT
+query TT rowsort
 SELECT
   nspname, usename
 FROM
@@ -608,13 +639,20 @@ CREATE DATABASE new_db
 statement ok
 USE new_db
 
+statement ok
+CREATE SCHEMA new_db.s1
+
 user testuser
 
 statement ok
 USE new_db
 
-statement error user testuser does not have CREATE privilege on database new_db
+# Public role has CREATE on public schema, hence we can create.
+statement ok
 CREATE TABLE new_db.public.bar()
+
+statement error pq: user testuser does not have CREATE privilege on schema s1
+CREATE TABLE new_db.s1.bar()
 
 user root
 
@@ -623,8 +661,8 @@ CREATE SCHEMA AUTHORIZATION testuser
 
 user testuser
 
-statement error user testuser does not have CREATE privilege on database new_db
-CREATE TABLE new_db.public.bar()
+statement error pq: user testuser does not have CREATE privilege on schema s1
+CREATE TABLE new_db.s1.bar()
 
 statement ok
 CREATE TABLE new_db.testuser.bar()
@@ -703,32 +741,6 @@ SELECT * FROM testuser.test_table
 ----
 a
 
-# Ensure that when we create a schema, it inherits privileges from its parent
-# database, but only those which are valid for schemas.
-subtest create_schema_inherits_db_privileges
-
-user root
-
-statement ok
-CREATE DATABASE d54662;
-GRANT CREATE, SELECT ON DATABASE d54662 TO testuser;
-USE d54662;
-CREATE SCHEMA s
-
-query T
-SELECT privilege_type FROM [SHOW GRANTS ON schema s FOR testuser]
-----
-CREATE
-
-statement ok
-GRANT USAGE ON SCHEMA s TO testuser
-
-query T rowsort
-SELECT privilege_type FROM [SHOW GRANTS ON schema s FOR testuser]
-----
-CREATE
-USAGE
-
 # Verify that a table can be renamed with a schema prefixes
 subtest alter_table_rename
 
@@ -747,13 +759,13 @@ ALTER TABLE sch.table_to_rename RENAME TO renamed_table;
 statement ok
 ALTER TABLE sch.renamed_table RENAME TO sch.renamed_table_2;
 
-statement error pq: relation "d54662.sch.table_exists" already exists
+statement error pq: relation "new_db.sch.table_exists" already exists
 ALTER TABLE sch.renamed_table_2 RENAME TO sch.table_exists;
 
 statement ok
 ALTER TABLE public_table_to_rename RENAME TO public.renamed_public_table;
 
-statement error pq: relation "d54662.public.public_table_exists" already exists
+statement error pq: relation "new_db.public.public_table_exists" already exists
 ALTER TABLE renamed_public_table RENAME TO public_table_exists;
 
 subtest show_tables
@@ -847,10 +859,18 @@ statement ok
 CREATE DATABASE comment_db
 
 statement ok
-USE comment_db
+CREATE SCHEMA comment_db.foo
 
 statement ok
-CREATE SCHEMA foo
+COMMENT ON SCHEMA comment_db.foo IS 'foo'
+
+query T
+SELECT comment FROM system.comments LIMIT 1
+----
+foo
+
+statement ok
+USE comment_db
 
 statement ok
 COMMENT ON SCHEMA foo IS 'bar'
@@ -869,3 +889,595 @@ SELECT comment FROM system.comments LIMIT 1
 
 statement ok
 DROP DATABASE comment_db
+
+statement ok
+USE test
+
+# Test that a schema can be created when writing to the eventlog table is
+# disabled. This is a regression test for #86132.
+subtest create_schema_no_eventlog
+
+statement ok
+SET CLUSTER SETTING server.eventlog.enabled = false
+
+statement ok
+CREATE SCHEMA sc
+
+statement ok
+DROP SCHEMA sc
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+CREATE SCHEMA sc;
+COMMIT
+
+statement ok
+DROP SCHEMA sc
+
+statement ok
+SET CLUSTER SETTING server.eventlog.enabled = false
+
+subtest alter_table_schema
+
+# Renaming the schema should invalidate a schema-qualified table reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE TABLE sc.xy (x INT, y INT);
+INSERT INTO sc.xy VALUES (1, 1);
+
+query II
+SELECT * FROM sc.xy;
+----
+1 1
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: relation "sc.xy" does not exist
+SELECT * FROM sc.xy;
+
+query II
+SELECT * FROM sc1.xy;
+----
+1 1
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified table reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE TABLE d.xy (x INT, y INT);
+INSERT INTO d.xy VALUES (1, 1);
+
+query II
+SELECT * FROM d.xy;
+----
+1 1
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error pq: relation "d.xy" does not exist
+SELECT * FROM d.xy;
+
+query II
+SELECT * FROM d1.xy;
+----
+1 1
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified table
+# reference.
+statement ok
+CREATE TABLE xy (x INT, y INT);
+INSERT INTO xy VALUES (1, 1);
+
+query II
+SELECT * FROM xy;
+----
+1 1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: relation "xy" does not exist
+SELECT * FROM xy;
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d;
+DROP TABLE xy;
+
+# Regression tests for #96674.
+subtest alter_udt_schema
+
+# Renaming the schema should invalidate a schema-qualified UDT reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE TYPE sc.t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::sc.t;
+----
+HELLO
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: type "sc.t" does not exist
+SELECT 'HELLO'::sc.t;
+
+query T
+SELECT 'HELLO'::sc1.t;
+----
+HELLO
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified UDT reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE TYPE d.t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::d.t;
+----
+HELLO
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error pq: type "d.t" does not exist
+SELECT 'HELLO'::d.t;
+
+query T
+SELECT 'HELLO'::d1.t;
+----
+HELLO
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified UDT reference.
+statement ok
+CREATE TYPE t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::t;
+----
+HELLO
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: type "t" does not exist
+SELECT 'HELLO'::t;
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d;
+DROP TYPE t;
+
+subtest alter_udf_schema
+
+# Renaming the schema should invalidate a schema-qualified UDF reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE FUNCTION sc.fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT sc.fn(1);
+----
+1
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: schema "sc" does not exist
+SELECT sc.fn(1);
+
+query I
+SELECT sc1.fn(1);
+----
+1
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified UDF reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE FUNCTION fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT d.public.fn(1);
+----
+1
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error cross-database function references not allowed
+SELECT d.public.fn(1);
+
+query I
+SELECT d1.public.fn(1);
+----
+1
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified UDF reference.
+statement ok
+CREATE FUNCTION fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: unknown function: fn\(\)
+SELECT fn(1);
+
+statement ok
+USE test;
+
+statement ok
+DROP DATABASE d;
+DROP FUNCTION fn;
+
+# Regression test for #97757 - invalidate the query cache after changes to the
+# search path cause a function call to resolve to a UDF when it previously
+# resolved to a builtin function.
+subtest invalidate-builtin
+
+statement ok
+CREATE FUNCTION public.abs(val INT) RETURNS INT CALLED ON NULL INPUT LANGUAGE SQL AS $$ SELECT val+100 $$;
+
+query I
+SELECT abs(1);
+----
+1
+
+statement ok
+SET search_path = public, pg_catalog;
+
+# This should use the UDF abs which returns 101.
+query I
+SELECT abs(1);
+----
+101
+
+statement ok
+RESET search_path;
+
+# This should use the builtin abs again.
+query I
+SELECT abs(1);
+----
+1
+
+subtest search_path
+
+# Verify that spaces are trimmed.
+statement ok
+SET search_path = public,      a,     "   b  ",   c
+
+query T
+SHOW search_path
+----
+public, a, "   b  ", c
+
+# When each identifier is enclosed in single quotes, the search_path should
+# have multiple elements.
+statement ok
+SET search_path = '$user', 'public'
+
+query T
+SHOW search_path
+----
+"$user", public
+
+# When the whole value is enclosed in single quotes, the search_path should
+# have contain one element.
+statement ok
+SET search_path = '$user, public'
+
+query T
+SHOW search_path
+----
+"$user, public"
+
+# With single quotes, the identifier case is preserved.
+statement ok
+SET search_path = 'Abc', 'public'
+
+query T
+SHOW search_path
+----
+"Abc", public
+
+# Without single quotes, the identifier is normalized to lower case.
+statement ok
+SET search_path = Abc, 'public'
+
+query T
+SHOW search_path
+----
+abc, public
+
+# An empty identifier is allowed.
+statement ok
+SET search_path = ''
+
+query T
+SHOW search_path
+----
+""
+
+# An empty identifier is allowed.
+statement ok
+SET search_path = ""
+
+query T
+SHOW search_path
+----
+""
+
+# A whitespace identifier is allowed.
+statement ok
+SET search_path = "  ", abc
+
+query T
+SHOW search_path
+----
+"  ", abc
+
+# Handle special characters.
+statement ok
+SET search_path = 'a\bc', "d\ef", 'g-hi', "j-kl"
+
+query T
+SHOW search_path
+----
+"a\bc", "d\ef", "g-hi", "j-kl"
+
+statement error syntax error
+SET search_path = abc, def,
+
+subtest end
+
+# Regression test for #102375 - check that all data sources resolve to the same
+# schema objects before checking access privileges.
+subtest privileges
+
+user root
+
+statement ok
+RESET search_path;
+
+statement ok
+CREATE DATABASE testdb1;
+USE testdb1;
+CREATE TABLE ab (a INT PRIMARY KEY, b INT);
+INSERT INTO ab VALUES (1, 1);
+CREATE TABLE xy (x INT, y INT, FOREIGN KEY (x) REFERENCES ab(a));
+GRANT ALL ON xy TO testuser;
+GRANT ALL ON ab TO testuser;
+
+statement ok
+CREATE DATABASE testdb2;
+USE testdb2;
+CREATE TABLE ab (a INT PRIMARY KEY, b INT);
+INSERT INTO ab VALUES (1, 1);
+CREATE TABLE xy (x INT, y INT, FOREIGN KEY (x) REFERENCES ab(a));
+CREATE USER testuser2;
+GRANT ALL ON xy TO testuser2;
+GRANT ALL ON ab TO testuser2;
+
+user testuser
+
+statement ok
+USE testdb1
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user testuser2
+
+statement ok
+USE testdb2
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user testuser
+
+statement ok
+USE testdb1
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user root
+
+statement ok
+USE test;
+
+statement ok
+REVOKE ALL ON testdb2.xy FROM testuser2;
+REVOKE ALL ON testdb2.ab FROM testuser2;
+DROP USER testuser2;
+DROP DATABASE testdb1 CASCADE;
+DROP DATABASE testdb2 CASCADE;
+
+subtest end
+
+subtest public_schema_create_privilege
+
+statement ok
+CREATE DATABASE should_have_create
+
+statement ok
+USE should_have_create
+
+query TTTT rowsort
+SELECT database_name, schema_name, grantee, privilege_type FROM [SHOW GRANTS ON SCHEMA public] WHERE grantee = 'public'
+----
+should_have_create  public  public  CREATE
+should_have_create  public  public  USAGE
+
+statement ok
+SET CLUSTER SETTING sql.auth.public_schema_create_privilege.enabled = false
+
+statement ok
+CREATE DATABASE should_not_have_create
+
+statement ok
+USE should_not_have_create
+
+query TTTT
+SELECT database_name, schema_name, grantee, privilege_type FROM [SHOW GRANTS ON SCHEMA public] WHERE grantee = 'public'
+----
+should_not_have_create  public  public  USAGE
+
+statement ok
+RESET CLUSTER SETTING sql.auth.public_schema_create_privilege.enabled
+
+subtest end
+
+
+subtest schema_with_temp_in_name
+
+statement ok
+CREATE SCHEMA my_pg_temp_123_123;
+
+statement ok
+DROP SCHEMA  my_pg_temp_123_123;
+
+subtest end
+
+# Regression test for #126244: during Memo staleness checking, check object
+# resolution before privileges, to avoid spurious privilege errors.
+subtest check_privileges_after_resolution
+
+statement ok
+create database foo;
+
+statement ok
+create database bar;
+
+statement ok
+create user foo_user;
+
+statement ok
+create user bar_user;
+
+statement ok
+create ROLE foo_role;
+
+statement ok
+create ROLE bar_role;
+
+statement ok
+use foo;
+
+statement ok
+CREATE TABLE baz (
+  id   int NOT NULL,
+  name varchar NOT NULL,
+  PRIMARY KEY (id)
+);
+
+statement ok
+CREATE FUNCTION qux() RETURNS void LANGUAGE SQL AS $$
+    SELECT * FROM baz;
+$$;
+
+statement ok
+ALTER TABLE baz OWNER TO foo_role;
+
+statement ok
+use bar;
+
+statement ok
+CREATE TABLE baz (
+  id   int NOT NULL,
+  name varchar NOT NULL,
+  PRIMARY KEY (id)
+);
+
+statement ok
+CREATE FUNCTION qux() RETURNS void LANGUAGE SQL AS $$
+    SELECT * FROM baz;
+$$;
+
+statement ok
+ALTER TABLE baz OWNER TO bar_role;
+
+statement ok
+GRANT foo_role TO foo_user;
+
+statement ok
+GRANT bar_role TO bar_user;
+
+statement ok
+use foo;
+set role foo_user;
+
+query IT rowsort
+select * from baz;
+----
+
+query T
+SELECT qux();
+----
+NULL
+
+statement ok
+use bar;
+set role bar_user;
+
+query IT rowsort
+select * from baz;
+----
+
+query T
+SELECT qux();
+----
+NULL
+
+subtest end

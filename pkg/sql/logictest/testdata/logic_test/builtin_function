@@ -1,6 +1,4 @@
-# LogicTest: !3node-tenant(49854) !fakedist-spec-planning
-# TODO(asubiotto): Possibly split out the test that attempts to set a zone
-# config in order to run the other ones.
+# tenant-capability-override-opt: can_check_consistency=true
 
 statement ok
 CREATE TABLE foo (a int)
@@ -8,8 +6,11 @@ CREATE TABLE foo (a int)
 statement ok
 INSERT INTO foo (a) VALUES (1)
 
-query error unknown function: foo.bar
+query error pq: schema "foo" does not exist
 SELECT foo.bar()
+
+query error unknown function: pg_catalog.defaults()
+SELECT pg_catalog.defaults()
 
 query error unknown function: defaults
 SELECT defaults()
@@ -39,6 +40,18 @@ query III
 SELECT bit_length('Hello'), bit_length('世界'), bit_length(b'世界')
 ----
 40 48 48
+
+statement ok
+CREATE TABLE bit_count_test (a BIT(3), b varbit, c bytea)
+
+statement ok
+INSERT INTO bit_count_test VALUES (B'101', B'00', '\x10'), (B'100', B'101', '\x10A2')
+
+query TTTIII rowsort
+SELECT a, b, encode(c, 'hex'), bit_count(a), bit_count(b), bit_count(c) FROM bit_count_test
+----
+101  00   10    2  0  1
+100  101  10a2  1  2  4
 
 query TTTTTTTT
 SELECT quote_ident('abc'), quote_ident('ab.c'), quote_ident('ab"c'), quote_ident('世界'),
@@ -102,20 +115,22 @@ SELECT upper('roacH7')
 upper
 ROACH7
 
-query T
-SELECT unaccent(str) FROM ( VALUES 
+query T rowsort
+SELECT unaccent(str) FROM ( VALUES
    ('no_special_CHARACTERS1!'),
    ('Żółć'),
    ('⃞h̀ＥＬＬＯ`̀́⃞'),
    ('Softhyphen­separator'),
-   ('some ̂thing')
+   ('some ̂thing'),
+   ('héllö wòrld')
 ) tbl(str)
 ----
 no_special_CHARACTERS1!
 Zolc
 hELLO`
 Softhyphen-separator
-something
+some thing
+hello world
 
 statement error unknown signature: upper\(decimal\)
 SELECT upper(2.2)
@@ -135,6 +150,40 @@ SELECT random() * 0.0
 ----
 0
 
+statement ok
+SELECT setseed(0.1)
+
+# The previous call to setseed() should affect the next query.
+query IR
+SELECT i, random() FROM ROWS FROM (generate_series(1, 5)) AS i ORDER by i
+----
+1  0.8090535001228529
+2  0.33363615433097443
+3  0.10208231032120892
+4  0.43716650508717286
+5  0.16686635296305902
+
+statement ok
+SELECT setseed(0.1)
+
+query IR
+SELECT i, random() FROM ROWS FROM (generate_series(1, 5)) AS i ORDER by i
+----
+1  0.8090535001228529
+2  0.33363615433097443
+3  0.10208231032120892
+4  0.43716650508717286
+5  0.16686635296305902
+
+# Subqueries need to use the same RNG.
+statement ok
+SELECT setseed(0.1)
+
+query RR
+WITH cte(col) AS (SELECT random()) SELECT col, random() FROM cte
+----
+0.8090535001228529  0.33363615433097443
+
 # Concatenating 'empty' because the empty string doesn't work in these tests.
 query T
 SELECT concat() || 'empty'
@@ -146,8 +195,13 @@ SELECT concat('RoacH', NULL)
 ----
 RoacH
 
-statement error unknown signature: concat\(string, bool, decimal, bool\)
-SELECT concat('RoacH', false, 64.532, TRUE)
+statement ok
+CREATE TYPE concat_enum AS ENUM ('foo', 'bar', 'baz')
+
+query T
+SELECT concat('foo'::concat_enum, ' ', 64.532, ' ', 'baz'::concat_enum, ' ', 42, ' ', 1 = 0, ' ', '{"foo": "bar"}'::json, ' ', '{1, 2, 3}'::int[])
+----
+foo 64.532 baz 42 f {"foo": "bar"} {1,2,3}
 
 query T
 SELECT substr('RoacH', 2, 3)
@@ -738,27 +792,27 @@ subtest standard_float_digits
 query RR
 SELECT acos(-0.5), round(acos(0.5), 15)
 ----
-2.0943951023932  1.0471975511966
+2.0943951023931957  1.047197551196598
 
 query RR
 SELECT cot(-0.5), cot(0.5)
 ----
--1.83048772171245  1.83048772171245
+-1.830487721712452  1.830487721712452
 
 query RRR
 SELECT asin(-0.5), asin(0.5), asin(1.5)
 ----
--0.523598775598299  0.523598775598299  NaN
+-0.5235987755982989  0.5235987755982989  NaN
 
 query RR
 SELECT atan(-0.5), atan(0.5)
 ----
--0.463647609000806  0.463647609000806
+-0.4636476090008061  0.4636476090008061
 
 query RR
 SELECT atan2(-10.0, 5.0), atan2(10.0, 5.0)
 ----
--1.10714871779409  1.10714871779409
+-1.1071487177940904  1.1071487177940904
 
 query RRR
 SELECT cbrt(-1.0::float), round(cbrt(27.0::float), 15), cbrt(19.3::decimal)
@@ -774,17 +828,17 @@ SELECT ceil(-0.5::float), ceil(0.5::float), ceiling(0.5::float), ceil(0.1::decim
 query RR
 SELECT cos(-0.5), cos(0.5)
 ----
-0.877582561890373  0.877582561890373
+0.8775825618903728  0.8775825618903728
 
 query RRR
 SELECT sin(-1.0), sin(0.0), sin(1.0)
 ----
--0.841470984807897  0  0.841470984807897
+-0.8414709848078965  0  0.8414709848078965
 
 query RR
 SELECT degrees(-0.5), degrees(0.5)
 ----
--28.6478897565412  28.6478897565412
+-28.64788975654116  28.64788975654116
 
 subtest extra_float_digits_3
 
@@ -1188,10 +1242,10 @@ SELECT round(123.456::float, -1), round(123.456::float, -2), round(123.456::floa
 ----
 120 100 0
 
-query RRRR
-SELECT round(123.456::decimal, -1), round(123.456::decimal, -2), round(123.456::decimal, -3), round(123.456::decimal, -200)
+query RRRRR
+SELECT round(123.456::decimal, -1), round(123.456::decimal, -2), round(123.456::decimal, -3), round(123.456::decimal, -200), round(-0.1::decimal)
 ----
-1.2E+2  1E+2  0E+3  0E+200
+1.2E+2  1E+2  0E+3  0E+200  0
 
 query RRRR
 SELECT round('nan'::decimal), round('nan'::decimal, 1), round('nan'::float), round('nan'::float, 1)
@@ -1232,7 +1286,7 @@ SELECT sign(-2.0), sign(-0.0), sign(0.0), sign(2.0)
 query RR
 SELECT sqrt(4.0::float), sqrt(9.0::decimal)
 ----
-2 3
+2  3.0000000000000000000
 
 query error cannot take square root of a negative number
 SELECT sqrt(-1.0::float)
@@ -1249,6 +1303,23 @@ query RRRR
 SELECT trunc(-0.0), trunc(0.0), trunc(1.9), trunc(19.5678::decimal)
 ----
 0 0 1 19
+
+query RRRRRRR rowsort
+WITH v(x) AS
+  (VALUES('0'::numeric),('1'::numeric),('-1'::numeric),('4.2'::numeric),
+    ('-7.777'::numeric),('9127.777'::numeric),('inf'::numeric),('-inf'::numeric),('nan'::numeric))
+SELECT x, trunc(x), trunc(x,1), trunc(x,2), trunc(x,0), trunc(x,-1), trunc(x,-2)
+FROM v
+----
+0          0          0.0        0.00       0          0          0
+1          1          1.0        1.00       1          0          0
+-1         -1         -1.0       -1.00      -1         0          0
+4.2        4          4.2        4.20       4          0          0
+-7.777     -7         -7.7       -7.77      -7         0          0
+9127.777   9127       9127.7     9127.77    9127       9.12E+3    9.1E+3
+Infinity   Infinity   Infinity   Infinity   Infinity   Infinity   Infinity
+-Infinity  -Infinity  -Infinity  -Infinity  -Infinity  -Infinity  -Infinity
+NaN        NaN        NaN        NaN        NaN        NaN        NaN
 
 query T
 SELECT translate('Techonthenet.com', 'e.to', '456')
@@ -1648,7 +1719,7 @@ SELECT current_schemas(false)
 
 # Force the function to be evaluated at execution time and verify it doesn't
 # break when distsql is on.
-query T
+query T rowsort
 SELECT current_schemas(x) FROM (VALUES (true), (false)) AS t(x);
 ----
 {pg_catalog,pg_extension,public}
@@ -1939,11 +2010,6 @@ select ln(4.0786335175292462e+34::decimal)
 79.693655171940461633
 
 query IB
-SELECT length(gen_random_uuid()::BYTES), gen_random_uuid() = gen_random_uuid()
-----
-16 false
-
-query IB
 SELECT length(gen_random_ulid()::BYTES), gen_random_ulid() = gen_random_ulid()
 ----
 16 false
@@ -2006,7 +2072,7 @@ SELECT pg_catalog.pg_typeof(sign(1:::decimal))
 ----
 numeric
 
-query T
+query T rowsort
 VALUES (pg_typeof(1:::int)),
        (pg_typeof('a':::string)),
        (pg_typeof(true)),
@@ -2027,7 +2093,7 @@ timestamp with time zone
 bytea
 bigint[]
 
-query T
+query T rowsort
 VALUES (format_type('anyelement'::regtype, -1)),
        (format_type('bit'::regtype, -1)),
        (format_type('bool'::regtype, -1)),
@@ -2065,6 +2131,7 @@ VALUES (format_type('anyelement'::regtype, -1)),
        (format_type('unknown'::regtype, -1)),
        (format_type('varbit'::regtype, -1)),
        (format_type('varchar'::regtype, -1)),
+       (format_type('void'::regtype, -1)),
        (format_type('int[]'::regtype, -1)),
        (format_type('int2[]'::regtype, -1)),
        (format_type('string[]'::regtype, -1)),
@@ -2109,6 +2176,7 @@ uuid
 unknown
 bit varying
 character varying
+void
 bigint[]
 smallint[]
 text[]
@@ -2116,7 +2184,7 @@ character varying[]
 integer
 smallint
 
-query T
+query T rowsort
 VALUES (format_type('anyelement'::regtype, NULL)),
        (format_type('bool'::regtype, NULL)),
        (format_type('bytea'::regtype, NULL)),
@@ -2162,10 +2230,27 @@ SELECT format_type(oid, -1) FROM pg_type WHERE typname='_text' LIMIT 1
 ----
 text[]
 
+# Ensure each type can be formatted.
+statement ok
+SELECT format_type(oid, NULL) FROM pg_type
+
+# Ensure that implicit record types for virtual tables can be formatted.
+query T
+select format_type('pg_namespace'::regtype, null);
+----
+pg_namespace
+
 query T
 SELECT pg_catalog.pg_get_userbyid((SELECT oid FROM pg_roles WHERE rolname='root'))
 ----
 root
+
+query T
+SELECT pg_catalog.pg_get_userbyid(d.datdba)
+FROM pg_database d
+WHERE d.datname = 'system'
+----
+node
 
 query T
 SELECT pg_catalog.pg_get_userbyid(20)
@@ -2233,10 +2318,13 @@ SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_in
 ----
 b
 
+# The empty string should be returned for index 3. Previously, there was a bug
+# where this would return the primary key column name, since the primary key
+# is stored in the index.
 query T
 SELECT pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_cols_idx'), 3, false)
 ----
-rowid
+·
 
 query I
 SELECT length(pg_catalog.pg_get_indexdef((SELECT oid from pg_class WHERE relname='pg_indexdef_cols_idx'), 4, false))
@@ -2285,6 +2373,14 @@ SELECT pg_catalog.pg_get_viewdef('pg_viewdef_view'::regclass::oid, false)
 SELECT a, b FROM test.public.pg_viewdef_test
 
 statement ok
+CREATE MATERIALIZED VIEW test.pg_viewdef_mview AS SELECT b, a FROM test.pg_viewdef_test
+
+query T
+SELECT pg_catalog.pg_get_viewdef('pg_viewdef_mview'::regclass::oid)
+----
+SELECT b, a FROM test.public.pg_viewdef_test
+
+statement ok
 CREATE TABLE test.pg_constraintdef_test (
   a int,
   b int unique,
@@ -2301,12 +2397,13 @@ SELECT pg_catalog.pg_get_constraintdef(oid)
 FROM pg_catalog.pg_constraint
 WHERE conrelid='pg_constraintdef_test'::regclass
 ----
+FOREIGN KEY (a) REFERENCES pg_indexdef_test(a) ON DELETE CASCADE
 FOREIGN KEY (c) REFERENCES pg_indexdef_test(a) NOT VALID
 CHECK ((c > a))
 CHECK ((c > 0)) NOT VALID
+PRIMARY KEY (rowid ASC)
 UNIQUE (b ASC)
 UNIQUE (a ASC) WHERE (d = 'foo'::STRING)
-FOREIGN KEY (a) REFERENCES pg_indexdef_test(a) ON DELETE CASCADE
 
 # These functions always return NULL since we don't support comments on vtable columns and databases.
 query TT
@@ -2365,12 +2462,22 @@ SELECT pg_catalog.length('hello')
 ----
 5
 
-query OOO
-SELECT oid(3), oid(0), oid(12023948723)
+# -2147483648 is MinInt32.
+# 4294967295 is MaxUint32.
+query OOOOO
+SELECT oid(3), oid(0), (-1)::oid, (-2147483648)::oid, (4294967295)::oid
 ----
-3  0  12023948723
+3  0  4294967295  2147483648  4294967295
 
-query T
+# -2147483649 is (MinInt32 - 1).
+query error OID out of range: -2147483649
+SELECT oid(-2147483649)
+
+# 4294967296 is (MaxUint32 + 1).
+query error OID out of range: 4294967296
+SELECT oid(4294967296)
+
+query T rowsort
 SELECT to_english(i) FROM (VALUES (1), (13), (617), (-2), (-9223372036854775808)) AS a(i)
 ----
 one
@@ -2396,7 +2503,7 @@ true false true false true false true true true
 
 # The hash functions should be stable, so verify that the following hashes
 # don't change.
-query T
+query T rowsort
 SELECT i FROM (VALUES
   (sha512(true::string)),
   (sha512(false::string)),
@@ -2416,7 +2523,7 @@ be09b235155bae6cb96b94ce4645260937e856ac3907d710850256e6351f50b428f948a7af339374
 f7fbba6e0636f890e56fbbf3283e524c6fa3204ae298382d624741d0dc6638326e282c41be5e4254d8820772c5518a2c5a8c0c7f7eda19594a7eb539453e1ed7
 95bce0fdbcf48ba9c944dae46238d89bbd6df696a0d0b7cc8fc16eeabd30c03d6d2506cfcce81de320b37bc677df1bd045ac9231b43ae11807773db3909d1220
 b2d173023893f71caadf7cb2f9557355462570de2c9c971b9cfa5494936e28df8e13d0db4d550aab66d5e7a002f678ddb02def092c069ce473cf5fb293953986
-960b0fed9378be1e9adefd91e1be6ac9c1de7208008dfec438ff845135727bebea0f7458a5181079f61288176e0168cfea501b900c3e495b3ab9bbe4d372486d
+17ecb6d43868f7502f588817661f5edb85b8e408d304ffbdeddd6b1abbec00dc5dda907b930356f1a031be368ea053626af59a9e74fbe55cf9cb7855acfd5f17
 d82c4eb5261cb9c8aa9855edd67d1bd10482f41529858d925094d173fa662aa91ff39bc5b188615273484021dfb16fd8284cf684ccf0fc795be3aa2fc1e6c181
 
 # We only support one encoding, UTF8, which is hardcoded to id 6 just like in
@@ -2472,6 +2579,73 @@ SELECT array_to_string(NULL, ','), array_to_string(NULL, 'foo', 'zerp')
 ----
 NULL  NULL
 
+# Builtin array_to_string should recursively search nested arrays.
+query T
+SELECT array_to_string(ARRAY[ARRAY[ARRAY[5,6], ARRAY[2,3]], ARRAY[ARRAY[7,8], ARRAY[4,44]]], ' ');
+----
+5 6 2 3 7 8 4 44
+
+# Builtin array_to_string should recursively search nested arrays.
+query T
+SELECT array_to_string(ARRAY[(SELECT ARRAY[1,2]::int2vector)],' ');
+----
+1 2
+
+# Examples from https://www.postgresql.org/docs/9.3/functions-string.html#FUNCTIONS-STRING-FORMAT
+query T
+SELECT format('Hello %s', 'World')
+----
+Hello World
+
+query T
+SELECT format('INSERT INTO %I VALUES(%L)', 'locations', 'C:\Program Files')
+----
+INSERT INTO locations VALUES(e'C:\\Program Files')
+
+query T
+SELECT format('|%10s|', 'foo')
+----
+|       foo|
+
+query T
+SELECT format('|%-10s|', 'foo')
+----
+|foo       |
+
+query T
+SELECT format('|%*s|', 10, 'foo')
+----
+|       foo|
+
+query T
+SELECT format('|%*s|', -10, 'foo')
+----
+|foo       |
+
+query T
+SELECT format('|%-*s|', 10, 'foo')
+----
+|foo       |
+
+query T
+SELECT format('|%-*s|', -10, 'foo')
+----
+|foo       |
+
+# Escaping $ into \x24 only needed in testlogic or prepared statements
+query T
+SELECT format(E'Testing %3\x24s, %2\x24s, %1\x24s', 'one', 'two', 'three')
+----
+Testing three, two, one
+
+query T
+SELECT format(E'Testing %3\x24s, %2\x24s, %s', 'one', 'two', 'three')
+----
+Testing three, two, three
+
+query error pq: format\(\): error parsing format string: not enough arguments
+SELECT format(E'%2\x24s','foo');
+
 subtest pg_is_in_recovery
 
 query B colnames
@@ -2493,52 +2667,7 @@ SELECT pg_catalog.pg_client_encoding()
 ----
 UTF8
 
-subtest check_consistency
-
-# Sanity-check crdb_internal.check_consistency.
-
-statement error start key must be >= "\\x02"
-SELECT crdb_internal.check_consistency(true, '\x01', '\xffff')
-
-statement error end key must be < "\\xff\\xff"
-SELECT crdb_internal.check_consistency(true, '\x02', '\xffff00')
-
-statement error start key must be less than end key
-SELECT crdb_internal.check_consistency(true, '\x02', '\x02')
-
-statement error start key must be less than end key
-SELECT crdb_internal.check_consistency(true, '\x03', '\x02')
-
-query ITT
-SELECT range_id, status, regexp_replace(detail, '[0-9]+', '', 'g') FROM crdb_internal.check_consistency(true, '\x02', '\xffff') WHERE range_id = 1
-----
-1  RANGE_CONSISTENT  stats: {ContainsEstimates: LastUpdateNanos: IntentAge: GCBytesAge: LiveBytes: LiveCount: KeyBytes: KeyCount: ValBytes: ValCount: IntentBytes: IntentCount: SeparatedIntentCount: SysBytes: SysCount: AbortSpanBytes:}
-
-# Without explicit keys, scans all ranges (we don't test this too precisely to
-# avoid flaking the test when the range count changes, just want to know that
-# we're touching multiple ranges).
-query B
-SELECT count(*) > 5 FROM crdb_internal.check_consistency(true, '', '')
-----
-true
-
-# Query that should touch only a single range.
-query B
-SELECT count(*) = 1 FROM crdb_internal.check_consistency(true, '\x03', '\x0300')
-----
-true
-
-# Ditto, but implicit start key \x02
-query B
-SELECT count(*) = 1 FROM crdb_internal.check_consistency(true, '', '\x0200')
-----
-true
-
-# Ditto, but implicit end key.
-query B
-SELECT count(*) = 1 FROM crdb_internal.check_consistency(true, '\xff', '')
-----
-true
+subtest width_bucket
 
 # Tests for width_bucket builtin
 query I
@@ -2575,6 +2704,28 @@ query BBB
 SELECT pg_type_is_visible('int'::regtype), pg_type_is_visible(NULL), pg_type_is_visible(99999)
 ----
 true  NULL  NULL
+
+# Sanity check pg_get_function_arguments.
+query T
+SELECT pg_get_function_arguments('convert_from'::regproc::oid)
+----
+bytea, text
+
+# This produces an empty string in Postgres too.
+query T
+SELECT pg_get_function_arguments('version'::regproc::oid)
+----
+·
+
+query T
+SELECT pg_get_function_arguments('array_length'::regproc)
+----
+anyarray, int8
+
+query T
+SELECT pg_get_function_arguments((select oid from pg_proc where proname='variance' and proargtypes[0] = 'int'::regtype))
+----
+int8
 
 # Sanity check pg_get_function_identity_arguments.
 query T
@@ -2619,14 +2770,6 @@ bool
 query error pq: more than one function named 'unnest'
 SELECT pg_get_function_result('unnest'::regproc);
 
-# Regression test for #40297.
-statement ok
-CREATE TABLE t40297 AS SELECT g FROM generate_series(NULL, NULL) AS g
-
-query I
-SELECT COALESCE((SELECT ()), NULL) FROM t40297
-----
-
 query T
 SELECT CASE WHEN true THEN (1, 2) ELSE NULL END
 ----
@@ -2660,108 +2803,6 @@ query T
 select to_hex('abc')
 ----
 616263
-
-# Test crdb_internal commands which execute as root, but
-# only checks for permissions afterwards.
-subtest crdb_internal_privileged_only
-
-user root
-
-statement ok
-CREATE DATABASE root_test;
-REVOKE CONNECT ON DATABASE root_test FROM public
-
-statement ok
-CREATE TABLE root_test.t(a int)
-
-statement ok
-ALTER DATABASE root_test CONFIGURE ZONE USING num_replicas = 5
-
-query I
-SELECT crdb_internal.get_namespace_id(0, 'does_not_exist')
-----
-NULL
-
-query I
-SELECT crdb_internal.get_namespace_id(0, 'root_test')
-----
-63
-
-query I
-SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
-----
-64
-
-query T
-SELECT crdb_internal.get_zone_config(-1)::string
-----
-NULL
-
-query T
-SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(0, 'root_test'))::string
-----
-\x2805500158017800
-
-query T
-SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't'))::string
-----
-NULL
-
-# switch users -- this one has no permissions so expect errors
-user testuser
-
-query I
-SELECT crdb_internal.get_namespace_id(0, 'does_not_exist')
-----
-NULL
-
-query error insufficient privilege
-SELECT crdb_internal.get_namespace_id(0, 'root_test')
-
-query T
-SELECT crdb_internal.get_zone_config(-1)::string
-----
-NULL
-
-query error insufficient privilege
-SELECT crdb_internal.get_zone_config(61)::string -- based on root query. having no permissions blocks us from this test rapidly changing though.
-
-# give testuser permissions on everything and retest
-user root
-
-statement ok
-GRANT ALL ON DATABASE root_test TO testuser
-
-statement ok
-GRANT ALL ON root_test.t TO testuser
-
-user testuser
-
-query I
-SELECT crdb_internal.get_namespace_id(0, 'root_test')
-----
-63
-
-query I
-SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
-----
-64
-
-query T
-SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(0, 'root_test'))::string
-----
-\x2805500158017800
-
-query T
-SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't'))::string
-----
-NULL
-
-# reset state to default
-user root
-
-statement ok
-DROP DATABASE root_test CASCADE
 
 # Test for timezone builtin.
 subtest timezone_test
@@ -2986,7 +3027,7 @@ select crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, 
 ----
 system
 
-query error pq: crdb_internal.pb_to_json\(\): unknown proto message type cockroach.sql.sqlbase.descriptor
+query error pq: crdb_internal.pb_to_json\(\): invalid protocol message: unknown proto message type cockroach.sql.sqlbase.descriptor
 select crdb_internal.pb_to_json('cockroach.sql.sqlbase.descriptor', descriptor)->'database'->>'name' from system.descriptor where id=1
 
 query B
@@ -2994,24 +3035,27 @@ SELECT (SELECT * FROM [SHOW crdb_version]) = version()
 ----
 true
 
+# Replicated version field was added in 24.3, which will make the two non-equivalent.
+skipif config local-mixed-24.1
+skipif config local-mixed-24.2
 query B
 select crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor)) = descriptor from system.descriptor where id = 1
 ----
 true
 
-query error pq: crdb_internal.json_to_pb\(\): unmarshaling json to cockroach.sql.sqlbase.Descriptor: unknown field "__redacted__" in descpb.Descriptor
+query error pq: crdb_internal.json_to_pb\(\): invalid proto JSON: unmarshaling to cockroach.sql.sqlbase.Descriptor json: .+ unknown field "__redacted__" in descpb.Descriptor
 select crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, true, true)) = descriptor from system.descriptor where id = 1
 
 subtest regexp_split
 
-query T
+query T nosort
 SELECT regexp_split_to_table('3aa0AAa1', 'a+')
 ----
 3
 0AA
 1
 
-query T
+query T nosort
 SELECT regexp_split_to_table('3aa0AAa1', 'a+', 'i')
 ----
 3
@@ -3033,7 +3077,7 @@ subtest crdb_internal.trace_id
 # switch users -- this one has no permissions so expect errors
 user testuser
 
-query error insufficient privilege
+query error user testuser does not have REPAIRCLUSTER system privilege
 SELECT * FROM crdb_internal.trace_id()
 
 user root
@@ -3048,7 +3092,7 @@ subtest crdb_internal.payloads_for_span
 # switch users -- this one has no permissions so expect errors
 user testuser
 
-query error pq: only users with the admin role are allowed to use crdb_internal.payloads_for_span
+query error user testuser does not have REPAIRCLUSTER system privilege
 SELECT * FROM crdb_internal.payloads_for_span(0)
 
 user root
@@ -3064,7 +3108,7 @@ subtest crdb_internal.payloads_for_trace
 # switch users -- this one has no permissions so expect errors
 user testuser
 
-query error pq: only users with the admin role are allowed to use crdb_internal.payloads_for_span
+query error user testuser does not have REPAIRCLUSTER system privilege
 SELECT * FROM crdb_internal.payloads_for_span(0)
 
 user root
@@ -3078,7 +3122,7 @@ span_id payload_type  payload_jsonb
 # switch users -- this one has no permissions so expect errors
 user testuser
 
-query error insufficient privilege
+query error user testuser does not have REPAIRCLUSTER system privilege
 SELECT * FROM crdb_internal.set_trace_verbose(0, false)
 
 user root
@@ -3092,7 +3136,7 @@ WHERE false
 statement ok
 SET timezone = 'Europe/Berlin'
 
-query T
+query T nosort
 select generate_series('2021-07-05'::timestamptz, '2021-07-06'::timestamptz, '1day'::interval)
 ----
 2021-07-05 00:00:00 +0200 CEST
@@ -3105,7 +3149,7 @@ statement ok
 set timezone = 'Europe/Bucharest';
 
 # the following two queries should provide the same output
-query T
+query T nosort
 select '2020-10-25 00:00'::TIMESTAMPTZ + (i::text || ' hour')::interval from generate_series(0, 24) AS g(i);
 ----
 2020-10-25 00:00:00 +0300 EEST
@@ -3134,7 +3178,7 @@ select '2020-10-25 00:00'::TIMESTAMPTZ + (i::text || ' hour')::interval from gen
 2020-10-25 22:00:00 +0200 EET
 2020-10-25 23:00:00 +0200 EET
 
-query T
+query T nosort
 select generate_series('2020-10-25 00:00'::TIMESTAMPTZ, '2020-10-25 23:00'::TIMESTAMPTZ, '1 hour');
 ----
 2020-10-25 00:00:00 +0300 EEST
@@ -3205,3 +3249,1165 @@ query B
 SELECT 'ACTIVE'::text ~ similar_to_escape(NULL::text)
 ----
 NULL
+
+subtest password_hash
+
+# Need to escapes the dollar signs since the testlogic language gives them special meaning.
+
+query error pgcode 42601 bcrypt algorithm version .3. requested is newer than current version .2.
+SELECT crdb_internal.check_password_hash_format(('CRDB-BCRYPT$'||'3a$'||'10$'||'vcmoIBvgeHjgScVHWRMWI.Z3v03WMixAw2bBS6qZihljSUuwi88Yq')::bytes)
+
+query error pgcode 42601 too short to be a bcrypted password
+SELECT crdb_internal.check_password_hash_format(('CRDB-BCRYPT$'||'2a$'||'10$'||'vcmoIBvgeHjgScVHWRMWI.Z3v0')::bytes)
+
+query error pgcode 42601 cost 1 is outside allowed range \(4,31\)
+SELECT crdb_internal.check_password_hash_format(('CRDB-BCRYPT$'||'2a$'||'01$'||'vcmoIBvgeHjgScVHWRMWI.Z3v03WMixAw2bBS6qZihljSUuwi88Yq')::bytes)
+
+query T
+SELECT crdb_internal.check_password_hash_format(('CRDB-BCRYPT$'||'2a$'||'10$'||'vcmoIBvgeHjgScVHWRMWI.Z3v03WMixAw2bBS6qZihljSUuwi88Yq')::bytes)
+----
+crdb-bcrypt
+
+# Legacy format, only recognized for parsing, not for storing passwords.
+query T
+SELECT crdb_internal.check_password_hash_format('md5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+----
+md5
+
+# Not yet supported for storing passwords, but recognized on input.
+query T
+SELECT crdb_internal.check_password_hash_format(('SCRAM-SHA-256$'||'4096:B5VaTCvCLDzZxSYL829oVA==$'||'3Ako3mNxNtdsaSOJl0Av3i6vyV2OiSP9Ly7famdFSbw=:d7BfSmrtjwbF74mSoOhQiDSpoIvlakXKdpBNb3Meunc=')::bytes)
+----
+scram-sha-256
+
+subtest session_revival_token
+
+user host-cluster-root
+
+statement ok
+ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true
+
+user root
+
+statement ok
+CREATE USER parentuser;
+GRANT parentuser TO testuser
+
+skipif config 3node-tenant-default-configs
+statement error session revival tokens are not supported on this cluster
+select crdb_internal.create_session_revival_token()
+
+onlyif config 3node-tenant
+statement error cannot create token for root user
+select crdb_internal.create_session_revival_token()
+
+user testuser
+
+statement ok
+CREATE TABLE token_payload(algorithm STRING, "expiresAt" TIMESTAMPTZ, "issuedAt" TIMESTAMPTZ, "user" STRING)
+
+# Make sure the token is generated for testuser, not parentuser.
+statement ok
+SET ROLE parentuser
+
+# create_session_revival_token requires tenant-signing certs, so it only works
+# in 3node-tenant.
+onlyif config 3node-tenant
+query TTBBBB
+WITH
+  a AS (SELECT crdb_internal.create_session_revival_token() AS token),
+  b AS (
+    SELECT
+      crdb_internal.pb_to_json(
+        'cockroach.sql.sessiondatapb.SessionRevivalToken',
+        a.token
+      ) AS json_token
+    FROM a
+  ),
+  c AS (
+    SELECT
+      (json_populate_record(
+        NULL::token_payload,
+        crdb_internal.pb_to_json(
+          'cockroach.sql.sessiondatapb.SessionRevivalToken.Payload',
+          decode(b.json_token->>'payload', 'base64'),
+          true
+        )
+      )).*
+    FROM b
+  )
+SELECT
+  algorithm,
+  "user",
+  "expiresAt" > now(),
+  "expiresAt" < (now() + INTERVAL '11 minutes'),
+  "expiresAt" > "issuedAt",
+  crdb_internal.validate_session_revival_token(a.token)
+FROM
+  c, a
+----
+Ed25519  testuser  true  true  true  true
+
+user host-cluster-root
+
+statement ok
+ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = false
+
+user root
+
+# test OVERLAPS expression
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 01:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 01:00:00',
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:15:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 01:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 01:00:00',
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:15:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:15:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 00:30:00',
+TIME '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 01:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 01:00:00',
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:15:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:00:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 00:30:00',
+TIMETZ '2000-01-01 01:30:00');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-03',
+DATE '2000-01-02',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-03',
+DATE '2000-01-01',
+DATE '2000-01-02',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-02',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '100 days',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIMESTAMP '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '100 days',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMESTAMPTZ '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIMESTAMPTZ '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '2 hours',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '100 s',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIME '2000-01-01 00:00:00',
+INTERVAL '30 minutes',
+TIME '2000-01-01 00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '3 hours',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+true
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '100 s',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+TIMETZ '00:00:00',
+INTERVAL '30 minutes',
+TIMETZ '00:30:00',
+INTERVAL '30 minutes');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '3 hours',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+false
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '2 days',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+true
+
+query B
+SELECT overlaps(
+DATE '2000-01-01',
+INTERVAL '1 day',
+DATE '2000-01-02',
+INTERVAL '2 days');
+----
+false
+
+query error pq: unknown signature: overlaps\(date, date, date, date, date\)
+SELECT overlaps
+(DATE '2000-01-03',
+DATE '2000-02-03',
+DATE '2000-03-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+
+query T
+SELECT overlaps(NULL, NULL, NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(NULL, INTERVAL '1 day', NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(DATE '2000-01-01', INTERVAL '1 day', NULL, NULL);
+----
+NULL
+
+query T
+SELECT overlaps(DATE '2000-01-01', NULL, DATE '2000-01-01', DATE '2000-01-02');
+----
+NULL
+
+query error pq: unknown signature: overlaps\(timestamp, time, time, timestamp\)
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIME '2000-01-01 01:00:00',
+TIME '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+
+query error pq: unknown signature: overlaps\(timestamp, interval, date, timestamptz\)
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+INTERVAL '2 days',
+DATE '2000-01-01',
+TIMESTAMPTZ '2000-01-01 01:30:00');
+
+query T
+SELECT encode(decompress(compress('Hello World', 'gzip'), 'gzip'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'zstd'), 'zstd'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'snappy'), 'snappy'), 'escape');
+----
+Hello World
+
+query T
+SELECT encode(decompress(compress('Hello World', 'lz4'), 'LZ4'), 'escape');
+----
+Hello World
+
+query error pq: decompress\(\): lz4: bad magic number
+SELECT encode(decompress(compress('Hello World', 'snappy'), 'lz4'), 'escape');
+
+query error pq: compress\(\): only 'gzip', 'lz4', 'snappy', or 'zstd' compression codecs are supported
+SELECT compress('Hello World', 'infiniteCompressionCodec');
+
+subtest crdb_internal.hide_sql_constants
+query T
+SELECT crdb_internal.hide_sql_constants('select 1, 2, 3')
+----
+SELECT _, _, _
+
+# Passing a redacted sql stmt shouldn't have any effect.
+query T
+SELECT crdb_internal.hide_sql_constants('select _, _, _')
+----
+SELECT _, _, _
+
+query T
+SELECT crdb_internal.hide_sql_constants(ARRAY('select 1', NULL, 'select ''hello''', '', 'not a sql stmt'))
+----
+{"SELECT _",NULL,"SELECT '_'","",""}
+
+query T
+SELECT crdb_internal.hide_sql_constants(ARRAY['banana'])
+----
+{""}
+
+query T
+SELECT crdb_internal.hide_sql_constants('SELECT ''yes'' IN (''no'', ''maybe'', ''yes'')')
+----
+SELECT '_' IN ('_', '_', __more1_10__)
+
+query T
+SELECT crdb_internal.hide_sql_constants('')
+----
+·
+
+query T
+SELECT crdb_internal.hide_sql_constants(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.hide_sql_constants('not a sql stmt')
+----
+·
+
+
+query T
+select crdb_internal.hide_sql_constants(e'\r');
+----
+·
+
+
+query T
+SELECT crdb_internal.hide_sql_constants(create_statement) from crdb_internal.create_statements where descriptor_name = 'foo'
+----
+CREATE TABLE public.foo (a INT8 NULL, rowid INT8 NOT NULL NOT VISIBLE DEFAULT unique_rowid(), CONSTRAINT foo_pkey PRIMARY KEY (rowid ASC))
+
+# More tests are in parse_ident_builtin_test.go.
+query T rowsort
+SELECT parse_ident(str) FROM ( VALUES
+  ('a.b.c'),
+  ('"YesCaps".NoCaps'),
+  ('"a""b".xyz'),
+  ('"a\b".xyz')
+) tbl(str)
+----
+{a,b,c}
+{YesCaps,nocaps}
+{"a\"b",xyz}
+{"a\\b",xyz}
+
+query T
+SELECT parse_ident('ab.xyz()', false)
+----
+{ab,xyz}
+
+query error string is not a valid identifier: \"ab.xyz\(\)\"
+SELECT parse_ident('ab.xyz()', true)
+
+# Test that we return appropriate user-facing errors when trying to decode invalid bytes.
+query error pgcode 22023 pq: crdb_internal.job_payload_type\(\): invalid protocol message: proto: wrong wireType = 1 for field Import
+select crdb_internal.job_payload_type('invalid'::BYTES);
+
+query error pgcode 22023 pq: crdb_internal.job_payload_type\(\): invalid type in job payload protocol message: Payload.Type called on a payload with an unknown details type: <nil>
+select crdb_internal.job_payload_type('');
+
+subtest crdb_internal.get_fully_qualified_table_name
+query T
+SELECT crdb_internal.get_fully_qualified_table_name(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.get_fully_qualified_table_name(9999999)
+----
+NULL
+
+statement ok
+CREATE DATABASE "testDatabase"
+
+query T
+SELECT crdb_internal.get_fully_qualified_table_name((SELECT id FROM system.namespace WHERE name = 'foo'))
+----
+test.public.foo
+
+statement error unknown signature: crdb_internal.get_fully_qualified_table_name\(string\)
+SELECT crdb_internal.get_fully_qualified_table_name('')
+
+statement ok
+USE "testDatabase"
+
+statement ok
+CREATE SCHEMA "testSchema"
+
+statement ok
+CREATE TABLE "testSchema"."testTable" (a INT)
+
+let $testTableID
+SELECT id FROM system.namespace WHERE name = 'testTable'
+
+statement ok
+USE test
+
+query T
+SELECT crdb_internal.get_fully_qualified_table_name($testTableID)
+----
+"testDatabase"."testSchema"."testTable"
+
+user testuser
+
+# Verify that testuser has permissions to use the builtin function, and the
+# backing view.
+query T
+SELECT crdb_internal.get_fully_qualified_table_name($testTableID)
+----
+"testDatabase"."testSchema"."testTable"
+
+user root
+
+statement ok
+REVOKE CONNECT ON DATABASE "testDatabase" FROM public
+
+user testuser
+
+# testuser should no longer be able to see the name.
+query T
+SELECT crdb_internal.get_fully_qualified_table_name($testTableID)
+----
+NULL
+
+user root
+
+subtest crdb_internal.redactable_sql_constants
+query T
+SELECT crdb_internal.redactable_sql_constants(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.redactable_sql_constants('')
+----
+·
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT 1, 2, 3')
+----
+SELECT ‹1›, ‹2›, ‹3›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('UPDATE mytable SET col = ''abc'' WHERE key = 0')
+----
+UPDATE mytable SET col = ‹'abc'› WHERE key = ‹0›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('not a sql statement')
+----
+‹not a sql statement›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('1')
+----
+‹1›
+
+statement error unknown signature: crdb_internal.redactable_sql_constants\(int\)
+SELECT crdb_internal.redactable_sql_constants(1)
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[]::string[])
+----
+{}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[''])
+----
+{""}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY[NULL])
+----
+{NULL}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY['banana'])
+----
+{‹banana›}
+
+query T
+SELECT crdb_internal.redactable_sql_constants(ARRAY['SELECT 1', NULL, 'SELECT ''hello''', ''])
+----
+{"SELECT ‹1›",NULL,"SELECT ‹'hello'›",""}
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT ''yes'' IN (''no'', ''maybe'', ''yes'')')
+----
+SELECT ‹'yes'› IN (‹'no'›, ‹'maybe'›, ‹'yes'›)
+
+query T
+SELECT crdb_internal.redactable_sql_constants(e'\r')
+----
+‹
+›
+
+query T
+SELECT crdb_internal.redactable_sql_constants('SELECT crdb_internal.redactable_sql_constants('''')')
+----
+SELECT crdb_internal.redactable_sql_constants(‹''›)
+
+query T
+SELECT crdb_internal.redactable_sql_constants('WITH j AS (VALUES (0.1, false, ''{}''::jsonb, ARRAY[''x'', ''y'', ''''])) INSERT INTO i SELECT *, 7 FROM j WHERE true')
+----
+WITH j AS (VALUES (‹0.1›, ‹false›, ‹'{}'›::JSONB, ARRAY[‹'x'›, ‹'y'›, ‹''›])) INSERT INTO i SELECT *, ‹7› FROM j WHERE ‹true›
+
+query T
+SELECT crdb_internal.redactable_sql_constants(create_statement)
+FROM crdb_internal.create_statements
+WHERE descriptor_name = 'foo'
+----
+CREATE TABLE public.foo (a INT8 NULL, rowid INT8 NOT NULL NOT VISIBLE DEFAULT unique_rowid(), CONSTRAINT foo_pkey PRIMARY KEY (rowid ASC))
+
+statement ok
+CREATE TABLE redactable_sql_constants_table (
+  a INT PRIMARY KEY,
+  b STRING DEFAULT 'yo' CHECK (b != 'grapefruit'),
+  c STRING AS (b || 'foo') VIRTUAL,
+  FAMILY (a, b),
+  INDEX (b) WHERE b > 'z'
+);
+
+query T
+SELECT crdb_internal.redactable_sql_constants(create_statement)
+FROM crdb_internal.create_statements
+WHERE descriptor_name = 'redactable_sql_constants_table'
+----
+CREATE TABLE public.redactable_sql_constants_table (a INT8 NOT NULL, b STRING NULL DEFAULT ‹'yo'›:::STRING, c STRING NULL AS (b || ‹'foo'›:::STRING) VIRTUAL, CONSTRAINT redactable_sql_constants_table_pkey PRIMARY KEY (a ASC), INDEX redactable_sql_constants_table_b_idx (b ASC) WHERE b > ‹'z'›:::STRING, FAMILY fam_0_a_b (a, b), CONSTRAINT check_b CHECK (b != ‹'grapefruit'›:::STRING))
+
+statement ok
+DROP TABLE redactable_sql_constants_table
+
+subtest crdb_internal.redact
+
+query T
+SELECT crdb_internal.redact(NULL)
+----
+NULL
+
+query T
+SELECT crdb_internal.redact('')
+----
+·
+
+query T
+SELECT crdb_internal.redact('0')
+----
+0
+
+query T
+SELECT crdb_internal.redact('‹0›')
+----
+‹×›
+
+query T
+SELECT crdb_internal.redact('‹‹0››')
+----
+‹‹×››
+
+query T
+SELECT crdb_internal.redact('‹0› ‹0›')
+----
+‹×› ‹×›
+
+query T
+SELECT crdb_internal.redact('‹‹0›')
+----
+‹‹×›
+
+query T
+SELECT crdb_internal.redact(ARRAY[]::string[])
+----
+{}
+
+query T
+SELECT crdb_internal.redact(ARRAY[NULL])
+----
+{NULL}
+
+query T
+SELECT crdb_internal.redact(ARRAY[''])
+----
+{""}
+
+query T
+SELECT crdb_internal.redact(ARRAY['‹0›', '', NULL, '‹0› ‹0›', '‹0'])
+----
+{‹×›,"",NULL,"‹×› ‹×›",‹0}
+
+query T
+SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants('SELECT 1, 2, 3'))
+----
+SELECT ‹×›, ‹×›, ‹×›
+
+query T
+SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants(ARRAY['SELECT 1', NULL, 'SELECT ''hello''', '']))
+----
+{"SELECT ‹×›",NULL,"SELECT ‹×›",""}
+
+subtest check_consistency
+
+# Sanity-check crdb_internal.check_consistency.
+
+statement error start key must be >=
+SELECT crdb_internal.check_consistency(true, '\x00', crdb_internal.tenant_span()[2])
+
+statement error end key must be <=
+SELECT crdb_internal.check_consistency(true, crdb_internal.tenant_span()[1], '\xffff00')
+
+statement error start key must be less than end key
+SELECT crdb_internal.check_consistency(true, crdb_internal.tenant_span()[2], crdb_internal.tenant_span()[2])
+
+query TT
+SELECT status, regexp_replace(detail, '[0-9-]+', '', 'g')
+FROM crdb_internal.check_consistency(true, crdb_internal.tenant_span()[1], crdb_internal.tenant_span()[2])
+ORDER BY range_id
+LIMIT 1
+----
+RANGE_CONSISTENT  stats: {ContainsEstimates: LastUpdateNanos: LockAge: GCBytesAge: LiveBytes: LiveCount: KeyBytes: KeyCount: ValBytes: ValCount: IntentBytes: IntentCount: LockBytes: LockCount: RangeKeyCount: RangeKeyBytes: RangeValCount: RangeValBytes: SysBytes: SysCount: AbortSpanBytes:}
+
+
+
+# Fill a table with consistency check results. This used to panic.
+# See: https://github.com/cockroachdb/cockroach/issues/88222
+statement ok
+CREATE TABLE conscheckresult AS (SELECT * FROM crdb_internal.check_consistency(false, '', ''));
+
+subtest end
+
+subtest merge_aggregated_stmts_metadata
+
+query T
+SELECT crdb_internal.merge_aggregated_stmt_metadata(ARRAY[ '{ "db": [ "defaultdb", "movr" ], "distSQLCount": 1, "fullScanCount": 0, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 33, "vecCount": 0 }'::JSON, '{ "db": ["tpcc"], "distSQLCount": 1, "fullScanCount": 0, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 85, "vecCount": 2 }'::JSON ])
+----
+{"appNames": [], "db": ["defaultdb", "movr", "tpcc"], "distSQLCount": 2, "fingerprintID": "", "formattedQuery": "", "fullScanCount": 0, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 118, "vecCount": 2}
+
+query T
+SELECT crdb_internal.merge_aggregated_stmt_metadata(ARRAY[])
+----
+{"appNames": [], "db": [], "distSQLCount": 0, "fingerprintID": "", "formattedQuery": "", "fullScanCount": 0, "implicitTxn": false, "query": "", "querySummary": "", "stmtType": "", "totalCount": 0, "vecCount": 0}
+
+query T
+SELECT crdb_internal.merge_aggregated_stmt_metadata(ARRAY[ '{ "db": [ "defaultdb", "tpcc" ], "distSQLCount": 1, "fullScanCount": 0, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 33, "vecCount": 0 }'::JSON, '{ "db": ["tpcc"], "distSQLCount": 23, "fullScanCount": 99, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 3, "vecCount": 2 }'::JSON, '{"hello": "world"}'::JSON ])
+----
+{"appNames": [], "db": ["defaultdb", "tpcc"], "distSQLCount": 24, "fingerprintID": "", "formattedQuery": "", "fullScanCount": 99, "implicitTxn": true, "query": "SELECT 1", "querySummary": "SELECT 1", "stmtType": "TypeDML", "totalCount": 36, "vecCount": 2}
+
+query T
+SELECT crdb_internal.merge_aggregated_stmt_metadata(ARRAY[ '{"aMalformedMetadaObj": 123}'::JSON, '{"key": "value"}'::JSON ])
+----
+{"appNames": [], "db": [], "distSQLCount": 0, "fingerprintID": "", "formattedQuery": "", "fullScanCount": 0, "implicitTxn": false, "query": "", "querySummary": "", "stmtType": "", "totalCount": 0, "vecCount": 0}
+
+# Merge 2 objects with partial data to check that no value is reused between iterations.
+query T
+SELECT crdb_internal.merge_aggregated_stmt_metadata(ARRAY[ '{"distSQLCount": 111, "fullScanCount": 333 }'::JSON, '{"totalCount": 1, "vecCount": 2}'::JSON, '{"key": "value"}'::JSON ])
+----
+{"appNames": [], "db": [], "distSQLCount": 111, "fingerprintID": "", "formattedQuery": "", "fullScanCount": 333, "implicitTxn": false, "query": "", "querySummary": "", "stmtType": "", "totalCount": 1, "vecCount": 2}
+
+subtest end
+
+# Test bitmask_or function for string and varbit data
+query T
+SELECT bitmask_or('1010010', '0101');
+----
+1010111
+
+query T
+SELECT bitmask_or('1010010'::bit(7), '0101'::bit(4));
+----
+1010111
+
+query T
+SELECT bitmask_or('1010010'::bit(7), '0101');
+----
+1010111
+
+query T
+SELECT bitmask_or('1010010', '0101'::bit(4));
+----
+1010111
+
+query T
+SELECT bitmask_or('1010010'::varbit, '0101'::varbit);
+----
+1010111
+
+# Test bitmask_and function for string and varbit data
+query T
+SELECT bitmask_and('1010010', '0101');
+----
+0000000
+
+query T
+SELECT bitmask_and('1010010'::bit(7), '0101'::bit(4));
+----
+0000000
+
+query T
+SELECT bitmask_and('1010010'::bit(7), '0101');
+----
+0000000
+
+query T
+SELECT bitmask_and('1010010', '0101'::bit(4));
+----
+0000000
+
+query T
+SELECT bitmask_and('1010010'::varbit, '0101'::varbit);
+----
+0000000
+
+# Test bitmask_xor function for string and varbit data
+query T
+SELECT bitmask_xor('1010010', '0101');
+----
+1010111
+
+query T
+SELECT bitmask_xor('1010010'::bit(7), '0101'::bit(4));
+----
+1010111
+
+query T
+SELECT bitmask_xor('1010010'::bit(7), '0101');
+----
+1010111
+
+query T
+SELECT bitmask_xor('1010010', '0101'::bit(4));
+----
+1010111
+
+query T
+SELECT bitmask_xor('1010010'::varbit, '0101'::varbit);
+----
+1010111
+
+# Test for invalid inputs.
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_or('not binary', '111')
+
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_or('111', 'not binary')
+
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_and('not binary', '111')
+
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_and('111', 'not binary')
+
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_xor('not binary', '111')
+
+statement error pgcode 22P02 could not parse string as bit array: "n" is not a valid binary digit
+SELECT bitmask_xor('111', 'not binary')
+
+# Accept hex as well as binary inputs.
+query T
+SELECT bitmask_or('xfe8c', '1111');
+----
+1111111010001111
+
+query T
+SELECT bitmask_and('1111', 'xfe8c');
+----
+0000000000001100
+
+query T
+SELECT bitmask_xor('xfe8c', '1111');
+----
+1111111010000011
+
+# Test on a large (>64 bit) input.
+query T
+SELECT bitmask_or('xffffffffffffffffff', '010');
+----
+111111111111111111111111111111111111111111111111111111111111111111111111
+
+query T
+SELECT bitmask_and('xffffffffffffffffff', '010');
+----
+000000000000000000000000000000000000000000000000000000000000000000000010
+
+query T
+SELECT bitmask_xor('xffffffffffffffffff', '010');
+----
+111111111111111111111111111111111111111111111111111111111111111111111101
+
+# Regression test for mixed-type arguments (#108976).
+query T
+SELECT bitmask_or('101'::STRING, B'001'::VARBIT);
+----
+101
+
+query T
+SELECT bitmask_or(B'001'::VARBIT, '101'::STRING);
+----
+101
+
+query T
+SELECT bitmask_and('101'::STRING, B'001'::VARBIT);
+----
+001
+
+query T
+SELECT bitmask_and(B'001'::VARBIT, '101'::STRING);
+----
+001
+
+query T
+SELECT bitmask_xor('101'::STRING, B'001'::VARBIT);
+----
+100
+
+query T
+SELECT bitmask_xor(B'001'::VARBIT, '101'::STRING);
+----
+100
+
+# Query `percentile_disc_impl(arg1: float, arg2: bool) -> bool` from pg_proc
+query T rowsort
+SELECT oidvectortypes(proargtypes) FROM pg_proc WHERE oid=263
+----
+float, bool
+
+# Query a custom type and function.
+statement ok
+CREATE TYPE custom_typ AS ENUM ('good', 'bad');
+CREATE OR REPLACE FUNCTION custom_fn(c custom_typ) RETURNS custom_typ AS 'SELECT c' LANGUAGE SQL;
+
+query T rowsort
+SELECT oidvectortypes(proargtypes) FROM pg_proc WHERE proname='custom_fn'
+----
+custom_typ
+
+subtest obj_description_with_comment_on_type
+
+skipif config local-legacy-schema-changer
+statement ok
+CREATE TYPE roach_dwellings AS ENUM ('roach_motel','roach_kitchen','roach_bathroom','roach_house');
+
+skipif config local-legacy-schema-changer
+skipif config local-mixed-24.1
+statement ok
+COMMENT ON TYPE roach_dwellings IS 'roach_penthouse coming soon';
+
+# This select statement tests the underlying statement run with \dT
+skipif config local-legacy-schema-changer
+query TTT colnames
+SELECT n.nspname AS "Schema",
+         pg_catalog.format_type(t.oid, NULL) AS "Name",
+         COALESCE(pg_catalog.obj_description(t.oid, 'pg_type'),'') AS "Description"
+    FROM pg_catalog.pg_type t
+LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+   WHERE (t.typrelid = 0
+         OR (SELECT c.relkind = 'c'
+               FROM pg_catalog.pg_class c
+              WHERE c.oid = t.typrelid))
+     AND (NOT EXISTS(
+         SELECT 1
+           FROM pg_catalog.pg_type el
+          WHERE el.oid = t.typelem AND el.typarray = t.oid))
+     AND n.nspname !~ '^pg_'
+     AND n.nspname <> 'information_schema'
+     AND n.nspname <> 'crdb_internal'
+     AND pg_catalog.pg_type_is_visible(t.oid)
+ORDER BY 1, 2;
+----
+Schema  Name             Description
+public  concat_enum      ·
+public  custom_typ       ·
+public  roach_dwellings  ·
+public  testenum         ·
+
+subtest end
+
+subtest type_is_indexable
+
+# Indexable type (int4).
+query B
+SELECT crdb_internal.type_is_indexable(23);
+----
+true
+
+# Unindexable type (refcursor).
+query B
+SELECT crdb_internal.type_is_indexable(1790);
+----
+false
+
+statement ok
+CREATE TYPE foo_type AS ENUM ('v1', 'v2', 'v3');
+
+query B
+SELECT crdb_internal.type_is_indexable((SELECT oid FROM pg_type WHERE typname = 'foo_type'));
+----
+true
+
+query T
+SELECT crdb_internal.type_is_indexable(NULL);
+----
+NULL
+
+subtest end

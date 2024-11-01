@@ -1,40 +1,32 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
-
-//go:generate mockgen -source drt.go -package tests -destination drt_generated.go
 
 import (
 	"context"
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 )
 
-// PromClient is an interface allowing queries against Prometheus.
-type PromClient interface {
-	Query(ctx context.Context, query string, ts time.Time) (model.Value, promv1.Warnings, error)
-}
+//go:generate mockgen -package tests -destination drt_generated_test.go github.com/cockroachdb/cockroach/pkg/roachprod/prometheus Client
 
 type tpccChaosEventProcessor struct {
 	workloadInstances []workloadInstance
 	workloadNodeIP    string
 	ops               []string
 	ch                chan ChaosEvent
-	promClient        PromClient
+	promClient        prometheus.Client
 	errs              []error
 
 	// allowZeroSuccessDuringUptime allows 0 successes during an uptime event.
@@ -159,27 +151,13 @@ func (ep *tpccChaosEventProcessor) checkMetrics(
 			ep.workloadNodeIP,
 			w.prometheusPort,
 		)
-		fromVal, warnings, err := ep.promClient.Query(
-			ctx,
-			q,
-			fromTime,
-		)
+		fromVal, err := ep.queryPrometheus(ctx, l, q, fromTime)
 		if err != nil {
 			return err
 		}
-		if len(warnings) > 0 {
-			return errors.Newf("found warnings querying prometheus: %s", warnings)
-		}
-		toVal, warnings, err := ep.promClient.Query(
-			ctx,
-			q,
-			toTime,
-		)
+		toVal, err := ep.queryPrometheus(ctx, l, q, toTime)
 		if err != nil {
 			return err
-		}
-		if len(warnings) > 0 {
-			return errors.Newf("found warnings querying prometheus: %s", warnings)
 		}
 
 		// Results are a vector with 1 element, so deserialize accordingly.
@@ -215,6 +193,29 @@ func (ep *tpccChaosEventProcessor) checkMetrics(
 		}
 	}
 	return nil
+}
+
+func (ep *tpccChaosEventProcessor) queryPrometheus(
+	ctx context.Context, l *logger.Logger, q string, ts time.Time,
+) (val model.Value, err error) {
+	rOpts := base.DefaultRetryOptions()
+	rOpts.MaxRetries = 5
+	var warnings promv1.Warnings
+	for r := retry.Start(rOpts); r.Next(); {
+		val, warnings, err = ep.promClient.Query(
+			ctx,
+			q,
+			ts,
+		)
+		if err == nil {
+			break
+		}
+		l.Printf("error querying prometheus, retrying: %+v", err)
+	}
+	if len(warnings) > 0 {
+		return nil, errors.Newf("found warnings querying prometheus: %s", warnings)
+	}
+	return val, err
 }
 
 func (ep *tpccChaosEventProcessor) writeErr(ctx context.Context, l *logger.Logger, err error) {

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -18,5 +13,5 @@ func (d *delegator) delegateShowZoneConfig(n *tree.ShowZoneConfig) (tree.Stateme
 	if n.ZoneSpecifier != (tree.ZoneSpecifier{}) {
 		return nil, nil
 	}
-	return parse(`SELECT target, raw_config_sql FROM crdb_internal.zones`)
+	return d.parse(`SELECT target, raw_config_sql FROM crdb_internal.zones`)
 }

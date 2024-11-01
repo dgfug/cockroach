@@ -20,7 +20,7 @@ SELECT '1.00'::JSON
 ----
 1.00
 
-statement error unexpected EOF
+statement error could not parse JSON
 SELECT '{'::JSON
 
 query T
@@ -179,10 +179,10 @@ SELECT bar FROM foo WHERE bar->'a' = '"b"'::JSON
 ----
 {"a": "b"}
 
-statement error pgcode 0A000 can't order by column type jsonb.*\nHINT.*\n.*35706
+statement ok
 SELECT bar FROM foo ORDER BY bar
 
-statement error pgcode 0A000 column k is of type jsonb and thus is not indexable
+statement ok
 CREATE TABLE pk (k JSON PRIMARY KEY)
 
 query T rowsort
@@ -209,7 +209,7 @@ SELECT * from foo where bar->'x' = '{}'
 query T
 SELECT array_agg(bar ORDER BY pk) FROM foo
 ----
-{"'{\"a\": \"b\"}'","'[1, 2, 3]'","\"hello\"",1.000,true,false,NULL,"'{\"x\": [1, 2, 3]}'","'{\"x\": {\"y\": \"z\"}}'"}
+{"{\"a\": \"b\"}","[1, 2, 3]","\"hello\"",1.000,true,false,NULL,"{\"x\": [1, 2, 3]}","{\"x\": {\"y\": \"z\"}}"}
 
 statement ok
 DELETE FROM foo
@@ -608,6 +608,15 @@ SELECT true FROM x WHERE j->'a' @> '2'::JSONB
 true
 
 query T
+SELECT j FROM x WHERE j ?| ARRAY[NULL]
+----
+
+query T
+SELECT j FROM x WHERE j ?& ARRAY[NULL::STRING]
+----
+{"a": [1, 2, 3]}
+
+query T
 SELECT '{"foo": {"bar": 1}}'::JSONB #- ARRAY['foo', 'bar']
 ----
 {"foo": {}}
@@ -837,7 +846,7 @@ SELECT '{"foo": "bar"}' - s AS a, '{"bar": "foo"}' - s AS b FROM t57165 ORDER BY
 {}              {"bar": "foo"}
 {"foo": "bar"}  {}
 
-query T
+query T nosort
 SELECT j - s FROM t57165
 ----
 {}
@@ -872,3 +881,135 @@ query B
 SELECT json_valid(NULL)
 ----
 NULL
+
+# Regression tests for #81647 (false negatives for ? operator in some cases).
+subtest regression_81647
+
+statement ok
+CREATE TABLE t81647(j JSON);
+INSERT INTO t81647 VALUES ('["a", "b"]')
+
+query TBTB
+SELECT j, j ? 'a', j-1, (j-1) ? 'a' FROM t81647
+----
+["a", "b"]  true  ["a"]  true
+
+#
+# Test JSONB subscripting.
+#
+
+# Constant folding.
+query TTT
+SELECT
+  ('{"a": {"b": {"c": 1}}}'::jsonb)['a'],
+  ('{"a": {"b": {"c": 1}}}'::jsonb)['a']['b']['c'],
+  ('[1, "2", null]'::jsonb)[1]
+----
+{"b": {"c": 1}}  1  "2"
+
+# Referencing subscript which does not exist.
+query TTTT
+SELECT
+  ('{"a": 1}'::jsonb)['b'],
+  ('{"a": {"b": {"c": 1}}}'::jsonb)['c']['b']['c'],
+  ('[1, "2", null]'::jsonb)[4],
+  ('{"a": 1}'::jsonb)[NULL]
+----
+NULL  NULL  NULL  NULL
+
+# Error cases.
+statement error unexpected JSON subscript type: TIMESTAMPTZ
+SELECT ('{"a": 1}'::jsonb)[now()]
+
+statement error jsonb subscript does not support slices
+SELECT ('{"a": 1}'::jsonb)['a':'b']
+
+# Check it works from a JSON table.
+statement ok
+CREATE TABLE json_subscript_test (
+  id SERIAL PRIMARY KEY,
+  j JSONB,
+  extract_field TEXT,
+  extract_int_field INT
+);
+INSERT INTO json_subscript_test (j, extract_field, extract_int_field) VALUES
+  ('{"other_field": 2}', 'other_field', 1),
+  ('{"field": {"field": 2}}', 'field', 0),
+  ('[1, 2, 3]', 'nothing_to_fetch', 1)
+
+# Test subscripts with fields using other columns.
+query TTITTTT
+SELECT j, extract_field, extract_int_field, j['field'], j[extract_field], j[extract_field][extract_field], j[extract_int_field]
+FROM json_subscript_test ORDER BY id
+----
+{"other_field": 2}       other_field       1  NULL          2             NULL  NULL
+{"field": {"field": 2}}  field             0  {"field": 2}  {"field": 2}  2     NULL
+[1, 2, 3]                nothing_to_fetch  1  NULL          NULL          NULL  2
+
+# Test use in a WHERE clause.
+query T
+SELECT j FROM json_subscript_test WHERE j['other_field'] = '2' ORDER BY id
+----
+{"other_field": 2}
+
+# Regression test for https://github.com/cockroachdb/cockroach/issues/49144.
+# Check that json columns can be compared.
+
+statement ok
+CREATE TABLE test_49144 (
+    value jsonb
+);
+INSERT INTO test_49144 VALUES ('{"c": 2}'), ('{"c": 2.5}'), ('{"c": 3}')
+
+query T
+SELECT * FROM test_49144 WHERE ("test_49144"."value" -> 'c') > '2' ORDER BY 1
+----
+{"c": 2.5}
+{"c": 3}
+
+query T
+SELECT * FROM test_49144 WHERE ("test_49144"."value" -> 'c') > '2.33' ORDER BY 1
+----
+{"c": 2.5}
+{"c": 3}
+
+# Regression test for #113103. Expressions with JSON values are
+# composite-sensitive. The optimizer should not assume otherwise and perform
+# optimizations that produce incorrect results.
+subtest regression_113103
+
+# Order three text values that are cast from logically equivalent JSON values.
+query T
+SELECT j::TEXT
+FROM (VALUES ('1.0'::JSON), ('1'::JSON), ('1.00'::JSON)) v(j)
+ORDER BY 1
+----
+1
+1.0
+1.00
+
+# Add a filter that holds the JSON values constant to 1. The output should be
+# the same as above.
+query T
+SELECT j::TEXT
+FROM (VALUES ('1.0'::JSON), ('1'::JSON), ('1.00'::JSON)) v(j)
+WHERE j = '1'::JSON
+ORDER BY 1
+----
+1
+1.0
+1.00
+
+subtest end
+
+# Regression test for not using value-encoding for JSON when fingerprinting a
+# tuple (#118380).
+query T rowsort
+WITH cte1 AS (SELECT * FROM (VALUES
+  (('1':::JSON, 1)),
+  (('2':::JSON, 2))
+) AS tab (col1))
+SELECT * FROM cte1 GROUP BY cte1.col1;
+----
+(1,1)
+(2,2)

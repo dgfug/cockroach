@@ -1,17 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import classNames from "classnames/bind";
-import styles from "./tableHead.module.scss";
+import React from "react";
+
 import { ExpandableConfig, SortableColumn, SortSetting } from "../sortedtable";
+
+import styles from "./tableHead.module.scss";
 
 const cx = classNames.bind(styles);
 
@@ -23,33 +20,27 @@ interface TableHeadProps {
   firstCellBordered: boolean;
 }
 
-export const TableHead: React.FC<TableHeadProps> = ({
-  expandableConfig,
-  columns,
-  sortSetting,
-  onChangeSortSetting,
-  firstCellBordered,
-}) => {
+export const TableHead: React.FC<TableHeadProps> = props => {
+  const { expandableConfig, columns, sortSetting, firstCellBordered } = props;
   const trClass = cx("head-wrapper__row", "head-wrapper__row--header");
   const thClass = cx("head-wrapper__cell");
   const cellContentWrapper = cx("inner-content-wrapper");
   const arrowsClass = cx("sortable__actions");
 
-  function handleSort(picked: boolean, columnTitle: string) {
+  function handleSort(
+    newColumnSelected: boolean,
+    columnTitle: string,
+    prevValue: boolean,
+  ) {
     // If the columnTitle is different than the previous value, initial sort
-    // descending. If the same columnTitle is clicked multiple times consecutively,
-    // first change to ascending, then remove the sort key.
-    const ASCENDING = true;
-    const DESCENDING = false;
+    // descending. If is the same columnTitle the value is updated.
 
-    const direction = picked ? ASCENDING : DESCENDING;
-    const sortElementColumnTitle =
-      picked && sortSetting.ascending ? null : columnTitle;
-
-    onChangeSortSetting({
-      ascending: direction,
-      columnTitle: sortElementColumnTitle,
-    });
+    const ascending = newColumnSelected ? false : !prevValue;
+    props.onChangeSortSetting &&
+      props.onChangeSortSetting({
+        ascending,
+        columnTitle,
+      });
   }
 
   return (
@@ -57,25 +48,31 @@ export const TableHead: React.FC<TableHeadProps> = ({
       <tr className={trClass}>
         {expandableConfig && <th className={thClass} />}
         {columns.map((c: SortableColumn, idx: number) => {
-          const sortable = c.columnTitle !== (null || undefined);
-          const picked = c.name === sortSetting.columnTitle;
+          const sortable = !!c.columnTitle;
+          const newColumnSelected = c.name !== sortSetting.columnTitle;
           const style = { textAlign: c.titleAlign };
-          const cellAction = sortable ? () => handleSort(picked, c.name) : null;
+          const cellAction = () =>
+            sortable &&
+            handleSort(newColumnSelected, c.name, sortSetting.ascending);
           const cellClasses = cx(
             "head-wrapper__cell",
             "sorted__cell",
             sortable && "sorted__cell--sortable",
-            sortSetting.ascending && picked && "sorted__cell--ascending",
-            !sortSetting.ascending && picked && "sorted__cell--descending",
+            sortSetting.ascending &&
+              !newColumnSelected &&
+              "sorted__cell--ascending",
+            !sortSetting.ascending &&
+              !newColumnSelected &&
+              "sorted__cell--descending",
             firstCellBordered && idx === 0 && "cell-header",
           );
-          const titleClasses = cx("column-title");
+          const titleClasses = c.hideTitleUnderline ? "" : cx("column-title");
 
           return (
             <th
-              className={classNames(cellClasses)}
+              className={cx(cellClasses)}
               key={"headCell" + idx}
-              onClick={cellAction}
+              onClick={_ => cellAction()}
               style={style}
             >
               <div className={cellContentWrapper}>

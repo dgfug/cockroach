@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -56,7 +52,7 @@ func hasPolygonOrientation(g geom.T, o Orientation) (bool, error) {
 					return false, nil
 				}
 			default:
-				return false, errors.Newf("unexpected orientation: %v", o)
+				return false, pgerror.Newf(pgcode.InvalidParameterValue, "unexpected orientation: %v", o)
 			}
 		}
 		return true, nil
@@ -77,7 +73,7 @@ func hasPolygonOrientation(g geom.T, o Orientation) (bool, error) {
 	case *geom.Point, *geom.MultiPoint, *geom.LineString, *geom.MultiLineString:
 		return true, nil
 	default:
-		return false, errors.Newf("unhandled geometry type: %T", g)
+		return false, pgerror.Newf(pgcode.InvalidParameterValue, "unhandled geometry type: %T", g)
 	}
 }
 
@@ -115,7 +111,7 @@ func forcePolygonOrientation(g geom.T, o Orientation) error {
 					reverse = true
 				}
 			default:
-				return errors.Newf("unexpected orientation: %v", o)
+				return pgerror.Newf(pgcode.InvalidParameterValue, "unexpected orientation: %v", o)
 			}
 
 			if reverse {
@@ -149,6 +145,6 @@ func forcePolygonOrientation(g geom.T, o Orientation) error {
 	case *geom.Point, *geom.MultiPoint, *geom.LineString, *geom.MultiLineString:
 		return nil
 	default:
-		return errors.Newf("unhandled geometry type: %T", g)
+		return pgerror.Newf(pgcode.InvalidParameterValue, "unhandled geometry type: %T", g)
 	}
 }

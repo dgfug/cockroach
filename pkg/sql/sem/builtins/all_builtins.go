@@ -1,108 +1,150 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
 import (
-	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
-// AllBuiltinNames is an array containing all the built-in function
+var allBuiltinNames stringSet
+
+// AllBuiltinNames returns a slice containing all the built-in function
 // names, sorted in alphabetical order. This can be used for a
 // deterministic walk through the Builtins map.
-var AllBuiltinNames []string
+func AllBuiltinNames() []string {
+	return allBuiltinNames.Ordered()
+}
 
-// AllAggregateBuiltinNames is an array containing the subset of
+var allAggregateBuiltinNames stringSet
+
+// AllAggregateBuiltinNames returns a slice containing the subset of
 // AllBuiltinNames that corresponds to aggregate functions.
-var AllAggregateBuiltinNames []string
+func AllAggregateBuiltinNames() []string {
+	return allAggregateBuiltinNames.Ordered()
+}
 
-// AllWindowBuiltinNames is an array containing the subset of
+var allWindowBuiltinNames stringSet
+
+// AllWindowBuiltinNames returns a slice containing the subset of
 // AllBuiltinNames that corresponds to window functions.
-var AllWindowBuiltinNames []string
+func AllWindowBuiltinNames() []string {
+	return allWindowBuiltinNames.Ordered()
+}
 
 func init() {
-	initAggregateBuiltins()
-	initWindowBuiltins()
-	initGeneratorBuiltins()
-	initGeoBuiltins()
-	initPGBuiltins()
-	initMathBuiltins()
-	initReplicationBuiltins()
-
-	AllBuiltinNames = make([]string, 0, len(builtins))
-	AllAggregateBuiltinNames = make([]string, 0, len(aggregates))
 	tree.FunDefs = make(map[string]*tree.FunctionDefinition)
-	for name, def := range builtins {
-		fDef := tree.NewFunctionDefinition(name, &def.props, def.overloads)
+	tree.ResolvedBuiltinFuncDefs = make(map[string]*tree.ResolvedFunctionDefinition)
+	tree.OidToQualifiedBuiltinOverload = make(map[oid.Oid]tree.QualifiedOverload)
+	tree.OidToBuiltinName = make(map[oid.Oid]string)
+
+	builtinsregistry.AddSubscription(func(name string, props *tree.FunctionProperties, overloads []tree.Overload) {
+		for i, fn := range overloads {
+			signature := name + fn.Signature(true)
+			overloads[i].Oid = signatureMustHaveHardcodedOID(signature)
+			tree.OidToBuiltinName[overloads[i].Oid] = name
+			if _, ok := CastBuiltinNames[name]; ok {
+				retOid := fn.ReturnType(nil).Oid()
+				if _, ok := CastBuiltinOIDs[retOid]; !ok {
+					CastBuiltinOIDs[retOid] = make(map[types.Family]oid.Oid, len(overloads))
+				}
+				CastBuiltinOIDs[retOid][fn.Types.GetAt(0).Family()] = overloads[i].Oid
+			}
+		}
+		fDef := tree.NewFunctionDefinition(name, props, overloads)
+		addResolvedFuncDef(tree.ResolvedBuiltinFuncDefs, tree.OidToQualifiedBuiltinOverload, fDef)
 		tree.FunDefs[name] = fDef
 		if !fDef.ShouldDocument() {
 			// Avoid listing help for undocumented functions.
-			continue
+			return
 		}
-		AllBuiltinNames = append(AllBuiltinNames, name)
-		if def.props.Class == tree.AggregateClass {
-			AllAggregateBuiltinNames = append(AllAggregateBuiltinNames, name)
-		} else if def.props.Class == tree.WindowClass {
-			AllWindowBuiltinNames = append(AllWindowBuiltinNames, name)
-		}
-		for _, overload := range def.overloads {
-			fnCount := 0
-			if overload.Fn != nil {
-				fnCount++
-			}
-			if overload.FnWithExprs != nil {
-				fnCount++
-			}
-			if overload.Generator != nil {
-				overload.Fn = unsuitableUseOfGeneratorFn
-				overload.FnWithExprs = unsuitableUseOfGeneratorFnWithExprs
-				fnCount++
-			}
-			if overload.GeneratorWithExprs != nil {
-				overload.Fn = unsuitableUseOfGeneratorFn
-				overload.FnWithExprs = unsuitableUseOfGeneratorFnWithExprs
-				fnCount++
-			}
-			if fnCount > 1 {
-				panic(fmt.Sprintf(
-					"builtin %s: at most 1 of Fn, FnWithExprs, Generator, and GeneratorWithExprs"+
-						"must be set on overloads; (found %d)",
-					name, fnCount,
-				))
+		allBuiltinNames.Add(name)
+		for _, fn := range overloads {
+			if fn.Class == tree.AggregateClass {
+				allAggregateBuiltinNames.Add(name)
+			} else if fn.Class == tree.WindowClass {
+				allWindowBuiltinNames.Add(name)
 			}
 		}
+	})
+}
+
+func addResolvedFuncDef(
+	resolved map[string]*tree.ResolvedFunctionDefinition,
+	oidToOl map[oid.Oid]tree.QualifiedOverload,
+	def *tree.FunctionDefinition,
+) {
+	parts := strings.Split(def.Name, ".")
+	if len(parts) > 2 || len(parts) == 0 {
+		// This shouldn't happen in theory.
+		panic(errors.AssertionFailedf("invalid builtin function name: %s", def.Name))
 	}
 
-	// Generate missing categories.
-	for _, name := range AllBuiltinNames {
-		def := builtins[name]
-		if def.props.Category == "" {
-			def.props.Category = getCategory(def.overloads)
-			builtins[name] = def
+	var fd *tree.ResolvedFunctionDefinition
+	if len(parts) == 2 {
+		fd = tree.QualifyBuiltinFunctionDefinition(def, parts[0])
+		resolved[def.Name] = fd
+		return
+	} else {
+		resolvedName := catconstants.PgCatalogName + "." + def.Name
+		fd = tree.QualifyBuiltinFunctionDefinition(def, catconstants.PgCatalogName)
+		resolved[resolvedName] = fd
+		if def.AvailableOnPublicSchema {
+			resolvedName = catconstants.PublicSchemaName + "." + def.Name
+			resolved[resolvedName] = tree.QualifyBuiltinFunctionDefinition(def, catconstants.PublicSchemaName)
 		}
 	}
+	for _, o := range fd.Overloads {
+		oidToOl[o.Oid] = o
+	}
+}
 
-	sort.Strings(AllBuiltinNames)
-	sort.Strings(AllAggregateBuiltinNames)
-	sort.Strings(AllWindowBuiltinNames)
+// registerBuiltin adds the given builtin to the builtins registry. All
+// overloads of the Generator class are updated to have Fn and FnWithExprs
+// fields to be functions that return assertion errors upon execution (to
+// prevent misuse).
+//
+// If enforceClass is true, then it panics if at least one overload is not of
+// the expected class.
+//
+// Note that additional sanity checks are also performed in eval/overload.go.
+func registerBuiltin(
+	name string, def builtinDefinition, expectedClass tree.FunctionClass, enforceClass bool,
+) {
+	for i := range def.overloads {
+		overload := &def.overloads[i]
+		if enforceClass {
+			if overload.Class != expectedClass {
+				panic(errors.AssertionFailedf("%s: expected to be marked with class %q, found %q",
+					name, expectedClass, overload.Class))
+			}
+		}
+		if overload.Class == tree.GeneratorClass {
+			overload.Fn = unsuitableUseOfGeneratorFn
+			overload.FnWithExprs = unsuitableUseOfGeneratorFnWithExprs
+		}
+	}
+	if def.props.ShouldDocument() && def.props.Category == "" {
+		def.props.Category = getCategory(def.overloads)
+	}
+	builtinsregistry.Register(name, &def.props, def.overloads)
 }
 
 func getCategory(b []tree.Overload) string {
 	// If single argument attempt to categorize by the type of the argument.
 	for _, ovl := range b {
 		switch typ := ovl.Types.(type) {
-		case tree.ArgTypes:
+		case tree.ParamTypes:
 			if len(typ) == 1 {
 				return categorizeType(typ[0].Typ)
 			}
@@ -124,8 +166,32 @@ func collectOverloads(
 			r = append(r, f(t))
 		}
 	}
-	return builtinDefinition{
-		props:     props,
-		overloads: r,
+	return makeBuiltin(props, r...)
+}
+
+// stringSet is a set of strings that can be ordered.
+type stringSet struct {
+	set     map[string]struct{}
+	ordered []string
+}
+
+// Add adds a string to the set.
+func (s *stringSet) Add(str string) {
+	if s.set == nil {
+		s.set = make(map[string]struct{})
 	}
+	s.set[str] = struct{}{}
+	s.ordered = nil
+}
+
+// Ordered returns an ordered slice of the strings in the set.
+func (s stringSet) Ordered() []string {
+	if s.ordered == nil {
+		s.ordered = make([]string, 0, len(s.set))
+		for str := range s.set {
+			s.ordered = append(s.ordered, str)
+		}
+		sort.Strings(s.ordered)
+	}
+	return s.ordered
 }

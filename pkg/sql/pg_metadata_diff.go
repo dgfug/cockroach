@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This file contains constants and types used by pg_catalog diff tool
 // that are also re-used in /pkg/cmd/generate-postgres-metadata-tables
@@ -44,8 +39,7 @@ const GetPGMetadataSQL = `
 	JOIN pg_namespace n ON n.oid = c.relnamespace
 	WHERE n.nspname = $1
 	AND a.attnum > 0
-  AND c.relkind != 'i'
-	ORDER BY 1, 2;
+  AND c.relkind != 'i';
 `
 
 // Summary will keep accountability for any unexpected difference and report it in the log.
@@ -69,12 +63,12 @@ type PGMetadataColumnDiff struct {
 type PGMetadataColumnDiffs map[string]*PGMetadataColumnDiff
 
 // PGMetadataTableDiffs is used to store and load expected diffs:
-// - A table name pointing to a zero length PGMetadataColumnDiffs means that we expect this table to be missing
-//   in cockroach db.
-// - If PGMetadataColumnDiffs is not empty but columnName points to null, we expect that column to be missing in that table in
-//   cockroach db.
-// - If column Name points to a not null PGMetadataColumnDiff, the test column describes how we expect that data type to be
-//   different between cockroach db and postgres.
+//   - A table name pointing to a zero length PGMetadataColumnDiffs means that we expect this table to be missing
+//     in cockroach db.
+//   - If PGMetadataColumnDiffs is not empty but columnName points to null, we expect that column to be missing in that table in
+//     cockroach db.
+//   - If column Name points to a not null PGMetadataColumnDiff, the test column describes how we expect that data type to be
+//     different between cockroach db and postgres.
 type PGMetadataTableDiffs map[string]PGMetadataColumnDiffs
 
 // PGMetadataColumnType represents a column type from postgres/mysql.
@@ -86,8 +80,14 @@ type PGMetadataColumnType struct {
 // PGMetadataColumns maps columns names to datatypes.
 type PGMetadataColumns map[string]*PGMetadataColumnType
 
+// PGMetadataTableInfo represents a table with column mapping and column names in insertion order.
+type PGMetadataTableInfo struct {
+	ColumnNames []string          `json:"columnNames"`
+	Columns     PGMetadataColumns `json:"columns"`
+}
+
 // PGMetadataTables maps tables with columns.
-type PGMetadataTables map[string]PGMetadataColumns
+type PGMetadataTables map[string]PGMetadataTableInfo
 
 // PGMetadataFile stores the schema gotten from postgres/mysql.
 type PGMetadataFile struct {
@@ -116,15 +116,22 @@ func (d PGMetadataTableDiffs) addColumn(
 	columns[columnName] = column
 }
 
-func (p PGMetadataTables) addColumn(tableName, columnName string, column *PGMetadataColumnType) {
-	columns, ok := p[tableName]
+func (p PGMetadataTables) addColumn(
+	tableName string, columnName string, column *PGMetadataColumnType,
+) {
+	tableInfo, ok := p[tableName]
 
 	if !ok {
-		columns = make(PGMetadataColumns)
-		p[tableName] = columns
+		tableInfo = PGMetadataTableInfo{
+			ColumnNames: []string{},
+			Columns:     make(PGMetadataColumns),
+		}
+		p[tableName] = tableInfo
 	}
 
-	columns[columnName] = column
+	tableInfo.ColumnNames = append(tableInfo.ColumnNames, columnName)
+	tableInfo.Columns[columnName] = column
+	p[tableName] = tableInfo
 }
 
 // AddColumnMetadata is used to load data from postgres or cockroach pg_catalog schema
@@ -274,11 +281,11 @@ func Save(writer io.Writer, file interface{}) {
 	}
 }
 
-//getUnimplementedTables retrieves the tables that are not yet part of CRDB.
+// getUnimplementedTables retrieves the tables that are not yet part of CRDB.
 func (d PGMetadataTableDiffs) getUnimplementedTables(source PGMetadataTables) PGMetadataTables {
 	unimplementedTables := make(PGMetadataTables)
 	for tableName := range d {
-		if len(d[tableName]) == 0 && len(source[tableName].getUnimplementedTypes()) == 0 {
+		if len(d[tableName]) == 0 && len(source[tableName].Columns.getUnimplementedTypes()) == 0 {
 			unimplementedTables[tableName] = source[tableName]
 		}
 	}
@@ -295,7 +302,7 @@ func (d PGMetadataTableDiffs) getUnimplementedColumns(target PGMetadataTables) P
 				// dataType mismatch (Not a new column).
 				continue
 			}
-			sourceType, ok := target[tableName][columnName]
+			sourceType, ok := target[tableName].Columns[columnName]
 			if !ok {
 				continue
 			}
@@ -313,12 +320,12 @@ func (d PGMetadataTableDiffs) getUnimplementedColumns(target PGMetadataTables) P
 // removeImplementedColumns removes diff columns that are marked as expected
 // diff (or unimplemented column) but is already implemented in CRDB.
 func (d PGMetadataTableDiffs) removeImplementedColumns(source PGMetadataTables) {
-	for tableName, columns := range source {
+	for tableName, tableInfo := range source {
 		pColumns, exists := d[tableName]
 		if !exists {
 			continue
 		}
-		for columnName := range columns {
+		for _, columnName := range tableInfo.ColumnNames {
 			columnType, exists := pColumns[columnName]
 			if !exists {
 				continue
@@ -347,8 +354,8 @@ func (c PGMetadataColumns) getUnimplementedTypes() map[oid.Oid]string {
 
 func (p PGMetadataTables) getUnimplementedTypes() map[oid.Oid]string {
 	unimplemented := make(map[oid.Oid]string)
-	for _, column := range p {
-		for typeOid, dataType := range column.getUnimplementedTypes() {
+	for _, tableInfo := range p {
+		for typeOid, dataType := range tableInfo.Columns.getUnimplementedTypes() {
 			unimplemented[typeOid] = dataType
 		}
 	}

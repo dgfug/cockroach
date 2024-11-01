@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -15,10 +10,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
 )
@@ -37,7 +35,7 @@ type mergeJoiner struct {
 	leftIdx, rightIdx       int
 	trackMatchedRight       bool
 	emitUnmatchedRight      bool
-	matchedRight            util.FastIntSet
+	matchedRight            intsets.Fast
 	matchedRightCount       int
 
 	streamMerger streamMerger
@@ -45,45 +43,34 @@ type mergeJoiner struct {
 
 var _ execinfra.Processor = &mergeJoiner{}
 var _ execinfra.RowSource = &mergeJoiner{}
-var _ execinfra.OpNode = &mergeJoiner{}
+var _ execopnode.OpNode = &mergeJoiner{}
 
 const mergeJoinerProcName = "merge joiner"
 
 func newMergeJoiner(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.MergeJoinerSpec,
 	leftSource execinfra.RowSource,
 	rightSource execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*mergeJoiner, error) {
-	leftEqCols := make([]uint32, 0, len(spec.LeftOrdering.Columns))
-	rightEqCols := make([]uint32, 0, len(spec.RightOrdering.Columns))
-	for i, c := range spec.LeftOrdering.Columns {
-		if spec.RightOrdering.Columns[i].Direction != c.Direction {
-			return nil, errors.New("unmatched column orderings")
-		}
-		leftEqCols = append(leftEqCols, c.ColIdx)
-		rightEqCols = append(rightEqCols, spec.RightOrdering.Columns[i].ColIdx)
-	}
-
 	m := &mergeJoiner{
 		leftSource:        leftSource,
 		rightSource:       rightSource,
 		trackMatchedRight: shouldEmitUnmatchedRow(rightSide, spec.Type) || spec.Type == descpb.RightSemiJoin,
 	}
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		m.leftSource = newInputStatCollector(m.leftSource)
 		m.rightSource = newInputStatCollector(m.rightSource)
 		m.ExecStatsForTrace = m.execStatsForTrace
 	}
 
-	if err := m.joinerBase.init(
-		m /* self */, flowCtx, processorID, leftSource.OutputTypes(), rightSource.OutputTypes(),
-		spec.Type, spec.OnExpr, leftEqCols, rightEqCols, false, /* outputContinuationColumn */
-		post, output,
+	if _, err := m.joinerBase.init(
+		ctx, m /* self */, flowCtx, processorID, leftSource.OutputTypes(), rightSource.OutputTypes(),
+		spec.Type, spec.OnExpr, false /* outputContinuationColumn */, post,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{leftSource, rightSource},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -95,7 +82,7 @@ func newMergeJoiner(
 		return nil, err
 	}
 
-	m.MemMonitor = execinfra.NewMonitor(flowCtx.EvalCtx.Ctx(), flowCtx.EvalCtx.Mon, "mergejoiner-mem")
+	m.MemMonitor = execinfra.NewMonitor(ctx, flowCtx.Mon, "mergejoiner-mem")
 
 	var err error
 	m.streamMerger, err = makeStreamMerger(
@@ -117,7 +104,7 @@ func newMergeJoiner(
 func (m *mergeJoiner) Start(ctx context.Context) {
 	ctx = m.StartInternal(ctx, mergeJoinerProcName)
 	m.streamMerger.start(ctx)
-	m.cancelChecker.Reset(ctx)
+	m.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 }
 
 // Next is part of the Processor interface.
@@ -240,7 +227,7 @@ func (m *mergeJoiner) nextRow() (rowenc.EncDatumRow, *execinfrapb.ProducerMetada
 		// TODO(paul): Investigate (with benchmarks) whether or not it's
 		// worthwhile to only buffer one row from the right stream per batch
 		// for semi-joins.
-		m.leftRows, m.rightRows, meta = m.streamMerger.NextBatch(m.Ctx, m.EvalCtx)
+		m.leftRows, m.rightRows, meta = m.streamMerger.NextBatch(m.Ctx(), m.FlowCtx.EvalCtx)
 		if meta != nil {
 			return nil, meta
 		}
@@ -252,15 +239,15 @@ func (m *mergeJoiner) nextRow() (rowenc.EncDatumRow, *execinfrapb.ProducerMetada
 		m.emitUnmatchedRight = shouldEmitUnmatchedRow(rightSide, m.joinType)
 		m.leftIdx, m.rightIdx = 0, 0
 		if m.trackMatchedRight {
-			m.matchedRight = util.FastIntSet{}
+			m.matchedRight = intsets.Fast{}
 		}
 	}
 }
 
 func (m *mergeJoiner) close() {
 	if m.InternalClose() {
-		m.streamMerger.close(m.Ctx)
-		m.MemMonitor.Stop(m.Ctx)
+		m.streamMerger.close(m.Ctx())
+		m.MemMonitor.Stop(m.Ctx())
 	}
 }
 
@@ -289,29 +276,29 @@ func (m *mergeJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (m *mergeJoiner) ChildCount(verbose bool) int {
-	if _, ok := m.leftSource.(execinfra.OpNode); ok {
-		if _, ok := m.rightSource.(execinfra.OpNode); ok {
+	if _, ok := m.leftSource.(execopnode.OpNode); ok {
+		if _, ok := m.rightSource.(execopnode.OpNode); ok {
 			return 2
 		}
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (m *mergeJoiner) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (m *mergeJoiner) Child(nth int, verbose bool) execopnode.OpNode {
 	switch nth {
 	case 0:
-		if n, ok := m.leftSource.(execinfra.OpNode); ok {
+		if n, ok := m.leftSource.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("left input to mergeJoiner is not an execinfra.OpNode")
+		panic("left input to mergeJoiner is not an execopnode.OpNode")
 	case 1:
-		if n, ok := m.rightSource.(execinfra.OpNode); ok {
+		if n, ok := m.rightSource.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("right input to mergeJoiner is not an execinfra.OpNode")
+		panic("right input to mergeJoiner is not an execopnode.OpNode")
 	default:
 		panic(errors.AssertionFailedf("invalid index %d", nth))
 	}

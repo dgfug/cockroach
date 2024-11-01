@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cluster
 
@@ -25,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/docker/distribution/reference"
@@ -80,7 +75,11 @@ func hasImage(ctx context.Context, l *DockerCluster, ref string) error {
 	if err != nil {
 		return err
 	}
-	path := reference.Path(distributionRef)
+	path := distributionRef.Name()
+	// Images hosted on docker.io have local name without the domain name
+	if strings.HasPrefix(path, "docker.io") {
+		path = reference.Path(distributionRef)
+	}
 	// Correct for random docker stupidity:
 	//
 	// https://github.com/moby/moby/blob/7248742/registry/service.go#L207:L215
@@ -113,7 +112,7 @@ func hasImage(ctx context.Context, l *DockerCluster, ref string) error {
 	var imageList []string
 	for _, image := range images {
 		for _, tag := range image.RepoTags {
-			imageList = append(imageList, "%s %s", tag, image.ID)
+			imageList = append(imageList, fmt.Sprintf("%s %s", tag, image.ID))
 		}
 	}
 	return errors.Errorf("%s not found in:\n%s", wanted, strings.Join(imageList, "\n"))
@@ -280,16 +279,21 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	} else if ci.State.Running {
 		exp = append(exp, eventDie)
 	}
-	if err := c.cluster.client.ContainerRestart(ctx, c.id, timeout); err != nil {
+
+	timeoutSeconds := int(timeout.Seconds())
+	stopOpts := container.StopOptions{
+		Timeout: &timeoutSeconds,
+	}
+	if err := c.cluster.client.ContainerRestart(ctx, c.id, stopOpts); err != nil {
 		return err
 	}
 	c.cluster.expectEvent(c, append(exp, eventRestart)...)
 	return nil
 }
 
-// Wait waits for a running container to exit.
-func (c *Container) Wait(ctx context.Context, condition container.WaitCondition) error {
-	waitOKBodyCh, errCh := c.cluster.client.ContainerWait(ctx, c.id, condition)
+// WaitUntilNotRunning waits for a running container to exit.
+func (c *Container) WaitUntilNotRunning(ctx context.Context) error {
+	waitOKBodyCh, errCh := c.cluster.client.ContainerWait(ctx, c.id, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		return err
@@ -309,7 +313,15 @@ func (c *Container) Wait(ctx context.Context, condition container.WaitCondition)
 		if exitCode := waitOKBody.StatusCode; exitCode != 0 {
 			err = errors.Errorf("non-zero exit code: %d", exitCode)
 			fmt.Fprintln(out, err.Error())
-			log.Shoutf(ctx, severity.INFO, "command left-over files in %s", c.cluster.volumesDir)
+			volumesDir := c.cluster.volumesDir
+			// NB: TEST_UNDECLARED_OUTPUTS_DIR is set for remote Bazel tests.
+			undeclaredOutsDir := os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR")
+			if undeclaredOutsDir != "" {
+				log.Shoutf(ctx, severity.INFO, "command left-over files in %s",
+					strings.Replace(volumesDir, undeclaredOutsDir, "outputs.zip", 1))
+			} else {
+				log.Shoutf(ctx, severity.INFO, "command left-over files in %s", volumesDir)
+			}
 		}
 
 		return err
@@ -386,7 +398,7 @@ func (cli resilientDockerClient) ContainerStart(
 	clientCtx context.Context, id string, opts types.ContainerStartOptions,
 ) error {
 	for {
-		err := contextutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
+		err := timeutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
 			return cli.APIClient.ContainerStart(ctx, id, opts)
 		})
 
@@ -407,7 +419,7 @@ func (cli resilientDockerClient) ContainerCreate(
 	networkingConfig *network.NetworkingConfig,
 	platformSpec *specs.Platform,
 	containerName string,
-) (container.ContainerCreateCreatedBody, error) {
+) (container.CreateResponse, error) {
 	response, err := cli.APIClient.ContainerCreate(
 		ctx, config, hostConfig, networkingConfig, platformSpec, containerName,
 	)
@@ -419,7 +431,7 @@ func (cli resilientDockerClient) ContainerCreate(
 		})
 		if cerr != nil {
 			log.Infof(ctx, "unable to list containers: %v", cerr)
-			return container.ContainerCreateCreatedBody{}, err
+			return container.CreateResponse{}, err
 		}
 		for _, c := range containers {
 			for _, n := range c.Names {
@@ -435,7 +447,7 @@ func (cli resilientDockerClient) ContainerCreate(
 				}
 				if rerr := cli.ContainerRemove(ctx, c.ID, options); rerr != nil {
 					log.Infof(ctx, "unable to remove container: %v", rerr)
-					return container.ContainerCreateCreatedBody{}, err
+					return container.CreateResponse{}, err
 				}
 				return cli.ContainerCreate(ctx, config, hostConfig, networkingConfig, platformSpec, containerName)
 			}

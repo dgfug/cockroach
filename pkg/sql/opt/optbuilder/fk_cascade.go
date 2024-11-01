@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -20,72 +15,81 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
-// onDeleteCascadeBuilder is a memo.CascadeBuilder implementation for
+// onDeleteCascadeBuilder is a memo.PostQueryBuilder implementation for
 // ON DELETE CASCADE.
 //
 // It provides a method to build the cascading delete in the child table,
 // equivalent to a query like:
 //
-//   DELETE FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
+//	DELETE FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
 //
 // The input to the mutation is a semi-join of the table with the mutation
 // input:
 //
-//   delete child
-//    └── semi-join (hash)
-//         ├── columns: c:5!null child.p:6!null
-//         ├── scan child
-//         │    └── columns: c:5!null child.p:6!null
-//         ├── with-scan &1
-//         │    ├── columns: p:7!null
-//         │    └── mapping:
-//         │         └──  parent.p:2 => p:7
-//         └── filters
-//              └── child.p:6 = p:7
+//	delete child
+//	 └── semi-join (hash)
+//	      ├── columns: c:5!null child.p:6!null
+//	      ├── scan child
+//	      │    └── columns: c:5!null child.p:6!null
+//	      ├── with-scan &1
+//	      │    ├── columns: p:7!null
+//	      │    └── mapping:
+//	      │         └──  parent.p:2 => p:7
+//	      └── filters
+//	           └── child.p:6 = p:7
 //
 // Note that NULL values in the mutation input don't require any special
 // handling - they will be effectively ignored by the semi-join.
 //
 // See testdata/fk-on-delete-cascades for more examples.
-//
 type onDeleteCascadeBuilder struct {
 	mutatedTable cat.Table
 	// fkInboundOrdinal is the ordinal of the inbound foreign key constraint on
 	// the mutated table (can be passed to mutatedTable.InboundForeignKey).
 	fkInboundOrdinal int
 	childTable       cat.Table
+
+	// oldValues is the list of columns from the mutation input that correspond to
+	// old values of the modified rows. The list maps 1-to-1 to FK columns.
+	// Note that the columns must be remapped to the new memo when the cascade is
+	// built.
+	oldValues opt.ColList
 }
 
-var _ memo.CascadeBuilder = &onDeleteCascadeBuilder{}
+var _ memo.PostQueryBuilder = &onDeleteCascadeBuilder{}
 
 func newOnDeleteCascadeBuilder(
-	mutatedTable cat.Table, fkInboundOrdinal int, childTable cat.Table,
+	mutatedTable cat.Table, fkInboundOrdinal int, childTable cat.Table, oldValues opt.ColList,
 ) *onDeleteCascadeBuilder {
 	return &onDeleteCascadeBuilder{
 		mutatedTable:     mutatedTable,
 		fkInboundOrdinal: fkInboundOrdinal,
 		childTable:       childTable,
+		oldValues:        oldValues,
 	}
 }
 
-// Build is part of the memo.CascadeBuilder interface.
+// Build is part of the memo.PostQueryBuilder interface.
 func (cb *onDeleteCascadeBuilder) Build(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	catalog cat.Catalog,
 	factoryI interface{},
 	binding opt.WithID,
 	bindingProps *props.Relational,
-	oldValues, newValues opt.ColList,
+	colMap opt.ColMap,
 ) (_ memo.RelExpr, err error) {
-	return buildCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+	return buildTriggerCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+		opt.MaybeInjectOptimizerTestingPanic(ctx, evalCtx)
+
 		fk := cb.mutatedTable.InboundForeignKey(cb.fkInboundOrdinal)
 
 		dep := opt.DepByID(fk.OriginTableID())
@@ -100,6 +104,7 @@ func (cb *onDeleteCascadeBuilder) Build(
 		// The scope returned by buildDeleteCascadeMutationInput has one column
 		// for each public table column, making it appropriate to set it as
 		// mb.fetchScope.
+		oldValues := cb.oldValues.RemapColumns(colMap)
 		mb.fetchScope = b.buildDeleteCascadeMutationInput(
 			cb.childTable, &mb.alias, fk, binding, bindingProps, oldValues,
 		)
@@ -112,7 +117,7 @@ func (cb *onDeleteCascadeBuilder) Build(
 	})
 }
 
-// onDeleteFastCascadeBuilder is a memo.CascadeBuilder implementation for
+// onDeleteFastCascadeBuilder is a memo.PostQueryBuilder implementation for
 // certain cases of ON DELETE CASCADE where we are deleting the entire table or
 // where we can transfer a filter from the original statement instead of
 // buffering the deleted rows.
@@ -120,23 +125,23 @@ func (cb *onDeleteCascadeBuilder) Build(
 // It provides a method to build the cascading delete in the child table,
 // equivalent to a query like:
 //
-//   DELETE FROM child WHERE <condition on fk column> AND fk IS NOT NULL
+//	DELETE FROM child WHERE <condition on fk column> AND fk IS NOT NULL
 //
 // The input to the mutation is a Select on top of a Scan. For example:
 //
-//── delete child
-//    ├── columns: <none>
-//    ├── fetch columns: c:8 child.p:9
-//    └── select
-//         ├── columns: c:8!null child.p:9!null
-//         ├── scan child
-//         │    └── columns: c:8!null child.p:9!null
-//         └── filters
-//              ├── child.p:9 > 1
-//              └── child.p:9 IS DISTINCT FROM CAST(NULL AS INT8)
+// ── delete child
+//
+//	├── columns: <none>
+//	├── fetch columns: c:8 child.p:9
+//	└── select
+//	     ├── columns: c:8!null child.p:9!null
+//	     ├── scan child
+//	     │    └── columns: c:8!null child.p:9!null
+//	     └── filters
+//	          ├── child.p:9 > 1
+//	          └── child.p:9 IS DISTINCT FROM CAST(NULL AS INT8)
 //
 // See testdata/fk-on-delete-cascades for more examples.
-//
 type onDeleteFastCascadeBuilder struct {
 	mutatedTable cat.Table
 	// fkInboundOrdinal is the ordinal of the inbound foreign key constraint on
@@ -148,7 +153,7 @@ type onDeleteFastCascadeBuilder struct {
 	origFKCols  opt.ColList
 }
 
-var _ memo.CascadeBuilder = &onDeleteFastCascadeBuilder{}
+var _ memo.PostQueryBuilder = &onDeleteFastCascadeBuilder{}
 
 // tryNewOnDeleteFastCascadeBuilder checks if the fast path cascade is
 // applicable to the given mutation, and if yes it returns an instance of
@@ -187,7 +192,7 @@ func tryNewOnDeleteFastCascadeBuilder(
 		if !p.OuterCols.SubsetOf(fkCols.ToSet()) {
 			return nil, false
 		}
-		if memo.CanBeCompositeSensitive(md, &sel.Filters) {
+		if memo.CanBeCompositeSensitive(&sel.Filters) {
 			return nil, false
 		}
 		if sel.Relational().HasSubquery {
@@ -207,7 +212,7 @@ func tryNewOnDeleteFastCascadeBuilder(
 		return nil, false
 	}
 
-	var visited util.FastIntSet
+	var visited intsets.Fast
 	parentTabID := parentTab.ID()
 	childTabID := childTab.ID()
 
@@ -238,6 +243,13 @@ func tryNewOnDeleteFastCascadeBuilder(
 		default:
 			tab = resolveTable(ctx, catalog, tabID)
 		}
+		// If the table could not be resolved, then we cannot confirm that FK
+		// references form a simple tree, so we return false. This is possible
+		// when resolveTable returns nil above because the table is in the
+		// process of being added.
+		if tab == nil {
+			return false
+		}
 		for i, n := 0, tab.InboundForeignKeyCount(); i < n; i++ {
 			if !checkPaths(tab.InboundForeignKey(i).OriginTableID()) {
 				return false
@@ -258,18 +270,20 @@ func tryNewOnDeleteFastCascadeBuilder(
 	}, true
 }
 
-// Build is part of the memo.CascadeBuilder interface.
+// Build is part of the memo.PostQueryBuilder interface.
 func (cb *onDeleteFastCascadeBuilder) Build(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	catalog cat.Catalog,
 	factoryI interface{},
 	_ opt.WithID,
 	_ *props.Relational,
-	_, _ opt.ColList,
+	_ opt.ColMap,
 ) (_ memo.RelExpr, err error) {
-	return buildCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+	return buildTriggerCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+		opt.MaybeInjectOptimizerTestingPanic(ctx, evalCtx)
+
 		fk := cb.mutatedTable.InboundForeignKey(cb.fkInboundOrdinal)
 
 		dep := opt.DepByID(fk.OriginTableID())
@@ -284,14 +298,14 @@ func (cb *onDeleteFastCascadeBuilder) Build(
 		mb.fetchScope = b.buildScan(
 			b.addTable(cb.childTable, &mb.alias),
 			tableOrdinals(cb.childTable, columnKinds{
-				includeMutations:       false,
-				includeSystem:          false,
-				includeInverted:        false,
-				includeVirtualComputed: false,
+				includeMutations: false,
+				includeSystem:    false,
+				includeInverted:  false,
 			}),
 			nil, /* indexFlags */
 			noRowLocking,
 			b.allocScope(),
+			true, /* disableNotVisibleIndex */
 		)
 		mb.outScope = mb.fetchScope
 
@@ -345,45 +359,44 @@ func (cb *onDeleteFastCascadeBuilder) Build(
 	})
 }
 
-// onDeleteSetBuilder is a memo.CascadeBuilder implementation for
+// onDeleteSetBuilder is a memo.PostQueryBuilder implementation for
 // ON DELETE SET NULL and ON DELETE SET DEFAULT.
 //
 // It provides a method to build the cascading delete in the child table,
 // equivalent to a query like:
 //
-//   UPDATE SET fk = NULL FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
-//   or
-//   UPDATE SET fk = DEFAULT FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
+//	UPDATE SET fk = NULL FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
+//	or
+//	UPDATE SET fk = DEFAULT FROM child WHERE fk IN (SELECT fk FROM original_mutation_input)
 //
 // The input to the mutation is a semi-join of the table with the mutation
 // input:
 //
-//   update child
-//    ├── columns: <none>
-//    ├── fetch columns: c:5 child.p:6
-//    ├── update-mapping:
-//    │    └── column8:8 => child.p:4
-//    └── project
-//         ├── columns: column8:8 c:5!null child.p:6
-//         ├── semi-join (hash)
-//         │    ├── columns: c:5!null child.p:6
-//         │    ├── scan child
-//         │    │    └── columns: c:5!null child.p:6
-//         │    ├── with-scan &1
-//         │    │    ├── columns: p:7!null
-//         │    │    └── mapping:
-//         │    │         └──  parent.p:2 => p:7
-//         │    └── filters
-//         │         └── child.p:6 = p:7
-//         └── projections
-//                  └── NULL::INT8 [as=column8:8]
+//	update child
+//	 ├── columns: <none>
+//	 ├── fetch columns: c:5 child.p:6
+//	 ├── update-mapping:
+//	 │    └── column8:8 => child.p:4
+//	 └── project
+//	      ├── columns: column8:8 c:5!null child.p:6
+//	      ├── semi-join (hash)
+//	      │    ├── columns: c:5!null child.p:6
+//	      │    ├── scan child
+//	      │    │    └── columns: c:5!null child.p:6
+//	      │    ├── with-scan &1
+//	      │    │    ├── columns: p:7!null
+//	      │    │    └── mapping:
+//	      │    │         └──  parent.p:2 => p:7
+//	      │    └── filters
+//	      │         └── child.p:6 = p:7
+//	      └── projections
+//	               └── NULL::INT8 [as=column8:8]
 //
 // Note that NULL values in the mutation input don't require any special
 // handling - they will be effectively ignored by the semi-join.
 //
 // See testdata/fk-on-delete-set-null and fk-on-delete-set-default for more
 // examples.
-//
 type onDeleteSetBuilder struct {
 	mutatedTable cat.Table
 	// fkInboundOrdinal is the ordinal of the inbound foreign key constraint on
@@ -393,33 +406,46 @@ type onDeleteSetBuilder struct {
 
 	// action is either SetNull or SetDefault.
 	action tree.ReferenceAction
+
+	// oldValues is the list of columns from the mutation input that correspond to
+	// old values of the modified rows. The list maps 1-to-1 to FK columns.
+	// Note that the columns must be remapped to the new memo when the cascade is
+	// built.
+	oldValues opt.ColList
 }
 
-var _ memo.CascadeBuilder = &onDeleteSetBuilder{}
+var _ memo.PostQueryBuilder = &onDeleteSetBuilder{}
 
 func newOnDeleteSetBuilder(
-	mutatedTable cat.Table, fkInboundOrdinal int, childTable cat.Table, action tree.ReferenceAction,
+	mutatedTable cat.Table,
+	fkInboundOrdinal int,
+	childTable cat.Table,
+	action tree.ReferenceAction,
+	oldValues opt.ColList,
 ) *onDeleteSetBuilder {
 	return &onDeleteSetBuilder{
 		mutatedTable:     mutatedTable,
 		fkInboundOrdinal: fkInboundOrdinal,
 		childTable:       childTable,
 		action:           action,
+		oldValues:        oldValues,
 	}
 }
 
-// Build is part of the memo.CascadeBuilder interface.
+// Build is part of the memo.PostQueryBuilder interface.
 func (cb *onDeleteSetBuilder) Build(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	catalog cat.Catalog,
 	factoryI interface{},
 	binding opt.WithID,
 	bindingProps *props.Relational,
-	oldValues, newValues opt.ColList,
+	colMap opt.ColMap,
 ) (_ memo.RelExpr, err error) {
-	return buildCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+	return buildTriggerCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+		opt.MaybeInjectOptimizerTestingPanic(ctx, evalCtx)
+
 		fk := cb.mutatedTable.InboundForeignKey(cb.fkInboundOrdinal)
 
 		dep := opt.DepByID(fk.OriginTableID())
@@ -434,6 +460,7 @@ func (cb *onDeleteSetBuilder) Build(
 		// The scope returned by buildDeleteCascadeMutationInput has one column
 		// for each public table column, making it appropriate to set it as
 		// mb.fetchScope.
+		oldValues := cb.oldValues.RemapColumns(colMap)
 		mb.fetchScope = b.buildDeleteCascadeMutationInput(
 			cb.childTable, &mb.alias, fk, binding, bindingProps, oldValues,
 		)
@@ -481,20 +508,19 @@ func (cb *onDeleteSetBuilder) Build(
 // For example, if we have a child table with foreign key on p, the expression
 // will look like this:
 //
-//   semi-join (hash)
-//    ├── columns: c:5!null child.p:6!null
-//    ├── scan child
-//    │    └── columns: c:5!null child.p:6!null
-//    ├── with-scan &1
-//    │    ├── columns: p:7!null
-//    │    └── mapping:
-//    │         └──  parent.p:2 => p:7
-//    └── filters
-//         └── child.p:6 = p:7
+//	semi-join (hash)
+//	 ├── columns: c:5!null child.p:6!null
+//	 ├── scan child
+//	 │    └── columns: c:5!null child.p:6!null
+//	 ├── with-scan &1
+//	 │    ├── columns: p:7!null
+//	 │    └── mapping:
+//	 │         └──  parent.p:2 => p:7
+//	 └── filters
+//	      └── child.p:6 = p:7
 //
 // Note that NULL values in the mutation input don't require any special
 // handling - they will be effectively ignored by the semi-join.
-//
 func (b *Builder) buildDeleteCascadeMutationInput(
 	childTable cat.Table,
 	childTableAlias *tree.TableName,
@@ -503,24 +529,17 @@ func (b *Builder) buildDeleteCascadeMutationInput(
 	bindingProps *props.Relational,
 	oldValues opt.ColList,
 ) (outScope *scope) {
-	// We must fetch virtual computed columns for cascades that result in an
-	// update to the child table. The execution engine requires that the fetch
-	// columns are a superset of the update columns. See the related panic in
-	// execFactory.ConstructUpdate.
-	action := fk.DeleteReferenceAction()
-	fetchVirtualComputedCols := action == tree.SetNull || action == tree.SetDefault
-
 	outScope = b.buildScan(
 		b.addTable(childTable, childTableAlias),
 		tableOrdinals(childTable, columnKinds{
-			includeMutations:       false,
-			includeSystem:          false,
-			includeInverted:        false,
-			includeVirtualComputed: fetchVirtualComputedCols,
+			includeMutations: false,
+			includeSystem:    false,
+			includeInverted:  false,
 		}),
 		nil, /* indexFlags */
 		noRowLocking,
 		b.allocScope(),
+		true, /* disableNotVisibleIndex */
 	)
 
 	numFKCols := fk.ColumnCount()
@@ -563,40 +582,40 @@ func (b *Builder) buildDeleteCascadeMutationInput(
 	return outScope
 }
 
-// onUpdateCascadeBuilder is a memo.CascadeBuilder implementation for
+// onUpdateCascadeBuilder is a memo.PostQueryBuilder implementation for
 // ON UPDATE CASCADE / SET NULL / SET DEFAULT.
 //
 // It provides a method to build the cascading update in the child table,
 // equivalent to a query like:
 //
-//   UPDATE child SET fk = fk_new_val
-//   FROM (SELECT fk_old_val, fk_new_val FROM original_mutation_input)
-//   WHERE fk_old_val IS DISTINCT FROM fk_new_val AND fk = fk_old_val
+//	UPDATE child SET fk = fk_new_val
+//	FROM (SELECT fk_old_val, fk_new_val FROM original_mutation_input)
+//	WHERE fk_old_val IS DISTINCT FROM fk_new_val AND fk = fk_old_val
 //
 // The input to the mutation is an inner-join of the table with the mutation
 // input, producing the old and new FK values for each row:
 //
-//   update child
-//    ├── columns: <none>
-//    ├── fetch columns: c:6 child.p:7
-//    ├── update-mapping:
-//    │    └── p_new:9 => child.p:5
-//    ├── input binding: &2
-//    └─── inner-join (hash)
-//         ├── columns: c:6!null child.p:7!null p:8!null p_new:9!null
-//         ├── scan child
-//         │    └── columns: c:6!null child.p:7!null
-//         ├── select
-//         │    ├── columns: p:8!null p_new:9!null
-//         │    ├── with-scan &1
-//         │    │    ├── columns: p:8!null p_new:9!null
-//         │    │    └── mapping:
-//         │    │         ├──  parent.p:2 => p:8
-//         │    │         └──  p_new:3 => p_new:9
-//         │    └── filters
-//         │         └── p:8 IS DISTINCT FROM p_new:9
-//         └── filters
-//              └── child.p:7 = p:8
+//	update child
+//	 ├── columns: <none>
+//	 ├── fetch columns: c:6 child.p:7
+//	 ├── update-mapping:
+//	 │    └── p_new:9 => child.p:5
+//	 ├── input binding: &2
+//	 └─── inner-join (hash)
+//	      ├── columns: c:6!null child.p:7!null p:8!null p_new:9!null
+//	      ├── scan child
+//	      │    └── columns: c:6!null child.p:7!null
+//	      ├── select
+//	      │    ├── columns: p:8!null p_new:9!null
+//	      │    ├── with-scan &1
+//	      │    │    ├── columns: p:8!null p_new:9!null
+//	      │    │    └── mapping:
+//	      │    │         ├──  parent.p:2 => p:8
+//	      │    │         └──  p_new:3 => p_new:9
+//	      │    └── filters
+//	      │         └── p:8 IS DISTINCT FROM p_new:9
+//	      └── filters
+//	           └── child.p:7 = p:8
 //
 // The inner join equality columns form a key in the with-scan (because they
 // form a key in the parent table); so the inner-join is essentially equivalent
@@ -606,7 +625,6 @@ func (b *Builder) buildDeleteCascadeMutationInput(
 // handling - they will be effectively ignored by the join.
 //
 // See testdata/fk-on-update-* for more examples.
-//
 type onUpdateCascadeBuilder struct {
 	mutatedTable cat.Table
 	// fkInboundOrdinal is the ordinal of the inbound foreign key constraint on
@@ -615,33 +633,53 @@ type onUpdateCascadeBuilder struct {
 	childTable       cat.Table
 
 	action tree.ReferenceAction
+
+	// oldValues is the list of columns from the mutation input that correspond to
+	// old values of the modified rows. There is one entry per column in the
+	// table. Note that the columns must be remapped to the new memo when the
+	// cascade is built.
+	oldValues opt.ColList
+
+	// newValues is the list of columns from the mutation input that correspond to
+	// new values of the modified rows. There is one entry per column in the
+	// table. Note that the columns must be remapped to the new memo when the
+	// cascade is built.
+	newValues opt.ColList
 }
 
-var _ memo.CascadeBuilder = &onUpdateCascadeBuilder{}
+var _ memo.PostQueryBuilder = &onUpdateCascadeBuilder{}
 
 func newOnUpdateCascadeBuilder(
-	mutatedTable cat.Table, fkInboundOrdinal int, childTable cat.Table, action tree.ReferenceAction,
+	mutatedTable cat.Table,
+	fkInboundOrdinal int,
+	childTable cat.Table,
+	action tree.ReferenceAction,
+	oldValues, newValues opt.ColList,
 ) *onUpdateCascadeBuilder {
 	return &onUpdateCascadeBuilder{
 		mutatedTable:     mutatedTable,
 		fkInboundOrdinal: fkInboundOrdinal,
 		childTable:       childTable,
 		action:           action,
+		oldValues:        oldValues,
+		newValues:        newValues,
 	}
 }
 
-// Build is part of the memo.CascadeBuilder interface.
+// Build is part of the memo.PostQueryBuilder interface.
 func (cb *onUpdateCascadeBuilder) Build(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	catalog cat.Catalog,
 	factoryI interface{},
 	binding opt.WithID,
 	bindingProps *props.Relational,
-	oldValues, newValues opt.ColList,
+	colMap opt.ColMap,
 ) (_ memo.RelExpr, err error) {
-	return buildCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+	return buildTriggerCascadeHelper(ctx, semaCtx, evalCtx, catalog, factoryI, func(b *Builder) memo.RelExpr {
+		opt.MaybeInjectOptimizerTestingPanic(ctx, evalCtx)
+
 		fk := cb.mutatedTable.InboundForeignKey(cb.fkInboundOrdinal)
 
 		dep := opt.DepByID(fk.OriginTableID())
@@ -652,6 +690,8 @@ func (cb *onUpdateCascadeBuilder) Build(
 		mb.init(b, "update", cb.childTable, tree.MakeUnqualifiedTableName(cb.childTable.Name()))
 
 		// Build a join of the table with the mutation input.
+		oldValues := cb.oldValues.RemapColumns(colMap)
+		newValues := cb.newValues.RemapColumns(colMap)
 		mb.outScope = b.buildUpdateCascadeMutationInput(
 			cb.childTable, &mb.alias, fk, binding, bindingProps, oldValues, newValues,
 		)
@@ -701,21 +741,21 @@ func (cb *onUpdateCascadeBuilder) Build(
 // For example, if we have a child table with foreign key on p, the expression
 // will look like this:
 //
-//   inner-join (hash)
-//    ├── columns: c:6!null child.p:7!null p:8!null p_new:9!null
-//    ├── scan child
-//    │    └── columns: c:6!null child.p:7!null
-//    ├── select
-//    │    ├── columns: p:8!null p_new:9!null
-//    │    ├── with-scan &1
-//    │    │    ├── columns: p:8!null p_new:9!null
-//    │    │    └── mapping:
-//    │    │         ├──  parent.p:2 => p:8
-//    │    │         └──  p_new:3 => p_new:9
-//    │    └── filters
-//    │         └── p:8 IS DISTINCT FROM p_new:9
-//    └── filters
-//         └── child.p:7 = p:8
+//	inner-join (hash)
+//	 ├── columns: c:6!null child.p:7!null p:8!null p_new:9!null
+//	 ├── scan child
+//	 │    └── columns: c:6!null child.p:7!null
+//	 ├── select
+//	 │    ├── columns: p:8!null p_new:9!null
+//	 │    ├── with-scan &1
+//	 │    │    ├── columns: p:8!null p_new:9!null
+//	 │    │    └── mapping:
+//	 │    │         ├──  parent.p:2 => p:8
+//	 │    │         └──  p_new:3 => p_new:9
+//	 │    └── filters
+//	 │         └── p:8 IS DISTINCT FROM p_new:9
+//	 └── filters
+//	      └── child.p:7 = p:8
 //
 // The inner join equality columns form a key in the with-scan (because they
 // form a key in the parent table); so the inner-join is essentially equivalent
@@ -737,7 +777,6 @@ func (cb *onUpdateCascadeBuilder) Build(
 // inserted rows the "old" values are all NULL and won't match anything in the
 // inner-join anyway. This reasoning is very similar to that of FK checks for
 // Upserts (see buildFKChecksForUpsert).
-//
 func (b *Builder) buildUpdateCascadeMutationInput(
 	childTable cat.Table,
 	childTableAlias *tree.TableName,
@@ -747,20 +786,17 @@ func (b *Builder) buildUpdateCascadeMutationInput(
 	oldValues opt.ColList,
 	newValues opt.ColList,
 ) (outScope *scope) {
-	// We must fetch virtual computed columns for cascades. The execution engine
-	// requires that the fetch columns are a superset of the update columns. See
-	// the related panic in execFactory.ConstructUpdate.
 	outScope = b.buildScan(
 		b.addTable(childTable, childTableAlias),
 		tableOrdinals(childTable, columnKinds{
-			includeMutations:       false,
-			includeSystem:          false,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: false,
+			includeSystem:    false,
+			includeInverted:  false,
 		}),
 		nil, /* indexFlags */
 		noRowLocking,
 		b.allocScope(),
+		true, /* disableNotVisibleIndex */
 	)
 
 	numFKCols := fk.ColumnCount()
@@ -777,10 +813,11 @@ func (b *Builder) buildUpdateCascadeMutationInput(
 	outColsNew := outCols[numFKCols:]
 	for i := 0; i < numFKCols; i++ {
 		c := childTable.Column(fk.OriginColumnOrdinal(childTable, i))
+		typ := md.ColumnMeta(oldValues[i]).Type
 		oldName := fmt.Sprintf("%s_old", c.ColName())
 		newName := fmt.Sprintf("%s_new", c.ColName())
-		outColsOld[i] = md.AddColumn(oldName, c.DatumType())
-		outColsNew[i] = md.AddColumn(newName, c.DatumType())
+		outColsOld[i] = md.AddColumn(oldName, typ)
+		outColsNew[i] = md.AddColumn(newName, typ)
 	}
 
 	md.AddWithBinding(binding, b.factory.ConstructFakeRel(&memo.FakeRelPrivate{
@@ -885,13 +922,13 @@ func (b *Builder) buildUpdateCascadeMutationInput(
 	return outScope
 }
 
-// buildCascadeHelper contains boilerplate for CascadeBuilder.Build
+// buildTriggerCascadeHelper contains boilerplate for PostQueryBuilder.Build
 // implementations. It creates a Builder, sets up panic-to-error conversion,
 // and executes the given function.
-func buildCascadeHelper(
+func buildTriggerCascadeHelper(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	catalog cat.Catalog,
 	factoryI interface{},
 	fn func(b *Builder) memo.RelExpr,

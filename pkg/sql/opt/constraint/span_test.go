@@ -1,25 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // This file implements data structures used by index constraints generation.
 
 package constraint
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -190,13 +187,13 @@ func TestSpanSingleKey(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		st := cluster.MakeTestingClusterSettings()
-		evalCtx := tree.MakeTestingEvalContext(st)
+		ctx := context.Background()
+		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			var sp Span
 			sp.Init(tc.start, tc.startBoundary, tc.end, tc.endBoundary)
-			if sp.HasSingleKey(&evalCtx) != tc.expected {
+			if sp.HasSingleKey(ctx, &evalCtx) != tc.expected {
 				t.Errorf("expected: %v, actual: %v", tc.expected, !tc.expected)
 			}
 		})
@@ -670,7 +667,7 @@ func TestSpanPreferInclusive(t *testing.T) {
 }
 
 func TestSpan_KeyCount(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	kcAscAsc := testKeyContext(1, 2)
 	kcDescDesc := testKeyContext(-1, -2)
 	enums := makeEnums(t)
@@ -699,7 +696,7 @@ func TestSpan_KeyCount(t *testing.T) {
 			// Multiple key span with DOid datum type.
 			keyCtx:   kcAscAsc,
 			length:   1,
-			span:     ParseSpan(&evalCtx, "[/-5 - /5]", types.OidFamily),
+			span:     ParseSpan(&evalCtx, "[/0 - /10]", types.OidFamily),
 			expected: "11",
 		},
 		{ // 3
@@ -864,6 +861,27 @@ func TestSpan_KeyCount(t *testing.T) {
 			span:     ParseSpan(&evalCtx, "(/US_WEST - /US_WEST/fix]"),
 			expected: "FAIL",
 		},
+		{ // 23
+			// Fails since the key count overflows.
+			keyCtx:   kcAscAsc,
+			length:   1,
+			span:     ParseSpan(&evalCtx, "[/0 - /9223372036854775807]"),
+			expected: "FAIL",
+		},
+		{ // 24
+			// Succeeds since the key count is int64 max.
+			keyCtx:   kcAscAsc,
+			length:   1,
+			span:     ParseSpan(&evalCtx, "[/1 - /9223372036854775807]"),
+			expected: "9223372036854775807",
+		},
+		{ // 25
+			// Fails since the key count overflows.
+			keyCtx:   kcAscAsc,
+			length:   1,
+			span:     ParseSpan(&evalCtx, "[/-9223372036854775808 - /9223372036854775807]"),
+			expected: "FAIL",
+		},
 	}
 
 	for i, tc := range testCases {
@@ -883,7 +901,7 @@ func TestSpan_KeyCount(t *testing.T) {
 }
 
 func TestSpan_SplitSpan(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	kcAscAsc := testKeyContext(1, 2)
 	kcDescDesc := testKeyContext(-1, -2)
 	enums := makeEnums(t)
@@ -1062,7 +1080,7 @@ func TestSpan_SplitSpan(t *testing.T) {
 func makeEnums(t *testing.T) tree.Datums {
 	t.Helper()
 	enumMembers := []string{"hello", "hey", "hi"}
-	enumType := types.MakeEnum(typedesc.TypeIDToOID(500), typedesc.TypeIDToOID(100500))
+	enumType := types.MakeEnum(catid.TypeIDToOID(500), catid.TypeIDToOID(100500))
 	enumType.TypeMeta = types.UserDefinedTypeMetadata{
 		Name: &types.UserDefinedTypeName{
 			Schema: "test",
@@ -1090,5 +1108,5 @@ func makeEnums(t *testing.T) tree.Datums {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tree.Datums{enumHello, enumHey, enumHi}
+	return tree.Datums{&enumHello, &enumHey, &enumHi}
 }

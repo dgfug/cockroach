@@ -1,19 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backupccl
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -21,9 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 func distBackupPlanSpecs(
@@ -31,49 +32,53 @@ func distBackupPlanSpecs(
 	planCtx *sql.PlanningCtx,
 	execCtx sql.JobExecContext,
 	dsp *sql.DistSQLPlanner,
+	jobID int64,
 	spans roachpb.Spans,
 	introducedSpans roachpb.Spans,
 	pkIDs map[uint64]bool,
 	defaultURI string,
 	urisByLocalityKV map[string]string,
 	encryption *jobspb.BackupEncryptionOptions,
-	mvccFilter roachpb.MVCCFilter,
+	kmsEnv cloud.KMSEnv,
+	mvccFilter kvpb.MVCCFilter,
 	startTime, endTime hlc.Timestamp,
-) (map[roachpb.NodeID]*execinfrapb.BackupDataSpec, error) {
+	elide execinfrapb.ElidePrefix,
+	includeValueHeader bool,
+) (map[base.SQLInstanceID]*execinfrapb.BackupDataSpec, error) {
 	var span *tracing.Span
-	ctx, span = tracing.ChildSpan(ctx, "backup-plan-specs")
-	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
+	ctx, span = tracing.ChildSpan(ctx, "backupccl.distBackupPlanSpecs")
 	defer span.Finish()
 	user := execCtx.User()
-	execCfg := execCtx.ExecCfg()
 
 	var spanPartitions []sql.SpanPartition
 	var introducedSpanPartitions []sql.SpanPartition
 	var err error
 	if len(spans) > 0 {
-		spanPartitions, err = dsp.PartitionSpans(planCtx, spans)
+		spanPartitions, err = dsp.PartitionSpans(ctx, planCtx, spans)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if len(introducedSpans) > 0 {
-		introducedSpanPartitions, err = dsp.PartitionSpans(planCtx, introducedSpans)
+		introducedSpanPartitions, err = dsp.PartitionSpans(ctx, planCtx, introducedSpans)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if encryption != nil && encryption.Mode == jobspb.EncryptionMode_KMS {
-		kms, err := cloud.KMSFromURI(encryption.KMSInfo.Uri, &backupKMSEnv{
-			settings: execCfg.Settings,
-			conf:     &execCfg.ExternalIODirConfig,
-		})
+		kms, err := cloud.KMSFromURI(ctx, encryption.KMSInfo.Uri, kmsEnv)
 		if err != nil {
 			return nil, err
 		}
+		defer func() {
+			err := kms.Close()
+			if err != nil {
+				log.Infof(ctx, "failed to close KMS: %+v", err)
+			}
+		}()
 
-		encryption.Key, err = kms.Decrypt(planCtx.EvalContext().Context,
-			encryption.KMSInfo.EncryptedDataKey)
+		encryption.Key, err = kms.Decrypt(ctx, encryption.KMSInfo.EncryptedDataKey)
 		if err != nil {
 			return nil, errors.Wrap(err,
 				"failed to decrypt data key before starting BackupDataProcessor")
@@ -81,62 +86,67 @@ func distBackupPlanSpecs(
 	}
 	// Wrap the relevant BackupEncryptionOptions to be used by the Backup
 	// processor and KV ExportRequest.
-	var fileEncryption *roachpb.FileEncryptionOptions
+	var fileEncryption *kvpb.FileEncryptionOptions
 	if encryption != nil {
-		fileEncryption = &roachpb.FileEncryptionOptions{Key: encryption.Key}
+		fileEncryption = &kvpb.FileEncryptionOptions{Key: encryption.Key}
 	}
 
 	// First construct spans based on span partitions. Then add on
 	// introducedSpans based on how those partition.
-	nodeToSpec := make(map[roachpb.NodeID]*execinfrapb.BackupDataSpec)
+	sqlInstanceIDToSpec := make(map[base.SQLInstanceID]*execinfrapb.BackupDataSpec)
 	for _, partition := range spanPartitions {
 		spec := &execinfrapb.BackupDataSpec{
-			Spans:            partition.Spans,
-			DefaultURI:       defaultURI,
-			URIsByLocalityKV: urisByLocalityKV,
-			MVCCFilter:       mvccFilter,
-			Encryption:       fileEncryption,
-			PKIDs:            pkIDs,
-			BackupStartTime:  startTime,
-			BackupEndTime:    endTime,
-			UserProto:        user.EncodeProto(),
+			JobID:                  jobID,
+			Spans:                  partition.Spans,
+			DefaultURI:             defaultURI,
+			URIsByLocalityKV:       urisByLocalityKV,
+			MVCCFilter:             mvccFilter,
+			Encryption:             fileEncryption,
+			PKIDs:                  pkIDs,
+			BackupStartTime:        startTime,
+			BackupEndTime:          endTime,
+			UserProto:              user.EncodeProto(),
+			ElidePrefix:            elide,
+			IncludeMVCCValueHeader: includeValueHeader,
 		}
-		nodeToSpec[partition.Node] = spec
+		sqlInstanceIDToSpec[partition.SQLInstanceID] = spec
 	}
 
 	for _, partition := range introducedSpanPartitions {
-		if spec, ok := nodeToSpec[partition.Node]; ok {
+		if spec, ok := sqlInstanceIDToSpec[partition.SQLInstanceID]; ok {
 			spec.IntroducedSpans = partition.Spans
 		} else {
 			// We may need to introduce a new spec in the case that there is a node
 			// which is not the leaseholder for any of the spans, but is for an
 			// introduced span.
 			spec := &execinfrapb.BackupDataSpec{
-				IntroducedSpans:  partition.Spans,
-				DefaultURI:       defaultURI,
-				URIsByLocalityKV: urisByLocalityKV,
-				MVCCFilter:       mvccFilter,
-				Encryption:       fileEncryption,
-				PKIDs:            pkIDs,
-				BackupStartTime:  startTime,
-				BackupEndTime:    endTime,
-				UserProto:        user.EncodeProto(),
+				JobID:                  jobID,
+				IntroducedSpans:        partition.Spans,
+				DefaultURI:             defaultURI,
+				URIsByLocalityKV:       urisByLocalityKV,
+				MVCCFilter:             mvccFilter,
+				Encryption:             fileEncryption,
+				PKIDs:                  pkIDs,
+				BackupStartTime:        startTime,
+				BackupEndTime:          endTime,
+				UserProto:              user.EncodeProto(),
+				IncludeMVCCValueHeader: includeValueHeader,
 			}
-			nodeToSpec[partition.Node] = spec
+			sqlInstanceIDToSpec[partition.SQLInstanceID] = spec
 		}
 	}
 
-	backupPlanningTraceEvent := BackupProcessorPlanningTraceEvent{
+	backupPlanningTraceEvent := backuppb.BackupProcessorPlanningTraceEvent{
 		NodeToNumSpans: make(map[int32]int64),
 	}
-	for node, spec := range nodeToSpec {
+	for node, spec := range sqlInstanceIDToSpec {
 		numSpans := int64(len(spec.Spans) + len(spec.IntroducedSpans))
 		backupPlanningTraceEvent.NodeToNumSpans[int32(node)] = numSpans
 		backupPlanningTraceEvent.TotalNumSpans += numSpans
 	}
 	span.RecordStructured(&backupPlanningTraceEvent)
 
-	return nodeToSpec, nil
+	return sqlInstanceIDToSpec, nil
 }
 
 // distBackup is used to plan the processors for a distributed backup. It
@@ -148,24 +158,29 @@ func distBackup(
 	planCtx *sql.PlanningCtx,
 	dsp *sql.DistSQLPlanner,
 	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
-	backupSpecs map[roachpb.NodeID]*execinfrapb.BackupDataSpec,
+	tracingAggCh chan *execinfrapb.TracingAggregatorEvents,
+	backupSpecs map[base.SQLInstanceID]*execinfrapb.BackupDataSpec,
 ) error {
-	ctx, span := tracing.ChildSpan(ctx, "backup-distsql")
+	ctx, span := tracing.ChildSpan(ctx, "backupccl.distBackup")
 	defer span.Finish()
-	ctx = logtags.AddTag(ctx, "backup-distsql", nil)
 	evalCtx := execCtx.ExtendedEvalContext()
 	var noTxn *kv.Txn
 
 	if len(backupSpecs) == 0 {
 		close(progCh)
+		close(tracingAggCh)
 		return nil
 	}
 
 	// Setup a one-stage plan with one proc per input spec.
 	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(backupSpecs))
 	i := 0
-	for node, spec := range backupSpecs {
-		corePlacement[i].NodeID = node
+	var jobID jobspb.JobID
+	for sqlInstanceID, spec := range backupSpecs {
+		if i == 0 {
+			jobID = jobspb.JobID(spec.JobID)
+		}
+		corePlacement[i].SQLInstanceID = sqlInstanceID
 		corePlacement[i].Core.BackupData = spec
 		i++
 	}
@@ -176,12 +191,16 @@ func distBackup(
 	p.AddNoInputStage(corePlacement, execinfrapb.PostProcessSpec{}, []*types.T{}, execinfrapb.Ordering{})
 	p.PlanToStreamColMap = []int{}
 
-	dsp.FinalizePlan(planCtx, p)
+	sql.FinalizePlan(ctx, planCtx, p)
 
 	metaFn := func(_ context.Context, meta *execinfrapb.ProducerMetadata) error {
 		if meta.BulkProcessorProgress != nil {
 			// Send the progress up a level to be written to the manifest.
 			progCh <- meta.BulkProcessorProgress
+		}
+
+		if meta.AggregatorEvents != nil {
+			tracingAggCh <- meta.AggregatorEvents
 		}
 		return nil
 	}
@@ -196,14 +215,16 @@ func distBackup(
 		noTxn, /* txn - the flow does not read or write the database */
 		nil,   /* clockUpdater */
 		evalCtx.Tracing,
-		evalCtx.ExecCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
 	defer close(progCh)
+	defer close(tracingAggCh)
+	execCfg := execCtx.ExecCfg()
+	jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, jobID)
+
 	// Copy the evalCtx, as dsp.Run() might change it.
 	evalCtxCopy := *evalCtx
-	dsp.Run(planCtx, noTxn, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)()
+	dsp.Run(ctx, planCtx, noTxn, p, recv, &evalCtxCopy, nil /* finishedSetupFn */)
 	return rowResultWriter.Err()
 }

@@ -13,7 +13,7 @@ go_library(
     # autogenerating them.
     #
     # keep
-    cdeps = ["@cockroach//c-deps:libproj"],
+    cdeps = ["//c-deps:libproj"],
     cgo = True,
     # keep
     clinkopts = select({
@@ -42,7 +42,8 @@ go_library(
     deps = [
         "//pkg/geo/geographiclib",
         "//pkg/geo/geoprojbase",
-        "@com_github_cockroachdb_errors//:errors",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
     ],
 )
 
@@ -53,6 +54,7 @@ go_test(
     embed = [":geoproj"],
     deps = [
         "//pkg/geo/geoprojbase",
+        "//pkg/util/leaktest",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

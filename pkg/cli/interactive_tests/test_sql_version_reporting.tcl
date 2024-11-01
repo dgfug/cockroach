@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 
 start_test "Check that the client starts with the welcome message."
 eexpect "# Welcome to the CockroachDB SQL shell."
@@ -31,17 +31,11 @@ start_test "Check that a reconnect without version change is quiet."
 force_stop_server $argv
 start_server $argv
 send "select 1;\r"
-eexpect "driver: bad connection"
+eexpect "connection closed unexpectedly"
 # Check that the prompt immediately succeeds the error message
 eexpect "connection lost"
 eexpect "opening new connection: all session settings will be lost"
-expect {
-    "\r\n# " {
-	report "unexpected server message"
-	exit 1
-    }
-    "root@" {}
-}
+eexpect "root@"
 
 # Check the reconnect did succeed - this also resets the connection state to good.
 send "select 1;\r"
@@ -55,23 +49,22 @@ system "mv logs/db logs/db-bak"
 start_server $argv
 send "select 1;\r"
 eexpect "opening new connection"
-eexpect "error"
 eexpect "the cluster ID has changed!"
 eexpect "Previous ID:"
-eexpect "New ID:"
+eexpect "New Cluster ID:"
 eexpect root@
 end_test
 
-interrupt
+send_eof
 eexpect eof
 
 stop_server $argv
 
 start_test "Check that the client picks up a new server version, and warns about lower versions."
-set env(COCKROACH_TESTING_VERSION_TAG) "v0.1.0-fakever"
+set env(COCKROACH_TESTING_VERSION_OVERRIDE) "v0.1.0-fakever"
 start_server $argv
-set env(COCKROACH_TESTING_VERSION_TAG) "v0.2.0-fakever"
-spawn $argv sql
+set env(COCKROACH_TESTING_VERSION_OVERRIDE) "v0.2.0-fakever"
+spawn $argv sql --no-line-editor
 send "select 1;\r"
 eexpect "# Client version: CockroachDB"
 eexpect "# Server version: CockroachDB"
@@ -80,7 +73,7 @@ eexpect "warning: server version older than client"
 eexpect root@
 end_test
 
-interrupt
+send_eof
 eexpect eof
 
 stop_server $argv

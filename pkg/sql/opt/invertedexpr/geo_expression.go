@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedexpr
 
@@ -23,9 +18,9 @@ import (
 
 // This file contains functions to encode geoindex.{UnionKeySpans, RPKeyExpr}
 // into a SpanExpression. These functions are in this package since they
-// need to use sqlbase.EncodeTableKey to convert geoindex.Key to
-// invertedexpr.EncVal and that cannot be done in the geoindex package
-// as it introduces a circular dependency.
+// need to use keyside.Encode to convert geoindex.Key to invertedexpr.EncVal and
+// that cannot be done in the geoindex package as it introduces a circular
+// dependency.
 //
 // TODO(sumeer): change geoindex to produce SpanExpressions directly.
 

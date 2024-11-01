@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# Copyright 2016 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -e
 
 pkgs=$(git grep 'go:generate' | grep add-leaktest.sh | awk -F: '{print $1}' | xargs -n1 dirname)
@@ -16,6 +22,11 @@ for pkg in ${pkgs}; do
 }
 
 /defer leaktest.AfterTest\(.+\)\(\)/ {
+  test = 0
+  next
+}
+
+/t.Cleanup\(leaktest.AfterTest\(.+\)\)/ {
   test = 0
   next
 }

@@ -1,18 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // SimplifiablePartialIndexProjectCols returns the set of projected partial
@@ -54,6 +52,30 @@ func (c *CustomFuncs) SimplifiablePartialIndexProjectCols(
 	// Columns that are required by the mutation operator and columns that
 	// have already been simplified to false are ineligible to be simplified.
 	ineligibleCols := neededMutationCols.Union(simplifiedProjectCols)
+
+	// Partial index PUT and DEL columns that are used for multiple partial
+	// indexes cannot be simplified to false. This may occur when multiple
+	// partial indexes have the same predicate expression. If one index does not
+	// have mutating columns, simplifying its PUT or DEL columns to false would
+	// incorrectly prevent writes to other indexes that have mutating columns.
+	//
+	// For example, consider:
+	//
+	//   CREATE TABLE t (
+	//     a INT,
+	//     b INT,
+	//     c INT,
+	//     INDEX a_idx (a) WHERE c IS NULL,
+	//     INDEX b_idx (b) WHERE c IS NULL
+	//   )
+	//
+	//   UPDATE t SET a = NULL
+	//
+	// In the UPDATE, a single column is synthesized for the PUT and DEL columns
+	// of both partial indexes. Even though the UPDATE does not mutate columns
+	// in b_idx, the synthesized PUT/DEL column cannot be simplified to false.
+	// If it were set to false, writes to a_idx would never occur.
+	ineligibleCols.UnionWith(multiUsePartialIndexCols(private))
 
 	// ord is an ordinal into the mutation's PartialIndexPutCols and
 	// PartialIndexDelCols, which both have entries for each partial index
@@ -101,12 +123,58 @@ func (c *CustomFuncs) SimplifiablePartialIndexProjectCols(
 	return cols
 }
 
+// multiUsePartialIndexCols returns the set of columns that are used as PUT or
+// DEL columns for more than one partial index. This may occur when multiple
+// partial indexes share the same predicate expression. Columns used as a PUT
+// and DEL column for the same index and no other indexes are not included in
+// the output.
+func multiUsePartialIndexCols(mp *memo.MutationPrivate) opt.ColSet {
+	var cols opt.ColSet
+
+	for i := range mp.PartialIndexPutCols {
+		putCol := mp.PartialIndexPutCols[i]
+		delCol := mp.PartialIndexDelCols[i]
+		putColUsedAgain := false
+		delColUsedAgain := false
+
+		for j := 0; j < i; j++ {
+			// A PUT column used as a PUT or DEL column for another index should
+			// be included in cols.
+			if putCol == mp.PartialIndexPutCols[j] || putCol == mp.PartialIndexDelCols[j] {
+				putColUsedAgain = true
+			}
+
+			// A DEL column used as a PUT or DEL column for another index should
+			// be included in cols.
+			if delCol == mp.PartialIndexPutCols[j] || delCol == mp.PartialIndexDelCols[j] {
+				delColUsedAgain = true
+			}
+
+			if putColUsedAgain && delColUsedAgain {
+				break
+			}
+		}
+
+		if putColUsedAgain {
+			cols.Add(putCol)
+		}
+		if delColUsedAgain {
+			cols.Add(delCol)
+		}
+	}
+
+	return cols
+}
+
 // SimplifyPartialIndexProjections returns a new projection expression with any
 // projected column's expression simplified to false if the column exists in
 // simplifiableCols.
 func (c *CustomFuncs) SimplifyPartialIndexProjections(
-	projections memo.ProjectionsExpr, simplifiableCols opt.ColSet,
-) memo.ProjectionsExpr {
+	projections memo.ProjectionsExpr,
+	passthrough opt.ColSet,
+	simplifiableCols opt.ColSet,
+	private *memo.MutationPrivate,
+) (memo.ProjectionsExpr, *memo.MutationPrivate) {
 	simplified := make(memo.ProjectionsExpr, len(projections))
 	for i := range projections {
 		if col := projections[i].Col; simplifiableCols.Contains(col) {
@@ -115,5 +183,40 @@ func (c *CustomFuncs) SimplifyPartialIndexProjections(
 			simplified[i] = projections[i]
 		}
 	}
-	return simplified
+
+	// Any simplifiable partial index expressions that are currently passthrough
+	// columns must be changed to projected false expressions.
+	simplifiableCols.IntersectionWith(passthrough)
+	if simplifiableCols.Empty() {
+		return simplified, private
+	}
+
+	// Copy the MutationPrivate in order to change the partial index columns.
+	simplifiedPrivate := *private
+	simplifiedPrivate.PartialIndexPutCols = append(opt.OptionalColList{}, private.PartialIndexPutCols...)
+	simplifiedPrivate.PartialIndexDelCols = append(opt.OptionalColList{}, private.PartialIndexDelCols...)
+
+	ord := len(simplifiedPrivate.PartialIndexPutCols)
+	for i, col := range simplifiedPrivate.PartialIndexPutCols {
+		if simplifiableCols.Contains(col) {
+			name := fmt.Sprintf("partial_index_put%d", ord+1)
+			newPutCol := c.f.Metadata().AddColumn(name, types.Bool)
+			simplified = append(simplified, c.f.ConstructProjectionsItem(memo.FalseSingleton, newPutCol))
+			simplifiedPrivate.PartialIndexPutCols[i] = newPutCol
+			ord++
+		}
+	}
+
+	ord = len(simplifiedPrivate.PartialIndexDelCols)
+	for i, col := range simplifiedPrivate.PartialIndexDelCols {
+		if simplifiableCols.Contains(col) {
+			name := fmt.Sprintf("partial_index_del%d", ord+1)
+			newDelCol := c.f.Metadata().AddColumn(name, types.Bool)
+			simplified = append(simplified, c.f.ConstructProjectionsItem(memo.FalseSingleton, newDelCol))
+			simplifiedPrivate.PartialIndexDelCols[i] = newDelCol
+			ord++
+		}
+	}
+
+	return simplified, &simplifiedPrivate
 }

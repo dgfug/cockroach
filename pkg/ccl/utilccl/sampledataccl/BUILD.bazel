@@ -19,8 +19,8 @@ go_test(
     srcs = ["main_test.go"],
     embed = [":sampledataccl"],
     deps = [
-        "//pkg/ccl/utilccl",
-        "//pkg/security",
+        "//pkg/ccl",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils/serverutils",

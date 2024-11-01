@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -18,17 +13,25 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestHelpFunctions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	numTestsRun := 0
 	// This test checks that all the built-in functions receive contextual help.
-	for f := range builtins {
+	builtinsregistry.AddSubscription(func(f string, prop *tree.FunctionProperties, _ []tree.Overload) {
 		if unicode.IsUpper(rune(f[0])) {
-			continue
+			return
+		}
+		if prop.Category == builtinconstants.CategoryCast {
+			return
 		}
 		t.Run(f, func(t *testing.T) {
+			numTestsRun++
 			_, err := parser.Parse("select " + f + "(??")
 			if err == nil {
 				t.Errorf("parser didn't trigger error")
@@ -52,5 +55,9 @@ func TestHelpFunctions(t *testing.T) {
 				t.Errorf("help text didn't match %q:\n%s", pattern, help)
 			}
 		})
+	})
+
+	if numTestsRun < 1000 {
+		t.Errorf("Test saw %d builtins, probably load order is wrong", numTestsRun)
 	}
 }

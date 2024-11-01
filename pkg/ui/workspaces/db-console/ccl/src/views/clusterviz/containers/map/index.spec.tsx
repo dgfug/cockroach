@@ -1,20 +1,18 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { assert } from "chai";
 import { shallow } from "enzyme";
 import { createMemoryHistory, History } from "history";
+import React from "react";
 import { match as Match } from "react-router-dom";
 
-import "src/enzymeInit";
-import { ClusterVisualization } from "./index";
+import { refreshCluster } from "src/redux/apiReducers";
+
 import { Breadcrumbs } from "./breadcrumbs";
+
+import { ClusterVisualization } from "./index";
 
 describe("ClusterVisualization", () => {
   describe("parse tiers params from URL path", () => {
@@ -42,11 +40,12 @@ describe("ClusterVisualization", () => {
           enterpriseEnabled={true}
           licenseDataExists={true}
           match={match}
+          refreshCluster={refreshCluster}
         />,
       );
       history.push("/overview/map");
       wrapper.update();
-      assert.lengthOf(wrapper.find(Breadcrumbs).prop("tiers"), 0);
+      expect(wrapper.find(Breadcrumbs).prop("tiers").length).toBe(0);
     });
 
     it("parses multiple tiers in path for `/overview/map/region=us-west/az=a` path", () => {
@@ -59,6 +58,7 @@ describe("ClusterVisualization", () => {
           enterpriseEnabled={true}
           licenseDataExists={true}
           match={match}
+          refreshCluster={refreshCluster}
         />,
       );
 
@@ -67,7 +67,7 @@ describe("ClusterVisualization", () => {
         { key: "region", value: "us-west" },
         { key: "az", value: "a" },
       ];
-      assert.deepEqual(wrapper.find(Breadcrumbs).prop("tiers"), expectedTiers);
+      expect(wrapper.find(Breadcrumbs).prop("tiers")).toEqual(expectedTiers);
     });
   });
 });

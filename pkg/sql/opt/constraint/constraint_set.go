@@ -1,19 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package constraint
 
 import (
+	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -40,21 +37,21 @@ var Contradiction = &Set{contradiction: true}
 // expression tree each time.
 //
 // A few examples:
-//  - @1 >= 10
-//      /@1: [/10 - ]
 //
-//  - @1 > 10 AND @2 = 5
-//      /@1: [/11 - ]
-//      /@2: [/5 - /5]
+//   - @1 >= 10
+//     /@1: [/10 - ]
 //
-//  - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
-//      /@1: [/10 - /10] [/20 - /20]
-//      /@2: [/1 - ]
+//   - @1 > 10 AND @2 = 5
+//     /@1: [/11 - ]
+//     /@2: [/5 - /5]
 //
-//  - @1 > 10.5 AND @2 != 'foo'
-//      /@1: (10.5 - ]
-//      /@2: [ - 'foo') ('foo' - ]
+//   - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
+//     /@1: [/10 - /10] [/20 - /20]
+//     /@2: [/1 - ]
 //
+//   - @1 > 10.5 AND @2 != 'foo'
+//     /@1: (10.5 - ]
+//     /@2: [ - 'foo') ('foo' - ]
 type Set struct {
 	// firstConstraint holds the first constraint in the set and otherConstraints
 	// hold any constraints beyond the first. These are separated in order to
@@ -116,7 +113,7 @@ func (s *Set) IsUnconstrained() bool {
 // Constraints that exist in either of the input sets will get merged into the
 // combined set. Compatible constraints (that share same column list) are
 // intersected with one another. Intersect returns the merged set.
-func (s *Set) Intersect(evalCtx *tree.EvalContext, other *Set) *Set {
+func (s *Set) Intersect(ctx context.Context, evalCtx *eval.Context, other *Set) *Set {
 	// Intersection with the contradiction set is always the contradiction set.
 	if s == Contradiction || other == Contradiction {
 		return Contradiction
@@ -157,7 +154,7 @@ func (s *Set) Intersect(evalCtx *tree.EvalContext, other *Set) *Set {
 			// Constraints have same columns, so they're compatible and need to
 			// be merged.
 			*merge = *s.Constraint(index)
-			merge.IntersectWith(evalCtx, other.Constraint(otherIndex))
+			merge.IntersectWith(ctx, evalCtx, other.Constraint(otherIndex))
 			if merge.IsContradiction() {
 				return Contradiction
 			}
@@ -184,11 +181,13 @@ func (s *Set) Intersect(evalCtx *tree.EvalContext, other *Set) *Set {
 // may not be "tight", meaning that the new constraint set might allow
 // additional combinations of values that neither of the input sets allowed. For
 // example:
-//   (x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
+//	(x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
 // the union is unconstrained (and thus allows combinations like x,y = 10,0).
 //
 // Union returns the merged set.
-func (s *Set) Union(evalCtx *tree.EvalContext, other *Set) *Set {
+func (s *Set) Union(ctx context.Context, evalCtx *eval.Context, other *Set) *Set {
 	// Union with the contradiction set is an identity operation.
 	if s == Contradiction {
 		return other
@@ -236,7 +235,7 @@ func (s *Set) Union(evalCtx *tree.EvalContext, other *Set) *Set {
 		merge := mergeSet.allocConstraint(length - index + otherLength - otherIndex)
 
 		*merge = *s.Constraint(index)
-		merge.UnionWith(evalCtx, other.Constraint(otherIndex))
+		merge.UnionWith(ctx, evalCtx, other.Constraint(otherIndex))
 		if merge.IsUnconstrained() {
 			// Together, constraints allow any possible value, and so there's nothing
 			// to add to the set.
@@ -265,33 +264,35 @@ func (s *Set) ExtractCols() opt.ColSet {
 
 // ExtractNotNullCols returns a set of columns that cannot be NULL for the
 // constraints in the set to hold.
-func (s *Set) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
+func (s *Set) ExtractNotNullCols(ctx context.Context, evalCtx *eval.Context) opt.ColSet {
 	if s == Unconstrained || s == Contradiction {
 		return opt.ColSet{}
 	}
-	res := s.Constraint(0).ExtractNotNullCols(evalCtx)
+	res := s.Constraint(0).ExtractNotNullCols(ctx, evalCtx)
 	for i := 1; i < s.Length(); i++ {
-		res.UnionWith(s.Constraint(i).ExtractNotNullCols(evalCtx))
+		res.UnionWith(s.Constraint(i).ExtractNotNullCols(ctx, evalCtx))
 	}
 	return res
 }
 
 // ExtractConstCols returns a set of columns which can only have one value
 // for the constraints in the set to hold.
-func (s *Set) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
+func (s *Set) ExtractConstCols(ctx context.Context, evalCtx *eval.Context) opt.ColSet {
 	if s == Unconstrained || s == Contradiction {
 		return opt.ColSet{}
 	}
-	res := s.Constraint(0).ExtractConstCols(evalCtx)
+	res := s.Constraint(0).ExtractConstCols(ctx, evalCtx)
 	for i := 1; i < s.Length(); i++ {
-		res.UnionWith(s.Constraint(i).ExtractConstCols(evalCtx))
+		res.UnionWith(s.Constraint(i).ExtractConstCols(ctx, evalCtx))
 	}
 	return res
 }
 
 // ExtractValueForConstCol extracts the value for a constant column returned
 // by ExtractConstCols. If the given column is not constant, nil is returned.
-func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnID) tree.Datum {
+func (s *Set) ExtractValueForConstCol(
+	ctx context.Context, evalCtx *eval.Context, col opt.ColumnID,
+) tree.Datum {
 	if s == Unconstrained || s == Contradiction {
 		return nil
 	}
@@ -304,33 +305,71 @@ func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnI
 				break
 			}
 		}
-		if colOrd != -1 && s.ExtractConstCols(evalCtx).Contains(col) {
+		if colOrd != -1 && s.ExtractConstCols(ctx, evalCtx).Contains(col) {
 			return c.Spans.Get(0).StartKey().Value(colOrd)
 		}
 	}
 	return nil
 }
 
-// HasSingleColumnConstValues returns true if the Set contains a single
-// constraint on a single column which allows for one or more non-ranging
-// constant values. On success, returns the column and the constant value.
-func (s *Set) HasSingleColumnConstValues(
-	evalCtx *tree.EvalContext,
-) (col opt.ColumnID, constValues tree.Datums, ok bool) {
+// HasSingleColumnNonNullConstValues returns true if all of the following are
+// true:
+//   - The given column is the only constrained column.
+//   - The column is constrained to a set of constant values.
+//   - None of the values are NULL.
+func (s *Set) HasSingleColumnNonNullConstValues(
+	ctx context.Context, evalCtx *eval.Context, col opt.ColumnID,
+) bool {
 	if s.Length() != 1 {
-		return 0, nil, false
+		return false
 	}
 	c := s.Constraint(0)
-	if c.Columns.Count() != 1 || c.Prefix(evalCtx) != 1 {
-		return 0, nil, false
+	if c.Columns.Count() != 1 {
+		return false
 	}
+	if c.Columns.Get(0).ID() != col {
+		return false
+	}
+	for i, n := 0, c.Spans.Count(); i < n; i++ {
+		sp := c.Spans.Get(i)
+		start := sp.StartKey()
+		end := sp.EndKey()
+		if start.Length() < 1 || end.Length() < 1 {
+			return false
+		}
+		startVal := start.Value(0)
+		if startVal == tree.DNull {
+			return false
+		}
+		if cmp, err := startVal.Compare(ctx, evalCtx, end.Value(0)); err != nil {
+			panic(err)
+		} else if cmp != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractSingleColumnNonNullConstValues returns the constant values that the
+// given column is constrained to. It returns ok=false if any of the following
+// are not true:
+//   - The given column is the only constrained column.
+//   - The column is constrained to a set of constant values.
+//   - None of the values are NULL.
+func (s *Set) ExtractSingleColumnNonNullConstValues(
+	ctx context.Context, evalCtx *eval.Context, col opt.ColumnID,
+) (constValues tree.Datums, ok bool) {
+	if ok := s.HasSingleColumnNonNullConstValues(ctx, evalCtx, col); !ok {
+		return nil, false
+	}
+	c := s.Constraint(0)
 	numSpans := c.Spans.Count()
 	constValues = make(tree.Datums, numSpans)
 	for i := range constValues {
 		val := c.Spans.Get(i).StartKey().Value(0)
 		constValues[i] = val
 	}
-	return c.Columns.Get(0).ID(), constValues, true
+	return constValues, true
 }
 
 // allocConstraint allocates space for a new constraint in the set and returns

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2014 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -21,8 +16,9 @@
 package colexechash
 
 import (
-	"math/rand"
 	"unsafe"
+
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 const (
@@ -54,6 +50,7 @@ func readUnaligned64(p unsafe.Pointer) uint64 {
 }
 
 // Should be a built-in for unsafe.Pointer?
+//
 //go:nosplit
 func add(p unsafe.Pointer, x uintptr) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(p) + x)
@@ -65,6 +62,7 @@ func add(p unsafe.Pointer, x uintptr) unsafe.Pointer {
 // output depends on the input.  noescape is inlined and currently
 // compiles down to zero instructions.
 // USE CAREFULLY!
+//
 //go:nosplit
 func noescape(p unsafe.Pointer) unsafe.Pointer {
 	x := uintptr(p)
@@ -158,9 +156,7 @@ func f64hash(p unsafe.Pointer, h uintptr) uintptr {
 	case f == 0:
 		return c1 * (c0 ^ h) // +0, -0
 	case f != f:
-		// TODO(asubiotto): fastrand relies on some stack internals.
-		//return c1 * (c0 ^ h ^ uintptr(fastrand())) // any kind of NaN
-		return c1 * (c0 ^ h ^ uintptr(rand.Uint32())) // any kind of NaN
+		return c1 * (c0 ^ h ^ uintptr(randutil.FastUint32())) // any kind of NaN
 	default:
 		return memhash(p, h, 8)
 	}

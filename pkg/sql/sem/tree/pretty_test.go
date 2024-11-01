@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree_test
 
@@ -15,9 +10,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,10 +21,12 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -49,7 +47,7 @@ var (
 func TestPrettyDataShort(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	matches, err := filepath.Glob(filepath.Join("testdata", "pretty", "*.sql"))
+	matches, err := filepath.Glob(datapathutils.TestDataPath(t, "pretty", "*.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +75,7 @@ func runTestPrettyData(
 	for _, m := range matches {
 		m := m
 		t.Run(filepath.Base(m), func(t *testing.T) {
-			sql, err := ioutil.ReadFile(m)
+			sql, err := os.ReadFile(m)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,7 +109,10 @@ func runTestPrettyData(
 				for p := range work {
 					thisCfg := cfg
 					thisCfg.LineWidth = p.numCols
-					res[p.idx] = thisCfg.Pretty(stmt.AST)
+					res[p.idx], err = thisCfg.Pretty(stmt.AST)
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 				return nil
 			}
@@ -143,13 +144,13 @@ func runTestPrettyData(
 			}
 
 			if *flagWritePretty {
-				if err := ioutil.WriteFile(outfile, []byte(got), 0666); err != nil {
+				if err := os.WriteFile(outfile, []byte(got), 0666); err != nil {
 					t.Fatal(err)
 				}
 				return
 			}
 
-			expect, err := ioutil.ReadFile(outfile)
+			expect, err := os.ReadFile(outfile)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,7 +178,10 @@ func TestPrettyVerify(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := tree.Pretty(stmt.AST)
+			got, err := tree.Pretty(stmt.AST)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if pretty != got {
 				t.Fatalf("got: %s\nexpected: %s", got, pretty)
 			}
@@ -185,15 +189,41 @@ func TestPrettyVerify(t *testing.T) {
 	}
 }
 
+func TestPrettyBigStatement(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Create a SELECT statement with a 1 million item IN expression. Without
+	// mitigation, this can cause stack overflows - see #91197.
+	var sb strings.Builder
+	sb.WriteString("SELECT * FROM foo WHERE id IN (")
+	for i := 0; i < 1_000_000; i++ {
+		if i != 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.Itoa(i))
+	}
+	sb.WriteString(");")
+
+	stmt, err := parser.ParseOne(sb.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := tree.DefaultPrettyCfg()
+	_, err = cfg.Pretty(stmt.AST)
+	assert.Errorf(t, err, "max call stack depth of be exceeded")
+}
+
 func BenchmarkPrettyData(b *testing.B) {
-	matches, err := filepath.Glob(filepath.Join("testdata", "pretty", "*.sql"))
+	matches, err := filepath.Glob(datapathutils.TestDataPath(b, "pretty", "*.sql"))
 	if err != nil {
 		b.Fatal(err)
 	}
 	var docs []pretty.Doc
 	cfg := tree.DefaultPrettyCfg()
 	for _, m := range matches {
-		sql, err := ioutil.ReadFile(m)
+		sql, err := os.ReadFile(m)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -208,7 +238,10 @@ func BenchmarkPrettyData(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		for _, doc := range docs {
 			for _, w := range []int{1, 30, 80} {
-				pretty.Pretty(doc, w, true /*useTabs*/, 4 /*tabWidth*/, nil /* keywordTransform */)
+				_, err := pretty.Pretty(doc, w, true /*useTabs*/, 4 /*tabWidth*/, nil /* keywordTransform */)
+				if err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
 	}
@@ -225,7 +258,10 @@ func TestPrettyExprs(t *testing.T) {
 	}
 
 	for expr, pretty := range tests {
-		got := tree.Pretty(expr)
+		got, err := tree.Pretty(expr)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if pretty != got {
 			t.Fatalf("got: %s\nexpected: %s", got, pretty)
 		}

@@ -1,19 +1,14 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
 import (
 	"regexp"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
@@ -36,7 +31,7 @@ func IsError(err error, re string) bool {
 
 // IsPError returns true if pErr's message matches the supplied regex.
 // An empty regex is interpreted to mean that a nil error is expected.
-func IsPError(pErr *roachpb.Error, re string) bool {
+func IsPError(pErr *kvpb.Error, re string) bool {
 	if pErr == nil && re == "" {
 		return true
 	}

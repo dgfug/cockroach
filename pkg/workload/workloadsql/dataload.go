@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadsql
 
@@ -18,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -61,11 +57,40 @@ func (l InsertsDataLoader) InitialDataLoad(
 		}
 	}
 
-	for _, table := range tables {
-		createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" %s`, table.Name, table.Schema)
-		if _, err := db.ExecContext(ctx, createStmt); err != nil {
-			return 0, errors.Wrapf(err, "could not create table: %s", table.Name)
+	const maxTableBatchSize = 5000
+	currentTable := 0
+	// When dealing with large number of tables, opt to use transactions
+	// to minimize the round trips involved, which can be bad on multi-region
+	// clusters.
+	for currentTable < len(tables) {
+		batchEnd := min(currentTable+maxTableBatchSize, len(tables))
+		nextBatch := tables[currentTable:batchEnd]
+		if err := crdb.ExecuteTx(ctx, db, &gosql.TxOptions{}, func(tx *gosql.Tx) error {
+			currentDatabase := ""
+			for _, table := range nextBatch {
+				// Switch databases if one is explicitly specified for multi-region
+				// configurations with multiple databases.
+				if table.ObjectPrefix != nil &&
+					table.ObjectPrefix.ExplicitCatalog &&
+					currentDatabase != table.ObjectPrefix.Catalog() {
+					_, err := tx.ExecContext(ctx, "USE $1", table.ObjectPrefix.Catalog())
+					if err != nil {
+						return err
+					}
+					currentDatabase = table.ObjectPrefix.Catalog()
+				}
+				tableName := table.GetResolvedName()
+				createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s %s`, tableName.String(), table.Schema)
+				if _, err := tx.ExecContext(ctx, createStmt); err != nil {
+					return errors.WithDetailf(errors.Wrapf(err, "could not create table: %q", table.Name),
+						"SQL: %s", createStmt)
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
 		}
+		currentTable += maxTableBatchSize
 	}
 
 	if hooks.PreLoad != nil {
@@ -74,7 +99,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 		}
 	}
 
-	var bytesAtomic int64
+	var bytesAtomic atomic.Int64
 	for _, table := range tables {
 		if table.InitialRows.NumBatches == 0 {
 			continue
@@ -83,7 +108,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 				`initial data is not supported for workload %s`, gen.Meta().Name)
 		}
 		tableStart := timeutil.Now()
-		var tableRowsAtomic int64
+		var tableRowsAtomic atomic.Int64
 
 		batchesPerWorker := table.InitialRows.NumBatches / l.Concurrency
 		g, gCtx := errgroup.WithContext(ctx)
@@ -94,6 +119,8 @@ func (l InsertsDataLoader) InitialDataLoad(
 				// Account for any rounding error in batchesPerWorker.
 				endIdx = table.InitialRows.NumBatches
 			}
+			table := table // copy for safe reference in Go routine
+			tableName := table.GetResolvedName()
 			g.Go(func() error {
 				var insertStmtBuf bytes.Buffer
 				var params []interface{}
@@ -102,11 +129,11 @@ func (l InsertsDataLoader) InitialDataLoad(
 					if len(params) > 0 {
 						insertStmt := insertStmtBuf.String()
 						if _, err := db.ExecContext(gCtx, insertStmt, params...); err != nil {
-							return errors.Wrapf(err, "failed insert into %s", table.Name)
+							return errors.Wrapf(err, "failed insert into %s", tableName.String())
 						}
 					}
 					insertStmtBuf.Reset()
-					fmt.Fprintf(&insertStmtBuf, `INSERT INTO "%s" VALUES `, table.Name)
+					fmt.Fprintf(&insertStmtBuf, `INSERT INTO %s VALUES `, tableName.String())
 					params = params[:0]
 					numRows = 0
 					return nil
@@ -115,13 +142,13 @@ func (l InsertsDataLoader) InitialDataLoad(
 
 				for batchIdx := startIdx; batchIdx < endIdx; batchIdx++ {
 					for _, row := range table.InitialRows.BatchRows(batchIdx) {
-						atomic.AddInt64(&tableRowsAtomic, 1)
+						tableRowsAtomic.Add(1)
 						if len(params) != 0 {
 							insertStmtBuf.WriteString(`,`)
 						}
 						insertStmtBuf.WriteString(`(`)
 						for i, datum := range row {
-							atomic.AddInt64(&bytesAtomic, workload.ApproxDatumSize(datum))
+							bytesAtomic.Add(workload.ApproxDatumSize(datum))
 							if i != 0 {
 								insertStmtBuf.WriteString(`,`)
 							}
@@ -142,10 +169,10 @@ func (l InsertsDataLoader) InitialDataLoad(
 		if err := g.Wait(); err != nil {
 			return 0, err
 		}
-		tableRows := int(atomic.LoadInt64(&tableRowsAtomic))
+		tableRows := int(tableRowsAtomic.Load())
 		log.Infof(ctx, `imported %s (%s, %d rows)`,
 			table.Name, timeutil.Since(tableStart).Round(time.Second), tableRows,
 		)
 	}
-	return atomic.LoadInt64(&bytesAtomic), nil
+	return bytesAtomic.Load(), nil
 }

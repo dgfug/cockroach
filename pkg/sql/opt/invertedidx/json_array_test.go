@@ -1,16 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedidx_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -19,13 +15,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 func TestTryJoinJsonOrArrayIndex(t *testing.T) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
 
@@ -46,7 +43,7 @@ func TestTryJoinJsonOrArrayIndex(t *testing.T) {
 	}
 
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn1 := tree.NewUnqualifiedTableName("t1")
 	tn2 := tree.NewUnqualifiedTableName("t2")
@@ -195,7 +192,7 @@ func TestTryJoinJsonOrArrayIndex(t *testing.T) {
 		}
 
 		actInvertedExpr := invertedidx.TryJoinInvertedIndex(
-			evalCtx.Context, &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
+			context.Background(), &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
 		)
 
 		if actInvertedExpr == nil {
@@ -217,18 +214,26 @@ func TestTryJoinJsonOrArrayIndex(t *testing.T) {
 }
 
 func TestTryFilterJsonOrArrayIndex(t *testing.T) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
-	if _, err := tc.ExecuteDDL(
-		"CREATE TABLE t (j JSON, a INT[], INVERTED INDEX (j), INVERTED INDEX (a))",
+	if _, err := tc.ExecuteDDL(`
+		CREATE TABLE t (
+			j JSON,
+			j2 JSON,
+			a INT[],
+			str STRING[],
+			INVERTED INDEX (j),
+			INVERTED INDEX (a),
+			INVERTED INDEX (str)
+		)`,
 	); err != nil {
 		t.Fatal(err)
 	}
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn := tree.NewUnqualifiedTableName("t")
 	tab := md.AddTable(tc.Table(tn), tn)
@@ -305,6 +310,12 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			// Wrong index ordinal.
 			filters:  "j @> '1'",
 			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			// Filtering a non-indexed column.
+			filters:  "j2 @> '1'",
+			indexOrd: jsonOrd,
 			ok:       false,
 		},
 		{
@@ -409,7 +420,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd:         jsonOrd,
 			ok:               true,
 			tight:            false,
-			unique:           false,
+			unique:           true,
 			remainingFilters: "j @> '[[1, 2]]' OR j @> '[3, 4]'",
 		},
 		{
@@ -419,7 +430,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd:         jsonOrd,
 			ok:               true,
 			tight:            false,
-			unique:           false,
+			unique:           true,
 			remainingFilters: "j @> '[1, 2]' OR j @> '[[3, 4]]'",
 		},
 		{
@@ -429,7 +440,7 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			indexOrd: jsonOrd,
 			ok:       true,
 			tight:    true,
-			unique:   false,
+			unique:   true,
 		},
 		{
 			// With AND conditions the remaining filters may be a subset of the
@@ -459,8 +470,16 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Integer indexes are not yet supported.
-			filters:  "j->0 = '1'",
+			filters:          "j->0 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0 = '1'",
+		},
+		{
+			// Filtering a non-indexed column.
+			filters:  "j2->0 = '1'",
 			indexOrd: jsonOrd,
 			ok:       false,
 		},
@@ -503,8 +522,96 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:   true,
 		},
 		{
-			// Integer indexes are not yet supported.
-			filters:  "j->0->'b' = '1'",
+			filters:          "j->0->'b' = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0->'b' = '1'",
+		},
+		{
+			filters:          "j->'b'->0->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'b'->0->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'a'->0->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0 = '1' AND j->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->'a'->0 = '1' AND j->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->'a'->0 = '1' OR j->'a'->1 = '1'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->'a'->0 = '1' OR j->'a'->1 = '1'",
+		},
+		{
+			filters:          "j->0 @> '2'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 @> '2'",
+		},
+		{
+			filters:          "j->0 <@ '2'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 <@ '2'",
+		},
+		{
+			filters:          "j->0 @> '[1,2]'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "j->0 @> '[1,2]'",
+		},
+		{
+			filters:          "j->0 <@ '[1,2]'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0 <@ '[1,2]'",
+		},
+		{
+			filters:          `j->0 <@ '{"b": "c"}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 <@ '{"b": "c"}'`,
+		},
+		{
+			filters:          `j->0 @> '{"b": "c"}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j->0 @> '{"b": "c"}'`,
+		},
+		{
+			// Filtering a non-indexed column.
+			filters:  `j2->0 @> '{"b": "c"}'`,
 			indexOrd: jsonOrd,
 			ok:       false,
 		},
@@ -705,6 +812,362 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 			unique:           false,
 			remainingFilters: "",
 		},
+		{
+			// Filtering a non-indexed column.
+			filters:  `'1' <@ j2->'a'`,
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// JSONExists is supported. Unique is false for all Exists predicates
+			// because they check containment within arrays as well.
+			filters:          "j ? 'foo'",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			// JSONSomeExists is supported.
+			filters:          "j ?| ARRAY['foo','bar']",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			// JSONAllExists is supported.
+			filters:          "j ?& ARRAY['foo','bar']",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			// JSONExists with boolean expressions are supported.
+			filters:          "j ?& ARRAY['foo','bar'] AND j ? 'qux' OR j ?| ARRAY['a','b']",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			// FetchVal + Exists isn't supported yet.
+			filters:  "j->'foo' ? 'bar'",
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// Overlaps is supported for arrays.
+			// Overlaps with a single element array produces
+			// unique inverted span expression.
+			filters:          "a && '{1}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            true,
+			unique:           true,
+			remainingFilters: "",
+		},
+		{
+			// Overlaps with an empty array produces a non-inverted
+			// expression.
+			filters:  "a && '{}'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			// Overlaps with conjunction of two tight expressions with
+			// same variable produces a tight expression.
+			// Overlaps with conjunction of two expressions over same
+			// variable producing unique span expressions results in a
+			// unique span expression.
+			filters:          "a && '{1}' AND a && '{2}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            true,
+			unique:           true,
+			remainingFilters: "",
+		},
+		{
+			// Overlaps with disjunction of two tight expressions with
+			// same variable produces a tight expression.
+			// Overlaps with disjunction of two expressions over same
+			// variable produces non-unique span expression.
+			filters:          "a && '{1}' OR a && '{2}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			// When operations affecting two different variables are AND-ed,
+			// the first index gets constrained. If the two expressions
+			// produce unique results, the AND-ed result is also unique.
+			filters:          "a && '{1}' AND str && '{hello}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "str && '{hello}'",
+		},
+		{
+			// When operations affecting two different variables are OR-ed, we cannot
+			// constrain either index.
+			filters:  "a && '{1}' OR str && '{hello}'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			filters:  "a && '{1}' OR str <@ '{hello}'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			filters:  "a && '{1}' OR str @> '{hello}'",
+			indexOrd: arrayOrd,
+			ok:       false,
+		},
+		{
+			// If the two expressions produce unique results,
+			// the AND-ed result is also unique.
+			filters:          "a && '{1}' AND str <@ '{hello}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "str <@ '{hello}'",
+		},
+		{
+			filters:          "str <@ '{hello}' AND a && '{1}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "str <@ '{hello}'",
+		},
+		{
+			// If all the expressions in a conjunction produce unique results,
+			// then the AND-ed result is also unique.
+			filters:          "str <@ '{hello}' AND a && '{1}' AND str @> '{hello}'",
+			indexOrd:         arrayOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: "str <@ '{hello}' AND str @> '{hello}'",
+		},
+		{
+			// Testing the IN operator with the fetch value as a string
+			filters:          "j->'a' IN ('1', '2', '3')",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			filters:          `j->'a' IN ('"a"', '"b"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            true,
+			unique:           false,
+			remainingFilters: "",
+		},
+		{
+			filters:          `j->'a' IN ('{"a": "b"}', '"a"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a' IN ('{"a": "b"}', '"a"')`,
+		},
+		{
+			filters:          `j->'a' IN ('[1,2,3]', '[1]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j->'a' IN ('[1,2,3]', '[1]')`,
+		},
+		{
+			filters:          `j->'a' IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->'a' IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+		},
+		{
+			// Testing the IN operator with the fetch value as an integer
+			filters:          "j->0->1 IN ('1', '2', '3')",
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: "j->0->1 IN ('1', '2', '3')",
+		},
+		{
+			filters:          `j->0 IN ('"a"', '"b"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 IN ('"a"', '"b"')`,
+		},
+		{
+			filters:          `j->0->'a' IN ('{"a": "b"}', '"a"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0->'a' IN ('{"a": "b"}', '"a"')`,
+		},
+		{
+			filters:          `j->'a'->0 IN ('[1,2,3]', '[1]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j->'a'->0 IN ('[1,2,3]', '[1]')`,
+		},
+		{
+			filters:          `j->0 IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j->0 IN ('[1,2,3]', '{"a": "b"}', '"a"', 'null')`,
+		},
+		{
+			// Testing the IN operator with non-constant JSON values inside the
+			// enclosing tuple.
+			filters:  `j->0 IN (j->0, j->1)`,
+			indexOrd: jsonOrd,
+			ok:       false,
+			tight:    false,
+			unique:   false,
+		},
+		{
+			filters:  `j->0 IN (j->0, '[1, 2, 3]')`,
+			indexOrd: jsonOrd,
+			ok:       false,
+			tight:    false,
+			unique:   false,
+		},
+		{
+			// Testing the equality operator without the fetch value operator.
+			filters:          `j = '1'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '1'`,
+		},
+		{
+			filters:          `j = '"a"'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '"a"'`,
+		},
+		{
+			filters:          `j = '[1, 2, 3, 4]'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '[1, 2, 3, 4]'`,
+		},
+		{
+			filters:          `j = '[1]'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '[1]'`,
+		},
+		{
+			filters:          `j = '{"a": "b"}'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '{"a": "b"}'`,
+		},
+		{
+			filters:          `j = '{"a": "b"}' OR j = '[1, 2, 3]'`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j = '{"a": "b"}' OR j = '[1, 2, 3]'`,
+		},
+		{
+			// Filtering a non-indexed column.
+			filters:  `j2 = '"a"'`,
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
+		{
+			// Testing the IN operator without the fetch value operator.
+			filters:          `j IN ('1', '2', '3')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j IN ('1', '2', '3')`,
+		},
+		{
+			filters:          `j IN ('"a"', '"b"', '"c"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j IN ('"a"', '"b"', '"c"')`,
+		},
+		{
+			filters:          `j IN ('1', '"b"', '[1, 2, 3]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j IN ('1', '"b"', '[1, 2, 3]')`,
+		},
+		{
+			filters:          `j IN ('[1, 2, 3]')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j IN ('[1, 2, 3]')`,
+		},
+		{
+			filters:          `j IN ('[1, 2, 3]', '{"a": "b"}')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           true,
+			remainingFilters: `j IN ('[1, 2, 3]', '{"a": "b"}')`,
+		},
+		{
+			filters:          `j IN ('[1, 2, 3]', '{"a": "b"}', '1', '"a"')`,
+			indexOrd:         jsonOrd,
+			ok:               true,
+			tight:            false,
+			unique:           false,
+			remainingFilters: `j IN ('[1, 2, 3]', '{"a": "b"}', '1', '"a"')`,
+		},
+		{
+			// Filtering a non-indexed column.
+			filters:  `j2 IN ('1', '2', '3')`,
+			indexOrd: jsonOrd,
+			ok:       false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -716,13 +1179,15 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 		// the index when we expect to and we have the correct values for tight,
 		// unique, and remainingFilters.
 		spanExpr, _, remainingFilters, _, ok := invertedidx.TryFilterInvertedIndex(
+			context.Background(),
 			evalCtx,
 			&f,
 			filters,
 			nil, /* optionalFilters */
 			tab,
 			md.Table(tab).Index(tc.indexOrd),
-			nil, /* computedColumns */
+			nil,       /* computedColumns */
+			func() {}, /* checkCancellation */
 		)
 		if tc.ok != ok {
 			t.Fatalf("expected %v, got %v", tc.ok, ok)
@@ -732,24 +1197,24 @@ func TestTryFilterJsonOrArrayIndex(t *testing.T) {
 		}
 
 		if tc.tight != spanExpr.Tight {
-			t.Fatalf("expected tight=%v, but got %v", tc.tight, spanExpr.Tight)
+			t.Fatalf("For (%s), expected tight=%v, but got %v", tc.filters, tc.tight, spanExpr.Tight)
 		}
 		if tc.unique != spanExpr.Unique {
-			t.Fatalf("expected unique=%v, but got %v", tc.unique, spanExpr.Unique)
+			t.Fatalf("For (%s), expected unique=%v, but got %v", tc.filters, tc.unique, spanExpr.Unique)
 		}
 
 		if remainingFilters == nil {
 			if tc.remainingFilters != "" {
-				t.Fatalf("expected remainingFilters=%s, got <nil>", tc.remainingFilters)
+				t.Fatalf("For (%s), expected remainingFilters=%s, got <nil>", tc.filters, tc.remainingFilters)
 			}
 			continue
 		}
 		if tc.remainingFilters == "" {
-			t.Fatalf("expected remainingFilters=<nil>, got %v", remainingFilters)
+			t.Fatalf("For (%s), expected remainingFilters=<nil>, got %v", tc.filters, remainingFilters)
 		}
 		expRemainingFilters := testutils.BuildFilters(t, &f, &semaCtx, evalCtx, tc.remainingFilters)
 		if remainingFilters.String() != expRemainingFilters.String() {
-			t.Errorf("expected remainingFilters=%v, got %v", expRemainingFilters, remainingFilters)
+			t.Errorf("For (%s), expected remainingFilters=%v, got %v", tc.filters, expRemainingFilters, remainingFilters)
 		}
 	}
 }

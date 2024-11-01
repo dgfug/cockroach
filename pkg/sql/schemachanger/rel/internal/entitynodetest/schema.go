@@ -1,13 +1,9 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package entitynodetest exposes a reltest.Suite.
 package entitynodetest
 
 import (
@@ -20,9 +16,10 @@ import (
 )
 
 type entity struct {
-	I8  int8
-	PI8 *int8
-	I16 int16
+	I8      int8
+	PI8     *int8
+	I16     int16
+	I16Refs []int16
 }
 
 type node struct {
@@ -67,6 +64,7 @@ const (
 	value
 	left
 	right
+	i16ref
 )
 
 var schema = rel.MustSchema("testschema",
@@ -74,6 +72,7 @@ var schema = rel.MustSchema("testschema",
 		rel.EntityAttr(i8, "I8"),
 		rel.EntityAttr(pi8, "PI8"),
 		rel.EntityAttr(i16, "I16"),
+		rel.EntityAttr(i16ref, "I16Refs"),
 	),
 	rel.EntityMapping(reflect.TypeOf((*node)(nil)),
 		rel.EntityAttr(value, "Value"),

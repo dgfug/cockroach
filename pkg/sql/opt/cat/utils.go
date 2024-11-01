@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat
 
@@ -16,12 +11,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // ExpandDataSourceGlob is a utility function that expands a tree.TablePattern
@@ -54,81 +48,16 @@ func ExpandDataSourceGlob(
 func ResolveTableIndex(
 	ctx context.Context, catalog Catalog, flags Flags, name *tree.TableIndexName,
 ) (Index, DataSourceName, error) {
-	if name.Table.ObjectName != "" {
-		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &name.Table)
-		if err != nil {
-			return nil, DataSourceName{}, err
-		}
-		table, ok := ds.(Table)
-		if !ok {
-			return nil, DataSourceName{}, pgerror.Newf(
-				pgcode.WrongObjectType, "%q is not a table", name.Table.ObjectName,
-			)
-		}
-		if name.Index == "" {
-			// Return primary index.
-			return table.Index(0), tn, nil
-		}
-		for i := 0; i < table.IndexCount(); i++ {
-			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
-				return idx, tn, nil
-			}
-		}
-		// Fallback to referencing @primary as the PRIMARY KEY.
-		// Note that indexes with "primary" as their name takes precedence above.
-		if name.Index == tabledesc.LegacyPrimaryKeyIndexName {
-			return table.Index(0), tn, nil
-		}
-		return nil, DataSourceName{}, pgerror.Newf(
-			pgcode.UndefinedObject, "index %q does not exist", name.Index,
-		)
-	}
-
-	// We have to search for a table that has an index with the given name.
-	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.ObjectNamePrefix)
-	if err != nil {
-		return nil, DataSourceName{}, err
-	}
-	dsNames, _, err := schema.GetDataSourceNames(ctx)
-	if err != nil {
-		return nil, DataSourceName{}, err
-	}
-	var found Index
-	var foundTabName DataSourceName
-	for i := range dsNames {
-		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &dsNames[i])
-		if err != nil {
-			return nil, DataSourceName{}, err
-		}
-		table, ok := ds.(Table)
-		if !ok {
-			// Not a table, ignore.
-			continue
-		}
-		for i := 0; i < table.IndexCount(); i++ {
-			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
-				if found != nil {
-					return nil, DataSourceName{}, pgerror.Newf(pgcode.AmbiguousParameter,
-						"index name %q is ambiguous (found in %s and %s)",
-						name.Index, tn.String(), foundTabName.String())
-				}
-				found = idx
-				foundTabName = tn
-				break
-			}
-		}
-	}
-	if found == nil {
-		return nil, DataSourceName{}, pgerror.Newf(
-			pgcode.UndefinedObject, "index %q does not exist", name.Index,
-		)
-	}
-	return found, foundTabName, nil
+	return catalog.ResolveIndex(ctx, flags, name)
 }
 
 // FormatTable nicely formats a catalog table using a treeprinter for debugging
-// and testing.
-func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
+// and testing. With redactableValues set to true, all user-supplied constants
+// and literals (e.g. DEFAULT values, constants in generated column expressions,
+// etc.) are surrounded by redaction markers.
+func FormatTable(
+	ctx context.Context, cat Catalog, tab Table, tp treeprinter.Node, redactableValues bool,
+) {
 	child := tp.Childf("TABLE %s", tab.Name())
 	if tab.IsVirtualTable() {
 		child.Child("virtual table")
@@ -137,7 +66,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 	var buf bytes.Buffer
 	for i := 0; i < tab.ColumnCount(); i++ {
 		buf.Reset()
-		formatColumn(tab.Column(i), &buf)
+		formatColumn(tab.Column(i), &buf, redactableValues)
 		child.Child(buf.String())
 	}
 
@@ -151,19 +80,19 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 	}
 
 	for i := 0; i < tab.CheckCount(); i++ {
-		child.Childf("CHECK (%s)", tab.Check(i).Constraint)
+		child.Childf("CHECK (%s)", MaybeMarkRedactable(tab.Check(i).Constraint(), redactableValues))
 	}
 
 	for i := 0; i < tab.DeletableIndexCount(); i++ {
-		formatCatalogIndex(tab, i, child)
+		formatCatalogIndex(tab, i, child, redactableValues)
 	}
 
 	for i := 0; i < tab.OutboundForeignKeyCount(); i++ {
-		formatCatalogFKRef(cat, false /* inbound */, tab.OutboundForeignKey(i), child)
+		formatCatalogFKRef(ctx, cat, false /* inbound */, tab.OutboundForeignKey(i), child)
 	}
 
 	for i := 0; i < tab.InboundForeignKeyCount(); i++ {
-		formatCatalogFKRef(cat, true /* inbound */, tab.InboundForeignKey(i), child)
+		formatCatalogFKRef(ctx, cat, true /* inbound */, tab.InboundForeignKey(i), child)
 	}
 
 	for i := 0; i < tab.UniqueCount(); i++ {
@@ -178,7 +107,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 			formatCols(tab, tab.Unique(i).ColumnCount(), tab.Unique(i).ColumnOrdinal),
 		)
 		if pred, isPartial := uniq.Predicate(); isPartial {
-			c.Childf("WHERE %s", pred)
+			c.Childf("WHERE %s", MaybeMarkRedactable(pred, redactableValues))
 		}
 	}
 
@@ -187,7 +116,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 
 // formatCatalogIndex nicely formats a catalog index using a treeprinter for
 // debugging and testing.
-func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
+func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node, redactableValues bool) {
 	idx := tab.Index(ord)
 	idxType := ""
 	if idx.Ordinal() == PrimaryIndex {
@@ -201,7 +130,17 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 	if IsMutationIndex(tab, ord) {
 		mutation = " (mutation)"
 	}
-	child := tp.Childf("%sINDEX %s%s", idxType, idx.Name(), mutation)
+
+	idxVisibililty := ""
+	if invisibility := idx.GetInvisibility(); invisibility != 0.0 {
+		if invisibility == 1.0 {
+			idxVisibililty = " NOT VISIBLE"
+		} else {
+			idxVisibililty = " VISIBILITY " + fmt.Sprintf("%.2f", 1-invisibility)
+		}
+	}
+
+	child := tp.Childf("%sINDEX %s%s%s", idxType, idx.Name(), mutation, idxVisibililty)
 
 	var buf bytes.Buffer
 	colCount := idx.ColumnCount()
@@ -214,7 +153,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		buf.Reset()
 
 		idxCol := idx.Column(i)
-		formatColumn(idxCol.Column, &buf)
+		formatColumn(idxCol.Column, &buf, redactableValues)
 		if idxCol.Descending {
 			fmt.Fprintf(&buf, " desc")
 		}
@@ -223,7 +162,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 			fmt.Fprintf(&buf, " (storing)")
 		}
 
-		if i < idx.ImplicitPartitioningColumnCount() {
+		if i < idx.ImplicitColumnCount() {
 			fmt.Fprintf(&buf, " (implicit)")
 		}
 
@@ -239,13 +178,13 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 			part := c.Child(p.Name())
 			prefixes := part.Child("partition by list prefixes")
 			for _, datums := range p.PartitionByListPrefixes() {
-				prefixes.Child(datums.String())
+				prefixes.Child(MaybeMarkRedactable(datums.String(), redactableValues))
 			}
 			FormatZone(p.Zone(), part)
 		}
 	}
 	if pred, isPartial := idx.Predicate(); isPartial {
-		child.Childf("WHERE %s", pred)
+		child.Childf("WHERE %s", MaybeMarkRedactable(pred, redactableValues))
 	}
 }
 
@@ -269,13 +208,17 @@ func formatCols(tab Table, numCols int, colOrdinal func(tab Table, i int) int) s
 // formatCatalogFKRef nicely formats a catalog foreign key reference using a
 // treeprinter for debugging and testing.
 func formatCatalogFKRef(
-	catalog Catalog, inbound bool, fkRef ForeignKeyConstraint, tp treeprinter.Node,
+	ctx context.Context,
+	catalog Catalog,
+	inbound bool,
+	fkRef ForeignKeyConstraint,
+	tp treeprinter.Node,
 ) {
-	originDS, _, err := catalog.ResolveDataSourceByID(context.TODO(), Flags{}, fkRef.OriginTableID())
+	originDS, _, err := catalog.ResolveDataSourceByID(ctx, Flags{}, fkRef.OriginTableID())
 	if err != nil {
 		panic(err)
 	}
-	refDS, _, err := catalog.ResolveDataSourceByID(context.TODO(), Flags{}, fkRef.ReferencedTableID())
+	refDS, _, err := catalog.ResolveDataSourceByID(ctx, Flags{}, fkRef.ReferencedTableID())
 	if err != nil {
 		panic(err)
 	}
@@ -304,22 +247,23 @@ func formatCatalogFKRef(
 	)
 }
 
-func formatColumn(col *Column, buf *bytes.Buffer) {
+func formatColumn(col *Column, buf *bytes.Buffer, redactableValues bool) {
 	fmt.Fprintf(buf, "%s %s", col.ColName(), col.DatumType())
 	if !col.IsNullable() {
 		fmt.Fprintf(buf, " not null")
 	}
 	if col.IsComputed() {
+		exprStr := MaybeMarkRedactable(col.ComputedExprStr(), redactableValues)
 		if col.IsVirtualComputed() {
-			fmt.Fprintf(buf, " as (%s) virtual", col.ComputedExprStr())
+			fmt.Fprintf(buf, " as (%s) virtual", exprStr)
 		} else {
-			fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+			fmt.Fprintf(buf, " as (%s) stored", exprStr)
 		}
 	}
 	if col.HasDefault() {
 		generatedAsIdentityType := col.GeneratedAsIdentityType()
 		if generatedAsIdentityType == NotGeneratedAsIdentity {
-			fmt.Fprintf(buf, " default (%s)", col.DefaultExprStr())
+			fmt.Fprintf(buf, " default (%s)", MaybeMarkRedactable(col.DefaultExprStr(), redactableValues))
 		} else {
 			switch generatedAsIdentityType {
 			case GeneratedAlwaysAsIdentity:
@@ -333,7 +277,9 @@ func formatColumn(col *Column, buf *bytes.Buffer) {
 		}
 	}
 	if col.HasOnUpdate() {
-		fmt.Fprintf(buf, " on update (%s)", col.OnUpdateExprStr())
+		fmt.Fprintf(
+			buf, " on update (%s)", MaybeMarkRedactable(col.OnUpdateExprStr(), redactableValues),
+		)
 	}
 
 	kind := col.Kind()
@@ -373,4 +319,13 @@ func formatFamily(family Family, buf *bytes.Buffer) {
 		buf.WriteString(string(col.ColName()))
 	}
 	buf.WriteString(")")
+}
+
+// MaybeMarkRedactable surrounds an unsafe string with redaction markers if
+// markRedactable is true.
+func MaybeMarkRedactable(unsafe string, markRedactable bool) string {
+	if markRedactable {
+		return string(redact.Sprintf("%s", encoding.Unsafe(unsafe)))
+	}
+	return unsafe
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgnotice
 
@@ -34,8 +29,13 @@ const (
 	// DisplaySeverityNotice is a DisplaySeverity value allowing all notices
 	// of value <= DisplaySeverityNotice to display.
 	DisplaySeverityNotice
+	// DisplaySeverityInfo is a DisplaySeverity value allowing all notices
+	// of value <= DisplaySeverityInfo to display. DisplaySeverityInfo is a
+	// special case in that it will always send a message to the client, no matter
+	// the value of client_min_messages.
+	DisplaySeverityInfo
 	// DisplaySeverityLog is a DisplaySeverity value allowing all notices
-	// of value <= DisplaySeverityLog.g to display.
+	// of value <= DisplaySeverityLog to display.
 	DisplaySeverityLog
 	// DisplaySeverityDebug1 is a DisplaySeverity value allowing all notices
 	// of value <= DisplaySeverityDebug1 to display.
@@ -76,6 +76,7 @@ var noticeDisplaySeverityNames = [...]string{
 	DisplaySeverityDebug2:  "debug2",
 	DisplaySeverityDebug1:  "debug1",
 	DisplaySeverityLog:     "log",
+	DisplaySeverityInfo:    "info",
 	DisplaySeverityNotice:  "notice",
 	DisplaySeverityWarning: "warning",
 	DisplaySeverityError:   "error",

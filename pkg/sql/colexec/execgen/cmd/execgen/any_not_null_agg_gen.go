@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -15,7 +10,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
 
 const anyNotNullAggTmpl = "pkg/sql/colexec/colexecagg/any_not_null_agg_tmpl.go"
@@ -41,10 +36,12 @@ func genAnyNotNullAgg(inputFileContents string, wr io.Writer) error {
 		return err
 	}
 
-	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.EQ])
+	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[treecmp.EQ])
 }
 
 func init() {
 	registerAggGenerator(
-		genAnyNotNullAgg, "any_not_null_agg.eg.go", anyNotNullAggTmpl, false /* genWindowVariant */)
+		genAnyNotNullAgg, "any_not_null_agg.eg.go", /* filenameSuffix */
+		anyNotNullAggTmpl, "anyNotNull" /* aggName */, false, /* genWindowVariant */
+	)
 }

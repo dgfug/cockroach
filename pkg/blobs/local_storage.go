@@ -1,25 +1,20 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package blobs
 
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 )
 
@@ -121,9 +116,9 @@ func (l *LocalStorage) Writer(ctx context.Context, filename string) (io.WriteClo
 	// - it avoids a cross-filesystem rename in the common case.
 	//   (There can still be cross-filesystem renames in very
 	//   exotic edge cases, hence the use fileutil.Move below.)
-	// See the explanatory comment for ioutil.TempFile to understand
+	// See the explanatory comment for os.CreateTemp to understand
 	// what the "*" in the suffix means.
-	tmpFile, err := ioutil.TempFile(targetDir, filepath.Base(fullPath)+"*.tmp")
+	tmpFile, err := os.CreateTemp(targetDir, filepath.Base(fullPath)+"*.tmp")
 	if err != nil {
 		return nil, errors.Wrap(err, "creating temporary file")
 	}
@@ -133,7 +128,7 @@ func (l *LocalStorage) Writer(ctx context.Context, filename string) (io.WriteClo
 // ReadFile prepends IO dir to filename and reads the content of that local file.
 func (l *LocalStorage) ReadFile(
 	filename string, offset int64,
-) (res io.ReadCloser, size int64, err error) {
+) (res ioctx.ReadCloserCtx, size int64, err error) {
 	fullPath, err := l.prependExternalIODir(filename)
 	if err != nil {
 		return nil, 0, err
@@ -161,7 +156,7 @@ func (l *LocalStorage) ReadFile(
 			return nil, 0, errors.Errorf("seek to offset %d returned %d", offset, ret)
 		}
 	}
-	return f, fi.Size(), nil
+	return ioctx.ReadCloserAdapter(f), fi.Size(), nil
 }
 
 // List prepends IO dir to pattern and glob matches all local files against that pattern.

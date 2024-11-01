@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -15,7 +10,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
 
 const minMaxAggTmpl = "pkg/sql/colexec/colexecagg/min_max_agg_tmpl.go"
@@ -53,17 +48,19 @@ func genMinMaxAgg(inputFileContents string, wr io.Writer) error {
 		{
 			Agg:       "min",
 			AggTitle:  "Min",
-			Overloads: sameTypeComparisonOpToOverloads[tree.LT],
+			Overloads: sameTypeComparisonOpToOverloads[treecmp.LT],
 		},
 		{
 			Agg:       "max",
 			AggTitle:  "Max",
-			Overloads: sameTypeComparisonOpToOverloads[tree.GT],
+			Overloads: sameTypeComparisonOpToOverloads[treecmp.GT],
 		},
 	})
 }
 
 func init() {
 	registerAggGenerator(
-		genMinMaxAgg, "min_max_agg.eg.go", minMaxAggTmpl, true /* genWindowVariant */)
+		genMinMaxAgg, "min_max_agg.eg.go", /* filenameSuffix */
+		minMaxAggTmpl, "minMax" /* aggName */, true, /* genWindowVariant */
+	)
 }

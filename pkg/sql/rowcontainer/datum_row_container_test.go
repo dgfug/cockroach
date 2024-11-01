@@ -1,18 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowcontainer
 
 import (
 	"context"
-	"math"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -20,11 +14,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func TestRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	for _, numCols := range []int{0, 1, 2, 3, 5, 10, 15} {
@@ -35,9 +30,7 @@ func TestRowContainer(t *testing.T) {
 					resCol[i] = colinfo.ResultColumn{Typ: types.Int}
 				}
 				st := cluster.MakeTestingClusterSettings()
-				m := mon.NewUnlimitedMonitor(
-					ctx, "test", mon.MemoryResource, nil, nil, math.MaxInt64, st,
-				)
+				m := getUnlimitedMemoryMonitor(st)
 				rc := NewRowContainer(m.MakeBoundAccount(), colinfo.ColTypeInfoFromResCols(resCol))
 				row := make(tree.Datums, numCols)
 				for i := 0; i < numRows; i++ {
@@ -78,10 +71,11 @@ func TestRowContainer(t *testing.T) {
 
 func TestRowContainerAtOutOfRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	m := mon.NewUnlimitedMonitor(ctx, "test", mon.MemoryResource, nil, nil, math.MaxInt64, st)
+	m := getUnlimitedMemoryMonitor(st)
 	defer m.Stop(ctx)
 
 	resCols := colinfo.ResultColumns{colinfo.ResultColumn{Typ: types.Int}}
@@ -105,10 +99,11 @@ func TestRowContainerAtOutOfRange(t *testing.T) {
 
 func TestRowContainerZeroCols(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	m := mon.NewUnlimitedMonitor(ctx, "test", mon.MemoryResource, nil, nil, math.MaxInt64, st)
+	m := getUnlimitedMemoryMonitor(st)
 	defer m.Stop(ctx)
 
 	rc := NewRowContainer(m.MakeBoundAccount(), colinfo.ColTypeInfoFromResCols(nil))
@@ -153,14 +148,15 @@ func TestRowContainerZeroCols(t *testing.T) {
 }
 
 func BenchmarkRowContainerAt(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
 	const numCols = 3
 	const numRows = 1024
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	m := mon.NewUnlimitedMonitor(
-		ctx, "test", mon.MemoryResource, nil, nil, math.MaxInt64, st,
-	)
+	m := getUnlimitedMemoryMonitor(st)
 	defer m.Stop(ctx)
 
 	resCol := make(colinfo.ResultColumns, numCols)

@@ -1,85 +1,132 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
-// IndexBackfillPlanner holds dependencies for an index backfiller.
+// IndexBackfillPlanner holds dependencies for an index backfiller
+// for use in the declarative schema changer.
 type IndexBackfillPlanner struct {
-	execCfg   *ExecutorConfig
-	ieFactory sqlutil.SessionBoundInternalExecutorFactory
+	execCfg *ExecutorConfig
 }
 
 // NewIndexBackfiller creates a new IndexBackfillPlanner.
-func NewIndexBackfiller(
-	execCfg *ExecutorConfig, ieFactory sqlutil.SessionBoundInternalExecutorFactory,
-) *IndexBackfillPlanner {
-	return &IndexBackfillPlanner{execCfg: execCfg, ieFactory: ieFactory}
+func NewIndexBackfiller(execCfg *ExecutorConfig) *IndexBackfillPlanner {
+	return &IndexBackfillPlanner{execCfg: execCfg}
 }
 
-// BackfillIndex will backfill the specified index on the passed table.
-//
-// TODO(ajwerner): allow backfilling multiple indexes.
-func (ib *IndexBackfillPlanner) BackfillIndex(
-	ctx context.Context,
-	tracker scexec.JobProgressTracker,
-	descriptor catalog.TableDescriptor,
-	source descpb.IndexID,
-	toBackfill ...descpb.IndexID,
-) error {
-
+// MaybePrepareDestIndexesForBackfill is part of the scexec.Backfiller interface.
+func (ib *IndexBackfillPlanner) MaybePrepareDestIndexesForBackfill(
+	ctx context.Context, current scexec.BackfillProgress, td catalog.TableDescriptor,
+) (scexec.BackfillProgress, error) {
+	if !current.MinimumWriteTimestamp.IsEmpty() {
+		return current, nil
+	}
 	// Pick an arbitrary read timestamp for the reads of the backfill.
 	// It's safe to use any timestamp to read even if we've partially backfilled
 	// at an earlier timestamp because other writing transactions have been
 	// writing at the appropriate timestamps in-between.
-	backfillReadTimestamp := ib.execCfg.DB.Clock().Now()
-	targetSpans := make([]roachpb.Span, len(toBackfill))
-	for i, idxID := range toBackfill {
-		targetSpans[i] = descriptor.IndexSpan(ib.execCfg.Codec, idxID)
+	backfillReadTimestamp := ib.execCfg.Clock.Now()
+	targetSpans := make([]roachpb.Span, len(current.DestIndexIDs))
+	for i, idxID := range current.DestIndexIDs {
+		targetSpans[i] = td.IndexSpan(ib.execCfg.Codec, idxID)
 	}
-	if err := ib.scanTargetSpansToPushTimestampCache(
-		ctx, backfillReadTimestamp, targetSpans,
+	if err := scanTargetSpansToPushTimestampCache(
+		ctx, ib.execCfg.DB, backfillReadTimestamp, targetSpans,
 	); err != nil {
-		return err
+		return scexec.BackfillProgress{}, err
 	}
+	return scexec.BackfillProgress{
+		Backfill:              current.Backfill,
+		MinimumWriteTimestamp: backfillReadTimestamp,
+	}, nil
+}
 
-	// TODO(dt): persist a write ts, don't rescan above.
-	backfillWriteTimestamp := backfillReadTimestamp
+// BackfillIndexes is part of the scexec.Backfiller interface.
+func (ib *IndexBackfillPlanner) BackfillIndexes(
+	ctx context.Context,
+	progress scexec.BackfillProgress,
+	tracker scexec.BackfillerProgressWriter,
+	job *jobs.Job,
+	descriptor catalog.TableDescriptor,
+) (err error) {
+	// Potentially install a protected timestamp before the GC interval is hit,
+	// which can help avoid transaction retry errors, with shorter GC intervals.
+	protectedTimestampCleaner := ib.execCfg.ProtectedTimestampManager.TryToProtectBeforeGC(ctx,
+		job,
+		descriptor,
+		progress.MinimumWriteTimestamp)
+	defer func() {
+		cleanupError := protectedTimestampCleaner(ctx)
+		if cleanupError != nil {
+			err = errors.CombineErrors(cleanupError, err)
+		}
+	}()
 
-	resumeSpans, err := tracker.GetResumeSpans(ctx, descriptor.GetID(), source)
-	if err != nil {
-		return err
+	var completed = struct {
+		syncutil.Mutex
+		g roachpb.SpanGroup
+	}{}
+	addCompleted := func(c ...roachpb.Span) []roachpb.Span {
+		completed.Lock()
+		defer completed.Unlock()
+		completed.g.Add(c...)
+		return completed.g.Slice()
 	}
-	run, err := ib.plan(ctx, descriptor, backfillReadTimestamp, backfillWriteTimestamp, backfillReadTimestamp, resumeSpans, toBackfill, func(
+	updateFunc := func(
 		ctx context.Context, meta *execinfrapb.ProducerMetadata,
 	) error {
-		// TODO(ajwerner): Hook up the jobs tracking stuff.
-		log.Infof(ctx, "got update: %v", meta)
+		if meta.BulkProcessorProgress == nil {
+			return nil
+		}
+		progress.CompletedSpans = addCompleted(
+			meta.BulkProcessorProgress.CompletedSpans...)
+		return tracker.SetBackfillProgress(ctx, progress)
+	}
+	var spansToDo []roachpb.Span
+	{
+		sourceIndexSpan := descriptor.IndexSpan(ib.execCfg.Codec, progress.SourceIndexID)
+		var g roachpb.SpanGroup
+		g.Add(sourceIndexSpan)
+		g.Sub(progress.CompletedSpans...)
+		spansToDo = g.Slice()
+	}
+	if len(spansToDo) == 0 { // already done
 		return nil
-	})
+	}
+	now := ib.execCfg.DB.Clock().Now()
+	run, err := ib.plan(
+		ctx,
+		descriptor,
+		progress.MinimumWriteTimestamp,
+		now,
+		progress.MinimumWriteTimestamp,
+		spansToDo,
+		progress.DestIndexIDs,
+		updateFunc,
+	)
 	if err != nil {
 		return err
 	}
@@ -93,29 +140,34 @@ func (ib *IndexBackfillPlanner) BackfillIndex(
 // anything else from sneaking under us. Since these are new indexes, these
 // spans should be essentially empty, so this should be a pretty quick and
 // cheap scan.
-func (ib *IndexBackfillPlanner) scanTargetSpansToPushTimestampCache(
-	ctx context.Context, backfillTimestamp hlc.Timestamp, targetSpans []roachpb.Span,
+func scanTargetSpansToPushTimestampCache(
+	ctx context.Context, db *kv.DB, backfillTimestamp hlc.Timestamp, targetSpans []roachpb.Span,
 ) error {
 	const pageSize = 10000
-	return ib.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetFixedTimestamp(ctx, backfillTimestamp); err != nil {
-			return err
-		}
-		for _, span := range targetSpans {
-			// TODO(dt): a Count() request would be nice here if the target isn't
-			// empty, since we don't need to drag all the results back just to
-			// then ignore them -- we just need the iteration on the far end.
-			if err := txn.Iterate(ctx, span.Key, span.EndKey, pageSize, iterateNoop); err != nil {
+	return db.TxnWithAdmissionControl(
+		ctx, kvpb.AdmissionHeader_FROM_SQL, admissionpb.BulkNormalPri,
+		kv.SteppingDisabled,
+		func(
+			ctx context.Context, txn *kv.Txn,
+		) error {
+			if err := txn.SetFixedTimestamp(ctx, backfillTimestamp); err != nil {
 				return err
 			}
-		}
-		return nil
-	})
+			for _, span := range targetSpans {
+				// TODO(dt): a Count() request would be nice here if the target isn't
+				// empty, since we don't need to drag all the results back just to
+				// then ignore them -- we just need the iteration on the far end.
+				if err := txn.Iterate(ctx, span.Key, span.EndKey, pageSize, iterateNoop); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 }
 
 func iterateNoop(_ []kv.KeyValue) error { return nil }
 
-var _ scexec.IndexBackfiller = (*IndexBackfillPlanner)(nil)
+var _ scexec.Backfiller = (*IndexBackfillPlanner)(nil)
 
 func (ib *IndexBackfillPlanner) plan(
 	ctx context.Context,
@@ -131,19 +183,25 @@ func (ib *IndexBackfillPlanner) plan(
 	var planCtx *PlanningCtx
 	td := tabledesc.NewBuilder(tableDesc.TableDesc()).BuildExistingMutableTable()
 	if err := DescsTxn(ctx, ib.execCfg, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, nowTimestamp, ib.ieFactory, descriptors)
-		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
-			true /* distribute */)
-		// TODO(ajwerner): Adopt util.ConstantWithMetamorphicTestRange for the
+		sd := NewInternalSessionData(ctx, ib.execCfg.Settings, "plan-index-backfill")
+		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, sd, nowTimestamp, descriptors)
+		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(
+			ctx, &evalCtx, nil /* planner */, txn.KV(), FullDistribution,
+		)
+		// TODO(ajwerner): Adopt metamorphic.ConstantWithTestRange for the
 		// batch size. Also plumb in a testing knob.
 		chunkSize := indexBackfillBatchSize.Get(&ib.execCfg.Settings.SV)
-		spec, err := initIndexBackfillerSpec(*td.TableDesc(), writeAsOf, readAsOf, chunkSize, indexesToBackfill)
+		const writeAtRequestTimestamp = true
+		spec, err := initIndexBackfillerSpec(
+			*td.TableDesc(), writeAsOf, readAsOf, writeAtRequestTimestamp, chunkSize,
+			indexesToBackfill,
+		)
 		if err != nil {
 			return err
 		}
-		p, err = ib.execCfg.DistSQLPlanner.createBackfillerPhysicalPlan(planCtx, spec, sourceSpans)
+		p, err = ib.execCfg.DistSQLPlanner.createBackfillerPhysicalPlan(ctx, planCtx, spec, sourceSpans)
 		return err
 	}); err != nil {
 		return nil, err
@@ -159,12 +217,10 @@ func (ib *IndexBackfillPlanner) plan(
 			nil, /* txn - the flow does not run wholly in a txn */
 			ib.execCfg.Clock,
 			evalCtx.Tracing,
-			ib.execCfg.ContentionRegistry,
-			nil, /* testingPushCallback */
 		)
 		defer recv.Release()
 		evalCtxCopy := evalCtx
-		ib.execCfg.DistSQLPlanner.Run(planCtx, nil, p, recv, &evalCtxCopy, nil)()
+		ib.execCfg.DistSQLPlanner.Run(ctx, planCtx, nil, p, recv, &evalCtxCopy, nil)
 		return cbw.Err()
 	}, nil
 }

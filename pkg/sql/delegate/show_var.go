@@ -1,20 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
 import (
-	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -27,7 +20,6 @@ var ValidVars = make(map[string]struct{})
 
 // Show a session-local variable name.
 func (d *delegator) delegateShowVar(n *tree.ShowVar) (tree.Statement, error) {
-	origName := n.Name
 	name := strings.ToLower(n.Name)
 
 	if name == "locality" {
@@ -35,9 +27,19 @@ func (d *delegator) delegateShowVar(n *tree.ShowVar) (tree.Statement, error) {
 	}
 
 	if name == "all" {
-		return parse(
+		return d.parse(
 			"SELECT variable, value FROM crdb_internal.session_variables WHERE hidden = FALSE",
 		)
+	}
+
+	// TODO(richardjcai): Remove this clause by making the `SetVar` for
+	// the database session variable verify if the database exists or not.
+	// Currently, on connection to a database, we rely on a query to
+	// hit the database resolution path giving us a database is undefined
+	// error. The below query allows us to keep this behaviour.
+	if name == "database" {
+		return d.parse(
+			"SELECT value as database FROM crdb_internal.session_variables WHERE variable = 'database'")
 	}
 
 	if _, ok := ValidVars[name]; !ok {
@@ -46,13 +48,8 @@ func (d *delegator) delegateShowVar(n *tree.ShowVar) (tree.Statement, error) {
 			return nil, nil
 		}
 		return nil, pgerror.Newf(pgcode.UndefinedObject,
-			"unrecognized configuration parameter %q", origName)
+			"unrecognized configuration parameter %q", n.Name)
 	}
 
-	varName := lexbase.EscapeSQLString(name)
-	nm := tree.Name(name)
-	return parse(fmt.Sprintf(
-		`SELECT value AS %[1]s FROM crdb_internal.session_variables WHERE variable = %[2]s`,
-		nm.String(), varName,
-	))
+	return nil, nil
 }

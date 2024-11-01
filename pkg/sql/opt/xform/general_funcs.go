@@ -1,29 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package xform contains logic for transforming SQL queries.
 package xform
 
 import (
-	"sort"
+	"container/list"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/lookupjoin"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -35,6 +31,7 @@ type CustomFuncs struct {
 	norm.CustomFuncs
 	e  *explorer
 	im partialidx.Implicator
+	cb lookupjoin.ConstraintBuilder
 }
 
 // Init initializes a new CustomFuncs with the given explorer.
@@ -45,7 +42,7 @@ func (c *CustomFuncs) Init(e *explorer) {
 		e: e,
 	}
 	c.CustomFuncs.Init(e.f)
-	c.im.Init(e.f, e.mem.Metadata(), e.evalCtx)
+	c.im.Init(e.ctx, e.f, e.mem.Metadata(), e.evalCtx)
 }
 
 // IsCanonicalScan returns true if the given ScanPrivate is an original
@@ -69,42 +66,49 @@ func (c *CustomFuncs) HasInvertedIndexes(scanPrivate *memo.ScanPrivate) bool {
 	return false
 }
 
-// MapFilterCols returns a new FiltersExpr with all the src column IDs in
-// the input expression replaced with column IDs in dst.
-//
-// NOTE: Every ColumnID in src must map to the a ColumnID in dst with the same
-// relative position in the ColSets. For example, if src and dst are (1, 5, 6)
-// and (7, 12, 15), then the following mapping would be applied:
-//
-//   1 => 7
-//   5 => 12
-//   6 => 15
-func (c *CustomFuncs) MapFilterCols(
-	filters memo.FiltersExpr, src, dst opt.ColSet,
+// RemapJoinColsInFilter returns a new FiltersExpr where columns in leftSrc's
+// table are replaced with columns of the same ordinal in leftDst's table and
+// rightSrc's table are replaced with columns of the same ordinal in rightDst's
+// table. leftSrc and leftDst must scan the same base table. rightSrc and
+// rightDst must scan the same base table.
+func (c *CustomFuncs) remapJoinColsInFilter(
+	filters memo.FiltersExpr, leftSrc, leftDst, rightSrc, rightDst *memo.ScanPrivate,
 ) memo.FiltersExpr {
-	newFilters := c.mapScalarExprCols(&filters, src, dst).(*memo.FiltersExpr)
+	newFilters := c.remapJoinColsInScalarExpr(&filters, leftSrc, leftDst, rightSrc, rightDst).(*memo.FiltersExpr)
 	return *newFilters
 }
 
-func (c *CustomFuncs) mapScalarExprCols(scalar opt.ScalarExpr, src, dst opt.ColSet) opt.ScalarExpr {
-	if src.Len() != dst.Len() {
-		panic(errors.AssertionFailedf(
-			"src and dst must have the same number of columns, src: %v, dst: %v",
-			src,
-			dst,
-		))
+// remapJoinColsInScalarExpr remaps ColumnIDs in a scalar expression involving
+// columns from a join of two base table scans.
+func (c *CustomFuncs) remapJoinColsInScalarExpr(
+	scalar opt.ScalarExpr, leftSrc, leftDst, rightSrc, rightDst *memo.ScanPrivate,
+) opt.ScalarExpr {
+	md := c.e.mem.Metadata()
+	if md.Table(leftSrc.Table).ID() != md.Table(leftDst.Table).ID() {
+		panic(errors.AssertionFailedf("left scans must have the same base table"))
 	}
-
-	// Map each column in src to a column in dst based on the relative position
-	// of both the src and dst ColumnIDs in the ColSet.
+	if md.Table(rightSrc.Table).ID() != md.Table(rightDst.Table).ID() {
+		panic(errors.AssertionFailedf("right scans must have the same base table"))
+	}
+	if leftSrc.Cols.Len() != leftDst.Cols.Len() {
+		panic(errors.AssertionFailedf("left scans must have the same number of columns"))
+	}
+	if rightSrc.Cols.Len() != rightDst.Cols.Len() {
+		panic(errors.AssertionFailedf("rightscans must have the same number of columns"))
+	}
+	// Remap each column in leftSrc to a column in leftDst.
 	var colMap opt.ColMap
-	dstCol, _ := dst.Next(0)
-	for srcCol, ok := src.Next(0); ok; srcCol, ok = src.Next(srcCol + 1) {
+	for srcCol, ok := leftSrc.Cols.Next(0); ok; srcCol, ok = leftSrc.Cols.Next(srcCol + 1) {
+		ord := leftSrc.Table.ColumnOrdinal(srcCol)
+		dstCol := leftDst.Table.ColumnID(ord)
 		colMap.Set(int(srcCol), int(dstCol))
-		dstCol, _ = dst.Next(dstCol + 1)
 	}
-
-	return c.RemapCols(scalar, colMap)
+	for srcCol, ok := rightSrc.Cols.Next(0); ok; srcCol, ok = rightSrc.Cols.Next(srcCol + 1) {
+		ord := rightSrc.Table.ColumnOrdinal(srcCol)
+		dstCol := rightDst.Table.ColumnID(ord)
+		colMap.Set(int(srcCol), int(dstCol))
+	}
+	return c.e.f.RemapCols(scalar, colMap)
 }
 
 // checkConstraintFilters generates all filters that we can derive from the
@@ -121,14 +125,15 @@ func (c *CustomFuncs) mapScalarExprCols(scalar opt.ScalarExpr, src, dst opt.ColS
 // indexes to be constrained and used. Consider the following example:
 //
 // CREATE TABLE abc (
-// 	a INT PRIMARY KEY,
-// 	b INT NOT NULL,
-// 	c STRING NOT NULL,
-// 	CHECK (a < 10 AND a > 1),
-// 	CHECK (b < 10 AND b > 1),
-// 	CHECK (c in ('first', 'second')),
-// 	INDEX secondary (b, a),
-// 	INDEX tertiary (c, b, a))
+//
+//	a INT PRIMARY KEY,
+//	b INT NOT NULL,
+//	c STRING NOT NULL,
+//	CHECK (a < 10 AND a > 1),
+//	CHECK (b < 10 AND b > 1),
+//	CHECK (c in ('first', 'second')),
+//	INDEX secondary (b, a),
+//	INDEX tertiary (c, b, a))
 //
 // Now consider the query: SELECT a, b WHERE a > 5
 //
@@ -138,14 +143,15 @@ func (c *CustomFuncs) mapScalarExprCols(scalar opt.ScalarExpr, src, dst opt.ColS
 // indexes. In fact, for the above query we can do the following:
 //
 // select
-//  ├── columns: a:1(int!null) b:2(int!null)
-//  ├── scan abc@tertiary
-//  │		├── columns: a:1(int!null) b:2(int!null)
-//  │		└── constraint: /3/2/1: [/'first'/2/6 - /'first'/9/9] [/'second'/2/6 - /'second'/9/9]
-//  └── filters
-//        └── gt [type=bool]
-//            ├── variable: a [type=int]
-//            └── const: 5 [type=int]
+//
+//	├── columns: a:1(int!null) b:2(int!null)
+//	├── scan abc@tertiary
+//	│		├── columns: a:1(int!null) b:2(int!null)
+//	│		└── constraint: /3/2/1: [/'first'/2/6 - /'first'/9/9] [/'second'/2/6 - /'second'/9/9]
+//	└── filters
+//	      └── gt [type=bool]
+//	          ├── variable: a [type=int]
+//	          └── const: 5 [type=int]
 //
 // Similarly, the secondary index could also be used. All such index scans
 // will be added to the memo group.
@@ -173,6 +179,7 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 	md := c.e.mem.Metadata()
 	tabMeta := md.TableMeta(tabID)
 	index := tabMeta.Table.Index(indexOrd)
+	ps := tabMeta.IndexPartitionLocality(index.Ordinal())
 	columns := make([]opt.OrderingColumn, index.LaxKeyColumnCount())
 	var notNullCols opt.ColSet
 	for i := range columns {
@@ -188,305 +195,13 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 
 	// Generate index constraints.
 	ic.Init(
-		requiredFilters, optionalFilters,
+		c.e.ctx, requiredFilters, optionalFilters,
 		columns, notNullCols, tabMeta.ComputedCols,
-		true /* consolidate */, c.e.evalCtx, c.e.f,
+		tabMeta.ColsInComputedColsExpressions,
+		true /* consolidate */, c.e.evalCtx, c.e.f, ps,
+		c.checkCancellation,
 	)
 	return ic
-}
-
-// computedColFilters generates all filters that can be derived from the list of
-// computed column expressions from the given table. A computed column can be
-// used as a filter when it has a constant value. That is true when:
-//
-//   1. All other columns it references are constant, because other filters in
-//      the query constrain them to be so.
-//   2. All functions in the computed column expression can be folded into
-//      constants (i.e. they do not have problematic side effects).
-//
-// Note that computed columns can depend on other computed columns; in general
-// the dependencies form an acyclic directed graph. computedColFilters will
-// return filters for all constant computed columns, regardless of the order of
-// their dependencies.
-//
-// As with checkConstraintFilters, computedColFilters do not really filter any
-// rows, they are rather facts or guarantees about the data. Treating them as
-// filters may allow some indexes to be constrained and used. Consider the
-// following example:
-//
-//   CREATE TABLE t (
-//     k INT NOT NULL,
-//     hash INT AS (k % 4) STORED,
-//     PRIMARY KEY (hash, k)
-//   )
-//
-//   SELECT * FROM t WHERE k = 5
-//
-// Notice that the filter provided explicitly wouldn't allow the optimizer to
-// seek using the primary index (it would have to fall back to a table scan).
-// However, column "hash" can be proven to have the constant value of 1, since
-// it's dependent on column "k", which has the constant value of 5. This enables
-// usage of the primary index:
-//
-//     scan t
-//      ├── columns: k:1(int!null) hash:2(int!null)
-//      ├── constraint: /2/1: [/1/5 - /1/5]
-//      ├── key: (2)
-//      └── fd: ()-->(1)
-//
-// The values of both columns in that index are known, enabling a single value
-// constraint to be generated.
-func (c *CustomFuncs) computedColFilters(
-	scanPrivate *memo.ScanPrivate, requiredFilters, optionalFilters memo.FiltersExpr,
-) memo.FiltersExpr {
-	tabMeta := c.e.mem.Metadata().TableMeta(scanPrivate.Table)
-	if len(tabMeta.ComputedCols) == 0 {
-		return nil
-	}
-
-	// Start with set of constant columns, as derived from the list of filter
-	// conditions.
-	constCols := make(constColsMap)
-	c.findConstantFilterCols(constCols, scanPrivate, requiredFilters)
-	c.findConstantFilterCols(constCols, scanPrivate, optionalFilters)
-	if len(constCols) == 0 {
-		// No constant values could be derived from filters, so assume that there
-		// are also no constant computed columns.
-		return nil
-	}
-
-	// Construct a new filter condition for each computed column that is
-	// constant (i.e. all of its variables are in the constCols set).
-	var computedColFilters memo.FiltersExpr
-	for colID := range tabMeta.ComputedCols {
-		if c.tryFoldComputedCol(tabMeta, colID, constCols) {
-			constVal := constCols[colID]
-			// Note: Eq is not correct here because of NULLs.
-			eqOp := c.e.f.ConstructIs(c.e.f.ConstructVariable(colID), constVal)
-			computedColFilters = append(computedColFilters, c.e.f.ConstructFiltersItem(eqOp))
-		}
-	}
-	return computedColFilters
-}
-
-// constColsMap maps columns to constant values that we can infer from query
-// filters.
-//
-// Note that for composite types, the constant value is not interchangeable with
-// the column in all contexts. Composite types are types which can have
-// logically equal but not identical values, like the decimals 1.0 and 1.00.
-//
-// For example:
-//   CREATE TABLE t (
-//     d DECIMAL,
-//     c DECIMAL AS (d*10) STORED
-//   );
-//   INSERT INTO t VALUES (1.0), (1.00), (1.000);
-//   SELECT c::STRING FROM t WHERE d=1;
-//   ----
-//     10.0
-//     10.00
-//     10.000
-//
-// We can infer that c has a constant value of 1 but we can't replace it with 1
-// in any expression.
-type constColsMap map[opt.ColumnID]opt.ScalarExpr
-
-// findConstantFilterCols adds to constFilterCols mappings from table column ID
-// to the constant value of that column. It does this by iterating over the
-// given lists of filters and finding expressions that constrain columns to a
-// single constant value. For example:
-//
-//   x = 5 AND y = 'foo'
-//
-// This would add a mapping from x => 5 and y => 'foo', which constants can
-// then be used to prove that dependent computed columns are also constant.
-func (c *CustomFuncs) findConstantFilterCols(
-	constFilterCols constColsMap, scanPrivate *memo.ScanPrivate, filters memo.FiltersExpr,
-) {
-	tab := c.e.mem.Metadata().Table(scanPrivate.Table)
-	for i := range filters {
-		// If filter constraints are not tight, then no way to derive constant
-		// values.
-		props := filters[i].ScalarProps()
-		if !props.TightConstraints {
-			continue
-		}
-
-		// Iterate over constraint conjuncts with a single column and single
-		// span having a single key.
-		for i, n := 0, props.Constraints.Length(); i < n; i++ {
-			cons := props.Constraints.Constraint(i)
-			if cons.Columns.Count() != 1 || cons.Spans.Count() != 1 {
-				continue
-			}
-
-			// Skip columns that aren't in the scanned table.
-			colID := cons.Columns.Get(0).ID()
-			if !scanPrivate.Cols.Contains(colID) {
-				continue
-			}
-
-			colTyp := tab.Column(scanPrivate.Table.ColumnOrdinal(colID)).DatumType()
-
-			span := cons.Spans.Get(0)
-			if !span.HasSingleKey(c.e.evalCtx) {
-				continue
-			}
-
-			datum := span.StartKey().Value(0)
-			if datum != tree.DNull {
-				constFilterCols[colID] = c.e.f.ConstructConstVal(datum, colTyp)
-			}
-		}
-	}
-}
-
-// isZoneLocal returns true if the given zone config indicates that the replicas
-// it constrains will be primarily located in the localRegion.
-func isZoneLocal(zone cat.Zone, localRegion string) bool {
-	// First count the number of local and remote replica constraints. If all
-	// are local or all are remote, we can return early.
-	local, remote := 0, 0
-	for i, n := 0, zone.ReplicaConstraintsCount(); i < n; i++ {
-		replicaConstraint := zone.ReplicaConstraints(i)
-		for j, m := 0, replicaConstraint.ConstraintCount(); j < m; j++ {
-			constraint := replicaConstraint.Constraint(j)
-			if isLocal, ok := isConstraintLocal(constraint, localRegion); ok {
-				if isLocal {
-					local++
-				} else {
-					remote++
-				}
-			}
-		}
-	}
-	if local > 0 && remote == 0 {
-		return true
-	}
-	if remote > 0 && local == 0 {
-		return false
-	}
-
-	// Next check the voter replica constraints. Once again, if all are local or
-	// all are remote, we can return early.
-	local, remote = 0, 0
-	for i, n := 0, zone.VoterConstraintsCount(); i < n; i++ {
-		replicaConstraint := zone.VoterConstraint(i)
-		for j, m := 0, replicaConstraint.ConstraintCount(); j < m; j++ {
-			constraint := replicaConstraint.Constraint(j)
-			if isLocal, ok := isConstraintLocal(constraint, localRegion); ok {
-				if isLocal {
-					local++
-				} else {
-					remote++
-				}
-			}
-		}
-	}
-	if local > 0 && remote == 0 {
-		return true
-	}
-	if remote > 0 && local == 0 {
-		return false
-	}
-
-	// Use the lease preferences as a tie breaker. We only really care about the
-	// first one, since subsequent lease preferences only apply in edge cases.
-	if zone.LeasePreferenceCount() > 0 {
-		leasePref := zone.LeasePreference(0)
-		for i, n := 0, leasePref.ConstraintCount(); i < n; i++ {
-			constraint := leasePref.Constraint(i)
-			if isLocal, ok := isConstraintLocal(constraint, localRegion); ok {
-				return isLocal
-			}
-		}
-	}
-
-	return false
-}
-
-// isConstraintLocal returns isLocal=true and ok=true if the given constraint is
-// a required constraint matching the given localRegion. Returns isLocal=false
-// and ok=true if the given constraint is a prohibited constraint matching the
-// given local region or if it is a required constraint matching a different
-// region. Any other scenario returns ok=false, since this constraint gives no
-// information about whether the constrained replicas are local or remote.
-func isConstraintLocal(constraint cat.Constraint, localRegion string) (isLocal bool, ok bool) {
-	if constraint.GetKey() != regionKey {
-		// We only care about constraints on the region.
-		return false /* isLocal */, false /* ok */
-	}
-	if constraint.GetValue() == localRegion {
-		if constraint.IsRequired() {
-			// The local region is required.
-			return true /* isLocal */, true /* ok */
-		}
-		// The local region is prohibited.
-		return false /* isLocal */, true /* ok */
-	}
-	if constraint.IsRequired() {
-		// A remote region is required.
-		return false /* isLocal */, true /* ok */
-	}
-	// A remote region is prohibited, so this constraint gives no information
-	// about whether the constrained replicas are local or remote.
-	return false /* isLocal */, false /* ok */
-}
-
-// prefixIsLocal contains a PARTITION BY LIST prefix, and a boolean indicating
-// whether the prefix is from a local partition.
-type prefixIsLocal struct {
-	prefix  tree.Datums
-	isLocal bool
-}
-
-// prefixSorter sorts prefixes (which are wrapped in prefixIsLocal structs) so
-// that longer prefixes are ordered first.
-type prefixSorter []prefixIsLocal
-
-var _ sort.Interface = &prefixSorter{}
-
-// Len is part of sort.Interface.
-func (ps prefixSorter) Len() int {
-	return len(ps)
-}
-
-// Less is part of sort.Interface.
-func (ps prefixSorter) Less(i, j int) bool {
-	return len(ps[i].prefix) > len(ps[j].prefix)
-}
-
-// Swap is part of sort.Interface.
-func (ps prefixSorter) Swap(i, j int) {
-	ps[i], ps[j] = ps[j], ps[i]
-}
-
-// getSortedPrefixes collects all the prefixes from all the different partitions
-// in the index (remembering which ones came from local partitions), and sorts
-// them so that longer prefixes come before shorter prefixes.
-func getSortedPrefixes(index cat.Index, localPartitions util.FastIntSet) []prefixIsLocal {
-	allPrefixes := make(prefixSorter, 0, index.PartitionCount())
-	for i, n := 0, index.PartitionCount(); i < n; i++ {
-		part := index.Partition(i)
-		isLocal := localPartitions.Contains(i)
-		partitionPrefixes := part.PartitionByListPrefixes()
-		if len(partitionPrefixes) == 0 {
-			// This can happen when the partition value is DEFAULT.
-			allPrefixes = append(allPrefixes, prefixIsLocal{
-				prefix:  nil,
-				isLocal: isLocal,
-			})
-		}
-		for j := range partitionPrefixes {
-			allPrefixes = append(allPrefixes, prefixIsLocal{
-				prefix:  partitionPrefixes[j],
-				isLocal: isLocal,
-			})
-		}
-	}
-	sort.Sort(allPrefixes)
-	return allPrefixes
 }
 
 // splitScanIntoUnionScans tries to find a UnionAll of Scan operators (with an
@@ -497,7 +212,6 @@ func getSortedPrefixes(index cat.Index, localPartitions util.FastIntSet) []prefi
 // returned. This is beneficial in cases where an ordering is required on a
 // suffix of the index columns, and constraining the first column(s) allows the
 // scan to provide that ordering.
-// TODO(drewk): handle inverted scans.
 func (c *CustomFuncs) splitScanIntoUnionScans(
 	ordering props.OrderingChoice,
 	scan memo.RelExpr,
@@ -506,10 +220,72 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 	limit int,
 	keyPrefixLength int,
 ) (_ memo.RelExpr, ok bool) {
-	const maxScanCount = 16
-	const threshold = 4
+	return c.splitScanIntoUnionScansOrSelects(ordering, scan, sp, cons, limit, keyPrefixLength, nil /* filters */)
+}
 
-	keyCtx := constraint.MakeKeyContext(&cons.Columns, c.e.evalCtx)
+// splitScanIntoUnionScansOrSelects tries to find a UnionAll of Scan operators,
+// (with an optional hard limit), or UnionAll of Selects from Scans that each
+// scan over a single key from the original Scan's constraints. The UnionAll is
+// returned if the scans/selects can provide the given ordering, and if the
+// statistics suggest that splitting them could be beneficial. If no such
+// UnionAll of Scans/Selects can be found, ok=false is returned. This is
+// beneficial in cases where an ordering is required on a suffix of the index
+// columns, and constraining the first column(s) allows the scan to provide that
+// ordering.
+// TODO(drewk): handle inverted scans.
+func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
+	ordering props.OrderingChoice,
+	scan memo.RelExpr,
+	sp *memo.ScanPrivate,
+	cons *constraint.Constraint,
+	limit int,
+	keyPrefixLength int,
+	filters memo.FiltersExpr,
+) (_ memo.RelExpr, ok bool) {
+	// Hash index bucket count may be higher than 16, especially in large table
+	// cases. Pick a default maxScanCount sufficiently high to avoid disabling
+	// this optimization for such indexes with high bucket count, but not so high
+	// that we might plan thousands of Scans. If IN list check constraints on the
+	// first index column exist, use that to find the number for maxScanCount.
+	// TODO(msirek): Is there a more efficient way to represent this plan when #
+	//   of scans is high, for example, introduce new operation types like
+	//   "SkipScanExpr", "SkipSelectExpr", "LooseScanExpr", "LooseSelectExpr" (see
+	//   https://wiki.postgresql.org/wiki/Loose_indexscan and
+	//   https://github.com/cockroachdb/cockroach/pull/38216), or maybe just set
+	//   new read modes in the pre-existing ScanExpr and SelectExpr?
+	//   This would allow us to represent order-preserving skip scans without the
+	//   need for large UNION ALL expressions.
+	//
+	// TODO(msirek): We may want to lift this max entirely at some point.
+	// maxScanCount is the maximum number of scans to produce if there is no
+	// non-null check constraint defined on the first index column.
+	maxScanCount := 256
+	// hardMaxScanCount is the upper limit on what we'll attempt to increase
+	// maxScanCount to using numAllowedValues() based on check constraint values.
+	// This is configurable using a session setting opt_split_scan_limit.
+	// If OptSplitScanLimit is below maxScanCount, we will decrease maxScanCount
+	// to that value because a hard limit should never be lower than a soft limit.
+	hardMaxScanCount := int(c.e.evalCtx.SessionData().OptSplitScanLimit)
+	if hardMaxScanCount < maxScanCount {
+		maxScanCount = hardMaxScanCount
+	}
+	if cons.Columns.Count() == 0 {
+		return
+	}
+	firstColID := cons.Columns.Get(0).ID()
+	// The number of allowed values from the check constraints may surpass
+	// maxScanCount. Find this number so we don't inadvertently disable this
+	// optimization.
+	if checkConstraintValues, ok := c.numAllowedValues(firstColID, sp.Table); ok {
+		if maxScanCount < checkConstraintValues {
+			if checkConstraintValues > hardMaxScanCount {
+				maxScanCount = hardMaxScanCount
+			} else {
+				maxScanCount = checkConstraintValues
+			}
+		}
+	}
+	keyCtx := constraint.MakeKeyContext(c.e.ctx, &cons.Columns, c.e.evalCtx)
 	spans := cons.Spans
 
 	// Get the total number of keys that can be extracted from the spans. Also
@@ -526,6 +302,7 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 				// Splitting any spans from this span on would lead to exceeding the max
 				// Scan count. Keep track of the index of this span.
 				budgetExceededIndex = i
+				break
 			}
 		}
 	}
@@ -539,13 +316,16 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 		// We will construct at most maxScanCount new Scans.
 		scanCount = maxScanCount
 	}
-
+	rowCount := scan.Relational().Statistics().RowCount
 	if limit > 0 {
-		if scan.Relational().Stats.Available &&
-			float64(scanCount*limit*threshold) >= scan.Relational().Stats.RowCount {
+		nLogN := rowCount * math.Log2(rowCount)
+		if scan.Relational().Statistics().Available &&
+			float64(scanCount*randIOCostFactor+limit*seqIOCostFactor) >= nLogN {
 			// Splitting the Scan may not be worth the overhead. Creating a sequence of
 			// Scans and Unions is expensive, so we only want to create the plan if it
-			// is likely to be used.
+			// is likely to be used. This rewrite is competing against a plan with a
+			// sort, which is approximately O(N log N), so use that as a rough costing
+			// threshold.
 			return nil, false
 		}
 	}
@@ -558,14 +338,19 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 		return nil, false
 	}
 	newHardLimit := memo.MakeScanLimit(int64(limit), reverse)
+	// With a filter we might have to scan all rows before reaching the LIMIT.
+	if !filters.IsTrue() {
+		newHardLimit = 0
+	}
 
-	// makeNewUnion extends the UnionAll tree rooted at 'last' to include
-	// 'newScan'. The ColumnIDs of the original Scan are used by the resulting
-	// expression.
-	makeNewUnion := func(last, newScan memo.RelExpr, outCols opt.ColList) memo.RelExpr {
-		return c.e.f.ConstructUnionAll(last, newScan, &memo.SetPrivate{
-			LeftCols:  last.Relational().OutputCols.ToList(),
-			RightCols: newScan.Relational().OutputCols.ToList(),
+	// makeNewUnion builds a UnionAll tree node with 'left' and 'right' child
+	// nodes, which may be scans, selects or previously-built UnionAllExprs. The
+	// ColumnIDs of the original Scan are used by the resulting expression, but it
+	// is up to the caller to set this via outCols.
+	makeNewUnion := func(left, right memo.RelExpr, outCols opt.ColList) memo.RelExpr {
+		return c.e.f.ConstructUnionAll(left, right, &memo.SetPrivate{
+			LeftCols:  left.Relational().OutputCols.ToList(),
+			RightCols: right.Relational().OutputCols.ToList(),
 			OutCols:   outCols,
 		})
 	}
@@ -576,6 +361,8 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 	// UnionAll tree.
 	var noLimitSpans constraint.Spans
 	var last memo.RelExpr
+	spColList := sp.Cols.ToList()
+	queue := list.New()
 	for i, n := 0, spans.Count(); i < n; i++ {
 		if i >= budgetExceededIndex {
 			// The Scan budget has been reached; no additional Scans can be created.
@@ -590,28 +377,91 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 			continue
 		}
 		for j, m := 0, singleKeySpans.Count(); j < m; j++ {
-			if last == nil {
-				// This is the first limited Scan, so no UnionAll necessary.
-				last = c.makeNewScan(sp, cons.Columns, newHardLimit, singleKeySpans.Get(j))
-				continue
-			}
 			// Construct a new Scan for each span.
-			newScan := c.makeNewScan(sp, cons.Columns, newHardLimit, singleKeySpans.Get(j))
-
-			// Add the scan to the union tree. If it is the final union in the
-			// tree, use the original scan's columns as the union's out columns.
-			// Otherwise, create new output column IDs for the union.
-			var outCols opt.ColList
-			finalUnion := i == n-1 && j == m-1 && noLimitSpans.Count() == 0
-			if finalUnion {
-				outCols = sp.Cols.ToList()
-			} else {
-				_, cols := c.DuplicateColumnIDs(sp.Table, sp.Cols)
-				outCols = cols.ToList()
+			// Note: newHardLimit will be 0 (i.e., no limit) if there are
+			// filters to be applied in a Select.
+			newScanPrivate := c.makeNewScanPrivate(
+				sp,
+				cons.Columns,
+				newHardLimit,
+				singleKeySpans.Get(j),
+			)
+			newScanOrLimitedSelect := c.e.f.ConstructScan(newScanPrivate)
+			if !filters.IsTrue() {
+				// If there are filters, apply them and a limit. The limit is
+				// not needed if there are no filters because the scan's hard
+				// limit will be set (see newHardLimit).
+				//
+				// TODO(mgartner/msirek): Converting ColSets to ColLists here is
+				// only safe because column IDs are always allocated in a
+				// consistent, ascending order for each duplicated table in the
+				// metadata. If column ID allocation changes, this could break.
+				newColList := newScanPrivate.Cols.ToList()
+				newScanOrLimitedSelect = c.e.f.ConstructLimit(
+					c.e.f.ConstructSelect(
+						newScanOrLimitedSelect,
+						c.RemapScanColsInFilter(filters, sp, newScanPrivate),
+					),
+					c.IntConst(tree.NewDInt(tree.DInt(limit))),
+					ordering.RemapColumns(spColList, newColList),
+				)
 			}
-			last = makeNewUnion(last, newScan, outCols)
+			queue.PushBack(newScanOrLimitedSelect)
 		}
 	}
+
+	// Return early if the queue is empty. This is possible if the first
+	// splittable span splits into a number of keys greater than maxScanCount.
+	if queue.Len() == 0 {
+		return nil, false
+	}
+
+	var outCols opt.ColList
+	oddNumScans := (queue.Len() % 2) != 0
+
+	// Make the UNION ALLs as a balanced tree. This performs better for large
+	// numbers of spans than a left-deep tree because neighboring branches can
+	// be processed in parallel and the deeper the tree, the more comparisons the
+	// rows from the deepest nodes in the tree need to undergo as rows are merged
+	// for each UNION ALL operation.
+	//
+	// This balanced tree building  works by feeding RelExprs into a queue and
+	// popping them from the front, combining each pair of nodes with a
+	// UnionAllOp. Initially only Scan or Select operations are pushed to the
+	// queue, so the first round of UnionAllOps, representing the deepest level of
+	// the tree, contain only unions of scans. As UnionAllOps are built, they are
+	// fed into the back of the queue, and when all scans have been popped from
+	// the queue, the unions are processed. The unions themselves are then built
+	// as children of new UnionAllOps. For every two UnionAllOps popped, we push
+	// one new parent UnionAllOp onto the queue. Eventually we will end up with
+	// only a single RelExpr in the queue, which is our root node.
+	for queue.Len() > 1 {
+		left := queue.Front()
+		queue.Remove(left)
+		right := queue.Front()
+		queue.Remove(right)
+		if oddNumScans &&
+			(left.Value.(memo.RelExpr).Op() == opt.UnionAllOp ||
+				right.Value.(memo.RelExpr).Op() == opt.UnionAllOp) {
+			// Not necessary, but keep spans with lower values in the left subtree.
+			left, right = right, left
+		}
+		// TODO(mgartner/msirek): Converting ColSets to ColLists here is only safe
+		// because column IDs are always allocated in a consistent, ascending order
+		// for each duplicated table in the metadata. If column ID allocation
+		// changes, this could break.
+		if noLimitSpans.Count() == 0 && queue.Len() == 0 {
+			outCols = sp.Cols.ToList()
+		} else {
+			_, cols := c.DuplicateColumnIDs(sp.Table, sp.Cols)
+			outCols = cols.ToList()
+		}
+		queue.PushBack(makeNewUnion(left.Value.(memo.RelExpr), right.Value.(memo.RelExpr), outCols))
+	}
+	lastElem := queue.Front()
+	last = lastElem.Value.(memo.RelExpr)
+	queue.Remove(lastElem)
+
 	if noLimitSpans.Count() == spans.Count() {
 		// Expect to generate at least one new limited single-key Scan. This could
 		// happen if a valid key count could be obtained for at least span, but no
@@ -626,12 +476,92 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 	// If any spans could not be used to generate limited Scans, use them to
 	// construct an unlimited Scan and add it to the UnionAll tree.
 	newScanPrivate := c.DuplicateScanPrivate(sp)
-	newScanPrivate.SetConstraint(c.e.evalCtx, &constraint.Constraint{
-		Columns: sp.Constraint.Columns.RemapColumns(sp.Table, newScanPrivate.Table),
+	// Map from cons Columns to new columns.
+	newScanPrivate.SetConstraint(c.e.ctx, c.e.evalCtx, &constraint.Constraint{
+		Columns: cons.Columns.RemapColumns(sp.Table, newScanPrivate.Table),
 		Spans:   noLimitSpans,
 	})
-	newScan := c.e.f.ConstructScan(newScanPrivate)
-	return makeNewUnion(last, newScan, sp.Cols.ToList()), true
+	// TODO(mgartner): We should be able to add a LIMIT above the Scan or Select
+	// below, as long as we remap the original ordering columns. This could
+	// allow a top-k to be planned instead of a sort.
+	newScanOrSelect := c.e.f.ConstructScan(newScanPrivate)
+	if !filters.IsTrue() {
+		newScanOrSelect = c.e.f.ConstructSelect(
+			newScanOrSelect,
+			c.RemapScanColsInFilter(filters, sp, newScanPrivate),
+		)
+	}
+	// TODO(mgartner/msirek): Converting ColSets to ColLists here is only safe
+	// because column IDs are always allocated in a consistent, ascending order
+	// for each duplicated table in the metadata. If column ID allocation
+	// changes, this could break.
+	return makeNewUnion(last, newScanOrSelect, spColList), true
+}
+
+// numAllowedValues returns the number of allowed values for a column with a
+// given columnID by checking if there is a CHECK constraint with no nulls
+// defined on it and returning the maximum number of results that can be read
+// from Spans on that individual column. If not found, (0, false) is returned.
+func (c *CustomFuncs) numAllowedValues(
+	columnID opt.ColumnID, tabID opt.TableID,
+) (numValues int, ok bool) {
+	tabMeta := c.e.f.Metadata().TableMeta(tabID)
+	constraints := tabMeta.Constraints
+	if constraints == nil {
+		return 0, false
+	}
+	if constraints.Op() != opt.FiltersOp {
+		return 0, false
+	}
+	cols := opt.MakeColSet(columnID)
+	filters := *constraints.(*memo.FiltersExpr)
+	// For each ANDed check constraint...
+	for i := 0; i < len(filters); i++ {
+		filter := &filters[i]
+		// This must be some type of comparison operation, or an OR or AND
+		// expression. These operations have at least 2 children.
+		if filter.Condition.ChildCount() < 2 {
+			continue
+		}
+		if filter.ScalarProps().Constraints == nil {
+			continue
+		}
+		for j := 0; j < filter.ScalarProps().Constraints.Length(); j++ {
+			constraint := filter.ScalarProps().Constraints.Constraint(j)
+			firstConstraintColID := constraint.Columns.Get(0).ID()
+			if columnID != firstConstraintColID {
+				continue
+			}
+			if constraint.IsContradiction() || constraint.IsUnconstrained() {
+				continue
+			}
+			if distinctVals, ok := constraint.CalculateMaxResults(c.e.ctx, c.e.evalCtx, cols, cols); ok {
+				if distinctVals > math.MaxInt32 {
+					return math.MaxInt32, true
+				}
+				return int(distinctVals), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// indexHasOrderingSequenceOnOne returns whether the Scan can provide an
+// ordering on at least one of the columns in cols, in either the forward or
+// reverse direction, under the assumption that we are scanning a single-key
+// span with the given keyLength.
+func indexHasOrderingSequenceOnOne(
+	md *opt.Metadata, scan memo.RelExpr, sp *memo.ScanPrivate, cols opt.ColSet, keyLength int,
+) (hasSequence bool) {
+	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col) {
+		var ord props.OrderingChoice
+		ord.AppendCol(col, false)
+		if has, _ := indexHasOrderingSequence(md, scan, sp, ord, keyLength); has {
+			return true
+		}
+		col++
+	}
+	return false
 }
 
 // indexHasOrderingSequence returns whether the Scan can provide a given
@@ -656,7 +586,6 @@ func (c *CustomFuncs) splitScanIntoUnionScans(
 // keyLength: 1,
 // =>
 // hasSequence: False, reverse: False
-//
 func indexHasOrderingSequence(
 	md *opt.Metadata,
 	scan memo.RelExpr,
@@ -696,16 +625,16 @@ func indexHasOrderingSequence(
 	return ordering.ScanPrivateCanProvide(md, sp, &requiredOrdering)
 }
 
-// makeNewScan constructs a new Scan operator with a new TableID and the given
-// limit and span. All ColumnIDs and references to those ColumnIDs are
-// replaced with new ones from the new TableID. All other fields are simply
-// copied from the old ScanPrivate.
-func (c *CustomFuncs) makeNewScan(
+// makeNewScanPrivate returns a new ScanPrivate with a new TableID and the given
+// limit and span. All ColumnIDs and references to those ColumnIDs are replaced
+// with new ones from the new TableID. All other fields are simply copied from
+// the old ScanPrivate.
+func (c *CustomFuncs) makeNewScanPrivate(
 	sp *memo.ScanPrivate,
 	columns constraint.Columns,
 	newHardLimit memo.ScanLimit,
 	span *constraint.Span,
-) memo.RelExpr {
+) *memo.ScanPrivate {
 	newScanPrivate := c.DuplicateScanPrivate(sp)
 
 	// duplicateScanPrivate does not initialize the Constraint or HardLimit
@@ -720,9 +649,9 @@ func (c *CustomFuncs) makeNewScan(
 		Columns: columns.RemapColumns(sp.Table, newScanPrivate.Table),
 		Spans:   newSpans,
 	}
-	newScanPrivate.SetConstraint(c.e.evalCtx, newConstraint)
+	newScanPrivate.SetConstraint(c.e.ctx, c.e.evalCtx, newConstraint)
 
-	return c.e.f.ConstructScan(newScanPrivate)
+	return newScanPrivate
 }
 
 // getKnownScanConstraint returns a Constraint that is known to hold true for
@@ -732,21 +661,22 @@ func (c *CustomFuncs) makeNewScan(
 // constraints. getKnownScanConstraint assumes that the scan is not inverted.
 func (c *CustomFuncs) getKnownScanConstraint(
 	sp *memo.ScanPrivate,
-) (cons *constraint.Constraint, found bool) {
+) (_ *constraint.Constraint, found bool) {
 	if sp.Constraint != nil {
 		// The ScanPrivate has a constraint, so return it.
-		cons = sp.Constraint
-	} else {
-		// Build a constraint set with the check constraints of the underlying
-		// table.
-		filters := c.checkConstraintFilters(sp.Table)
-		instance := c.initIdxConstraintForIndex(
-			nil, /* requiredFilters */
-			filters,
-			sp.Table,
-			sp.Index,
-		)
-		cons = instance.Constraint()
+		return sp.Constraint, !sp.Constraint.IsUnconstrained()
 	}
-	return cons, !cons.IsUnconstrained()
+
+	// Build a constraint set with the check constraints of the underlying
+	// table.
+	filters := c.checkConstraintFilters(sp.Table)
+	instance := c.initIdxConstraintForIndex(
+		nil, /* requiredFilters */
+		filters,
+		sp.Table,
+		sp.Index,
+	)
+	var cons constraint.Constraint
+	instance.Constraint(&cons)
+	return &cons, !cons.IsUnconstrained()
 }

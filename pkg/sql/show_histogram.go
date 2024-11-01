@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,10 +9,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -44,11 +38,11 @@ func (p *planner) ShowHistogram(ctx context.Context, n *tree.ShowHistogram) (pla
 		columns: showHistogramColumns,
 
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			row, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
+			row, err := p.InternalSQLTxn().QueryRowEx(
 				ctx,
 				"read-histogram",
 				p.txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.NodeUserSessionDataOverride,
 				`SELECT histogram
 				 FROM system.table_statistics
 				 WHERE "statisticID" = $1`,
@@ -74,17 +68,22 @@ func (p *planner) ShowHistogram(ctx context.Context, n *tree.ShowHistogram) (pla
 				return nil, err
 			}
 
-			v := p.newContainerValuesNode(showHistogramColumns, 0)
+			v := p.newContainerValuesNode(showHistogramColumns, len(histogram.Buckets))
+			resolver := descs.NewDistSQLTypeResolver(p.descCollection, p.InternalSQLTxn().KV())
+			if err := typedesc.EnsureTypeIsHydrated(ctx, histogram.ColumnType, &resolver); err != nil {
+				return nil, err
+			}
+			var a tree.DatumAlloc
 			for _, b := range histogram.Buckets {
-				ed, _, err := rowenc.EncDatumFromBuffer(
-					histogram.ColumnType, descpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
-				)
+				var upperBound string
+				datum, err := stats.DecodeUpperBound(histogram.Version, histogram.ColumnType, &a, b.UpperBound)
 				if err != nil {
-					v.Close(ctx)
-					return nil, err
+					upperBound = fmt.Sprintf("<error: %v>", err)
+				} else {
+					upperBound = datum.String()
 				}
 				row := tree.Datums{
-					tree.NewDString(ed.String(histogram.ColumnType)),
+					tree.NewDString(upperBound),
 					tree.NewDInt(tree.DInt(b.NumRange)),
 					tree.NewDFloat(tree.DFloat(b.DistinctRange)),
 					tree.NewDInt(tree.DInt(b.NumEq)),

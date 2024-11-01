@@ -1,17 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracing
 
 import (
-	"strings"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -49,6 +44,13 @@ func (s *spanInner) TraceID() tracingpb.TraceID {
 	return s.crdb.TraceID()
 }
 
+func (s *spanInner) SpanID() tracingpb.SpanID {
+	if s.isNoop() {
+		return 0
+	}
+	return s.crdb.SpanID()
+}
+
 func (s *spanInner) isNoop() bool {
 	return s.crdb == nil && s.netTr == nil && s.otelSpan == nil
 }
@@ -57,50 +59,106 @@ func (s *spanInner) isSterile() bool {
 	return s.sterile
 }
 
-func (s *spanInner) RecordingType() RecordingType {
+func (s *spanInner) RecordingType() tracingpb.RecordingType {
 	return s.crdb.recordingType()
 }
 
-func (s *spanInner) SetVerbose(to bool) {
+func (s *spanInner) SetRecordingType(to tracingpb.RecordingType) {
 	if s.isNoop() {
-		panic(errors.AssertionFailedf("SetVerbose called on NoopSpan; use the WithForceRealSpan option for StartSpan"))
+		panic(errors.AssertionFailedf("SetRecordingType called on NoopSpan; use the WithForceRealSpan option for StartSpan"))
 	}
-	s.crdb.SetVerbose(to)
+	s.crdb.SetRecordingType(to)
 }
 
-func (s *spanInner) ResetRecording() {
-	s.crdb.resetRecording()
-}
-
-func (s *spanInner) GetRecording(recType RecordingType) Recording {
+// GetTraceRecording returns the span's recording as a Trace.
+//
+// See also GetRecording(), which returns it as a tracingpb.Recording.
+func (s *spanInner) GetTraceRecording(recType tracingpb.RecordingType, finishing bool) Trace {
 	if s.isNoop() {
-		return nil
+		return Trace{}
 	}
-	return s.crdb.GetRecording(recType)
+	return s.crdb.GetRecording(recType, finishing)
 }
 
-func (s *spanInner) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
-	s.crdb.recordFinishedChildren(remoteSpans)
+// GetRecording returns the span's recording.
+//
+// finishing indicates whether s is in the process of finishing. If it isn't,
+// the recording will include an "_unfinished" tag.
+func (s *spanInner) GetRecording(
+	recType tracingpb.RecordingType, finishing bool,
+) tracingpb.Recording {
+	trace := s.GetTraceRecording(recType, finishing)
+	return trace.ToRecording()
+}
+
+func (s *spanInner) ImportTrace(trace Trace) {
+	s.crdb.recordFinishedChildren(trace)
+}
+
+func treeifyRecording(rec tracingpb.Recording) Trace {
+	if len(rec) == 0 {
+		return Trace{}
+	}
+
+	byParent := make(map[tracingpb.SpanID][]*tracingpb.RecordedSpan)
+	for i := range rec {
+		s := &rec[i]
+		byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
+	}
+	r := treeifyRecordingInner(rec[0], byParent)
+
+	// Include the orphans under the root.
+	orphans := rec.OrphanSpans()
+	traces := make([]Trace, len(orphans))
+	for i, sp := range orphans {
+		traces[i] = treeifyRecordingInner(sp, byParent)
+	}
+	r.addChildren(traces, 0 /* maxSpans */, 0 /* maxStructuredBytes */)
+	return r
+}
+
+func treeifyRecordingInner(
+	sp tracingpb.RecordedSpan, byParent map[tracingpb.SpanID][]*tracingpb.RecordedSpan,
+) Trace {
+	r := MakeTrace(sp)
+	children := make([]Trace, len(byParent[sp.SpanID]))
+	for i, s := range byParent[sp.SpanID] {
+		children[i] = treeifyRecordingInner(*s, byParent)
+	}
+	r.addChildren(children, 0 /* maxSpans */, 0 /* maxStructuredBytes */)
+	return r
 }
 
 func (s *spanInner) Finish() {
-	if s == nil {
-		return
-	}
-	if s.isNoop() {
+	if s == nil || s.isNoop() {
 		return
 	}
 
 	if !s.crdb.finish() {
-		// The span was already finished. External spans and net/trace are not
-		// always forgiving about spans getting finished twice, but it may happen so
-		// let's be resilient to it.
+		// Short-circuit because netTr.Finish does not tolerate double-finish.
 		return
 	}
 
 	if s.otelSpan != nil {
+		// Serialize the lazy tags.
+		s.crdb.mu.Lock()
+		defer s.crdb.mu.Unlock()
+		for _, lazyTagGroup := range s.crdb.getLazyTagGroupsLocked() {
+			for _, tag := range lazyTagGroup.Tags {
+				key := attribute.Key(tag.Key)
+				if lazyTagGroup.Name != tracingpb.AnonymousTagGroupName {
+					key = attribute.Key(fmt.Sprintf("%s-%s", lazyTagGroup.Name, tag.Key))
+				}
+				s.otelSpan.SetAttributes(attribute.KeyValue{
+					Key:   key,
+					Value: attribute.StringValue(tag.Value),
+				})
+			}
+		}
+
 		s.otelSpan.End()
 	}
+
 	if s.netTr != nil {
 		s.netTr.Finish()
 	}
@@ -109,7 +167,7 @@ func (s *spanInner) Finish() {
 func (s *spanInner) Meta() SpanMeta {
 	var traceID tracingpb.TraceID
 	var spanID tracingpb.SpanID
-	var recordingType RecordingType
+	var recordingType tracingpb.RecordingType
 	var sterile bool
 
 	if s.crdb != nil {
@@ -139,27 +197,19 @@ func (s *spanInner) Meta() SpanMeta {
 	}
 }
 
-func (s *spanInner) SetOperationName(operationName string) *spanInner {
+// OperationName returns the span's name. The name was specified at span
+// creation time.
+func (s *spanInner) OperationName() string {
 	if s.isNoop() {
-		return s
+		return "noop"
 	}
-	if s.otelSpan != nil {
-		s.otelSpan.SetName(operationName)
-	}
-	s.crdb.mu.Lock()
-	s.crdb.mu.operation = operationName
-	s.crdb.mu.Unlock()
-	return s
+	return s.crdb.operation
 }
 
 func (s *spanInner) SetTag(key string, value attribute.Value) *spanInner {
 	if s.isNoop() {
 		return s
 	}
-	return s.setTagInner(key, value, false /* locked */)
-}
-
-func (s *spanInner) setTagInner(key string, value attribute.Value, locked bool) *spanInner {
 	if s.otelSpan != nil {
 		s.otelSpan.SetAttributes(attribute.KeyValue{
 			Key:   attribute.Key(key),
@@ -169,13 +219,39 @@ func (s *spanInner) setTagInner(key string, value attribute.Value, locked bool) 
 	if s.netTr != nil {
 		s.netTr.LazyPrintf("%s:%v", key, value)
 	}
-	// The internal tags will be used if we start a recording on this Span.
-	if !locked {
-		s.crdb.mu.Lock()
-		defer s.crdb.mu.Unlock()
-	}
+	s.crdb.mu.Lock()
+	defer s.crdb.mu.Unlock()
 	s.crdb.setTagLocked(key, value)
 	return s
+}
+
+func (s *spanInner) SetLazyTag(key string, value interface{}) *spanInner {
+	if s.isNoop() {
+		return s
+	}
+	s.crdb.mu.Lock()
+	defer s.crdb.mu.Unlock()
+	s.crdb.setLazyTagLocked(key, value)
+	return s
+}
+
+func (s *spanInner) setLazyTagLocked(key string, value interface{}) *spanInner {
+	if s.isNoop() {
+		return s
+	}
+	s.crdb.setLazyTagLocked(key, value)
+	return s
+}
+
+// GetLazyTag returns the value of the tag with the given key. If that tag doesn't
+// exist, the bool retval is false.
+func (s *spanInner) GetLazyTag(key string) (interface{}, bool) {
+	if s.isNoop() {
+		return attribute.Value{}, false
+	}
+	s.crdb.mu.Lock()
+	defer s.crdb.mu.Unlock()
+	return s.crdb.getLazyTagLocked(key)
 }
 
 func (s *spanInner) RecordStructured(item Structured) {
@@ -184,9 +260,10 @@ func (s *spanInner) RecordStructured(item Structured) {
 	}
 	s.crdb.recordStructured(item)
 	if s.hasVerboseSink() {
-		// NB: TrimSpace avoids the trailing whitespace generated by the
-		// protobuf stringers.
-		s.Record(strings.TrimSpace(item.String()))
+		// Do not call .String() on the item, so that non-redactable bits
+		// in its representation are properly preserved by Recordf() in
+		// verbose recordings.
+		s.Recordf("%v", item)
 	}
 }
 
@@ -198,7 +275,22 @@ func (s *spanInner) Recordf(format string, args ...interface{}) {
 	if !s.hasVerboseSink() {
 		return
 	}
-	str := redact.Sprintf(format, args...)
+	var str redact.RedactableString
+	if s.Tracer().Redactable() {
+		str = redact.Sprintf(format, args...)
+	} else {
+		// `fmt.Sprintf` when called on a logEntry will use the faster
+		// `logEntry.String` method instead of `logEntry.SafeFormat`.
+		// The additional use of `redact.Sprint(...)` is necessary
+		// to wrap the result in redaction markers.
+		str = redact.Sprint(fmt.Sprintf(format, args...))
+	}
+	s.recordRedactable(format, args, str)
+}
+
+func (s *spanInner) recordRedactable(
+	format string, args []interface{}, str redact.RedactableString,
+) {
 	if s.otelSpan != nil {
 		// TODO(obs-inf): depending on the situation it may be more appropriate to
 		// redact the string here.
@@ -215,7 +307,7 @@ func (s *spanInner) Recordf(format string, args ...interface{}) {
 // hasVerboseSink returns false if there is no reason to even evaluate Record
 // because the result wouldn't be used for anything.
 func (s *spanInner) hasVerboseSink() bool {
-	if s.netTr == nil && s.otelSpan == nil && s.RecordingType() != RecordingVerbose {
+	if s.netTr == nil && s.otelSpan == nil && s.RecordingType() != tracingpb.RecordingVerbose {
 		return false
 	}
 	return true

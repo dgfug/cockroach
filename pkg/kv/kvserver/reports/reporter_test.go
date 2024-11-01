@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -19,17 +14,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -40,13 +36,14 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	// This test takes seconds because of replication vagaries.
 	skip.UnderShort(t)
-	// Under stressrace, replication changes seem to hit 1m deadline errors and
+	// Under race, replication changes seem to hit 1m deadline errors and
 	// don't make progress.
-	skip.UnderStressRace(t)
 	skip.UnderRace(t, "takes >1min under race")
+	// Similarly, skip the test under deadlock builds.
+	skip.UnderDeadlock(t, "takes >1min under deadlock")
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
 			1: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
@@ -58,16 +55,18 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	db := tc.ServerConn(0)
-	// Speed up the generation of the
-	_, err := db.Exec("set cluster setting kv.replication_reports.interval = '1ms'")
-	require.NoError(t, err)
+	tdb := sqlutils.MakeSQLRunner(db)
+	// Speed up the generation of the reports.
+	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table and a zone config for it.
 	// The zone will be configured with a constraints that can't be satisfied
 	// because there are not enough nodes in the requested region.
-	_, err = db.Exec("create table t(x int primary key); " +
+	tdb.Exec(t, "create table t(x int primary key); "+
 		"alter table t configure zone using constraints='[+region=r1]'")
-	require.NoError(t, err)
 
 	// Get the id of the newly created zone.
 	r := db.QueryRow("select zone_id from crdb_internal.zones where table_name = 't'")
@@ -90,8 +89,7 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	})
 
 	// Now change the constraint asking for t to be placed in r2. This time it can be satisfied.
-	_, err = db.Exec("alter table t configure zone using constraints='[+region=r2]'")
-	require.NoError(t, err)
+	tdb.Exec(t, "alter table t configure zone using constraints='[+region=r2]'")
 
 	// Wait for the violation to clear.
 	testutils.SucceedsSoon(t, func() error {
@@ -123,7 +121,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	// 2 regions, 3 dcs per region.
-	tc := serverutils.StartNewTestCluster(t, 6, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 6, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -163,9 +161,12 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	db := tc.ServerConn(0)
+	tdb := sqlutils.MakeSQLRunner(db)
 	// Speed up the generation of the reports.
-	_, err := db.Exec("set cluster setting kv.replication_reports.interval = '1ms'")
-	require.NoError(t, err)
+	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Since we're using ReplicationManual, all the ranges will start with a
 	// single replica on node 1. So, the node's dc and the node's region are
@@ -236,10 +237,9 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	// only for creating the zone; we don't actually care about the configuration.
 	// Also do a split by hand. With manual replication, we're not getting the
 	// split for the table automatically.
-	_, err = db.Exec("create table t(x int primary key); " +
-		"alter table t configure zone using num_replicas=3; " +
+	tdb.Exec(t, "create table t(x int primary key); "+
+		"alter table t configure zone using num_replicas=3; "+
 		"alter table t split at values (0);")
-	require.NoError(t, err)
 	// Get the id of the newly created zone.
 	r := db.QueryRow("select zone_id from crdb_internal.zones where table_name = 't'")
 	var zoneID int
@@ -249,18 +249,16 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	require.NoError(t, checkCritical(db, zoneID, "region=r1", "region=r1,dc=dc1"))
 
 	// Upreplicate to 2 dcs. Now they're both critical.
-	_, err = db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2], 1)")
-	require.NoError(t, err)
+	tdb.Exec(t, "ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2], 1)")
+
 	require.NoError(t, checkCritical(db, zoneID, "region=r1", "region=r1,dc=dc1", "region=r1,dc=dc2"))
 
 	// Upreplicate to one more dc. Now no dc is critical, only the region.
-	_, err = db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)")
-	require.NoError(t, err)
+	tdb.Exec(t, "ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)")
 	require.NoError(t, checkCritical(db, zoneID, "region=r1"))
 
 	// Move two replicas to the other region. Now that region is critical.
-	_, err = db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,4,5], 1)")
-	require.NoError(t, err)
+	tdb.Exec(t, "ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,4,5], 1)")
 	require.NoError(t, checkCritical(db, zoneID, "region=r2"))
 }
 
@@ -305,7 +303,7 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 4, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -313,31 +311,31 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	db := tc.ServerConn(0)
-	// Speed up the generation of the
-	_, err := db.Exec("set cluster setting kv.replication_reports.interval = '1ms'")
-	require.NoError(t, err)
+	tdb := sqlutils.MakeSQLRunner(db)
+	// Speed up the generation of the reports.
+	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table with a dummy zone config. Configuring the zone is useful
 	// only for creating the zone; we don't actually care about the configuration.
 	// Also do a split by hand. With manual replication, we're not getting the
 	// split for the table automatically.
-	_, err = db.Exec("create table t(x int primary key); " +
-		"alter table t configure zone using num_replicas=3; " +
+	tdb.Exec(t, "create table t(x int primary key); "+
+		"alter table t configure zone using num_replicas=3; "+
 		"alter table t split at values (0);")
-	require.NoError(t, err)
 	// Get the id of the newly created zone.
 	r := db.QueryRow("select zone_id from crdb_internal.zones where table_name = 't'")
 	var zoneID int
 	require.NoError(t, r.Scan(&zoneID))
 
 	// Upreplicate the range.
-	_, err = db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)")
-	require.NoError(t, err)
+	tdb.Exec(t, "ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)")
 	require.NoError(t, checkZoneReplication(db, zoneID, 1, 0, 0, 0))
 
 	// Over-replicate.
-	_, err = db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3,4], 1)")
-	require.NoError(t, err)
+	tdb.Exec(t, "ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3,4], 1)")
 	require.NoError(t, checkZoneReplication(db, zoneID, 1, 0, 1, 0))
 
 	// TODO(andrei): I'd like to downreplicate to one replica and then stop that
@@ -368,7 +366,7 @@ func checkZoneReplication(db *gosql.DB, zoneID, total, under, over, unavailable 
 			return fmt.Errorf("expected total: %d, got: %d", total, gotTotal)
 		}
 		if under != gotUnder {
-			return fmt.Errorf("expected under: %d, got: %d", total, gotUnder)
+			return fmt.Errorf("expected under: %d, got: %d", under, gotUnder)
 		}
 		if over != gotOver {
 			return fmt.Errorf("expected over: %d, got: %d", over, gotOver)
@@ -384,7 +382,9 @@ func TestMeta2RangeIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// First make an interator with a large page size and use it to determine the numner of ranges.
@@ -414,66 +414,6 @@ func TestMeta2RangeIter(t *testing.T) {
 	require.Equal(t, numRanges, numRangesPaginated)
 }
 
-// Test that a retriable error returned from the range iterator is properly
-// handled by resetting the report.
-func TestRetriableErrorWhenGenerationReport(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-
-	cfg := s.GossipI().(*gossip.Gossip).GetSystemConfig()
-	dummyNodeChecker := func(id roachpb.NodeID) bool { return true }
-
-	v := makeReplicationStatsVisitor(ctx, cfg, dummyNodeChecker)
-	realIter := makeMeta2RangeIter(db, 10000 /* batchSize */)
-	require.NoError(t, visitRanges(ctx, &realIter, cfg, &v))
-	expReport := v.Report()
-	require.Greater(t, len(expReport), 0, "unexpected empty report")
-
-	realIter = makeMeta2RangeIter(db, 10000 /* batchSize */)
-	errorIter := erroryRangeIterator{
-		iter:           realIter,
-		injectErrAfter: 3,
-	}
-	v = makeReplicationStatsVisitor(ctx, cfg, func(id roachpb.NodeID) bool { return true })
-	require.NoError(t, visitRanges(ctx, &errorIter, cfg, &v))
-	require.Greater(t, len(v.report), 0, "unexpected empty report")
-	require.Equal(t, expReport, v.report)
-}
-
-type erroryRangeIterator struct {
-	iter           meta2RangeIter
-	rangesReturned int
-	injectErrAfter int
-}
-
-var _ RangeIterator = &erroryRangeIterator{}
-
-func (it *erroryRangeIterator) Next(ctx context.Context) (roachpb.RangeDescriptor, error) {
-	if it.rangesReturned == it.injectErrAfter {
-		// Don't inject any more errors.
-		it.injectErrAfter = -1
-
-		var err error
-		err = roachpb.NewTransactionRetryWithProtoRefreshError(
-			"injected err", uuid.Nil, roachpb.Transaction{})
-		// Let's wrap the error to check the unwrapping.
-		err = errors.Wrap(err, "dummy wrapper")
-		// Feed the error to the underlying iterator to reset it.
-		it.iter.handleErr(ctx, err)
-		return roachpb.RangeDescriptor{}, err
-	}
-	it.rangesReturned++
-	rd, err := it.iter.Next(ctx)
-	return rd, err
-}
-
-func (it *erroryRangeIterator) Close(ctx context.Context) {
-	it.iter.Close(ctx)
-}
-
 func TestZoneChecker(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -485,10 +425,11 @@ func TestZoneChecker(t *testing.T) {
 		newRootZoneCfg *zonepb.ZoneConfig
 		newZoneKey     ZoneKey
 	}
-	// NB: IDs need to be beyond MaxSystemConfigDescID, otherwise special logic
-	// kicks in for mapping keys to zones.
-	dbID := 50
-	t1ID := 51
+	// NB: IDs need to be beyond DeprecatedMaxSystemConfigDescID, otherwise special logic
+	// kicks in for mapping keys to zones. They also need to not overlap with any
+	// system table IDs.
+	dbID := int(bootstrap.TestingMinUserDescID())
+	t1ID := dbID + 1
 	t1 := table{name: "t1",
 		partitions: []partition{
 			{
@@ -515,9 +456,9 @@ func TestZoneChecker(t *testing.T) {
 	p2SubzoneIndex := 1
 	require.Equal(t, "p1", t1Zone.Subzones[p1SubzoneIndex].PartitionName)
 	require.Equal(t, "p2", t1Zone.Subzones[p2SubzoneIndex].PartitionName)
-	t1ZoneKey := MakeZoneKey(config.SystemTenantObjectID(t1ID), NoSubzone)
-	p1ZoneKey := MakeZoneKey(config.SystemTenantObjectID(t1ID), base.SubzoneIDFromIndex(p1SubzoneIndex))
-	p2ZoneKey := MakeZoneKey(config.SystemTenantObjectID(t1ID), base.SubzoneIDFromIndex(p2SubzoneIndex))
+	t1ZoneKey := MakeZoneKey(config.ObjectID(t1ID), NoSubzone)
+	p1ZoneKey := MakeZoneKey(config.ObjectID(t1ID), base.SubzoneIDFromIndex(p1SubzoneIndex))
+	p2ZoneKey := MakeZoneKey(config.ObjectID(t1ID), base.SubzoneIDFromIndex(p2SubzoneIndex))
 
 	ranges := []tc{
 		{
@@ -562,7 +503,8 @@ func TestZoneChecker(t *testing.T) {
 		splits[i].key = ranges[i].split
 	}
 	keyScanner := keysutils.MakePrettyScannerForNamedTables(
-		map[string]int{"t1": t1ID} /* tableNameToID */, nil /* idxNameToID */)
+		roachpb.SystemTenantID, map[string]int{"t1": t1ID} /* tableNameToID */, nil, /* idxNameToID */
+	)
 	rngs, err := processSplits(keyScanner, splits, nil /* stores */)
 	require.NoError(t, err)
 
@@ -572,7 +514,7 @@ func TestZoneChecker(t *testing.T) {
 		newZone := !sameZone
 		require.Equal(t, tc.newZone, newZone, "failed at: %d (%s)", i, tc.split)
 		if newZone {
-			objectID, _ := config.DecodeKeyIntoZoneIDAndSuffix(rngs[i].StartKey)
+			objectID, _ := config.DecodeKeyIntoZoneIDAndSuffix(keys.SystemSQLCodec, rngs[i].StartKey)
 			zc.setZone(objectID, tc.newZoneKey, tc.newRootZoneCfg)
 		}
 	}
@@ -589,7 +531,7 @@ func TestRangeIteration(t *testing.T) {
 		schema: []database{{
 			name: "db1",
 			zone: &zone{
-				replicas: 3,
+				voters: 3,
 			},
 			tables: []table{
 				{
@@ -630,20 +572,24 @@ func TestRangeIteration(t *testing.T) {
 	compiled, err := compileTestCase(schema)
 	require.NoError(t, err)
 	v := recordingRangeVisitor{}
-	require.NoError(t, visitRanges(ctx, &compiled.iter, compiled.cfg, &v))
+	// In addition to the meat of the test, we'll surround v with
+	// error-injecting range visitors as a regression test for index out of
+	// bounds when removing visitors that encountered errors (#104788).
+	var extraVisitor1, extraVisitor2 errorRangeVisitor
+	require.Error(t, visitRanges(ctx, &compiled.iter, compiled.cfg, &extraVisitor1, &v, &extraVisitor2))
 
 	type entry struct {
 		newZone bool
 		key     string
 	}
 	exp := []entry{
-		{newZone: true, key: "/Table/51/1/1"},
-		{newZone: false, key: "/Table/51/1/2"},
-		{newZone: true, key: "/Table/51/1/100"},
-		{newZone: false, key: "/Table/51/1/101"},
-		{newZone: true, key: "/Table/51/1/200"},
-		{newZone: true, key: "/Table/51/1/305"},
-		{newZone: true, key: "/Table/52/1/1"},
+		{newZone: true, key: "/Table/101/1/1"},
+		{newZone: false, key: "/Table/101/1/2"},
+		{newZone: true, key: "/Table/101/1/100"},
+		{newZone: false, key: "/Table/101/1/101"},
+		{newZone: true, key: "/Table/101/1/200"},
+		{newZone: true, key: "/Table/101/1/305"},
+		{newZone: true, key: "/Table/102/1/1"},
 	}
 	got := make([]entry, len(v.rngs))
 	for i, r := range v.rngs {
@@ -674,11 +620,25 @@ func (r *recordingRangeVisitor) failed() bool {
 	return false
 }
 
-func (r *recordingRangeVisitor) reset(ctx context.Context) {
-	r.rngs = nil
-}
-
 type visitorEntry struct {
 	newZone bool
 	rng     roachpb.RangeDescriptor
+}
+
+// errorRangeVisitor always returns an error on visitNewZone call.
+type errorRangeVisitor struct {
+	errorReturned bool
+}
+
+var _ rangeVisitor = &errorRangeVisitor{}
+
+func (e *errorRangeVisitor) visitNewZone(context.Context, *roachpb.RangeDescriptor) error {
+	e.errorReturned = true
+	return errors.New("an error")
+}
+
+func (e *errorRangeVisitor) visitSameZone(context.Context, *roachpb.RangeDescriptor) {}
+
+func (e *errorRangeVisitor) failed() bool {
+	return e.errorReturned
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opt_test
 
@@ -16,21 +11,27 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMetadata(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	var f norm.Factory
-	f.Init(&evalCtx, nil /* catalog */)
+	f.Init(context.Background(), &evalCtx, nil /* catalog */)
 	md := f.Metadata()
 
 	schID := md.AddSchema(&testcat.Schema{})
@@ -39,11 +40,15 @@ func TestMetadata(t *testing.T) {
 	tabID := md.AddTable(&testcat.Table{}, &tree.TableName{})
 	seqID := md.AddSequence(&testcat.Sequence{})
 	md.AddView(&testcat.View{})
-	md.AddUserDefinedType(types.MakeEnum(152100, 154180))
+	md.AddUserDefinedType(types.MakeEnum(152100, 154180), nil /* name */)
 
 	// Call Init and add objects from catalog, verifying that IDs have been reset.
 	testCat := testcat.New()
-	tab := &testcat.Table{Revoked: true}
+	tabName := tree.MakeTableNameWithSchema("t", "public", "tab")
+	tab := &testcat.Table{
+		TabName: tabName,
+		Revoked: true,
+	}
 	testCat.AddTable(tab)
 
 	// Create a (col = 1) scalar expression.
@@ -73,7 +78,9 @@ func TestMetadata(t *testing.T) {
 	}
 	tabMeta := md.TableMeta(tabID)
 	tabMeta.SetConstraints(scalar)
-	tabMeta.AddComputedCol(cmpID, scalar)
+	var sharedProps props.Shared
+	memo.BuildSharedProps(scalar, &sharedProps, &evalCtx)
+	tabMeta.AddComputedCol(cmpID, scalar, sharedProps.OuterCols)
 	tabMeta.AddPartialIndexPredicate(0, scalar)
 	if md.AddSequence(&testcat.Sequence{SeqID: 100}) != seqID {
 		t.Fatalf("unexpected sequence id")
@@ -84,23 +91,30 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected views")
 	}
 
-	md.AddUserDefinedType(types.MakeEnum(151500, 152510))
+	md.AddUserDefinedType(types.MakeEnum(151500, 152510), nil /* name */)
 	if len(md.AllUserDefinedTypes()) != 1 {
 		fmt.Println(md)
 		t.Fatalf("unexpected types")
 	}
 
 	md.AddDependency(opt.DepByName(&tab.TabName), tab, privilege.CREATE)
-	depsUpToDate, err := md.CheckDependencies(context.Background(), testCat)
+	depsUpToDate, err := md.CheckDependencies(context.Background(), &evalCtx, testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked")
 	}
+
+	udfName := tree.MakeQualifiedRoutineName("t", "public", "udf")
+	md.AddUserDefinedRoutine(
+		&tree.Overload{Oid: catid.FuncIDToOID(1111)},
+		types.OneIntCol,
+		udfName.ToUnresolvedObjectName(),
+	)
 
 	// Call CopyFrom and verify that same objects are present in new metadata.
 	expr := &memo.ProjectExpr{}
 	md.AddWithBinding(1, expr)
 	var mdNew opt.Metadata
-	mdNew.CopyFrom(md, f.CopyScalarWithoutPlaceholders)
+	mdNew.CopyFrom(md, f.CopyWithoutAssigningPlaceholders)
 
 	if mdNew.Schema(schID) != testCat.Schema() {
 		t.Fatalf("unexpected schema")
@@ -128,6 +142,10 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("expected computed column expression to be copied")
 	}
 
+	if !tabMeta.ColsInComputedColsExpressions.Equals(tabMetaNew.ColsInComputedColsExpressions) {
+		t.Fatalf("expected computed column expression referenced columns to be copied")
+	}
+
 	partialIdxPredPtr := reflect.ValueOf(tabMeta.PartialIndexPredicatesUnsafe()).Pointer()
 	newPartialIdxPredPtr := reflect.ValueOf(tabMetaNew.PartialIndexPredicatesUnsafe()).Pointer()
 	if newPartialIdxPredPtr == partialIdxPredPtr {
@@ -150,7 +168,35 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected type")
 	}
 
-	depsUpToDate, err = md.CheckDependencies(context.Background(), testCat)
+	newDSDeps, oldDSDeps := mdNew.TestingDataSourceDeps(), md.TestingDataSourceDeps()
+	for id, dataSource := range oldDSDeps {
+		if newDSDeps[id] != dataSource {
+			t.Fatalf("expected data source dependency to be copied")
+		}
+	}
+
+	if !mdNew.TestingRoutineDepsEqual(md) {
+		t.Fatalf("expected user-defined routine dependency to be copied")
+	}
+
+	newNamesByID, oldNamesByID := mdNew.TestingObjectRefsByName(), md.TestingObjectRefsByName()
+	for id, names := range oldNamesByID {
+		newNames := newNamesByID[id]
+		for i, name := range names {
+			if newNames[i] != name {
+				t.Fatalf("expected object name to be copied")
+			}
+		}
+	}
+
+	newPrivileges, oldPrivileges := mdNew.TestingPrivileges(), md.TestingPrivileges()
+	for id, privileges := range oldPrivileges {
+		if newPrivileges[id] != privileges {
+			t.Fatalf("expected privileges to be copied")
+		}
+	}
+
+	depsUpToDate, err = md.CheckDependencies(context.Background(), &evalCtx, testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked in metadata copy")
 	}
@@ -336,13 +382,16 @@ func TestIndexColumns(t *testing.T) {
 
 // TestDuplicateTable tests that we can extract a set of columns from an index ordinal.
 func TestDuplicateTable(t *testing.T) {
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	var f norm.Factory
+	f.Init(context.Background(), &evalCtx, nil /* catalog */)
+	md := f.Metadata()
 	cat := testcat.New()
 	_, err := cat.ExecuteDDL("CREATE TABLE a (b BOOL, b2 BOOL, INDEX (b2) WHERE b)")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var md opt.Metadata
 	tn := tree.NewUnqualifiedTableName("a")
 	a := md.AddTable(cat.Table(tn), tn)
 	b := a.ColumnID(0)
@@ -350,7 +399,10 @@ func TestDuplicateTable(t *testing.T) {
 
 	tabMeta := md.TableMeta(a)
 	tabMeta.SetConstraints(&memo.VariableExpr{Col: b})
-	tabMeta.AddComputedCol(b2, &memo.VariableExpr{Col: b})
+	scalar := &memo.VariableExpr{Col: b}
+	var sharedProps props.Shared
+	memo.BuildSharedProps(scalar, &sharedProps, &evalCtx)
+	tabMeta.AddComputedCol(b2, scalar, sharedProps.OuterCols)
 	tabMeta.AddPartialIndexPredicate(1, &memo.VariableExpr{Col: b})
 
 	// remap is a simple function that can only remap column IDs in a
@@ -388,6 +440,18 @@ func TestDuplicateTable(t *testing.T) {
 		t.Errorf("expected computed column to reference new column ID %d, got %d", dupB, col)
 	}
 
+	if tabMeta.ColsInComputedColsExpressions.Equals(dupTabMeta.ColsInComputedColsExpressions) {
+		t.Fatalf("expected computed column expression referenced columns to hold new column ids")
+	}
+
+	if dupTabMeta.ColsInComputedColsExpressions.Empty() {
+		t.Fatalf("expected computed column expression referenced columns to not be empty")
+	}
+
+	if tabMeta.ColsInComputedColsExpressions.Len() != dupTabMeta.ColsInComputedColsExpressions.Len() {
+		t.Fatalf("expected same number of computed column expression referenced columns")
+	}
+
 	pred, isPartialIndex := dupTabMeta.PartialIndexPredicate(1)
 	if !isPartialIndex {
 		t.Fatalf("expected partial index predicates to be duplicated")
@@ -407,4 +471,76 @@ func TestDuplicateTable(t *testing.T) {
 	if col == b {
 		t.Errorf("expected partial index predicate to reference new column ID %d, got %d", dupB, col)
 	}
+}
+
+// TestTableMeta_GetRegionsInDatabases exercises the multiregion.RegionConfig
+// annotation.
+func TestTableMeta_GetRegionsInDatabase(t *testing.T) {
+	cat := testcat.New()
+	_, err := cat.ExecuteDDL("CREATE TABLE a (b BOOL, b2 BOOL, INDEX (b2) WHERE b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var md opt.Metadata
+	tn := tree.NewUnqualifiedTableName("a")
+	tab := cat.Table(tn)
+	tab.DatabaseID = 1 // must be non-zero to trigger the region lookup
+	a := md.AddTable(tab, tn)
+	tabMeta := md.TableMeta(a)
+	tab.SetMultiRegion(true)
+
+	p := &fakeGetMultiregionConfigPlanner{}
+	// Call the function once, make sure our planner method gets invoked.
+	{
+		_, exists := tabMeta.GetRegionsInDatabase(context.Background(), p)
+		require.False(t, exists)
+		require.Equal(t, 1, p.getMultiregionConfigCalled)
+	}
+	// Call the function again, make sure that our planner method doesn't
+	// get invoked again.
+	{
+		_, exists := tabMeta.GetRegionsInDatabase(context.Background(), p)
+		require.False(t, exists)
+		require.Equal(t, 1, p.getMultiregionConfigCalled)
+	}
+}
+
+type fakeGetMultiregionConfigPlanner struct {
+	eval.Planner
+	getMultiregionConfigCalled int
+}
+
+func (f *fakeGetMultiregionConfigPlanner) GetMultiregionConfig(
+	ctx context.Context, databaseID descpb.ID,
+) (interface{}, bool) {
+	f.getMultiregionConfigCalled++
+	return nil, false
+}
+
+// IsANSIDML is part of the eval.Planner interface.
+func (f *fakeGetMultiregionConfigPlanner) IsANSIDML() bool {
+	return false
+}
+
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (f *fakeGetMultiregionConfigPlanner) EnforceHomeRegion() bool {
+	return false
+}
+
+// GetRangeDescByID is part of the eval.Planner interface.
+func (ep *fakeGetMultiregionConfigPlanner) GetRangeDescByID(
+	context.Context, roachpb.RangeID,
+) (rangeDesc roachpb.RangeDescriptor, err error) {
+	return
+}
+
+// Optimizer is part of the cat.Catalog interface.
+func (ep *fakeGetMultiregionConfigPlanner) Optimizer() interface{} {
+	return nil
+}
+
+// AutoCommit is part of the eval.Planner interface.
+func (ep *fakeGetMultiregionConfigPlanner) AutoCommit() bool {
+	return false
 }

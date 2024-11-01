@@ -1,37 +1,34 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
-	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 )
 
 // RunBuildInfo is a test that sanity checks the build info.
 func RunBuildInfo(ctx context.Context, t test.Test, c cluster.Cluster) {
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-	c.Start(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 	var details serverpb.DetailsResponse
-	adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, c.Node(1))
+	adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, t.L(), c.Node(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := `http://` + adminUIAddrs[0] + `/_status/details/local`
-	err = httputil.GetJSON(http.Client{}, url, &details)
+	url := `https://` + adminUIAddrs[0] + `/_status/details/local`
+	client := roachtestutil.DefaultHTTPClient(c, t.L())
+	err = client.GetJSON(ctx, url, &details)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +57,6 @@ func RunBuildAnalyze(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.Skip("local execution not supported")
 	}
 
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-
 	// 1. Check for executable stack.
 	//
 	// Executable stack memory is a security risk (not a vulnerability
@@ -83,14 +78,15 @@ func RunBuildAnalyze(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// we can use, choose `scanelf` for being the simplest to use (empty
 	// output indicates everything's fine, non-empty means something
 	// bad).
-	c.Run(ctx, c.Node(1), "sudo apt-get update")
-	c.Run(ctx, c.Node(1), "sudo apt-get -qqy install pax-utils")
+	c.Run(ctx, option.WithNodes(c.Node(1)), "sudo apt-get update")
+	c.Run(ctx, option.WithNodes(c.Node(1)), "sudo apt-get -qqy install pax-utils")
 
-	output, err := c.RunWithBuffer(ctx, t.L(), c.Node(1), "scanelf -qe cockroach")
+	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.Node(1)), "scanelf -qe cockroach")
 	if err != nil {
 		t.Fatalf("scanelf failed: %s", err)
 	}
+	output := strings.TrimSpace(result.Stdout)
 	if len(output) > 0 {
-		t.Fatalf("scanelf returned non-empty output (executable stack): %s", string(output))
+		t.Fatalf("scanelf returned non-empty output (executable stack): %s", output)
 	}
 }

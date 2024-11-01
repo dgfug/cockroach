@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr_test
 
@@ -14,23 +9,25 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 func TestIndexPredicateValidator_Validate(t *testing.T) {
 	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 
 	// Trick to get the init() for the builtins package to run.
-	_ = builtins.AllBuiltinNames
+	_ = builtins.AllBuiltinNames()
 
 	database := tree.Name("foo")
 	table := tree.Name("bar")
-	tn := tree.MakeTableNameWithSchema(database, tree.PublicSchemaName, table)
+	tn := tree.MakeTableNameWithSchema(database, catconstants.PublicSchemaName, table)
 
 	desc := testTableDesc(
 		string(table),
@@ -90,7 +87,7 @@ func TestIndexPredicateValidator_Validate(t *testing.T) {
 			}
 
 			deqExpr, err := schemaexpr.ValidatePartialIndexPredicate(
-				ctx, desc, expr, &tn, &semaCtx,
+				ctx, desc, expr, &tn, &semaCtx, clusterversion.TestingClusterVersion,
 			)
 
 			if !d.expectedValid {

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -19,13 +14,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -40,15 +33,15 @@ import (
 func TestCleanupSchemaObjects(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
 	// TODO(arul): Investigate why we need this -- the job executes serially
 	// and we are just running drop statements in the job. Ideally this should
 	// not require disabling leases, but the test fails if we don't. See #52412.
 	defer lease.TestingDisableTableLeases()()
-
-	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, db, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
 
 	conn, err := db.Conn(ctx)
 	require.NoError(t, err)
@@ -56,10 +49,16 @@ func TestCleanupSchemaObjects(t *testing.T) {
 	_, err = conn.ExecContext(ctx, `
 SET experimental_enable_temp_tables=true;
 SET serial_normalization='sql_sequence';
-CREATE TEMP TABLE a (a SERIAL, c INT);
+CREATE TEMP TABLE a (a SERIAL, c INT);`,
+	)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `
 ALTER TABLE a ADD COLUMN b SERIAL;
 CREATE TEMP SEQUENCE a_sequence;
-CREATE TEMP VIEW a_view AS SELECT a FROM a;
+CREATE TEMP VIEW a_view AS SELECT a FROM a;`,
+	)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `
 CREATE TABLE perm_table (a int DEFAULT nextval('a_sequence'), b int);
 INSERT INTO perm_table VALUES (DEFAULT, 1);
 `)
@@ -88,29 +87,30 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 		require.NoError(t, err)
 		require.NoError(t, rows.Close())
 	}
-
-	require.NoError(
-		t,
-		s.ExecutorConfig().(ExecutorConfig).CollectionFactory.Txn(
+	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	ief := execCfg.InternalDB
+	require.NoError(t, ief.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
+	) error {
+		// Add a hack to not wait for one version on the descriptors.
+		defer txn.Descriptors().ReleaseAll(ctx)
+		defaultDB, err := txn.Descriptors().ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Database(ctx, namesToID["defaultdb"])
+		if err != nil {
+			return err
+		}
+		tempSchema, err := txn.Descriptors().ByName(txn.KV()).Get().Schema(ctx, defaultDB, tempSchemaName)
+		if err != nil {
+			return err
+		}
+		return cleanupTempSchemaObjects(
 			ctx,
-			s.InternalExecutor().(*InternalExecutor),
-			kvDB,
-			func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
-				execCfg := s.ExecutorConfig().(ExecutorConfig)
-				err = cleanupSchemaObjects(
-					ctx,
-					execCfg.Settings,
-					txn,
-					descsCol,
-					execCfg.Codec,
-					s.InternalExecutor().(*InternalExecutor),
-					namesToID["defaultdb"],
-					tempSchemaName,
-				)
-				require.NoError(t, err)
-				return nil
-			}),
-	)
+			txn,
+			txn.Descriptors(),
+			execCfg.Codec,
+			defaultDB,
+			tempSchema,
+		)
+	}))
 
 	ensureTemporaryObjectsAreDeleted(ctx, t, conn, tempSchemaName, tempNames)
 
@@ -147,7 +147,7 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 	}
 	settings := cluster.MakeTestingClusterSettings()
 	TempObjectWaitInterval.Override(context.Background(), &settings.SV, time.Microsecond)
-	tc := serverutils.StartNewTestCluster(
+	tc := serverutils.StartCluster(
 		t,
 		numNodes,
 		base.TestClusterArgs{
@@ -227,7 +227,7 @@ func TestTemporarySchemaDropDatabase(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	numNodes := 3
-	tc := serverutils.StartNewTestCluster(
+	tc := serverutils.StartCluster(
 		t,
 		numNodes,
 		base.TestClusterArgs{

@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvevent
 
@@ -46,6 +43,27 @@ func (a *Alloc) Release(ctx context.Context) {
 	a.clear()
 }
 
+// AdjustBytesToTarget adjust byte allocation to the specified target.
+// Target bytes cannot be adjusted to the higher level than the current allocation.
+func (a *Alloc) AdjustBytesToTarget(ctx context.Context, targetBytes int64) {
+	if a.isZero() || targetBytes <= 0 || targetBytes >= a.bytes {
+		return
+	}
+	toRelease := a.bytes - targetBytes
+	a.bytes = targetBytes
+	a.ap.Release(ctx, toRelease, 0)
+}
+
+// Bytes returns the size of this alloc in bytes.
+func (a *Alloc) Bytes() int64 {
+	return a.bytes
+}
+
+// Events returns the number of items associated with this alloc.
+func (a *Alloc) Events() int64 {
+	return a.entries
+}
+
 // Merge merges other resources into this allocation.
 func (a *Alloc) Merge(other *Alloc) {
 	defer other.clear()
@@ -84,6 +102,14 @@ func (a *Alloc) Merge(other *Alloc) {
 
 func (a *Alloc) clear()       { *a = Alloc{} }
 func (a *Alloc) isZero() bool { return a.ap == nil }
+func (a *Alloc) init(bytes int64, p pool) {
+	if !a.isZero() {
+		panic("cannot initialize already initialized alloc")
+	}
+	a.bytes = bytes
+	a.entries = 1
+	a.ap = p
+}
 
 // TestingMakeAlloc creates allocation for the specified number of bytes
 // in a single message using allocation pool 'p'.

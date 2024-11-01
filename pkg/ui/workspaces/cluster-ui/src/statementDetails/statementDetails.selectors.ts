@@ -1,190 +1,76 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { createSelector } from "@reduxjs/toolkit";
-import { RouteComponentProps, match as Match } from "react-router-dom";
-import { Location } from "history";
-import _ from "lodash";
+import Long from "long";
+import moment from "moment-timezone";
+import { RouteComponentProps } from "react-router-dom";
+
 import { AppState } from "../store";
+import { selectTimeScale } from "../store/utils/selectors";
+import { TimeScale, toRoundedDateRange } from "../timeScaleDropdown";
 import {
-  appAttr,
-  combineStatementStats,
-  ExecutionStatistics,
-  FixLong,
-  flattenStatementStats,
-  getMatchParamByName,
-  implicitTxnAttr,
+  appNamesAttr,
   statementAttr,
-  databaseAttr,
-  StatementStatistics,
-  statementKey,
-  aggregatedTsAttr,
-  aggregationIntervalAttr,
+  getMatchParamByName,
   queryByName,
+  generateStmtDetailsToID,
 } from "../util";
-import { AggregateStatistics } from "../statementsTable";
-import { Fraction } from "./statementDetails";
 
-interface StatementDetailsData {
-  nodeId: number;
-  summary: string;
-  aggregatedTs: number;
-  aggregationInterval: number;
-  implicitTxn: boolean;
-  fullScan: boolean;
-  database: string;
-  stats: StatementStatistics[];
-}
+type StatementDetailsResponseMessage =
+  cockroach.server.serverpb.StatementDetailsResponse;
 
-function coalesceNodeStats(
-  stats: ExecutionStatistics[],
-): AggregateStatistics[] {
-  const statsKey: { [nodeId: string]: StatementDetailsData } = {};
-
-  stats.forEach(stmt => {
-    const key = statementKey(stmt);
-    if (!(key in statsKey)) {
-      statsKey[key] = {
-        nodeId: stmt.node_id,
-        summary: stmt.statement_summary,
-        aggregatedTs: stmt.aggregated_ts,
-        aggregationInterval: stmt.aggregation_interval,
-        implicitTxn: stmt.implicit_txn,
-        fullScan: stmt.full_scan,
-        database: stmt.database,
-        stats: [],
+export const selectStatementDetails = createSelector(
+  (_state: AppState, props: RouteComponentProps): string =>
+    getMatchParamByName(props.match, statementAttr),
+  (_state: AppState, props: RouteComponentProps): string =>
+    queryByName(props.location, appNamesAttr),
+  (state: AppState): TimeScale => selectTimeScale(state),
+  (state: AppState) => state.adminUI?.sqlDetailsStats.cachedData,
+  (
+    fingerprintID,
+    appNames,
+    timeScale,
+    statementDetailsStatsData,
+  ): {
+    statementDetails: StatementDetailsResponseMessage;
+    isLoading: boolean;
+    lastError: Error;
+    lastUpdated: moment.Moment | null;
+  } => {
+    // Since the aggregation interval is 1h, we want to round the selected timeScale to include
+    // the full hour. If a timeScale is between 14:32 - 15:17 we want to search for values
+    // between 14:00 - 16:00. We don't encourage the aggregation interval to be modified, but
+    // in case that changes in the future we might consider changing this function to use the
+    // cluster settings value for the rounding function.
+    const [start, end] = toRoundedDateRange(timeScale);
+    const key = generateStmtDetailsToID(
+      fingerprintID,
+      appNames,
+      Long.fromNumber(start.unix()),
+      Long.fromNumber(end.unix()),
+    );
+    if (Object.keys(statementDetailsStatsData).includes(key)) {
+      return {
+        statementDetails: statementDetailsStatsData[key].data,
+        isLoading: statementDetailsStatsData[key].inFlight,
+        lastError: statementDetailsStatsData[key].lastError,
+        lastUpdated: statementDetailsStatsData[key].lastUpdated,
       };
     }
-    statsKey[key].stats.push(stmt.stats);
-  });
-
-  return Object.keys(statsKey).map(key => {
-    const stmt = statsKey[key];
     return {
-      label: stmt.nodeId.toString(),
-      summary: stmt.summary,
-      aggregatedTs: stmt.aggregatedTs,
-      aggregationInterval: stmt.aggregationInterval,
-      implicitTxn: stmt.implicitTxn,
-      fullScan: stmt.fullScan,
-      database: stmt.database,
-      stats: combineStatementStats(stmt.stats),
-    };
-  });
-}
-
-function fractionMatching(
-  stats: ExecutionStatistics[],
-  predicate: (stmt: ExecutionStatistics) => boolean,
-): Fraction {
-  let numerator = 0;
-  let denominator = 0;
-
-  stats.forEach(stmt => {
-    const count = FixLong(stmt.stats.first_attempt_count).toInt();
-    denominator += count;
-    if (predicate(stmt)) {
-      numerator += count;
-    }
-  });
-
-  return { numerator, denominator };
-}
-
-function filterByRouterParamsPredicate(
-  match: Match<any>,
-  location: Location,
-  internalAppNamePrefix: string,
-): (stat: ExecutionStatistics) => boolean {
-  const statement = getMatchParamByName(match, statementAttr);
-  const implicitTxn = getMatchParamByName(match, implicitTxnAttr) === "true";
-  const database =
-    queryByName(location, databaseAttr) === "(unset)"
-      ? ""
-      : queryByName(location, databaseAttr);
-  const apps = queryByName(location, appAttr)
-    ? queryByName(location, appAttr).split(",")
-    : null;
-  // If the aggregatedTs is unset, we will aggregate across the current date range.
-  const aggregatedTs = queryByName(location, aggregatedTsAttr);
-  const aggInterval = queryByName(location, aggregationIntervalAttr);
-
-  const filterByKeys = (stmt: ExecutionStatistics) =>
-    stmt.statement === statement &&
-    (aggregatedTs == null || stmt.aggregated_ts.toString() === aggregatedTs) &&
-    (aggInterval == null ||
-      stmt.aggregation_interval.toString() === aggInterval) &&
-    stmt.implicit_txn === implicitTxn &&
-    (stmt.database === database || database === null);
-
-  if (!apps) {
-    return filterByKeys;
-  }
-  if (apps.includes("(unset)")) {
-    apps.push("");
-  }
-  let showInternal = false;
-  if (apps.includes(internalAppNamePrefix)) {
-    showInternal = true;
-  }
-
-  return (stmt: ExecutionStatistics) =>
-    filterByKeys(stmt) &&
-    ((showInternal && stmt.app.startsWith(internalAppNamePrefix)) ||
-      apps.includes(stmt.app));
-}
-
-export const selectStatement = createSelector(
-  (state: AppState) => state.adminUI.statements,
-  (_state: AppState, props: RouteComponentProps) => props,
-  (statementsState, props) => {
-    const statements = statementsState.data?.statements;
-    if (!statements) {
-      return null;
-    }
-
-    const internalAppNamePrefix =
-      statementsState.data?.internal_app_name_prefix;
-    const flattened = flattenStatementStats(statements);
-    const results = _.filter(
-      flattened,
-      filterByRouterParamsPredicate(
-        props.match,
-        props.location,
-        internalAppNamePrefix,
-      ),
-    );
-    const statement = getMatchParamByName(props.match, statementAttr);
-    return {
-      statement,
-      stats: combineStatementStats(results.map(s => s.stats)),
-      byNode: coalesceNodeStats(results),
-      app: _.uniq(
-        results.map(s =>
-          s.app.startsWith(internalAppNamePrefix)
-            ? internalAppNamePrefix
-            : s.app,
-        ),
-      ),
-      database: queryByName(props.location, databaseAttr),
-      distSQL: fractionMatching(results, s => s.distSQL),
-      vec: fractionMatching(results, s => s.vec),
-      implicit_txn: fractionMatching(results, s => s.implicit_txn),
-      full_scan: fractionMatching(results, s => s.full_scan),
-      failed: fractionMatching(results, s => s.failed),
-      node_id: _.uniq(results.map(s => s.node_id)),
+      statementDetails: null,
+      isLoading: true,
+      lastError: null,
+      lastUpdated: null,
     };
   },
 );
 
 export const selectStatementDetailsUiConfig = createSelector(
-  (state: AppState) => state.adminUI.uiConfig.pages.statementDetails,
+  (state: AppState) => state.adminUI?.uiConfig?.pages.statementDetails,
   statementDetailsUiConfig => statementDetailsUiConfig,
 );

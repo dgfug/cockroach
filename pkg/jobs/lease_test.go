@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs_test
 
@@ -17,18 +12,26 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
 func TestJobsTableClaimFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	args := base.TestServerArgs{}
+	args.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
+		SkipJobBootstrap: true,
+	}
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
@@ -42,8 +45,8 @@ func TestJobsTableClaimFamily(t *testing.T) {
 
 	now := timeutil.Now()
 	_ = sqlDB.Query(t, `
-INSERT INTO system.jobs (id, status, payload, claim_session_id, claim_instance_id, num_runs, last_run)
-VALUES (1, 'running', '@!%$%45', 'foo', 101, 100, $1)`, now)
+INSERT INTO system.jobs (id, status, claim_session_id, claim_instance_id, num_runs, last_run)
+VALUES (1, 'running', 'foo', 101, 100, $1)`, now)
 	var status, sessionID string
 	var instanceID, numRuns int64
 	var lastRun time.Time

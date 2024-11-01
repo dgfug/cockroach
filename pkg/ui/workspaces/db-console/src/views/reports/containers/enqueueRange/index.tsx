@@ -1,21 +1,19 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import moment from "moment-timezone";
 import React, { Fragment } from "react";
 import Helmet from "react-helmet";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import moment from "moment";
 
-import { enqueueRange } from "src/util/api";
 import { cockroach } from "src/js/protos";
+import { enqueueRange } from "src/util/api";
 import Print from "src/views/reports/containers/range/print";
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
+import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
+
 import "./index.styl";
 
 import EnqueueRangeRequest = cockroach.server.serverpb.EnqueueRangeRequest;
@@ -23,15 +21,20 @@ import EnqueueRangeResponse = cockroach.server.serverpb.EnqueueRangeResponse;
 
 const QUEUES = [
   "replicate",
-  "gc",
+  "mvccGC",
   "merge",
   "split",
+  "lease",
   "replicaGC",
   "raftlog",
   "raftsnapshot",
   "consistencyChecker",
   "timeSeriesMaintenance",
 ];
+
+const queueOptions = QUEUES.map(q => {
+  return { value: q, label: q };
+});
 
 interface EnqueueRangeProps {
   handleEnqueueRange: (
@@ -51,22 +54,31 @@ interface EnqueueRangeState {
   error: Error;
 }
 
+export type EnqueueRangeAllProps = EnqueueRangeProps & RouteComponentProps;
+
 export class EnqueueRange extends React.Component<
-  EnqueueRangeProps & RouteComponentProps,
+  EnqueueRangeAllProps,
   EnqueueRangeState
 > {
-  state: EnqueueRangeState = {
-    queue: QUEUES[0],
-    rangeID: "",
-    nodeID: "",
-    skipShouldQueue: false,
-    response: null,
-    error: null,
-  };
+  constructor(props: EnqueueRangeAllProps) {
+    super(props);
+    const { history } = this.props;
+    const searchParams = new URLSearchParams(history.location.search);
+    const rangeID = searchParams.get("rangeID") || "";
 
-  handleUpdateQueue = (evt: React.FormEvent<{ value: string }>) => {
+    this.state = {
+      queue: QUEUES[0],
+      rangeID: rangeID,
+      nodeID: "",
+      skipShouldQueue: false,
+      response: null,
+      error: null,
+    };
+  }
+
+  handleUpdateQueue = (selectedOption: DropdownOption) => {
     this.setState({
-      queue: evt.currentTarget.value,
+      queue: selectedOption.value,
     });
   };
 
@@ -88,6 +100,12 @@ export class EnqueueRange extends React.Component<
     nodeID: number,
     skipShouldQueue: boolean,
   ) => {
+    // Handle mixed-version clusters across the "gc" to "mvccGC" queue rename.
+    // TODO(nvanbenschoten): remove this in v22.2. The server logic will continue
+    // to map "gc" to "mvccGC" until v23.1.
+    if (queue === "mvccGC") {
+      queue = "gc";
+    }
     const req = new EnqueueRangeRequest({
       queue: queue,
       range_id: rangeID,
@@ -192,6 +210,7 @@ export class EnqueueRange extends React.Component<
     return (
       <Fragment>
         <Helmet title="Enqueue Range" />
+        <BackToAdvanceDebug history={this.props.history} />
         <div className="content">
           <section className="section">
             <div className="form-container">
@@ -205,18 +224,18 @@ export class EnqueueRange extends React.Component<
                 method="post"
               >
                 <label>
-                  Queue:{" "}
-                  <select onChange={this.handleUpdateQueue}>
-                    {QUEUES.map(queue => (
-                      <option key={queue} value={queue}>
-                        {queue}
-                      </option>
-                    ))}
-                  </select>
+                  <span className={"label-text"}>Queue:</span>
+                  <Dropdown
+                    title=""
+                    options={queueOptions}
+                    selected={this.state.queue}
+                    onChange={this.handleUpdateQueue}
+                    className={"dropdown-area"}
+                  />
                 </label>
                 <br />
                 <label>
-                  RangeID:{" "}
+                  <span className={"label-text"}>RangeID:</span>
                   <input
                     type="number"
                     name="rangeID"
@@ -228,7 +247,7 @@ export class EnqueueRange extends React.Component<
                 </label>
                 <br />
                 <label>
-                  NodeID:{" "}
+                  <span className={"label-text"}>NodeID:</span>
                   <input
                     type="number"
                     name="nodeID"
@@ -237,14 +256,16 @@ export class EnqueueRange extends React.Component<
                     value={this.state.nodeID}
                     placeholder="NodeID (optional)"
                   />
-                  &nbsp;If not specified, we'll attempt to enqueue on all the
-                  nodes.
+                  <span className={"label-tooltip"}>
+                    If not specified, we'll attempt to enqueue on all the nodes.
+                  </span>
                 </label>
                 <br />
                 <label>
-                  SkipShouldQueue:{" "}
+                  <span className={"label-text"}>SkipShouldQueue:</span>
                   <input
                     type="checkbox"
+                    className="checkbox-area"
                     checked={this.state.skipShouldQueue}
                     name="skipShouldQueue"
                     onChange={() =>
@@ -255,7 +276,7 @@ export class EnqueueRange extends React.Component<
                   />
                 </label>
                 <br />
-                <input type="submit" className="submit-button" value="Submit" />
+                <input type="submit" className="button-crl" value="Submit" />
               </form>
             </div>
           </section>

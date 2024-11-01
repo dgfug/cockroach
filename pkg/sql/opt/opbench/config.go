@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opbench
 
@@ -91,7 +86,7 @@ func (it *ConfigIterator) Next() (Configuration, bool) {
 // value for each "slot". So if the first option has 2 choices and the second
 // has 3, the increment process goes like:
 //
-//   [0 0] => [1 0] => [0 1] => [1 1] => [0 2] => [1 2] => done.
+//	[0 0] => [1 0] => [0 1] => [1 1] => [0 2] => [1 2] => done.
 func (it *ConfigIterator) increment() {
 	i := 0
 	for i < len(it.options) {

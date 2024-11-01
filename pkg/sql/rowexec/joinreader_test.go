@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This file doesn't live next to execinfra/joinreader.go in order to avoid
 // the import cycle with distsqlutils.
@@ -15,6 +10,7 @@ package rowexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -24,15 +20,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -40,11 +40,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -79,7 +80,7 @@ func TestJoinReader(t *testing.T) {
 	}
 
 	sqlutils.CreateTable(t, sqlDB, "t",
-		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), INDEX bs (b,s)",
+		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), INDEX bs (b,s), INDEX bssum (b,s,sum)",
 		99,
 		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
 
@@ -88,14 +89,14 @@ func TestJoinReader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tdSecondary := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tdSecondary := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	sqlutils.CreateTable(t, sqlDB, "t2",
-		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), FAMILY f1 (a, b), FAMILY f2 (s), FAMILY f3 (sum), INDEX bs (b,s)",
+		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), FAMILY f1 (a, b), FAMILY f2 (s), FAMILY f3 (sum), INDEX bs (b,s), INDEX bssum (b,s,sum)",
 		99,
 		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
 
-	tdFamily := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t2")
+	tdFamily := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t2")
 
 	sqlutils.CreateTable(t, sqlDB, "t3parent",
 		"a INT PRIMARY KEY",
@@ -106,13 +107,14 @@ func TestJoinReader(t *testing.T) {
 		description string
 		indexIdx    uint32
 		// The OutputColumns in post are the ones without continuation. For tests
-		// that include the continuation column, the test adds the column position
-		// using outputColumnForContinuation.
+		// that include the continuation column, the test adds the continuation
+		// column.
 		post             execinfrapb.PostProcessSpec
 		onExpr           string
 		lookupExpr       string
 		remoteLookupExpr string
 		input            [][]tree.Datum
+		fetchCols        []uint32
 		lookupCols       []uint32
 		joinType         descpb.JoinType
 		inputTypes       []*types.T
@@ -121,9 +123,8 @@ func TestJoinReader(t *testing.T) {
 		outputTypes            []*types.T
 		secondJoinInPairedJoin bool
 		// Without and with continuation output.
-		expected                    string
-		expectedWithContinuation    string
-		outputColumnForContinuation uint32
+		expected                 string
+		expectedWithContinuation string
 	}{
 		{
 			description: "Test selecting columns from second table",
@@ -137,12 +138,12 @@ func TestJoinReader(t *testing.T) {
 				{aFn(10), bFn(10)},
 				{aFn(15), bFn(15)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.ThreeIntCols,
-			expected:                    "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
-			expectedWithContinuation:    "[[0 2 2 false] [0 5 5 false] [1 0 1 false] [1 5 6 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.ThreeIntCols,
+			expected:                 "[[0 2 2] [0 5 5] [1 0 1] [1 5 6]]",
+			expectedWithContinuation: "[[0 2 2 false] [0 5 5 false] [1 0 1 false] [1 5 6 false]]",
 		},
 		{
 			description: "Test duplicates in the input of lookup joins",
@@ -157,12 +158,12 @@ func TestJoinReader(t *testing.T) {
 				{aFn(10), bFn(10)},
 				{aFn(15), bFn(15)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.ThreeIntCols,
-			expected:                    "[[0 2 2] [0 2 2] [0 5 5] [1 0 0] [1 5 5]]",
-			expectedWithContinuation:    "[[0 2 2 false] [0 2 2 false] [0 5 5 false] [1 0 0 false] [1 5 5 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.ThreeIntCols,
+			expected:                 "[[0 2 2] [0 2 2] [0 5 5] [1 0 0] [1 5 5]]",
+			expectedWithContinuation: "[[0 2 2 false] [0 2 2 false] [0 5 5 false] [1 0 0 false] [1 5 5 false]]",
 		},
 		{
 			description: "Test lookup join queries with separate families",
@@ -176,12 +177,12 @@ func TestJoinReader(t *testing.T) {
 				{aFn(10), bFn(10)},
 				{aFn(15), bFn(15)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.FourIntCols,
-			expected:                    "[[0 2 2 2] [0 5 5 5] [1 0 0 1] [1 5 5 6]]",
-			expectedWithContinuation:    "[[0 2 2 2 false] [0 5 5 5 false] [1 0 0 1 false] [1 5 5 6 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.FourIntCols,
+			expected:                 "[[0 2 2 2] [0 5 5 5] [1 0 0 1] [1 5 5 6]]",
+			expectedWithContinuation: "[[0 2 2 2 false] [0 5 5 5 false] [1 0 0 1 false] [1 5 5 6 false]]",
 		},
 		{
 			description: "Test lookup joins preserve order of left input",
@@ -196,12 +197,12 @@ func TestJoinReader(t *testing.T) {
 				{aFn(10), bFn(10)},
 				{aFn(15), bFn(15)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.ThreeIntCols,
-			expected:                    "[[0 2 2] [0 5 5] [0 2 2] [1 0 0] [1 5 5]]",
-			expectedWithContinuation:    "[[0 2 2 false] [0 5 5 false] [0 2 2 false] [1 0 0 false] [1 5 5 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.ThreeIntCols,
+			expected:                 "[[0 2 2] [0 5 5] [0 2 2] [1 0 0] [1 5 5]]",
+			expectedWithContinuation: "[[0 2 2 false] [0 5 5 false] [0 2 2 false] [1 0 0 false] [1 5 5 false]]",
 		},
 		{
 			description: "Test lookup join with onExpr",
@@ -215,13 +216,13 @@ func TestJoinReader(t *testing.T) {
 				{aFn(10), bFn(10)},
 				{aFn(15), bFn(15)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.ThreeIntCols,
-			onExpr:                      "@2 < @5",
-			expected:                    "[[1 0 1] [1 5 6]]",
-			expectedWithContinuation:    "[[1 0 1 false] [1 5 6 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.ThreeIntCols,
+			onExpr:                   "@2 < @5",
+			expected:                 "[[1 0 1] [1 5 6]]",
+			expectedWithContinuation: "[[1 0 1 false] [1 5 6 false]]",
 		},
 		{
 			description: "Test left outer lookup join on primary index",
@@ -233,13 +234,13 @@ func TestJoinReader(t *testing.T) {
 				{aFn(100), bFn(100)},
 				{aFn(2), bFn(2)},
 			},
-			lookupCols:                  []uint32{0, 1},
-			joinType:                    descpb.LeftOuterJoin,
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.ThreeIntCols,
-			expected:                    "[[10 0 NULL] [0 2 2]]",
-			expectedWithContinuation:    "[[10 0 NULL false] [0 2 2 false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1, 2},
+			lookupCols:               []uint32{0, 1},
+			joinType:                 descpb.LeftOuterJoin,
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.ThreeIntCols,
+			expected:                 "[[10 0 NULL] [0 2 2]]",
+			expectedWithContinuation: "[[10 0 NULL false] [0 2 2 false]]",
 		},
 		{
 			description: "Test lookup join with multiple matches for a row",
@@ -253,6 +254,7 @@ func TestJoinReader(t *testing.T) {
 				{aFn(200), bFn(200)},
 				{aFn(12), bFn(12)},
 			},
+			fetchCols:   []uint32{0, 1, 2},
 			lookupCols:  []uint32{0},
 			inputTypes:  types.TwoIntCols,
 			outputTypes: types.FourIntCols,
@@ -264,7 +266,6 @@ func TestJoinReader(t *testing.T) {
 				"[0 2 0 5 true] [0 2 0 6 true] [0 2 0 7 true] [0 2 0 8 true] [0 2 0 9 true] " +
 				"[1 2 1 1 false] [1 2 1 2 true] [1 2 1 3 true] [1 2 1 4 true] [1 2 1 5 true] " +
 				"[1 2 1 6 true] [1 2 1 7 true] [1 2 1 8 true] [1 2 1 9 true] [1 2 1 10 true]",
-			outputColumnForContinuation: 6,
 		},
 		{
 			description: "Test left outer lookup join with multiple matches for a row",
@@ -278,6 +279,7 @@ func TestJoinReader(t *testing.T) {
 				{aFn(200), bFn(200)},
 				{aFn(12), bFn(12)},
 			},
+			fetchCols:   []uint32{0, 1, 2},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftOuterJoin,
 			inputTypes:  types.TwoIntCols,
@@ -292,7 +294,6 @@ func TestJoinReader(t *testing.T) {
 				"[20 0 NULL NULL false] " +
 				"[1 2 1 1 false] [1 2 1 2 true] [1 2 1 3 true] [1 2 1 4 true] [1 2 1 5 true] " +
 				"[1 2 1 6 true] [1 2 1 7 true] [1 2 1 8 true] [1 2 1 9 true] [1 2 1 10 true]",
-			outputColumnForContinuation: 6,
 		},
 		{
 			description: "Test lookup join on secondary index with NULL lookup value",
@@ -304,12 +305,12 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{tree.NewDInt(0), tree.DNull},
 			},
-			lookupCols:                  []uint32{0, 1},
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.OneIntCol,
-			expected:                    "[]",
-			expectedWithContinuation:    "[]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1},
+			lookupCols:               []uint32{0, 1},
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.OneIntCol,
+			expected:                 "[]",
+			expectedWithContinuation: "[]",
 		},
 		{
 			description: "Test left outer lookup join on secondary index with NULL lookup value",
@@ -321,13 +322,13 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{tree.NewDInt(0), tree.DNull},
 			},
-			lookupCols:                  []uint32{0, 1},
-			joinType:                    descpb.LeftOuterJoin,
-			inputTypes:                  types.TwoIntCols,
-			outputTypes:                 types.TwoIntCols,
-			expected:                    "[[0 NULL]]",
-			expectedWithContinuation:    "[[0 NULL false]]",
-			outputColumnForContinuation: 6,
+			fetchCols:                []uint32{0, 1},
+			lookupCols:               []uint32{0, 1},
+			joinType:                 descpb.LeftOuterJoin,
+			inputTypes:               types.TwoIntCols,
+			outputTypes:              types.TwoIntCols,
+			expected:                 "[[0 NULL]]",
+			expectedWithContinuation: "[[0 NULL false]]",
 		},
 		{
 			description: "Test lookup join on secondary index with an implicit key column",
@@ -339,12 +340,12 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
 			},
-			lookupCols:                  []uint32{1, 2, 0},
-			inputTypes:                  []*types.T{types.Int, types.Int, types.String},
-			outputTypes:                 types.OneIntCol,
-			expected:                    "[['two']]",
-			expectedWithContinuation:    "[['two' false]]",
-			outputColumnForContinuation: 7,
+			fetchCols:                []uint32{0, 1, 3},
+			lookupCols:               []uint32{1, 2, 0},
+			inputTypes:               []*types.T{types.Int, types.Int, types.String},
+			outputTypes:              types.OneIntCol,
+			expected:                 "[['two']]",
+			expectedWithContinuation: "[['two' false]]",
 		},
 		{
 			description: "Test left semi lookup join",
@@ -361,10 +362,11 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(7)), sqlutils.RowEnglishFn(2)},
 				{tree.NewDInt(tree.DInt(1)), sqlutils.RowEnglishFn(2)},
 			},
+			fetchCols:   []uint32{0},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftSemiJoin,
 			inputTypes:  []*types.T{types.Int, types.String},
-			outputTypes: types.TwoIntCols,
+			outputTypes: []*types.T{types.Int, types.String},
 			expected:    "[[1 'two'] [1 'two'] [6 'two'] [7 'two'] [1 'two']]",
 		},
 		{
@@ -377,6 +379,7 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{tree.NewDInt(0), tree.DNull},
 			},
+			fetchCols:   []uint32{0, 1},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftSemiJoin,
 			inputTypes:  types.TwoIntCols,
@@ -398,6 +401,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(7)), bFn(3)},
 				{tree.NewDInt(tree.DInt(1)), bFn(2)},
 			},
+			fetchCols:   []uint32{0},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftSemiJoin,
 			onExpr:      "@2 > 2",
@@ -415,6 +419,7 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(1234)), tree.NewDInt(tree.DInt(1234))},
 			},
+			fetchCols:   []uint32{0},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
 			inputTypes:  types.TwoIntCols,
@@ -435,6 +440,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(7)), bFn(3)},
 				{tree.NewDInt(tree.DInt(1)), bFn(2)},
 			},
+			fetchCols:   []uint32{0},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
 			onExpr:      "@2 > 2",
@@ -452,6 +458,7 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{aFn(10), tree.NewDInt(tree.DInt(1234))},
 			},
+			fetchCols:   []uint32{0},
 			lookupCols:  []uint32{0},
 			joinType:    descpb.LeftAntiJoin,
 			inputTypes:  types.TwoIntCols,
@@ -468,6 +475,7 @@ func TestJoinReader(t *testing.T) {
 			input: [][]tree.Datum{
 				{tree.NewDInt(0), tree.DNull},
 			},
+			fetchCols:   []uint32{0, 1},
 			lookupCols:  []uint32{0, 1},
 			joinType:    descpb.LeftAntiJoin,
 			inputTypes:  types.TwoIntCols,
@@ -491,6 +499,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
 				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
 			},
+			fetchCols:              []uint32{0, 1, 2, 3},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftOuterJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -515,6 +524,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
 				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
 			},
+			fetchCols:              []uint32{0, 1, 2, 3},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftSemiJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -539,6 +549,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(110), bFn(110), tree.DBoolTrue},
 				{tree.NewDInt(tree.DInt(34)), aFn(120), bFn(120), tree.DBoolTrue},
 			},
+			fetchCols:              []uint32{0, 1, 2, 3},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftAntiJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -568,6 +579,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
 				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
 			},
+			fetchCols:              []uint32{0, 1, 2, 3},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftOuterJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -597,6 +609,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
 				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
 			},
+			fetchCols:              []uint32{1, 2},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftSemiJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -626,6 +639,7 @@ func TestJoinReader(t *testing.T) {
 				{tree.NewDInt(tree.DInt(34)), aFn(5), bFn(5), tree.DBoolFalse},
 				{tree.NewDInt(tree.DInt(43)), aFn(105), bFn(105), tree.DBoolFalse},
 			},
+			fetchCols:              []uint32{1, 2},
 			lookupCols:             []uint32{1, 2},
 			joinType:               descpb.LeftAntiJoin,
 			inputTypes:             threeIntColsAndBoolCol,
@@ -646,6 +660,7 @@ func TestJoinReader(t *testing.T) {
 				{aFn(2), bFn(2)},
 				{aFn(2), bFn(2)},
 			},
+			fetchCols:   []uint32{0, 1},
 			lookupExpr:  "@3 IN (1, 2) AND @2 = @4",
 			joinType:    descpb.LeftOuterJoin,
 			inputTypes:  types.TwoIntCols,
@@ -653,7 +668,6 @@ func TestJoinReader(t *testing.T) {
 			expected:    "[[0 1 0] [0 2 0] [11 NULL NULL] [2 1 2] [2 2 2] [2 1 2] [2 2 2]]",
 			expectedWithContinuation: "[[0 1 0 false] [0 2 0 true] [11 NULL NULL false] [2 1 2 false] " +
 				"[2 2 2 true] [2 1 2 false] [2 2 2 true]]",
-			outputColumnForContinuation: 6,
 		},
 		{
 			description: "Test left anti lookup join on primary index with lookup expr",
@@ -668,6 +682,7 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row.
 				{tree.NewDInt(tree.DInt(11)), tree.NewDInt(tree.DInt(11))},
 			},
+			fetchCols:   []uint32{0, 1},
 			lookupExpr:  "@4 = @2 AND @3 IN (1, 2)",
 			joinType:    descpb.LeftAntiJoin,
 			inputTypes:  types.TwoIntCols,
@@ -679,7 +694,7 @@ func TestJoinReader(t *testing.T) {
 			indexIdx:    1,
 			post: execinfrapb.PostProcessSpec{
 				Projection:    true,
-				OutputColumns: []uint32{0, 1, 6},
+				OutputColumns: []uint32{0, 1, 5},
 			},
 			input: [][]tree.Datum{
 				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
@@ -690,7 +705,8 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row since it's null.
 				{tree.DNull, bFn(1), sqlutils.RowEnglishFn(1)},
 			},
-			lookupExpr:  "@5 IN (1, 2, 5) AND @4 = @1 AND @7 IN ('one', 'two', 'one-two')",
+			fetchCols:   []uint32{0, 1, 3},
+			lookupExpr:  "@5 IN (1, 2, 5) AND @4 = @1 AND @6 IN ('one', 'two', 'one-two')",
 			joinType:    descpb.LeftOuterJoin,
 			inputTypes:  []*types.T{types.Int, types.Int, types.String},
 			outputTypes: []*types.T{types.Int, types.Int, types.String},
@@ -698,7 +714,6 @@ func TestJoinReader(t *testing.T) {
 				"[2 0 NULL] [NULL 1 NULL]]",
 			expectedWithContinuation: "[[0 1 'one' false] [0 1 'two' true] [0 2 'one' false] " +
 				"[0 2 'two' true] [1 NULL 'one-two' false] [2 0 NULL false] [NULL 1 NULL false]]",
-			outputColumnForContinuation: 7,
 		},
 		{
 			description: "Test left anti lookup join on secondary index with lookup expr",
@@ -716,7 +731,8 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row since it's null.
 				{tree.DNull, bFn(1), sqlutils.RowEnglishFn(1)},
 			},
-			lookupExpr:  "@5 IN (1, 2, 5) AND @7 IN ('one', 'two', 'one-two') AND @1 = @4",
+			fetchCols:   []uint32{0, 1, 3},
+			lookupExpr:  "@5 IN (1, 2, 5) AND @6 IN ('one', 'two', 'one-two') AND @1 = @4",
 			joinType:    descpb.LeftAntiJoin,
 			inputTypes:  []*types.T{types.Int, types.Int, types.String},
 			outputTypes: types.TwoIntCols,
@@ -735,6 +751,7 @@ func TestJoinReader(t *testing.T) {
 				{aFn(2), bFn(2)},
 				{aFn(2), bFn(2)},
 			},
+			fetchCols:        []uint32{0, 1},
 			lookupExpr:       "@3 = 1 AND @2 = @4",
 			remoteLookupExpr: "@3 = 2 AND @2 = @4",
 			joinType:         descpb.LeftSemiJoin,
@@ -747,7 +764,7 @@ func TestJoinReader(t *testing.T) {
 			indexIdx:    1,
 			post: execinfrapb.PostProcessSpec{
 				Projection:    true,
-				OutputColumns: []uint32{0, 1, 6},
+				OutputColumns: []uint32{0, 1, 5},
 			},
 			input: [][]tree.Datum{
 				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
@@ -759,22 +776,92 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row.
 				{aFn(20), bFn(20), sqlutils.RowEnglishFn(20)},
 			},
-			lookupExpr:       "@5 = 1 AND @3 = @7",
-			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @7",
+			fetchCols:        []uint32{0, 1, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @6",
+			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @6",
 			joinType:         descpb.InnerJoin,
 			inputTypes:       []*types.T{types.Int, types.Int, types.String},
 			outputTypes:      []*types.T{types.Int, types.Int, types.String},
 			expected:         "[[0 1 'one'] [1 1 'one-one'] [0 2 'two'] [2 2 'two-two']]",
 			expectedWithContinuation: "[[0 1 'one' false] [1 1 'one-one' false] [0 2 'two' false] " +
 				"[2 2 'two-two' false]]",
-			outputColumnForContinuation: 7,
+		},
+		{
+			description: "Test locality optimized inner lookup join on covering secondary index with inequality filter",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 1",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 1",
+			joinType:         descpb.InnerJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[1 1 'one-one'] [0 2 'two'] [2 2 'two-two']]",
+		},
+		{
+			description: "Test locality optimized inner lookup join on covering secondary index with inequality filter, no local matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 2",
+			joinType:         descpb.InnerJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[2 2 'two-two']]",
+		},
+		{
+			description: "Test locality optimized inner lookup join on covering secondary index with inequality filter, no remote matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				// No match for this row because of the inequality filter.
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 < 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 < 2",
+			joinType:         descpb.InnerJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[0 1 'one']]",
 		},
 		{
 			description: "Test locality optimized left outer lookup join on secondary index",
 			indexIdx:    1,
 			post: execinfrapb.PostProcessSpec{
 				Projection:    true,
-				OutputColumns: []uint32{0, 1, 6},
+				OutputColumns: []uint32{0, 1, 5},
 			},
 			input: [][]tree.Datum{
 				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
@@ -786,15 +873,85 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row.
 				{aFn(20), bFn(20), sqlutils.RowEnglishFn(20)},
 			},
-			lookupExpr:       "@5 = 1 AND @3 = @7",
-			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @7",
+			fetchCols:        []uint32{0, 1, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @6",
+			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @6",
 			joinType:         descpb.LeftOuterJoin,
 			inputTypes:       []*types.T{types.Int, types.Int, types.String},
 			outputTypes:      []*types.T{types.Int, types.Int, types.String},
 			expected:         "[[0 1 'one'] [1 1 'one-one'] [0 2 'two'] [2 2 'two-two'] [1 NULL NULL] [2 0 NULL]]",
 			expectedWithContinuation: "[[0 1 'one' false] [1 1 'one-one' false] [0 2 'two' false] " +
 				"[2 2 'two-two' false] [1 NULL NULL false] [2 0 NULL false]]",
-			outputColumnForContinuation: 7,
+		},
+		{
+			description: "Test locality optimized left outer lookup join on covering secondary index with inequality filter",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 1",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 1",
+			joinType:         descpb.LeftOuterJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[0 1 NULL] [1 1 'one-one'] [0 2 'two'] [2 2 'two-two']]",
+		},
+		{
+			description: "Test locality optimized left outer lookup join on covering secondary index with inequality filter, no local matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 2",
+			joinType:         descpb.LeftOuterJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[0 1 NULL] [1 1 NULL] [0 2 NULL] [2 2 'two-two']]",
+		},
+		{
+			description: "Test locality optimized left outer lookup join on covering secondary index with inequality filter, no remote matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				// No match for this row because of the inequality filter.
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 < 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 < 2",
+			joinType:         descpb.LeftOuterJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      []*types.T{types.Int, types.Int, types.String},
+			expected:         "[[0 1 'one'] [1 1 NULL] [0 2 NULL] [2 2 NULL]]",
 		},
 		{
 			description: "Test locality optimized left semi lookup join on secondary index",
@@ -813,30 +970,92 @@ func TestJoinReader(t *testing.T) {
 				// No match for this row.
 				{aFn(20), bFn(20), sqlutils.RowEnglishFn(20)},
 			},
-			lookupExpr:       "@5 = 1 AND @3 = @7",
-			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @7",
+			fetchCols:        []uint32{0, 1, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @6",
+			remoteLookupExpr: "@5 IN (2, 5) AND @3 = @6",
 			joinType:         descpb.LeftSemiJoin,
 			inputTypes:       []*types.T{types.Int, types.Int, types.String},
 			outputTypes:      types.TwoIntCols,
 			expected:         "[[0 1] [1 1] [0 2] [2 2]]",
 		},
+		{
+			description: "Test locality optimized left semi lookup join on covering secondary index with inequality filter",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 1",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 1",
+			joinType:         descpb.LeftSemiJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      types.TwoIntCols,
+			expected:         "[[1 1] [0 2] [2 2]]",
+		},
+		{
+			description: "Test locality optimized left semi lookup join on covering secondary index with inequality filter, no local matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
+			input: [][]tree.Datum{
+				// No match for this row because of the inequality filter.
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 > 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 > 2",
+			joinType:         descpb.LeftSemiJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      types.TwoIntCols,
+			expected:         "[[2 2]]",
+		},
+		{
+			description: "Test locality optimized left semi lookup join on covering secondary index with inequality filter, no remote matches",
+			indexIdx:    2,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
+			input: [][]tree.Datum{
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row because of the inequality filter.
+				{aFn(11), bFn(11), sqlutils.RowEnglishFn(11)},
+				// No match for this row because of the inequality filter.
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				// No match for this row because of the inequality filter.
+				{aFn(22), bFn(22), sqlutils.RowEnglishFn(22)},
+			},
+			fetchCols:        []uint32{0, 1, 2, 3},
+			lookupExpr:       "@5 = 1 AND @3 = @7 AND @6 < 2",
+			remoteLookupExpr: "@5 = 2 AND @3 = @7 AND @6 < 2",
+			joinType:         descpb.LeftSemiJoin,
+			inputTypes:       []*types.T{types.Int, types.Int, types.String},
+			outputTypes:      types.TwoIntCols,
+			expected:         "[[0 1]]",
+		},
 	}
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
-	diskMonitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily} {
 		for _, c := range testCases {
@@ -860,10 +1079,11 @@ func TestJoinReader(t *testing.T) {
 						}
 						t.Run(fmt.Sprintf("%d/reqOrdering=%t/%s/smallBatch=%t/cont=%t",
 							i, reqOrdering, c.description, smallBatch, outputContinuation), func(t *testing.T) {
-							evalCtx := tree.MakeTestingEvalContext(st)
+							evalCtx := eval.MakeTestingEvalContext(st)
 							defer evalCtx.Stop(ctx)
 							flowCtx := execinfra.FlowCtx{
 								EvalCtx: &evalCtx,
+								Mon:     evalCtx.TestingMon,
 								Cfg: &execinfra.ServerConfig{
 									Settings:    st,
 									TempStorage: tempEngine,
@@ -884,14 +1104,33 @@ func TestJoinReader(t *testing.T) {
 							out := &distsqlutils.RowBuffer{}
 							post := c.post
 							if outputContinuation {
-								post.OutputColumns = append(post.OutputColumns, c.outputColumnForContinuation)
+								post.OutputColumns = append(post.OutputColumns, uint32(len(c.fetchCols)+len(c.inputTypes)))
 							}
+
+							index := td.ActiveIndexes()[c.indexIdx]
+							var fetchColIDs []descpb.ColumnID
+							var neededOrds intsets.Fast
+							for _, ord := range c.fetchCols {
+								neededOrds.Add(int(ord))
+								fetchColIDs = append(fetchColIDs, td.PublicColumns()[ord].GetID())
+							}
+							var fetchSpec fetchpb.IndexFetchSpec
+							if err := rowenc.InitIndexFetchSpec(
+								&fetchSpec,
+								keys.SystemSQLCodec,
+								td, index, fetchColIDs,
+							); err != nil {
+								t.Fatal(err)
+							}
+							splitter := span.MakeSplitter(td, index, neededOrds)
+
 							jr, err := newJoinReader(
+								ctx,
 								&flowCtx,
 								0, /* processorID */
 								&execinfrapb.JoinReaderSpec{
-									Table:                             *td.TableDesc(),
-									IndexIdx:                          c.indexIdx,
+									FetchSpec:                         fetchSpec,
+									SplitFamilyIDs:                    splitter.FamilyIDs(),
 									LookupColumns:                     c.lookupCols,
 									LookupExpr:                        execinfrapb.Expression{Expr: c.lookupExpr},
 									RemoteLookupExpr:                  execinfrapb.Expression{Expr: c.remoteLookupExpr},
@@ -903,7 +1142,6 @@ func TestJoinReader(t *testing.T) {
 								},
 								in,
 								&post,
-								out,
 								lookupJoinReaderType,
 							)
 							if err != nil {
@@ -916,7 +1154,7 @@ func TestJoinReader(t *testing.T) {
 							}
 							// Else, use the default.
 
-							jr.Run(ctx)
+							jr.Run(ctx, out)
 
 							if !in.Done {
 								t.Fatal("joinReader didn't consume all the rows")
@@ -1001,30 +1239,22 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		key, stringColVal, numRows); err != nil {
 		t.Fatal(err)
 	}
-	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	diskMonitor := mon.NewMonitor(
-		"test-disk",
-		mon.DiskResource,
-		nil, /* curCount */
-		nil, /* maxHist */
-		-1,  /* increment: use default block size */
-		math.MaxInt64,
-		st,
-	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -1038,18 +1268,30 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	// DiskBackedIndexedRowContainer.
 	flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = mon.DefaultPoolAllocationSize
 
-	// Input row is just a single 0.
+	// The two input rows are just a single 0 each. We use two input rows because
+	// matches to the first input row are never buffered.
 	inputRows := rowenc.EncDatumRows{
 		rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
+		rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
+	}
+	var fetchSpec fetchpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(
+		&fetchSpec,
+		keys.SystemSQLCodec,
+		td,
+		td.ActiveIndexes()[1],
+		[]descpb.ColumnID{1, 2, 3},
+	); err != nil {
+		t.Fatal(err)
 	}
 
 	out := &distsqlutils.RowBuffer{}
 	jr, err := newJoinReader(
+		ctx,
 		&flowCtx,
 		0, /* processorID */
 		&execinfrapb.JoinReaderSpec{
-			Table:         *td.TableDesc(),
-			IndexIdx:      1,
+			FetchSpec:     fetchSpec,
 			LookupColumns: []uint32{0},
 			Type:          descpb.InnerJoin,
 			// Disk storage is only used when the input ordering must be maintained.
@@ -1060,13 +1302,12 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 			Projection:    true,
 			OutputColumns: []uint32{2},
 		},
-		out,
 		lookupJoinReaderType,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jr.Run(ctx)
+	jr.Run(ctx, out)
 
 	count := 0
 	for {
@@ -1082,7 +1323,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		require.Equal(t, expected, actual)
 		count++
 	}
-	require.Equal(t, numRows, count)
+	require.Equal(t, numRows*len(inputRows), count)
 	require.True(t, jr.(*joinReader).Spilled())
 }
 
@@ -1090,6 +1331,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 // is closed.
 func TestJoinReaderDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -1102,50 +1344,62 @@ func TestJoinReaderDrain(t *testing.T) {
 		1, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn),
 	)
-	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := s.ClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(context.Background(), base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(context.Background(), base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec, nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 
 	// Run the flow in a verbose trace so that we can test for tracing info.
-	tracer := tracing.NewTracer()
-	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test flow ctx")
+	tracer := s.TracerI().(*tracing.Tracer)
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
 
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
-	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), &leafInputState)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
+	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
 		},
 		Txn:         leafTxn,
+		Gateway:     false,
 		DiskMonitor: diskMonitor,
 	}
 
 	encRow := make(rowenc.EncDatumRow, 1)
 	encRow[0] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(1))
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	var fetchSpec fetchpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(
+		&fetchSpec,
+		keys.SystemSQLCodec,
+		td, td.GetPrimaryIndex(), []descpb.ColumnID{1},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
 		return newJoinReader(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
-			&execinfrapb.JoinReaderSpec{Table: *td.TableDesc()},
+			&execinfrapb.JoinReaderSpec{FetchSpec: fetchSpec},
 			distsqlutils.NewRowBuffer(types.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{}),
 			&execinfrapb.PostProcessSpec{},
-			out,
 			lookupJoinReaderType,
 		)
 	})
@@ -1162,15 +1416,16 @@ func TestJoinReaderDrain(t *testing.T) {
 
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerDone()
+
 		jr, err := newJoinReader(
-			&flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{
-				Table: *td.TableDesc(),
-			}, in, &execinfrapb.PostProcessSpec{},
-			out, lookupJoinReaderType)
+			ctx, &flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{
+				FetchSpec: fetchSpec,
+			}, in, &execinfrapb.PostProcessSpec{}, lookupJoinReaderType,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		jr.Run(ctx)
+		jr.Run(ctx, out)
 		row, meta := out.Next()
 		if row != nil {
 			t.Fatalf("row was pushed unexpectedly: %s", row.String(types.OneIntCol))
@@ -1238,8 +1493,8 @@ func TestIndexJoiner(t *testing.T) {
 		99,
 		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
 
-	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-	tdf := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t2")
+	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tdf := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t2")
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -1248,7 +1503,8 @@ func TestIndexJoiner(t *testing.T) {
 
 	testCases := []struct {
 		description string
-		desc        *descpb.TableDescriptor
+		desc        catalog.TableDescriptor
+		fetchCols   []int
 		post        execinfrapb.PostProcessSpec
 		input       rowenc.EncDatumRows
 		outputTypes []*types.T
@@ -1256,7 +1512,7 @@ func TestIndexJoiner(t *testing.T) {
 	}{
 		{
 			description: "Test selecting rows using the primary index",
-			desc:        td.TableDesc(),
+			desc:        td,
 			post: execinfrapb.PostProcessSpec{
 				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
@@ -1277,7 +1533,7 @@ func TestIndexJoiner(t *testing.T) {
 		},
 		{
 			description: "Test selecting rows using the primary index with multiple family spans",
-			desc:        tdf.TableDesc(),
+			desc:        tdf,
 			post: execinfrapb.PostProcessSpec{
 				Projection:    true,
 				OutputColumns: []uint32{0, 1, 2},
@@ -1300,9 +1556,20 @@ func TestIndexJoiner(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run(c.description, func(t *testing.T) {
+			var fetchSpec fetchpb.IndexFetchSpec
+			if err := rowenc.InitIndexFetchSpec(
+				&fetchSpec,
+				keys.SystemSQLCodec,
+				c.desc, c.desc.GetPrimaryIndex(),
+				[]descpb.ColumnID{1, 2, 3, 4},
+			); err != nil {
+				t.Fatal(err)
+			}
+			splitter := span.MakeSplitter(c.desc, c.desc.GetPrimaryIndex(), intsets.MakeFast(0, 1, 2, 3))
+
 			spec := execinfrapb.JoinReaderSpec{
-				Table:    *c.desc,
-				IndexIdx: 0,
+				FetchSpec:      fetchSpec,
+				SplitFamilyIDs: splitter.FamilyIDs(),
 			}
 			txn := kv.NewTxn(context.Background(), s.DB(), s.NodeID())
 			runProcessorTest(
@@ -1314,6 +1581,8 @@ func TestIndexJoiner(t *testing.T) {
 				c.outputTypes,
 				c.expected,
 				txn,
+				s.Stopper(),
+				s.DistSenderI().(*kvcoord.DistSender),
 			)
 		})
 	}
@@ -1355,17 +1624,22 @@ func BenchmarkJoinReader(b *testing.B) {
 //
 // input: 0,1,2,3,4 (size of input is 'numLookupRows')
 // table: one | four | sixteen |
-//          0 |    0 |       0
-//          1 |    0 |       0
-//          2 |    0 |       0
-//          3 |    0 |       0
-//          4 |    1 |       0
-//          5 |    1 |       0
-//  ...
+//
+//	        0 |    0 |       0
+//	        1 |    0 |       0
+//	        2 |    0 |       0
+//	        3 |    0 |       0
+//	        4 |    1 |       0
+//	        5 |    1 |       0
+//	...
+//
 // SELECT one FROM input INNER LOOKUP JOIN t64 ON i = one;
-//    -> 0,1,2,3,4
+//
+//	-> 0,1,2,3,4
+//
 // SELECT four FROM input INNER LOOKUP JOIN t64 ON i = four;
-//    -> 0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3
+//
+//	-> 0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3
 func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 
 	// Create an *on-disk* store spec for the primary store and temp engine to
@@ -1382,10 +1656,11 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 			StoreSpecs: []base.StoreSpec{storeSpec},
 		})
 		st          = s.ClusterSettings()
-		evalCtx     = tree.MakeTestingEvalContext(st)
+		evalCtx     = eval.MakeTestingEvalContext(st)
 		diskMonitor = execinfra.NewTestDiskMonitor(ctx, st)
 		flowCtx     = execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -1397,11 +1672,17 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 	defer evalCtx.Stop(ctx)
 	defer diskMonitor.Stop(ctx)
 
+	evalCtx.TestingKnobs.ForceProductionValues = true
+
 	tempStoragePath, cleanupTempDir := testutils.TempDir(b)
 	defer cleanupTempDir()
 	tempStoreSpec, err := base.NewStoreSpec(fmt.Sprintf("path=%s", tempStoragePath))
 	require.NoError(b, err)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{
+		Path:     tempStoragePath,
+		Mon:      diskMonitor,
+		Settings: st,
+	}, tempStoreSpec, nil /* statsCollector */)
 	require.NoError(b, err)
 	defer tempEngine.Close()
 	flowCtx.Cfg.TempStorage = tempEngine
@@ -1506,7 +1787,7 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 
 								// Get the table descriptor and find the index that will provide us with
 								// the expected match ratio.
-								tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
+								tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 								foundIndex := catalog.FindPublicNonPrimaryIndex(tableDesc, func(idx catalog.Index) bool {
 									require.Equal(b, 1, idx.NumKeyColumns(), "all indexes created in this benchmark should only contain one column")
 									return idx.GetKeyColumnName(0) == columnDef.name
@@ -1521,25 +1802,27 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 								}), numLookupRows)
 								output := rowDisposer{}
 
+								var fetchSpec fetchpb.IndexFetchSpec
+								if err := rowenc.InitIndexFetchSpec(
+									&fetchSpec,
+									keys.SystemSQLCodec,
+									tableDesc, tableDesc.ActiveIndexes()[indexIdx],
+									[]descpb.ColumnID{descpb.ColumnID(columnIdx + 1)},
+								); err != nil {
+									b.Fatal(err)
+								}
+
 								spec := execinfrapb.JoinReaderSpec{
-									Table:               *tableDesc.TableDesc(),
+									FetchSpec:           fetchSpec,
 									LookupColumnsAreKey: parallel,
-									IndexIdx:            indexIdx,
 									MaintainOrdering:    reqOrdering,
 								}
 								if lookupExpr {
-									// this is always @1 = @columnIdx+2 because @1 refers to column 0 of the input
-									// and the other refers to the column in the table of the index we supplied.
-									spec.LookupExpr = execinfrapb.Expression{Expr: fmt.Sprintf("@1 = @%d", columnIdx+2)}
+									// @1 is the column in the input, @2 is the only fetched column.
+									spec.LookupExpr = execinfrapb.Expression{Expr: "@1 = @2"}
 								} else {
 									// This is always zero because the input has one column
 									spec.LookupColumns = []uint32{0}
-								}
-								// Post specifies that only the columns contained in the secondary index
-								// need to be output.
-								post := execinfrapb.PostProcessSpec{
-									Projection:    true,
-									OutputColumns: []uint32{uint32(columnIdx + 1)},
 								}
 
 								expectedNumOutputRows := numLookupRows * columnDef.matchesPerLookupRow
@@ -1553,11 +1836,13 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 								spilled := false
 								for i := 0; i < b.N; i++ {
 									flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
-									jr, err := newJoinReader(&flowCtx, 0 /* processorID */, &spec, input, &post, &output, lookupJoinReaderType)
+									jr, err := newJoinReader(
+										ctx, &flowCtx, 0 /* processorID */, &spec, input, &execinfrapb.PostProcessSpec{}, lookupJoinReaderType,
+									)
 									if err != nil {
 										b.Fatal(err)
 									}
-									jr.Run(ctx)
+									jr.Run(ctx, &output)
 									if !spilled && jr.(*joinReader).Spilled() {
 										spilled = true
 									}
@@ -1640,10 +1925,11 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 			StoreSpecs: []base.StoreSpec{storeSpec},
 		})
 		st          = s.ClusterSettings()
-		evalCtx     = tree.MakeTestingEvalContext(st)
+		evalCtx     = eval.MakeTestingEvalContext(st)
 		diskMonitor = execinfra.NewTestDiskMonitor(ctx, st)
 		flowCtx     = execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -1655,11 +1941,17 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	defer diskMonitor.Stop(ctx)
 
+	evalCtx.TestingKnobs.ForceProductionValues = true
+
 	tempStoragePath, cleanupTempDir := testutils.TempDir(b)
 	defer cleanupTempDir()
 	tempStoreSpec, err := base.NewStoreSpec(fmt.Sprintf("path=%s", tempStoragePath))
 	require.NoError(b, err)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{
+		Path:     tempStoragePath,
+		Mon:      diskMonitor,
+		Settings: st,
+	}, tempStoreSpec, nil /* statsCollector */)
 	require.NoError(b, err)
 	defer tempEngine.Close()
 	flowCtx.Cfg.TempStorage = tempEngine
@@ -1705,7 +1997,7 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 
 			// Get the table descriptor and find the index that will provide us with
 			// the expected match ratio.
-			tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
+			tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 			foundIndex := catalog.FindPublicNonPrimaryIndex(tableDesc, func(idx catalog.Index) bool {
 				return idx.NumKeyColumns() == numCols
 			})
@@ -1719,10 +2011,23 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 			}), numLookupRows)
 			output := rowDisposer{}
 
+			var fetchColumnIDs []descpb.ColumnID
+			for i := 1; i <= numCols; i++ {
+				fetchColumnIDs = append(fetchColumnIDs, descpb.ColumnID(i))
+			}
+
+			var fetchSpec fetchpb.IndexFetchSpec
+			if err := rowenc.InitIndexFetchSpec(
+				&fetchSpec,
+				keys.SystemSQLCodec,
+				tableDesc, tableDesc.ActiveIndexes()[indexIdx],
+				fetchColumnIDs,
+			); err != nil {
+				b.Fatal(err)
+			}
 			spec := execinfrapb.JoinReaderSpec{
-				Table: *tableDesc.TableDesc(),
+				FetchSpec: fetchSpec,
 				LookupColumnsAreKey:/*parallel=*/ true,
-				IndexIdx: indexIdx,
 				MaintainOrdering:/*reqOrdering=*/ false,
 			}
 			lookupExprString := "@1 = @2"
@@ -1735,17 +2040,17 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 			// need to be output.
 			post := execinfrapb.PostProcessSpec{
 				Projection:    true,
-				OutputColumns: []uint32{uint32(2)},
+				OutputColumns: []uint32{uint32(1)},
 			}
 
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				jr, err := newJoinReader(&flowCtx, 0 /* processorID */, &spec, input, &post, &output, lookupJoinReaderType)
+				jr, err := newJoinReader(ctx, &flowCtx, 0 /* processorID */, &spec, input, &post, lookupJoinReaderType)
 				if err != nil {
 					b.Fatal(err)
 				}
-				jr.Run(ctx)
+				jr.Run(ctx, &output)
 
 				if output.NumRowsDisposed() != numLookupRows {
 					b.Fatalf("got %d output rows, expected %d", output.NumRowsDisposed(), numLookupRows)

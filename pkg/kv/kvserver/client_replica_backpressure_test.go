@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -21,14 +16,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
@@ -39,6 +37,8 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRace(t, "takes >1m under race")
+
 	rRand, _ := randutil.NewTestRand()
 	ctx := context.Background()
 
@@ -46,10 +46,12 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 	// range size parameters. We want something not too tiny but also not too big
 	// that it takes a while to load.
 	const (
-		rowSize  = 16 << 10  // 16 KiB
-		dataSize = 512 << 10 // 512 KiB
-		numRows  = dataSize / rowSize
+		rowSize             = 5 << 20   // 5 MiB
+		dataSize            = 200 << 20 // 200 MiB
+		numRows             = dataSize / rowSize
+		min_range_max_bytes = 64 << 20 // 64 MiB
 	)
+	val := randutil.RandBytes(rRand, rowSize)
 
 	// setup will set up a testcluster with a table filled with data. All splits
 	// will be blocked until the returned closure is called.
@@ -66,18 +68,18 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		var allowSplits atomic.Value
 		allowSplits.Store(true)
 		unblockCh := make(chan struct{}, 1)
-		var rangesBlocked sync.Map
+		var rangesBlocked syncutil.Set[roachpb.RangeID]
 		args = base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingRequestFilter: func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+						TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if ba.Header.Txn != nil && ba.Header.Txn.Name == "split" && !allowSplits.Load().(bool) {
-								rangesBlocked.Store(ba.Header.RangeID, true)
-								defer rangesBlocked.Delete(ba.Header.RangeID)
+								rangesBlocked.Add(ba.Header.RangeID)
+								defer rangesBlocked.Remove(ba.Header.RangeID)
 								select {
 								case <-unblockCh:
-									return roachpb.NewError(errors.Errorf("splits disabled"))
+									return kvpb.NewError(errors.Errorf("splits disabled"))
 								case <-ctx.Done():
 									<-ctx.Done()
 								}
@@ -93,6 +95,11 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 
 		// Create the table, split it off, and load it up with data.
 		tdb = sqlutils.MakeSQLRunner(tc.ServerConn(0))
+
+		// speeds up the test
+		//		tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+		//		tdb.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms'`)
+
 		tdb.Exec(t, "CREATE TABLE foo (k INT PRIMARY KEY, v BYTES NOT NULL)")
 
 		var tableID int
@@ -102,9 +109,9 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		tc.SplitRangeOrFatal(t, tablePrefix)
 		require.NoError(t, tc.WaitForSplitAndInitialization(tablePrefix))
 
-		for i := 0; i < dataSize/rowSize; i++ {
+		for i := 0; i < numRows; i++ {
 			tdb.Exec(t, "UPSERT INTO foo VALUES ($1, $2)",
-				rRand.Intn(numRows), randutil.RandBytes(rRand, rowSize))
+				rRand.Intn(numRows), val)
 		}
 
 		// Block splits and return.
@@ -118,7 +125,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		}
 		waitForBlockedRange = func(id roachpb.RangeID) {
 			testutils.SucceedsSoon(t, func() error {
-				if _, ok := rangesBlocked.Load(id); !ok {
+				if !rangesBlocked.Contains(id) {
 					return errors.Errorf("waiting for %v to be blocked", id)
 				}
 				return nil
@@ -132,7 +139,10 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 			for i := 0; i < tc.NumServers(); i++ {
 				s := tc.Server(i)
 				_, r := getFirstStoreReplica(t, s, tablePrefix)
-				conf := r.SpanConfig()
+				conf, err := r.LoadSpanConfig(ctx)
+				if err != nil {
+					return err
+				}
 				if conf.RangeMaxBytes != exp {
 					return fmt.Errorf("expected %d, got %d", exp, conf.RangeMaxBytes)
 				}
@@ -176,19 +186,18 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		defer unblockSplits()
 
 		tdb.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING "+
-			"range_max_bytes = $1, range_min_bytes = $2", dataSize/5, dataSize/10)
-		waitForSpanConfig(t, tc, tablePrefix, dataSize/5)
+			"range_max_bytes = $1, range_min_bytes = $2", min_range_max_bytes, dataSize/10)
+		waitForSpanConfig(t, tc, tablePrefix, min_range_max_bytes)
 
 		// Don't observe backpressure.
 		tdb.Exec(t, "UPSERT INTO foo VALUES ($1, $2)",
-			rRand.Intn(10000000), randutil.RandBytes(rRand, rowSize))
+			rRand.Intn(10000000), val)
 	})
 
 	t.Run("no backpressure when much larger on new node", func(t *testing.T) {
 		tc, args, tdb, tablePrefix, unblockSplits, _ := setup(t, 1)
 		defer tc.Stopper().Stop(ctx)
 		defer unblockSplits()
-
 		// We didn't want to have to load too much data into these ranges because
 		// it makes the testing slower so let's lower the threshold at which we'll
 		// consider the range to be way over the backpressure limit from megabytes
@@ -196,15 +205,15 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		tdb.Exec(t, "SET CLUSTER SETTING kv.range.backpressure_byte_tolerance = '1 KiB'")
 
 		tdb.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING "+
-			"range_max_bytes = $1, range_min_bytes = $2", dataSize/5, dataSize/10)
-		waitForSpanConfig(t, tc, tablePrefix, dataSize/5)
+			"range_max_bytes = $1, range_min_bytes = $2", min_range_max_bytes, dataSize/10)
+		waitForSpanConfig(t, tc, tablePrefix, min_range_max_bytes)
 
 		// Then we'll add a new server and move the table there.
 		moveTableToNewStore(t, tc, args, tablePrefix)
 
 		// Don't observe backpressure.
 		tdb.Exec(t, "UPSERT INTO foo VALUES ($1, $2)",
-			rRand.Intn(10000000), randutil.RandBytes(rRand, rowSize))
+			rRand.Intn(10000000), val)
 	})
 
 	t.Run("no backpressure when near limit on existing node", func(t *testing.T) {
@@ -223,7 +232,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		// backpressureByteTolerance. We won't see backpressure because the range
 		// will remember its previous zone config setting.
 		s, repl := getFirstStoreReplica(t, tc.Server(0), tablePrefix.Next())
-		newMax := repl.GetMVCCStats().Total()/2 - 32<<10
+		newMax := repl.GetMVCCStats().Total()/2 - 32<<20
 		newMin := newMax / 4
 		tdb.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING "+
 			"range_max_bytes = $1, range_min_bytes = $2", newMax, newMin)
@@ -232,7 +241,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		// Don't observe backpressure because we remember the previous max size on
 		// this node.
 		tdb.Exec(t, "UPSERT INTO foo VALUES ($1, $2)",
-			rRand.Intn(10000000), randutil.RandBytes(rRand, rowSize))
+			rRand.Intn(10000000), val)
 
 		// Allow one split to occur and make sure that the remembered value is
 		// cleared.
@@ -246,6 +255,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 			return nil
 		})
 	})
+
 	// This case is very similar to the above case but differs in that the range
 	// is moved to a new node after the range size is decreased. This new node
 	// never knew about the old, larger range size, and thus will backpressure
@@ -259,7 +269,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		// Now we'll change the range_max_bytes to be half the range size less a
 		// bit. This is the range where we expect to observe backpressure.
 		_, repl := getFirstStoreReplica(t, tc.Server(0), tablePrefix.Next())
-		newMax := repl.GetMVCCStats().Total()/2 - 32<<10
+		newMax := repl.GetMVCCStats().Total()/2 - 32<<20
 		newMin := newMax / 4
 		tdb.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING "+
 			"range_max_bytes = $1, range_min_bytes = $2", newMax, newMin)
@@ -268,8 +278,21 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		// Then we'll add a new server and move the table there.
 		moveTableToNewStore(t, tc, args, tablePrefix)
 
+		// Ensure that the new replica has applied the same config.
+		testutils.SucceedsSoon(t, func() error {
+			_, r := getFirstStoreReplica(t, tc.Server(1), tablePrefix)
+			conf, err := r.LoadSpanConfig(ctx)
+			if err != nil {
+				return err
+			}
+			if conf.RangeMaxBytes != newMax {
+				return fmt.Errorf("expected %d, got %d", newMax, conf.RangeMaxBytes)
+			}
+			return nil
+		})
+
 		s, repl := getFirstStoreReplica(t, tc.Server(1), tablePrefix)
-		s.SetReplicateQueueActive(false)
+		s.TestingSetReplicateQueueActive(false)
 		require.Len(t, repl.Desc().Replicas().Descriptors(), 1)
 		// We really need to make sure that the split queue has hit this range,
 		// otherwise we'll fail to backpressure.
@@ -281,7 +304,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 
 		// Observe backpressure now that the range is just over the limit.
 		// Use pgx so that cancellation does something reasonable.
-		url, cleanup := sqlutils.PGUrl(t, tc.Server(1).ServingSQLAddr(), "", url.User("root"))
+		url, cleanup := sqlutils.PGUrl(t, tc.Server(1).AdvSQLAddr(), "", url.User("root"))
 		defer cleanup()
 		conf, err := pgx.ParseConfig(url.String())
 		require.NoError(t, err)

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package nstree
 
@@ -17,25 +12,25 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
 )
 
 // TestSetDataDriven tests the Set using a data-driven
 // exposition format. The tests support the following commands:
 //
-//   add [parent-id=...] [parent-schema-id=...] name=...
-//     Calls the add method with an entry matching the spec.
-//     Prints the entry.
+//	add [parent-id=...] [parent-schema-id=...] name=...
+//	  Calls the add method with an entry matching the spec.
+//	  Prints the entry.
 //
-//   contains [parent-id=...] [parent-schema-id=...] name=...
-//     Calls the Remove method on the specified id.
-//     Prints whether it is contained removed.
+//	contains [parent-id=...] [parent-schema-id=...] name=...
+//	  Calls the Remove method on the specified id.
+//	  Prints whether it is contained removed.
 //
-//   clear
-//     Clears the tree.
-//
+//	clear
+//	  Clears the tree.
 func TestSetDataDriven(t *testing.T) {
-	datadriven.Walk(t, "testdata/set", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "set"), func(t *testing.T, path string) {
 		var tr Set
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			return testSetDataDriven(t, d, &tr)

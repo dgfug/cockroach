@@ -1,17 +1,13 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -164,9 +161,22 @@ Creation fails if the CA expiration time is before the desired certificate expir
 // TODO(marc): there is currently no way to specify which CA cert to use if more
 // than one if present.
 func runCreateClientCert(cmd *cobra.Command, args []string) error {
-	username, err := security.MakeSQLUsernameFromUserInput(args[0], security.UsernameCreation)
+	user, err := username.MakeSQLUsernameFromUserInput(args[0], username.PurposeCreation)
 	if err != nil {
-		return errors.Wrap(err, "failed to generate client certificate and key")
+		const genError = "failed to generate client certificate and key"
+		if _, err := username.MakeSQLUsernameFromUserInput(args[0], username.PurposeValidation); err != nil {
+			return errors.Wrap(err, genError)
+		}
+		if certCtx.disableUsernameValidation {
+			// The username is not valid SQL structure, but we're still OK
+			// minting a TLS certificate for it. Simply inform the user they
+			// will need extra work to use it with SQL.
+			fmt.Fprintf(stderr, "warning: the specified identity %q is not a valid SQL username.\n"+
+				"Before it can be used to log in, an identity map rule will need to be set on the server.",
+				args[0])
+		} else {
+			return errors.Wrap(err, genError)
+		}
 	}
 
 	return errors.Wrap(
@@ -176,7 +186,9 @@ func runCreateClientCert(cmd *cobra.Command, args []string) error {
 			certCtx.keySize,
 			certCtx.certificateLifetime,
 			certCtx.overwriteFiles,
-			username,
+			user,
+			certCtx.tenantScope,
+			certCtx.tenantNameScope,
 			certCtx.generatePKCS8Key),
 		"failed to generate client certificate and key")
 }
@@ -287,6 +299,142 @@ func runListCerts(cmd *cobra.Command, args []string) error {
 	return sqlExecCtx.PrintQueryOutput(os.Stdout, stderr, certTableHeaders, clisqlexec.NewRowSliceIter(rows, alignment))
 }
 
+// encodeURICmd creates a PG URI for the given parameters.
+var encodeURICmd = func() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "encode-uri [postgres://][USERNAME[:PASSWORD]@]HOST",
+		Short: "encode a CRDB connection URL",
+		Args:  cobra.ExactArgs(1),
+		RunE:  clierrorplus.MaybeDecorateError(encodeURI),
+	}
+	f := cmd.PersistentFlags()
+	f.BoolVar(&encodeURIOpts.sslInline, "inline", false, "whether to inline certificates (supported by CRDB's Physical Replication feature)")
+	f.StringVar(&encodeURIOpts.user, "user", "", "username (overrides any username in the passed URL)")
+	f.StringVar(&encodeURIOpts.cluster, "cluster", "system", "virtual cluster to connect to")
+	f.StringVar(&encodeURIOpts.certsDir, "certs-dir", "", "certs directory in which to find certs automatically")
+	f.StringVar(&encodeURIOpts.caCertPath, "ca-cert", "", "path to CA certificate")
+	f.StringVar(&encodeURIOpts.certPath, "cert", "", "path to certificate for client-cert authentication")
+	f.StringVar(&encodeURIOpts.keyPath, "key", "", "path to key for client-cert authentication")
+	f.StringVar(&encodeURIOpts.database, "database", "defaultdb", "database to connect to")
+	return cmd
+}()
+
+var encodeURIOpts = struct {
+	sslInline  bool
+	user       string
+	cluster    string
+	certsDir   string
+	caCertPath string
+	certPath   string
+	keyPath    string
+	database   string
+}{}
+
+func encodeURI(cmd *cobra.Command, args []string) error {
+	pgURL, err := url.Parse(args[0])
+	if err != nil {
+		return err
+	}
+
+	if pgURL.Scheme == "" {
+		pgURL.Scheme = "postgresql://"
+	}
+
+	if encodeURIOpts.database != "" {
+		pgURL.Path = encodeURIOpts.database
+	}
+
+	userName := encodeURIOpts.user
+	if userName == "" && pgURL.User != nil {
+		userName = pgURL.User.Username()
+	}
+
+	user := username.RootUserName()
+	if userName != "" {
+		u, err := username.MakeSQLUsernameFromPreNormalizedStringChecked(userName)
+		if err != nil {
+			return err
+		}
+		user = u
+	}
+
+	// Now that we've established the username, update it in the URL.
+	if pgURL.User == nil {
+		pgURL.User = url.User(user.Normalized())
+	} else {
+		if pass, hasPass := pgURL.User.Password(); hasPass {
+			pgURL.User = url.UserPassword(user.Normalized(), pass)
+		} else {
+			pgURL.User = url.User(user.Normalized())
+		}
+	}
+
+	if encodeURIOpts.certsDir != "" {
+		cm, err := security.NewCertificateManager(encodeURIOpts.certsDir, security.CommandTLSSettings{})
+		if err != nil {
+			return errors.Wrap(err, "cannot load certificates")
+		}
+		if encodeURIOpts.caCertPath == "" {
+			encodeURIOpts.caCertPath = cm.CACertPath()
+		}
+
+		if encodeURIOpts.certPath == "" {
+			encodeURIOpts.certPath = cm.ClientCertPath(user)
+		}
+		if encodeURIOpts.keyPath == "" {
+			encodeURIOpts.keyPath = cm.ClientKeyPath(user)
+		}
+	}
+
+	options := pgURL.Query()
+	if encodeURIOpts.cluster != "" {
+		options.Set("options", fmt.Sprintf("-ccluster=%s", encodeURIOpts.cluster))
+	}
+
+	if encodeURIOpts.sslInline {
+		options.Set("sslinline", "true")
+	}
+
+	getCert := func(path string) (string, error) {
+		if !encodeURIOpts.sslInline {
+			return path, nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return string(content), err
+	}
+
+	if encodeURIOpts.caCertPath != "" {
+		sslRootCert, err := getCert(encodeURIOpts.caCertPath)
+		if err != nil {
+			return err
+		}
+		options.Set("sslrootcert", sslRootCert)
+		options.Set("sslmode", "verify-full")
+	}
+
+	if encodeURIOpts.certPath != "" {
+		sslClientCert, err := getCert(encodeURIOpts.certPath)
+		if err != nil {
+			return err
+		}
+		options.Set("sslcert", sslClientCert)
+	}
+
+	if encodeURIOpts.keyPath != "" {
+		sslClientKey, err := getCert(encodeURIOpts.keyPath)
+		if err != nil {
+			return err
+		}
+		options.Set("sslkey", sslClientKey)
+	}
+	pgURL.RawQuery = options.Encode()
+	fmt.Printf("%s\n", pgURL.String())
+	return nil
+}
+
 var certCmds = []*cobra.Command{
 	createCACertCmd,
 	createClientCACertCmd,
@@ -294,6 +442,7 @@ var certCmds = []*cobra.Command{
 	createNodeCertCmd,
 	createClientCertCmd,
 	mtCreateTenantCertCmd,
+	mtCreateTenantSigningCertCmd,
 	listCertsCmd,
 }
 

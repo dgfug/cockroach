@@ -1,19 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { Button, util, Timestamp } from "@cockroachlabs/cluster-ui";
+import { ArrowLeft } from "@cockroachlabs/icons";
+import find from "lodash/find";
+import map from "lodash/map";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { Link, RouteComponentProps, withRouter } from "react-router-dom";
 import { createSelector } from "reselect";
+
 import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
 import {
   livenessNomenclature,
@@ -24,8 +23,6 @@ import {
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
-import { LongToMoment } from "src/util/convert";
-import { Bytes, DATE_FORMAT, Percentage } from "src/util/format";
 import { INodeStatus, MetricConstants, StatusMetrics } from "src/util/proto";
 import { getMatchParamByName } from "src/util/query";
 import {
@@ -33,9 +30,9 @@ import {
   SummaryLabel,
   SummaryValue,
 } from "src/views/shared/components/summaryBar";
-import { Button } from "@cockroachlabs/cluster-ui";
-import { ArrowLeft } from "@cockroachlabs/icons";
+
 import "./nodeOverview.styl";
+
 import {
   LiveBytesTooltip,
   KeyBytesTooltip,
@@ -45,8 +42,10 @@ import {
   NodeUsedCapacityTooltip,
   NodeAvailableCapacityTooltip,
   NodeMaximumCapacityTooltip,
+  MVCCRangeKeyBytesTooltip,
+  MVCCRangeValueBytesTooltip,
+  CellTooltipProps,
 } from "./tooltips";
-import { TooltipProps } from "src/components/tooltip/tooltip";
 
 /**
  * TableRow is a small stateless component that renders a single row in the node
@@ -58,7 +57,7 @@ function TableRow(props: {
   data: INodeStatus;
   title: string;
   valueFn: (s: StatusMetrics) => React.ReactNode;
-  CellTooltip?: React.FC<TooltipProps>;
+  CellTooltip?: React.FC<CellTooltipProps>;
   nodeName?: string;
 }) {
   const { data, title, valueFn, CellTooltip } = props;
@@ -72,7 +71,7 @@ function TableRow(props: {
         )}
       </td>
       <td className="table__cell">{valueFn(data.metrics)}</td>
-      {_.map(data.store_statuses, ss => {
+      {map(data.store_statuses, ss => {
         return (
           <td key={ss.desc.store_id} className="table__cell">
             {valueFn(ss.metrics)}
@@ -115,6 +114,7 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
 
   render() {
     const { node, nodesSummary } = this.props;
+    const { Bytes, Percentage, DATE_FORMAT_24_TZ } = util;
     if (!node) {
       return (
         <div className="section">
@@ -154,7 +154,7 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
                 <tr className="table__row table__row--header">
                   <th className="table__cell" />
                   <th className="table__cell">{`Node ${node.desc.node_id}`}</th>
-                  {_.map(node.store_statuses, ss => {
+                  {map(node.store_statuses, ss => {
                     const storeId = ss.desc.store_id;
                     return (
                       <th
@@ -187,6 +187,24 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
                   valueFn={metrics => Bytes(metrics[MetricConstants.valBytes])}
                   nodeName={nodesSummary.nodeDisplayNameByID[node.desc.node_id]}
                   CellTooltip={ValueBytesTooltip}
+                />
+                <TableRow
+                  data={node}
+                  title="MVCC Range Key Bytes"
+                  valueFn={metrics =>
+                    Bytes(metrics[MetricConstants.rangeKeyBytes] || 0)
+                  }
+                  nodeName={nodesSummary.nodeDisplayNameByID[node.desc.node_id]}
+                  CellTooltip={MVCCRangeKeyBytesTooltip}
+                />
+                <TableRow
+                  data={node}
+                  title="MVCC Range Value Bytes"
+                  valueFn={metrics =>
+                    Bytes(metrics[MetricConstants.rangeValBytes] || 0)
+                  }
+                  nodeName={nodesSummary.nodeDisplayNameByID[node.desc.node_id]}
+                  CellTooltip={MVCCRangeValueBytesTooltip}
                 />
                 <TableRow
                   data={node}
@@ -287,7 +305,12 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
               />
               <SummaryValue
                 title="Last Update"
-                value={LongToMoment(node.updated_at).format(DATE_FORMAT)}
+                value={
+                  <Timestamp
+                    time={util.LongToMoment(node.updated_at)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               <SummaryValue title="Build" value={node.build_info.tag} />
               <SummaryValue
@@ -314,7 +337,7 @@ export const currentNode = createSelector(
     if (!nodes || !id) {
       return undefined;
     }
-    return _.find(nodes, ns => ns.desc.node_id === id);
+    return find(nodes, ns => ns.desc.node_id === id);
   },
 );
 

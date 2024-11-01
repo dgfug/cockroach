@@ -1,18 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -23,34 +19,41 @@ import (
 // records.
 //
 // Sample usage:
-//   sd := StreamDecoder{}
-//   var row sqlbase.EncDatumRow
-//   for each message in stream {
-//       err := sd.AddMessage(msg)
-//       if err != nil { ... }
-//       for {
-//           row, meta, err := sd.GetRow(row)
-//           if err != nil { ... }
-//           if row == nil && meta.Empty() {
-//               // No more rows in this message.
-//               break
-//           }
-//           // Use <row>
-//           ...
-//       }
-//   }
+//
+//	sd := StreamDecoder{}
+//	var row sqlbase.EncDatumRow
+//	for each message in stream {
+//	    err := sd.AddMessage(msg)
+//	    if err != nil { ... }
+//	    for {
+//	        row, meta, err := sd.GetRow(row)
+//	        if err != nil { ... }
+//	        if row == nil && meta.Empty() {
+//	            // No more rows in this message.
+//	            break
+//	        }
+//	        // Use <row>
+//	        ...
+//	    }
+//	}
 //
 // AddMessage can be called multiple times before getting the rows, but this
 // will cause data to accumulate internally.
 type StreamDecoder struct {
-	typing       []execinfrapb.DatumInfo
+	types        []*types.T
+	encoding     []catenumpb.DatumEncoding
 	data         []byte
 	numEmptyRows int
 	metadata     []execinfrapb.ProducerMetadata
 	rowAlloc     rowenc.EncDatumRowAlloc
 
-	headerReceived bool
-	typingReceived bool
+	headerReceived   bool
+	encodingReceived bool
+}
+
+// Init initializes the decoder.
+func (sd *StreamDecoder) Init(types []*types.T) {
+	sd.types = types
 }
 
 // AddMessage adds the data in a ProducerMessage to the decoder.
@@ -66,17 +69,17 @@ func (sd *StreamDecoder) AddMessage(ctx context.Context, msg *execinfrapb.Produc
 		}
 		sd.headerReceived = true
 	}
-	if msg.Typing != nil {
-		if sd.typingReceived {
-			return errors.Errorf("typing information received multiple times")
+	if msg.Encoding != nil {
+		if sd.encodingReceived {
+			return errors.Errorf("encoding information received multiple times")
 		}
-		sd.typingReceived = true
-		sd.typing = msg.Typing
+		sd.encodingReceived = true
+		sd.encoding = msg.Encoding
 	}
 
 	if len(msg.Data.RawBytes) > 0 {
-		if !sd.headerReceived || !sd.typingReceived {
-			return errors.Errorf("received data before header and/or typing info")
+		if !sd.headerReceived || !sd.encodingReceived {
+			return errors.Errorf("received data before header and/or encoding info")
 		}
 
 		if len(sd.data) == 0 {
@@ -136,7 +139,7 @@ func (sd *StreamDecoder) GetRow(
 	if len(sd.data) == 0 {
 		return nil, nil, nil
 	}
-	rowLen := len(sd.typing)
+	rowLen := len(sd.types)
 	if cap(rowBuf) >= rowLen {
 		rowBuf = rowBuf[:rowLen]
 	} else {
@@ -145,7 +148,7 @@ func (sd *StreamDecoder) GetRow(
 	for i := range rowBuf {
 		var err error
 		rowBuf[i], sd.data, err = rowenc.EncDatumFromBuffer(
-			sd.typing[i].Type, sd.typing[i].Encoding, sd.data,
+			sd.encoding[i], sd.data,
 		)
 		if err != nil {
 			// Reset sd because it is no longer usable.
@@ -154,14 +157,4 @@ func (sd *StreamDecoder) GetRow(
 		}
 	}
 	return rowBuf, nil, nil
-}
-
-// Types returns the types of the columns; can only be used after we received at
-// least one row.
-func (sd *StreamDecoder) Types() []*types.T {
-	types := make([]*types.T, len(sd.typing))
-	for i := range types {
-		types[i] = sd.typing[i].Type
-	}
-	return types
 }

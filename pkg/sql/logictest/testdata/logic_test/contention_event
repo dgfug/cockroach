@@ -6,17 +6,23 @@
 # that do get emitted in various contention scenarios.
 
 statement ok
-GRANT ADMIN TO testuser
+GRANT CREATE ON DATABASE test TO testuser
 
 statement ok
 CREATE TABLE kv (k VARCHAR PRIMARY KEY, v VARCHAR);
 ALTER TABLE kv SPLIT AT VALUES ('b'), ('d'), ('q'), ('z')
 
+statement ok
+GRANT INSERT ON TABLE kv TO testuser
+
+statement ok
+GRANT SYSTEM VIEWACTIVITYREDACTED TO testuser
+
 query TT
 SELECT * FROM kv
 ----
 
-user testuser
+user testuser nodeidx=3
 
 statement ok
 BEGIN
@@ -38,10 +44,18 @@ BEGIN;
 SET TRANSACTION PRIORITY HIGH;
 SELECT * FROM kv ORDER BY k ASC
 
-user testuser
+user testuser nodeidx=3
 
 statement ok
 ROLLBACK
+
+# Check keys are redacted based on privileges
+user testuser
+
+query T
+SELECT key::STRING FROM crdb_internal.node_contention_events LIMIT 1
+----
+\x
 
 user root
 
@@ -77,14 +91,27 @@ WITH payloads AS (
 ----
 true
 
+# check that the coordinator node id that initiates the transaction is properly stored with the contention event
+query B
+WITH payloads AS (
+  SELECT *
+  FROM crdb_internal.payloads_for_trace(crdb_internal.trace_id())
+) SELECT count(*) > 0
+  FROM payloads
+  WHERE payload_type = 'roachpb.ContentionEvent'
+  AND crdb_internal.pretty_key(decode(payload_jsonb->>'key', 'base64'), 1) LIKE '/1/"k"/%'
+  AND (payload_jsonb->'txnMeta'->>'coordinatorNodeId')::INTEGER = 4
+----
+true
+
 # Check that there is at least 1 contention event for kv table in the contention
 # virtual tables.
 query B
-SELECT count(*) > 0 FROM crdb_internal.cluster_contention_events WHERE table_id = 53
+SELECT count(*) > 0 FROM crdb_internal.cluster_contention_events WHERE table_id = 'kv'::REGCLASS::INT
 ----
 true
 
 query B
-SELECT count(*) > 0 FROM crdb_internal.node_contention_events WHERE table_id = 53
+SELECT count(*) > 0 FROM crdb_internal.node_contention_events WHERE table_id = 'kv'::REGCLASS::INT
 ----
 true

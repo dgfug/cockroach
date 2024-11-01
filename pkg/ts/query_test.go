@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
@@ -28,6 +24,8 @@ import (
 // cluster configured to run in column format.
 func runTestCaseMultipleFormats(t *testing.T, testCase func(*testing.T, testModelRunner)) {
 	t.Run("Row Format", func(t *testing.T) {
+		defer log.Scope(t).Close(t)
+
 		tm := newTestModelRunner(t)
 		tm.Start()
 		tm.DB.forceRowFormat = true
@@ -36,6 +34,8 @@ func runTestCaseMultipleFormats(t *testing.T, testCase func(*testing.T, testMode
 	})
 
 	t.Run("Column Format", func(t *testing.T) {
+		defer log.Scope(t).Close(t)
+
 		tm := newTestModelRunner(t)
 		tm.Start()
 		defer tm.Stop()
@@ -359,6 +359,7 @@ func TestInterpolationLimit(t *testing.T) {
 
 func TestQueryWorkerMemoryConstraint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	runTestCaseMultipleFormats(t, func(t *testing.T, tm testModelRunner) {
 		generateData := func(dps int64) []tspb.TimeSeriesDatapoint {
 			result := make([]tspb.TimeSeriesDatapoint, 0, dps)
@@ -394,16 +395,12 @@ func TestQueryWorkerMemoryConstraint(t *testing.T) {
 		// Track the total maximum memory used for a query with no budget.
 		{
 			// Swap model's memory monitor in order to adjust allocation size.
-			adjustedMon := mon.NewMonitor(
-				"timeseries-test-worker-adjusted",
-				mon.MemoryResource,
-				nil,
-				nil,
-				1,
-				math.MaxInt64,
-				cluster.MakeTestingClusterSettings(),
-			)
-			adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+			adjustedMon := mon.NewMonitor(mon.Options{
+				Name:      "timeseries-test-worker-adjusted",
+				Increment: 1,
+				Settings:  cluster.MakeTestingClusterSettings(),
+			})
+			adjustedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 			defer adjustedMon.Stop(context.Background())
 
 			query := tm.makeQuery("test.metric", resolution1ns, 11, 109)
@@ -419,7 +416,7 @@ func TestQueryWorkerMemoryConstraint(t *testing.T) {
 			} {
 				// Limit memory in use by model. Reset memory monitor to get new maximum.
 				adjustedMon.Stop(context.Background())
-				adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+				adjustedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 				if adjustedMon.MaximumBytes() != 0 {
 					t.Fatalf("maximum bytes was %d, wanted zero", adjustedMon.MaximumBytes())
 				}
@@ -471,17 +468,13 @@ func TestQueryWorkerMemoryMonitor(t *testing.T) {
 
 		// Create a limited bytes monitor.
 		memoryBudget := int64(100 * 1024)
-		limitedMon := mon.NewMonitorWithLimit(
-			"timeseries-test-limited",
-			mon.MemoryResource,
-			memoryBudget,
-			nil,
-			nil,
-			100,
-			100,
-			cluster.MakeTestingClusterSettings(),
-		)
-		limitedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+		limitedMon := mon.NewMonitor(mon.Options{
+			Name:      "timeseries-test-limited",
+			Limit:     memoryBudget,
+			Increment: 100,
+			Settings:  cluster.MakeTestingClusterSettings(),
+		})
+		limitedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 		defer limitedMon.Stop(context.Background())
 
 		// Assert correctness with no memory pressure.
@@ -503,7 +496,7 @@ func TestQueryWorkerMemoryMonitor(t *testing.T) {
 
 		// Start/Stop limited monitor to reset maximum allocation.
 		limitedMon.Stop(context.Background())
-		limitedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+		limitedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 
 		var (
 			memStatsBefore runtime.MemStats
@@ -553,6 +546,7 @@ func TestQueryBadRequests(t *testing.T) {
 
 func TestQueryNearCurrentTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	runTestCaseMultipleFormats(t, func(t *testing.T, tm testModelRunner) {
 		tm.storeTimeSeriesData(resolution1ns, []tspb.TimeSeriesData{
 			tsd("metric.test", "source1",
@@ -626,6 +620,7 @@ func TestQueryNearCurrentTime(t *testing.T) {
 
 func TestQueryRollup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Rollups are always columnar, no need to run this test using row format.
 	tm := newTestModelRunner(t)

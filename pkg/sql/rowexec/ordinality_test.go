@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -29,6 +25,7 @@ import (
 
 func TestOrdinality(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [15]rowenc.EncDatum{}
 	for i := range v {
@@ -110,19 +107,20 @@ func TestOrdinality(t *testing.T) {
 			out := &distsqlutils.RowBuffer{}
 
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 
-			d, err := newOrdinalityProcessor(&flowCtx, 0 /* processorID */, &os, in, &execinfrapb.PostProcessSpec{}, out)
+			d, err := newOrdinalityProcessor(context.Background(), &flowCtx, 0 /* processorID */, &os, in, &execinfrapb.PostProcessSpec{})
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			d.Run(context.Background())
+			d.Run(context.Background(), out)
 			if !out.ProducerClosed() {
 				t.Fatalf("output RowReceiver not closed")
 			}
@@ -157,12 +155,13 @@ func BenchmarkOrdinality(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	spec := &execinfrapb.OrdinalitySpec{}
 
@@ -172,11 +171,11 @@ func BenchmarkOrdinality(b *testing.B) {
 		b.SetBytes(int64(8 * numRows * numCols))
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				o, err := newOrdinalityProcessor(flowCtx, 0 /* processorID */, spec, input, post, &rowDisposer{})
+				o, err := newOrdinalityProcessor(ctx, flowCtx, 0 /* processorID */, spec, input, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				o.Run(ctx)
+				o.Run(ctx, &rowDisposer{})
 				input.Reset()
 			}
 		})

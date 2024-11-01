@@ -1,21 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"strconv"
+	"time"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/lib/pq/oid"
 )
 
@@ -44,10 +46,16 @@ func (d *DTuple) pgwireFormat(ctx *FmtCtx) {
 	// string printer called pgwireFormatStringInTuple().
 	ctx.WriteByte('(')
 	comma := ""
+	tc := d.ResolvedType().TupleContents()
 	for i, v := range d.D {
 		ctx.WriteString(comma)
-		t := d.ResolvedType().TupleContents()[i]
-		switch dv := UnwrapDatum(nil, v).(type) {
+		var t *types.T
+		if i < len(tc) {
+			t = tc[i]
+		} else {
+			t = v.ResolvedType()
+		}
+		switch dv := UnwrapDOidWrapper(v).(type) {
 		case dNull:
 		case *DString:
 			s := ResolveBlankPaddedChar(string(*dv), t)
@@ -58,13 +66,19 @@ func (d *DTuple) pgwireFormat(ctx *FmtCtx) {
 			// Bytes cannot use the default case because they will be incorrectly
 			// double escaped.
 		case *DBytes:
+			ctx.WriteString(`"\`)
 			ctx.FormatNode(dv)
+			ctx.WriteString(`"`)
 		case *DJSON:
 			var buf bytes.Buffer
 			dv.JSON.Format(&buf)
 			pgwireFormatStringInTuple(&ctx.Buffer, buf.String())
+		case *DFloat:
+			fl := float64(*dv)
+			b := PgwireFormatFloat(nil /*buf*/, fl, ctx.dataConversionConfig, t)
+			ctx.WriteString(string(b))
 		default:
-			s := AsStringWithFlags(v, ctx.flags, FmtDataConversionConfig(ctx.dataConversionConfig))
+			s := AsStringWithFlags(v, ctx.flags, FmtDataConversionConfig(ctx.dataConversionConfig), FmtLocation(ctx.location))
 			pgwireFormatStringInTuple(&ctx.Buffer, s)
 		}
 		comma = ","
@@ -118,14 +132,14 @@ func (d *DArray) pgwireFormat(ctx *FmtCtx) {
 		return
 	}
 
-	if ctx.HasFlags(FmtPGCatalog) {
+	if ctx.HasFlags(fmtPGCatalog) {
 		ctx.WriteByte('\'')
 	}
 	ctx.WriteByte('{')
-	comma := ""
+	delimiter := ""
 	for _, v := range d.Array {
-		ctx.WriteString(comma)
-		switch dv := UnwrapDatum(nil, v).(type) {
+		ctx.WriteString(delimiter)
+		switch dv := UnwrapDOidWrapper(v).(type) {
 		case dNull:
 			ctx.WriteString("NULL")
 		case *DString:
@@ -135,15 +149,26 @@ func (d *DArray) pgwireFormat(ctx *FmtCtx) {
 			// Bytes cannot use the default case because they will be incorrectly
 			// double escaped.
 		case *DBytes:
+			ctx.WriteString(`"\`)
 			ctx.FormatNode(dv)
+			ctx.WriteString(`"`)
+		case *DFloat:
+			fl := float64(*dv)
+			floatTyp := d.ResolvedType().ArrayContents()
+			b := PgwireFormatFloat(nil /*buf*/, fl, ctx.dataConversionConfig, floatTyp)
+			ctx.WriteString(string(b))
+		case *DJSON:
+			flags := ctx.flags | fmtRawStrings
+			s := AsStringWithFlags(v, flags, FmtDataConversionConfig(ctx.dataConversionConfig), FmtLocation(ctx.location))
+			pgwireFormatStringInArray(ctx, s)
 		default:
-			s := AsStringWithFlags(v, ctx.flags, FmtDataConversionConfig(ctx.dataConversionConfig))
+			s := AsStringWithFlags(v, ctx.flags, FmtDataConversionConfig(ctx.dataConversionConfig), FmtLocation(ctx.location))
 			pgwireFormatStringInArray(ctx, s)
 		}
-		comma = ","
+		delimiter = d.ParamTyp.Delimiter()
 	}
 	ctx.WriteByte('}')
-	if ctx.HasFlags(FmtPGCatalog) {
+	if ctx.HasFlags(fmtPGCatalog) {
 		ctx.WriteByte('\'')
 	}
 }
@@ -159,6 +184,27 @@ func init() {
 	arrayQuoteSet, ok = makeASCIISet(" \t\v\f\r\n{},\"\\")
 	if !ok {
 		panic("array asciiset")
+	}
+}
+
+// PgwireFormatFloat returns a []byte representing a float according to
+// pgwire encoding. The result is appended to the given buffer.
+func PgwireFormatFloat(
+	buf []byte, fl float64, conv sessiondatapb.DataConversionConfig, floatTyp *types.T,
+) []byte {
+	// PostgreSQL supports 'Inf' as a valid literal for the floating point
+	// special value Infinity, therefore handling the special cases for them.
+	// (https://github.com/cockroachdb/cockroach/issues/62601)
+	if math.IsInf(fl, 1) {
+		return append(buf, []byte("Infinity")...)
+	} else if math.IsInf(fl, -1) {
+		return append(buf, []byte("-Infinity")...)
+	} else {
+		return strconv.AppendFloat(
+			buf, fl, 'g',
+			conv.GetFloatPrec(floatTyp),
+			int(floatTyp.Width()),
+		)
 	}
 }
 
@@ -192,7 +238,7 @@ func pgwireFormatStringInArray(ctx *FmtCtx, in string) {
 			// Strings in arrays escape " and \.
 			buf.WriteByte('\\')
 			buf.WriteByte(byte(r))
-		} else if ctx.HasFlags(FmtPGCatalog) && r == '\'' {
+		} else if ctx.HasFlags(fmtPGCatalog) && r == '\'' {
 			buf.WriteByte('\'')
 			buf.WriteByte('\'')
 		} else {
@@ -240,4 +286,84 @@ func (as *asciiSet) in(s string) bool {
 		}
 	}
 	return false
+}
+
+// This block contains all available PG time formats.
+const (
+	PGTimeFormat              = "15:04:05.999999"
+	PGDateFormat              = "2006-01-02"
+	PGTimeStampFormatNoOffset = PGDateFormat + " " + PGTimeFormat
+	PGTimeStampFormat         = PGTimeStampFormatNoOffset + "-07"
+	PGTime2400Format          = "24:00:00"
+	PGTimeTZFormat            = PGTimeFormat + "-07"
+)
+
+// PGWireFormatTime formats t into a format lib/pq understands, appending to the
+// provided tmp buffer and reallocating if needed. The function will then return
+// the resulting buffer.
+func PGWireFormatTime(t timeofday.TimeOfDay, tmp []byte) []byte {
+	return t.AppendFormat(tmp)
+}
+
+// PGWireFormatTimeTZ formats t into a format lib/pq understands, appending to the
+// provided tmp buffer and reallocating if needed. The function will then return
+// the resulting buffer.
+func PGWireFormatTimeTZ(t timetz.TimeTZ, tmp []byte) []byte {
+	format := PGTimeTZFormat
+	if t.OffsetSecs%60 != 0 {
+		format += ":00:00"
+	} else if t.OffsetSecs%3600 != 0 {
+		format += ":00"
+	}
+	ret := t.ToTime().AppendFormat(tmp, format)
+	// time.Time's AppendFormat does not recognize 2400, so special case it accordingly.
+	if t.TimeOfDay == timeofday.Time2400 {
+		// It instead reads 00:00:00. Replace that text.
+		var newRet []byte
+		newRet = append(newRet, PGTime2400Format...)
+		newRet = append(newRet, ret[len(PGTime2400Format):]...)
+		ret = newRet
+	}
+	return ret
+}
+
+// PGWireFormatTimestamp formats t into a format lib/pq understands.
+// If offset is not nil, it will not display the timezone offset.
+func PGWireFormatTimestamp(t time.Time, offset *time.Location, tmp []byte) (b []byte) {
+	if t == pgdate.TimeInfinity {
+		return []byte("infinity")
+	}
+	if t == pgdate.TimeNegativeInfinity {
+		return []byte("-infinity")
+	}
+
+	format := PGTimeStampFormatNoOffset
+	if offset != nil {
+		format = PGTimeStampFormat
+		if _, offsetSeconds := t.In(offset).Zone(); offsetSeconds%60 != 0 {
+			format += ":00:00"
+		} else if offsetSeconds%3600 != 0 {
+			format += ":00"
+		}
+	}
+
+	// Need to send dates before 0001 A.D. with " BC" suffix, instead of the
+	// minus sign preferred by Go.
+	// Beware, "0000" in ISO is "1 BC", "-0001" is "2 BC" and so on
+	if offset != nil {
+		t = t.In(offset)
+	}
+
+	bc := false
+	if t.Year() <= 0 {
+		// flip year sign, and add 1, e.g: "0" will be "1", and "-10" will be "11"
+		t = t.AddDate((-t.Year())*2+1, 0, 0)
+		bc = true
+	}
+
+	b = t.AppendFormat(tmp, format)
+	if bc {
+		b = append(b, " BC"...)
+	}
+	return b
 }

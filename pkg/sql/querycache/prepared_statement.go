@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package querycache
 
@@ -14,7 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/lib/pq/oid"
@@ -24,11 +19,14 @@ import (
 // during Prepare and is later used during Describe or Execute.
 type PrepareMetadata struct {
 	// Note that AST may be nil if the prepared statement is empty.
-	parser.Statement
+	statements.Statement[tree.Statement]
 
 	// StatementNoConstants is the statement string formatted without constants,
 	// suitable for recording in statement statistics.
 	StatementNoConstants string
+
+	// StatementSummary is a summarized version of the query.
+	StatementSummary string
 
 	// Provides TypeHints and Types fields which contain placeholder typing
 	// information.

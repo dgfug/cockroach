@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
@@ -28,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 type stringMatcher interface {
@@ -62,6 +58,7 @@ type infoStore struct {
 
 	nodeID  *base.NodeIDContainer
 	stopper *stop.Stopper
+	metrics Metrics
 
 	Infos           infoMap                  `json:"infos,omitempty"` // Map from key to info
 	NodeAddr        util.UnresolvedAddr      `json:"-"`               // Address of node owning this info store: "host:port"
@@ -160,18 +157,21 @@ func newInfoStore(
 	nodeID *base.NodeIDContainer,
 	nodeAddr util.UnresolvedAddr,
 	stopper *stop.Stopper,
+	metrics Metrics,
 ) *infoStore {
 	is := &infoStore{
 		AmbientContext:  ambient,
 		nodeID:          nodeID,
 		stopper:         stopper,
+		metrics:         metrics,
 		Infos:           make(infoMap),
 		NodeAddr:        nodeAddr,
 		highWaterStamps: map[roachpb.NodeID]int64{},
 		callbackCh:      make(chan struct{}, 1),
 	}
 
-	_ = is.stopper.RunAsyncTask(context.Background(), "infostore", func(ctx context.Context) {
+	bgCtx := ambient.AnnotateCtx(context.Background())
+	_ = is.stopper.RunAsyncTask(bgCtx, "infostore", func(ctx context.Context) {
 		for {
 			for {
 				is.callbackWorkMu.Lock()
@@ -252,7 +252,7 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
 			// Report both timestamps in the crash.
 			log.Fatalf(context.Background(),
-				"high water stamp %d >= %d", log.Safe(highWaterStamp), log.Safe(i.OrigStamp))
+				"high water stamp %d >= %d", redact.Safe(highWaterStamp), redact.Safe(i.OrigStamp))
 		}
 	}
 	// Update info map.
@@ -274,6 +274,23 @@ func (is *infoStore) getHighWaterStamps() map[roachpb.NodeID]int64 {
 		copy[k] = hws
 	}
 	return copy
+}
+
+// getHighWaterStampsWithDiff returns a copy of the high water stamps that are
+// different from the ones provided in prevFull. It also returns a full map of
+// updated high water stamps. The caller should use this in subsequent calls to
+// this method.
+func (is *infoStore) getHighWaterStampsWithDiff(
+	prevFull map[roachpb.NodeID]int64,
+) (newFull, diff map[roachpb.NodeID]int64) {
+	diff = make(map[roachpb.NodeID]int64)
+	for k, hws := range is.highWaterStamps {
+		if prevFull[k] != hws {
+			prevFull[k] = hws
+			diff[k] = hws
+		}
+	}
+	return prevFull, diff
 }
 
 // registerCallback registers a callback for a key pattern to be
@@ -333,9 +350,26 @@ func (is *infoStore) processCallbacks(key string, content roachpb.Value, changed
 
 func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks ...Callback) {
 	// Add the callbacks to the callback work list.
+	beforeQueue := timeutil.Now()
+	is.metrics.CallbacksPending.Inc(int64(len(callbacks)))
 	f := func() {
+		afterQueue := timeutil.Now()
 		for _, method := range callbacks {
+			queueDur := afterQueue.Sub(beforeQueue)
+			is.metrics.CallbacksPending.Dec(1)
+			if queueDur >= minCallbackDurationToRecord {
+				is.metrics.CallbacksPendingDuration.RecordValue(queueDur.Nanoseconds())
+			}
+
 			method(key, content)
+
+			afterProcess := timeutil.Now()
+			processDur := afterProcess.Sub(afterQueue)
+			is.metrics.CallbacksProcessed.Inc(1)
+			if processDur > minCallbackDurationToRecord {
+				is.metrics.CallbacksProcessingDuration.RecordValue(processDur.Nanoseconds())
+			}
+			afterQueue = afterProcess // update for next iteration
 		}
 	}
 	is.callbackWorkMu.Lock()
@@ -433,7 +467,7 @@ func (is *infoStore) delta(highWaterTimestamps map[roachpb.NodeID]int64) map[str
 // propagated regardless of high water stamps.
 func (is *infoStore) populateMostDistantMarkers(infos map[string]*Info) {
 	if err := is.visitInfos(func(key string, i *Info) error {
-		if IsNodeIDKey(key) {
+		if IsNodeDescKey(key) {
 			infos[key] = i
 		}
 		return nil
@@ -465,7 +499,7 @@ func (is *infoStore) mostDistant(
 		// acquire unreliably high Hops values in some pathological cases such as
 		// those described in #9819.
 		if i.NodeID != localNodeID && i.Hops > maxHops &&
-			IsNodeIDKey(key) && !hasOutgoingConn(i.NodeID) {
+			IsNodeDescKey(key) && !hasOutgoingConn(i.NodeID) {
 			maxHops = i.Hops
 			nodeID = i.NodeID
 		}

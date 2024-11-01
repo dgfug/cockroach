@@ -1,48 +1,28 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descpb
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
-
-// ToEncodingDirection converts a direction from the proto to an encoding.Direction.
-func (dir IndexDescriptor_Direction) ToEncodingDirection() (encoding.Direction, error) {
-	switch dir {
-	case IndexDescriptor_ASC:
-		return encoding.Ascending, nil
-	case IndexDescriptor_DESC:
-		return encoding.Descending, nil
-	default:
-		return encoding.Ascending, errors.Errorf("invalid direction: %s", dir)
-	}
-}
 
 // ID, ColumnID, FamilyID, and IndexID are all uint32, but are each given a
 // type alias to prevent accidental use of one of the types where
 // another is expected.
 
 // ID is a custom type for {Database,Table}Descriptor IDs.
-type ID tree.ID
-
-// SafeValue implements the redact.SafeValue interface.
-func (ID) SafeValue() {}
+type ID = catid.DescID
 
 // InvalidID is the uninitialised descriptor id.
-const InvalidID ID = 0
+const InvalidID = catid.InvalidDescID
 
 // IDs is a sortable list of IDs.
 type IDs []ID
@@ -51,8 +31,19 @@ func (ids IDs) Len() int           { return len(ids) }
 func (ids IDs) Less(i, j int) bool { return ids[i] < ids[j] }
 func (ids IDs) Swap(i, j int)      { ids[i], ids[j] = ids[j], ids[i] }
 
+// Contains returns whether `ids` contains `targetID`.
+func (ids IDs) Contains(targetID ID) bool {
+	for _, id := range ids {
+		if id == targetID {
+			return true
+		}
+	}
+	return false
+}
+
 // FormatVersion is a custom type for TableDescriptor versions of the sql to
 // key:value mapping.
+//
 //go:generate stringer -type=FormatVersion
 type FormatVersion uint32
 
@@ -70,16 +61,16 @@ const (
 )
 
 // FamilyID is a custom type for ColumnFamilyDescriptor IDs.
-type FamilyID uint32
-
-// SafeValue implements the redact.SafeValue interface.
-func (FamilyID) SafeValue() {}
+type FamilyID = catid.FamilyID
 
 // IndexID is a custom type for IndexDescriptor IDs.
-type IndexID tree.IndexID
+type IndexID = catid.IndexID
 
-// SafeValue implements the redact.SafeValue interface.
-func (IndexID) SafeValue() {}
+// ConstraintID is a custom type for TableDescriptor constraint IDs.
+type ConstraintID = catid.ConstraintID
+
+// TriggerID is a custom type for TableDescriptor trigger IDs.
+type TriggerID = catid.TriggerID
 
 // DescriptorVersion is a custom type for TableDescriptor Versions.
 type DescriptorVersion uint64
@@ -119,13 +110,15 @@ const (
 	// these were implicitly derived based on the set of non-virtual columns in
 	// the table.
 	PrimaryIndexWithStoredColumnsVersion
+	// LatestIndexDescriptorVersion corresponds to the latest encoding version.
+	LatestIndexDescriptorVersion = PrimaryIndexWithStoredColumnsVersion
 )
 
-// ColumnID is a custom type for ColumnDescriptor IDs.
-type ColumnID tree.ColumnID
+// PGAttributeNum is a custom type for ColumnDescriptor's PGAttributeNum field.
+type PGAttributeNum = catid.PGAttributeNum
 
-// SafeValue implements the redact.SafeValue interface.
-func (ColumnID) SafeValue() {}
+// ColumnID is a custom type for ColumnDescriptor IDs.
+type ColumnID = catid.ColumnID
 
 // ColumnIDs is a slice of ColumnDescriptor IDs.
 type ColumnIDs []ColumnID
@@ -163,12 +156,12 @@ func (c ColumnIDs) Equals(input ColumnIDs) bool {
 // PermutationOf returns true if this list and the input list contain the same
 // set of column IDs in any order. Duplicate ColumnIDs have no effect.
 func (c ColumnIDs) PermutationOf(input ColumnIDs) bool {
-	ourColsSet := util.MakeFastIntSet()
+	ourColsSet := intsets.MakeFast()
 	for _, col := range c {
 		ourColsSet.Add(int(col))
 	}
 
-	inputColsSet := util.MakeFastIntSet()
+	inputColsSet := intsets.MakeFast()
 	for _, inputCol := range input {
 		inputColsSet.Add(int(inputCol))
 	}
@@ -185,23 +178,6 @@ func (c ColumnIDs) Contains(i ColumnID) bool {
 	}
 	return false
 }
-
-// IndexDescriptorEncodingType is a custom type to represent different encoding types
-// for secondary indexes.
-type IndexDescriptorEncodingType uint32
-
-const (
-	// SecondaryIndexEncoding corresponds to the standard way of encoding secondary indexes
-	// as described in docs/tech-notes/encoding.md. We allow the 0 value of this type
-	// to have a value so that existing descriptors are encoding using this encoding.
-	SecondaryIndexEncoding IndexDescriptorEncodingType = iota
-	// PrimaryIndexEncoding corresponds to when a secondary index is encoded using the
-	// primary index encoding as described in docs/tech-notes/encoding.md.
-	PrimaryIndexEncoding
-)
-
-// Remove unused warning.
-var _ = SecondaryIndexEncoding
 
 // MutationID is a custom type for TableDescriptor mutations.
 type MutationID uint32
@@ -252,6 +228,11 @@ func (desc *TableDescriptor) MaterializedView() bool {
 	return desc.IsMaterializedView
 }
 
+// IsReadOnly implements the TableDescriptor interface.
+func (desc *TableDescriptor) IsReadOnly() bool {
+	return desc.IsMaterializedView || desc.GetExternal() != nil
+}
+
 // IsPhysicalTable implements the TableDescriptor interface.
 func (desc *TableDescriptor) IsPhysicalTable() bool {
 	return desc.IsSequence() || (desc.IsTable() && !desc.IsVirtualTable()) || desc.MaterializedView()
@@ -280,6 +261,17 @@ func (desc *TableDescriptor) Persistence() tree.Persistence {
 	return tree.PersistencePermanent
 }
 
+// ForEachPublicIndex is exported to provide low-overhead access to the set of
+// public indexes in a table descriptor for use in backup planning.
+//
+// Most users should prefer the methods provided by the catalog package.
+func (desc *TableDescriptor) ForEachPublicIndex(f func(*IndexDescriptor)) {
+	f(&desc.PrimaryIndex)
+	for i := range desc.Indexes {
+		f(&desc.Indexes[i])
+	}
+}
+
 // IsVirtualTable returns true if the TableDescriptor describes a
 // virtual Table (like the information_schema tables) and thus doesn't
 // need to be physically stored.
@@ -289,12 +281,7 @@ func IsVirtualTable(id ID) bool {
 
 // IsSystemConfigID returns whether this ID is for a system config object.
 func IsSystemConfigID(id ID) bool {
-	return id > 0 && id <= keys.MaxSystemConfigDescID
-}
-
-// IsReservedID returns whether this ID is for any system object.
-func IsReservedID(id ID) bool {
-	return id > 0 && id <= keys.MaxReservedDescID
+	return id == keys.DescriptorTableID || id == keys.ZonesTableID
 }
 
 // AnonymousTable is the empty table name, used when a data source
@@ -306,9 +293,10 @@ func (opts *TableDescriptor_SequenceOpts) HasOwner() bool {
 	return !opts.SequenceOwner.Equal(TableDescriptor_SequenceOpts_SequenceOwner{})
 }
 
-// EffectiveCacheSize returns the CacheSize field of a sequence option with
-// the exception that it will return 1 if the CacheSize field is 0.
-// A cache size of 1 indicates that there is no caching. The returned value
+// EffectiveCacheSize returns the CacheSize or NodeCacheSize field of a sequence option with
+// the exception that it will return 1 if both fields are set to 0.
+// A cache size of 1 indicates that there is no caching. A node cache size of 0 indicates there is no
+// node-level caching. The returned value
 // will always be greater than or equal to 1.
 //
 // Prior to #51259, sequence caching was unimplemented and cache sizes were
@@ -316,8 +304,11 @@ func (opts *TableDescriptor_SequenceOpts) HasOwner() bool {
 // size of 0, it should be treated in the same was as sequences with cache
 // sizes of 1.
 func (opts *TableDescriptor_SequenceOpts) EffectiveCacheSize() int64 {
-	if opts.CacheSize == 0 {
+	if opts.CacheSize == 0 && opts.NodeCacheSize == 0 {
 		return 1
+	}
+	if opts.CacheSize == 1 && opts.NodeCacheSize != 0 {
+		return opts.NodeCacheSize
 	}
 	return opts.CacheSize
 }
@@ -333,37 +324,6 @@ func (DescriptorMutation_State) SafeValue() {}
 
 // SafeValue implements the redact.SafeValue interface.
 func (DescriptorState) SafeValue() {}
-
-// SafeValue implements the redact.SafeValue interface.
-func (ConstraintType) SafeValue() {}
-
-// UniqueConstraint is an interface for a unique constraint. It allows
-// both UNIQUE indexes and UNIQUE WITHOUT INDEX constraints to serve as
-// the referenced side of a foreign key constraint.
-type UniqueConstraint interface {
-	// IsValidReferencedUniqueConstraint returns whether the unique constraint can
-	// serve as a referenced unique constraint for a foreign key constraint with the
-	// provided set of referencedColumnIDs.
-	IsValidReferencedUniqueConstraint(referencedColIDs ColumnIDs) bool
-
-	// GetName returns the constraint name.
-	GetName() string
-}
-
-var _ UniqueConstraint = &UniqueWithoutIndexConstraint{}
-var _ UniqueConstraint = &IndexDescriptor{}
-
-// IsValidReferencedUniqueConstraint is part of the UniqueConstraint interface.
-func (u *UniqueWithoutIndexConstraint) IsValidReferencedUniqueConstraint(
-	referencedColIDs ColumnIDs,
-) bool {
-	return ColumnIDs(u.ColumnIDs).PermutationOf(referencedColIDs)
-}
-
-// GetName is part of the UniqueConstraint interface.
-func (u *UniqueWithoutIndexConstraint) GetName() string {
-	return u.Name
-}
 
 // IsPartial returns true if the constraint is a partial unique constraint.
 func (u *UniqueWithoutIndexConstraint) IsPartial() bool {
@@ -383,4 +343,8 @@ func (ni NameInfo) GetParentSchemaID() ID {
 // GetName implements the catalog.NameKeyHaver interface.
 func (ni NameInfo) GetName() string {
 	return ni.Name
+}
+
+func init() {
+	protoreflect.RegisterShorthands((*Descriptor)(nil), "descriptor", "desc")
 }

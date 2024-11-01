@@ -2,13 +2,8 @@
 
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanlatch
 
@@ -59,7 +54,7 @@ func (t *btree) verifyLeafSameDepth(tt *testing.T) {
 }
 
 func (n *node) verifyDepthEqualToHeight(t *testing.T, depth, height int) {
-	if n.leaf {
+	if n.leaf() {
 		require.Equal(t, height, depth, "all leaves should have the same depth as the tree height")
 	}
 	n.recurse(func(child *node, _ int16) {
@@ -83,7 +78,7 @@ func (n *node) verifyCountAllowed(t *testing.T, root bool) {
 			require.Nil(t, item, "latch above count")
 		}
 	}
-	if !n.leaf {
+	if !n.leaf() {
 		for i, child := range n.children {
 			if i <= int(n.count) {
 				require.NotNil(t, child, "node below count")
@@ -103,15 +98,15 @@ func (t *btree) isSorted(tt *testing.T) {
 
 func (n *node) isSorted(t *testing.T) {
 	for i := int16(1); i < n.count; i++ {
-		require.LessOrEqual(t, cmp(n.items[i-1], n.items[i]), 0)
+		require.LessOrEqual(t, compare(n.items[i-1], n.items[i]), 0)
 	}
-	if !n.leaf {
+	if !n.leaf() {
 		for i := int16(0); i < n.count; i++ {
 			prev := n.children[i]
 			next := n.children[i+1]
 
-			require.LessOrEqual(t, cmp(prev.items[prev.count-1], n.items[i]), 0)
-			require.LessOrEqual(t, cmp(n.items[i], next.items[0]), 0)
+			require.LessOrEqual(t, compare(prev.items[prev.count-1], n.items[i]), 0)
+			require.LessOrEqual(t, compare(n.items[i], next.items[0]), 0)
 		}
 	}
 	n.recurse(func(child *node, _ int16) {
@@ -124,14 +119,14 @@ func (t *btree) isUpperBoundCorrect(tt *testing.T) {
 }
 
 func (n *node) isUpperBoundCorrect(t *testing.T) {
-	require.Equal(t, 0, n.findUpperBound().compare(n.max))
+	require.Equal(t, 0, n.findUpperBound().compare(n.max()))
 	for i := int16(1); i < n.count; i++ {
-		require.LessOrEqual(t, upperBound(n.items[i]).compare(n.max), 0)
+		require.LessOrEqual(t, upperBound(n.items[i]).compare(n.max()), 0)
 	}
-	if !n.leaf {
+	if !n.leaf() {
 		for i := int16(0); i <= n.count; i++ {
 			child := n.children[i]
-			require.LessOrEqual(t, child.max.compare(n.max), 0)
+			require.LessOrEqual(t, child.max().compare(n.max()), 0)
 		}
 	}
 	n.recurse(func(child *node, _ int16) {
@@ -140,7 +135,7 @@ func (n *node) isUpperBoundCorrect(t *testing.T) {
 }
 
 func (n *node) recurse(f func(child *node, pos int16)) {
-	if !n.leaf {
+	if !n.leaf() {
 		for i := int16(0); i <= n.count; i++ {
 			f(n.children[i], i)
 		}
@@ -412,8 +407,8 @@ func TestBTreeSeekOverlap(t *testing.T) {
 	}
 }
 
-// TestBTreeCmp tests the btree item comparison.
-func TestBTreeCmp(t *testing.T) {
+// TestBTreeCompare tests the btree item comparison.
+func TestBTreeCompare(t *testing.T) {
 	// NB: go_generics doesn't do well with anonymous types, so name this type.
 	// Avoid the slice literal syntax, which GofmtSimplify mandates the use of
 	// anonymous constructors with.
@@ -482,13 +477,13 @@ func TestBTreeCmp(t *testing.T) {
 		},
 	)
 	for _, tc := range testCases {
-		name := fmt.Sprintf("cmp(%s:%d,%s:%d)", tc.spanA, tc.idA, tc.spanB, tc.idB)
+		name := fmt.Sprintf("compare(%s:%d,%s:%d)", tc.spanA, tc.idA, tc.spanB, tc.idB)
 		t.Run(name, func(t *testing.T) {
 			laA := newItem(tc.spanA)
 			laA.SetID(tc.idA)
 			laB := newItem(tc.spanB)
 			laB.SetID(tc.idB)
-			require.Equal(t, tc.exp, cmp(laA, laB))
+			require.Equal(t, tc.exp, compare(laA, laB))
 		})
 	}
 }
@@ -1063,7 +1058,7 @@ func BenchmarkBTreeIterPrev(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if !it.Valid() {
-			it.First()
+			it.Last()
 		}
 		it.Prev()
 	}

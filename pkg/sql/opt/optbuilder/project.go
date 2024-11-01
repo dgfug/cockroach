@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // constructProjectForScope constructs a projection if it will result in a
@@ -34,7 +30,7 @@ func (b *Builder) constructProjectForScope(inScope, projectionsScope *scope) {
 		projectionsScope.expr = inScope.expr
 	} else {
 		projectionsScope.expr = b.constructProject(
-			inScope.expr.(memo.RelExpr),
+			inScope.expr,
 			append(projectionsScope.cols, projectionsScope.extraCols...),
 		)
 	}
@@ -79,7 +75,7 @@ func (b *Builder) dropOrderingAndExtraCols(s *scope) {
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeProjectionList(
-	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
+	selects *tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous values of the replaceSRFs field
 	// and the field in semaCtx in case we are recursively called within a
@@ -98,7 +94,7 @@ func (b *Builder) analyzeProjectionList(
 // and adds the resulting aliases and typed expressions to outScope. See the
 // header comment for analyzeSelectList.
 func (b *Builder) analyzeReturningList(
-	returning tree.ReturningExprs, desiredTypes []*types.T, inScope, outScope *scope,
+	returning *tree.ReturningExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -109,7 +105,7 @@ func (b *Builder) analyzeReturningList(
 	b.semaCtx.Properties.Require(exprKindReturning.String(), tree.RejectSpecial)
 	inScope.context = exprKindReturning
 
-	b.analyzeSelectList(tree.SelectExprs(returning), desiredTypes, inScope, outScope)
+	b.analyzeSelectList((*tree.SelectExprs)(returning), desiredTypes, inScope, outScope)
 }
 
 // analyzeSelectList is a helper function used by analyzeProjectionList and
@@ -119,10 +115,15 @@ func (b *Builder) analyzeReturningList(
 //
 // As a side-effect, the appropriate scopes are updated with aggregations
 // (scope.groupby.aggs)
+//
+// If we are building a function, the `selects` expressions will be overwritten
+// with expressions that replace any `*` expressions with their columns.
 func (b *Builder) analyzeSelectList(
-	selects tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
+	selects *tree.SelectExprs, desiredTypes []*types.T, inScope, outScope *scope,
 ) {
-	for i, e := range selects {
+	var expansions tree.SelectExprs
+	for i, e := range *selects {
+		expanded := false
 		// Start with fast path, looking for simple column reference.
 		texpr := b.resolveColRef(e.Expr, inScope)
 		if texpr == nil {
@@ -142,8 +143,21 @@ func (b *Builder) analyzeSelectList(
 					}
 
 					aliases, exprs := b.expandStar(e.Expr, inScope)
+					if b.insideFuncDef || b.insideViewDef {
+						expanded = true
+						for _, expr := range exprs {
+							switch col := expr.(type) {
+							case *scopeColumn:
+								expansions = append(expansions, tree.SelectExpr{Expr: tree.NewColumnItem(&col.table, col.name.ReferenceName())})
+							case *tree.ColumnAccessExpr:
+								expansions = append(expansions, tree.SelectExpr{Expr: col})
+							default:
+								panic(errors.AssertionFailedf("unexpected column type in expansion"))
+							}
+						}
+					}
 					if outScope.cols == nil {
-						outScope.cols = make([]scopeColumn, 0, len(selects)+len(exprs)-1)
+						outScope.cols = make([]scopeColumn, 0, len(*selects)+len(exprs)-1)
 					}
 					for j, e := range exprs {
 						outScope.addColumn(scopeColName(tree.Name(aliases[j])), e)
@@ -164,10 +178,16 @@ func (b *Builder) analyzeSelectList(
 		// have to determine the output column name before we perform type
 		// checking.
 		if outScope.cols == nil {
-			outScope.cols = make([]scopeColumn, 0, len(selects))
+			outScope.cols = make([]scopeColumn, 0, len(*selects))
 		}
 		alias := b.getColName(e)
 		outScope.addColumn(scopeColName(tree.Name(alias)), texpr)
+		if (b.insideViewDef || b.insideFuncDef) && !expanded {
+			expansions = append(expansions, e)
+		}
+	}
+	if b.insideFuncDef || b.insideViewDef {
+		*selects = expansions
 	}
 }
 
@@ -185,7 +205,7 @@ func (b *Builder) buildProjectionList(inScope *scope, projectionsScope *scope) {
 // resolveColRef looks for the common case of a standalone column reference
 // expression, like this:
 //
-//   SELECT ..., c, ... FROM ...
+//	SELECT ..., c, ... FROM ...
 //
 // It resolves the column name to a scopeColumn and returns it as a TypedExpr.
 func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
@@ -195,10 +215,8 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 		_, srcMeta, _, resolveErr := inScope.FindSourceProvidingColumn(b.ctx, tree.Name(colName))
 		if resolveErr != nil {
 			// It may be a reference to a table, e.g. SELECT tbl FROM tbl.
-			// Attempt to resolve as a TupleStar. We do not attempt to resolve
-			// as a TupleStar if we are inside a view definition because views
-			// do not support * expressions.
-			if !b.insideViewDef && sqlerrors.IsUndefinedColumnError(resolveErr) {
+			// Attempt to resolve as a TupleStar.
+			if sqlerrors.IsUndefinedColumnError(resolveErr) {
 				return func() tree.TypedExpr {
 					defer wrapColTupleStarPanic(resolveErr)
 					return inScope.resolveType(columnNameAsTupleStar(colName), types.Any)
@@ -213,7 +231,7 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 
 // getColName returns the output column name for a projection expression.
 func (b *Builder) getColName(expr tree.SelectExpr) string {
-	s, err := tree.GetRenderColName(b.semaCtx.SearchPath, expr)
+	s, err := tree.GetRenderColName(b.ctx, b.semaCtx.SearchPath, expr, b.semaCtx.FunctionResolver)
 	if err != nil {
 		panic(err)
 	}
@@ -226,14 +244,18 @@ func (b *Builder) getColName(expr tree.SelectExpr) string {
 // nil, then finishBuildScalar synthesizes a new output column in outScope with
 // the expression as its value.
 //
-// texpr     The given scalar expression. The expression is any scalar
-//           expression except for a bare variable or aggregate (those are
-//           handled separately in buildVariableProjection and
-//           buildFunction).
-// scalar    The memo expression that has already been built for the given
-//           typed expression.
-// outCol    The output column of the scalar which is being built. It can be
-//           nil if outScope is nil.
+//   - texpr:
+//     The given scalar expression. The expression is any scalar expression except
+//     for a bare variable or aggregate (those are handled separately in
+//     buildVariableProjection and buildFunction).
+//
+//   - scalar:
+//     The memo expression that has already been built for the given typed
+//     expression.
+//
+//   - outCol:
+//     The output column of the scalar which is being built. It can be nil if
+//     outScope is nil.
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
@@ -269,9 +291,12 @@ func (b *Builder) finishBuildScalar(
 //
 // col      Column containing the scalar expression that's been referenced.
 // outCol   The output column which is being built. It can be nil if outScope is
-//          nil.
+//
+//	nil.
+//
 // colRefs  The set of columns referenced so far by the scalar expression being
-//          built. If not nil, it is updated with the ID of this column.
+//
+//	built. If not nil, it is updated with the ID of this column.
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
@@ -324,20 +349,41 @@ func (b *Builder) finishBuildScalarRef(
 //
 // Sample usage:
 //
-//   pb := makeProjectionBuilder(b, scope)
-//   b.Add(name, expr, typ)
-//   ...
-//   scope = pb.Finish()
+//	pb := makeProjectionBuilder(b, scope)
+//	b.Add(name, expr, typ)
+//	...
+//	scope = pb.Finish()
 //
 // Note that this is all a cheap no-op if Add is not called.
 type projectionBuilder struct {
-	b        *Builder
-	inScope  *scope
+	b *Builder
+	// inScope is the scope of the expression to build a projection on top of.
+	inScope *scope
+	// resolveScope is the scope used to resolve column references in projection
+	// expressions. If resolveScope is nil, then inScope is used to resolve
+	// column references.
+	resolveScope *scope
+	// outScope is the scope of the resulting projection.
 	outScope *scope
 }
 
 func makeProjectionBuilder(b *Builder, inScope *scope) projectionBuilder {
 	return projectionBuilder{b: b, inScope: inScope}
+}
+
+// HasResolveScope returns true if a scope other than the inScope has been
+// provided.
+func (pb *projectionBuilder) HasResolveScope() bool {
+	return pb.resolveScope != nil
+}
+
+// SetResolveScope replaces inScope for resolving column references in
+// projection expressions.
+func (pb *projectionBuilder) SetResolveScope(resolveScope *scope) {
+	if pb.HasResolveScope() {
+		panic(errors.AssertionFailedf("expected resolveScope to be nil"))
+	}
+	pb.resolveScope = resolveScope
 }
 
 // Add a projection.
@@ -352,9 +398,13 @@ func (pb *projectionBuilder) Add(
 		pb.outScope = pb.inScope.replace()
 		pb.outScope.appendColumnsFromScope(pb.inScope)
 	}
-	typedExpr := pb.inScope.resolveAndRequireType(expr, desiredType)
+	resolveScope := pb.inScope
+	if pb.HasResolveScope() {
+		resolveScope = pb.resolveScope
+	}
+	typedExpr := resolveScope.resolveType(expr, desiredType)
 	scopeCol := pb.outScope.addColumn(name, typedExpr)
-	scalar := pb.b.buildScalar(typedExpr, pb.inScope, pb.outScope, scopeCol, nil)
+	scalar := pb.b.buildScalar(typedExpr, resolveScope, pb.outScope, scopeCol, nil)
 
 	return scopeCol.id, scalar
 }

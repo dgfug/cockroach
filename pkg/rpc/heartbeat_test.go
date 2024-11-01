@@ -1,19 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
 import (
 	"context"
-	"fmt"
-	"regexp"
 	"testing"
 	"time"
 
@@ -24,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -45,19 +38,19 @@ func TestRemoteOffsetString(t *testing.T) {
 
 func TestHeartbeatReply(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	manual := hlc.NewManualClock(5)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	maxOffset := time.Nanosecond /* maxOffset */
 	st := cluster.MakeTestingClusterSettings()
 	heartbeat := &HeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
-		settings:           st,
+		version:            st.Version,
 	}
 
 	request := &PingRequest{
 		Ping:          "testPing",
-		ServerVersion: st.Version.BinaryVersion(),
+		ServerVersion: st.Version.LatestVersion(),
 	}
 	response, err := heartbeat.Ping(context.Background(), request)
 	if err != nil {
@@ -75,12 +68,17 @@ func TestHeartbeatReply(t *testing.T) {
 
 // A ManualHeartbeatService allows manual control of when heartbeats occur.
 type ManualHeartbeatService struct {
-	clock              *hlc.Clock
+	clock              hlc.WallClock
+	maxOffset          time.Duration
 	remoteClockMonitor *RemoteClockMonitor
-	settings           *cluster.Settings
+	version            clusterversion.Handle
 	nodeID             *base.NodeIDContainer
 	// Heartbeats are processed when a value is sent here.
+	// If ready is nil, readyFn must be set instead and is
+	// invoked whenever a heartbeat arrives to supply the
+	// error, if one is to be injected.
 	ready   chan error
+	readyFn func() error
 	stopper *stop.Stopper
 }
 
@@ -88,21 +86,28 @@ type ManualHeartbeatService struct {
 func (mhs *ManualHeartbeatService) Ping(
 	ctx context.Context, args *PingRequest,
 ) (*PingResponse, error) {
+	extraCh := make(chan error, 1)
+	if mhs.ready == nil {
+		extraCh <- mhs.readyFn()
+	}
+
+	var err error
 	select {
-	case err := <-mhs.ready:
-		if err != nil {
-			return nil, err
-		}
+	case err = <-extraCh:
+	case err = <-mhs.ready:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		err = ctx.Err()
 	case <-mhs.stopper.ShouldQuiesce():
-		return nil, errors.New("quiesce")
+		err = errors.New("quiesce")
+	}
+	if err != nil {
+		return nil, err
 	}
 	hs := HeartbeatService{
 		clock:              mhs.clock,
 		remoteClockMonitor: mhs.remoteClockMonitor,
 		clusterID:          &base.ClusterIDContainer{},
-		settings:           mhs.settings,
+		version:            mhs.version,
 		nodeID:             mhs.nodeID,
 	}
 	return hs.Ping(ctx, args)
@@ -110,25 +115,26 @@ func (mhs *ManualHeartbeatService) Ping(
 
 func TestManualHeartbeat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	manual := hlc.NewManualClock(5)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	maxOffset := time.Nanosecond
 	st := cluster.MakeTestingClusterSettings()
 	manualHeartbeat := &ManualHeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		maxOffset:          maxOffset,
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		ready:              make(chan error, 1),
-		settings:           st,
+		version:            st.Version,
 	}
 	regularHeartbeat := &HeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
-		settings:           st,
+		version:            st.Version,
 	}
 
 	request := &PingRequest{
 		Ping:          "testManual",
-		ServerVersion: st.Version.BinaryVersion(),
+		ServerVersion: st.Version.LatestVersion(),
 	}
 	manualHeartbeat.ready <- nil
 	ctx := context.Background()
@@ -152,39 +158,6 @@ func TestManualHeartbeat(t *testing.T) {
 	}
 }
 
-func TestClockOffsetMismatch(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println(r)
-			if match, _ := regexp.MatchString("locally configured maximum clock offset", r.(string)); !match {
-				t.Errorf("expected clock mismatch error")
-			}
-		}
-	}()
-
-	ctx := context.Background()
-
-	clock := hlc.NewClock(hlc.UnixNano, 250*time.Millisecond)
-	st := cluster.MakeTestingClusterSettings()
-	hs := &HeartbeatService{
-		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
-		clusterID:          &base.ClusterIDContainer{},
-		settings:           st,
-	}
-	hs.clusterID.Set(ctx, uuid.Nil)
-
-	request := &PingRequest{
-		Ping:                 "testManual",
-		OriginAddr:           "test",
-		OriginMaxOffsetNanos: (500 * time.Millisecond).Nanoseconds(),
-		ServerVersion:        st.Version.BinaryVersion(),
-	}
-	response, err := hs.Ping(context.Background(), request)
-	t.Fatalf("should not have reached but got response=%v err=%v", response, err)
-}
-
 func TestClusterIDCompare(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	uuid1, uuid2 := uuid.MakeV4(), uuid.MakeV4()
@@ -201,14 +174,14 @@ func TestClusterIDCompare(t *testing.T) {
 		{"cluster ID mismatch", uuid1, uuid2, true},
 	}
 
-	manual := hlc.NewManualClock(5)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	maxOffset := time.Nanosecond
 	st := cluster.MakeTestingClusterSettings()
 	heartbeat := &HeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
-		settings:           st,
+		version:            st.Version,
 	}
 
 	for _, td := range testData {
@@ -217,7 +190,7 @@ func TestClusterIDCompare(t *testing.T) {
 			request := &PingRequest{
 				Ping:          "testPing",
 				ClusterID:     &td.clientClusterID,
-				ServerVersion: st.Version.BinaryVersion(),
+				ServerVersion: st.Version.LatestVersion(),
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
 			if td.expectError && err == nil {
@@ -245,15 +218,15 @@ func TestNodeIDCompare(t *testing.T) {
 		{"node ID mismatch", 1, 2, true},
 	}
 
-	manual := hlc.NewManualClock(5)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	maxOffset := time.Nanosecond
 	st := cluster.MakeTestingClusterSettings()
 	heartbeat := &HeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
 		nodeID:             &base.NodeIDContainer{},
-		settings:           st,
+		version:            st.Version,
 	}
 
 	for _, td := range testData {
@@ -262,7 +235,7 @@ func TestNodeIDCompare(t *testing.T) {
 			request := &PingRequest{
 				Ping:          "testPing",
 				TargetNodeID:  td.clientNodeID,
-				ServerVersion: st.Version.BinaryVersion(),
+				ServerVersion: st.Version.LatestVersion(),
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
 			if td.expectError && err == nil {
@@ -280,22 +253,22 @@ func TestNodeIDCompare(t *testing.T) {
 // active where the system tenant may not.
 func TestTenantVersionCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	manual := hlc.NewManualClock(5)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	maxOffset := time.Nanosecond
 	st := cluster.MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion,
-		clusterversion.TestingBinaryMinSupportedVersion,
+		clusterversion.Latest.Version(),
+		clusterversion.MinSupported.Version(),
 		true /* initialize */)
 	heartbeat := &HeartbeatService{
 		clock:              clock,
-		remoteClockMonitor: newRemoteClockMonitor(clock, time.Hour, 0),
+		remoteClockMonitor: newRemoteClockMonitor(clock, maxOffset, time.Hour, 0),
 		clusterID:          &base.ClusterIDContainer{},
-		settings:           st,
+		version:            st.Version,
 	}
 
 	request := &PingRequest{
 		Ping:          "testPing",
-		ServerVersion: st.Version.BinaryMinSupportedVersion(),
+		ServerVersion: st.Version.MinSupportedVersion(),
 	}
 	const failedRE = `version compatibility check failed on ping request:` +
 		` cluster requires at least version .*, but peer has version .*`
@@ -306,94 +279,14 @@ func TestTenantVersionCheck(t *testing.T) {
 	})
 	// Ensure the same behavior when a tenant ID exists but is for the system tenant.
 	t.Run("too old, system tenant", func(t *testing.T) {
-		tenantCtx := roachpb.NewContextForTenant(context.Background(), roachpb.SystemTenantID)
+		tenantCtx := roachpb.ContextWithClientTenant(context.Background(), roachpb.SystemTenantID)
 		_, err := heartbeat.Ping(tenantCtx, request)
 		require.Regexp(t, failedRE, err)
 	})
 	// Ensure that the same ping succeeds with a secondary tenant context.
 	t.Run("old, secondary tenant", func(t *testing.T) {
-		tenantCtx := roachpb.NewContextForTenant(context.Background(), roachpb.MakeTenantID(2))
+		tenantCtx := roachpb.ContextWithClientTenant(context.Background(), roachpb.MustMakeTenantID(2))
 		_, err := heartbeat.Ping(tenantCtx, request)
 		require.NoError(t, err)
 	})
-}
-
-// HeartbeatStreamService is like HeartbeatService, but it implements the
-// TestingHeartbeatStreamServer interface in addition to the HeartbeatServer
-// interface. Instead of providing a request-response model, the service reads
-// on its input stream and periodically sends on its output stream with its
-// latest ping response. This means that even if the service stops receiving
-// requests, it will continue to send responses.
-type HeartbeatStreamService struct {
-	HeartbeatService
-	interval time.Duration
-}
-
-func (hss *HeartbeatStreamService) PingStream(
-	stream TestingHeartbeatStream_PingStreamServer,
-) error {
-	ctx := stream.Context()
-
-	// Launch a goroutine to read from the stream and construct responses.
-	respC := make(chan *PingResponse)
-	recvErrC := make(chan error, 1)
-	sendErrC := make(chan struct{})
-	go func() {
-		for {
-			ping, err := stream.Recv()
-			if err != nil {
-				recvErrC <- err
-				return
-			}
-			resp, err := hss.Ping(ctx, ping)
-			if err != nil {
-				recvErrC <- err
-				return
-			}
-			select {
-			case respC <- resp:
-				continue
-			case <-sendErrC:
-				return
-			}
-		}
-	}()
-
-	// Launch a timer to periodically send the ping responses, even if the
-	// response has not been updated.
-	t := time.NewTicker(hss.interval)
-	defer t.Stop()
-
-	var resp *PingResponse
-	for {
-		select {
-		case <-t.C:
-			if resp != nil {
-				err := stream.Send(resp)
-				if err != nil {
-					close(sendErrC)
-					return err
-				}
-			}
-		case resp = <-respC:
-			// Update resp.
-		case err := <-recvErrC:
-			return err
-		}
-	}
-}
-
-// lockedPingStreamClient is an implementation of
-// HeartbeatStream_PingStreamClient which provides support for concurrent calls
-// to Send. Note that the default implementation of grpc.Stream for server
-// responses (grpc.serverStream) is not safe for concurrent calls to Send.
-type lockedPingStreamClient struct {
-	TestingHeartbeatStream_PingStreamClient
-	sendMu syncutil.Mutex
-}
-
-func (c *lockedPingStreamClient) Send(req *PingRequest) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	return c.TestingHeartbeatStream_PingStreamClient.Send(req)
 }

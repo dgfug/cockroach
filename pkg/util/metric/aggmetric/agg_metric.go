@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package aggmetric provides functionality to create metrics which expose
 // aggregate metrics for internal collection and additionally per-child
@@ -15,7 +10,6 @@ package aggmetric
 
 import (
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -39,6 +33,12 @@ func (b Builder) Gauge(metadata metric.Metadata) *AggGauge {
 	return NewGauge(metadata, b.labels...)
 }
 
+// FunctionalGauge constructs a new AggGauge with the Builder's labels who's
+// value is determined when asked for.
+func (b Builder) FunctionalGauge(metadata metric.Metadata, f func(cvs []int64) int64) *AggGauge {
+	return NewFunctionalGauge(metadata, f, b.labels...)
+}
+
 // GaugeFloat64 constructs a new AggGaugeFloat64 with the Builder's labels.
 func (b Builder) GaugeFloat64(metadata metric.Metadata) *AggGaugeFloat64 {
 	return NewGaugeFloat64(metadata, b.labels...)
@@ -49,11 +49,14 @@ func (b Builder) Counter(metadata metric.Metadata) *AggCounter {
 	return NewCounter(metadata, b.labels...)
 }
 
+// CounterFloat64 constructs a new AggCounter with the Builder's labels.
+func (b Builder) CounterFloat64(metadata metric.Metadata) *AggCounterFloat64 {
+	return NewCounterFloat64(metadata, b.labels...)
+}
+
 // Histogram constructs a new AggHistogram with the Builder's labels.
-func (b Builder) Histogram(
-	metadata metric.Metadata, duration time.Duration, maxVal int64, sigFigs int,
-) *AggHistogram {
-	return NewHistogram(metadata, duration, maxVal, sigFigs, b.labels...)
+func (b Builder) Histogram(opts metric.HistogramOptions) *AggHistogram {
+	return NewHistogram(opts, b.labels...)
 }
 
 type childSet struct {
@@ -88,6 +91,16 @@ func (cs *childSet) Each(
 		}
 		pm.Label = childLabels
 		f(pm)
+		return true
+	})
+}
+
+// apply applies the given applyFn to every item in the childSet
+func (cs *childSet) apply(applyFn func(item btree.Item)) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.mu.tree.Ascend(func(item btree.Item) bool {
+		applyFn(item)
 		return true
 	})
 }

@@ -1,30 +1,112 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package vm
 
 import (
-	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
 )
+
+const (
+	// TagCluster is cluster name tag const.
+	TagCluster = "cluster"
+	// TagCreated is created time tag const, RFC3339-formatted timestamp.
+	TagCreated = "created"
+	// TagLifetime is lifetime tag const.
+	TagLifetime = "lifetime"
+	// TagRoachprod is roachprod tag const, value is true & false.
+	TagRoachprod = "roachprod"
+	// TagSpotInstance is a tag added to spot instance vms with value as true.
+	TagSpotInstance = "spot"
+	// TagUsage indicates where a certain resource is used. "roachtest" is used
+	// as the key for roachtest created resources.
+	TagUsage = "usage"
+	// TagArch is the CPU architecture tag const.
+	TagArch = "arch"
+
+	ArchARM64   = CPUArch("arm64")
+	ArchAMD64   = CPUArch("amd64")
+	ArchFIPS    = CPUArch("fips")
+	ArchUnknown = CPUArch("unknown")
+
+	// InitializedFile is the base name of the initialization paths defined below.
+	InitializedFile = ".roachprod-initialized"
+	// OSInitializedFile is a marker file that is created on a VM to indicate
+	// that it has been initialized at least once by the VM start-up script. This
+	// is used to avoid re-initializing a VM that has been stopped and restarted.
+	OSInitializedFile = "/" + InitializedFile
+	// DisksInitializedFile is a marker file that is created on a VM to indicate
+	// that the disks have been initialized by the VM start-up script. This is
+	// separate from OSInitializedFile, because the disks may be ephemeral and
+	// need to be re-initialized on every start. The presence of this file
+	// automatically implies the presence of OSInitializedFile.
+	DisksInitializedFile = "/mnt/data1/" + InitializedFile
+	// StartupLogs is a log file that is created on a VM to redirect startup script
+	// output logs.
+	StartupLogs = "/var/log/roachprod_startup.log"
+)
+
+// UnimplementedError is returned when a method is not implemented by a
+// provider. An error is returned instead of panicking to isolate failures to a
+// single test (in the context of `roachtest`), otherwise the entire test run
+// would fail.
+var UnimplementedError = errors.New("unimplemented")
+
+type CPUArch string
+
+// ParseArch parses a string into a CPUArch using a simple, non-exhaustive heuristic.
+// Supported input values were extracted from the following CLI tools/binaries: file, gcloud, aws
+func ParseArch(s string) CPUArch {
+	if s == "" {
+		return ArchUnknown
+	}
+	arch := strings.ToLower(s)
+
+	if strings.Contains(arch, "amd64") || strings.Contains(arch, "x86_64") ||
+		strings.Contains(arch, "intel") {
+		return ArchAMD64
+	}
+	if strings.Contains(arch, "arm64") || strings.Contains(arch, "aarch64") ||
+		strings.Contains(arch, "ampere") || strings.Contains(arch, "graviton") {
+		return ArchARM64
+	}
+	if strings.Contains(arch, "fips") {
+		return ArchFIPS
+	}
+	return ArchUnknown
+}
+
+// GetDefaultLabelMap returns a label map for a common set of labels.
+func GetDefaultLabelMap(opts CreateOpts) map[string]string {
+	// Add architecture override tag, only if it was specified.
+	if opts.Arch != "" {
+		return map[string]string{
+			TagCluster:   opts.ClusterName,
+			TagLifetime:  opts.Lifetime.String(),
+			TagRoachprod: "true",
+			TagArch:      opts.Arch,
+		}
+	}
+	return map[string]string{
+		TagCluster:   opts.ClusterName,
+		TagLifetime:  opts.Lifetime.String(),
+		TagRoachprod: "true",
+	}
+}
 
 // A VM is an abstract representation of a specific machine instance.  This type is used across
 // the various cloud providers supported by roachprod.
@@ -33,10 +115,18 @@ type VM struct {
 	CreatedAt time.Time `json:"created_at"`
 	// If non-empty, indicates that some or all of the data in the VM instance
 	// is not present or otherwise invalid.
-	Errors   []error       `json:"errors"`
-	Lifetime time.Duration `json:"lifetime"`
+	Errors      []error           `json:"errors"`
+	Lifetime    time.Duration     `json:"lifetime"`
+	Preemptible bool              `json:"preemptible"`
+	Labels      map[string]string `json:"labels"`
 	// The provider-internal DNS name for the VM instance
 	DNS string `json:"dns"`
+
+	// PublicDNS is the public DNS name that can be used to connect to the VM.
+	PublicDNS string `json:"public_dns"`
+	// The DNS provider to use for DNS operations performed for this VM.
+	DNSProvider string `json:"dns_provider"`
+
 	// The name of the cloud provider that hosts the VM instance
 	Provider string `json:"provider"`
 	// The provider-specific id for the instance.  This may or may not be the same as Name, depending
@@ -52,23 +142,35 @@ type VM struct {
 	// their public or private IP.
 	VPC         string `json:"vpc"`
 	MachineType string `json:"machine_type"`
-	Zone        string `json:"zone"`
+	// When available, either vm.ArchAMD64 or vm.ArchARM64.
+	CPUArch CPUArch `json:"cpu_architecture"`
+	// When available, 'Haswell', 'Skylake', etc.
+	CPUFamily string `json:"cpu_family"`
+	Zone      string `json:"zone"`
 	// Project represents the project to which this vm belongs, if the VM is in a
 	// cloud that supports project (i.e. GCE). Empty otherwise.
 	Project string `json:"project"`
 
-	// SQLPort is the port on which the cockroach process is listening for SQL
-	// connections.
-	// Usually config.DefaultSQLPort, except for local clusters.
-	SQLPort int `json:"sql_port"`
-
-	// AdminUIPort is the port on which the cockroach process is listening for
-	// HTTP traffic for the Admin UI.
-	// Usually config.DefaultAdminUIPort, except for local clusters.
-	AdminUIPort int `json:"adminui_port"`
-
 	// LocalClusterName is only set for VMs in a local cluster.
 	LocalClusterName string `json:"local_cluster_name,omitempty"`
+
+	// NonBootAttachedVolumes are the non-bootable, _persistent_ volumes attached to the VM.
+	NonBootAttachedVolumes []Volume `json:"non_bootable_volumes"`
+
+	// BootVolume is the bootable, _persistent_ volume attached to the VM.
+	BootVolume Volume `json:"bootable_volume"`
+
+	// LocalDisks are the ephemeral SSD disks attached to the VM.
+	LocalDisks []Volume `json:"local_disks"`
+
+	// CostPerHour is the estimated cost per hour of this VM, in US dollars. 0 if
+	//there is no estimate available.
+	CostPerHour float64
+
+	// EmptyCluster indicates that the VM does not exist. Azure allows for empty
+	// clusters, but roachprod does not allow VM-less clusters except when deleting them.
+	// A fake VM will be used in this scenario.
+	EmptyCluster bool
 }
 
 // Name generates the name for the i'th node in a cluster.
@@ -78,9 +180,10 @@ func Name(cluster string, idx int) string {
 
 // Error values for VM.Error
 var (
-	ErrBadNetwork   = errors.New("could not determine network information")
-	ErrInvalidName  = errors.New("invalid VM name")
-	ErrNoExpiration = errors.New("could not determine expiration")
+	ErrBadNetwork    = errors.New("could not determine network information")
+	ErrBadScheduling = errors.New("could not determine scheduling information")
+	ErrInvalidName   = errors.New("invalid VM name")
+	ErrNoExpiration  = errors.New("could not determine expiration")
 )
 
 var regionRE = regexp.MustCompile(`(.*[^-])-?[a-z]$`)
@@ -92,20 +195,20 @@ func (vm *VM) IsLocal() bool {
 
 // Locality returns the cloud, region, and zone for the VM.  We want to include the cloud, since
 // GCE and AWS use similarly-named regions (e.g. us-east-1)
-func (vm *VM) Locality() string {
+func (vm *VM) Locality() (string, error) {
 	var region string
 	if vm.IsLocal() {
 		region = vm.Zone
 	} else if match := regionRE.FindStringSubmatch(vm.Zone); len(match) == 2 {
 		region = match[1]
 	} else {
-		log.Fatalf(context.Background(), "unable to parse region from zone %q", vm.Zone)
+		return "", errors.Newf("unable to parse region from zone %q", vm.Zone)
 	}
-	return fmt.Sprintf("cloud=%s,region=%s,zone=%s", vm.Provider, region, vm.Zone)
+	return fmt.Sprintf("cloud=%s,region=%s,zone=%s", vm.Provider, region, vm.Zone), nil
 }
 
 // ZoneEntry returns a line representing the VMs DNS zone entry
-func (vm VM) ZoneEntry() (string, error) {
+func (vm *VM) ZoneEntry() (string, error) {
 	if len(vm.Name) >= 60 {
 		return "", errors.Errorf("Name too long: %s", vm.Name)
 	}
@@ -115,6 +218,46 @@ func (vm VM) ZoneEntry() (string, error) {
 	// TODO(rail): We should probably skip local VMs too. They add a bunch of
 	// entries for localhost.roachprod.crdb.io pointing to 127.0.0.1.
 	return fmt.Sprintf("%s 60 IN A %s\n", vm.Name, vm.PublicIP), nil
+}
+
+func (vm *VM) AttachVolume(l *logger.Logger, v Volume) (deviceName string, _ error) {
+	vm.NonBootAttachedVolumes = append(vm.NonBootAttachedVolumes, v)
+	if err := ForProvider(vm.Provider, func(provider Provider) error {
+		var err error
+		deviceName, err = provider.AttachVolume(l, v, vm)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	return deviceName, nil
+}
+
+const vmNameFormat = "user-<clusterid>-<nodeid>"
+
+// ClusterName returns the cluster name a VM belongs to.
+func (vm *VM) ClusterName() (string, error) {
+	if vm.IsLocal() {
+		return vm.LocalClusterName, nil
+	}
+	name := vm.Name
+	parts := strings.Split(name, "-")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("expected VM name in the form %s, got %s", vmNameFormat, name)
+	}
+	return strings.Join(parts[:len(parts)-1], "-"), nil
+}
+
+// UserName returns the username of a VM.
+func (vm *VM) UserName() (string, error) {
+	if vm.IsLocal() {
+		return config.Local, nil
+	}
+	name := vm.Name
+	parts := strings.Split(name, "-")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("expected VM name in the form %s, got %s", vmNameFormat, name)
+	}
+	return parts[0], nil
 }
 
 // List represents a list of VMs.
@@ -151,9 +294,12 @@ const (
 
 // CreateOpts is the set of options when creating VMs.
 type CreateOpts struct {
-	ClusterName    string
-	Lifetime       time.Duration
+	ClusterName  string
+	Lifetime     time.Duration
+	CustomLabels map[string]string
+
 	GeoDistributed bool
+	Arch           string
 	VMProviders    []string
 	SSDOpts        struct {
 		UseLocalSSD bool
@@ -174,6 +320,8 @@ func DefaultCreateOpts() CreateOpts {
 		GeoDistributed: false,
 		VMProviders:    []string{},
 		OsVolumeSize:   10,
+		// N.B. When roachprod is used via CLI, this will be overridden by {"roachprod":"true"}.
+		CustomLabels: map[string]string{"roachtest": "true"},
 	}
 	defaultCreateOpts.SSDOpts.UseLocalSSD = true
 	defaultCreateOpts.SSDOpts.NoExt4Barrier = true
@@ -193,37 +341,152 @@ const (
 	AcceptMultipleProjects = true
 )
 
-// ProviderFlags is a hook point for Providers to supply additional,
-// provider-specific flags to various roachprod commands. In general, the flags
+// ProviderOpts is a hook point for Providers to supply additional,
+// provider-specific options to various roachprod commands. In general, the flags
 // should be prefixed with the provider's name to prevent collision between
 // similar options.
 //
 // If a new command is added (perhaps `roachprod enlarge`) that needs
 // additional provider- specific flags, add a similarly-named method
 // `ConfigureEnlargeFlags` to mix in the additional flags.
-type ProviderFlags interface {
-	// Configures a FlagSet with any options relevant to the `create` command.
+type ProviderOpts interface {
+	// ConfigureCreateFlags configures a FlagSet with any options relevant to the
+	// `create` command.
 	ConfigureCreateFlags(*pflag.FlagSet)
-	// Configures a FlagSet with any options relevant to cluster manipulation
-	// commands (`create`, `destroy`, `list`, `sync` and `gc`).
+	// ConfigureClusterFlags configures a FlagSet with any options relevant to
+	// cluster manipulation commands (`create`, `destroy`, `list`, `sync` and
+	// `gc`).
 	ConfigureClusterFlags(*pflag.FlagSet, MultipleProjectsOption)
-	// Updates provider opts values to match the passed provider opts struct
-	ConfigureProviderOpts(interface{})
+	// ConfigureClusterCleanupFlags configures a FlagSet with any options relevant to
+	// commands (`gc`)
+	ConfigureClusterCleanupFlags(*pflag.FlagSet)
+}
+
+// VolumeSnapshot is an abstract representation of a specific volume snapshot.
+// This type is used across various cloud providers supported by roachprod.
+type VolumeSnapshot struct {
+	ID   string
+	Name string
+}
+
+type VolumeSnapshots []VolumeSnapshot
+
+func (v VolumeSnapshots) Len() int {
+	return len(v)
+}
+
+func (v VolumeSnapshots) Less(i, j int) bool {
+	// This sorting-by-name looks like it happens by default in the gcloud API,
+	// but it doesn't hurt to be paranoid. Since node index number is part of
+	// the fingerprint, this plays nicely with applying snapshots in index
+	// order. That matters -- if the workload is being run on the 10th node,
+	// it's not expecting to have CRDB state. Nor should we expect the 9-node
+	// CRDB cluster to have to work out that now the 10th roachprod node should
+	// be running the CRDB process post snapshot application.
+	return strings.Compare(v[i].Name, v[j].Name) < 0
+}
+
+func (v VolumeSnapshots) Swap(i, j int) {
+	v[i], v[j] = v[j], v[i]
+}
+
+var _ sort.Interface = VolumeSnapshots{}
+
+// VolumeSnapshotCreateOpts groups input callers can provide when creating
+// volume snapshots. Namely, what name it has, the labels it's created with, and
+// a description (visible through cloud consoles).
+type VolumeSnapshotCreateOpts struct {
+	Name        string
+	Labels      map[string]string
+	Description string
+}
+
+// VolumeSnapshotListOpts provides a way to search for specific volume
+// snapshots. Callers can regex match snapshot names, search by exact labels, or
+// filter only for snapshots created before some timestamp. Individual
+// parameters are optional and can be combined with others.
+type VolumeSnapshotListOpts struct {
+	NamePrefix    string
+	Labels        map[string]string
+	CreatedBefore time.Time
+}
+
+// Volume is an abstract representation of a specific volume/disks. This type is
+// used across various cloud providers supported by roachprod, and can typically
+// be snapshotted or attached, detached, mounted from existing VMs.
+type Volume struct {
+	ProviderResourceID string
+	ProviderVolumeType string
+	Zone               string
+	Encrypted          bool
+	Name               string
+	Labels             map[string]string
+	Size               int
+}
+
+// VolumeCreateOpts groups input callers can provide when creating volumes.
+type VolumeCreateOpts struct {
+	Name string
+	// N.B. Customer managed encryption is not supported at this time
+	Encrypted        bool
+	Architecture     string
+	IOPS             int
+	Size             int
+	Type             string
+	SourceSnapshotID string
+	Zone             string
+	Labels           map[string]string
+}
+
+type ListOptions struct {
+	Username             string // if set, <username>-.* clusters are detected as 'mine'
+	IncludeVolumes       bool
+	IncludeEmptyClusters bool
+	ComputeEstimatedCost bool
+	IncludeProviders     []string
+}
+
+type PreemptedVM struct {
+	Name        string
+	PreemptedAt time.Time
+}
+
+// CreatePreemptedVMs returns a list of PreemptedVM created from given list of vmNames
+func CreatePreemptedVMs(vmNames []string) []PreemptedVM {
+	preemptedVMs := make([]PreemptedVM, len(vmNames))
+	for i, name := range vmNames {
+		preemptedVMs[i] = PreemptedVM{Name: name}
+	}
+	return preemptedVMs
+}
+
+// ServiceAddress stores the IP and port of a service.
+type ServiceAddress struct {
+	IP   string
+	Port int
 }
 
 // A Provider is a source of virtual machines running on some hosting platform.
 type Provider interface {
-	CleanSSH() error
-	ConfigSSH() error
-	Create(names []string, opts CreateOpts) error
-	Reset(vms List) error
-	Delete(vms List) error
-	Extend(vms List, lifetime time.Duration) error
+	CreateProviderOpts() ProviderOpts
+	CleanSSH(l *logger.Logger) error
+
+	// ConfigSSH takes a list of zones and configures SSH for machines in those
+	// zones for the given provider.
+	ConfigSSH(l *logger.Logger, zones []string) error
+	Create(l *logger.Logger, names []string, opts CreateOpts, providerOpts ProviderOpts) error
+	Grow(l *logger.Logger, vms List, clusterName string, names []string) error
+	Shrink(l *logger.Logger, vmsToRemove List, clusterName string) error
+	Reset(l *logger.Logger, vms List) error
+	Delete(l *logger.Logger, vms List) error
+	Extend(l *logger.Logger, vms List, lifetime time.Duration) error
 	// Return the account name associated with the provider
-	FindActiveAccount() (string, error)
-	// Returns a hook point for extending top-level roachprod tooling flags
-	Flags() ProviderFlags
-	List() (List, error)
+	FindActiveAccount(l *logger.Logger) (string, error)
+	List(l *logger.Logger, opts ListOptions) (List, error)
+	// AddLabels adds (or updates) the given labels to the given VMs.
+	// N.B. If a VM contains a label with the same key, its value will be updated.
+	AddLabels(l *logger.Logger, vms List, labels map[string]string) error
+	RemoveLabels(l *logger.Logger, vms List, labels []string) error
 	// The name of the Provider, which will also surface in the top-level Providers map.
 	Name() string
 
@@ -238,16 +501,80 @@ type Provider interface {
 	// ProjectActive returns true if the given project is currently active in the
 	// provider.
 	ProjectActive(project string) bool
+
+	// Volume and volume snapshot related APIs.
+
+	// CreateVolume creates a new volume using the given options.
+	CreateVolume(l *logger.Logger, vco VolumeCreateOpts) (Volume, error)
+	// ListVolumes lists all volumes already attached to the given VM.
+	ListVolumes(l *logger.Logger, vm *VM) ([]Volume, error)
+	// DeleteVolume detaches and deletes the given volume from the given VM.
+	DeleteVolume(l *logger.Logger, volume Volume, vm *VM) error
+	// AttachVolume attaches the given volume to the given VM.
+	AttachVolume(l *logger.Logger, volume Volume, vm *VM) (string, error)
+	// CreateVolumeSnapshot creates a snapshot of the given volume, using the
+	// given options.
+	CreateVolumeSnapshot(l *logger.Logger, volume Volume, vsco VolumeSnapshotCreateOpts) (VolumeSnapshot, error)
+	// ListVolumeSnapshots lists the individual volume snapshots that satisfy
+	// the search criteria.
+	ListVolumeSnapshots(l *logger.Logger, vslo VolumeSnapshotListOpts) ([]VolumeSnapshot, error)
+	// DeleteVolumeSnapshots permanently deletes the given snapshots.
+	DeleteVolumeSnapshots(l *logger.Logger, snapshot ...VolumeSnapshot) error
+
+	// SpotVM related APIs.
+
+	// SupportsSpotVMs returns if the provider supports spot VMs.
+	SupportsSpotVMs() bool
+	// GetPreemptedSpotVMs returns a list of Spot VMs that were preempted since the time specified.
+	// Returns nil, nil when SupportsSpotVMs() is false.
+	GetPreemptedSpotVMs(l *logger.Logger, vms List, since time.Time) ([]PreemptedVM, error)
+	// GetHostErrorVMs returns a list of VMs that had host error since the time specified.
+	GetHostErrorVMs(l *logger.Logger, vms List, since time.Time) ([]string, error)
+	// GetVMSpecs returns a map from VM.Name to a map of VM attributes, according to a specific cloud provider.
+	GetVMSpecs(l *logger.Logger, vms List) (map[string]map[string]interface{}, error)
+
+	// CreateLoadBalancer creates a load balancer, for a specific port, that
+	// delegates to the given cluster.
+	CreateLoadBalancer(l *logger.Logger, vms List, port int) error
+
+	// DeleteLoadBalancer deletes a load balancers created for a specific port.
+	DeleteLoadBalancer(l *logger.Logger, vms List, port int) error
+
+	// ListLoadBalancers returns a list of load balancer IPs and ports that are currently
+	// routing to services for the given VMs.
+	ListLoadBalancers(l *logger.Logger, vms List) ([]ServiceAddress, error)
 }
 
 // DeleteCluster is an optional capability for a Provider which can
 // destroy an entire cluster in a single operation.
 type DeleteCluster interface {
-	DeleteCluster(name string) error
+	DeleteCluster(l *logger.Logger, name string) error
 }
 
 // Providers contains all known Provider instances. This is initialized by subpackage init() functions.
 var Providers = map[string]Provider{}
+
+// ProviderOptionsContainer is a container for a collection of provider-specific options.
+type ProviderOptionsContainer map[string]ProviderOpts
+
+// CreateProviderOptionsContainer returns a ProviderOptionsContainer which is
+// populated with options for all registered providers. Only call it after
+// initiliazing providers (populating vm.Providers).
+func CreateProviderOptionsContainer() ProviderOptionsContainer {
+	container := make(ProviderOptionsContainer)
+	for providerName, providerInstance := range Providers {
+		container[providerName] = providerInstance.CreateProviderOpts()
+	}
+	return container
+}
+
+// SetProviderOpts updates the container it operates on with the given
+// provider options for the given provider.
+func (container ProviderOptionsContainer) SetProviderOpts(
+	providerName string, providerOpts ProviderOpts,
+) {
+	container[providerName] = providerOpts
+}
 
 // AllProviderNames returns the names of all known vm Providers.  This is useful with the
 // ProvidersSequential or ProvidersParallel methods.
@@ -268,15 +595,12 @@ func FanOut(list List, action func(Provider, List) error) error {
 
 	var g errgroup.Group
 	for name, vms := range m {
-		// capture loop variables
-		n := name
-		v := vms
 		g.Go(func() error {
-			p, ok := Providers[n]
+			p, ok := Providers[name]
 			if !ok {
-				return errors.Errorf("unknown provider name: %s", n)
+				return errors.Errorf("unknown provider name: %s", name)
 			}
-			return action(p, v)
+			return action(p, vms)
 		})
 	}
 
@@ -288,14 +612,14 @@ var cachedActiveAccounts map[string]string
 
 // FindActiveAccounts queries the active providers for the name of the user
 // account.
-func FindActiveAccounts() (map[string]string, error) {
+func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 	source := cachedActiveAccounts
 
 	if source == nil {
 		// Ask each Provider for its active account name.
 		source = map[string]string{}
 		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
-			account, err := p.FindActiveAccount()
+			account, err := p.FindActiveAccount(l)
 			if err != nil {
 				return err
 			}
@@ -336,10 +660,8 @@ func ForProvider(named string, action func(Provider) error) error {
 func ProvidersParallel(named []string, action func(Provider) error) error {
 	var g errgroup.Group
 	for _, name := range named {
-		// capture loop variable
-		n := name
 		g.Go(func() error {
-			return ForProvider(n, action)
+			return ForProvider(name, action)
 		})
 	}
 	return g.Wait()
@@ -363,10 +685,15 @@ func ProvidersSequential(named []string, action func(Provider) error) error {
 //
 // For example:
 //
-//   ZonePlacement(3, 8) = []int{0, 0, 1, 1, 2, 2, 0, 1}
-//
+//	ZonePlacement(3, 8) = []int{0, 0, 1, 1, 2, 2, 0, 1}
 func ZonePlacement(numZones, numNodes int) (nodeZones []int) {
+	if numZones < 1 {
+		panic("expected 1 or more zones")
+	}
 	numPerZone := numNodes / numZones
+	if numPerZone < 1 {
+		numPerZone = 1
+	}
 	extraStartIndex := numPerZone * numZones
 	nodeZones = make([]int, numNodes)
 	for i := 0; i < numNodes; i++ {
@@ -400,19 +727,57 @@ func ExpandZonesFlag(zoneFlag []string) (zones []string, err error) {
 	return zones, nil
 }
 
-// DNSSafeAccount takes a string and returns a cleaned version of the string that can be used in DNS entries.
+// DNSSafeName takes a string and returns a cleaned version of the string that can be used in DNS entries.
 // Unsafe characters are dropped. No length check is performed.
-func DNSSafeAccount(account string) string {
+func DNSSafeName(name string) string {
 	safe := func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z':
 			return r
 		case r >= 'A' && r <= 'Z':
 			return unicode.ToLower(r)
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-':
+			return r
 		default:
 			// Negative value tells strings.Map to drop the rune.
 			return -1
 		}
 	}
-	return strings.Map(safe, account)
+	name = strings.Map(safe, name)
+
+	// DNS entries cannot start or end with hyphens.
+	name = strings.Trim(name, "-")
+
+	// Consecutive hyphens are allowed in DNS entries, but disallow it for readability.
+	return regexp.MustCompile(`-+`).ReplaceAllString(name, "-")
+}
+
+// SanitizeLabel returns a version of the string that can be used as a (resource) label.
+// This takes the lowest common denominator of the label requirements;
+// GCE: "The value can only contain lowercase letters, numeric characters, underscores and dashes.
+// The value can be at most 63 characters long"
+func SanitizeLabel(label string) string {
+	// Replace any non-alphanumeric characters with hyphens
+	re := regexp.MustCompile("[^a-zA-Z0-9]+")
+	label = re.ReplaceAllString(label, "-")
+	label = strings.ToLower(label)
+
+	// Truncate the label to 63 characters (the maximum allowed by GCP)
+	if len(label) > 63 {
+		label = label[:63]
+	}
+	// Remove any leading or trailing hyphens
+	label = strings.Trim(label, "-")
+	return label
+}
+
+// SanitizeLabelValues returns the same set of keys with sanitized values.
+func SanitizeLabelValues(labels map[string]string) map[string]string {
+	sanitized := map[string]string{}
+	for k, v := range labels {
+		sanitized[k] = SanitizeLabel(v)
+	}
+	return sanitized
 }

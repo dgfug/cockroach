@@ -1,17 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.storage.enginepb;
-option go_package = "enginepb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/storage/enginepb";
 
+import "kv/kvserver/concurrency/isolation/levels.proto";
 import "util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
 
@@ -25,13 +21,19 @@ message TxnMeta {
   bytes id = 1 [(gogoproto.customname) = "ID",
       (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
       (gogoproto.nullable) = false];
-  reserved 2;
-  // key is the key which anchors the transaction. This is typically
-  // the first key read or written during the transaction and
-  // determines which range in the cluster will hold the transaction
-  // record.
+  // key is the key which anchors the transaction. This is any key (that is
+  // locked) in the first locking batch executed by the transaction. Typically,
+  // this is the first locking key in the first locking batch executed by the
+  // transaction, but this behavior can be changed by toggling the
+  // RandomizedTxnAnchorKeyEnabled cluster setting.
+  //
+  // The range to which this key belongs will hold the transaction's record. By
+  // extension, the leaseholder of this range may also be responsible for
+  // coordinating async intent resolution once the transaction is finalized.
   bytes key = 3; // TODO(tschottdorf): [(gogoproto.casttype) = "Key"];
-  // Incremented on txn retry.
+  // iso_level is the isolation level of the transaction.
+  cockroach.kv.kvserver.concurrency.isolation.Level iso_level = 2;
+  // epoch is the current epoch of the transaction.
   int32 epoch = 4 [(gogoproto.casttype) = "TxnEpoch"];
   // The proposed timestamp for the transaction. This starts as the current wall
   // time on the txn coordinator, and is forwarded by the timestamp cache if the
@@ -51,11 +53,9 @@ message TxnMeta {
   // Note that reads do not occur at this timestamp; they instead occur at
   // ReadTimestamp, which is tracked in the containing roachpb.Transaction.
   //
-  // Writes used to be performed at the txn's read timestamp, which was
-  // necessary to avoid lost update anomalies in snapshot isolation mode. We no
-  // longer support snapshot isolation mode, and there are now several important
-  // reasons that writes are performed at this timestamp instead of the txn's
-  // original timestamp:
+  // Writes used to be performed at the txn's read timestamp before 57d02014.
+  // However, there are now several important reasons to perform writes at the
+  // write timestamp instead of the txn's read timestamp:
   //
   //    1. This timestamp is forwarded by the timestamp cache when this
   //       transaction attempts to write beneath a more recent read. Leaving the
@@ -122,6 +122,13 @@ message TxnMeta {
   int32 sequence = 7 [(gogoproto.casttype) = "TxnSeq"];
 
   reserved 8;
+
+  // The ID of the node where this transaction originated.
+  // This field represents either a SQLInstanceID of a SQL pod, a SQL
+  // gateway NodeID, or a KV node ID (in the case of KV-initiated
+  // transactions) and was introduced for the purposes of SQL Observability.
+  // TODO(sarkesian): Refactor to use gogoproto.casttype GenericNodeID when #73309 completes.
+  int32 coordinator_node_id = 10 [(gogoproto.customname) = "CoordinatorNodeID"];
 }
 
 // IgnoredSeqNumRange describes a range of ignored seqnums.
@@ -133,6 +140,115 @@ message IgnoredSeqNumRange {
   int32 end = 2 [(gogoproto.casttype) = "TxnSeq"];
 }
 
+// MVCCValueHeader holds MVCC-level metadata for a versioned value.
+// Used by storage.MVCCValue.
+//
+// NB: a shallow copy of this value has to equal a deep copy, i.e. there
+// must be (recursively) no pointers in this type. Should this need to
+// change, need to update mvccGet.
+//
+// NB: ensure that this struct stays in sync with MVCCValueHeader{Pure,CrdbTest}.
+// See kvpb.RequestHeader for details on how they help us keep the KVNemesisSeq
+// field out of production code.
+message MVCCValueHeader {
+  option (gogoproto.equal) = true;
+  option (gogoproto.marshaler) = false;
+  option (gogoproto.sizer) = false;
+
+  message Empty{};
+  // Empty is zero-size in production. It's an int64 under the crdb_test build tag.
+  // This is used to enable kvnemesis testing, which builds on uniqueness of values
+  // in the MVCC history. Deletions don't have a user-definable value, so we need
+  // an extra identifier, which is provided by this field.
+  //
+  // NB: it's important that this isn't at the end of the message, see:
+  // https://dave.cheney.net/2015/10/09/padding-is-hard
+  Empty kvnemesis_seq = 2 [
+    (gogoproto.customname) = "KVNemesisSeq",
+    (gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil.Container"];
+
+  // The local clock timestamp records the value of the local HLC clock on the
+  // leaseholder when the key was originally written. It is used to make claims
+  // about the relative real time ordering of the key-value's writer and readers
+  // when comparing a reader's uncertainty interval (and observed timestamps) to
+  // the key-value. Ignoring edge cases, readers with an observed timestamp from
+  // the key-value's leaseholder that is greater than the local clock timestamp
+  // stored in the key cannot make claims about real time ordering and must
+  // consider it possible that the key-value's write occurred before the read
+  // began. However, readers with an observed timestamp from the key-value's
+  // leaseholder that is less than the clock timestamp can claim that the reader
+  // captured that observed timestamp before the key-value was written and
+  // therefore can consider the key-value's write to have been concurrent with
+  // the read. In doing so, the reader can avoid an uncertainty restart. For
+  // more, see pkg/kv/kvserver/observedts/doc.go.
+  //
+  // If the local timestamp is empty, it is assumed to be equal to the key's
+  // version timestamp. This property is used to avoid storing the local clock
+  // timestamp in the common case where the HLC clock on the leaseholder is
+  // greater than or equal to the version timestamp at the time that it is
+  // written. If is safe for the local clock timestamp to be rounded down, as
+  // this will simply lead to additional uncertainty restarts. However, it is
+  // not safe for the local clock timestamp to be rounded up, as this could lead
+  // to stale reads.
+  util.hlc.Timestamp local_timestamp = 1 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+
+  // When set to true, this value will be filtered out by rangefeeds and will
+  // not be available in changefeeds. This allows higher levels of the system to
+  // control which writes are exported.
+  bool omit_in_rangefeeds = 3;
+
+  // ImportEpoch identifies the number of times a user has called IMPORT
+  // INTO on the table this key belongs to when the table was not empty.
+  uint32 import_epoch = 4;
+  
+  // OriginID identifes the original cluster that wrote this key during Logical
+  // Data Replication (LDR). 0 identifies a local write and the default value
+  // when LDR is not being run, 1 identifies a remote write, and 2+ are reserved
+  // to identify remote clusters.
+  uint32 origin_id = 5  [(gogoproto.customname) = "OriginID"];
+  
+  // OriginTimestamp identifies the timestamp this kv was written on the
+  // original source cluster during Logical Data Replication. A default empty
+  // timestamp implies that this kv did not originate from a Logical Data
+  // Replication stream. 
+  util.hlc.Timestamp origin_timestamp = 6  [(gogoproto.nullable) = false,(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.Timestamp"];
+
+   // NextID = 7.
+}
+
+// MVCCValueHeaderPure is not to be used directly. It's generated only for use of
+// its marshaling methods by MVCCValueHeader. See the comment there.
+message MVCCValueHeaderPure {
+  util.hlc.Timestamp local_timestamp = 1 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+
+  bool omit_in_rangefeeds = 3;
+  uint32 import_epoch = 4;
+  uint32 origin_id = 5  [(gogoproto.customname) = "OriginID"];
+
+  // OriginTimestamp is not-nullable in MVCCValueHeader but here it is nullable.
+  // This is because it leads to more efficient marshaling when the timestamp is
+  // not set. See the pure() conversion method.
+  util.hlc.Timestamp origin_timestamp = 6 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.Timestamp"];
+}
+// MVCCValueHeaderCrdbTest is not to be used directly. It's generated only for use of
+// its marshaling methods by MVCCValueHeader. See the comment there.
+message MVCCValueHeaderCrdbTest {
+  message Empty{};
+  Empty kvnemesis_seq = 2 [
+    (gogoproto.customname) = "KVNemesisSeq",
+    (gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil.Container"];
+  util.hlc.Timestamp local_timestamp = 1 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+  bool omit_in_rangefeeds = 3;
+  uint32 import_epoch = 4;
+  uint32 origin_id = 5  [(gogoproto.customname) = "OriginID"];
+  util.hlc.Timestamp origin_timestamp = 6 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.Timestamp"];
+}
+
 // MVCCStatsDelta is convertible to MVCCStats, but uses signed variable width
 // encodings for most fields that make it more efficient to store negative
 // values. This makes the encodings incompatible.
@@ -141,7 +257,7 @@ message MVCCStatsDelta {
 
   int64 contains_estimates = 14;
   sfixed64 last_update_nanos = 1;
-  sfixed64 intent_age = 2;
+  sfixed64 lock_age = 2;
   sfixed64 gc_bytes_age = 3 [(gogoproto.customname) = "GCBytesAge"];
   sint64 live_bytes = 4;
   sint64 live_count = 5;
@@ -151,7 +267,12 @@ message MVCCStatsDelta {
   sint64 val_count = 9;
   sint64 intent_bytes = 10;
   sint64 intent_count = 11;
-  sint64 separated_intent_count = 16;
+  sint64 lock_bytes = 21;
+  sint64 lock_count = 16;
+  sint64 range_key_count = 17;
+  sint64 range_key_bytes = 18;
+  sint64 range_val_count = 19;
+  sint64 range_val_bytes = 20;
   sint64 sys_bytes = 12;
   sint64 sys_count = 13;
   sint64 abort_span_bytes = 15;
@@ -160,72 +281,25 @@ message MVCCStatsDelta {
   // whole message is marked as safe for log redaction.
 }
 
-// MVCCPersistentStats is convertible to MVCCStats, but uses signed variable
-// width encodings for most fields that make it efficient to store positive
-// values but inefficient to store negative values. This makes the encodings
-// incompatible.
-message MVCCPersistentStats {
-  option (gogoproto.equal) = true;
-  option (gogoproto.populate) = true;
-
-  int64 contains_estimates = 14; // must never go negative absent a bug
-  sfixed64 last_update_nanos = 1;
-  sfixed64 intent_age = 2;
-  sfixed64 gc_bytes_age = 3 [(gogoproto.customname) = "GCBytesAge"];
-  int64 live_bytes = 4;
-  int64 live_count = 5;
-  int64 key_bytes = 6;
-  int64 key_count = 7;
-  int64 val_bytes = 8;
-  int64 val_count = 9;
-  int64 intent_bytes = 10;
-  int64 intent_count = 11;
-  int64 separated_intent_count = 16;
-  int64 sys_bytes = 12;
-  int64 sys_count = 13;
-  int64 abort_span_bytes = 15;
-}
-
-// RangeAppliedState combines the raft and lease applied indices with
-// mvcc stats. These are all persisted on each transition of the Raft
-// state machine (i.e. on each Raft application), so they are stored
-// in the same RocksDB key for efficiency.
-message RangeAppliedState {
-  option (gogoproto.equal) = true;
-  option (gogoproto.populate) = true;
-
-  // raft_applied_index is the highest (and last) index applied to the Raft
-  // state machine.
-  uint64 raft_applied_index = 1;
-  // lease_applied_index is the highest (and last) lease index applied to the
-  // Raft state machine.
-  uint64 lease_applied_index = 2;
-  // range_stats is the set of mvcc stats that accounts for the current value
-  // of the Raft state machine.
-  MVCCPersistentStats range_stats = 3 [(gogoproto.nullable) = false];
-
-  // raft_closed_timestamp is the largest timestamp that is known to have been
-  // closed through Raft commands as of this lease applied index. This means
-  // that the current leaseholder (if any) and any future leaseholder will not
-  // evaluate writes at or below this timestamp, and also that any in-flight
-  // commands that can still apply are writing at higher timestamps.
-  // Non-leaseholder replicas are free to serve "follower reads" at or below
-  // this timestamp.
-  //
-  // TODO(andrei): Make this field not-nullable in 21.2, once all the ranges
-  // have a closed timestamp applied to their state (this might need a
-  // migration). In 21.1 we cannot write empty timestamp to disk because that
-  // looks like an inconsistency to the consistency-checker.
-  util.hlc.Timestamp raft_closed_timestamp = 4;
-}
 
 // MVCCWriteValueOp corresponds to a value being written outside of a
-// transaction.
+// transaction. Inline values (without timestamp) are not logged.
+// Note that 1PC writes are included here.
 message MVCCWriteValueOp {
   bytes key = 1;
   util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
   bytes value = 3;
   bytes prev_value = 4;
+  // When set to true, this value will be filtered out by rangefeeds and will
+  // not be available in changefeeds. OmitInRangefeeds is populated from the
+  // MVCCValueHeader of the corresponding write. It is only relevant for
+  // transactional writes, which in the case of MVCCWriteValueOp are 1PC writes.
+  bool omit_in_rangefeeds = 6;
+
+  // OriginID identifes the original cluster that wrote this key in Logical Data
+  // Replication. 0 identifies a local write, 1 identifies a remote write, and
+  // 2+ are reserved to identify remote clusters.
+  uint32 origin_id = 5  [(gogoproto.customname) = "OriginID"];
 }
 
 // MVCCUpdateIntentOp corresponds to an intent being written for a given
@@ -236,6 +310,7 @@ message MVCCWriteIntentOp {
     (gogoproto.customname) = "TxnID",
     (gogoproto.nullable) = false];
   bytes txn_key = 2;
+  cockroach.kv.kvserver.concurrency.isolation.Level txn_iso_level = 5;
   util.hlc.Timestamp txn_min_timestamp = 4 [(gogoproto.nullable) = false];
   util.hlc.Timestamp timestamp = 3 [(gogoproto.nullable) = false];
 }
@@ -261,6 +336,16 @@ message MVCCCommitIntentOp {
   util.hlc.Timestamp timestamp = 3 [(gogoproto.nullable) = false];
   bytes value = 4;
   bytes prev_value = 5;
+  // When set to true, this value will be filtered out by rangefeeds and will
+  // not be available in changefeeds. OmitInRangefeeds is populated from the
+  // MVCCValueHeader of the corresponding write. It is only relevant for
+  // transactional writes.
+  bool omit_in_rangefeeds = 6;
+  
+  // OriginID identifes the original cluster that wrote this key in Logical Data
+  // Replication. 0 identifies a local write, 1 identifies a remote write, and
+  // 2+ are reserved to identify remote clusters.
+  uint32 origin_id = 7  [(gogoproto.customname) = "OriginID"];
 }
 
 // MVCCAbortIntentOp corresponds to an intent being aborted for a given
@@ -287,6 +372,15 @@ message MVCCAbortTxnOp {
     (gogoproto.nullable) = false];
 }
 
+// MVCCDeleteRangeOp corresponds to a range deletion using an MVCC range
+// tombstone.
+message MVCCDeleteRangeOp {
+  bytes              start_key = 1;
+  bytes              end_key   = 2;
+  util.hlc.Timestamp timestamp = 3 [(gogoproto.nullable) = false];
+}
+
+
 // MVCCLogicalOp is a union of all logical MVCC operation types.
 message MVCCLogicalOp {
   option (gogoproto.onlyone) = true;
@@ -297,4 +391,5 @@ message MVCCLogicalOp {
   MVCCCommitIntentOp commit_intent = 4;
   MVCCAbortIntentOp  abort_intent  = 5;
   MVCCAbortTxnOp     abort_txn     = 6;
+  MVCCDeleteRangeOp  delete_range  = 7;
 }

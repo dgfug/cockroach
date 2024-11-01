@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -202,7 +197,7 @@ func generateRandomDataForTestSort(
 		tups[i] = make(colexectestutils.Tuple, nCols)
 		for j := range tups[i] {
 			// Small range so we can test partitioning
-			if rng.Float64() < nullProbability {
+			if rng.Float64() < 0.1 {
 				tups[i][j] = nil
 			} else {
 				tups[i][j] = rng.Int63() % 2048
@@ -269,7 +264,7 @@ func TestAllSpooler(t *testing.T) {
 			allSpooler.init(context.Background())
 			allSpooler.spool()
 			if len(tc.tuples) != allSpooler.getNumTuples() {
-				t.Fatal(fmt.Sprintf("allSpooler spooled wrong number of tuples: expected %d, but received %d", len(tc.tuples), allSpooler.getNumTuples()))
+				t.Fatalf("allSpooler spooled wrong number of tuples: expected %d, but received %d", len(tc.tuples), allSpooler.getNumTuples())
 			}
 			if allSpooler.getPartitionsCol() != nil {
 				t.Fatal("allSpooler returned non-nil partitionsCol")
@@ -278,8 +273,8 @@ func TestAllSpooler(t *testing.T) {
 				colVec := allSpooler.getValues(col).Int64()
 				for i := 0; i < allSpooler.getNumTuples(); i++ {
 					if colVec[i] != int64(tc.tuples[i][col].(int)) {
-						t.Fatal(fmt.Sprintf("allSpooler returned wrong value in %d column of %d'th tuple : expected %v, but received %v",
-							col, i, tc.tuples[i][col].(int), colVec[i]))
+						t.Fatalf("allSpooler returned wrong value in %d column of %d'th tuple : expected %v, but received %v",
+							col, i, tc.tuples[i][col].(int), colVec[i])
 					}
 				}
 			}
@@ -345,12 +340,12 @@ func BenchmarkSortUUID(b *testing.B) {
 			for _, constAbbrPct := range []int{0, 50, 75, 90, 100} {
 				name := fmt.Sprintf("rows=%d/cols=%d/constAbbrPct=%d", nBatches*coldata.BatchSize(), nCols, constAbbrPct)
 				b.Run(name, func(b *testing.B) {
-					// 8 (bytes / int64) * nBatches (number of batches) * coldata.BatchSize() (rows /
+					// 16 (bytes / int64) * nBatches (number of batches) * coldata.BatchSize() (rows /
 					// batch) * nCols (number of columns / row).
-					b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols))
+					b.SetBytes(int64(16 * nBatches * coldata.BatchSize() * nCols))
 					typs := make([]*types.T, nCols)
 					for i := range typs {
-						typs[i] = types.Bytes
+						typs[i] = types.Uuid
 					}
 					batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 					batch.SetLength(coldata.BatchSize())
@@ -367,17 +362,11 @@ func BenchmarkSortUUID(b *testing.B) {
 						// all abbreviated values are the same, then comparing
 						// them is unnecessary work because we must always fall
 						// back to full comparisons.
-						id, err := uuid.NewV4()
-						if err != nil {
-							b.Fatalf("unexpected error: %s", err)
-						}
+						id := uuid.NewV4()
 						constPrefix := id[:8]
 
 						for j := 0; j < coldata.BatchSize(); j++ {
-							id, err := uuid.NewV4()
-							if err != nil {
-								b.Fatalf("unexpected error: %s", err)
-							}
+							id := uuid.NewV4()
 							idBytes := id[:16]
 							// Make the abbreviated bytes constant constAbbrPct% of
 							// the time.

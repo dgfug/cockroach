@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -19,8 +14,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -29,11 +24,10 @@ import (
 
 func TestSavepoints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 70220, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, "testdata/savepoints", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "savepoints"), func(t *testing.T, path string) {
 
 		params := base.TestServerArgs{}
 		s, origConn, _ := serverutils.StartServer(t, params)
@@ -65,8 +59,7 @@ func TestSavepoints(t *testing.T) {
 					var ok bool
 					sqlConn, ok = sqlConns[connName]
 					if !ok {
-						sqlConn = serverutils.OpenDBConn(
-							t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+						sqlConn = s.ApplicationLayer().SQLConn(t, serverutils.DBName(params.UseDatabase))
 						sqlConns[connName] = sqlConn
 					}
 				}

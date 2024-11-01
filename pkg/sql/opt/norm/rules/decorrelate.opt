@@ -66,6 +66,67 @@
     (EmptyJoinPrivate)
 )
 
+# TryRemapJoinOuterColsRight attempts to replace outer column references in the
+# right input of a join with equivalent non-outer columns using the ON filters.
+# It is valid to do this whenever it is possible to push the equality filter(s)
+# down the tree until it holds true for the outer-column reference. Using the
+# following query as an example:
+#
+#   SELECT * FROM xy INNER JOIN LATERAL (SELECT * FROM ab WHERE a = x) ON b = x
+#
+# It is possible to push the 'b = x' filter down into the correlated right input
+# of the join, which would allow replacing the 'a = x' filter with 'a = b', thus
+# decorrelating the join. The match condition is similar to that for
+# PushFilterIntoJoinRight because TryRemapJoinOuterColsRight simulates filter
+# push-down when it makes the replacement.
+#
+# It is desirable to attempt to fire TryRemapJoinOuterColsRight before other
+# decorrelation rules because it does not perform any transformations beyond the
+# variable replacement. This prevents situations where decorrelation rules make
+# the plan worse in their attempts to decorrelate the query. For example,
+# decorrelation can pull filters up the operator tree or hoist subqueries into
+# joins. This can cause plan changes which are difficult for the optimizer to
+# reverse, and it won't even attempt to do so if the query isn't successfully
+# decorrelated.
+[TryRemapJoinOuterColsRight, Normalize]
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | SemiJoin
+        | SemiJoinApply | AntiJoin | AntiJoinApply
+    $left:*
+    $right:* & (HasOuterCols $right)
+    $on:* &
+        (CanMaybeRemapOuterCols $right $on) &
+        (Let ($remapped $ok):(TryRemapOuterCols $right $on) $ok)
+    $private:*
+)
+=>
+((OpName) $left $remapped $on $private)
+
+# TryRemapJoinOuterColsLeft is similar to TryRemapJoinOuterColsRight, but it
+# applies to the left input of a join.
+[TryRemapJoinOuterColsLeft, Normalize]
+(InnerJoin | InnerJoinApply | SemiJoin | SemiJoinApply
+    $left:* & (HasOuterCols $left)
+    $right:*
+    $on:* &
+        (CanMaybeRemapOuterCols $left $on) &
+        (Let ($remapped $ok):(TryRemapOuterCols $left $on) $ok)
+    $private:*
+)
+=>
+((OpName) $remapped $right $on $private)
+
+# TryRemapSelectOuterCols is similar to TryRemapJoinOuterColsRight, but it
+# applies to the input of a Select.
+[TryRemapSelectOuterCols, Normalize]
+(Select
+    $input:* & (HasOuterCols $input)
+    $on:* &
+        (CanMaybeRemapOuterCols $input $on) &
+        (Let ($remapped $ok):(TryRemapOuterCols $input $on) $ok)
+)
+=>
+(Select $remapped $on)
+
 # TryDecorrelateSelect "pushes down" the join apply into the select operator,
 # in order to eliminate any correlation between the select filter list and the
 # left side of the join, and also to keep "digging" down to find and eliminate
@@ -345,6 +406,70 @@
     (OutputCols2 $left $right)
 )
 
+# TryDecorrelateUnion replaces a Union/UnionAll beneath a ScalarGroupBy with a
+# cross-join (InnerJoin on True) between two ScalarGroupBy operators. A Project
+# operator coalesces columns from each join input to produce the final result.
+# This transformation applies when the ScalarGroupBy has only "any-not-null"
+# aggregations, which select an arbitrary non-null value from the input column.
+#
+# Here's a simplified example:
+#
+#   scalar-group-by
+#    ├── union-all
+#    │    ├── scan foo
+#    │    └── scan bar (has-outer-cols)
+#    └── aggregations
+#         └── any-not-null
+#   =>
+#   project
+#    ├── inner-join (cross)
+#    │    ├── scalar-group-by
+#    │    │    └── scan foo
+#    │    ├── scalar-group-by
+#    │    │    └── scan bar
+#    │    └── filters (true)
+#    └── projections
+#         └── coalesce
+#
+# This situation occurs after a correlated EXISTS subquery containing a Union is
+# hoisted. Note that TryDecorrelateUnion does not itself decorrelate the Union,
+# but makes it easier for other rules to do so.
+#
+# NOTE: the outer Project operator is necessary just in case the ScalarGroupBy
+# is synthesizing new columns, despite using any-not-null aggregations.
+# NOTE: TryDecorrelateUnion should be ordered before TryDecorrelateScalarGroupBy
+# to ensure that Union operators have a chance to be decorrelated.
+#
+# TODO(drewk): We could extend this rule to apply to other aggregations; for
+# example, for a count() we can sum the counts taken on each side of the join.
+# TODO(drewk): We could extend this rule to handle other set operations. For
+# example, ExceptAll could become an AntiJoin.
+[TryDecorrelateUnion, Normalize]
+(ScalarGroupBy
+    $input:(Union | UnionAll $left:* $right:* $unionPrivate:*) &
+        (HasOuterCols $input)
+    $aggs:* & (AreAllAnyNotNullAggs $aggs)
+    $private:*
+)
+=>
+(Project
+    (Project
+        (InnerJoin
+            (MakeAnyNotNullScalarGroupBy $left)
+            (MakeAnyNotNullScalarGroupBy $right)
+            []
+            (EmptyJoinPrivate)
+        )
+        (MakeCoalesceProjectionsForUnion $unionPrivate)
+        (MakeEmptyColSet)
+    )
+    (ConvertAnyNotNullAggsToProjections $aggs)
+    (IntersectionCols
+        (GroupingOutputCols $private $aggs)
+        (OutputCols $input)
+    )
+)
+
 # TryDecorrelateScalarGroupBy "pushes down" a Join into a ScalarGroupBy
 # operator, in an attempt to keep "digging" down to find and eliminate
 # unnecessary correlation. The eventual hope is to trigger the DecorrelateJoin
@@ -587,21 +712,27 @@
     $private:*
 )
 =>
-(Select
-    ((OpName)
-        $left
-        (Window
-            $input
-            (Let
-                ($rowNum $rowNumCol):(MakeRowNumberWindowFunc)
-                $rowNum
+(Project
+    # Needed to project away the rowNum column.
+    (Select
+        ((OpName)
+            $left
+            (Window
+                $input
+                (Let
+                    ($rowNum $rowNumCol):(MakeRowNumberWindowFunc
+                    )
+                    $rowNum
+                )
+                (MakeWindowPrivate (MakeEmptyColSet) $ordering)
             )
-            (MakeWindowPrivate (MakeEmptyColSet) $ordering)
+            $on
+            $private
         )
-        $on
-        $private
+        (LimitToRowNumberFilter $limit $rowNumCol)
     )
-    (LimitToRowNumberFilter $limit $rowNumCol)
+    []
+    (OutputCols2 $left $right)
 )
 
 # TryDecorrelateProjectSet "pushes down" an InnerJoinApply operator into a
@@ -947,7 +1078,7 @@
                     )
                 ]
             )
-            $anyPrivate
+            (ConvertSubToExistsPrivate $anyPrivate)
         )
     )
 )
@@ -987,7 +1118,7 @@
                     )
                 ]
             )
-            $anyPrivate
+            (ConvertSubToExistsPrivate $anyPrivate)
         )
     )
     $private
@@ -1036,7 +1167,7 @@
                         )
                     ]
                 )
-                $anyPrivate
+                (ConvertSubToExistsPrivate $anyPrivate)
             )
         )
     )
@@ -1082,7 +1213,7 @@
                         )
                     ]
                 )
-                $anyPrivate
+                (ConvertSubToExistsPrivate $anyPrivate)
             )
         )
     )

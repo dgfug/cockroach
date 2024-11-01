@@ -1,18 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"context"
-	"database/sql/driver"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,13 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/cloud/userfile"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -94,7 +89,8 @@ atomic, and all deletions prior to the first failure will occur.
 }
 
 func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -103,7 +99,7 @@ func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
 	glob := args[0]
 
 	var deletedFiles []string
-	if deletedFiles, err = deleteUserFile(context.Background(), conn, glob); err != nil {
+	if deletedFiles, err = deleteUserFile(ctx, conn, glob); err != nil {
 		return err
 	}
 
@@ -116,7 +112,8 @@ func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
 }
 
 func runUserFileList(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -128,7 +125,7 @@ func runUserFileList(cmd *cobra.Command, args []string) (resErr error) {
 	}
 
 	var files []string
-	if files, err = listUserFile(context.Background(), conn, glob); err != nil {
+	if files, err = listUserFile(ctx, conn, glob); err != nil {
 		return err
 	}
 
@@ -187,7 +184,8 @@ func uploadUserFileRecursive(conn clisqlclient.Conn, srcDir, dstDir string) erro
 }
 
 func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -205,7 +203,7 @@ func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
 			return err
 		}
 	} else {
-		uploadedFile, err := uploadUserFile(context.Background(), conn, source,
+		uploadedFile, err := uploadUserFile(ctx, conn, source,
 			destination)
 		if err != nil {
 			return err
@@ -218,12 +216,13 @@ func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
 }
 
 func runUserFileGet(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
-	ctx := context.Background()
 
 	var dest string
 	if len(args) > 1 {
@@ -240,7 +239,7 @@ func runUserFileGet(cmd *cobra.Command, args []string) (resErr error) {
 	pattern := fullPath[len(conf.Path):]
 	displayPath := strings.TrimPrefix(conf.Path, "/")
 
-	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.GetDriverConn().(cloud.SQLConnI))
+	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.GetDriverConn())
 	if err != nil {
 		return err
 	}
@@ -325,7 +324,7 @@ func openUserFile(source string) (io.ReadCloser, error) {
 // This schema gives us the two properties we desire from this table name prefix:
 // - Uniqueness amongst users with different usernames.
 // - Support for all current and future valid usernames.
-func getDefaultQualifiedTableName(user security.SQLUsername) string {
+func getDefaultQualifiedTableName(user username.SQLUsername) string {
 	normalizedUsername := user.Normalized()
 	if lexbase.IsBareIdentifier(normalizedUsername) {
 		return defaultQualifiedNamePrefix + normalizedUsername
@@ -334,7 +333,7 @@ func getDefaultQualifiedTableName(user security.SQLUsername) string {
 }
 
 // Construct the userfile ExternalStorage URI from CLI args.
-func constructUserfileDestinationURI(source, destination string, user security.SQLUsername) string {
+func constructUserfileDestinationURI(source, destination string, user username.SQLUsername) string {
 	// User has not specified a destination URI/path. We use the default URI
 	// scheme and host, and the basename from the source arg as the path.
 	if destination == "" {
@@ -374,7 +373,7 @@ func constructUserfileDestinationURI(source, destination string, user security.S
 	return userFileURL.String()
 }
 
-func constructUserfileListURI(glob string, user security.SQLUsername) string {
+func constructUserfileListURI(glob string, user username.SQLUsername) string {
 	// If the destination is a well-formed userfile URI of the form
 	// userfile://db.schema.tablename_prefix/glob/pattern, then we
 	// use that as the final URI.
@@ -397,27 +396,27 @@ func constructUserfileListURI(glob string, user security.SQLUsername) string {
 
 func getUserfileConf(
 	ctx context.Context, conn clisqlclient.Conn, glob string,
-) (roachpb.ExternalStorage_FileTable, error) {
-	if err := conn.EnsureConn(); err != nil {
-		return roachpb.ExternalStorage_FileTable{}, err
+) (cloudpb.ExternalStorage_FileTable, error) {
+	if err := conn.EnsureConn(ctx); err != nil {
+		return cloudpb.ExternalStorage_FileTable{}, err
 	}
 
 	connURL, err := url.Parse(conn.GetURL())
 	if err != nil {
-		return roachpb.ExternalStorage_FileTable{}, err
+		return cloudpb.ExternalStorage_FileTable{}, err
 	}
 
-	reqUsername, _ := security.MakeSQLUsernameFromUserInput(connURL.User.Username(), security.UsernameValidation)
+	reqUsername, _ := username.MakeSQLUsernameFromUserInput(connURL.User.Username(), username.PurposeValidation)
 
 	userfileListURI := constructUserfileListURI(glob, reqUsername)
 	unescapedUserfileListURI, err := url.PathUnescape(userfileListURI)
 	if err != nil {
-		return roachpb.ExternalStorage_FileTable{}, err
+		return cloudpb.ExternalStorage_FileTable{}, err
 	}
 
 	userFileTableConf, err := cloud.ExternalStorageConfFromURI(unescapedUserfileListURI, reqUsername)
 	if err != nil {
-		return roachpb.ExternalStorage_FileTable{}, err
+		return cloudpb.ExternalStorage_FileTable{}, err
 	}
 	return userFileTableConf.FileTableConfig, nil
 
@@ -433,7 +432,7 @@ func listUserFile(ctx context.Context, conn clisqlclient.Conn, glob string) ([]s
 	conf.Path = cloud.GetPrefixBeforeWildcard(fullPath)
 	pattern := fullPath[len(conf.Path):]
 
-	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.GetDriverConn().(cloud.SQLConnI))
+	f, err := userfile.MakeSQLConnFileTableStorage(ctx, conf, conn.GetDriverConn())
 	if err != nil {
 		return nil, err
 	}
@@ -459,11 +458,11 @@ func listUserFile(ctx context.Context, conn clisqlclient.Conn, glob string) ([]s
 func downloadUserfile(
 	ctx context.Context, store cloud.ExternalStorage, src, dst string,
 ) (int64, error) {
-	remoteFile, err := store.ReadFile(ctx, src)
+	remoteFile, _, err := store.ReadFile(ctx, src, cloud.ReadOptions{NoFileSize: true})
 	if err != nil {
 		return 0, err
 	}
-	defer remoteFile.Close()
+	defer remoteFile.Close(ctx)
 
 	localDir := path.Dir(dst)
 	if err := os.MkdirAll(localDir, 0700); err != nil {
@@ -477,11 +476,11 @@ func downloadUserfile(
 	}
 	defer localFile.Close()
 
-	return io.Copy(localFile, remoteFile)
+	return io.Copy(localFile, ioctx.ReaderCtxAdapter(ctx, remoteFile))
 }
 
 func deleteUserFile(ctx context.Context, conn clisqlclient.Conn, glob string) ([]string, error) {
-	if err := conn.EnsureConn(); err != nil {
+	if err := conn.EnsureConn(ctx); err != nil {
 		return nil, err
 	}
 
@@ -490,7 +489,7 @@ func deleteUserFile(ctx context.Context, conn clisqlclient.Conn, glob string) ([
 		return nil, err
 	}
 
-	reqUsername, _ := security.MakeSQLUsernameFromUserInput(connURL.User.Username(), security.UsernameValidation)
+	reqUsername, _ := username.MakeSQLUsernameFromUserInput(connURL.User.Username(), username.PurposeValidation)
 
 	userfileListURI := constructUserfileListURI(glob, reqUsername)
 	unescapedUserfileListURI, err := url.PathUnescape(userfileListURI)
@@ -510,8 +509,7 @@ func deleteUserFile(ctx context.Context, conn clisqlclient.Conn, glob string) ([
 	userFileTableConf.FileTableConfig.Path = cloud.GetPrefixBeforeWildcard(fullPath)
 	pattern := fullPath[len(userFileTableConf.FileTableConfig.Path):]
 
-	f, err := userfile.MakeSQLConnFileTableStorage(ctx, userFileTableConf.FileTableConfig,
-		conn.GetDriverConn().(cloud.SQLConnI))
+	f, err := userfile.MakeSQLConnFileTableStorage(ctx, userFileTableConf.FileTableConfig, conn.GetDriverConn())
 	if err != nil {
 		return nil, err
 	}
@@ -542,39 +540,16 @@ func renameUserFile(
 	ctx context.Context, conn clisqlclient.Conn, oldFilename,
 	newFilename, qualifiedTableName string,
 ) error {
-	if err := conn.EnsureConn(); err != nil {
+	if err := conn.EnsureConn(ctx); err != nil {
 		return err
 	}
-
 	ex := conn.GetDriverConn()
-	if _, err := ex.ExecContext(ctx, `BEGIN`, nil); err != nil {
-		return err
-	}
 
-	stmt, err := conn.GetDriverConn().Prepare(fmt.Sprintf(`UPDATE %s SET filename=$1 WHERE filename=$2`,
-		qualifiedTableName+fileTableNameSuffix))
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		if stmt != nil {
-			_ = stmt.Close()
-			_, _ = ex.ExecContext(ctx, `ROLLBACK`, nil)
-		}
-	}()
-
-	_, err = stmt.Exec([]driver.Value{newFilename, oldFilename})
-	if err != nil {
-		return err
-	}
-
-	if err := stmt.Close(); err != nil {
-		return err
-	}
-	stmt = nil
-
-	if _, err := ex.ExecContext(ctx, `COMMIT`, nil); err != nil {
+	if err := ex.Exec(
+		ctx,
+		fmt.Sprintf(`UPDATE %s SET filename=$1 WHERE filename=$2`, qualifiedTableName+fileTableNameSuffix),
+		newFilename, oldFilename,
+	); err != nil {
 		return err
 	}
 
@@ -594,14 +569,11 @@ func uploadUserFile(
 	}
 	defer reader.Close()
 
-	if err := conn.EnsureConn(); err != nil {
+	if err := conn.EnsureConn(ctx); err != nil {
 		return "", err
 	}
 
 	ex := conn.GetDriverConn()
-	if _, err := ex.ExecContext(ctx, `BEGIN`, nil); err != nil {
-		return "", err
-	}
 
 	connURL, err := url.Parse(conn.GetURL())
 	if err != nil {
@@ -613,7 +585,7 @@ func uploadUserFile(
 	// is the same one on the remote machine, and it may contain special
 	// characters.
 	// See also: https://github.com/cockroachdb/cockroach/issues/55389
-	username, err := security.MakeSQLUsernameFromUserInput(connURL.User.Username(), security.UsernameCreation)
+	username, err := username.MakeSQLUsernameFromUserInput(connURL.User.Username(), username.PurposeCreation)
 	if err != nil {
 		return "", err
 	}
@@ -633,41 +605,9 @@ func uploadUserFile(
 	if err != nil {
 		return "", err
 	}
-	stmt, err := conn.GetDriverConn().Prepare(sql.CopyInFileStmt(unescapedUserfileURL, sql.CrdbInternalName,
-		sql.UserFileUploadTable))
-	if err != nil {
-		return "", err
-	}
+	stmt := sql.CopyInFileStmt(unescapedUserfileURL, sql.CrdbInternalName, sql.UserFileUploadTable)
 
-	defer func() {
-		if stmt != nil {
-			_ = stmt.Close()
-			_, _ = ex.ExecContext(ctx, `ROLLBACK`, nil)
-		}
-	}()
-
-	send := make([]byte, chunkSize)
-	for {
-		n, err := reader.Read(send)
-		if n > 0 {
-			// TODO(adityamaru): Switch to StmtExecContext once the copyin driver
-			// supports it.
-			_, err = stmt.Exec([]driver.Value{string(send[:n])})
-			if err != nil {
-				return "", err
-			}
-		} else if err == io.EOF {
-			break
-		} else if err != nil {
-			return "", err
-		}
-	}
-	if err := stmt.Close(); err != nil {
-		return "", err
-	}
-	stmt = nil
-
-	if _, err := ex.ExecContext(ctx, `COMMIT`, nil); err != nil {
+	if _, err := ex.CopyFrom(ctx, &escapingReader{r: reader}, stmt); err != nil {
 		return "", err
 	}
 

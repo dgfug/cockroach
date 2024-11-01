@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Functions used for testing metrics.
 
@@ -20,8 +15,8 @@ import (
 )
 
 // initializeQueryCounter returns a queryCounter that accounts for system
-// migrations that may have run DDL statements.
-func initializeQueryCounter(s serverutils.TestServerInterface) queryCounter {
+// upgrades that may have run DDL statements.
+func initializeQueryCounter(s serverutils.ApplicationLayerInterface) queryCounter {
 	return queryCounter{
 		txnBeginCount:                   s.MustGetSQLCounter(sql.MetaTxnBeginStarted.Name),
 		selectCount:                     s.MustGetSQLCounter(sql.MetaSelectStarted.Name),
@@ -44,7 +39,7 @@ func initializeQueryCounter(s serverutils.TestServerInterface) queryCounter {
 }
 
 func checkCounterDelta(
-	s serverutils.TestServerInterface, meta metric.Metadata, init, delta int64,
+	s serverutils.ApplicationLayerInterface, meta metric.Metadata, init, delta int64,
 ) (int64, error) {
 	actual := s.MustGetSQLCounter(meta.Name)
 	if actual != (init + delta) {
@@ -54,7 +49,7 @@ func checkCounterDelta(
 	return actual, nil
 }
 
-func checkCounterGE(s serverutils.TestServerInterface, meta metric.Metadata, e int64) error {
+func checkCounterGE(s serverutils.ApplicationLayerInterface, meta metric.Metadata, e int64) error {
 	if a := s.MustGetSQLCounter(meta.Name); a < e {
 		return errors.Errorf("stat %s: expected: actual %d >= %d",
 			meta.Name, a, e)

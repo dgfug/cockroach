@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
@@ -101,7 +96,11 @@ func (g *SpanGroup) Slice() []Span {
 	if rg == nil {
 		return nil
 	}
-	ret := make([]Span, 0, rg.Len())
+	n := rg.Len()
+	if n == 0 {
+		return nil
+	}
+	ret := make([]Span, 0, n)
 	it := rg.Iterator()
 	for {
 		rng, next := it.Next()
@@ -111,6 +110,13 @@ func (g *SpanGroup) Slice() []Span {
 		ret = append(ret, r2s(rng))
 	}
 	return ret
+}
+
+// ForEach calls the provided function for each span stored in the group.
+func (g *SpanGroup) ForEach(op func(span Span) error) error {
+	return g.rg.ForEach(func(r interval.Range) error {
+		return op(r2s(r))
+	})
 }
 
 // s2r converts a Span to an interval.Range.  Since the Key and

@@ -1,32 +1,43 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 type stmtDiagnosticsRequest struct {
-	ID                     int
-	StatementFingerprint   string
+	ID                   int
+	StatementFingerprint string
+	// Empty plan gist indicates that any plan will do.
+	PlanGist string
+	// If true and PlanGist is not empty, then any plan not matching the gist
+	// will do.
+	AntiPlanGist           bool
 	Completed              bool
 	StatementDiagnosticsID int
 	RequestedAt            time.Time
+	// Zero value indicates that we're sampling every execution.
+	SamplingProbability float64
+	// Zero value indicates that there is no minimum latency set on the request.
+	MinExecutionLatency time.Duration
+	// Zero value indicates that the request never expires.
+	ExpiresAt time.Time
+	// Indicates whether redacted bundle is requested.
+	Redacted bool
 }
 
 type stmtDiagnostics struct {
@@ -42,6 +53,8 @@ func (request *stmtDiagnosticsRequest) toProto() serverpb.StatementDiagnosticsRe
 		StatementFingerprint:   request.StatementFingerprint,
 		StatementDiagnosticsId: int64(request.StatementDiagnosticsID),
 		RequestedAt:            request.RequestedAt,
+		MinExecutionLatency:    request.MinExecutionLatency,
+		ExpiresAt:              request.ExpiresAt,
 	}
 	return resp
 }
@@ -55,16 +68,16 @@ func (diagnostics *stmtDiagnostics) toProto() serverpb.StatementDiagnostics {
 	return resp
 }
 
-// CreateStatementDiagnosticsRequest creates a statement diagnostics
+// CreateStatementDiagnosticsReport creates a statement diagnostics
 // request in the `system.statement_diagnostics_requests` table
 // to trace the next query matching the provided fingerprint.
 func (s *statusServer) CreateStatementDiagnosticsReport(
 	ctx context.Context, req *serverpb.CreateStatementDiagnosticsReportRequest,
 ) (*serverpb.CreateStatementDiagnosticsReportResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -72,7 +85,16 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 		Report: &serverpb.StatementDiagnosticsReport{},
 	}
 
-	err := s.stmtDiagnosticsRequester.InsertRequest(ctx, req.StatementFingerprint)
+	err := s.stmtDiagnosticsRequester.InsertRequest(
+		ctx,
+		req.StatementFingerprint,
+		req.PlanGist,
+		req.AntiPlanGist,
+		req.SamplingProbability,
+		req.MinExecutionLatency,
+		req.ExpiresAfter,
+		req.Redacted,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -81,33 +103,64 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 	return response, nil
 }
 
-// StatementDiagnosticsRequests retrieves all of the statement
-// diagnostics requests in the `system.statement_diagnostics_requests` table.
-func (s *statusServer) StatementDiagnosticsRequests(
-	ctx context.Context, req *serverpb.StatementDiagnosticsReportsRequest,
-) (*serverpb.StatementDiagnosticsReportsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+// CancelStatementDiagnosticsReport cancels the statement diagnostics request by
+// updating the corresponding row from the system.statement_diagnostics_requests
+// table to be expired.
+func (s *statusServer) CancelStatementDiagnosticsReport(
+	ctx context.Context, req *serverpb.CancelStatementDiagnosticsReportRequest,
+) (*serverpb.CancelStatementDiagnosticsReportResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	var err error
+	var response serverpb.CancelStatementDiagnosticsReportResponse
+	err := s.stmtDiagnosticsRequester.CancelRequest(ctx, req.RequestID)
+	if err != nil {
+		response.Canceled = false
+		response.Error = err.Error()
+	} else {
+		response.Canceled = true
+	}
+	return &response, nil
+}
 
+// StatementDiagnosticsRequests retrieves all statement diagnostics
+// requests in the `system.statement_diagnostics_requests` table that
+// have either completed or have not yet expired.
+func (s *statusServer) StatementDiagnosticsRequests(
+	ctx context.Context, _ *serverpb.StatementDiagnosticsReportsRequest,
+) (*serverpb.StatementDiagnosticsReportsResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	var extraColumns string
+	if s.st.Version.IsActive(ctx, clusterversion.V24_2_StmtDiagRedacted) {
+		extraColumns = `,
+			redacted`
+	}
 	// TODO(davidh): Add pagination to this request.
 	it, err := s.internalExecutor.QueryIteratorEx(ctx, "stmt-diag-get-all", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
-		},
-		`SELECT
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf(`SELECT
 			id,
 			statement_fingerprint,
 			completed,
 			statement_diagnostics_id,
-			requested_at
+			requested_at,
+			min_execution_latency,
+			expires_at,
+			sampling_probability,
+			plan_gist,
+			anti_plan_gist%s
 		FROM
-			system.statement_diagnostics_requests`)
+			system.statement_diagnostics_requests`, extraColumns))
 	if err != nil {
 		return nil, err
 	}
@@ -124,14 +177,36 @@ func (s *statusServer) StatementDiagnosticsRequests(
 			StatementFingerprint: statementFingerprint,
 			Completed:            completed,
 		}
-
 		if row[3] != tree.DNull {
 			sdi := int(*row[3].(*tree.DInt))
 			req.StatementDiagnosticsID = sdi
 		}
-
 		if requestedAt, ok := row[4].(*tree.DTimestampTZ); ok {
 			req.RequestedAt = requestedAt.Time
+		}
+		if samplingProbability, ok := row[7].(*tree.DFloat); ok {
+			req.SamplingProbability = float64(*samplingProbability)
+		}
+		if minExecutionLatency, ok := row[5].(*tree.DInterval); ok {
+			req.MinExecutionLatency = time.Duration(minExecutionLatency.Duration.Nanos())
+		}
+		if expiresAt, ok := row[6].(*tree.DTimestampTZ); ok {
+			req.ExpiresAt = expiresAt.Time
+			// Don't return already expired requests.
+			if !completed && req.ExpiresAt.Before(timeutil.Now()) {
+				continue
+			}
+		}
+		if planGist, ok := row[8].(*tree.DString); ok {
+			req.PlanGist = string(*planGist)
+		}
+		if antiGist, ok := row[9].(*tree.DBool); ok {
+			req.AntiPlanGist = bool(*antiGist)
+		}
+		if extraColumns != "" {
+			if redacted, ok := row[10].(*tree.DBool); ok {
+				req.Redacted = bool(*redacted)
+			}
 		}
 
 		requests = append(requests, req)
@@ -160,18 +235,16 @@ func (s *statusServer) StatementDiagnosticsRequests(
 func (s *statusServer) StatementDiagnostics(
 	ctx context.Context, req *serverpb.StatementDiagnosticsRequest,
 ) (*serverpb.StatementDiagnosticsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
 	var err error
 	row, err := s.internalExecutor.QueryRowEx(ctx, "stmt-diag-get-one", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
-		},
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT
 			id,
 			statement_fingerprint,

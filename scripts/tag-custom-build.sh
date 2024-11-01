@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2020 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 # This script makes it easy to make custom builds.
 #
 # It creates a tag for a SHA that triggers a build in the Make and Publish
@@ -50,7 +56,7 @@ git tag "$TAG" "$SHA"
 git push git@github.com:cockroachdb/cockroach.git "$TAG"
 
 TAG_URL="https://github.com/cockroachdb/cockroach/releases/tag/${TAG}"
-TEAMCITY_URL="https://teamcity.cockroachdb.com/buildConfiguration/Internal_Release_MakeAndPublishBuild?branch=${TAG}&mode=builds"
+TEAMCITY_URL="https://teamcity.cockroachdb.com/buildConfiguration/Internal_Cockroach_Release_Customized_MakeAndPublishCustomizedBuild?mode=builds&branch=${TAG}"
 if [ "$(command -v open)" ] ; then
     open "$TEAMCITY_URL"
     open "$TAG_URL"
@@ -75,4 +81,16 @@ Here is where the build run should show up in TeamCity for the tag:
 
 Tag name: $TAG
 Build ID: $ID
+
+The binaries will be available at:
+  https://storage.googleapis.com/cockroach-customized-builds-artifacts-prod/cockroach-$ID.linux-amd64.tgz
+  https://storage.googleapis.com/cockroach-customized-builds-artifacts-prod/cockroach-$ID.linux-amd64-fips.tgz
+  https://storage.googleapis.com/cockroach-customized-builds-artifacts-prod/cockroach-$ID.linux-arm64.tgz
+  https://storage.googleapis.com/cockroach-customized-builds-artifacts-prod/cockroach-$ID.darwin-10.9-amd64.tgz
+  https://storage.googleapis.com/cockroach-customized-builds-artifacts-prod/cockroach-$ID.windows-6.2-amd64.zip
+
+Pull the docker image by:
+  docker pull us-docker.pkg.dev/cockroach-cloud-images/cockroachdb-customized/cockroach-customized:$ID
+  docker pull us-docker.pkg.dev/cockroach-cloud-images/cockroachdb-customized/cockroach-customized:$ID-fips
+
 EOF

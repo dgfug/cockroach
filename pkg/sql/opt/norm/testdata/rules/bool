@@ -424,6 +424,22 @@ select
       ├── NOT (j:5 ?& ARRAY['foo']) [outer=(5), immutable]
       └── NOT (ARRAY[i:2] && ARRAY[1]) [outer=(2), immutable]
 
+# Regression test for #84476 - don't panic when encountering a negated
+# geospatial comparison operator.
+norm expect-not=NegateComparison
+SELECT
+	NULL, t.g
+FROM
+	(VALUES (NULL::GEOMETRY)) AS t (g)
+WHERE
+	(NOT (t.g ~ t.g));
+----
+values
+ ├── columns: "?column?":2!null g:1!null
+ ├── cardinality: [0 - 0]
+ ├── key: ()
+ └── fd: ()-->(1,2)
+
 # --------------------------------------------------
 # EliminateNot
 # --------------------------------------------------

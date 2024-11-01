@@ -1,26 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnSchemaNode struct {
@@ -30,7 +24,8 @@ type commentOnSchemaNode struct {
 
 // CommentOnSchema add comment on a schema.
 // Privileges: CREATE on scheme.
-//   notes: postgres requires CREATE on the scheme.
+//
+//	notes: postgres requires CREATE on the scheme.
 func (p *planner) CommentOnSchema(ctx context.Context, n *tree.CommentOnSchema) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -40,21 +35,23 @@ func (p *planner) CommentOnSchema(ctx context.Context, n *tree.CommentOnSchema) 
 		return nil, err
 	}
 
-	// Users can't create a schema without being connected to a DB.
-	dbName := p.CurrentDatabase()
+	var dbName string
+	if n.Name.ExplicitCatalog {
+		dbName = n.Name.Catalog()
+	} else {
+		dbName = p.CurrentDatabase()
+	}
 	if dbName == "" {
 		return nil, pgerror.New(pgcode.UndefinedDatabase,
 			"cannot comment schema without being connected to a database")
 	}
 
-	db, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-		dbName, tree.DatabaseLookupFlags{Required: true})
+	db, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, dbName)
 	if err != nil {
 		return nil, err
 	}
 
-	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.txn,
-		db.GetSchemaID(string(n.Name)), tree.DatabaseLookupFlags{Required: true})
+	schemaDesc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, db.GetSchemaID(n.Name.Schema()))
 	if err != nil {
 		return nil, err
 	}
@@ -63,31 +60,40 @@ func (p *planner) CommentOnSchema(ctx context.Context, n *tree.CommentOnSchema) 
 		return nil, err
 	}
 
-	return &commentOnSchemaNode{n: n, schemaDesc: schemaDesc}, nil
+	return &commentOnSchemaNode{
+		n:          n,
+		schemaDesc: schemaDesc,
+	}, nil
 }
 
 func (n *commentOnSchemaNode) startExec(params runParams) error {
-	if n.n.Comment != nil {
-		_, err := params.p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			"set-schema-comment",
-			params.p.Txn(),
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
-			keys.SchemaCommentType,
-			n.schemaDesc.GetID(),
-			*n.n.Comment)
-		if err != nil {
-			return err
-		}
+	var err error
+	if n.n.Comment == nil {
+		err = params.p.deleteComment(
+			params.ctx, n.schemaDesc.GetID(), 0 /* subID */, catalogkeys.SchemaCommentType,
+		)
 	} else {
-		err := params.p.removeSchemaComment(params.ctx, n.schemaDesc.GetID())
-		if err != nil {
-			return err
-		}
+		err = params.p.updateComment(
+			params.ctx, n.schemaDesc.GetID(), 0 /* subID */, catalogkeys.SchemaCommentType, *n.n.Comment,
+		)
+	}
+	if err != nil {
+		return err
 	}
 
-	return nil
+	scComment := ""
+	if n.n.Comment != nil {
+		scComment = *n.n.Comment
+	}
+
+	return params.p.logEvent(
+		params.ctx,
+		n.schemaDesc.GetID(),
+		&eventpb.CommentOnSchema{
+			SchemaName:  n.n.Name.String(),
+			Comment:     scComment,
+			NullComment: n.n.Comment == nil,
+		})
 }
 
 func (n *commentOnSchemaNode) Next(runParams) (bool, error) { return false, nil }

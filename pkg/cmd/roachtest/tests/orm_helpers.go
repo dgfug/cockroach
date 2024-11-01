@@ -1,24 +1,36 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 )
+
+var issueRegexp = regexp.MustCompile(`See: https://[^\s]+issue-v/(\d+)/[^\s]+`)
+
+type status int
+
+const (
+	statusPass status = iota
+	statusFail
+	statusSkip
+)
+
+// This `startOpts` option configures in-memory databases to use a
+// fixed (30%) amount of memory and is used in a variety of client
+// library tests.
+var sqlClientsInMemoryDB = option.InMemoryDB(0.3)
 
 // alterZoneConfigAndClusterSettings changes the zone configurations so that GC
 // occurs more quickly and jobs are retained for less time. This is useful for
@@ -26,92 +38,49 @@ import (
 // cause thousands of table descriptors and schema change jobs to accumulate
 // rapidly, thereby decreasing performance.
 func alterZoneConfigAndClusterSettings(
-	ctx context.Context, version string, c cluster.Cluster, nodeIdx int,
+	ctx context.Context, t test.Test, version string, c cluster.Cluster, nodeIdx int,
 ) error {
-	db, err := c.ConnE(ctx, nodeIdx)
+	db, err := c.ConnE(ctx, t.L(), nodeIdx)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
+	createUserStmt := `CREATE USER test_admin`
+	if c.IsSecure() {
+		createUserStmt = `CREATE USER test_admin WITH PASSWORD 'testpw'`
 	}
 
-	if _, err := db.ExecContext(
-		ctx, `ALTER DATABASE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
-	}
+	for _, cmd := range []string{
+		createUserStmt,
+		`GRANT admin TO test_admin`,
+		`ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
+		`ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
+		`ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
+		`ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
+		`ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
 
-	if _, err := db.ExecContext(
-		ctx, `ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
-	}
+		`SET CLUSTER SETTING kv.range_merge.queue_interval = '50ms'`,
+		`SET CLUSTER SETTING jobs.registry.interval.cancel = '180s';`,
+		`SET CLUSTER SETTING jobs.registry.interval.gc = '30s';`,
+		`SET CLUSTER SETTING jobs.retention_time = '15s';`,
+		`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;`,
+		`SET CLUSTER SETTING kv.range_split.by_load_merge_delay = '5s';`,
 
-	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
-	}
+		// Test with SCRAM password authentication.
+		`SET CLUSTER SETTING server.user_login.password_encryption = 'scram-sha-256';`,
 
-	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
-	}
-
-	if _, err := db.ExecContext(
-		ctx, `ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 60;`,
-	); err != nil {
-		return err
-	}
-
-	if _, err := db.ExecContext(
-		ctx, `SET CLUSTER SETTING jobs.retention_time = '180s';`,
-	); err != nil {
-		return err
-	}
-
-	// Shorten the merge queue interval to clean up ranges due to dropped tables.
-	if _, err := db.ExecContext(
-		ctx, `SET CLUSTER SETTING kv.range_merge.queue_interval = '200ms'`,
-	); err != nil {
-		return err
-	}
-
-	// Disable syncs associated with the Raft log which are the primary causes of
-	// fsyncs.
-	if _, err := db.ExecContext(
-		ctx, `SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = 'true'`,
-	); err != nil {
-		return err
-	}
-
-	// Enable temp tables
-	if _, err := db.ExecContext(
-		ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
-	); err != nil {
-		return err
-	}
-
-	// Enable datestyle.
-	if _, err := db.ExecContext(
-		ctx,
-		`SET CLUSTER SETTING sql.defaults.datestyle.enabled = true`,
-	); err != nil {
-		return err
-	}
-
-	// Enable intervalstyle.
-	if _, err := db.ExecContext(
-		ctx,
-		`SET CLUSTER SETTING sql.defaults.intervalstyle.enabled = true;`,
-	); err != nil {
-		return err
+		// Enable experimental/preview/compatibility features.
+		`SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
+		`ALTER ROLE ALL SET multiple_active_portals_enabled = 'true';`,
+		`ALTER ROLE ALL SET serial_normalization = 'sql_sequence_cached'`,
+		`ALTER ROLE ALL SET statement_timeout = '60s'`,
+		`ALTER ROLE ALL SET default_transaction_isolation = 'read committed'`,
+		`ALTER ROLE ALL SET autocommit_before_ddl = 'true'`,
+	} {
+		if _, err := db.ExecContext(ctx, cmd); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -147,12 +116,12 @@ func (r *ormTestsResults) summarizeAll(
 ) {
 	// Collect all the tests that were not run.
 	notRunCount := 0
-	for test, issue := range expectedFailures {
-		if _, ok := r.runTests[test]; ok {
+	for testName, issue := range expectedFailures {
+		if _, ok := r.runTests[testName]; ok {
 			continue
 		}
-		r.allTests = append(r.allTests, test)
-		r.results[test] = fmt.Sprintf("--- FAIL: %s - %s (not run)", test, maybeAddGithubLink(issue))
+		r.allTests = append(r.allTests, testName)
+		r.results[testName] = fmt.Sprintf("--- FAIL: %s - %s (not run)", testName, maybeAddGithubLink(issue))
 		notRunCount++
 	}
 
@@ -229,15 +198,25 @@ func (r *ormTestsResults) summarizeFailed(
 		var b strings.Builder
 		fmt.Fprintf(&b, "Here is new %s blocklist that can be used to update the test:\n\n", ormName)
 		fmt.Fprintf(&b, "var %s = blocklist{\n", blocklistName)
-		for _, test := range r.currentFailures {
-			issue := expectedFailures[test]
+
+		prevName := ""
+		for _, testName := range r.currentFailures {
+			// Avoid putting duplicates in the map. Since the currentFailures was
+			// sorted earlier, we just need to keep track of the previous element.
+			// The npgsql suite has duplicate test names since it seems to run
+			// some tests twice.
+			if testName == prevName {
+				continue
+			}
+			prevName = testName
+			issue := expectedFailures[testName]
 			if len(issue) == 0 || issue == "unknown" {
-				issue = r.allIssueHints[test]
+				issue = r.allIssueHints[testName]
 			}
 			if len(issue) == 0 {
 				issue = "unknown"
 			}
-			fmt.Fprintf(&b, "  \"%s\": \"%s\",\n", test, issue)
+			fmt.Fprintf(&b, "  `%s`: \"%s\",\n", testName, issue)
 		}
 		fmt.Fprintf(&b, "}\n\n")
 		t.L().Printf("\n\n%s\n\n", b.String())

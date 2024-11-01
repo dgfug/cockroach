@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -19,6 +14,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // InterceptWith diverts log traffic to the given interceptor `fn`.
@@ -71,8 +68,12 @@ func (l *loggingT) newInterceptorSinkInfo() *sinkInfo {
 // formatInterceptor converts the raw logpb.Entry to JSON.
 type formatInterceptor struct{}
 
+func (formatInterceptor) setOption(k string, _ string) error {
+	return errors.Newf("unknown option: %q", redact.Safe(k))
+}
 func (formatInterceptor) formatterName() string { return "json-intercept" }
 func (formatInterceptor) doc() string           { return "internal only" }
+func (formatInterceptor) contentType() string   { return "application/json" }
 func (formatInterceptor) formatEntry(entry logEntry) *buffer {
 	pEntry := entry.convertToLegacy()
 	buf := getBuffer()

@@ -1,16 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell
 
 import (
+	"bufio"
+	"os"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clicfg"
@@ -89,40 +86,11 @@ func TestIsEndOfStatement(t *testing.T) {
 	}
 }
 
-// Test handleCliCmd cases for client-side commands that are aliases for sql
-// statements.
-func TestHandleCliCmdSqlAlias(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	clientSideCommandTestsTable := []struct {
-		commandString string
-		wantSQLStmt   string
-	}{
-		{`\l`, `SHOW DATABASES`},
-		{`\dt`, `SHOW TABLES`},
-		{`\dT`, `SHOW TYPES`},
-		{`\du`, `SHOW USERS`},
-		{`\du myuser`, `SELECT * FROM [SHOW USERS] WHERE username = 'myuser'`},
-		{`\d mytable`, `SHOW COLUMNS FROM mytable`},
-		{`\d`, `SHOW TABLES`},
-	}
-
-	for _, tt := range clientSideCommandTestsTable {
-		c := setupTestCliState()
-		c.lastInputLine = tt.commandString
-		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
-
-		assert.Equal(t, cliRunStatement, gotState)
-		assert.Equal(t, tt.wantSQLStmt, c.concatLines)
-	}
-}
-
 func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	clientSideCommandTests := []string{`\d goodarg badarg`, `\dz`}
+	clientSideCommandTests := []string{`\d goodarg badarg`}
 
 	for _, tt := range clientSideCommandTests {
 		c := setupTestCliState()
@@ -130,7 +98,6 @@ func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
 
 		assert.Equal(t, cliStateEnum(0), gotState)
-		assert.Equal(t, errInvalidSyntax, c.exitErr)
 	}
 }
 
@@ -142,7 +109,7 @@ func TestHandleDemoNodeCommandsInvalidNodeName(t *testing.T) {
 
 	c := setupTestCliState()
 	c.handleDemoNodeCommands(demoNodeCommandTests, cliStateEnum(0), cliStateEnum(1))
-	assert.Equal(t, errInvalidSyntax, c.exitErr)
+	assert.ErrorContains(t, c.exitErr, "invalid syntax")
 }
 
 func setupTestCliState() *cliState {
@@ -154,6 +121,69 @@ func setupTestCliState() *cliState {
 	}
 	sqlCtx := &Context{}
 	c := NewShell(cliCtx, sqlConnCtx, sqlExecCtx, sqlCtx, nil).(*cliState)
-	c.ins = noLineEditor
+	c.ins = &bufioReader{wout: os.Stdout, buf: bufio.NewReader(os.Stdin)}
 	return c
+}
+
+func TestGetSetArgs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	td := []struct {
+		input    string
+		ok       bool
+		option   string
+		hasValue bool
+		value    string
+	}{
+		// Missing option.
+		{``, false, ``, false, ``},
+		// Missing option.
+		{`    `, false, ``, false, ``},
+		// Standalone option, also supporting various characters in the option.
+		{`a`, true, `a`, false, ``},
+		{`a.b`, true, `a.b`, false, ``},
+		{`a_b`, true, `a_b`, false, ``},
+		{`a-b`, true, `a-b`, false, ``},
+		{`a123`, true, `a123`, false, ``},
+		{`a/b`, true, `a/b`, false, ``},
+		// Optional spaces.
+		{`a   `, true, `a`, false, ``},
+		{`  a   `, true, `a`, false, ``},
+		// Simple values surrounded by spaces.
+		{`a b`, true, `a`, true, `b`},
+		{`a b    `, true, `a`, true, `b`},
+		{`   a b    `, true, `a`, true, `b`},
+		{`a    b`, true, `a`, true, `b`},
+		{`a    b     `, true, `a`, true, `b`},
+		// Quoted value.
+		{`a "b c"`, true, `a`, true, `"b c"`},
+		{`a   "b c"  `, true, `a`, true, `"b c"`},
+		{`a   'b\"c'  `, true, `a`, true, `b"c`},
+		{`a "" `, true, `a`, true, `""`},
+		// Non-quoted value.
+		{`a   b.c  `, true, `a`, true, `b.c`},
+		// Equal sign with optional spaces.
+		{` a=    b`, true, `a`, true, `b`},
+		{` a=    b`, true, `a`, true, `b`},
+		{` a    =    b`, true, `a`, true, `b`},
+		{` a    =    b   `, true, `a`, true, `b`},
+		{` a     =b`, true, `a`, true, `b`},
+		{` a     =b  `, true, `a`, true, `b`},
+		{` a     ="b c"  `, true, `a`, true, `"b c"`},
+		{` a "=b"`, true, `a`, true, `"=b"`},
+	}
+
+	for _, tc := range td {
+		args, err := scanLocalCmdArgs(tc.input)
+		if err != nil {
+			t.Errorf("%s: %v", tc.input, err)
+			continue
+		}
+		ok, option, hasValue, value := getSetArgs(args)
+		if ok != tc.ok || option != tc.option || hasValue != tc.hasValue || value != tc.value {
+			t.Errorf("%s: expected (%v,%v,%v,%v), got (%v,%v,%v,%v)", tc.input,
+				tc.ok, tc.option, tc.hasValue, tc.value,
+				ok, option, hasValue, value)
+		}
+	}
 }

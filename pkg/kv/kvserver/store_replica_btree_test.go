@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -87,7 +82,7 @@ func TestStoreReplicaBTree_VisitKeyRange(t *testing.T) {
 	})
 }
 
-func TestStoreReplicaBTree_LookupPrecedingReplica(t *testing.T) {
+func TestStoreReplicaBTree_LookupPrecedingAndNextReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
@@ -96,7 +91,7 @@ func TestStoreReplicaBTree_LookupPrecedingReplica(t *testing.T) {
 		desc.StartKey = roachpb.RKey(start)
 		desc.EndKey = roachpb.RKey(end)
 		r := &Replica{}
-		r.mu.state.Desc = desc
+		r.shMu.state.Desc = desc
 		r.startKey = desc.StartKey // this is what's actually used in the btree
 		return r
 	}
@@ -116,25 +111,29 @@ func TestStoreReplicaBTree_LookupPrecedingReplica(t *testing.T) {
 	require.Zero(t, b.ReplaceOrInsertReplica(ctx, repl5))
 
 	for i, tc := range []struct {
-		key     string
-		expRepl *Replica
+		key      string
+		preRepl  *Replica
+		nextRepl *Replica
 	}{
-		{"", nil},
-		{"a", nil},
-		{"aa", nil},
-		{"b", repl2},
-		{"bb", repl2},
-		{"c", repl3},
-		{"cc", repl3},
-		{"d", repl3},
-		{"dd", repl3},
-		{"e", repl3},
-		{"ee", repl3},
-		{"f", repl5},
-		{"\xff\xff", repl5},
+		{"", nil, repl2},
+		{"a", nil, repl2},
+		{"aa", nil, repl3},
+		{"b", repl2, repl3},
+		{"bb", repl2, repl5},
+		{"c", repl3, repl5},
+		{"cc", repl3, repl5},
+		{"d", repl3, repl5},
+		{"dd", repl3, repl5},
+		{"e", repl3, repl5},
+		{"ee", repl3, nil},
+		{"f", repl5, nil},
+		{"\xff\xff", repl5, nil},
 	} {
-		if repl := b.LookupPrecedingReplica(ctx, roachpb.RKey(tc.key)); repl != tc.expRepl {
-			t.Errorf("%d: expected replica %v; got %v", i, tc.expRepl, repl)
+		if got, want := b.LookupPrecedingReplica(ctx, roachpb.RKey(tc.key)), tc.preRepl; got != want {
+			t.Errorf("%d: expected preceding replica %v; got %v", i, want, got)
+		}
+		if got, want := b.LookupNextReplica(ctx, roachpb.RKey(tc.key)), tc.nextRepl; got != want {
+			t.Errorf("%d: expected next replica %v; got %v", i, want, got)
 		}
 	}
 }
@@ -142,11 +141,11 @@ func TestStoreReplicaBTree_LookupPrecedingReplica(t *testing.T) {
 func TestStoreReplicaBTree_ReplicaCanBeLockedDuringInsert(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Verify that the replica can be locked while being inserted (and removed).
-	// This is important for `Store.maybeMarkReplicaInitializedLockedReplLocked`.
+	// This is important for `Store.markReplicaInitializedLockedReplLocked`.
 	ctx := context.Background()
 	repl := &Replica{}
 	k := roachpb.RKey("a")
-	repl.mu.state.Desc = &roachpb.RangeDescriptor{
+	repl.shMu.state.Desc = &roachpb.RangeDescriptor{
 		RangeID: 12,
 	}
 	repl.startKey = k

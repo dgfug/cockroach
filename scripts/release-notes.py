@@ -1,4 +1,10 @@
 #! /usr/bin/env python3
+
+# Copyright 2018 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 #
 # Show a compact release note summary of a range of Git commits.
 #
@@ -157,7 +163,6 @@ relnotetitles = {
     'cli change': "Command-line changes",
     'ops change': "Operational changes",
     'sql change': "SQL language changes",
-    'api change': "API endpoint changes",
     'ui change': "DB Console changes",
     'general change': "General changes",
     'build change': "Build changes",
@@ -166,6 +171,7 @@ relnotetitles = {
     'performance improvement': "Performance improvements",
     'bug fix': "Bug fixes",
     'security update': "Security updates",
+    'cluster virtualization': "Cluster virtualization and multi-tenancy",
 }
 
 # Order in which to show the sections.
@@ -176,8 +182,8 @@ relnote_sec_order = [
     'enterprise change',
     'sql change',
     'ops change',
+    'cluster virtualization',
     'cli change',
-    'api change',
     'ui change',
     'bug fix',
     'performance improvement',
@@ -195,12 +201,14 @@ cat_misspells = {
     'ui': 'ui change',
     'operational change': 'ops change',
     'admin ui': 'ui change',
-    'api': 'api change',
-    'http': 'api change',
     'backwards-incompatible change': 'backward-incompatible change',
     'enterprise': 'enterprise change',
     'security': 'security update',
     'security change': 'security update',
+    'multi-tenant': 'cluster virtualization',
+    'multi tenant': 'cluster virtualization',
+    'multi tenancy': 'cluster virtualization',
+    'virtualization': 'cluster virtualization',
 }
 
 #
@@ -833,7 +841,7 @@ if not hideheader:
     print("summary: Additions and changes in CockroachDB version", current_version, "since version", previous_version)
     print("---")
     print()
-    print("## " + time.strftime("%B %d, %Y"))
+    print("## " + time.strftime("%B %-d, %Y"))
     print()
 
 # Print the release notes sign-up and Downloads section.
@@ -854,11 +862,22 @@ if not hidedownloads:
 
     print("""### Downloads
 
+#### Full CockroachDB executable
+
 <div id="os-tabs" class="filters clearfix">
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.linux-amd64.tgz"><button id="linux" class="filter-button" data-scope="linux" data-eventcategory="linux-binary-release-notes">Linux</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.darwin-10.9-amd64.tgz"><button id="mac" class="filter-button" data-scope="mac" data-eventcategory="mac-binary-release-notes">Mac</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.windows-6.2-amd64.zip"><button id="windows" class="filter-button" data-scope="windows" data-eventcategory="windows-binary-release-notes">Windows</button></a>
-    <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.src.tgz"><button id="source" class="filter-button" data-scope="source" data-eventcategory="source-release-notes">Source</button></a>
+    <a target="_blank" href="https://github.com/cockroachdb/cockroach/releases/tag/""" + current_version + '"' + """><button id="source" class="filter-button" data-scope="source" data-eventcategory="source-release-notes">Source</button></a>
+</div>
+
+#### SQL-only executable
+
+<div id="os-tabs" class="filters clearfix">
+    <a href="https://binaries.cockroachdb.com/cockroach-sql-""" + current_version + """.linux-amd64"><button id="linux" class="filter-button" data-scope="linux" data-eventcategory="linux-binary-release-notes">Linux</button></a>
+    <a href="https://binaries.cockroachdb.com/cockroach-sql-""" + current_version + """.darwin-10.9-amd64"><button id="mac" class="filter-button" data-scope="mac" data-eventcategory="mac-binary-release-notes">Mac</button></a>
+    <a href="https://binaries.cockroachdb.com/cockroach-sql-""" + current_version + """.windows-6.2-amd64.exe"><button id="windows" class="filter-button" data-scope="windows" data-eventcategory="windows-binary-release-notes">Windows</button></a>
+    <a target="_blank" href="https://github.com/cockroachdb/cockroach/releases/tag/""" + current_version + '"' + """><button id="source" class="filter-button" data-scope="source" data-eventcategory="source-release-notes">Source</button></a>
 </div>
 
 <section class="filter-content" data-scope="windows">

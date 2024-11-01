@@ -1,23 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
 )
 
 // plannerJobExecContext is a wrapper to implement JobExecContext with a planner
@@ -30,7 +27,11 @@ type plannerJobExecContext struct {
 
 // MakeJobExecContext makes a JobExecContext.
 func MakeJobExecContext(
-	opName string, user security.SQLUsername, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
+	ctx context.Context,
+	opName string,
+	user username.SQLUsername,
+	memMetrics *MemoryMetrics,
+	execCfg *ExecutorConfig,
 ) (JobExecContext, func()) {
 	plannerInterface, close := NewInternalPlanner(
 		opName,
@@ -38,7 +39,7 @@ func MakeJobExecContext(
 		user,
 		memMetrics,
 		execCfg,
-		sessiondatapb.SessionData{},
+		NewInternalSessionData(ctx, execCfg.Settings, opName),
 	)
 	p := plannerInterface.(*planner)
 	return &plannerJobExecContext{p: p}, close
@@ -57,16 +58,20 @@ func (e *plannerJobExecContext) SessionDataMutatorIterator() *sessionDataMutator
 func (e *plannerJobExecContext) ExecCfg() *ExecutorConfig        { return e.p.ExecCfg() }
 func (e *plannerJobExecContext) DistSQLPlanner() *DistSQLPlanner { return e.p.DistSQLPlanner() }
 func (e *plannerJobExecContext) LeaseMgr() *lease.Manager        { return e.p.LeaseMgr() }
-func (e *plannerJobExecContext) User() security.SQLUsername      { return e.p.User() }
-func (e *plannerJobExecContext) MigrationJobDeps() migration.JobDeps {
+func (e *plannerJobExecContext) User() username.SQLUsername      { return e.p.User() }
+func (e *plannerJobExecContext) MigrationJobDeps() upgrade.JobDeps {
 	return e.p.MigrationJobDeps()
 }
-func (e *plannerJobExecContext) SpanConfigReconciliationJobDeps() spanconfig.ReconciliationDependencies {
-	return e.p.SpanConfigReconciliationJobDeps()
+func (e *plannerJobExecContext) SpanConfigReconciler() spanconfig.Reconciler {
+	return e.p.SpanConfigReconciler()
+}
+
+func (e *plannerJobExecContext) SpanStatsConsumer() keyvisualizer.SpanStatsConsumer {
+	return e.p.SpanStatsConsumer()
 }
 
 // JobExecContext provides the execution environment for a job. It is what is
-// passed to the Resume/OnFailOrCancel/OnPauseRequested methods of a jobs's
+// passed to the Resume/OnFailOrCancel methods of a jobs's
 // Resumer to give that resumer access to things like ExecutorCfg, LeaseMgr,
 // etc -- the kinds of things that would usually be on planner or similar during
 // a non-job SQL statement's execution. Unlike a planner however, or planner-ish
@@ -82,7 +87,8 @@ type JobExecContext interface {
 	ExecCfg() *ExecutorConfig
 	DistSQLPlanner() *DistSQLPlanner
 	LeaseMgr() *lease.Manager
-	User() security.SQLUsername
-	MigrationJobDeps() migration.JobDeps
-	SpanConfigReconciliationJobDeps() spanconfig.ReconciliationDependencies
+	User() username.SQLUsername
+	MigrationJobDeps() upgrade.JobDeps
+	SpanConfigReconciler() spanconfig.Reconciler
+	SpanStatsConsumer() keyvisualizer.SpanStatsConsumer
 }

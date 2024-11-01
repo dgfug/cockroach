@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metamorphic
 
@@ -55,6 +50,7 @@ func newDeck(rng *rand.Rand, weights ...int) *deck {
 // probability of i is weights(i)/sum(weights).
 func (d *deck) Int() int {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.mu.index == len(d.mu.deck) {
 		d.rng.Shuffle(len(d.mu.deck), func(i, j int) {
 			d.mu.deck[i], d.mu.deck[j] = d.mu.deck[j], d.mu.deck[i]
@@ -63,6 +59,5 @@ func (d *deck) Int() int {
 	}
 	result := d.mu.deck[d.mu.index]
 	d.mu.index++
-	d.mu.Unlock()
 	return result
 }

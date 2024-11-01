@@ -1,15 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import * as React from "react";
 import classNames from "classnames/bind";
+import * as React from "react";
 
 import styles from "./badge.module.scss";
 
@@ -21,13 +16,21 @@ export interface BadgeProps {
   status?: BadgeStatus;
   icon?: React.ReactNode;
   iconPosition?: "left" | "right";
+  forceUpperCase: boolean;
 }
 
 const cx = classNames.bind(styles);
 
-export function Badge(props: BadgeProps) {
-  const { size, status, icon, iconPosition, text } = props;
-  const classes = cx("badge", `badge--size-${size}`, `badge--status-${status}`);
+export function Badge(props: BadgeProps): React.ReactElement {
+  const { size, status, icon, iconPosition, text, forceUpperCase } = props;
+  const classes = cx(
+    "badge",
+    `badge--size-${size}`,
+    `badge--status-${status}`,
+    {
+      "badge--uppercase": forceUpperCase,
+    },
+  );
   const iconClasses = cx(
     "badge__icon",
     `badge__icon--position-${iconPosition || "left"}`,
@@ -43,4 +46,5 @@ export function Badge(props: BadgeProps) {
 Badge.defaultProps = {
   size: "medium",
   status: "default",
+  forceUpperCase: true,
 };

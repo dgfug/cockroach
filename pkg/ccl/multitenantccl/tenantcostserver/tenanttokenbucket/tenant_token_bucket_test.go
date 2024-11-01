@@ -1,20 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenanttokenbucket
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 	"gopkg.in/yaml.v2"
@@ -24,7 +24,7 @@ import (
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
 
 		var ts testState
@@ -43,27 +43,35 @@ type testState struct {
 }
 
 func (ts *testState) String() string {
-	return fmt.Sprintf("Current RUs: %.10g\n", ts.RUCurrent)
+	return fmt.Sprintf(
+		strings.Join(
+			[]string{
+				"Burst Limit: %.10g",
+				"Refill Rate: %.10g",
+				"Current Tokens: %.10g",
+				"Average Tokens: %.10g",
+			}, "\n"),
+		ts.TokenBurstLimit, ts.TokenRefillRate, ts.TokenCurrent, ts.TokenCurrentAvg,
+	)
 }
 
 var testStateCommands = map[string]func(*testState, *testing.T, *datadriven.TestData) string{
-	"init":    (*testState).init,
-	"update":  (*testState).update,
-	"request": (*testState).request,
+	"reconfigure": (*testState).reconfigure,
+	"update":      (*testState).update,
+	"request":     (*testState).request,
 }
 
-func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
+func (ts *testState) reconfigure(t *testing.T, d *datadriven.TestData) string {
 	var vals struct {
+		Limit   float64
 		Rate    float64
-		Initial float64
+		Current float64
 	}
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &vals); err != nil {
-		d.Fatalf(t, "failed to unmarshal init values: %v", err)
+		d.Fatalf(t, "failed to unmarshal reconfigure values: %v", err)
 	}
-	ts.State = State{
-		RURefillRate: vals.Rate,
-		RUCurrent:    vals.Initial,
-	}
+	ts.State.Reconfigure(
+		context.Background(), roachpb.TenantID{}, vals.Current, vals.Rate, vals.Limit)
 	return ts.String()
 }
 
@@ -83,29 +91,29 @@ func (ts *testState) update(t *testing.T, d *datadriven.TestData) string {
 
 func (ts *testState) request(t *testing.T, d *datadriven.TestData) string {
 	var vals struct {
-		RU     float64
+		Tokens float64
 		Period string
 	}
 	vals.Period = "10s"
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &vals); err != nil {
 		d.Fatalf(t, "failed to unmarshal init values: %v", err)
 	}
-	req := roachpb.TokenBucketRequest{
-		RequestedRU:         vals.RU,
+	req := kvpb.TokenBucketRequest{
+		RequestedTokens:     vals.Tokens,
 		TargetRequestPeriod: parseDuration(t, d, vals.Period),
 	}
-	resp := ts.State.Request(&req)
+	resp := ts.State.Request(context.Background(), &req)
 	return fmt.Sprintf(
 		strings.Join(
 			[]string{
-				"Granted: %.10g RU",
+				"Granted: %.10g tokens",
 				"Trickle duration: %s",
-				"Fallback rate: %.10g RU/s",
+				"Fallback rate: %.10g tokens/s",
 				"%s",
 			},
 			"\n",
 		),
-		resp.GrantedRU,
+		resp.GrantedTokens,
 		resp.TrickleDuration,
 		resp.FallbackRate,
 		ts.String(),

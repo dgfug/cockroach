@@ -1,0 +1,38 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "upgrade",
+    srcs = [
+        "doc.go",
+        "helpers.go",
+        "system_upgrade.go",
+        "tenant_upgrade.go",
+        "upgrade.go",
+    ],
+    importpath = "github.com/cockroachdb/cockroach/pkg/upgrade",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/clusterversion",
+        "//pkg/jobs",
+        "//pkg/keys",
+        "//pkg/keyvisualizer",
+        "//pkg/kv",
+        "//pkg/multitenant/mtinfo",
+        "//pkg/roachpb",
+        "//pkg/server/license",
+        "//pkg/server/serverpb",
+        "//pkg/settings/cluster",
+        "//pkg/sql/catalog/descs",
+        "//pkg/sql/catalog/lease",
+        "//pkg/sql/catalog/resolver",
+        "//pkg/sql/isql",
+        "//pkg/sql/sessiondata",
+        "//pkg/sql/sqlstats",
+        "//pkg/upgrade/upgradebase",
+        "//pkg/util/retry",
+        "//pkg/util/stop",
+        "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_logtags//:logtags",
+    ],
+)

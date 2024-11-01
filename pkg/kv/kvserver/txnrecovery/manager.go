@@ -1,20 +1,17 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package txnrecovery
 
 import (
+	"bytes"
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,7 +33,7 @@ type Manager interface {
 	// The method may also return a transaction in any other state if it is
 	// discovered to still be live and undergoing state transitions.
 	ResolveIndeterminateCommit(
-		context.Context, *roachpb.IndeterminateCommitError,
+		context.Context, *kvpb.IndeterminateCommitError,
 	) (*roachpb.Transaction, error)
 
 	// Metrics returns the Manager's metrics struct.
@@ -63,7 +60,7 @@ type manager struct {
 	db      *kv.DB
 	stopper *stop.Stopper
 	metrics Metrics
-	txns    singleflight.Group
+	txns    *singleflight.Group
 	sem     chan struct{}
 }
 
@@ -76,13 +73,14 @@ func NewManager(ac log.AmbientContext, clock *hlc.Clock, db *kv.DB, stopper *sto
 		db:             db,
 		stopper:        stopper,
 		metrics:        makeMetrics(),
+		txns:           singleflight.NewGroup("resolve indeterminate commit", "txn"),
 		sem:            make(chan struct{}, defaultTaskLimit),
 	}
 }
 
 // ResolveIndeterminateCommit implements the Manager interface.
 func (m *manager) ResolveIndeterminateCommit(
-	ctx context.Context, ice *roachpb.IndeterminateCommitError,
+	ctx context.Context, ice *kvpb.IndeterminateCommitError,
 ) (*roachpb.Transaction, error) {
 	txn := &ice.StagingTxn
 	if txn.Status != roachpb.STAGING {
@@ -92,23 +90,23 @@ func (m *manager) ResolveIndeterminateCommit(
 	// Launch a single-flight task to recover the transaction. This may be
 	// coalesced with other recovery attempts for the same transaction.
 	log.VEventf(ctx, 2, "recovering txn %s from indeterminate commit", txn.ID.Short())
-	resC, _ := m.txns.DoChan(txn.ID.String(), func() (interface{}, error) {
-		return m.resolveIndeterminateCommitForTxn(txn)
-	})
-
-	// Wait for the inflight request.
-	select {
-	case res := <-resC:
-		if res.Err != nil {
-			log.VEventf(ctx, 2, "recovery error: %v", res.Err)
-			return nil, res.Err
-		}
-		txn := res.Val.(*roachpb.Transaction)
-		log.VEventf(ctx, 2, "recovered txn %s with status: %s", txn.ID.Short(), txn.Status)
-		return txn, nil
-	case <-ctx.Done():
-		return nil, errors.Wrap(ctx.Err(), "abandoned indeterminate commit recovery")
+	future, _ := m.txns.DoChan(ctx,
+		txn.ID.String(),
+		singleflight.DoOpts{
+			InheritCancelation: false,
+			Stop:               m.stopper,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			return m.resolveIndeterminateCommitForTxn(ctx, txn)
+		})
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		log.VEventf(ctx, 2, "recovery error: %v", res.Err)
+		return nil, errors.Wrap(res.Err, "failed indeterminate commit recovery")
 	}
+	txn = res.Val.(*roachpb.Transaction)
+	log.VEventf(ctx, 2, "recovered txn %s with status: %s", txn.ID.Short(), txn.Status)
+	return txn, nil
 }
 
 // resolveIndeterminateCommitForTxn attempts to to resolve the status of
@@ -120,48 +118,36 @@ func (m *manager) ResolveIndeterminateCommit(
 // is determined, the method issues a RecoverTxn request with a summary of their
 // outcome.
 func (m *manager) resolveIndeterminateCommitForTxn(
-	txn *roachpb.Transaction,
+	ctx context.Context, txn *roachpb.Transaction,
 ) (resTxn *roachpb.Transaction, resErr error) {
 	// Record the recovery attempt in the Manager's metrics.
 	onComplete := m.updateMetrics()
 	defer func() { onComplete(resTxn, resErr) }()
 
-	// TODO(nvanbenschoten): Set up tracing.
-	ctx := m.AnnotateCtx(context.Background())
+	// Grab semaphore with defaultTaskLimit.
+	select {
+	case m.sem <- struct{}{}:
+		defer func() { <-m.sem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
-	// Launch the recovery task.
-	resErr = m.stopper.RunTaskWithErr(ctx,
-		"recovery.manager: resolving indeterminate commit",
-		func(ctx context.Context) error {
-			// Grab semaphore with defaultTaskLimit.
-			select {
-			case m.sem <- struct{}{}:
-				defer func() { <-m.sem }()
-			case <-m.stopper.ShouldQuiesce():
-				return stop.ErrUnavailable
-			}
+	// We probe to determine whether the transaction is implicitly
+	// committed or not. If not, we prevent it from ever becoming
+	// implicitly committed at this (epoch, timestamp) pair.
+	preventedIntent, changedTxn, err := m.resolveIndeterminateCommitForTxnProbe(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	if changedTxn != nil {
+		return changedTxn, nil
+	}
 
-			// We probe to determine whether the transaction is implicitly
-			// committed or not. If not, we prevent it from ever becoming
-			// implicitly committed at this (epoch, timestamp) pair.
-			preventedIntent, changedTxn, err := m.resolveIndeterminateCommitForTxnProbe(ctx, txn)
-			if err != nil {
-				return err
-			}
-			if changedTxn != nil {
-				resTxn = changedTxn
-				return nil
-			}
-
-			// Now that we know whether the transaction was implicitly committed
-			// or not (implicitly committed = !preventedIntent), we attempt to
-			// recover it. If this succeeds, it will either move the transaction
-			// record to a COMMITTED or ABORTED status.
-			resTxn, err = m.resolveIndeterminateCommitForTxnRecover(ctx, txn, preventedIntent)
-			return err
-		},
-	)
-	return resTxn, resErr
+	// Now that we know whether the transaction was implicitly committed
+	// or not (implicitly committed = !preventedIntent), we attempt to
+	// recover it. If this succeeds, it will either move the transaction
+	// record to a COMMITTED or ABORTED status.
+	return m.resolveIndeterminateCommitForTxnRecover(ctx, txn, preventedIntent)
 }
 
 // resolveIndeterminateCommitForTxnProbe performs the "probing phase" of the
@@ -174,8 +160,8 @@ func (m *manager) resolveIndeterminateCommitForTxnProbe(
 ) (preventedIntent bool, changedTxn *roachpb.Transaction, err error) {
 	// Create a QueryTxnRequest that we will periodically send to the
 	// transaction's record during recovery processing.
-	queryTxnReq := roachpb.QueryTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	queryTxnReq := kvpb.QueryTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
 		Txn:           txn.TxnMeta,
@@ -207,21 +193,23 @@ func (m *manager) resolveIndeterminateCommitForTxnProbe(
 	//    record (e.g. if the record has been abandoned). However, it can fail if
 	//    the transaction has already refreshed at a higher timestamp in the
 	//    current epoch or restarted at a higher epoch.
-	queryIntentReqs := make([]roachpb.QueryIntentRequest, 0, len(txn.InFlightWrites))
+	queryIntentReqs := make([]kvpb.QueryIntentRequest, 0, len(txn.InFlightWrites))
 	for _, w := range txn.InFlightWrites {
 		meta := txn.TxnMeta
 		meta.Sequence = w.Sequence
-		queryIntentReqs = append(queryIntentReqs, roachpb.QueryIntentRequest{
-			RequestHeader: roachpb.RequestHeader{
+		queryIntentReqs = append(queryIntentReqs, kvpb.QueryIntentRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: w.Key,
 			},
-			Txn: meta,
+			Txn:            meta,
+			Strength:       w.Strength,
+			IgnoredSeqNums: txn.IgnoredSeqNums,
 		})
 	}
 
 	// Sort the query intent requests to maximize batching by range.
-	sort.Slice(queryIntentReqs, func(i, j int) bool {
-		return queryIntentReqs[i].Header().Key.Compare(queryIntentReqs[j].Header().Key) < 0
+	slices.SortFunc(queryIntentReqs, func(a, b kvpb.QueryIntentRequest) int {
+		return bytes.Compare(a.Key, b.Key)
 	})
 
 	// Query all of the intents in batches of size defaultBatchSize. The maximum
@@ -255,7 +243,7 @@ func (m *manager) resolveIndeterminateCommitForTxnProbe(
 		// state of the transaction record has changed since we began
 		// the recovery process.
 		resps := b.RawResponse().Responses
-		queryTxnResp := resps[0].GetInner().(*roachpb.QueryTxnResponse)
+		queryTxnResp := resps[0].GetInner().(*kvpb.QueryTxnResponse)
 		queriedTxn := &queryTxnResp.QueriedTxn
 		if queriedTxn.Status.IsFinalized() ||
 			txn.Epoch < queriedTxn.Epoch ||
@@ -269,8 +257,8 @@ func (m *manager) resolveIndeterminateCommitForTxnProbe(
 		// Next, look through the QueryIntentResponses to check whether
 		// any of the in-flight writes failed.
 		for _, ru := range resps[1:] {
-			queryIntentResp := ru.GetInner().(*roachpb.QueryIntentResponse)
-			if !queryIntentResp.FoundIntent {
+			queryIntentResp := ru.GetInner().(*kvpb.QueryIntentResponse)
+			if !queryIntentResp.FoundUnpushedIntent {
 				return true /* preventedIntent */, nil, nil
 			}
 		}
@@ -293,8 +281,8 @@ func (m *manager) resolveIndeterminateCommitForTxnRecover(
 ) (*roachpb.Transaction, error) {
 	var b kv.Batch
 	b.Header.Timestamp = m.batchTimestamp(txn)
-	b.AddRawRequest(&roachpb.RecoverTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	b.AddRawRequest(&kvpb.RecoverTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
 		Txn:                 txn.TxnMeta,
@@ -306,7 +294,7 @@ func (m *manager) resolveIndeterminateCommitForTxnRecover(
 	}
 
 	resps := b.RawResponse().Responses
-	recTxnResp := resps[0].GetInner().(*roachpb.RecoverTxnResponse)
+	recTxnResp := resps[0].GetInner().(*kvpb.RecoverTxnResponse)
 	return &recTxnResp.RecoveredTxn, nil
 }
 

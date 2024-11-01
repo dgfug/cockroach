@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package diagnosticsccl_test
 
@@ -15,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -27,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/diagutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -35,12 +32,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/system"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
-
-// Dummy import to pull in kvtenantccl. This allows us to start tenants.
-var _ = kvtenantccl.Connector{}
 
 const elemName = "somestring"
 
@@ -48,13 +44,12 @@ func TestTenantReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	rt := startReporterTest(t, base.TestControlsTenantsExplicitly)
 	defer rt.Close()
 
 	tenantArgs := base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		AllowSettingClusterSettings: true,
-		TestingKnobs:                rt.testingKnobs,
+		TenantID:     serverutils.TestTenantID(),
+		TestingKnobs: rt.testingKnobs,
 	}
 	tenant, tenantDB := serverutils.StartTenant(t, rt.server, tenantArgs)
 	reporter := tenant.DiagnosticsReporter().(*diagnostics.Reporter)
@@ -69,7 +64,10 @@ func TestTenantReport(t *testing.T) {
 	require.Equal(t, 1, rt.diagServer.NumRequests())
 
 	last := rt.diagServer.LastRequestData()
-	require.Equal(t, rt.server.ClusterID().String(), last.UUID)
+	lastUUID, err := uuid.FromString(last.UUID)
+	require.NoError(t, err)
+	require.Equal(t, rt.server.StorageClusterID().ToUint128().Hi, lastUUID.ToUint128().Hi,
+		"tenant cluster id should start with storage cluster hi bits")
 	require.Equal(t, tenantArgs.TenantID.String(), last.TenantID)
 	require.Equal(t, "", last.NodeID)
 	require.Equal(t, tenant.SQLInstanceID().String(), last.SQLInstanceID)
@@ -85,7 +83,7 @@ func TestTenantReport(t *testing.T) {
 	require.NotZero(t, len(last.FeatureUsage))
 
 	// Call PeriodicallyReportDiagnostics and ensure it sends out a report.
-	reporter.PeriodicallyReportDiagnostics(ctx, rt.server.Stopper())
+	reporter.PeriodicallyReportDiagnostics(ctx, tenant.AppStopper())
 	testutils.SucceedsSoon(t, func() error {
 		if rt.diagServer.NumRequests() != 2 {
 			return errors.Errorf("did not receive a diagnostics report")
@@ -100,7 +98,7 @@ func TestServerReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	rt := startReporterTest(t, base.TestIsSpecificToStorageLayerAndNeedsASystemTenant)
 	defer rt.Close()
 
 	ctx := context.Background()
@@ -121,10 +119,23 @@ func TestServerReport(t *testing.T) {
 				fmt.Sprintf(`ALTER %s CONFIGURE ZONE = '%s'`, cmd.resource, cmd.config),
 			); err != nil {
 				// Work around gossip asynchronicity.
-				return errors.Errorf("error applying zone config %q to %q: %v", cmd.config, cmd.resource, err)
+				return errors.Wrapf(err, "error applying zone config %q to %q", cmd.config, cmd.resource)
 			}
 			return nil
 		})
+	}
+
+	// We want to ensure that non-reportable settings, sensitive
+	// settings, and all string settings are redacted. Below we override
+	// one of each.
+	settingOverrides := []string{
+		`SET CLUSTER SETTING server.oidc_authentication.client_id = 'sensitive-client-id'`, // Sensitive setting.
+		`SET CLUSTER SETTING sql.log.user_audit = 'test_role NONE'`,                        // Non-reportable setting.
+		`SET CLUSTER SETTING changefeed.node_throttle_config = '{"message_rate": 0.5}'`,    // String setting.
+	}
+	for _, s := range settingOverrides {
+		_, err := rt.serverDB.Exec(s)
+		require.NoError(t, err)
 	}
 
 	expectedUsageReports := 0
@@ -181,7 +192,7 @@ func TestServerReport(t *testing.T) {
 	})
 
 	last := rt.diagServer.LastRequestData()
-	require.Equal(t, rt.server.ClusterID().String(), last.UUID)
+	require.Equal(t, rt.server.StorageClusterID().String(), last.UUID)
 	require.Equal(t, "system", last.TenantID)
 	require.Equal(t, rt.server.NodeID().String(), last.NodeID)
 	require.Equal(t, rt.server.NodeID().String(), last.SQLInstanceID)
@@ -198,15 +209,20 @@ func TestServerReport(t *testing.T) {
 	// 3 + 3 = 6: set 3 initially and org is set mid-test for 3 altered settings,
 	// plus version, reporting and secret settings are set in startup
 	// migrations.
-	expected, actual := 6, len(last.AlteredSettings)
+	expected, actual := 7+len(settingOverrides), len(last.AlteredSettings)
 	require.Equal(t, expected, actual, "expected %d changed settings, got %d: %v", expected, actual, last.AlteredSettings)
 
 	for key, expected := range map[string]string{
+		// Note: this uses setting _keys_, not setting names.
 		"cluster.organization":                     "<redacted>",
+		"cluster.label":                            "<redacted>",
 		"diagnostics.reporting.send_crash_reports": "false",
 		"server.time_until_store_dead":             "1m30s",
-		"version":                                  clusterversion.TestingBinaryVersion.String(),
+		"version":                                  clusterversion.Latest.String(),
 		"cluster.secret":                           "<redacted>",
+		"server.oidc_authentication.client_id":     "<redacted>",
+		"sql.log.user_audit":                       "<redacted>",
+		"changefeed.node_throttle_config":          "<redacted>",
 	} {
 		got, ok := last.AlteredSettings[key]
 		require.True(t, ok, "expected report of altered setting %q", key)
@@ -275,6 +291,68 @@ func TestServerReport(t *testing.T) {
 	}
 }
 
+func TestTelemetry_SuccessfulTelemetryPing(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	rt := startReporterTest(t, base.TestIsSpecificToStorageLayerAndNeedsASystemTenant)
+	defer rt.Close()
+
+	ctx := context.Background()
+	setupCluster(t, rt.serverDB)
+
+	for _, tc := range []struct {
+		name                  string
+		respError             error
+		respCode              int
+		expectTimestampUpdate bool
+	}{
+		{
+			name:                  "200 response",
+			respError:             nil,
+			respCode:              200,
+			expectTimestampUpdate: true,
+		},
+		{
+			name:                  "400 response",
+			respError:             nil,
+			respCode:              400,
+			expectTimestampUpdate: true,
+		},
+		{
+			name:                  "500 response",
+			respError:             nil,
+			respCode:              500,
+			expectTimestampUpdate: true,
+		},
+		{
+			name:                  "connection error",
+			respError:             errors.New("connection refused"),
+			expectTimestampUpdate: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer rt.diagServer.SetRespError(tc.respError)()
+			defer rt.diagServer.SetRespCode(tc.respCode)()
+
+			dr := rt.server.DiagnosticsReporter().(*diagnostics.Reporter)
+
+			before := timeutil.Now().Unix()
+			oldTimestamp := dr.LastSuccessfulTelemetryPing.Load()
+			require.LessOrEqual(t, dr.LastSuccessfulTelemetryPing.Load(), before)
+			dr.ReportDiagnostics(ctx)
+
+			if tc.expectTimestampUpdate {
+				require.GreaterOrEqual(t, dr.LastSuccessfulTelemetryPing.Load(), before)
+			} else {
+				require.Equal(t, oldTimestamp, dr.LastSuccessfulTelemetryPing.Load())
+			}
+		})
+	}
+
+}
+
 func TestUsageQuantization(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -284,12 +362,10 @@ func TestUsageQuantization(t *testing.T) {
 	r := diagutils.NewServer()
 	defer r.Close()
 
-	st := cluster.MakeTestingClusterSettings()
 	ctx := context.Background()
 
 	url := r.URL()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Settings: st,
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
 				DiagnosticsTestingKnobs: diagnostics.TestingKnobs{
@@ -299,7 +375,6 @@ func TestUsageQuantization(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	ts := s.(*server.TestServer)
 
 	// Disable periodic reporting so it doesn't interfere with the test.
 	if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = false`); err != nil {
@@ -331,6 +406,8 @@ func TestUsageQuantization(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	ts := s.ApplicationLayer()
+
 	// Flush the SQL stat pool.
 	ts.SQLServer().(*sql.Server).GetSQLStatsController().ResetLocalSQLStats(ctx)
 
@@ -340,7 +417,7 @@ func TestUsageQuantization(t *testing.T) {
 	// The stats "hide" the application name by hashing it. To find the
 	// test app name, we need to hash the ref string too prior to the
 	// comparison.
-	clusterSecret := sql.ClusterSecret.Get(&st.SV)
+	clusterSecret := sql.ClusterSecret.Get(&ts.ClusterSettings().SV)
 	hashedAppName := sql.HashForReporting(clusterSecret, "test")
 	require.NotEqual(t, sql.FailedHashedValue, hashedAppName, "expected hashedAppName to not be 'unknown'")
 
@@ -387,7 +464,9 @@ func (t *reporterTest) Close() {
 	t.server.Stopper().Stop(context.Background())
 }
 
-func startReporterTest(t *testing.T) *reporterTest {
+func startReporterTest(
+	t *testing.T, defaultTestTenant base.DefaultTestTenantOptions,
+) *reporterTest {
 	// Disable cloud info reporting, since it slows down tests.
 	rt := &reporterTest{
 		cloudEnable: cloudinfo.Disable(),
@@ -412,6 +491,7 @@ func startReporterTest(t *testing.T) *reporterTest {
 	storeSpec := base.DefaultTestStoreSpec
 	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{elemName}}
 	rt.serverArgs = base.TestServerArgs{
+		DefaultTestTenant: defaultTestTenant,
 		StoreSpecs: []base.StoreSpec{
 			storeSpec,
 			base.DefaultTestStoreSpec,
@@ -432,6 +512,13 @@ func startReporterTest(t *testing.T) *reporterTest {
 	// Make sure the test's generated activity is the only activity we measure.
 	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
 
+	// Ensure the org contains "Cockroach Labs" so the telemetry report
+	// is marked as "internal".
+	_, err := rt.server.SystemLayer().InternalExecutor().(isql.Executor).Exec(
+		context.Background(), "set-org", nil,
+		`SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - test'`)
+	require.NoError(t, err)
+
 	return rt
 }
 
@@ -443,14 +530,13 @@ func setupCluster(t *testing.T, db *gosql.DB) {
 	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = true`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.send_crash_reports = false`)
+	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.send_crash_reports.enabled = false`)
 	require.NoError(t, err)
 
 	_, err = db.Exec(fmt.Sprintf(`CREATE DATABASE %s`, elemName))
 	require.NoError(t, err)
 
-	// Set cluster to an internal testing cluster
-	q := `SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing'`
+	q := `SET CLUSTER SETTING cluster.label = 'Some String'`
 	_, err = db.Exec(q)
 	require.NoError(t, err)
 }

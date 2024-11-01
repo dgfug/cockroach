@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package extract
 
@@ -16,8 +11,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -83,7 +78,7 @@ func GenerateRRNet(bnf []byte, railroadAPITimeout time.Duration) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -105,13 +100,15 @@ func GenerateBNF(addr string, bnfAPITimeout time.Duration) (ebnf []byte, err err
 		if err != nil {
 			return nil, err
 		}
-		b, err = ioutil.ReadAll(resp.Body)
+		b, err = func() ([]byte, error) {
+			defer resp.Body.Close()
+			return io.ReadAll(resp.Body)
+		}()
 		if err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
 	} else {
-		body, err := ioutil.ReadFile(addr)
+		body, err := os.ReadFile(addr)
 		if err != nil {
 			return nil, err
 		}

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser
 
@@ -15,8 +10,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
 )
 
-func makeScanner(str string) scanner.Scanner {
-	var s scanner.Scanner
+func makeSQLScanner(str string) scanner.SQLScanner {
+	var s scanner.SQLScanner
 	s.Init(str)
 	return s
 }
@@ -26,7 +21,7 @@ func makeScanner(str string) scanner.Scanner {
 // including the first semicolon that separates statements. If there is no
 // semicolon, returns ok=false.
 func SplitFirstStatement(sql string) (pos int, ok bool) {
-	s := makeScanner(sql)
+	s := makeSQLScanner(sql)
 	var lval = &sqlSymType{}
 	for {
 		s.Scan(lval)
@@ -41,7 +36,7 @@ func SplitFirstStatement(sql string) (pos int, ok bool) {
 
 // Tokens decomposes the input into lexical tokens.
 func Tokens(sql string) (tokens []TokenString, ok bool) {
-	s := makeScanner(sql)
+	s := makeSQLScanner(sql)
 	for {
 		var lval = &sqlSymType{}
 		s.Scan(lval)

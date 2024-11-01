@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -56,7 +51,7 @@ func New_UPPERCASE_NAMEOperator(
 	frame *execinfrapb.WindowerSpec_Frame,
 	ordering *execinfrapb.Ordering,
 	argIdxs []int,
-) (colexecop.Operator, error) {
+) (colexecop.ClosableOperator, error) {
 	framer := newWindowFramer(args.EvalCtx, frame, ordering, args.InputTypes, args.PeersColIdx)
 	colsToStore := framer.getColsToStore([]int{argIdxs[0]})
 
@@ -68,8 +63,9 @@ func New_UPPERCASE_NAMEOperator(
 	bufferMemLimit := int64(float64(args.MemoryLimit) * 0.10)
 	mainMemLimit := args.MemoryLimit - bufferMemLimit
 	buffer := colexecutils.NewSpillingBuffer(
-		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
-		args.FdSemaphore, args.InputTypes, args.DiskAcc, colsToStore...)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg, args.FdSemaphore,
+		args.InputTypes, args.DiskAcc, args.DiskQueueMemAcc, colsToStore...,
+	)
 	base := _OP_NAMEBase{
 		partitionSeekerBase: partitionSeekerBase{
 			buffer:          buffer,
@@ -171,11 +167,15 @@ func (w *_OP_NAME_TYPEWindow) processBatch(batch coldata.Batch, startIdx, endIdx
 			continue
 		}
 		col := vec.TemplateType()
+		// {{if .IsBytesLike}}
+		outputCol.Copy(col, i, idx)
+		// {{else}}
 		val := col.Get(idx)
 		// {{if .Sliceable}}
 		//gcassert:bce
 		// {{end}}
 		outputCol.Set(i, val)
+		// {{end}}
 	}
 }
 
@@ -201,9 +201,9 @@ func (b *_OP_NAMEBase) Init(ctx context.Context) {
 }
 
 // Close implements the bufferedWindower interface.
-func (b *_OP_NAMEBase) Close() {
+func (b *_OP_NAMEBase) Close(ctx context.Context) {
 	if !b.CloserHelper.Close() {
 		return
 	}
-	b.buffer.Close(b.EnsureCtx())
+	b.buffer.Close(ctx)
 }

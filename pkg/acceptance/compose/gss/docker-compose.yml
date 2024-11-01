@@ -1,25 +1,34 @@
 version: '3'
 services:
   kdc:
-    build: ./kdc
+    image: us-east1-docker.pkg.dev/crl-ci-images/cockroach/acceptance-gss-kdc:20221214-131000
     volumes:
       - ./kdc/start.sh:/start.sh
       - keytab:/keytab
   cockroach:
-    image: ubuntu:xenial-20170214
+    # We use a docker image mirror to avoid pulling from 3rd party repos, which sometimes have reliability issues.
+    # See https://cockroachlabs.atlassian.net/wiki/spaces/devinf/pages/3462594561/Docker+image+sync for the details.
+    image: us-east1-docker.pkg.dev/crl-docker-sync/docker-io/library/ubuntu:xenial-20210804
     depends_on:
       - kdc
     command: /cockroach/cockroach --certs-dir=/certs start-single-node --listen-addr cockroach
     environment:
       - KRB5_KTNAME=/keytab/crdb.keytab
     volumes:
-      - ../../.localcluster.certs:/certs
+      - ${CERTS_DIR:-../../.localcluster.certs}:/certs
       - keytab:/keytab
-      - ../../../../cockroach-linux-2.6.32-gnu-amd64:/cockroach/cockroach
+      - ${COCKROACH_BINARY:-../../../../cockroach-linux-2.6.32-gnu-amd64}:/cockroach/cockroach
+    healthcheck:
+      test: "bash -c 'echo -n > /dev/tcp/cockroach/26257'"
+      interval: 0.5s
+      timeout: 10s
+      retries: 25
   psql:
-    build: ./psql
+    image: us-east1-docker.pkg.dev/crl-ci-images/cockroach/acceptance-gss-psql:20241009-173040
+    user: "${UID}:${GID}"
     depends_on:
-      - cockroach
+      cockroach:
+        condition: service_healthy
     environment:
       - PGHOST=cockroach
       - PGPORT=26257
@@ -27,7 +36,7 @@ services:
       - ./kdc/krb5.conf:/etc/krb5.conf
       - ./psql/gss_test.go:/test/gss_test.go
       - ./psql/start.sh:/start.sh
-      - ../../.localcluster.certs:/certs
-      - ../../../../cockroach-linux-2.6.32-gnu-amd64:/cockroach/cockroach
+      - ${CERTS_DIR:-../../.localcluster.certs}:/certs
+      - ${COCKROACH_BINARY:-../../../../cockroach-linux-2.6.32-gnu-amd64}:/cockroach/cockroach
 volumes:
   keytab:

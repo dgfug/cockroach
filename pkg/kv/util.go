@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -15,7 +10,7 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -36,7 +31,7 @@ func marshalKey(k interface{}) (roachpb.Key, error) {
 	case string:
 		return roachpb.Key(t), nil
 	case []byte:
-		return roachpb.Key(t), nil
+		return t, nil
 	}
 	return nil, fmt.Errorf("unable to marshal key: %T %q", k, k)
 }
@@ -74,7 +69,7 @@ func marshalValue(v interface{}) (roachpb.Value, error) {
 		return r, err
 
 	case roachpb.Key:
-		r.SetBytes([]byte(t))
+		r.SetBytes(t)
 		return r, nil
 
 	case time.Time:

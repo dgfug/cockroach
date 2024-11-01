@@ -1,20 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"math"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
@@ -23,7 +21,7 @@ import (
 // GetAddJoinDialOptions returns a standard list of DialOptions for use during
 // Add/Join operations.
 // TODO(aaron-crl): Possibly fold this into context.go.
-func GetAddJoinDialOptions(certPool *x509.CertPool) []grpc.DialOption {
+func GetAddJoinDialOptions(ctx context.Context, certPool *x509.CertPool) []grpc.DialOption {
 	// Populate the dialOpts.
 	var dialOpts []grpc.DialOption
 
@@ -34,14 +32,15 @@ func GetAddJoinDialOptions(certPool *x509.CertPool) []grpc.DialOption {
 	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor((snappyCompressor{}).Name())))
 	dialOpts = append(dialOpts, grpc.WithNoProxy())
 	backoffConfig := backoff.DefaultConfig
-	backoffConfig.MaxDelay = maxBackoff
+	backoffConfig.MaxDelay = time.Second
 	dialOpts = append(dialOpts, grpc.WithConnectParams(grpc.ConnectParams{
 		Backoff:           backoffConfig,
-		MinConnectTimeout: minConnectionTimeout}))
+		MinConnectTimeout: base.DialTimeout}))
 	dialOpts = append(dialOpts, grpc.WithKeepaliveParams(clientKeepalive))
+	var ws windowSizeSettings
 	dialOpts = append(dialOpts,
-		grpc.WithInitialWindowSize(initialWindowSize),
-		grpc.WithInitialConnWindowSize(initialConnWindowSize))
+		grpc.WithInitialWindowSize(ws.initialWindowSize(ctx)),
+		grpc.WithInitialConnWindowSize(ws.initialConnWindowSize(ctx)))
 
 	// Create a tls.Config that allows insecure mode if certPool is not set but
 	// requires it if certPool is set.

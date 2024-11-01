@@ -1,42 +1,45 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.Subsume, declareKeysSubsume, Subsume)
+	RegisterReadWriteCommand(kvpb.Subsume, declareKeysSubsume, Subsume)
 }
 
 func declareKeysSubsume(
-	_ ImmutableRangeState, header roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
-) {
+	_ ImmutableRangeState,
+	_ *kvpb.Header,
+	_ kvpb.Request,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
+	_ time.Duration,
+) error {
 	// Subsume must not run concurrently with any other command. It declares a
 	// non-MVCC write over every addressable key in the range; this guarantees
 	// that it conflicts with any other command because every command must
 	// declare at least one addressable key. It does not, in fact, write any
 	// keys.
 	declareAllKeys(latchSpans)
+	return nil
 }
 
 // Subsume freezes a range for merging with its left-hand neighbor. When called
@@ -46,15 +49,15 @@ func declareKeysSubsume(
 //
 // Specifically, the receiving replica guarantees that:
 //
-//   1. it is the leaseholder at the time the request executes,
-//   2. when it responds, there are no commands in flight with a timestamp
-//      greater than the FreezeStart timestamp provided in the response,
-//   3. the MVCC statistics in the response reflect the latest writes,
-//   4. it, and all future leaseholders for the range, will not process another
-//      command until they refresh their range descriptor with a consistent read
-//      from meta2, and
-//   5. if it or any future leaseholder for the range finds that its range
-//      descriptor has been deleted, it self destructs.
+//  1. it is the leaseholder at the time the request executes,
+//  2. when it responds, there are no commands in flight with a timestamp
+//     greater than the FreezeStart timestamp provided in the response,
+//  3. the MVCC statistics in the response reflect the latest writes,
+//  4. it, and all future leaseholders for the range, will not process another
+//     command until they refresh their range descriptor with a consistent read
+//     from meta2, and
+//  5. if it or any future leaseholder for the range finds that its range
+//     descriptor has been deleted, it self destructs.
 //
 // To achieve guarantees four and five, when issuing a Subsume request, the
 // caller must have a merge transaction open that has already placed deletion
@@ -68,10 +71,10 @@ func declareKeysSubsume(
 // The period of time after intents have been placed but before the merge
 // transaction is complete is called the merge's "critical phase".
 func Subsume(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.SubsumeRequest)
-	reply := resp.(*roachpb.SubsumeResponse)
+	args := cArgs.Args.(*kvpb.SubsumeRequest)
+	reply := resp.(*kvpb.SubsumeResponse)
 
 	// Verify that the Subsume request was sent to the correct range and that
 	// the range's bounds have not changed during the merge transaction.
@@ -95,17 +98,17 @@ func Subsume(
 	// the maximum timestamp to ensure that we see an intent if one exists,
 	// regardless of what timestamp it is written at.
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	_, intent, err := storage.MVCCGet(ctx, readWriter, descKey, hlc.MaxTimestamp,
-		storage.MVCCGetOptions{Inconsistent: true})
+	intentRes, err := storage.MVCCGet(ctx, readWriter, descKey, hlc.MaxTimestamp,
+		storage.MVCCGetOptions{Inconsistent: true, ReadCategory: fs.BatchEvalReadCategory})
 	if err != nil {
-		return result.Result{}, errors.Errorf("fetching local range descriptor: %s", err)
-	} else if intent == nil {
+		return result.Result{}, errors.Wrap(err, "fetching local range descriptor")
+	} else if intentRes.Intent == nil {
 		return result.Result{}, errors.Errorf("range missing intent on its local descriptor")
 	}
-	val, _, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, intent.Txn.WriteTimestamp, intent.Txn)
+	valRes, err := storage.MVCCGetAsTxn(ctx, readWriter, descKey, intentRes.Intent.Txn.WriteTimestamp, intentRes.Intent.Txn)
 	if err != nil {
-		return result.Result{}, errors.Errorf("fetching local range descriptor as txn: %s", err)
-	} else if val != nil {
+		return result.Result{}, errors.Wrap(err, "fetching local range descriptor as txn")
+	} else if valRes.Value != nil {
 		return result.Result{}, errors.Errorf("non-deletion intent on local range descriptor")
 	}
 
@@ -130,24 +133,28 @@ func Subsume(
 	reply.LeaseAppliedIndex = cArgs.EvalCtx.GetLeaseAppliedIndex()
 	reply.FreezeStart = cArgs.EvalCtx.Clock().NowAsClockTimestamp()
 
+	// We ship the range ID-local replicated stats as well, since these must be
+	// subtracted from MVCCStats for the merged range.
+	//
+	// NB: lease requests can race with this computation, since they ignore
+	// latches and write to the range ID-local keyspace. This can very rarely
+	// result in a minor SysBytes discrepancy when the GetMVCCStats() call above
+	// is not consistent with this readWriter snapshot. We accept this for now,
+	// rather than introducing additional synchronization complexity.
+	ridPrefix := keys.MakeRangeIDReplicatedPrefix(desc.RangeID)
+	reply.RangeIDLocalMVCCStats, err = storage.ComputeStats(
+		ctx, readWriter, ridPrefix, ridPrefix.PrefixEnd(), 0 /* nowNanos */)
+	if err != nil {
+		return result.Result{}, err
+	}
+
 	// Collect a read summary from the RHS leaseholder to ship to the LHS
 	// leaseholder. This is used to instruct the LHS on how to update its
 	// timestamp cache to ensure that no future writes are allowed to invalidate
 	// prior reads performed to this point on the RHS range.
 	priorReadSum := cArgs.EvalCtx.GetCurrentReadSummary(ctx)
-	// For now, forward this summary to the freeze time. This may appear to
-	// undermine the benefit of the read summary, but it doesn't entirely. Until
-	// we ship higher-resolution read summaries, the read summary doesn't
-	// provide much value in avoiding transaction retries, but it is necessary
-	// for correctness if the RHS has served reads at future times above the
-	// freeze time.
-	//
-	// We can remove this in the future when we increase the resolution of read
-	// summaries and have a per-range closed timestamp system that is easier to
-	// think about.
-	priorReadSum.Merge(rspb.FromTimestamp(reply.FreezeStart.ToTimestamp()))
 	reply.ReadSummary = &priorReadSum
-	reply.ClosedTimestamp = cArgs.EvalCtx.GetClosedTimestamp(ctx)
+	reply.ClosedTimestamp = cArgs.EvalCtx.GetCurrentClosedTimestamp(ctx)
 
 	return result.Result{}, nil
 }

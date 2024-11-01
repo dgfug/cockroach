@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // smithcmp is a tool to execute random queries on a database. A TOML
 // file provides configuration for which databases to connect to. If there
@@ -23,7 +18,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -81,7 +75,7 @@ func main() {
 		usage()
 	}
 
-	tomlData, err := ioutil.ReadFile(args[0])
+	tomlData, err := os.ReadFile(args[0])
 	if err != nil {
 		log.Fatal(err)
 	}

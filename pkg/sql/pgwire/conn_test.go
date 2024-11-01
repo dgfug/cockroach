@@ -1,23 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
 import (
-	"bytes"
 	"context"
 	gosql "database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"strconv"
@@ -28,33 +21,43 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/cidr"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v4"
+	pgx5 "github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
+
+var nilStat = func(int64) {}
 
 // Test the conn struct: check that it marshalls the correct commands to the
 // stmtBuf.
@@ -77,7 +80,7 @@ func TestConn(t *testing.T) {
 	// server that the client will connect to; we just use it on the side to
 	// execute some metadata queries that pgx sends whenever it opens a
 	// connection.
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true, UseDatabase: "system"})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{Insecure: true, UseDatabase: "system"})
 	defer s.Stopper().Stop(context.Background())
 
 	// Start a pgwire "server".
@@ -90,7 +93,8 @@ func TestConn(t *testing.T) {
 	log.Infof(context.Background(), "started listener on %s", serverAddr)
 
 	var g errgroup.Group
-	ctx := context.Background()
+	ctx, cancelConn := context.WithCancel(context.Background())
+	defer cancelConn()
 
 	var clientWG sync.WaitGroup
 	clientWG.Add(1)
@@ -99,23 +103,30 @@ func TestConn(t *testing.T) {
 		return client(ctx, serverAddr, &clientWG)
 	})
 
-	// Wait for the client to connect and perform the handshake.
-	conn, err := waitForClientConn(ln)
+	server := newTestServer()
+	// Wait for the client to connect.
+	netConn, err := waitForClientConn(ln)
 	if err != nil {
 		t.Fatal(err)
 	}
+	conn := server.newConn(
+		ctx,
+		cancelConn,
+		netConn,
+		sql.SessionArgs{ConnResultsBufferSize: 16 << 10},
+		timeutil.Now(),
+	)
 
 	// Run the conn's loop in the background - it will push commands to the
-	// buffer.
+	// buffer. serveImpl also performs the server handshake.
 	serveCtx, stopServe := context.WithCancel(ctx)
 	g.Go(func() error {
-		conn.serveImpl(
+		server.serveImpl(
 			serveCtx,
-			func() bool { return false }, /* draining */
-			// sqlServer - nil means don't create a command processor and a write side of the conn
-			nil,
-			mon.BoundAccount{}, /* reserved */
+			conn,
+			&mon.BoundAccount{}, /* reserved */
 			authOptions{testingSkipAuth: true, connType: hba.ConnHostAny},
+			clusterunique.ID{},
 		)
 		return nil
 	})
@@ -158,6 +169,9 @@ func TestConn(t *testing.T) {
 	if err := finishQuery(generateError, conn); err != nil {
 		t.Fatal(err)
 	}
+	expectExecStmt(ctx, t, "DECLARE \"a b\" CURSOR FOR SELECT 10", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "FETCH 1 \"a b\"", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "CLOSE \"a b\"", &rd, conn, queryStringComplete)
 	// We got to the COMMIT at the end of the batch.
 	expectExecStmt(ctx, t, "COMMIT TRANSACTION", &rd, conn, queryStringComplete)
 	expectSync(ctx, t, &rd)
@@ -174,15 +188,159 @@ func TestConn(t *testing.T) {
 	}
 }
 
+// TestPipelineMetric checks that we update the metric for commands in the
+// stmtBuf.
+func TestPipelineMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Start a pgwire "server". We use a fake server here since we need to control
+	// exactly when statements are removed from the stmtBuf in the server.
+	addr := util.TestAddr
+	ln, err := net.Listen(addr.Network(), addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := ln.Addr()
+	log.Infof(context.Background(), "started listener on %s", serverAddr)
+
+	ctx, cancelConn := context.WithCancel(context.Background())
+	defer cancelConn()
+	connectGroup := ctxgroup.WithContext(ctx)
+
+	var pgxConn *pgx5.Conn
+	connectGroup.GoCtx(func(ctx context.Context) error {
+		host, ports, err := net.SplitHostPort(serverAddr.String())
+		if err != nil {
+			return err
+		}
+		port, err := strconv.Atoi(ports)
+		if err != nil {
+			return err
+		}
+		pgxConn, err = pgx5.Connect(
+			ctx,
+			fmt.Sprintf("postgresql://%s@%s:%d/system?sslmode=disable", username.RootUser, host, port),
+		)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+
+	server := newTestServer()
+	// Wait for the client to connect.
+	netConn, err := waitForClientConn(ln)
+	require.NoError(t, err)
+	serverSideConn := server.newConn(
+		ctx,
+		cancelConn,
+		netConn,
+		sql.SessionArgs{ConnResultsBufferSize: 16 << 10},
+		timeutil.Now(),
+	)
+
+	// Run the conn's loop in the background - it will push commands to the
+	// buffer. serveImpl also performs the server handshake.
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	defer stopServe()
+	serveGroup := ctxgroup.WithContext(serveCtx)
+	serveGroup.GoCtx(func(ctx context.Context) error {
+		server.serveImpl(
+			ctx,
+			serverSideConn,
+			&mon.BoundAccount{}, /* reserved */
+			authOptions{testingSkipAuth: true, connType: hba.ConnHostAny},
+			clusterunique.ID{},
+		)
+		return nil
+	})
+
+	err = connectGroup.Wait()
+	require.NoError(t, err)
+	typeMap := pgxConn.TypeMap()
+	pipeline := pgxConn.PgConn().StartPipeline(ctx)
+
+	eqb := pgx5.ExtendedQueryBuilder{}
+	err = eqb.Build(typeMap, nil, []any{1, 2})
+	require.NoError(t, err)
+	pipeline.SendQueryParams(`select $1::int + $2::int`, eqb.ParamValues, nil, eqb.ParamFormats, eqb.ResultFormats)
+	err = eqb.Build(typeMap, nil, []any{3, 4, 5})
+	require.NoError(t, err)
+	pipeline.SendQueryParams(`select $1::int + $2::int + $3::int`, eqb.ParamValues, nil, eqb.ParamFormats, eqb.ResultFormats)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	// We need to poll until all the messages are received by the server. Note
+	// that the server will never actually send results back to the client, since
+	// we are just testing the stmtBuf, not the actual execution of the queries.
+	testutils.SucceedsSoon(t, func() error {
+		// Each query sends Prepare, Bind, Describe, and Execute. The Sync brings it
+		// to 9 total messages.
+		if n := serverSideConn.stmtBuf.PipelineCount.Value(); n != 9 {
+			return errors.Errorf("expected 9, got %d", n)
+		}
+		return nil
+	})
+
+	// Now we'll expect to receive the commands corresponding to the
+	// pipelined operations. This simulates the server processing the commands.
+	rd := sql.MakeStmtBufReader(&serverSideConn.stmtBuf)
+	expectPrepareStmt(ctx, t, "", "SELECT $1::INT8 + $2::INT8", &rd, serverSideConn)
+	expectBindStmt(ctx, t, "", &rd, serverSideConn)
+	expectDescribeStmt(ctx, t, "", pgwirebase.PreparePortal, &rd, serverSideConn)
+	expectExecPortal(ctx, t, "", &rd, serverSideConn)
+	require.EqualValues(t, 5, serverSideConn.stmtBuf.PipelineCount.Value())
+
+	// Send another query in the pipeline.
+	err = eqb.Build(typeMap, nil, []any{"abc"})
+	require.NoError(t, err)
+	pipeline.SendQueryParams(`select $1::text`, eqb.ParamValues, nil, eqb.ParamFormats, eqb.ResultFormats)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	// We need to poll until all the messages are received by the server. Note
+	// that the server will never actually send results back to the client, since
+	// we are just testing the stmtBuf, not the actual execution of the queries.
+	testutils.SucceedsSoon(t, func() error {
+		// Should have received Prepare, Bind, Describe, Execute and Sync.
+		if n := serverSideConn.stmtBuf.PipelineCount.Value(); n != 10 {
+			return errors.Errorf("expected 10, got %d", n)
+		}
+		return nil
+	})
+
+	// Process all of the commands that are in the pipeline.
+	expectPrepareStmt(ctx, t, "", "SELECT ($1::INT8 + $2::INT8) + $3::INT8", &rd, serverSideConn)
+	expectBindStmt(ctx, t, "", &rd, serverSideConn)
+	expectDescribeStmt(ctx, t, "", pgwirebase.PreparePortal, &rd, serverSideConn)
+	expectExecPortal(ctx, t, "", &rd, serverSideConn)
+	expectSync(ctx, t, &rd)
+	require.EqualValues(t, 5, serverSideConn.stmtBuf.PipelineCount.Value())
+
+	expectPrepareStmt(ctx, t, "", "SELECT $1::STRING", &rd, serverSideConn)
+	expectBindStmt(ctx, t, "", &rd, serverSideConn)
+	expectDescribeStmt(ctx, t, "", pgwirebase.PreparePortal, &rd, serverSideConn)
+	expectExecPortal(ctx, t, "", &rd, serverSideConn)
+	expectSync(ctx, t, &rd)
+	require.EqualValues(t, 0, serverSideConn.stmtBuf.PipelineCount.Value())
+
+	err = pipeline.Close()
+	require.NoError(t, err)
+	err = pgxConn.Close(ctx)
+	require.NoError(t, err)
+	err = serveGroup.Wait()
+	require.NoError(t, err)
+}
+
 func TestConnMessageTooBig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, mainDB, _ := serverutils.StartServer(t, params)
-	defer mainDB.Close()
-	defer s.Stopper().Stop(context.Background())
+	srv, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// Form a 1MB string.
 	longStr := "a"
@@ -310,11 +468,9 @@ func TestConnMessageTooBig(t *testing.T) {
 		},
 	}
 
-	pgURL, cleanup := sqlutils.PGUrl(
+	pgURL, cleanup := s.PGUrl(
 		t,
-		s.ServingSQLAddr(),
-		"TestBigClientMessage",
-		url.User(security.RootUser),
+		serverutils.CertsDirPrefix("TestBigClientMessage"),
 	)
 	defer cleanup()
 
@@ -432,9 +588,9 @@ func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c
 func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
-	it, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryIteratorEx(
+	it, err := s.InternalExecutor().(isql.Executor).QueryIteratorEx(
 		ctx, "test", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName(), Database: "system"},
+		sessiondata.InternalExecutorOverride{User: username.NodeUserName(), Database: "system"},
 		query,
 	)
 	if err != nil {
@@ -461,7 +617,7 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 		return err
 	}
 	cfg, err := pgx.ParseConfig(
-		fmt.Sprintf("postgresql://%s@%s:%d/system?sslmode=disable", security.RootUser, host, port),
+		fmt.Sprintf("postgresql://%s@%s:%d/system?sslmode=disable", username.RootUser, host, port),
 	)
 	if err != nil {
 		return err
@@ -504,6 +660,9 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	batch.Queue("BEGIN")
 	batch.Queue("select 7")
 	batch.Queue("select 8")
+	batch.Queue("declare \"a b\" cursor for select 10")
+	batch.Queue("fetch 1 \"a b\"")
+	batch.Queue("close \"a b\"")
 	batch.Queue("COMMIT")
 
 	batchResults := conn.SendBatch(ctx, batch)
@@ -526,49 +685,99 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	return conn.Close(ctx)
 }
 
+func newTestServer() *Server {
+	sqlMetrics := sql.MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
+	metrics := newTenantSpecificMetrics(sqlMetrics /* sqlMemMetrics */, metric.TestSampleInterval)
+	st := cluster.MakeTestingClusterSettings()
+	s := &Server{
+		tenantMetrics: metrics,
+		destinationMetrics: destinationAggMetrics{
+			BytesInCount:  aggmetric.NewCounter(MetaBytesIn, "remote"),
+			BytesOutCount: aggmetric.NewCounter(MetaBytesOut, "remote"),
+		},
+		execCfg: &sql.ExecutorConfig{
+			Settings:   st,
+			CidrLookup: cidr.NewLookup(&st.SV),
+		},
+	}
+	s.mu.destinations = make(map[string]*destinationMetrics)
+	return s
+}
+
 // waitForClientConn blocks until a client connects and performs the pgwire
 // handshake. This emulates what pgwire.Server does.
-func waitForClientConn(ln net.Listener) (*conn, error) {
-	conn, _, err := getSessionArgs(ln, false /* trustRemoteAddr */)
-	if err != nil {
-		return nil, err
-	}
-
-	metrics := makeServerMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
-	pgwireConn := newConn(conn, sql.SessionArgs{ConnResultsBufferSize: 16 << 10}, &metrics, timeutil.Now(), nil)
-	return pgwireConn, nil
+func waitForClientConn(ln net.Listener) (net.Conn, error) {
+	conn, _, err := getSessionArgs(ln, false /* trustRemoteAddr */, false /* sendResponse */)
+	return conn, err
 }
 
 // getSessionArgs blocks until a client connects and returns the connection
-// together with session arguments or an error.
-func getSessionArgs(ln net.Listener, trustRemoteAddr bool) (net.Conn, sql.SessionArgs, error) {
-	conn, err := ln.Accept()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
+// together with session arguments or an error. If sendResponse is true,
+// this also sends back a response to the client to indicate that the
+// connection is ready.
+func getSessionArgs(
+	ln net.Listener, trustRemoteAddr bool, sendResponse bool,
+) (netConn net.Conn, _ sql.SessionArgs, retErr error) {
+	for {
+		var err error
+		netConn, err = ln.Accept()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
 
-	buf := pgwirebase.MakeReadBuffer()
-	_, err = buf.ReadUntypedMsg(conn)
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
+		buf := pgwirebase.MakeReadBuffer()
+		_, err = buf.ReadUntypedMsg(netConn)
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		version, err := buf.GetUint32()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		if version == versionCancel {
+			// The pgx driver can send a cancel message asynchronously if the
+			// context expired, but these test should ignore it.
+			continue
+		}
+		if version != version30 {
+			return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
+		}
+		defer func() {
+			if !sendResponse {
+				return
+			}
+			// Implement a fake pgwire connection handshake. Send the response
+			// after parsing the client-sent parameters.
+			c := &conn{conn: netConn}
+			c.msgBuilder.init(nilStat)
+			if err := c.authOKMessage(); err != nil {
+				retErr = errors.CombineErrors(retErr, err)
+				return
+			}
+			if err := c.bufferInitialReadyForQuery(pgwirecancel.BackendKeyData(0)); err != nil {
+				retErr = errors.CombineErrors(retErr, err)
+				return
+			}
+			if err := c.Flush(0); err != nil {
+				retErr = errors.CombineErrors(retErr, err)
+				return
+			}
+		}()
+		ctx := context.Background()
+		cp, err := parseClientProvidedSessionParameters(ctx, &buf, netConn.RemoteAddr(), trustRemoteAddr,
+			false /* acceptTenantName */, false /* acceptSystemIdentityOption */)
+		if err != nil {
+			return netConn, sql.SessionArgs{}, err
+		}
+		args, err := finalizeClientParameters(ctx, cp, nil)
+		return netConn, args, err
 	}
-	version, err := buf.GetUint32()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
-	if version != version30 {
-		return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
-	}
-
-	args, err := parseClientProvidedSessionParameters(
-		context.Background(), nil, &buf, conn.RemoteAddr(), trustRemoteAddr,
-	)
-	return conn, args, err
 }
 
 func makeTestingConvCfg() (sessiondatapb.DataConversionConfig, *time.Location) {
 	return sessiondatapb.DataConversionConfig{
-		BytesEncodeFormat: sessiondatapb.BytesEncodeHex,
+		BytesEncodeFormat: lex.BytesEncodeHex,
+		ExtraFloatDigits:  1,
 	}, time.UTC
 }
 
@@ -674,7 +883,7 @@ func expectPrepareStmt(
 func expectDescribeStmt(
 	ctx context.Context,
 	t *testing.T,
-	expName string,
+	expName tree.Name,
 	expType pgwirebase.PrepareType,
 	rd *sql.StmtBufReader,
 	c *conn,
@@ -881,12 +1090,13 @@ func TestConnCloseReleasesLocks(t *testing.T) {
 	// We're going to test closing the connection in both the Open and Aborted
 	// state.
 	testutils.RunTrueAndFalse(t, "open state", func(t *testing.T, open bool) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 		ctx := context.Background()
-		defer s.Stopper().Stop(ctx)
+		srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+		defer srv.Stopper().Stop(ctx)
+		s := srv.ApplicationLayer()
 
-		pgURL, cleanupFunc := sqlutils.PGUrl(
-			t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
+		pgURL, cleanupFunc := s.PGUrl(
+			t, serverutils.CertsDirPrefix("testConnClose"), serverutils.User(username.RootUser),
 		)
 		defer cleanupFunc()
 		db, err := gosql.Open("postgres", pgURL.String())
@@ -950,9 +1160,11 @@ func TestConnCloseReleasesLocks(t *testing.T) {
 func TestConnCloseWhileProducingRows(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
 
 	// Disable results buffering.
 	if _, err := db.Exec(
@@ -960,8 +1172,8 @@ func TestConnCloseWhileProducingRows(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
+	pgURL, cleanupFunc := s.PGUrl(
+		t, serverutils.CertsDirPrefix("testConnClose"), serverutils.User(username.RootUser),
 	)
 	defer cleanupFunc()
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
@@ -1042,13 +1254,13 @@ func TestMaliciousInputs(t *testing.T) {
 				// The reason this works is that ioutil.devNull implements ReadFrom
 				// as an infinite loop, so it will Read continuously until it hits an
 				// error (on w.Close()).
-				_, _ = io.Copy(ioutil.Discard, w)
+				_, _ = io.Copy(io.Discard, w)
 			}()
 
 			errChan := make(chan error, 1)
-			go func() {
+			go func(data []byte) {
 				// Write the malicious data.
-				if _, err := w.Write(tc); err != nil {
+				if _, err := w.Write(data); err != nil {
 					errChan <- err
 					return
 				}
@@ -1059,28 +1271,28 @@ func TestMaliciousInputs(t *testing.T) {
 				_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgSync), 0x00, 0x00, 0x00, 0x04})
 				_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgTerminate), 0x00, 0x00, 0x00, 0x04})
 				close(errChan)
-			}()
+			}(tc)
 
-			sqlMetrics := sql.MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
-			metrics := makeServerMetrics(sqlMetrics, time.Second /* histogramWindow */)
-
-			conn := newConn(
+			ctx, cancelConn := context.WithCancel(ctx)
+			defer cancelConn()
+			s := newTestServer()
+			conn := s.newConn(
+				ctx,
+				cancelConn,
 				r,
 				// ConnResultsBufferSize - really small so that it overflows
 				// when we produce a few results.
 				sql.SessionArgs{ConnResultsBufferSize: 10},
-				&metrics,
 				timeutil.Now(),
-				nil,
 			)
 			// Ignore the error from serveImpl. There might be one when the client
 			// sends malformed input.
-			conn.serveImpl(
+			s.serveImpl(
 				ctx,
-				func() bool { return false }, /* draining */
-				nil,                          /* sqlServer */
-				mon.BoundAccount{},           /* reserved */
+				conn,
+				&mon.BoundAccount{}, /* reserved */
 				authOptions{testingSkipAuth: true, connType: hba.ConnHostAny},
+				clusterunique.ID{},
 			)
 			if err := <-errChan; err != nil {
 				t.Fatal(err)
@@ -1089,90 +1301,22 @@ func TestMaliciousInputs(t *testing.T) {
 	}
 }
 
-// TestReadTimeoutConn asserts that a readTimeoutConn performs reads normally
-// and exits with an appropriate error when exit conditions are satisfied.
-func TestReadTimeoutConnExits(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	// Cannot use net.Pipe because deadlines are not supported.
-	ln, err := net.Listen(util.TestAddr.Network(), util.TestAddr.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	log.Infof(context.Background(), "started listener on %s", ln.Addr())
-	defer func() {
-		if err := ln.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	expectedRead := []byte("expectedRead")
-
-	// Start a goroutine that performs reads using a readTimeoutConn.
-	errChan := make(chan error)
-	go func() {
-		defer close(errChan)
-		errChan <- func() error {
-			c, err := ln.Accept()
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-
-			readTimeoutConn := newReadTimeoutConn(c, func() error { return ctx.Err() })
-			// Assert that reads are performed normally.
-			readBytes := make([]byte, len(expectedRead))
-			if _, err := readTimeoutConn.Read(readBytes); err != nil {
-				return err
-			}
-			if !bytes.Equal(readBytes, expectedRead) {
-				return errors.Errorf("expected %v got %v", expectedRead, readBytes)
-			}
-
-			// The main goroutine will cancel the context, which should abort
-			// this read with an appropriate error.
-			_, err = readTimeoutConn.Read(make([]byte, 1))
-			return err
-		}()
-	}()
-
-	c, err := net.Dial(ln.Addr().Network(), ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	if _, err := c.Write(expectedRead); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case err := <-errChan:
-		t.Fatalf("goroutine unexpectedly returned: %v", err)
-	default:
-	}
-	cancel()
-	if err := <-errChan; !errors.Is(err, context.Canceled) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestConnResultsBufferSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	// Check that SHOW results_buffer_size correctly exposes the value when it
 	// inherits the default.
 	{
 		var size string
 		require.NoError(t, db.QueryRow(`SHOW results_buffer_size`).Scan(&size))
-		require.Equal(t, `16384`, size)
+		require.Equal(t, `524288`, size)
 	}
 
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	pgURL, cleanup := s.PGUrl(t, serverutils.CertsDirPrefix(t.Name()), serverutils.User(username.RootUser))
 	defer cleanup()
 	q := pgURL.Query()
 
@@ -1234,7 +1378,7 @@ func TestConnCloseCancelsAuth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	authBlocked := make(chan struct{})
-	s, _, _ := serverutils.StartServer(t,
+	srv := serverutils.StartServerOnly(t,
 		base.TestServerArgs{
 			Insecure: true,
 			Knobs: base.TestingKnobs{
@@ -1252,11 +1396,12 @@ func TestConnCloseCancelsAuth(t *testing.T) {
 			},
 		})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// We're going to open a client connection and do the minimum so that the
 	// server gets to the authentication phase, where it will block.
-	conn, err := net.Dial("tcp", s.ServingSQLAddr())
+	conn, err := net.Dial("tcp", s.AdvSQLAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1284,7 +1429,7 @@ func TestConnServerAbortsOnRepeatedErrors(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	var shouldError uint32 = 0
 	testingKnobError := fmt.Errorf("a random error")
-	s, db, _ := serverutils.StartServer(t,
+	srv, db, _ := serverutils.StartServer(t,
 		base.TestServerArgs{
 			Insecure: true,
 			Knobs: base.TestingKnobs{
@@ -1299,8 +1444,7 @@ func TestConnServerAbortsOnRepeatedErrors(t *testing.T) {
 			},
 		})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	defer db.Close()
+	defer srv.Stopper().Stop(ctx)
 
 	conn, err := db.Conn(ctx)
 	require.NoError(t, err)
@@ -1330,14 +1474,6 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Start a pgwire "server".
-	addr := util.TestAddr
-	ln, err := net.Listen(addr.Network(), addr.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverAddr := ln.Addr()
-	log.Infof(context.Background(), "started listener on %s", serverAddr)
 	testCases := []struct {
 		desc   string
 		query  string
@@ -1362,11 +1498,12 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 			},
 		},
 		{
-			desc:  "results_buffer_size is not configurable from options",
-			query: "user=root&options=-c%20results_buffer_size=42",
+			desc:  "results_buffer_size is configurable from options",
+			query: "user=root&options=-c%20results_buffer_size=512kb",
 			assert: func(t *testing.T, args sql.SessionArgs, err error) {
-				require.Error(t, err)
-				require.Regexp(t, "options: parameter \"results_buffer_size\" cannot be changed", err)
+				require.NoError(t, err)
+				require.Equal(t, "root", args.User.Normalized())
+				require.EqualValues(t, 512000, args.ConnResultsBufferSize)
 			},
 		},
 		{
@@ -1461,6 +1598,46 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 			},
 		},
 		{
+			desc:  "success parsing crdb:jwt_auth_enabled from true option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=1",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.True(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled from false option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=false",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled when there is some capitalization",
+			query: "user=root&options=-c CrDb:JwT_AUth_eNaBLEd=False",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "default crdb:jwt_auth_enabled value is false if not provided",
+			query: "user=root",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "crdb:jwt_auth_enabled must be a boolean if provided",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=notaboolean",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.Error(t, err)
+				require.Regexp(t, "crdb:jwt_auth_enabled: strconv.ParseBool: parsing \"notaboolean\": invalid syntax", err)
+			},
+		},
+		{
 			desc:  "remote_addr missing port",
 			query: "user=root&crdb:remote_addr=5.4.3.2",
 			assert: func(t *testing.T, args sql.SessionArgs, err error) {
@@ -1508,162 +1685,192 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				require.Equal(t, "ISO,YMD", args.SessionDefaults["datestyle"])
 			},
 		},
+		{
+			// Regression test for issue #98301.
+			desc:  "special characters that look like urlencoded must not be decoded during option parsing",
+			query: "options=-c application_name=%2566%256f%256f",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.Equal(t, "%66%6f%6f", args.SessionDefaults["application_name"])
+			},
+		},
 	}
-
-	baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
+			// Start a pgwire "server".
+			addr := util.TestAddr
+			ln, err := net.Listen(addr.Network(), addr.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ln.Close() }()
+			serverAddr := ln.Addr()
+			log.Infof(context.Background(), "started listener on %s", serverAddr)
+			baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
 
-			var connErr error
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			var netConn net.Conn
+			clientDone := sync.WaitGroup{}
+			clientDone.Add(1)
+			serverReceivedConn := sync.WaitGroup{}
+			serverReceivedConn.Add(1)
+			go func(query string) {
+				defer clientDone.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				url := fmt.Sprintf("%s&%s", baseURL, tc.query)
-				var c *pgx.Conn
-				c, connErr = pgx.Connect(ctx, url)
+				url := fmt.Sprintf("%s&%s", baseURL, query)
+				c, connErr := pgx.Connect(ctx, url)
 				if connErr != nil {
+					t.Error(connErr)
+					_ = ln.Close()
 					return
 				}
 				// ignore the error because there is no answer from the server, we are
-				// interested in parsing session arguments only
-				_ = c.Ping(ctx)
-				// closing connection immediately, since getSessionArgs is blocking
+				// interested in parsing session arguments only. We close the connection
+				// immediately, since getSessionArgs is blocking.
+				serverReceivedConn.Wait()
+				_ = netConn.Close()
 				_ = c.Close(ctx)
+
+				select {
+				case <-c.PgConn().CleanupDone():
+				case <-time.After(20 * time.Second):
+					// 20 seconds was picked because pgconn has an internal deadline of
+					// 15 seconds when performing the async close request.
+					t.Error("pgconn asyncClose did not clean up on time")
+				}
+			}(tc.query)
+			// Wait for the client to connect and perform the handshake. Use a
+			// closure so that the WaitGroup is marked as done even if there's a
+			// panic.
+			var args sql.SessionArgs
+			func() {
+				defer serverReceivedConn.Done()
+				netConn, args, err = getSessionArgs(ln, true /* trustRemoteAddr */, true /* sendResponse */)
 			}()
-			// Wait for the client to connect and perform the handshake.
-			_, args, err := getSessionArgs(ln, true /* trustRemoteAddr */)
+			clientDone.Wait()
 			tc.assert(t, args, err)
 		})
 	}
 }
 
-func TestSetSessionArguments(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	defer db.Close()
-
-	_, err := db.Exec("SET CLUSTER SETTING sql.defaults.datestyle.enabled = true")
-	require.NoError(t, err)
-	_, err = db.Exec("SET CLUSTER SETTING sql.defaults.intervalstyle.enabled = true")
-	require.NoError(t, err)
-
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
-	)
-	defer cleanupFunc()
-
-	q := pgURL.Query()
-	q.Add("options", "  --user=test -c    search_path=public,testsp %20 "+
-		"--default-transaction-isolation=read\\ uncommitted   "+
-		"-capplication_name=test  "+
-		"--DateStyle=ymd\\ ,\\ iso\\  "+
-		"-c intervalstyle%3DISO_8601 "+
-		"-ccustom_option.custom_option=test2")
-	pgURL.RawQuery = q.Encode()
-	noBufferDB, err := gosql.Open("postgres", pgURL.String())
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer noBufferDB.Close()
-
-	pgxConfig, err := pgx.ParseConfig(pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	conn, err := pgx.ConnectConfig(ctx, pgxConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rows, err := conn.Query(ctx, "show all")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expectedOptions := map[string]string{
-		"search_path": "public, testsp",
-		// setting an isolation level is a noop:
-		// all transactions execute with serializable isolation.
-		"default_transaction_isolation": "serializable",
-		"application_name":              "test",
-		"datestyle":                     "ISO, YMD",
-		"intervalstyle":                 "iso_8601",
-	}
-	expectedFoundOptions := len(expectedOptions)
-
-	var foundOptions int
-	var variable, value string
-	for rows.Next() {
-		err = rows.Scan(&variable, &value)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if v, ok := expectedOptions[variable]; ok {
-			foundOptions++
-			if v != value {
-				t.Fatalf("option %q expected value %q, actual %q", variable, v, value)
-			}
-		}
-	}
-	require.Equal(t, expectedFoundOptions, foundOptions)
-
-	// Custom session options don't show up on SHOW ALL
-	var customOption string
-	require.NoError(t, conn.QueryRow(ctx, "SHOW custom_option.custom_option").Scan(&customOption))
-	require.Equal(t, "test2", customOption)
-
-	if err := conn.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestCancelQuery uses the pgwire-level query cancellation protocol provided
-// by lib/pq to make sure that canceling a query has no effect, and makes sure
-// the dummy BackendKeyData does not cause problems.
-func TestCancelQuery(t *testing.T) {
+func TestParseSearchPathInConnectionString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	args := base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			SQLExecutor: &sql.ExecutorTestingKnobs{
-				BeforeExecute: func(ctx context.Context, stmt string) {
-					if strings.Contains(stmt, "pg_sleep") {
-						cancel()
-					}
-				},
-			},
+	testCases := []struct {
+		desc               string
+		query              string
+		expectedErr        string
+		expectedSearchPath string
+	}{
+		{
+			desc:               "mixed-case schemas require double quotes",
+			query:              `options=-c search_path="Abc",Def,Ghi`,
+			expectedSearchPath: `"Abc", def, ghi`,
+		},
+		{
+			desc:               "commas can be used in schemas in the search_path",
+			query:              `options=-c search_path="a,b",other_schema`,
+			expectedSearchPath: `"a,b", other_schema`,
+		},
+		{
+			desc:        "search_path cannot have an empty element",
+			query:       `options=-c search_path="Abc",Def,,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,,"`,
+		},
+		{
+			// Note: This is more permissive than Postgres. But this behaves the same
+			// as `SET search_path = "",Def;` so this is acceptable.
+			desc:               "search_path can have a quoted empty element",
+			query:              `options=-c search_path="",Def`,
+			expectedSearchPath: `"", def`,
+		},
+
+		{
+			desc:        "search_path cannot have a quoted whitespace element",
+			query:       `options=-c search_path="  ",Def`,
+			expectedErr: `option "\",Def" is invalid`,
+		},
+		{
+			desc:               "search_path can have a quoted whitespace element if not in the options param",
+			query:              `search_path="  ",Def`,
+			expectedSearchPath: `"  ", def`,
+		},
+		{
+			// This is a slight departure from Postgres. For some reason, Postgres
+			// will just ignore the backslashes, even though it doesn't ignore the
+			// hyphens.
+			desc:               "search_path can handle backslashes and other special characters",
+			query:              `search_path=a-b-c,d\ef,"g-hi","j\kl"`,
+			expectedSearchPath: `"a-b-c", "d\ef", "g-hi", "j\kl"`,
+		},
+		{
+			desc:        "search_path cannot end in a comma",
+			query:       `options=-c search_path="Abc",Def,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,"`,
+		},
+		{
+			desc:        "space cannot be in search_path",
+			query:       `options=-c search_path="Abc",Def,  Ghi`,
+			expectedErr: `option "Ghi" is invalid`,
+		},
+		{
+			desc:               "empty search_path is allowed",
+			query:              `options=-c search_path=`,
+			expectedSearchPath: ``,
+		},
+		{
+			desc:        "unbalanced quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b","other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b","other_schema"`,
+		},
+		{
+			desc:        "out-of-place quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b",""other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b",""other_schema"`,
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(cancelCtx)
 
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "TestCancelQuery" /* prefix */, url.User(security.RootUser),
-	)
-	defer cleanupFunc()
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	db, err := gosql.Open("postgres", pgURL.String())
-	require.NoError(t, err)
-	defer db.Close()
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			pgURL, cleanupFunc := s.PGUrl(
+				t, serverutils.CertsDirPrefix("TestParseSearchPathInConnectionString"),
+				serverutils.User(username.RootUser),
+			)
+			defer cleanupFunc()
 
-	// Cancellation has no effect on ongoing query.
-	if _, err := db.QueryContext(cancelCtx, "select pg_sleep(0)"); err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
+			tcValues, err := url.ParseQuery(tc.query)
+			require.NoError(t, err)
 
-	// Context is already canceled, so error should come before execution.
-	if _, err := db.QueryContext(cancelCtx, "select 1"); err == nil {
-		t.Fatal("expected error")
-	} else if err.Error() != "context canceled" {
-		t.Fatalf("unexpected error: %s", err)
+			// Combine existing query params with the test case query params.
+			values := pgURL.Query()
+			for k := range tcValues {
+				if values.Has(k) {
+					values.Set(k, values.Get(k)+" "+tcValues.Get(k))
+				} else {
+					values.Set(k, tcValues.Get(k))
+				}
+			}
+			pgURL.RawQuery = values.Encode()
+
+			c, connErr := pgx.Connect(ctx, pgURL.String())
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, connErr, tc.expectedErr)
+				return
+			}
+			require.NoError(t, connErr)
+
+			var sp string
+			err = c.QueryRow(ctx, `SHOW search_path`).Scan(&sp)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedSearchPath, sp)
+		})
 	}
 }
 
@@ -1672,15 +1879,16 @@ func TestRoleDefaultSettings(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-	defer db.Close()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
 
 	_, err := db.ExecContext(ctx, "CREATE ROLE testuser WITH LOGIN")
 	require.NoError(t, err)
 
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "TestRoleDefaultSettings" /* prefix */, url.User("testuser"),
+	pgURL, cleanupFunc := s.PGUrl(
+		t, serverutils.CertsDirPrefix("TestRoleDefaultSettings"), serverutils.User("testuser"),
 	)
 	defer cleanupFunc()
 
@@ -1755,6 +1963,19 @@ func TestRoleDefaultSettings(t *testing.T) {
 			expectedSearchPath: "f",
 		},
 		{
+			// RESET after connecting should go back to the per-role default setting.
+			setupStmt:          "",
+			postConnectStmt:    "SET search_path = 'new'; RESET search_path;",
+			expectedSearchPath: "f",
+		},
+		{
+			// RESET should use the query param as the default if it was provided.
+			setupStmt:             "",
+			searchPathOptOverride: "g",
+			postConnectStmt:       "SET search_path = 'new'; RESET ALL;",
+			expectedSearchPath:    "g",
+		},
+		{
 			setupStmt:          "ALTER ROLE testuser IN DATABASE defaultdb SET search_path = DEFAULT",
 			expectedSearchPath: "c",
 		},
@@ -1785,8 +2006,8 @@ func TestRoleDefaultSettings(t *testing.T) {
 
 			pgURLCopy := pgURL
 			if tc.userOverride != "" {
-				newPGURL, cleanupFunc := sqlutils.PGUrl(
-					t, s.ServingSQLAddr(), "TestRoleDefaultSettings" /* prefix */, url.User(tc.userOverride),
+				newPGURL, cleanupFunc := s.PGUrl(
+					t, serverutils.CertsDirPrefix("TestRoleDefaultSettings"), serverutils.User(tc.userOverride),
 				)
 				defer cleanupFunc()
 				pgURLCopy = newPGURL
@@ -1813,4 +2034,371 @@ func TestRoleDefaultSettings(t *testing.T) {
 			require.Equal(t, tc.expectedSearchPath, actual)
 		})
 	}
+}
+
+func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	testServer := srv.ApplicationLayer()
+
+	// Users.
+	rootUser := username.RootUser
+	nonAdmin := username.TestUser
+	admin := "testadmin"
+
+	// openConnWithUser opens a connection to the testServer for the given user
+	// and always returns an associated cleanup function, even in case of error,
+	// which should be called. The returned cleanup function is idempotent.
+	openConnWithUser := func(user string) (*pgx.Conn, func(), error) {
+		pgURL, cleanup := testServer.PGUrl(
+			t,
+			serverutils.UserPassword(user, user),
+			serverutils.ClientCerts(user == rootUser),
+		)
+		defer cleanup()
+		conn, err := pgx.Connect(ctx, pgURL.String())
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return conn, func() {
+			require.NoError(t, conn.Close(ctx))
+		}, nil
+	}
+
+	openConnWithUserSuccess := func(user string) (*pgx.Conn, func()) {
+		conn, cleanup, err := openConnWithUser(user)
+		if err != nil {
+			defer cleanup()
+			t.FailNow()
+		}
+		return conn, cleanup
+	}
+
+	openConnWithUserError := func(user string) {
+		_, cleanup, err := openConnWithUser(user)
+		defer cleanup()
+		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, pgcode.TooManyConnections.String(), pgErr.Code)
+	}
+
+	getConnectionCount := func() int {
+		return int(testServer.SQLServer().(*sql.Server).GetConnectionCount())
+	}
+
+	requireConnectionCount := func(t *testing.T, expectedCount int) {
+		testutils.SucceedsSoon(t, func() error {
+			if getConnectionCount() != expectedCount {
+				return errors.Newf("expected connection count to be %d", expectedCount)
+			}
+			return nil
+		})
+	}
+
+	getMaxConnections := func() int {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		var maxConnections int
+		err := conn.QueryRow(ctx, "SHOW CLUSTER SETTING server.max_connections_per_gateway").Scan(&maxConnections)
+		require.NoError(t, err)
+		return maxConnections
+	}
+
+	setMaxConnections := func(maxConnections int) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.max_connections_per_gateway = $1", maxConnections)
+		require.NoError(t, err)
+	}
+
+	setMaxNonRootConnections := func(maxConnections int) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway = $1", maxConnections)
+		require.NoError(t, err)
+	}
+
+	setMaxNonRootConnectionsReason := func(reason string) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway_reason = $1", reason)
+		require.NoError(t, err)
+	}
+
+	createUser := func(user string, isAdmin bool) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %[1]s WITH PASSWORD '%[1]s'", user))
+		require.NoError(t, err)
+
+		if isAdmin {
+			_, err := conn.Exec(ctx, fmt.Sprintf("grant admin to %[1]s", user))
+			require.NoError(t, err)
+		}
+	}
+
+	// create nonAdmin
+	createUser(nonAdmin, false)
+	createUser(admin, true)
+	requireConnectionCount(t, 0)
+
+	// assert default value
+	require.Equal(t, -1, getMaxConnections())
+	requireConnectionCount(t, 0)
+
+	t.Run("0 max_connections", func(t *testing.T) {
+		setMaxConnections(0)
+		requireConnectionCount(t, 0)
+		// can't connect with nonAdmin
+		openConnWithUserError(nonAdmin)
+		requireConnectionCount(t, 0)
+		// can connect with admin
+		_, adminCleanup := openConnWithUserSuccess(admin)
+		requireConnectionCount(t, 1)
+		adminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("1 max_connections nonAdmin -> admin", func(t *testing.T) {
+		setMaxConnections(1)
+		requireConnectionCount(t, 0)
+		// can connect with nonAdmin
+		_, nonAdminCleanup := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 1)
+		// can connect with admin
+		_, adminCleanup := openConnWithUserSuccess(admin)
+		requireConnectionCount(t, 2)
+		adminCleanup()
+		requireConnectionCount(t, 1)
+		nonAdminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("1 max_connections admin -> nonAdmin", func(t *testing.T) {
+		setMaxConnections(1)
+		requireConnectionCount(t, 0)
+		// can connect with admin
+		_, adminCleanup := openConnWithUserSuccess(admin)
+		requireConnectionCount(t, 1)
+		// can't connect with nonAdmin
+		openConnWithUserError(nonAdmin)
+		requireConnectionCount(t, 1)
+		adminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("-1 max_connections", func(t *testing.T) {
+		setMaxConnections(-1)
+		requireConnectionCount(t, 0)
+		// can connect with multiple nonAdmin
+		_, nonAdminCleanup1 := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 1)
+		_, nonAdminCleanup2 := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 2)
+		// can connect with admin
+		_, adminCleanup := openConnWithUserSuccess(admin)
+		requireConnectionCount(t, 3)
+		adminCleanup()
+		requireConnectionCount(t, 2)
+		nonAdminCleanup1()
+		requireConnectionCount(t, 1)
+		nonAdminCleanup2()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("0 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can't connect with non root
+		openConnWithUserError(admin)
+		requireConnectionCount(t, 1)
+		rootCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("1 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(1)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can connect with non root
+		_, nonAdminCleanup := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 2)
+		rootCleanup()
+		nonAdminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("max_non_root_connections_reason", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		setMaxNonRootConnectionsReason("foobar")
+		requireConnectionCount(t, 0)
+		_, cleanup, err := openConnWithUser(admin)
+		defer cleanup()
+		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, pgcode.TooManyConnections.String(), pgErr.Code)
+		require.Regexp(t, "foobar", pgErr.Error())
+	})
+}
+
+func TestConnCloseReleasesReservedMem(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
+	before := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
+
+	pgURL, cleanupFunc := s.PGUrl(
+		t, serverutils.CertsDirPrefix("testConnClose"), serverutils.User(username.RootUser),
+	)
+	values := pgURL.Query()
+	values.Set("options", "c sadsad=") // invalid client-provided session param
+	pgURL.RawQuery = values.Encode()
+
+	defer cleanupFunc()
+	db, err := gosql.Open("postgres", pgURL.String())
+	require.NoError(t, err)
+	defer db.Close()
+
+	err = db.Ping()
+	require.Error(t, err)
+	require.Regexp(t, "pq: option .* is invalid", err.Error())
+
+	// Check that no accounted-for memory is leaked, after the connection attempt fails.
+	after := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
+	require.Equal(t, before, after)
+}
+
+// write unit tests for the function publishConnLatencyMetric
+func TestPublishConnLatencyMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := conn{
+		metrics: &tenantSpecificMetrics{
+			AuthJWTConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthJWTConnLatency, time.Hour)),
+			AuthCertConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthCertConnLatency, time.Hour)),
+			AuthPassConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthPassConnLatency, time.Hour)),
+			AuthLDAPConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthLDAPConnLatency, time.Hour)),
+			AuthGSSConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthGSSConnLatency, time.Hour)),
+			AuthScramConnLatency: metric.NewHistogram(
+				getHistogramOptionsForIOLatency(AuthScramConnLatency, time.Hour)),
+		},
+	}
+
+	// JWT Token Authentication
+	jwtDuration := int64(1)
+	c.publishConnLatencyMetric(jwtDuration, jwtHBAEntry.string())
+	w := c.metrics.AuthJWTConnLatency.WindowedSnapshot()
+	count, sum := w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(1), sum)
+
+	// republish on JWT
+	jwtDuration = int64(2)
+	c.publishConnLatencyMetric(jwtDuration, jwtHBAEntry.string())
+	w = c.metrics.AuthJWTConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(3), sum)
+
+	// Cert
+	certDuration := int64(3)
+	c.publishConnLatencyMetric(certDuration, certHBAEntry.string())
+	w = c.metrics.AuthCertConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(3), sum)
+
+	// republish on cert
+	certDuration = int64(2)
+	c.publishConnLatencyMetric(certDuration, certHBAEntry.string())
+	w = c.metrics.AuthCertConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(5), sum)
+
+	// Password
+	passDuration := int64(4)
+	c.publishConnLatencyMetric(passDuration, passwordHBAEntry.string())
+	w = c.metrics.AuthPassConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(4), sum)
+
+	// republish on pass
+	passDuration = int64(3)
+	c.publishConnLatencyMetric(passDuration, passwordHBAEntry.string())
+	w = c.metrics.AuthPassConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(7), sum)
+
+	// LDAP
+	ldapDuration := int64(5)
+	c.publishConnLatencyMetric(ldapDuration, ldapHBAEntry.string())
+	w = c.metrics.AuthLDAPConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(5), sum)
+
+	// republish on LDAP
+	ldapDuration = int64(2)
+	c.publishConnLatencyMetric(ldapDuration, ldapHBAEntry.string())
+	w = c.metrics.AuthLDAPConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(7), sum)
+
+	// GSS
+	gssDuration := int64(6)
+	c.publishConnLatencyMetric(gssDuration, gssHBAEntry.string())
+	w = c.metrics.AuthGSSConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(6), sum)
+
+	// republish on GSS
+	gssDuration = int64(3)
+	c.publishConnLatencyMetric(gssDuration, gssHBAEntry.string())
+	w = c.metrics.AuthGSSConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(9), sum)
+
+	// scram
+	scramDuration := int64(7)
+	c.publishConnLatencyMetric(scramDuration, scramSHA256HBAEntry.string())
+	w = c.metrics.AuthScramConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(1), count)
+	require.Equal(t, float64(7), sum)
+
+	// republish on scram
+	scramDuration = int64(2)
+	c.publishConnLatencyMetric(scramDuration, scramSHA256HBAEntry.string())
+	w = c.metrics.AuthScramConnLatency.WindowedSnapshot()
+	count, sum = w.Total()
+	require.Equal(t, int64(2), count)
+	require.Equal(t, float64(9), sum)
 }

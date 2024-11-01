@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -14,6 +9,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	geom "github.com/twpayne/go-geom"
 	"github.com/twpayne/go-geom/xy"
@@ -23,7 +20,10 @@ import (
 // possible number of nodes while preserving all of the input ones.
 func Node(g geo.Geometry) (geo.Geometry, error) {
 	if g.ShapeType() != geopb.ShapeType_LineString && g.ShapeType() != geopb.ShapeType_MultiLineString {
-		return geo.Geometry{}, errors.New("geometry type is unsupported. Please pass a LineString or a MultiLineString")
+		return geo.Geometry{}, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"geometry type is unsupported. Please pass a LineString or a MultiLineString",
+		)
 	}
 
 	// Return GEOMETRYCOLLECTION EMPTY if it is empty.
@@ -162,7 +162,7 @@ func extractEndpoints(g geo.Geometry) (geo.Geometry, error) {
 			}
 		}
 	default:
-		return geo.Geometry{}, errors.Newf("unsupported type: %T", gt)
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "unsupported type: %T", gt)
 	}
 
 	result, err := geo.MakeGeometryFromGeomT(mp)

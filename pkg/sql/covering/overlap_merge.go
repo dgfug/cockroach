@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package covering
 
@@ -73,9 +68,10 @@ type Covering []Range
 // returned as a `[]interface{}` and in the same order as they are in coverings.
 //
 // Example:
-//  covering 1: [1, 2) -> 'a', [3, 4) -> 'b', [6, 7) -> 'c'
-//  covering 2: [1, 5) -> 'd'
-//  output: [1, 2) -> 'ad', [2, 3) -> `d`, [3, 4) -> 'bd', [4, 5) -> 'd', [6, 7) -> 'c'
+//
+//	covering 1: [1, 2) -> 'a', [3, 4) -> 'b', [6, 7) -> 'c'
+//	covering 2: [1, 5) -> 'd'
+//	output: [1, 2) -> 'ad', [2, 3) -> `d`, [3, 4) -> 'bd', [4, 5) -> 'd', [6, 7) -> 'c'
 //
 // The input is mutated (sorted). It is also assumed (and not checked) to be
 // valid (e.g. non-overlapping intervals in each covering).

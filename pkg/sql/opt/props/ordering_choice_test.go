@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props_test
 
@@ -26,6 +21,11 @@ func TestOrderingChoice_FromOrdering(t *testing.T) {
 
 	oc.FromOrderingWithOptCols(opt.Ordering{1, -2, 3, 4, -5}, opt.MakeColSet(1, 3, 5))
 	if exp, actual := "-2,+4 opt(1,3,5)", oc.String(); exp != actual {
+		t.Errorf("expected %s, got %s", exp, actual)
+	}
+
+	oc.FromOrderingWithOptCols(opt.Ordering{1, 2, 3}, opt.MakeColSet(1, 2, 3))
+	if exp, actual := "", oc.String(); exp != actual {
 		t.Errorf("expected %s, got %s", exp, actual)
 	}
 }
@@ -155,6 +155,9 @@ func TestOrderingChoice_Intersection(t *testing.T) {
 		{left: "+1", right: "+2 opt(2)", expected: "NO"},
 		{left: "+1", right: "-1 opt(2)", expected: "NO"},
 		{left: "+(1|2),+(3|4)", right: "+(2|5),+(6|7)", expected: "NO"},
+		{left: "+1 opt(3)", right: "+2", expected: "NO"},
+		{left: "+1", right: "+2 opt(3)", expected: "NO"},
+		{left: "+1 opt(3)", right: "+2 opt(3)", expected: "NO"},
 
 		// Non-commutative cases.
 		{
@@ -236,6 +239,9 @@ func TestOrderingChoice_CommonPrefix(t *testing.T) {
 		{left: "+1", right: "", expected: ""},
 		{left: "+1 opt(2)", right: "", expected: ""},
 		{left: "+1", right: "+1", expected: "+1"},
+		{left: "+1 opt(3)", right: "+2", expected: ""},
+		{left: "+1", right: "+2 opt(3)", expected: ""},
+		{left: "+1 opt(3)", right: "+2 opt(3)", expected: ""},
 		{left: "+1,-2", right: "+1", expected: "+1"},
 		{left: "+1,-2", right: "+1,-2", expected: "+1,-2"},
 		{left: "+1", right: "+1 opt(2)", expected: "+1"},
@@ -614,7 +620,8 @@ func TestOrderingChoice_RestrictToCols(t *testing.T) {
 		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{1, 2, 4}, expected: "+1,+2,-4"},
 		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{1, 4, 5, 6}, expected: "+1 opt(5,6)"},
 		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{1, 3, 5}, expected: "+1,+3 opt(5)"},
-		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{2, 4, 5}, expected: "opt(5)"},
+		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{2, 4, 5}, expected: ""},
+		{s: "+1,+(2|3),-4 opt(5,6)", cols: []opt.ColumnID{5, 6}, expected: ""},
 	}
 
 	for _, tc := range testcases {

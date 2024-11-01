@@ -1,19 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostserver
 
 import (
 	"context"
-	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -25,29 +22,30 @@ import (
 // of the TenantUsageServer interface; see that for more details.
 func (s *instance) ReconfigureTokenBucket(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	tenantID roachpb.TenantID,
-	availableRU float64,
+	availableTokens float64,
 	refillRate float64,
-	maxBurstRU float64,
-	asOf time.Time,
-	asOfConsumedRequestUnits float64,
+	maxBurstTokens float64,
 ) error {
 	if err := s.checkTenantID(ctx, txn, tenantID); err != nil {
 		return err
 	}
-	h := makeSysTableHelper(ctx, s.executor, txn, tenantID)
-	state, err := h.readTenantState()
+
+	// Check whether the consumption rates migration has run. If not, then do not
+	// attempt to write the new rates columns.
+	// TODO(andyk): Remove this after 24.3.
+	ratesAvailable := s.settings.Version.IsActive(ctx, clusterversion.V24_2_TenantRates)
+
+	h := makeSysTableHelper(ctx, tenantID, ratesAvailable)
+	state, err := h.readTenantState(txn)
 	if err != nil {
 		return err
 	}
 	now := s.timeSource.Now()
 	state.update(now)
-	state.Bucket.Reconfigure(
-		availableRU, refillRate, maxBurstRU, asOf, asOfConsumedRequestUnits,
-		now, state.Consumption.RU,
-	)
-	if err := h.updateTenantState(state); err != nil {
+	state.Bucket.Reconfigure(ctx, tenantID, availableTokens, refillRate, maxBurstTokens)
+	if err := h.updateTenantAndInstanceState(txn, &state, nil); err != nil {
 		return err
 	}
 	return nil
@@ -55,10 +53,10 @@ func (s *instance) ReconfigureTokenBucket(
 
 // checkTenantID verifies that the tenant exists and is active.
 func (s *instance) checkTenantID(
-	ctx context.Context, txn *kv.Txn, tenantID roachpb.TenantID,
+	ctx context.Context, txn isql.Txn, tenantID roachpb.TenantID,
 ) error {
-	row, err := s.executor.QueryRowEx(
-		ctx, "check-tenant", txn, sessiondata.NodeUserSessionDataOverride,
+	row, err := txn.QueryRowEx(
+		ctx, "check-tenant", txn.KV(), sessiondata.NodeUserSessionDataOverride,
 		`SELECT active FROM system.tenants WHERE id = $1`, tenantID.ToUint64(),
 	)
 	if err != nil {

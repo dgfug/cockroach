@@ -1,28 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { Loading, util } from "@cockroachlabs/cluster-ui";
+import isEmpty from "lodash/isEmpty";
+import map from "lodash/map";
+import orderBy from "lodash/orderBy";
 import React from "react";
 
 import * as protos from "src/js/protos";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { FixLong } from "src/util/fixLong";
 import Print from "src/views/reports/containers/range/print";
-import { Loading } from "@cockroachlabs/cluster-ui";
-import { TimestampToMoment } from "src/util/convert";
 
 interface LogTableProps {
   rangeID: Long;
-  log: CachedDataReducerState<
-    protos.cockroach.server.serverpb.RangeLogResponse
-  >;
+  log: CachedDataReducerState<protos.cockroach.server.serverpb.RangeLogResponse>;
 }
 
 function printLogEventType(
@@ -42,6 +36,9 @@ function printLogEventType(
       return "Split";
     case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.merge:
       return "Merge";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType
+      .unsafe_quorum_recovery:
+      return "Unsafe Quorum Recovery";
     default:
       return "Unknown";
   }
@@ -68,7 +65,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
   }
 
   renderLogInfoDescriptor(title: string, desc: string) {
-    if (_.isEmpty(desc)) {
+    if (isEmpty(desc)) {
       return null;
     }
     return (
@@ -100,9 +97,9 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
     const { log } = this.props;
 
     // Sort by descending timestamp.
-    const events = _.orderBy(
+    const events = orderBy(
       log && log.data && log.data.events,
-      event => TimestampToMoment(event.event.timestamp).valueOf(),
+      event => util.TimestampToMoment(event.event.timestamp).valueOf(),
       "desc",
     );
 
@@ -123,7 +120,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
             </th>
             <th className="log-table__cell log-table__cell--header">Info</th>
           </tr>
-          {_.map(events, (event, key) => (
+          {map(events, (event, key) => (
             <tr key={key} className="log-table__row">
               <td className="log-table__cell log-table__cell--date">
                 {Print.Timestamp(event.event.timestamp)}
@@ -156,6 +153,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
         <h2 className="base-heading">Range Log</h2>
         <Loading
           loading={!log || log.inFlight}
+          page={"log table"}
           error={log && log.lastError}
           render={this.renderContent}
         />

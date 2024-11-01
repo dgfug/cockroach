@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2016 The Oklog Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -618,8 +613,7 @@ func TestMonotonicSafe(t *testing.T) {
 	errs := make(chan error, 100)
 	for i := 0; i < cap(errs); i++ {
 		go func() {
-			u0 := ulid.MustNew(t0, safe)
-			u1 := ulid.MustNew(t0, safe)
+			var u0, u1 ulid.ULID
 			for j := 0; j < 1024; j++ {
 				u0, u1 = u1, ulid.MustNew(t0, safe)
 				if u0.String() >= u1.String() {

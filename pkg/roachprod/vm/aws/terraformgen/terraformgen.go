@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Command terraformgen generate the terraform file used to configure AWS for
 // multiregion support.
@@ -30,7 +25,7 @@ var templates = []struct {
 # TERRAFORM SETTINGS
 # ---------------------------------------------------------------------------------------------------------------------
 terraform {
-  required_version = ">= 0.11.8"
+  required_version = ">= 0.14"
   backend "s3" {
     key            = "terraform/{{ .ResourcePrefix }}"
     bucket         = "{{ .ResourcePrefix }}-cloud-state"
@@ -55,17 +50,14 @@ locals {
 provider "aws" {
   alias   = "{{ $.Resource . }}"
   region  = "{{ . }}"
-
-  # Fixed fields, DO NOT MODIFY.
-  version = "~> 1.41"
 }
 
 module "aws_{{ $.Resource . }}" {
-  providers {
-    aws  = "aws.{{ $.Resource . }}"
+  providers = {
+    aws  = aws.{{ $.Resource . }}
   }
   region = {{ . | printf "%q" }}
-  source = "aws-region"
+  source = "./aws-region"
   label  = {{ $.ResourcePrefix | printf "%q" }}
 }
 {{ end }}`},
@@ -73,25 +65,26 @@ module "aws_{{ $.Resource . }}" {
 	{"peerings",
 		`{{ range  .Peerings }}
 module "vpc_peer_{{index . 0 }}-{{ index . 1 }}" {
-  providers {
-    aws.owner    = "aws.{{ index . 0 }}"
-    aws.peer     = "aws.{{ index . 1 }}"
+  providers = {
+    aws.owner    = aws.{{ index . 0 }}
+    aws.peer     = aws.{{ index . 1 }}
   }
   owner_vpc_info = "${module.aws_{{index . 0}}.vpc_info}"
   peer_vpc_info  = "${module.aws_{{index . 1}}.vpc_info}"
 
   label          = {{ $.ResourcePrefix | printf "%q" }}
-  source         = "aws-vpc-peer"
+  source         = "./aws-vpc-peer"
 }
 {{ end }}
 `},
 
 	{"output",
 		`output "regions" {
-  value = "${list({{- range $index, $el := .Regions }}{{ if $index }},{{end}}
+  value = "${tolist([
+		{{- range $index, $el := .Regions }}{{ if $index }},{{end}}
     "${module.aws_{{ $.Resource . }}.region_info}"
     {{- end }}
-  )}"
+  ])}"
 }
 `},
 	{"terraform",

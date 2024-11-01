@@ -18,7 +18,7 @@ system "$argv init --insecure --host=localhost --cluster-name=foo"
 end_test
 
 start_test "Check that decommission works with a cluster-name provided"
-send "$argv node decommission 1 --insecure --host=localhost --wait=none --cluster-name=foo\r"
+send "$argv node decommission 1 --insecure --host=localhost --checks=skip --wait=none --cluster-name=foo\r"
 end_test
 
 start_test "Check that recommission works with cluster name verification disabled"
@@ -29,8 +29,8 @@ start_test "Check that debug commands work with a cluster name provided"
 send "$argv debug gossip-values --insecure --host=localhost --cluster-name=foo\r"
 end_test
 
-start_test "Check that quit works with a cluster-name provided"
-send "$argv quit --insecure --host=localhost --wait=none --cluster-name=foo\r"
+start_test "Check that node drain works with a cluster-name provided"
+send "$argv node drain 1 --insecure --host=localhost --cluster-name=foo\r"
 end_test
 
 stop_server $argv

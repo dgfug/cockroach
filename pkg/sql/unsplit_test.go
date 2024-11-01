@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -19,8 +14,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -31,7 +24,7 @@ func TestUnsplitAt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	// TODO(jeffreyxiao): Disable the merge queue due to a race condition. The
 	// merge queue might issue an AdminMerge and before the actual merge happens,
 	// the LHS of the merge is manually split and is later merged even though a
@@ -156,7 +149,7 @@ func TestUnsplitAt(t *testing.T) {
 		{
 			unsplitStmt: "ALTER TABLE d.i UNSPLIT AT VALUES ($1)",
 			args:        []interface{}{"blah"},
-			error:       "error in argument for $1: strconv.ParseInt",
+			error:       "error in argument for $1: could not parse \"blah\" as type int: strconv.ParseInt",
 		},
 		{
 			unsplitStmt: "ALTER TABLE d.i UNSPLIT AT VALUES ($1::string)",
@@ -203,12 +196,12 @@ func TestUnsplitAt(t *testing.T) {
 					t.Fatalf("%s: unexpected error: %s", tt.unsplitStmt, err)
 				}
 				// Successful unsplit, verify it happened.
-				rng, err := s.(*server.TestServer).LookupRange(key)
+				rng, err := s.LookupRange(key)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !rng.GetStickyBit().IsEmpty() {
-					t.Fatalf("%s: expected range sticky bit to be hlc.MinTimestamp, got %s", tt.unsplitStmt, rng.GetStickyBit())
+				if !rng.StickyBit.IsEmpty() {
+					t.Fatalf("%s: expected range sticky bit to be hlc.MinTimestamp, got %s", tt.unsplitStmt, rng.StickyBit)
 				}
 			}
 			if err := rows.Err(); err != nil {

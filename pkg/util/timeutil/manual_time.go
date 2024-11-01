@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
 import (
 	"container/heap"
 	"container/list"
+	"fmt"
 	"sort"
 	"time"
 
@@ -84,11 +80,37 @@ func (m *ManualTime) Advance(duration time.Duration) {
 	m.AdvanceTo(m.Now().Add(duration))
 }
 
+// Backwards moves the clock back by duration. Duration is expected to be
+// positive, and it will be subtracted from the current time.
+func (m *ManualTime) Backwards(duration time.Duration) {
+	if duration < 0 {
+		panic("invalid negative duration")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// No timers fire when the clock goes backwards.
+	m.mu.now = m.mu.now.Add(-duration)
+}
+
 // AdvanceTo advances the current time to t. If t is earlier than the current
 // time then AdvanceTo is a no-op.
 func (m *ManualTime) AdvanceTo(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.advanceToLocked(now)
+}
+
+// MustAdvanceTo is like AdvanceTo, except it panics if now is below m's current time.
+func (m *ManualTime) MustAdvanceTo(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now.Before(m.mu.now) {
+		panic(fmt.Sprintf("attempting to move ManualTime backwards from %s to %s", m.mu.now, now))
+	}
+	m.advanceToLocked(now)
+}
+
+func (m *ManualTime) advanceToLocked(now time.Time) {
 	if !now.After(m.mu.now) {
 		return
 	}

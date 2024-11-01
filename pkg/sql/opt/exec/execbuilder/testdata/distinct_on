@@ -95,7 +95,6 @@ vectorized: true
 ·
 • sort
 │ columns: (b)
-│ ordering: +b
 │ estimated row count: 1,000 (missing stats)
 │ order: +b
 │
@@ -254,17 +253,16 @@ vectorized: true
 • project
 │ columns: (a, c)
 │ ordering: +a
-│ estimated row count: 100 (missing stats)
 │
 └── • distinct
     │ columns: (a, b, c)
     │ ordering: +a
+    │ estimated row count: 100 (missing stats)
     │ distinct on: a
     │ order key: a
     │
     └── • sort
         │ columns: (a, b, c)
-        │ ordering: +a,-c,+b
         │ estimated row count: 1,000 (missing stats)
         │ order: +a,-c,+b
         │ already ordered: +a
@@ -288,7 +286,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x)
-│ ordering: -x
 │ estimated row count: 100 (missing stats)
 │ order: -x
 │
@@ -311,7 +308,6 @@ vectorized: true
 ·
 • sort
 │ columns: (y, z, x)
-│ ordering: +z
 │ estimated row count: 1,000 (missing stats)
 │ order: +z
 │
@@ -341,7 +337,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (x, y, z)
-    │ ordering: +x,-z,-y
     │ estimated row count: 1,000 (missing stats)
     │ order: +x,-z,-y
     │
@@ -424,11 +419,9 @@ vectorized: true
 ·
 • project
 │ columns: (min)
-│ estimated row count: 1 (missing stats)
 │
 └── • limit
     │ columns: (y, min)
-    │ estimated row count: 1 (missing stats)
     │ count: 1
     │
     └── • filter
@@ -585,7 +578,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y, z)
-│ ordering: +x,+y
 │ estimated row count: 1,000 (missing stats)
 │ order: +x,+y
 │
@@ -606,7 +598,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (x, y, z, pk1)
-    │ ordering: +x
     │ estimated row count: 1,000 (missing stats)
     │ order: +x
     │
@@ -630,7 +621,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (x, y)
-│ ordering: +y
 │ estimated row count: 1 (missing stats)
 │ order: +y
 │ k: 1
@@ -662,7 +652,6 @@ vectorized: true
     │
     └── • top-k
         │ columns: (x, y)
-        │ ordering: +y
         │ estimated row count: 1 (missing stats)
         │ order: +y
         │ k: 1

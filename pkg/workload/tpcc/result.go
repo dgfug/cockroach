@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpcc
 
@@ -14,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram/exporter"
 	"github.com/cockroachdb/errors"
 	"github.com/codahale/hdrhistogram"
 )
@@ -31,12 +27,11 @@ const SpecWarehouseFactor = 12.86
 // The 12.605 is computed from the operation mix and the number of secs
 // it takes to cycle through a deck:
 //
-//   10*(18+12) + 10*(3+12) + 1*(2+10) + 1*(2+5) + 1*(2+5) = 476
+//	10*(18+12) + 10*(3+12) + 1*(2+10) + 1*(2+5) + 1*(2+5) = 476
 //
 // 10 workers per warehouse times 10 newOrder ops per deck results in:
 //
-//   (10*10)/(476/60) = 12.605...
-//
+//	(10*10)/(476/60) = 12.605...
 const DeckWarehouseFactor = 12.605
 
 // PassingEfficiency is a percentage of the theoretical maximum tpmC required
@@ -125,7 +120,7 @@ func NewResult(
 // NewResultWithSnapshots creates a new result from a deserialized set of
 // histogram snapshots.
 func NewResultWithSnapshots(
-	activeWarehouses int, warehouseFactor float64, snapshots map[string][]histogram.SnapshotTick,
+	activeWarehouses int, warehouseFactor float64, snapshots map[string][]exporter.SnapshotTick,
 ) *Result {
 	var start time.Time
 	var end time.Time

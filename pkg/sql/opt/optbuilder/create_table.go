@@ -1,19 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -38,10 +34,10 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		// resolved correctly.
 		// TODO(solon): Once it is possible to drop schemas, it will no longer be
 		// safe to set the schema name to `public`, as it may have been dropped.
-		ct.Table.ObjectNamePrefix.SchemaName = tree.PublicSchemaName
+		ct.Table.ObjectNamePrefix.SchemaName = catconstants.PublicSchemaName
 		ct.Persistence = tree.PersistenceTemporary
 	}
-	sch, resName := b.resolveSchemaForCreate(&ct.Table)
+	sch, resName := b.resolveSchemaForCreateTable(&ct.Table)
 	ct.Table.ObjectNamePrefix = resName
 	schID := b.factory.Metadata().AddSchema(sch)
 
@@ -81,7 +77,7 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		input = outScope.expr
 		if !ct.AsHasUserSpecifiedPrimaryKey() {
 			// Synthesize rowid column, and append to end of column list.
-			props, overloads := builtins.GetBuiltinProperties("unique_rowid")
+			props, overloads := builtinsregistry.GetBuiltinProperties("unique_rowid")
 			private := &memo.FunctionPrivate{
 				Name:       "unique_rowid",
 				Typ:        types.Int,

@@ -1,24 +1,17 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package team involves processing team information based on a yaml
 // file containing team metadata.
 package team
 
 import (
+	_ "embed"
 	"io"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/reporoot"
 	"github.com/cockroachdb/errors"
 	"gopkg.in/yaml.v2"
 )
@@ -33,12 +26,16 @@ type Team struct {
 	// Aliases is a map from additional team name to purpose for which to use
 	// them. The purpose "other" indicates a team that exists but which has no
 	// particular purpose as far as `teams` is concerned (for example, teams like
-	// the @cockroachdb/bulk-prs team which exists primarily to route, via
-	// CODEOWNERS, code reviews for the @cockroachdb/bulk-io team). This map
+	// the @cockroachdb/kv-prs team which exists primarily to route, via
+	// CODEOWNERS, code reviews for the @cockroachdb/kv team). This map
 	// does not contain TeamName.
 	Aliases map[Alias]Purpose `yaml:"aliases"`
+	// GitHub label will be added to issues posted for this team.
+	Label string `yaml:"label"`
 	// TriageColumnID is the GitHub Column ID to assign issues to.
 	TriageColumnID int `yaml:"triage_column_id"`
+	// SilenceMentions is true if @-mentions should be supressed for this team.
+	SilenceMentions bool `yaml:"silence_mentions"`
 	// Email is the email address for this team.
 	//
 	// Currently unused.
@@ -81,19 +78,14 @@ func (m Map) GetAliasesForPurpose(alias Alias, purpose Purpose) ([]Alias, bool) 
 	return sl, true
 }
 
+//go:generate cp ../../../TEAMS.yaml TEAMS.yaml
+
+//go:embed TEAMS.yaml
+var teamsYaml string
+
 // DefaultLoadTeams loads teams from the repo root's TEAMS.yaml.
 func DefaultLoadTeams() (Map, error) {
-	path := reporoot.GetFor(".", "TEAMS.yaml")
-	if path == "" {
-		return nil, errors.New("TEAMS.yaml not found")
-	}
-	path = filepath.Join(path, "TEAMS.yaml")
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	return LoadTeams(f)
+	return LoadTeams(strings.NewReader(teamsYaml))
 }
 
 // Purpose determines which alias to return for a given team via
@@ -115,7 +107,7 @@ var validPurposes = map[Purpose]struct{}{
 // LoadTeams loads the teams from an io input.
 // It is expected the input is in YAML format.
 func LoadTeams(f io.Reader) (Map, error) {
-	b, err := ioutil.ReadAll(f)
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}

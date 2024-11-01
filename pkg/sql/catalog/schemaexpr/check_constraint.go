@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -15,9 +10,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -75,7 +72,7 @@ func (b *CheckConstraintBuilder) MarkNameInUse(name string) {
 // Note that mutable functions are currently allowed, unlike in partial index
 // predicates, but using them can lead to unexpected behavior.
 func (b *CheckConstraintBuilder) Build(
-	c *tree.CheckConstraintTableDef,
+	c *tree.CheckConstraintTableDef, version clusterversion.ClusterVersion,
 ) (*descpb.TableDescriptor_CheckConstraint, error) {
 	name := string(c.Name)
 
@@ -94,20 +91,23 @@ func (b *CheckConstraintBuilder) Build(
 		b.desc,
 		c.Expr,
 		types.Bool,
-		"CHECK",
+		tree.CheckConstraintExpr,
 		b.semaCtx,
-		tree.VolatilityVolatile,
+		volatility.Volatile,
 		&b.tableName,
+		version,
 	)
 	if err != nil {
 		return nil, err
 	}
-
+	constraintID := b.desc.TableDesc().GetNextConstraintID()
+	b.desc.TableDesc().NextConstraintID++
 	return &descpb.TableDescriptor_CheckConstraint{
-		Expr:      expr,
-		Name:      name,
-		ColumnIDs: colIDs.Ordered(),
-		Hidden:    c.Hidden,
+		Expr:                  expr,
+		Name:                  name,
+		ColumnIDs:             colIDs.Ordered(),
+		FromHashShardedColumn: c.FromHashShardedColumn,
+		ConstraintID:          constraintID,
 	}, nil
 }
 
@@ -151,9 +151,9 @@ func (b *CheckConstraintBuilder) generateUniqueName(expr tree.Expr) (string, err
 //
 // For example:
 //
-//   CHECK (a < 0) => check_a
-//   CHECK (a < 0 AND b = 'foo') => check_a_b
-//   CHECK (a < 0 AND b = 'foo' AND a < 10) => check_a_b_a
+//	CHECK (a < 0) => check_a
+//	CHECK (a < 0 AND b = 'foo') => check_a_b
+//	CHECK (a < 0 AND b = 'foo' AND a < 10) => check_a_b_a
 //
 // Note that the generated name is not guaranteed to be unique among the other
 // constraints of the table.

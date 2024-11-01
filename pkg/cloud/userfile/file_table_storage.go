@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package userfile
 
@@ -21,13 +16,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/cloud/userfile/filetable"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 )
@@ -38,12 +32,15 @@ const (
 	DefaultQualifiedNamespace = "defaultdb.public."
 	// DefaultQualifiedNamePrefix is the default FQN table name prefix.
 	DefaultQualifiedNamePrefix = "userfiles_"
+
+	scheme = "userfile"
 )
 
 func parseUserfileURL(
 	args cloud.ExternalStorageURIContext, uri *url.URL,
-) (roachpb.ExternalStorage, error) {
-	conf := roachpb.ExternalStorage{}
+) (cloudpb.ExternalStorage, error) {
+	userfileURL := cloud.ConsumeURL{URL: uri}
+	conf := cloudpb.ExternalStorage{}
 	qualifiedTableName := uri.Host
 	if args.CurrentUser.Undefined() {
 		return conf, errors.Errorf("user creating the FileTable ExternalStorage must be specified")
@@ -53,26 +50,31 @@ func parseUserfileURL(
 	// If the import statement does not specify a qualified table name then use
 	// the default to attempt to locate the file(s).
 	if qualifiedTableName == "" {
-		composedTableName := security.MakeSQLUsernameFromPreNormalizedString(
+		composedTableName := username.MakeSQLUsernameFromPreNormalizedString(
 			DefaultQualifiedNamePrefix + normUser)
 		qualifiedTableName = DefaultQualifiedNamespace +
 			// Escape special identifiers as needed.
 			composedTableName.SQLIdentifier()
 	}
 
-	conf.Provider = roachpb.ExternalStorageProvider_userfile
+	conf.Provider = cloudpb.ExternalStorageProvider_userfile
 	conf.FileTableConfig.User = normUser
 	conf.FileTableConfig.QualifiedTableName = qualifiedTableName
 	conf.FileTableConfig.Path = uri.Path
+
+	// Validate that all the passed in parameters are supported.
+	if unknownParams := userfileURL.RemainingQueryParams(); len(unknownParams) > 0 {
+		return cloudpb.ExternalStorage{}, errors.Errorf(
+			`unknown userfile query parameters: %s`, strings.Join(unknownParams, ", "))
+	}
+
 	return conf, nil
 }
 
 type fileTableStorage struct {
 	fs       *filetable.FileToTableSystem
-	cfg      roachpb.ExternalStorage_FileTable
+	cfg      cloudpb.ExternalStorage_FileTable
 	ioConf   base.ExternalIODirConfig
-	db       *kv.DB
-	ie       sqlutil.InternalExecutor
 	prefix   string // relative filepath
 	settings *cluster.Settings
 }
@@ -80,7 +82,7 @@ type fileTableStorage struct {
 var _ cloud.ExternalStorage = &fileTableStorage{}
 
 func makeFileTableStorage(
-	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest cloudpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.filetable")
 
@@ -110,10 +112,11 @@ func makeFileTableStorage(
 	}
 
 	// cfg.User is already a normalized SQL username.
-	username := security.MakeSQLUsernameFromPreNormalizedString(cfg.User)
-	executor := filetable.MakeInternalFileToTableExecutor(args.InternalExecutor, args.DB)
+	user := username.MakeSQLUsernameFromPreNormalizedString(cfg.User)
+	executor := filetable.MakeInternalFileToTableExecutor(args.DB)
+
 	fileToTableSystem, err := filetable.NewFileToTableSystem(ctx,
-		cfg.QualifiedTableName, executor, username)
+		cfg.QualifiedTableName, executor, user)
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +124,6 @@ func makeFileTableStorage(
 		fs:       fileToTableSystem,
 		cfg:      cfg,
 		ioConf:   args.IOConf,
-		db:       args.DB,
-		ie:       args.InternalExecutor,
 		prefix:   cfg.Path,
 		settings: args.Settings,
 	}, nil
@@ -133,15 +134,15 @@ func makeFileTableStorage(
 // interact with the underlying FileToTableSystem. It only supports a subset of
 // methods compared to the internal SQL connection backed FileTableStorage.
 func MakeSQLConnFileTableStorage(
-	ctx context.Context, cfg roachpb.ExternalStorage_FileTable, conn cloud.SQLConnI,
+	ctx context.Context, cfg cloudpb.ExternalStorage_FileTable, conn cloud.SQLConnI,
 ) (cloud.ExternalStorage, error) {
 	executor := filetable.MakeSQLConnFileToTableExecutor(conn)
 
 	// cfg.User is already a normalized username,
-	username := security.MakeSQLUsernameFromPreNormalizedString(cfg.User)
+	user := username.MakeSQLUsernameFromPreNormalizedString(cfg.User)
 
 	fileToTableSystem, err := filetable.NewFileToTableSystem(ctx,
-		cfg.QualifiedTableName, executor, username)
+		cfg.QualifiedTableName, executor, user)
 	if err != nil {
 		return nil, err
 	}
@@ -171,9 +172,9 @@ func (f *fileTableStorage) Close() error {
 
 // Conf implements the ExternalStorage interface and returns the FileTable
 // configuration.
-func (f *fileTableStorage) Conf() roachpb.ExternalStorage {
-	return roachpb.ExternalStorage{
-		Provider:        roachpb.ExternalStorageProvider_userfile,
+func (f *fileTableStorage) Conf() cloudpb.ExternalStorage {
+	return cloudpb.ExternalStorage{
+		Provider:        cloudpb.ExternalStorageProvider_userfile,
 		FileTableConfig: f.cfg,
 	}
 }
@@ -183,6 +184,8 @@ func (f *fileTableStorage) Conf() roachpb.ExternalStorage {
 func (f *fileTableStorage) ExternalIOConf() base.ExternalIODirConfig {
 	return f.ioConf
 }
+
+func (f *fileTableStorage) RequiresExternalIOAccounting() bool { return false }
 
 func (f *fileTableStorage) Settings() *cluster.Settings {
 	return f.settings
@@ -205,22 +208,16 @@ func checkBaseAndJoinFilePath(prefix, basename string) (string, error) {
 	return path.Join(prefix, basename), nil
 }
 
-// ReadFile is shorthand for ReadFileAt with offset 0.
-func (f *fileTableStorage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
-	body, _, err := f.ReadFileAt(ctx, basename, 0)
-	return body, err
-}
-
 // ReadFile implements the ExternalStorage interface and returns the contents of
 // the file stored in the user scoped FileToTableSystem.
-func (f *fileTableStorage) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
-) (io.ReadCloser, int64, error) {
+func (f *fileTableStorage) ReadFile(
+	ctx context.Context, basename string, opts cloud.ReadOptions,
+) (ioctx.ReadCloserCtx, int64, error) {
 	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
 	if err != nil {
 		return nil, 0, err
 	}
-	reader, size, err := f.fs.ReadFile(ctx, filepath, offset)
+	reader, size, err := f.fs.ReadFile(ctx, filepath, opts.Offset)
 	if oserror.IsNotExist(err) {
 		return nil, 0, errors.Wrapf(cloud.ErrFileDoesNotExist,
 			"file %s does not exist in the UserFileTableSystem", filepath)
@@ -235,12 +232,6 @@ func (f *fileTableStorage) Writer(ctx context.Context, basename string) (io.Writ
 	filepath, err := checkBaseAndJoinFilePath(f.prefix, basename)
 	if err != nil {
 		return nil, err
-	}
-
-	// This is only possible if the method is invoked by a SQLConnFileTableStorage
-	// which should never be the case.
-	if f.ie == nil {
-		return nil, errors.New("cannot Write without a configured internal executor")
 	}
 
 	return f.fs.NewFileWriter(ctx, filepath, filetable.ChunkDefaultSize)
@@ -259,7 +250,6 @@ func (f *fileTableStorage) List(
 
 	sort.Strings(res)
 	var prevPrefix string
-
 	for _, f := range res {
 		f = strings.TrimPrefix(f, dest)
 		if delim != "" {
@@ -300,6 +290,11 @@ func (f *fileTableStorage) Size(ctx context.Context, basename string) (int64, er
 }
 
 func init() {
-	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_userfile,
-		parseUserfileURL, makeFileTableStorage, cloud.RedactedParams(), "userfile")
+	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_userfile,
+		cloud.RegisteredProvider{
+			ConstructFn:    makeFileTableStorage,
+			ParseFn:        parseUserfileURL,
+			RedactedParams: cloud.RedactedParams(),
+			Schemes:        []string{scheme},
+		})
 }

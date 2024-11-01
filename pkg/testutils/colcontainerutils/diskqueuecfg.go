@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colcontainerutils
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
@@ -27,41 +23,37 @@ func NewTestingDiskQueueCfg(t testing.TB, inMem bool) (colcontainer.DiskQueueCfg
 	t.Helper()
 
 	var (
-		cfg       colcontainer.DiskQueueCfg
-		cleanup   func()
-		testingFS fs.FS
-		path      string
+		cfg     colcontainer.DiskQueueCfg
+		cleanup []func()
+		path    string
+		fsEnv   *fs.Env
 	)
 
 	if inMem {
-		ngn := storage.NewDefaultInMemForTesting()
-		testingFS = ngn.(fs.FS)
-		if err := testingFS.MkdirAll(inMemDirName); err != nil {
-			t.Fatal(err)
-		}
+		fsEnv = storage.InMemory()
 		path = inMemDirName
-		cleanup = ngn.Close
 	} else {
-		tempPath, dirCleanup := testutils.TempDir(t)
-		path = tempPath
-		ngn, err := storage.Open(
-			context.Background(),
-			storage.Filesystem(tempPath),
-			storage.CacheSize(0))
-		if err != nil {
+		var cleanupFunc func()
+		path, cleanupFunc = testutils.TempDir(t)
+		fsEnv = fs.MustInitPhysicalTestingEnv(path)
+		cleanup = append(cleanup, cleanupFunc)
+	}
+
+	if inMem {
+		if err := fsEnv.MkdirAll(inMemDirName, os.ModePerm); err != nil {
 			t.Fatal(err)
-		}
-		testingFS = ngn
-		cleanup = func() {
-			ngn.Close()
-			dirCleanup()
 		}
 	}
-	cfg.FS = testingFS
+
+	cleanup = append(cleanup, fsEnv.Close)
+	cfg.FS = fsEnv
 	cfg.GetPather = colcontainer.GetPatherFunc(func(context.Context) string { return path })
 	if err := cfg.EnsureDefaults(); err != nil {
 		t.Fatal(err)
 	}
-
-	return cfg, cleanup
+	return cfg, func() {
+		for _, f := range cleanup {
+			f()
+		}
+	}
 }

@@ -7,13 +7,16 @@ go_library(
         "column_meta.go",
         "constants.go",
         "doc.go",
+        "locking.go",
         "metadata.go",
         "operator.go",
         "ordering.go",
+        "panic_injection.go",
         "rule_name.go",
+        "schema_dependencies.go",
         "table_meta.go",
         "telemetry.go",
-        "view_dependencies.go",
+        "values.go",
         ":gen-operator",  # keep
         ":gen-rulenames",  # keep
         ":gen-rulenames-stringer",  # keep
@@ -22,17 +25,29 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/server/telemetry",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/colinfo",
+        "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/multiregion",
         "//pkg/sql/opt/cat",
+        "//pkg/sql/opt/partition",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
+        "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",
+        "//pkg/sql/sem/tree/treecmp",
         "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
         "//pkg/util",
+        "//pkg/util/buildutil",
+        "//pkg/util/intsets",
         "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
     ],
 )
@@ -42,21 +57,42 @@ go_test(
     size = "small",
     srcs = [
         "colset_test.go",
+        "main_test.go",
         "metadata_test.go",
+        "operator_agg_test.go",
         "operator_test.go",
         "ordering_test.go",
     ],
+    data = [
+        "//c-deps:libgeos",
+    ],
     embed = [":opt"],
     deps = [
+        "//pkg/base",
+        "//pkg/roachpb",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
+        "//pkg/server",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/descpb",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
+        "//pkg/sql/opt/props",
         "//pkg/sql/opt/testutils/testcat",
         "//pkg/sql/privilege",
+        "//pkg/sql/randgen",
+        "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/util",
+        "//pkg/testutils/serverutils",
+        "//pkg/testutils/sqlutils",
+        "//pkg/util/intsets",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
+        "//pkg/util/randutil",
+        "@com_github_stretchr_testify//require",
     ],
 )
 
@@ -75,7 +111,11 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ ops $(locations :ops)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 # Define the generator for the enumeration of rulenames.
@@ -91,7 +131,11 @@ genrule(
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ rulenames \
           $(locations :ops) $(locations //pkg/sql/opt/norm:rules) $(locations //pkg/sql/opt/xform:rules)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 # Define the generator for the stringification of rulenames.
@@ -106,21 +150,16 @@ genrule(
         ":gen-rulenames",
     ],
     outs = ["rule_name_string.go"],
-    # golang.org/x/tools executes commands via
-    # golang.org/x/sys/execabs which requires all PATH lookups to
-    # result in absolute paths. To account for this, we resolve the
-    # relative path returned by location to an absolute path.
     cmd = """
       cp $(location rule_name.go) `dirname $(location :gen-rulenames)`/rule_name.go
-      GO_REL_PATH=`dirname $(location @go_sdk//:bin/go)`
-      GO_ABS_PATH=`cd $$GO_REL_PATH && pwd`
-      # Set GOPATH to something to workaround https://github.com/golang/go/issues/43938
-      env PATH=$$GO_ABS_PATH HOME=$(GENDIR) GOPATH=/nonexist-gopath \
-      $(location @com_github_cockroachdb_tools//cmd/stringer:stringer) -output=$@ \
-      -type=RuleName `dirname $(location :gen-rulenames)`/rule_name.go $(location :gen-rulenames)
+      $(location //pkg/build/bazel/util/tinystringer) -output=$@ \
+          -type=RuleName `dirname $(location :gen-rulenames)`/rule_name.go $(location :gen-rulenames)
     """,
-    exec_tools = [
-        "@go_sdk//:bin/go",
-        "@com_github_cockroachdb_tools//cmd/stringer",
+    tools = [
+        "//pkg/build/bazel/util/tinystringer",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )

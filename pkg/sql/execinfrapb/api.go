@@ -1,20 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfrapb
 
 import (
 	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -50,9 +45,9 @@ func (f FlowID) IsUnset() bool {
 // DistSQLVersion identifies DistSQL engine versions.
 type DistSQLVersion uint32
 
-// MakeEvalContext serializes some of the fields of a tree.EvalContext into a
+// MakeEvalContext serializes some of the fields of a eval.Context into a
 // execinfrapb.EvalContext proto.
-func MakeEvalContext(evalCtx *tree.EvalContext) EvalContext {
+func MakeEvalContext(evalCtx *eval.Context) EvalContext {
 	sessionDataProto := evalCtx.SessionData().SessionData
 	sessiondata.MarshalNonLocal(evalCtx.SessionData(), &sessionDataProto)
 	return EvalContext{
@@ -63,31 +58,30 @@ func MakeEvalContext(evalCtx *tree.EvalContext) EvalContext {
 }
 
 // User accesses the user field.
-func (m *BackupDataSpec) User() security.SQLUsername {
+func (m *BackupDataSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }
 
 // User accesses the user field.
-func (m *CSVWriterSpec) User() security.SQLUsername {
+func (m *ExportSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }
 
 // User accesses the user field.
-func (m *ParquetWriterSpec) User() security.SQLUsername {
+func (m *ReadImportDataSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }
 
 // User accesses the user field.
-func (m *ReadImportDataSpec) User() security.SQLUsername {
+func (m *ChangeAggregatorSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }
 
 // User accesses the user field.
-func (m *ChangeAggregatorSpec) User() security.SQLUsername {
+func (m *ChangeFrontierSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }
 
-// User accesses the user field.
-func (m *ChangeFrontierSpec) User() security.SQLUsername {
+func (m *GenerativeSplitAndScatterSpec) User() username.SQLUsername {
 	return m.UserProto.Decode()
 }

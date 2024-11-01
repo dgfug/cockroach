@@ -1,16 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlproxyccl
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 )
 
 // metrics contains pointers to the metrics for monitoring proxy operations.
@@ -21,16 +19,51 @@ type metrics struct {
 	ClientDisconnectCount  *metric.Counter
 	CurConnCount           *metric.Gauge
 	RoutingErrCount        *metric.Counter
+	AcceptedConnCount      *metric.Counter
 	RefusedConnCount       *metric.Counter
 	SuccessfulConnCount    *metric.Counter
+	ConnectionLatency      metric.IHistogram
 	AuthFailedCount        *metric.Counter
 	ExpiredClientConnCount *metric.Counter
+
+	DialTenantLatency metric.IHistogram
+	DialTenantRetries *metric.Counter
+
+	ConnMigrationSuccessCount                *metric.Counter
+	ConnMigrationErrorFatalCount             *metric.Counter
+	ConnMigrationErrorRecoverableCount       *metric.Counter
+	ConnMigrationAttemptedCount              *metric.Counter
+	ConnMigrationAttemptedLatency            metric.IHistogram
+	ConnMigrationTransferResponseMessageSize metric.IHistogram
+
+	QueryCancelReceivedPGWire *metric.Counter
+	QueryCancelReceivedHTTP   *metric.Counter
+	QueryCancelForwarded      *metric.Counter
+	QueryCancelIgnored        *metric.Counter
+	QueryCancelSuccessful     *metric.Counter
+
+	AccessControlFileErrorCount *metric.Gauge
+
+	RoutingMethodCount              *aggmetric.AggCounter
+	SNIRoutingMethodCount           *aggmetric.Counter
+	DatabaseRoutingMethodCount      *aggmetric.Counter
+	ClusterOptionRoutingMethodCount *aggmetric.Counter
 }
 
 // MetricStruct implements the metrics.Struct interface.
 func (metrics) MetricStruct() {}
 
 var _ metric.Struct = metrics{}
+
+const (
+	// maxExpectedTransferResponseMessageSize corresponds to maximum expected
+	// response message size for the SHOW TRANSFER STATE query. We choose 16MB
+	// here to match the defaultMaxReadBufferSize used for ingesting SQL
+	// statements in the SQL server (see pkg/sql/pgwire/pgwirebase/encoding.go).
+	//
+	// This will be used to tune sql.session_transfer.max_session_size.
+	maxExpectedTransferResponseMessageSize = 1 << 24 // 16MB
+)
 
 var (
 	metaCurConnCount = metric.Metadata{
@@ -69,6 +102,12 @@ var (
 		Measurement: "Client Disconnects",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaAcceptedConnCount = metric.Metadata{
+		Name:        "proxy.sql.accepted_conns",
+		Help:        "Number of accepted connections",
+		Measurement: "Accepted connections",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaRefusedConnCount = metric.Metadata{
 		Name:        "proxy.err.refused_conn",
 		Help:        "Number of refused connections initiated by a given IP",
@@ -93,22 +132,163 @@ var (
 		Measurement: "Expired Client Connections",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDialTenantLatency = metric.Metadata{
+		Name:        "proxy.dial_tenant.latency",
+		Unit:        metric.Unit_NANOSECONDS,
+		Help:        "Latency histogram for establishing a tcp connection to a tenant cluster.",
+		Measurement: "Latency",
+	}
+	metaDialTenantRetries = metric.Metadata{
+		Name:        "proxy.dial_tenant.retries",
+		Unit:        metric.Unit_COUNT,
+		Help:        "Number of retries dialing a tenant cluster.",
+		Measurement: "Retries",
+	}
+	// Connection migration metrics.
+	//
+	// attempted = success + error_fatal + error_recoverable
+	metaConnMigrationSuccessCount = metric.Metadata{
+		Name:        "proxy.conn_migration.success",
+		Help:        "Number of successful connection migrations",
+		Measurement: "Connection Migrations",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConnMigrationErrorFatalCount = metric.Metadata{
+		// When connection migrations errored out, connections will be closed.
+		Name:        "proxy.conn_migration.error_fatal",
+		Help:        "Number of failed connection migrations which resulted in terminations",
+		Measurement: "Connection Migrations",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConnMigrationErrorRecoverableCount = metric.Metadata{
+		// Connections are recoverable, so they won't be closed.
+		Name:        "proxy.conn_migration.error_recoverable",
+		Help:        "Number of failed connection migrations that were recoverable",
+		Measurement: "Connection Migrations",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConnMigrationAttemptedCount = metric.Metadata{
+		Name:        "proxy.conn_migration.attempted",
+		Help:        "Number of attempted connection migrations",
+		Measurement: "Connection Migrations",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaConnMigrationAttemptedLatency = metric.Metadata{
+		Name:        "proxy.conn_migration.attempted.latency",
+		Help:        "Latency histogram for attempted connection migrations",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaConnMigrationTransferResponseMessageSize = metric.Metadata{
+		Name:        "proxy.conn_migration.transfer_response.message_size",
+		Help:        "Message size for the SHOW TRANSFER STATE response",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaQueryCancelReceivedPGWire = metric.Metadata{
+		Name:        "proxy.query_cancel.received.pgwire",
+		Help:        "Number of query cancel requests this proxy received over pgwire",
+		Measurement: "Query Cancel Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaQueryCancelReceivedHTTP = metric.Metadata{
+		Name:        "proxy.query_cancel.received.http",
+		Help:        "Number of query cancel requests this proxy received over HTTP",
+		Measurement: "Query Cancel Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaQueryCancelIgnored = metric.Metadata{
+		Name:        "proxy.query_cancel.ignored",
+		Help:        "Number of query cancel requests this proxy ignored",
+		Measurement: "Query Cancel Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaQueryCancelForwarded = metric.Metadata{
+		Name:        "proxy.query_cancel.forwarded",
+		Help:        "Number of query cancel requests this proxy forwarded to another proxy",
+		Measurement: "Query Cancel Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaQueryCancelSuccessful = metric.Metadata{
+		Name:        "proxy.query_cancel.successful",
+		Help:        "Number of query cancel requests this proxy forwarded to the tenant",
+		Measurement: "Query Cancel Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaAccessControlFileErrorCount = metric.Metadata{
+		Name:        "proxy.access_control.errors",
+		Help:        "Numbers of access control list files that are currently having errors",
+		Measurement: "Access Control File Errors",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRoutingMethodCount = metric.Metadata{
+		Name:        "proxy.sql.routing_method_count",
+		Help:        "Number of occurrences of each proxy routing method",
+		Measurement: "Number of occurrences",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // makeProxyMetrics instantiates the metrics holder for proxy monitoring.
 func makeProxyMetrics() metrics {
-	return metrics{
+	m := &metrics{
 		BackendDisconnectCount: metric.NewCounter(metaBackendDisconnectCount),
 		IdleDisconnectCount:    metric.NewCounter(metaIdleDisconnectCount),
 		BackendDownCount:       metric.NewCounter(metaBackendDownCount),
 		ClientDisconnectCount:  metric.NewCounter(metaClientDisconnectCount),
 		CurConnCount:           metric.NewGauge(metaCurConnCount),
 		RoutingErrCount:        metric.NewCounter(metaRoutingErrCount),
+		AcceptedConnCount:      metric.NewCounter(metaAcceptedConnCount),
 		RefusedConnCount:       metric.NewCounter(metaRefusedConnCount),
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
+		ConnectionLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaConnMigrationAttemptedCount,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
 		AuthFailedCount:        metric.NewCounter(metaAuthFailedCount),
 		ExpiredClientConnCount: metric.NewCounter(metaExpiredClientConnCount),
+		// Connector metrics.
+		DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaDialTenantLatency,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets},
+		),
+		DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
+		// Connection migration metrics.
+		ConnMigrationSuccessCount:          metric.NewCounter(metaConnMigrationSuccessCount),
+		ConnMigrationErrorFatalCount:       metric.NewCounter(metaConnMigrationErrorFatalCount),
+		ConnMigrationErrorRecoverableCount: metric.NewCounter(metaConnMigrationErrorRecoverableCount),
+		ConnMigrationAttemptedCount:        metric.NewCounter(metaConnMigrationAttemptedCount),
+		ConnMigrationAttemptedLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaConnMigrationAttemptedLatency,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
+		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(metric.HistogramOptions{
+			Metadata:     metaConnMigrationTransferResponseMessageSize,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.DataSize16MBBuckets,
+			MaxVal:       maxExpectedTransferResponseMessageSize,
+			SigFigs:      1,
+		}),
+		QueryCancelReceivedPGWire: metric.NewCounter(metaQueryCancelReceivedPGWire),
+		QueryCancelReceivedHTTP:   metric.NewCounter(metaQueryCancelReceivedHTTP),
+		QueryCancelIgnored:        metric.NewCounter(metaQueryCancelIgnored),
+		QueryCancelForwarded:      metric.NewCounter(metaQueryCancelForwarded),
+		QueryCancelSuccessful:     metric.NewCounter(metaQueryCancelSuccessful),
+
+		AccessControlFileErrorCount: metric.NewGauge(metaAccessControlFileErrorCount),
+
+		RoutingMethodCount: aggmetric.NewCounter(metaRoutingMethodCount, "method"),
 	}
+	m.SNIRoutingMethodCount = m.RoutingMethodCount.AddChild("sni")
+	m.DatabaseRoutingMethodCount = m.RoutingMethodCount.AddChild("database")
+	m.ClusterOptionRoutingMethodCount = m.RoutingMethodCount.AddChild("cluster_option")
+	return *m
 }
 
 // updateForError updates the metrics relevant for the type of the error
@@ -117,27 +297,24 @@ func (metrics *metrics) updateForError(err error) {
 	if err == nil {
 		return
 	}
-	codeErr := (*codeError)(nil)
-	if errors.As(err, &codeErr) {
-		switch codeErr.code {
-		case codeExpiredClientConnection:
-			metrics.ExpiredClientConnCount.Inc(1)
-		case codeBackendDisconnected:
-			metrics.BackendDisconnectCount.Inc(1)
-		case codeClientDisconnected:
-			metrics.ClientDisconnectCount.Inc(1)
-		case codeIdleDisconnect:
-			metrics.IdleDisconnectCount.Inc(1)
-		case codeProxyRefusedConnection:
-			metrics.RefusedConnCount.Inc(1)
-			metrics.BackendDownCount.Inc(1)
-		case codeParamsRoutingFailed:
-			metrics.RoutingErrCount.Inc(1)
-			metrics.BackendDownCount.Inc(1)
-		case codeBackendDown:
-			metrics.BackendDownCount.Inc(1)
-		case codeAuthFailed:
-			metrics.AuthFailedCount.Inc(1)
-		}
+	switch getErrorCode(err) {
+	case codeExpiredClientConnection:
+		metrics.ExpiredClientConnCount.Inc(1)
+	case codeBackendDisconnected, codeBackendReadFailed, codeBackendWriteFailed:
+		metrics.BackendDisconnectCount.Inc(1)
+	case codeClientDisconnected, codeClientWriteFailed, codeClientReadFailed:
+		metrics.ClientDisconnectCount.Inc(1)
+	case codeProxyRefusedConnection:
+		metrics.RefusedConnCount.Inc(1)
+	case codeParamsRoutingFailed, codeUnavailable:
+		metrics.RoutingErrCount.Inc(1)
+	case codeBackendDialFailed:
+		// NOTE: Historically, we had the code named codeBackendDown instead of
+		// codeBackendDialFailed. This has been renamed to codeBackendDialFailed
+		// for accuracy, and to prevent confusion by developers. We don't rename
+		// the metrics here as that may break downstream consumers.
+		metrics.BackendDownCount.Inc(1)
+	case codeAuthFailed:
+		metrics.AuthFailedCount.Inc(1)
 	}
 }

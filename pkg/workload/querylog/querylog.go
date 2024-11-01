@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package querylog
 
@@ -17,7 +12,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -35,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	workloadrand "github.com/cockroachdb/cockroach/pkg/workload/rand"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/lib/pq/oid"
 	"github.com/spf13/pflag"
 )
@@ -135,6 +129,9 @@ func (*querylog) Meta() workload.Meta { return querylogMeta }
 // Flags implements the Flagser interface.
 func (w *querylog) Flags() workload.Flags { return w.flags }
 
+// ConnFlags implements the ConnFlagser interface.
+func (w *querylog) ConnFlags() *workload.ConnFlags { return w.connFlags }
+
 // Tables implements the Generator interface.
 func (*querylog) Tables() []workload.Table {
 	// Assume the necessary tables are already present.
@@ -174,10 +171,6 @@ func (w *querylog) Hooks() workload.Hooks {
 func (w *querylog) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -212,7 +205,7 @@ func (w *querylog) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	if w.querybenchPath != `` {
 		conn, err := pgx.ConnectConfig(ctx, connCfg)
 		if err != nil {
@@ -458,7 +451,8 @@ func (w *worker) generatePlaceholders(
 							if c.isNullable && w.config.nullPct > 0 {
 								nullPct = 100 / w.config.nullPct
 							}
-							d := randgen.RandDatumWithNullChance(w.rng, c.dataType, nullPct)
+							d := randgen.RandDatumWithNullChance(w.rng, c.dataType, nullPct, /* nullChance */
+								false /* favorCommonData */, false /* targetColumnIsUnique */)
 							if i, ok := d.(*tree.DInt); ok && c.intRange > 0 {
 								j := int64(*i) % int64(c.intRange/2)
 								d = tree.NewDInt(tree.DInt(j))
@@ -599,7 +593,7 @@ const (
 
 // parseFile parses the file one line at a time. First queryLogHeaderLines are
 // skipped, and all other lines are expected to match the pattern of re.
-func (w *querylog) parseFile(ctx context.Context, fileInfo os.FileInfo, re *regexp.Regexp) error {
+func (w *querylog) parseFile(ctx context.Context, fileInfo os.DirEntry, re *regexp.Regexp) error {
 	start := timeutil.Now()
 	file, err := os.Open(w.dirPath + "/" + fileInfo.Name())
 	if err != nil {
@@ -681,7 +675,7 @@ func (w *querylog) processQueryLog(ctx context.Context) error {
 		log.Infof(ctx, "Unzipping to %s is complete", w.dirPath)
 	}
 
-	files, err := ioutil.ReadDir(w.dirPath)
+	files, err := os.ReadDir(w.dirPath)
 	if err != nil {
 		return err
 	}

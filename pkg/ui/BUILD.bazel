@@ -1,4 +1,14 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+
+npm_link_all_packages(name = "node_modules")
+
+exports_files([
+    ".npmrc.bazel",
+    "package.json",
+    "pnpm-lock.yaml",
+])
 
 go_library(
     name = "ui",
@@ -8,30 +18,39 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/build",
+        "//pkg/server/serverpb",
+        "//pkg/settings",
+        "//pkg/settings/cluster",
+        "//pkg/util/httputil",
         "//pkg/util/log",
-        "@com_github_cockroachdb_errors//:errors",
+        "//pkg/util/timeutil",
     ],
 )
 
-config_setting(
-    name = "cockroach_with_ui",
-    define_values = {
-        "cockroach_with_ui": "y",
-    },
-    visibility = ["//visibility:public"],
+test_suite(
+    name = "test",
+    tests = [
+        "//pkg/ui/workspaces/cluster-ui:jest",
+        "//pkg/ui/workspaces/db-console:jest",
+    ],
 )
 
-genrule(
-    name = "gen-empty-index.html",
-    outs = ["index.html"],
-    cmd = """
-    cat >$@ <<EOF
-<!DOCTYPE html>
-<title>CockroachDB</title>
-Binary built without web UI.
-<hr>
-<em>%s</em>
-EOF
-""",
-    visibility = ["//pkg/ui:__subpackages__"],
+test_suite(
+    name = "lint",
+    tests = [
+        "//pkg/ui/workspaces/cluster-ui:lint",
+        "//pkg/ui/workspaces/db-console:lint",
+    ],
+)
+
+go_test(
+    name = "ui_test",
+    srcs = ["ui_test.go"],
+    embed = [":ui"],
+    deps = [
+        "//pkg/base",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
+        "@com_github_stretchr_testify//require",
+    ],
 )

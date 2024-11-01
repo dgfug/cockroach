@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,7 +10,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -25,12 +23,15 @@ import (
 )
 
 func putTruncatedState(
-	t *testing.T, eng storage.Engine, rangeID roachpb.RangeID, truncState roachpb.RaftTruncatedState,
+	t *testing.T,
+	eng storage.Engine,
+	rangeID roachpb.RangeID,
+	truncState kvserverpb.RaftTruncatedState,
 ) {
 	key := keys.RaftTruncatedStateKey(rangeID)
 	if err := storage.MVCCPutProto(
-		context.Background(), eng, nil, key,
-		hlc.Timestamp{}, nil /* txn */, &truncState,
+		context.Background(), eng, key,
+		hlc.Timestamp{}, &truncState, storage.MVCCWriteOptions{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ func putTruncatedState(
 
 func readTruncStates(
 	t *testing.T, eng storage.Engine, rangeID roachpb.RangeID,
-) (truncatedState roachpb.RaftTruncatedState) {
+) (truncatedState kvserverpb.RaftTruncatedState) {
 	t.Helper()
 	found, err := storage.MVCCGetProto(
 		context.Background(), eng, keys.RaftTruncatedStateKey(rangeID),
@@ -62,16 +63,18 @@ func TestTruncateLog(t *testing.T) {
 		firstIndex = 100
 	)
 
+	st := cluster.MakeTestingClusterSettings()
 	evalCtx := &MockEvalCtx{
-		Desc:       &roachpb.RangeDescriptor{RangeID: rangeID},
-		Term:       term,
-		FirstIndex: firstIndex,
+		ClusterSettings: st,
+		Desc:            &roachpb.RangeDescriptor{RangeID: rangeID},
+		Term:            term,
+		FirstIndex:      firstIndex,
 	}
 
 	eng := storage.NewDefaultInMemForTesting()
 	defer eng.Close()
 
-	truncState := roachpb.RaftTruncatedState{
+	truncState := kvserverpb.RaftTruncatedState{
 		Index: firstIndex + 1,
 		Term:  term,
 	}
@@ -79,7 +82,7 @@ func TestTruncateLog(t *testing.T) {
 	putTruncatedState(t, eng, rangeID, truncState)
 
 	// Send a truncation request.
-	req := roachpb.TruncateLogRequest{
+	req := kvpb.TruncateLogRequest{
 		RangeID: rangeID,
 		Index:   firstIndex + 7,
 	}
@@ -87,13 +90,13 @@ func TestTruncateLog(t *testing.T) {
 		EvalCtx: evalCtx.EvalContext(),
 		Args:    &req,
 	}
-	resp := &roachpb.TruncateLogResponse{}
+	resp := &kvpb.TruncateLogResponse{}
 	res, err := TruncateLog(ctx, eng, cArgs, resp)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expTruncState := roachpb.RaftTruncatedState{
+	expTruncState := kvserverpb.RaftTruncatedState{
 		Index: req.Index - 1,
 		Term:  term,
 	}

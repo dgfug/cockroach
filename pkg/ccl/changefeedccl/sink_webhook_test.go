@@ -1,26 +1,27 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -28,7 +29,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func getGenericWebhookSinkOptions() map[string]string {
+func getGenericWebhookSinkOptions(
+	overrides ...struct {
+		key   string
+		value string
+	},
+) changefeedbase.StatementOptions {
+
 	opts := make(map[string]string)
 	opts[changefeedbase.OptFormat] = string(changefeedbase.OptFormatJSON)
 	opts[changefeedbase.OptKeyInValue] = ``
@@ -36,7 +43,12 @@ func getGenericWebhookSinkOptions() map[string]string {
 	opts[changefeedbase.OptTopicInValue] = ``
 	// speed up test by using faster backoff times
 	opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms"}}`
-	return opts
+
+	for _, o := range overrides {
+		opts[o.key] = o.value
+	}
+
+	return changefeedbase.MakeStatementOptions(opts)
 }
 
 // repeatStatusCode returns an array of status codes that the mock
@@ -61,7 +73,17 @@ func setupWebhookSinkWithDetails(
 		return nil, err
 	}
 
-	sinkSrc, err := makeWebhookSink(ctx, sinkURL{URL: u}, details.Opts, parallelism, source)
+	opts := changefeedbase.MakeStatementOptions(details.Opts)
+
+	encodingOpts, err := opts.GetEncodingOptions()
+	if err != nil {
+		return nil, err
+	}
+	sinkOpts, err := opts.GetWebhookSinkOptions()
+	if err != nil {
+		return nil, err
+	}
+	sinkSrc, err := makeWebhookSink(ctx, sinkURL{URL: u}, encodingOpts, sinkOpts, parallelism, nilPacerFactory, source, nilMetricsRecorderBuilder, cluster.MakeClusterSettings())
 	if err != nil {
 		return nil, err
 	}
@@ -79,14 +101,16 @@ func testSendAndReceiveRows(t *testing.T, sinkSrc Sink, sinkDest *cdctest.MockWe
 
 	// test an insert row entry
 	var pool testAllocPool
-	require.NoError(t, sinkSrc.EmitRow(ctx, nil, []byte("[1001]"),
-		[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-		hlc.Timestamp{}, pool.alloc()))
-	require.NoError(t, sinkSrc.EmitRow(ctx, nil, []byte("[1001]"),
-		[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"),
-		hlc.Timestamp{}, pool.alloc()))
+	require.NoError(t, sinkSrc.EmitRow(ctx, noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+	require.NoError(t, sinkSrc.EmitRow(ctx, noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 	require.NoError(t, sinkSrc.Flush(ctx))
-	require.EqualValues(t, 0, pool.used())
+	testutils.SucceedsSoon(t, func() error {
+		remaining := pool.used()
+		if remaining == 0 {
+			return nil
+		}
+		return errors.Newf("waiting for 0 allocs (%d)", remaining)
+	})
 
 	require.Equal(t,
 		"{\"payload\":[{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}],\"length\":1}", sinkDest.Latest(),
@@ -94,9 +118,7 @@ func testSendAndReceiveRows(t *testing.T, sinkSrc Sink, sinkDest *cdctest.MockWe
 		"{\"payload\":[{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}],\"length\":1}")
 
 	// test a delete row entry
-	require.NoError(t, sinkSrc.EmitRow(ctx, nil,
-		[]byte("[1002]"), []byte("{\"after\":null,\"key\":[1002],\"topic:\":\"foo\"}"),
-		hlc.Timestamp{}, pool.alloc()))
+	require.NoError(t, sinkSrc.EmitRow(ctx, noTopic{}, []byte("[1002]"), []byte("{\"after\":null,\"key\":[1002],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 	require.NoError(t, sinkSrc.Flush(ctx))
 
 	require.Equal(t,
@@ -104,7 +126,9 @@ func testSendAndReceiveRows(t *testing.T, sinkSrc Sink, sinkDest *cdctest.MockWe
 		"sink %s expected to receive message %s", sinkDest.URL(),
 		"{\"payload\":[{\"after\":null,\"key\":[1002],\"topic:\":\"foo\"}],\"length\":1}")
 
-	enc, err := makeJSONEncoder(getGenericWebhookSinkOptions(), jobspb.ChangefeedTargets{})
+	opts, err := getGenericWebhookSinkOptions().GetEncodingOptions()
+	require.NoError(t, err)
+	enc, err := makeJSONEncoder(ctx, jsonEncoderOptions{EncodingOptions: opts})
 	require.NoError(t, err)
 
 	// test a resolved timestamp entry
@@ -151,14 +175,9 @@ func TestWebhookSink(t *testing.T) {
 		require.NoError(t, err)
 
 		// now sink's client accepts no custom certs, should reject the server's cert and fail
-		require.NoError(t, sinkSrcNoCert.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrcNoCert.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
-		require.EqualError(t, sinkSrcNoCert.Flush(context.Background()),
-			fmt.Sprintf(`Post "%s": x509: certificate signed by unknown authority`, sinkDest.URL()))
-		require.EqualError(t, sinkSrcNoCert.EmitRow(context.Background(), nil, nil, nil, hlc.Timestamp{}, zeroAlloc),
-			`context canceled`)
+		require.Regexp(t, "x509", sinkSrcNoCert.Flush(context.Background()))
 
 		params.Set(changefeedbase.SinkParamSkipTLSVerify, "true")
 		sinkDestHost.RawQuery = params.Encode()
@@ -171,15 +190,11 @@ func TestWebhookSink(t *testing.T) {
 
 		// sink should throw an error if server is unreachable
 		sinkDest.Close()
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
 		err = sinkSrc.Flush(context.Background())
 		require.Error(t, err)
 		require.Contains(t, err.Error(), fmt.Sprintf(`Post "%s":`, sinkDest.URL()))
-		require.EqualError(t, sinkSrc.EmitRow(context.Background(), nil, nil, nil, hlc.Timestamp{}, zeroAlloc),
-			`context canceled`)
 
 		sinkDestHTTP, err := cdctest.StartMockWebhookSinkInsecure()
 		require.NoError(t, err)
@@ -189,30 +204,58 @@ func TestWebhookSink(t *testing.T) {
 		require.NoError(t, err)
 
 		// sink's client should not accept the endpoint's use of HTTP (expects HTTPS)
-		require.NoError(t, sinkSrcWrongProtocol.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrcWrongProtocol.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
 		require.EqualError(t, sinkSrcWrongProtocol.Flush(context.Background()),
 			fmt.Sprintf(`Post "%s": http: server gave HTTP response to HTTPS client`, fmt.Sprintf("https://%s", strings.TrimPrefix(sinkDestHTTP.URL(),
 				"http://"))))
-		require.EqualError(t, sinkSrcWrongProtocol.EmitRow(context.Background(), nil, nil, nil, hlc.Timestamp{}, zeroAlloc),
-			`context canceled`)
+
+		sinkDestSecure, err := cdctest.StartMockWebhookSinkSecure(cert)
+		require.NoError(t, err)
+
+		sinkDestSecureHost, err := url.Parse(sinkDestSecure.URL())
+		require.NoError(t, err)
+
+		clientCertPEM, clientKeyPEM, err := cdctest.GenerateClientCertAndKey(cert)
+		require.NoError(t, err)
+
+		params = sinkDestSecureHost.Query()
+		params.Set(changefeedbase.SinkParamSkipTLSVerify, "true")
+		params.Set(changefeedbase.SinkParamClientCert, base64.StdEncoding.EncodeToString(clientCertPEM))
+		params.Set(changefeedbase.SinkParamClientKey, base64.StdEncoding.EncodeToString(clientKeyPEM))
+		sinkDestSecureHost.RawQuery = params.Encode()
+
+		details = jobspb.ChangefeedDetails{
+			SinkURI: fmt.Sprintf("webhook-%s", sinkDestSecureHost.String()),
+			Opts:    opts,
+		}
+
+		require.NoError(t, sinkSrc.Close())
+		sinkSrc, err = setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
+		require.NoError(t, err)
+
+		// sink with client accepting server cert should pass
+		testSendAndReceiveRows(t, sinkSrc, sinkDestSecure)
 
 		require.NoError(t, sinkSrc.Close())
 		require.NoError(t, sinkSrcNoCert.Close())
 		require.NoError(t, sinkSrcInsecure.Close())
 		require.NoError(t, sinkSrcWrongProtocol.Close())
 		sinkDestHTTP.Close()
+		sinkDestSecure.Close()
 	}
 
 	// run tests with parallelism from 1-4
 	opts := getGenericWebhookSinkOptions()
-	optsZeroValueConfig := getGenericWebhookSinkOptions()
-	optsZeroValueConfig[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms"},"Flush":{"Bytes": 0, "Frequency": "0s", "Messages": 0}}`
+	optsZeroValueConfig := getGenericWebhookSinkOptions(
+		struct {
+			key   string
+			value string
+		}{changefeedbase.OptWebhookSinkConfig,
+			`{"Retry":{"Backoff": "5ms"},"Flush":{"Bytes": 0, "Frequency": "0s", "Messages": 0}}`})
 	for i := 1; i <= 4; i++ {
-		webhookSinkTestfn(i, opts)
-		webhookSinkTestfn(i, optsZeroValueConfig)
+		webhookSinkTestfn(i, opts.AsMap())
+		webhookSinkTestfn(i, optsZeroValueConfig.AsMap())
 	}
 }
 
@@ -231,8 +274,13 @@ func TestWebhookSinkWithAuthOptions(t *testing.T) {
 		sinkDest, err := cdctest.StartMockWebhookSinkWithBasicAuth(cert, username, password)
 		require.NoError(t, err)
 
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookAuthHeader] = fmt.Sprintf("Basic %s", authHeader)
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookAuthHeader,
+			value: fmt.Sprintf("Basic %s", authHeader),
+		})
 
 		sinkDestHost, err := url.Parse(sinkDest.URL())
 		require.NoError(t, err)
@@ -243,7 +291,7 @@ func TestWebhookSinkWithAuthOptions(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
@@ -252,31 +300,23 @@ func TestWebhookSinkWithAuthOptions(t *testing.T) {
 		testSendAndReceiveRows(t, sinkSrc, sinkDest)
 
 		// no credentials should result in a 401
-		delete(opts, changefeedbase.OptWebhookAuthHeader)
+		delete(details.Opts, changefeedbase.OptWebhookAuthHeader)
 		sinkSrcNoCreds, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
-		require.NoError(t, sinkSrcNoCreds.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrcNoCreds.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
 		require.EqualError(t, sinkSrcNoCreds.Flush(context.Background()), "401 Unauthorized: ")
-		require.EqualError(t, sinkSrcNoCreds.EmitRow(context.Background(), nil, nil, nil, hlc.Timestamp{}, zeroAlloc),
-			`context canceled`)
 
 		// wrong credentials should result in a 401 as well
 		var wrongAuthHeader string
 		cdctest.EncodeBase64ToString([]byte(fmt.Sprintf("%s:%s", username, "wrong-password")), &wrongAuthHeader)
-		opts[changefeedbase.OptWebhookAuthHeader] = fmt.Sprintf("Basic %s", wrongAuthHeader)
+		details.Opts[changefeedbase.OptWebhookAuthHeader] = fmt.Sprintf("Basic %s", wrongAuthHeader)
 		sinkSrcWrongCreds, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrcWrongCreds.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrcWrongCreds.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
 		require.EqualError(t, sinkSrcWrongCreds.Flush(context.Background()), "401 Unauthorized: ")
-		require.EqualError(t, sinkSrcWrongCreds.EmitRow(context.Background(), nil, nil, nil, hlc.Timestamp{}, zeroAlloc),
-			`context canceled`)
 
 		require.NoError(t, sinkSrc.Close())
 		require.NoError(t, sinkSrcNoCreds.Close())
@@ -295,8 +335,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 	var pool testAllocPool
 	retryThenSuccessFn := func(parallelism int) {
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms", "Max": 6}}`
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookSinkConfig,
+			value: `{"Retry":{"Backoff": "5ms", "Max": 6}}`,
+		})
 		cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -315,7 +360,7 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
@@ -350,15 +395,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 
 		require.EqualError(t, sinkSrc.Flush(context.Background()), "500 Internal Server Error: ")
 
@@ -371,8 +414,12 @@ func TestWebhookSinkConfig(t *testing.T) {
 	}
 
 	retryThenFailureCustomFn := func(parallelism int) {
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms", "Max": "6"}}`
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookSinkConfig,
+			value: `{"Retry":{"Backoff": "5ms", "Max": "6"}}`})
 		cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -390,14 +437,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 
 		require.EqualError(t, sinkSrc.Flush(context.Background()), "500 Internal Server Error: ")
 
@@ -410,8 +456,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 	}
 
 	largeBatchSizeFn := func(parallelism int) {
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms"},"Flush":{"Messages": 5, "Frequency": "1h"}}`
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookSinkConfig,
+			value: `{"Retry":{"Backoff": "5ms"},"Flush":{"Messages": 5, "Frequency": "1h"}}`,
+		})
 		cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -426,7 +477,7 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		mt := timeutil.NewManualTime(timeutil.Now())
@@ -434,16 +485,11 @@ func TestWebhookSinkConfig(t *testing.T) {
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, mt)
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1003},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1004},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1003},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1004},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 
 		require.NoError(t, sinkSrc.Flush(context.Background()))
 		require.Equal(t, sinkDest.Pop(), "{\"payload\":[{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"},"+
@@ -466,10 +512,8 @@ func TestWebhookSinkConfig(t *testing.T) {
 		require.Equal(t, sinkDest.Latest(), "")
 
 		// messages without a full batch should not send
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 		require.Equal(t, sinkDest.Latest(), "")
 
 		require.NoError(t, sinkSrc.Close())
@@ -477,8 +521,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 	}
 
 	largeBatchBytesFn := func(parallelism int) {
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms"},"Flush":{"Bytes": 330, "Frequency": "1h"}}`
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookSinkConfig,
+			value: `{"Retry":{"Backoff": "5ms"},"Flush":{"Bytes": 330, "Frequency": "1h"}}`,
+		})
 		cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -493,22 +542,17 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1003},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1004},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1002},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1003},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1004},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 
 		require.NoError(t, sinkSrc.Flush(context.Background()))
 		require.Equal(t, sinkDest.Pop(), "{\"payload\":[{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"},"+
@@ -518,10 +562,8 @@ func TestWebhookSinkConfig(t *testing.T) {
 			"{\"after\":{\"col1\":\"val1\",\"rowid\":1004},\"key\":[1001],\"topic:\":\"foo\"}],\"length\":5}")
 
 		// messages without a full batch should not send
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 		require.Equal(t, sinkDest.Latest(), "")
 
 		require.NoError(t, sinkSrc.Close())
@@ -529,8 +571,13 @@ func TestWebhookSinkConfig(t *testing.T) {
 	}
 
 	largeBatchFrequencyFn := func(parallelism int) {
-		opts := getGenericWebhookSinkOptions()
-		opts[changefeedbase.OptWebhookSinkConfig] = `{"Retry":{"Backoff": "5ms"},"Flush":{"Messages": 10, "Frequency": "1h"}}`
+		opts := getGenericWebhookSinkOptions(struct {
+			key   string
+			value string
+		}{
+			key:   changefeedbase.OptWebhookSinkConfig,
+			value: `{"Retry":{"Backoff": "5ms"},"Flush":{"Messages": 10, "Frequency": "1h"}}`,
+		})
 		cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -545,7 +592,7 @@ func TestWebhookSinkConfig(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		mt := timeutil.NewManualTime(timeutil.Now())
@@ -553,21 +600,25 @@ func TestWebhookSinkConfig(t *testing.T) {
 		sinkSrc, err := setupWebhookSinkWithDetails(context.Background(), details, parallelism, mt)
 		require.NoError(t, err)
 
+		batchingSink, ok := sinkSrc.(*batchingSink)
+		require.True(t, ok)
+		var appendCount int32 = 0
+		batchingSink.knobs.OnAppend = func(event *rowEvent) {
+			atomic.AddInt32(&appendCount, 1)
+		}
+
 		// send incomplete batch
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
-		require.NoError(t, sinkSrc.EmitRow(context.Background(), nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), hlc.Timestamp{}, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
+		require.NoError(t, sinkSrc.EmitRow(context.Background(), noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1001},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, pool.alloc()))
 
 		// no messages at first
 		require.Equal(t, sinkDest.Latest(), "")
 
 		testutils.SucceedsSoon(t, func() error {
-			// wait for the timer in batch worker to be set (1 hour from now, as specified by config) before advancing time.
-			if len(mt.Timers()) == 1 && mt.Timers()[0] == mt.Now().Add(time.Hour) {
+			if atomic.LoadInt32(&appendCount) >= 2 {
 				return nil
 			}
-			return errors.New("Waiting for timer to be created by batch worker")
+			return errors.New("Waiting for rows to be buffered")
 		})
 		mt.Advance(time.Hour)
 		require.NoError(t, sinkSrc.Flush(context.Background()))
@@ -619,15 +670,13 @@ func TestWebhookSinkShutsDownOnError(t *testing.T) {
 
 		details := jobspb.ChangefeedDetails{
 			SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
-			Opts:    opts,
+			Opts:    opts.AsMap(),
 		}
 
 		sinkSrc, err := setupWebhookSinkWithDetails(ctx, details, parallelism, timeutil.DefaultTimeSource{})
 		require.NoError(t, err)
 
-		require.NoError(t, sinkSrc.EmitRow(ctx, nil, []byte("[1001]"),
-			[]byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"),
-			hlc.Timestamp{}, zeroAlloc))
+		require.NoError(t, sinkSrc.EmitRow(ctx, noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
 		// error should be propagated immediately in the next call
 		require.EqualError(t, sinkSrc.Flush(ctx), "500 Internal Server Error: ")
 
@@ -642,4 +691,75 @@ func TestWebhookSinkShutsDownOnError(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		webhookSinkTestfn(i)
 	}
+}
+
+// Regression test for https://github.com/cockroachdb/cockroach/issues/102467.
+// Ensure that we do not use the default retry config which is capped at
+// 4000ms.
+func TestWebhookSinkRetryDuration(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	skip.UnderShort(t)
+
+	opts := getGenericWebhookSinkOptions(struct {
+		key   string
+		value string
+	}{
+		key:   changefeedbase.OptWebhookSinkConfig,
+		value: `{"Retry":{"Backoff": "2s", "Max": "2"}}`})
+	webhookOpts, err := opts.GetWebhookSinkOptions()
+	require.NoError(t, err)
+
+	_, retryCfg, err := (&deprecatedWebhookSink{}).getWebhookSinkConfig(webhookOpts.JSONConfig)
+	require.NoError(t, err)
+	require.Equal(t, retryCfg.MaxBackoff, 30*time.Second)
+
+	_, retryCfg, err = getSinkConfigFromJson(webhookOpts.JSONConfig, sinkJSONConfig{})
+	require.NoError(t, err)
+	require.Equal(t, retryCfg.MaxBackoff, 30*time.Second)
+}
+
+// Regression test for #118485.
+func TestWebhookSinkRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	skip.UnderShort(t)
+
+	ctx := context.Background()
+	opts := getGenericWebhookSinkOptions(struct {
+		key   string
+		value string
+	}{
+		key: changefeedbase.OptWebhookSinkConfig,
+		// Note: The original issue repros most successfully with a 60s backoff,
+		// which is higher than we support and is higher than desirable for testing.
+		value: `{"Retry":{"Backoff": "500ms", "Max": "2"}}`})
+	cert, certEncoded, err := cdctest.NewCACertBase64Encoded()
+	require.NoError(t, err)
+
+	sinkDest, err := cdctest.StartMockWebhookSink(cert)
+	require.NoError(t, err)
+	// Return an error that retries in the sink client, then ok.
+	sinkDest.SetStatusCodes([]int{http.StatusTooManyRequests, http.StatusOK})
+
+	sinkDestHost, err := url.Parse(sinkDest.URL())
+	require.NoError(t, err)
+
+	params := sinkDestHost.Query()
+	params.Set(changefeedbase.SinkParamCACert, certEncoded)
+	sinkDestHost.RawQuery = params.Encode()
+
+	details := jobspb.ChangefeedDetails{
+		SinkURI: fmt.Sprintf("webhook-%s", sinkDestHost.String()),
+		Opts:    opts.AsMap(),
+	}
+
+	sinkSrc, err := setupWebhookSinkWithDetails(ctx, details, 1 /* parallelism */, timeutil.DefaultTimeSource{})
+	require.NoError(t, err)
+
+	require.NoError(t, sinkSrc.EmitRow(ctx, noTopic{}, []byte("[1001]"), []byte("{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}"), zeroTS, zeroTS, zeroAlloc))
+	require.NoError(t, sinkSrc.Flush(ctx))
+
+	require.Equal(t, "{\"payload\":[{\"after\":{\"col1\":\"val1\",\"rowid\":1000},\"key\":[1001],\"topic:\":\"foo\"}],\"length\":1}", sinkDest.Pop())
+
+	sinkDest.Close()
+	require.NoError(t, sinkSrc.Close())
 }

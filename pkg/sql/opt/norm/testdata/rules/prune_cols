@@ -1008,7 +1008,7 @@ project
            └── i:2 < y:12 [outer=(2,12), constraints=(/2: (/NULL - ]; /12: (/NULL - ])]
 
 # ApplyJoin operator.
-norm expect=PruneJoinLeftCols
+norm expect=PruneJoinLeftCols disable=TryRemapJoinOuterColsRight
 SELECT k, i
 FROM a
 WHERE (SELECT k+1 AS r FROM xy WHERE y=k) = 1
@@ -1837,17 +1837,17 @@ SELECT ntile(i) OVER () FROM a
 project
  ├── columns: ntile:7(int)
  ├── stats: [rows=1000]
- ├── cost: 1084.56
+ ├── cost: 1088.56
  ├── prune: (7)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:7(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.54
+      ├── cost: 1078.54
       ├── prune: (7)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1074.52
+      │    ├── cost: 1078.52
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:7, type=int, outer=(2)]
@@ -1955,17 +1955,17 @@ SELECT x FROM (SELECT ntile(i) OVER () x, ntile(f::int) OVER () y FROM a)
 project
  ├── columns: x:7(int)
  ├── stats: [rows=1000]
- ├── cost: 1084.56
+ ├── cost: 1088.56
  ├── prune: (7)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:7(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.54
+      ├── cost: 1078.54
       ├── prune: (7)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1074.52
+      │    ├── cost: 1078.52
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:7, type=int, outer=(2)]
@@ -2071,6 +2071,9 @@ DELETE FROM a RETURNING k, s
 delete a
  ├── columns: k:1!null s:4
  ├── fetch columns: k:7 s:10
+ ├── return-mapping:
+ │    ├── k:7 => k:1
+ │    └── s:10 => s:4
  ├── volatile, mutations
  ├── key: (1)
  ├── fd: (1)-->(4)
@@ -2244,8 +2247,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO partial_indexes (a, d) VALUES (1, 2)
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 d:14
  ├── insert-mapping:
@@ -2301,8 +2304,8 @@ norm expect-not=PruneMutationFetchCols
 UPSERT INTO partial_indexes (a, b, d) VALUES (1, 2, 3)
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -2360,8 +2363,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO partial_indexes (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET d = 3
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 d:14
  ├── insert-mapping:
@@ -2418,8 +2421,8 @@ norm expect-not=PruneMutationFetchCols
 INSERT INTO partial_indexes (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3, d = 4
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -2613,8 +2616,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO virt_partial_idx (a, d) VALUES (1, 2)
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 d:16
  ├── insert-mapping:
@@ -2684,8 +2687,8 @@ norm expect-not=PruneMutationFetchCols
 UPSERT INTO virt_partial_idx (a, b, d) VALUES (1, 2, 3)
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:13
  ├── fetch columns: a:13 b:14 v:15 c:16 d:17
  ├── insert-mapping:
@@ -2758,8 +2761,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO virt_partial_idx (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET d = 3
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 d:16
  ├── insert-mapping:
@@ -2830,8 +2833,8 @@ norm expect-not=PruneMutationFetchCols
 INSERT INTO virt_partial_idx (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3, d = 4
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 b:13 v:14 c:15 d:16
  ├── insert-mapping:
@@ -3052,6 +3055,9 @@ project
       ├── fetch columns: a:8 b:9 c:10 d:11
       ├── update-mapping:
       │    └── c_new:15 => c:3
+      ├── return-mapping:
+      │    ├── a:8 => a:1
+      │    └── b:9 => b:2
       ├── volatile, mutations
       ├── key: (1)
       ├── fd: (1)-->(2)
@@ -3103,8 +3109,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO a (k, s) VALUES (1, 'foo') ON CONFLICT (k) DO UPDATE SET i=a.i+1
 ----
 upsert a
- ├── columns: <none>
  ├── arbiter indexes: a_pkey
+ ├── columns: <none>
  ├── canary column: k:11
  ├── fetch columns: k:11 i:12 f:13 s:14
  ├── insert-mapping:
@@ -3216,8 +3222,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO family (a, b) VALUES (1, 2)
 ----
 upsert family
- ├── columns: <none>
  ├── arbiter indexes: family_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12
  ├── insert-mapping:
@@ -3324,8 +3330,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO family VALUES (1, 2, 3, 4) ON CONFLICT (a) DO UPDATE SET d=10
 ----
 upsert family
- ├── columns: <none>
  ├── arbiter indexes: family_pkey
+ ├── columns: <none>
  ├── canary column: a:13
  ├── fetch columns: a:13 c:15 d:16
  ├── insert-mapping:
@@ -3375,8 +3381,8 @@ norm expect=(PruneMutationInputCols)
 INSERT INTO mutation VALUES (1, 2, 3) ON CONFLICT (a) DO UPDATE SET b=10
 ----
 upsert mutation
- ├── columns: <none>
  ├── arbiter indexes: mutation_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 b:13 c:14 d:15 e:16
  ├── insert-mapping:
@@ -3532,8 +3538,8 @@ norm
 UPSERT INTO checks (a, c, d) VALUES (1, 3, 4)
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -3756,8 +3762,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO uniq_fk_parent VALUES (2, 1) ON CONFLICT (k) DO UPDATE SET c = 1
 ----
 upsert uniq_fk_parent
- ├── columns: <none>
  ├── arbiter indexes: uniq_fk_parent_pkey
+ ├── columns: <none>
  ├── canary column: uniq_fk_parent.k:11
  ├── fetch columns: uniq_fk_parent.k:11 uniq_fk_parent.b:13 uniq_fk_parent.c:14
  ├── insert-mapping:
@@ -3868,8 +3874,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO uniq_fk_parent VALUES (1) ON CONFLICT (k) DO UPDATE SET d = 1
 ----
 upsert uniq_fk_parent
- ├── columns: <none>
  ├── arbiter indexes: uniq_fk_parent_pkey
+ ├── columns: <none>
  ├── canary column: uniq_fk_parent.k:10
  ├── fetch columns: uniq_fk_parent.k:10 uniq_fk_parent.d:14
  ├── insert-mapping:
@@ -4066,6 +4072,9 @@ project
  └── delete virt
       ├── columns: a:1!null v:3
       ├── fetch columns: a:6 v:8
+      ├── return-mapping:
+      │    ├── a:6 => a:1
+      │    └── v:8 => v:3
       ├── volatile, mutations
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -4273,6 +4282,154 @@ update virt_idx3
            └── b:8 + 1 [as=v:10, outer=(8), immutable]
 
 # ------------------------------------------------------------------------------
+# PruneInsertReturnCols
+# ------------------------------------------------------------------------------
+
+# Returning a single insert column can prune the others.
+norm expect=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) VALUES (1, 2, 3) RETURNING a
+----
+insert computed
+ ├── columns: a:1!null
+ ├── insert-mapping:
+ │    ├── column1:8 => a:1
+ │    ├── column2:9 => b:2
+ │    ├── column3:10 => c:3
+ │    ├── d_comp:11 => d:4
+ │    └── x_comp:12 => x:5
+ ├── return-mapping:
+ │    └── column1:8 => a:1
+ ├── cardinality: [1 - 1]
+ ├── volatile, mutations
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── values
+      ├── columns: column1:8!null column2:9!null column3:10!null d_comp:11!null x_comp:12!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(8-12)
+      └── (1, 2, 3, 4, 13)
+
+# RETURNING * does not prune columns
+norm expect-not=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) SELECT a, b, c FROM computed RETURNING *
+----
+insert computed
+ ├── columns: a:1!null b:2 c:3 d:4
+ ├── insert-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    ├── d_comp:15 => d:4
+ │    └── x_comp:16 => x:5
+ ├── return-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    └── d_comp:15 => d:4
+ ├── volatile, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(4)
+ └── project
+      ├── columns: d_comp:15 x_comp:16 a:8!null b:9 c:10
+      ├── immutable
+      ├── key: (8)
+      ├── fd: (8)-->(9,10), (10)-->(15,16)
+      ├── scan computed
+      │    ├── columns: a:8!null b:9 c:10
+      │    ├── computed column expressions
+      │    │    └── d:11
+      │    │         └── c:10 + 1
+      │    ├── key: (8)
+      │    └── fd: (8)-->(9,10)
+      └── projections
+           ├── c:10 + 1 [as=d_comp:15, outer=(10), immutable]
+           └── c:10 + 10 [as=x_comp:16, outer=(10), immutable]
+
+# Returning a subset of insert columns can prune the others.
+norm expect=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) SELECT a, b, c FROM computed RETURNING a, b, c
+----
+insert computed
+ ├── columns: a:1!null b:2 c:3
+ ├── insert-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    ├── d_comp:15 => d:4
+ │    └── x_comp:16 => x:5
+ ├── return-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    └── c:10 => c:3
+ ├── volatile, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ └── project
+      ├── columns: d_comp:15 x_comp:16 a:8!null b:9 c:10
+      ├── immutable
+      ├── key: (8)
+      ├── fd: (8)-->(9,10), (10)-->(15,16)
+      ├── scan computed
+      │    ├── columns: a:8!null b:9 c:10
+      │    ├── computed column expressions
+      │    │    └── d:11
+      │    │         └── c:10 + 1
+      │    ├── key: (8)
+      │    └── fd: (8)-->(9,10)
+      └── projections
+           ├── c:10 + 1 [as=d_comp:15, outer=(10), immutable]
+           └── c:10 + 10 [as=x_comp:16, outer=(10), immutable]
+
+# We apply the PruneInsertReturnCols rule multiple times, to get
+# the minimal set of columns. Columns c and b are pruned away.
+norm expect=PruneInsertReturnCols
+SELECT a FROM [SELECT a, b FROM [INSERT INTO computed (a, b, c) VALUES (1, 2, 3) RETURNING a, b, c]]
+----
+with &1
+ ├── columns: a:16!null
+ ├── cardinality: [1 - 1]
+ ├── volatile, mutations
+ ├── key: ()
+ ├── fd: ()-->(16)
+ ├── insert computed
+ │    ├── columns: computed.a:1!null computed.b:2!null computed.c:3!null
+ │    ├── insert-mapping:
+ │    │    ├── column1:8 => computed.a:1
+ │    │    ├── column2:9 => computed.b:2
+ │    │    ├── column3:10 => computed.c:3
+ │    │    ├── d_comp:11 => d:4
+ │    │    └── x_comp:12 => x:5
+ │    ├── return-mapping:
+ │    │    ├── column1:8 => computed.a:1
+ │    │    ├── column2:9 => computed.b:2
+ │    │    └── column3:10 => computed.c:3
+ │    ├── cardinality: [1 - 1]
+ │    ├── volatile, mutations
+ │    ├── key: ()
+ │    ├── fd: ()-->(1-3)
+ │    └── values
+ │         ├── columns: column1:8!null column2:9!null column3:10!null d_comp:11!null x_comp:12!null
+ │         ├── cardinality: [1 - 1]
+ │         ├── key: ()
+ │         ├── fd: ()-->(8-12)
+ │         └── (1, 2, 3, 4, 13)
+ └── project
+      ├── columns: a:16!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(16)
+      ├── with-scan &1
+      │    ├── columns: a:13!null
+      │    ├── mapping:
+      │    │    └──  computed.a:1 => a:13
+      │    ├── cardinality: [1 - 1]
+      │    ├── key: ()
+      │    └── fd: ()-->(13)
+      └── projections
+           └── a:13 [as=a:16, outer=(13)]
+
+# ------------------------------------------------------------------------------
 # PruneMutationReturnCols
 # ------------------------------------------------------------------------------
 
@@ -4306,6 +4463,15 @@ project
       ├── fetch columns: a:11 b:12 c:13 d:14 e:15 f:16 g:17 rowid:18
       ├── update-mapping:
       │    └── a_new:21 => a:1
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    ├── b:12 => b:2
+      │    ├── c:13 => c:3
+      │    ├── d:14 => d:4
+      │    ├── e:15 => e:5
+      │    ├── f:16 => f:6
+      │    ├── g:17 => g:7
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1-7)
@@ -4336,6 +4502,10 @@ project
       ├── fetch columns: a:11 d:14 e:15 f:16 g:17 rowid:18
       ├── update-mapping:
       │    └── d_new:21 => d:4
+      ├── return-mapping:
+      │    ├── a:11 => a:1
+      │    ├── d_new:21 => d:4
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1,4), (1)~~>(4,8)
@@ -4363,6 +4533,9 @@ project
       ├── fetch columns: a:11 rowid:18
       ├── update-mapping:
       │    └── a_new:21 => a:1
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1)
@@ -4393,6 +4566,11 @@ project
       ├── update-mapping:
       │    ├── a_new:21 => a:1
       │    └── a:11 => b:2
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    ├── a:11 => b:2
+      │    ├── c:13 => c:3
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1-3), (2)~~>(1,3,8)
@@ -4426,6 +4604,11 @@ with &1
  │         ├── fetch columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18
  │         ├── update-mapping:
  │         │    └── a_new:21 => returning_test.a:1
+ │         ├── return-mapping:
+ │         │    ├── a_new:21 => returning_test.a:1
+ │         │    ├── returning_test.b:12 => returning_test.b:2
+ │         │    ├── returning_test.c:13 => returning_test.c:3
+ │         │    └── rowid:18 => rowid:8
  │         ├── volatile, mutations
  │         ├── key: (8)
  │         ├── fd: (8)-->(1-3)
@@ -4467,6 +4650,11 @@ with &1
  │         ├── fetch columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18
  │         ├── update-mapping:
  │         │    └── a_new:21 => returning_test.a:1
+ │         ├── return-mapping:
+ │         │    ├── a_new:21 => returning_test.a:1
+ │         │    ├── returning_test.b:12 => returning_test.b:2
+ │         │    ├── returning_test.c:13 => returning_test.c:3
+ │         │    └── rowid:18 => rowid:8
  │         ├── volatile, mutations
  │         ├── key: (8)
  │         ├── fd: (8)-->(1-3)
@@ -4514,6 +4702,11 @@ with &2
  │         ├── fetch columns: returning_test.a:23 returning_test.b:24 returning_test.c:25 rowid:30
  │         ├── update-mapping:
  │         │    └── a_new:33 => returning_test.a:13
+ │         ├── return-mapping:
+ │         │    ├── a_new:33 => returning_test.a:13
+ │         │    ├── returning_test.b:24 => returning_test.b:14
+ │         │    ├── returning_test.c:25 => returning_test.c:15
+ │         │    └── rowid:30 => rowid:20
  │         ├── volatile, mutations
  │         ├── key: (20)
  │         ├── fd: (20)-->(13-15)
@@ -4642,6 +4835,11 @@ project
  └── delete returning_test
       ├── columns: a:1!null b:2 d:4 rowid:8!null
       ├── fetch columns: a:11 b:12 d:14 rowid:18
+      ├── return-mapping:
+      │    ├── a:11 => a:1
+      │    ├── b:12 => b:2
+      │    ├── d:14 => d:4
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1,2,4), (1)-->(2,4,8)
@@ -4707,30 +4905,13 @@ project
            │    ├── volatile
            │    ├── key: ()
            │    ├── fd: ()-->(11-19,23)
-           │    ├── ensure-upsert-distinct-on
+           │    ├── values
            │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    ├── grouping columns: rowid_default:15
-           │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
            │    │    ├── cardinality: [1 - 1]
            │    │    ├── volatile
            │    │    ├── key: ()
            │    │    ├── fd: ()-->(11-15)
-           │    │    ├── values
-           │    │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    │    ├── cardinality: [1 - 1]
-           │    │    │    ├── volatile
-           │    │    │    ├── key: ()
-           │    │    │    ├── fd: ()-->(11-15)
-           │    │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
-           │    │    └── aggregations
-           │    │         ├── first-agg [as=column1:11, outer=(11)]
-           │    │         │    └── column1:11
-           │    │         ├── first-agg [as=column2:12, outer=(12)]
-           │    │         │    └── column2:12
-           │    │         ├── first-agg [as=column3:13, outer=(13)]
-           │    │         │    └── column3:13
-           │    │         └── first-agg [as=d_default:14, outer=(14)]
-           │    │              └── d_default:14
+           │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
            │    ├── scan returning_test
            │    │    ├── columns: a:16 b:17 c:18 d:19 rowid:23!null
            │    │    ├── key: (23)
@@ -4756,9 +4937,12 @@ RETURNING
 update abcde
  ├── columns: a:1!null b:16 c:17
  ├── fetch columns: abcde.a:8 abcde.b:9 abcde.c:10 abcde.d:11 abcde.e:12
+ ├── passthrough columns: "family".b:16 "family".c:17
  ├── update-mapping:
  │    ├── "family".b:16 => abcde.b:2
  │    └── "family".c:17 => abcde.c:3
+ ├── return-mapping:
+ │    └── abcde.a:8 => abcde.a:1
  ├── volatile, mutations
  ├── key: (1)
  ├── fd: (1)-->(16,17)
@@ -4813,13 +4997,20 @@ semi-join (hash)
  │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3), (2,3)~~>(1)
- ├── scan family
- │    ├── columns: "family".a:8!null "family".b:9 "family".c:10
+ ├── project
+ │    ├── columns: column16:16 "family".a:8!null
+ │    ├── immutable
  │    ├── key: (8)
- │    └── fd: (8)-->(9,10)
+ │    ├── fd: (8)-->(16)
+ │    ├── scan family
+ │    │    ├── columns: "family".a:8!null "family".b:9 "family".c:10
+ │    │    ├── key: (8)
+ │    │    └── fd: (8)-->(9,10)
+ │    └── projections
+ │         └── "family".b:9 + "family".c:10 [as=column16:16, outer=(9,10), immutable]
  └── filters
       ├── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
-      └── abcde.b:2 > ("family".b:9 + "family".c:10) [outer=(2,9,10), immutable, constraints=(/2: (/NULL - ])]
+      └── abcde.b:2 > column16:16 [outer=(2,16), constraints=(/2: (/NULL - ]; /16: (/NULL - ])]
 
 norm expect=PruneSemiAntiJoinRightCols
 SELECT a, b, c FROM abcde WHERE NOT EXISTS (SELECT * FROM family WHERE abcde.a=family.a)
@@ -4839,7 +5030,7 @@ anti-join (hash)
       └── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
 
 # Test using multi-level nesting so we don't decorrelate the semi-join.
-norm expect=PruneSemiAntiJoinRightCols
+norm expect=PruneSemiAntiJoinRightCols disable=(TryRemapJoinOuterColsRight,TryRemapSelectOuterCols)
 SELECT
     a, b, c
 FROM
@@ -4878,7 +5069,7 @@ semi-join-apply
       └── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
 
 # Test using multi-level nesting so we don't decorrelate the anti-join.
-norm expect=PruneSemiAntiJoinRightCols
+norm expect=PruneSemiAntiJoinRightCols disable=(TryRemapJoinOuterColsRight,TryRemapSelectOuterCols)
 SELECT
     a, b, c
 FROM
@@ -4938,12 +5129,12 @@ WITH foo AS (SELECT * FROM a)
 with &1 (foo)
  ├── columns: i:8(int)
  ├── stats: [rows=1000]
- ├── cost: 1104.86
+ ├── cost: 1108.86
  ├── prune: (8)
  ├── scan t.public.a
  │    ├── columns: t.public.a.k:1(int!null) t.public.a.i:2(int) t.public.a.f:3(float) t.public.a.s:4(string)
  │    ├── stats: [rows=1000]
- │    ├── cost: 1104.82
+ │    ├── cost: 1108.82
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── prune: (1-4)
@@ -5157,3 +5348,118 @@ project
  │    └── filters (true)
  └── projections
       └── NULL [as="?column?":18]
+
+# Regression test for #86308.
+exec-ddl
+CREATE TABLE table86308 (
+  col3_0 INET NOT NULL,
+  col3_1 INT4 NOT NULL,
+  col3_2 TIMETZ NOT NULL,
+  col3_3 FLOAT4 NOT NULL,
+  col3_4 BIT(17) NOT NULL,
+  col3_5 GEOGRAPHY NOT NULL,
+  col3_6 BIT(22) NOT NULL,
+  col3_7 STRING NOT NULL,
+  col3_8 UUID NOT NULL,
+  col3_9 FLOAT8 NOT NULL AS (col3_3 + 0.7530620098114014:::FLOAT8) STORED,
+  col3_10 STRING NOT NULL AS (lower(CAST(col3_0 AS STRING))) STORED,
+  col3_11 FLOAT8 NOT NULL AS (col3_3 + 0.8790965676307678:::FLOAT8) VIRTUAL,
+  col3_12 STRING NOT NULL AS (lower(CAST(col3_0 AS STRING))) VIRTUAL,
+  col3_13 STRING NOT NULL AS (lower(CAST(col3_6 AS STRING))) STORED,
+  col3_14 FLOAT8 NOT NULL AS (col3_3 + (-0.27059364318847656):::FLOAT8) STORED,
+  col3_15 STRING NOT NULL AS (lower(CAST(col3_5 AS STRING))) STORED,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT table3_pkey PRIMARY KEY (rowid ASC),
+  UNIQUE INDEX table3_col3_4_col3_11_col3_1_col3_0_col3_3_key (col3_4 DESC, col3_11 ASC, col3_1 DESC, col3_0 ASC, col3_3 DESC) STORING (col3_5, col3_8, col3_9, col3_10, col3_13) WHERE ((((col3_9 = 5e-324:::FLOAT8) OR (col3_1 = (-32768):::INT8)) OR (col3_15 = '':::STRING)) AND (col3_3 > 3.4028234663852886e+38:::FLOAT8)) AND (col3_12 != '""':::STRING)
+);
+----
+
+# Before the fix, PruneGroupByCols would fire to push a Project below the
+# GroupBy. Then, since PruneWindowInputCols was disabled,
+# EliminateGroupByProject would remove the Project and the cycle would repeat.
+norm disable=PruneWindowInputCols format=hide-all
+SELECT concat_agg(tab_1739.col3_7::STRING ORDER BY tab_1739.col3_7 DESC)::STRING AS col_4664
+FROM table86308@[0] AS tab_1739 GROUP BY tab_1739.col3_7 HAVING bool_and(false::BOOL)::BOOL
+----
+project
+ └── group-by (hash)
+      ├── select
+      │    ├── window partition=(8)
+      │    │    ├── window partition=(8)
+      │    │    │    ├── project
+      │    │    │    │    ├── scan table86308
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    ├── col3_9
+      │    │    │    │    │    │    │    └── col3_3 + 0.7530620098114014
+      │    │    │    │    │    │    ├── col3_10
+      │    │    │    │    │    │    │    └── lower(col3_0::STRING)
+      │    │    │    │    │    │    ├── col3_11
+      │    │    │    │    │    │    │    └── col3_3 + 0.8790965676307678
+      │    │    │    │    │    │    ├── col3_12
+      │    │    │    │    │    │    │    └── lower(col3_0::STRING)
+      │    │    │    │    │    │    ├── col3_13
+      │    │    │    │    │    │    │    └── lower(col3_6::STRING)
+      │    │    │    │    │    │    ├── col3_14
+      │    │    │    │    │    │    │    └── col3_3 + -0.27059364318847656
+      │    │    │    │    │    │    └── col3_15
+      │    │    │    │    │    │         └── lower(col3_5::STRING)
+      │    │    │    │    │    └── partial index predicates
+      │    │    │    │    │         └── table3_col3_4_col3_11_col3_1_col3_0_col3_3_key: filters
+      │    │    │    │    │              ├── ((col3_9 = 5e-324) OR (col3_1 = -32768)) OR (col3_15 = '')
+      │    │    │    │    │              ├── col3_3 > 3.4028234663852886e+38
+      │    │    │    │    │              └── lower(col3_0::STRING) != '""'
+      │    │    │    │    └── projections
+      │    │    │    │         ├── false
+      │    │    │    │         ├── col3_3 + 0.8790965676307678
+      │    │    │    │         └── lower(col3_0::STRING)
+      │    │    │    └── windows
+      │    │    │         └── concat-agg [frame="range from unbounded to unbounded"]
+      │    │    │              └── col3_7
+      │    │    └── windows
+      │    │         └── bool-and [frame="range from unbounded to unbounded"]
+      │    │              └── column21
+      │    └── filters
+      │         └── bool_and
+      └── aggregations
+           └── const-agg
+                └── concat_agg
+
+exec-ddl
+CREATE TABLE p100478 (
+  region STRING NOT NULL,
+  id INT,
+  PRIMARY KEY (region, id),
+  UNIQUE INDEX p_id_idx (id)
+)
+----
+
+exec-ddl
+CREATE TABLE c100478 (
+  region STRING NOT NULL,
+  id INT PRIMARY KEY,
+  p_id INT NOT NULL,
+  FOREIGN KEY (region, p_id) REFERENCES p100478 (region, id)
+)
+----
+
+# A join which doesn't prune columns which could potentially appear in derived
+# ON clause conditions should not result in infinite rule recursion.
+norm expect=(EliminateGroupByProject,PruneJoinLeftCols,PruneJoinRightCols) disable=(EliminateJoinUnderProjectLeft,EliminateJoinUnderProjectRight,EliminateJoinUnderGroupByLeft,EliminateJoinUnderGroupByRight)
+SELECT p.id FROM p100478 p JOIN c100478 ON p_id = p.id GROUP BY p.id
+----
+distinct-on
+ ├── columns: id:2!null
+ ├── grouping columns: p.id:2!null
+ ├── key: (2)
+ └── inner-join (hash)
+      ├── columns: p.region:1!null p.id:2!null c100478.region:5!null p_id:7!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(exactly-one)
+      ├── fd: (2)-->(1), (2)==(7), (7)==(2)
+      ├── scan p100478 [as=p]
+      │    ├── columns: p.region:1!null p.id:2!null
+      │    ├── key: (2)
+      │    └── fd: (2)-->(1)
+      ├── scan c100478
+      │    └── columns: c100478.region:5!null p_id:7!null
+      └── filters
+           └── p_id:7 = p.id:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]

@@ -1,26 +1,30 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed
 
 import (
 	"bytes"
-	"container/heap"
+	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/container/heap"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
+
+// TODO(erikgrinaker): remove this once we're confident it won't fire.
+var DisableCommitIntentTimestampAssertion = envutil.EnvOrDefaultBool(
+	"COCKROACH_RANGEFEED_DISABLE_COMMIT_INTENT_TIMESTAMP_ASSERTION", false)
 
 // A rangefeed's "resolved timestamp" is defined as the timestamp at which no
 // future updates will be emitted to the feed at or before. The timestamp is
@@ -80,11 +84,13 @@ type resolvedTimestamp struct {
 	closedTS   hlc.Timestamp
 	resolvedTS hlc.Timestamp
 	intentQ    unresolvedIntentQueue
+	settings   *cluster.Settings
 }
 
-func makeResolvedTimestamp() resolvedTimestamp {
+func makeResolvedTimestamp(st *cluster.Settings) resolvedTimestamp {
 	return resolvedTimestamp{
-		intentQ: makeUnresolvedIntentQueue(),
+		intentQ:  makeUnresolvedIntentQueue(),
+		settings: st,
 	}
 }
 
@@ -98,14 +104,14 @@ func (rts *resolvedTimestamp) Get() hlc.Timestamp {
 // closed timestamp. Once initialized, the resolvedTimestamp can begin operating
 // in its steady state. The method returns whether this caused the resolved
 // timestamp to move forward.
-func (rts *resolvedTimestamp) Init() bool {
+func (rts *resolvedTimestamp) Init(ctx context.Context) bool {
 	rts.init = true
 	// Once the resolvedTimestamp is initialized, all prior written intents
 	// should be accounted for, so reference counts for transactions that
 	// would drop below zero will all be due to aborted transactions. These
 	// can all be ignored.
 	rts.intentQ.AllowNegRefCount(false)
-	return rts.recompute()
+	return rts.recompute(ctx)
 }
 
 // IsInit returns whether the resolved timestamp is initialized.
@@ -116,11 +122,11 @@ func (rts *resolvedTimestamp) IsInit() bool {
 // ForwardClosedTS indicates that the closed timestamp that serves as the basis
 // for the resolved timestamp has advanced. The method returns whether this
 // caused the resolved timestamp to move forward.
-func (rts *resolvedTimestamp) ForwardClosedTS(newClosedTS hlc.Timestamp) bool {
+func (rts *resolvedTimestamp) ForwardClosedTS(ctx context.Context, newClosedTS hlc.Timestamp) bool {
 	if rts.closedTS.Forward(newClosedTS) {
-		return rts.recompute()
+		return rts.recompute(ctx)
 	}
-	rts.assertNoChange()
+	rts.assertNoChange(ctx)
 	return false
 }
 
@@ -128,28 +134,40 @@ func (rts *resolvedTimestamp) ForwardClosedTS(newClosedTS hlc.Timestamp) bool {
 // operation within its range of tracked keys. This allows the structure to
 // update its internal intent tracking to reflect the change. The method returns
 // whether this caused the resolved timestamp to move forward.
-func (rts *resolvedTimestamp) ConsumeLogicalOp(op enginepb.MVCCLogicalOp) bool {
-	if rts.consumeLogicalOp(op) {
-		return rts.recompute()
+func (rts *resolvedTimestamp) ConsumeLogicalOp(
+	ctx context.Context, op enginepb.MVCCLogicalOp,
+) bool {
+	if rts.consumeLogicalOp(ctx, op) {
+		return rts.recompute(ctx)
 	}
-	rts.assertNoChange()
+	rts.assertNoChange(ctx)
 	return false
 }
 
-func (rts *resolvedTimestamp) consumeLogicalOp(op enginepb.MVCCLogicalOp) bool {
+func (rts *resolvedTimestamp) consumeLogicalOp(
+	ctx context.Context, op enginepb.MVCCLogicalOp,
+) bool {
 	switch t := op.GetValue().(type) {
 	case *enginepb.MVCCWriteValueOp:
-		rts.assertOpAboveRTS(op, t.Timestamp)
+		rts.assertOpAboveRTS(ctx, op, t.Timestamp, true /* fatal */)
+		return false
+
+	case *enginepb.MVCCDeleteRangeOp:
+		rts.assertOpAboveRTS(ctx, op, t.Timestamp, true /* fatal */)
 		return false
 
 	case *enginepb.MVCCWriteIntentOp:
-		rts.assertOpAboveRTS(op, t.Timestamp)
-		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.TxnMinTimestamp, t.Timestamp)
+		rts.assertOpAboveRTS(ctx, op, t.Timestamp, true /* fatal */)
+		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.TxnIsoLevel, t.TxnMinTimestamp, t.Timestamp)
 
 	case *enginepb.MVCCUpdateIntentOp:
 		return rts.intentQ.UpdateTS(t.TxnID, t.Timestamp)
 
 	case *enginepb.MVCCCommitIntentOp:
+		// TODO(erikgrinaker): make this unconditionally fatal.
+		fatal := !DisableCommitIntentTimestampAssertion
+		rts.assertOpAboveRTS(ctx, op, t.Timestamp, fatal)
+
 		return rts.intentQ.DecrRef(t.TxnID, t.Timestamp)
 
 	case *enginepb.MVCCAbortIntentOp:
@@ -206,20 +224,21 @@ func (rts *resolvedTimestamp) consumeLogicalOp(op enginepb.MVCCLogicalOp) bool {
 		return rts.intentQ.Del(t.TxnID)
 
 	default:
-		panic(errors.AssertionFailedf("unknown logical op %T", t))
+		log.Fatalf(ctx, "unknown logical op %T", t)
+		return false
 	}
 }
 
 // recompute computes the resolved timestamp based on its respective closed
 // timestamp and the in-flight intents that it is tracking. The method returns
 // whether this caused the resolved timestamp to move forward.
-func (rts *resolvedTimestamp) recompute() bool {
+func (rts *resolvedTimestamp) recompute(ctx context.Context) bool {
 	if !rts.IsInit() {
 		return false
 	}
 	if rts.closedTS.Less(rts.resolvedTS) {
-		panic(fmt.Sprintf("closed timestamp below resolved timestamp: %s < %s",
-			rts.closedTS, rts.resolvedTS))
+		log.Fatalf(ctx, "closed timestamp below resolved timestamp: %s < %s",
+			rts.closedTS, rts.resolvedTS)
 	}
 	newTS := rts.closedTS
 
@@ -227,8 +246,8 @@ func (rts *resolvedTimestamp) recompute() bool {
 	// timestamps cannot be resolved yet.
 	if txn := rts.intentQ.Oldest(); txn != nil {
 		if txn.timestamp.LessEq(rts.resolvedTS) {
-			panic(fmt.Sprintf("unresolved txn equal to or below resolved timestamp: %s <= %s",
-				txn.timestamp, rts.resolvedTS))
+			log.Fatalf(ctx, "unresolved txn equal to or below resolved timestamp: %s <= %s",
+				txn.timestamp, rts.resolvedTS)
 		}
 		// txn.timestamp cannot be resolved, so the resolved timestamp must be Prev.
 		txnTS := txn.timestamp.Prev()
@@ -239,8 +258,8 @@ func (rts *resolvedTimestamp) recompute() bool {
 	newTS.Logical = 0
 
 	if newTS.Less(rts.resolvedTS) {
-		panic(fmt.Sprintf("resolved timestamp regression, was %s, recomputed as %s",
-			rts.resolvedTS, newTS))
+		log.Fatalf(ctx, "resolved timestamp regression, was %s, recomputed as %s",
+			rts.resolvedTS, newTS)
 	}
 	return rts.resolvedTS.Forward(newTS)
 }
@@ -248,22 +267,32 @@ func (rts *resolvedTimestamp) recompute() bool {
 // assertNoChange asserts that a recomputation of the resolved timestamp does
 // not change its value. A violation of this assertion would indicate a logic
 // error in the resolvedTimestamp implementation.
-func (rts *resolvedTimestamp) assertNoChange() {
+func (rts *resolvedTimestamp) assertNoChange(ctx context.Context) {
 	before := rts.resolvedTS
-	changed := rts.recompute()
-	if changed || !before.EqOrdering(rts.resolvedTS) {
-		panic(fmt.Sprintf("unexpected resolved timestamp change on recomputation, "+
-			"was %s, recomputed as %s", before, rts.resolvedTS))
+	changed := rts.recompute(ctx)
+	if changed || before != rts.resolvedTS {
+		log.Fatalf(ctx, "unexpected resolved timestamp change on recomputation, "+
+			"was %s, recomputed as %s", before, rts.resolvedTS)
 	}
 }
 
 // assertOpAboveTimestamp asserts that this operation is at a larger timestamp
 // than the current resolved timestamp. A violation of this assertion would
 // indicate a failure of the closed timestamp mechanism.
-func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS hlc.Timestamp) {
+func (rts *resolvedTimestamp) assertOpAboveRTS(
+	ctx context.Context, op enginepb.MVCCLogicalOp, opTS hlc.Timestamp, fatal bool,
+) {
 	if opTS.LessEq(rts.resolvedTS) {
-		panic(fmt.Sprintf("resolved timestamp %s equal to or above timestamp of operation %v",
-			rts.resolvedTS, op))
+		// NB: MVCCLogicalOp.String() is only implemented for pointer receiver.
+		// We shadow the variable to avoid it escaping to the heap.
+		op := op
+		err := errors.AssertionFailedf(
+			"resolved timestamp %s equal to or above timestamp of operation %v", rts.resolvedTS, &op)
+		if fatal {
+			log.Fatalf(ctx, "%v", err)
+		} else {
+			log.Errorf(ctx, "%v", err)
+		}
 	}
 }
 
@@ -271,10 +300,11 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // that may at some point in the future result in a RangeFeedValue publication.
 // Based on this definition, there are three possible states that an extent
 // intent can be in while fitting the requirement to be an "unresolved intent":
-// 1. part of a PENDING transaction
-// 2. part of a STAGING transaction that has not been explicitly committed yet
-// 3. part of a COMMITTED transaction but not yet resolved due to the asynchronous
-//    nature of intent resolution
+//  1. part of a PENDING transaction
+//  2. part of a STAGING transaction that has not been explicitly committed yet
+//  3. part of a COMMITTED transaction but not yet resolved due to the asynchronous
+//     nature of intent resolution
+//
 // Notably, this means that an intent that exists but that is known to be part
 // of an ABORTED transaction is not considered "unresolved", even if it has yet
 // to be cleaned up. In the context of rangefeeds, the intent's fate is resolved
@@ -283,11 +313,11 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // Defining unresolved intents in this way presents two paths for an unresolved
 // intent to become resolved (and thus decrement the unresolvedTxn's ref count).
 // An unresolved intent can become resolved if:
-// 1. it is COMMITTED or ABORTED through the traditional intent resolution
-//    process.
-// 2. it's transaction is observed to be ABORTED, meaning that it is by
-//    definition resolved even if it has yet to be cleaned up by the intent
-//    resolution process.
+//  1. it is COMMITTED or ABORTED through the traditional intent resolution
+//     process.
+//  2. it's transaction is observed to be ABORTED, meaning that it is by
+//     definition resolved even if it has yet to be cleaned up by the intent
+//     resolution process.
 //
 // An unresolvedTxn is a transaction that has one or more unresolved intents on
 // a given range. The structure itself maintains metadata about the transaction
@@ -295,8 +325,9 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // the transaction on a given range.
 type unresolvedTxn struct {
 	txnID           uuid.UUID
-	txnKey          roachpb.Key
-	txnMinTimestamp hlc.Timestamp
+	txnKey          roachpb.Key     // unset if refCount < 0
+	txnIsoLevel     isolation.Level // unset if refCount < 0
+	txnMinTimestamp hlc.Timestamp   // unset if refCount < 0
 	timestamp       hlc.Timestamp
 	refCount        int // count of unresolved intents
 
@@ -307,9 +338,16 @@ type unresolvedTxn struct {
 
 // asTxnMeta returns a TxnMeta representation of the unresolved transaction.
 func (t *unresolvedTxn) asTxnMeta() enginepb.TxnMeta {
+	if t.refCount <= 0 {
+		// An unresolvedTxn with a non-positive reference count may have an
+		// uninitialized txnKey, txnIsoLevel, and txnMinTimestamp. When in this
+		// state, we disallow the construction of a TxnMeta.
+		panic("asTxnMeta called on unresolvedTxn with negative reference count")
+	}
 	return enginepb.TxnMeta{
 		ID:             t.txnID,
 		Key:            t.txnKey,
+		IsoLevel:       t.txnIsoLevel,
 		MinTimestamp:   t.txnMinTimestamp,
 		WriteTimestamp: t.timestamp,
 	}
@@ -326,7 +364,7 @@ func (h unresolvedTxnHeap) Less(i, j int) bool {
 	// container/heap constructs a min-heap by default, so prioritize the txn
 	// with the smaller timestamp. Break ties by comparing IDs to establish a
 	// total order.
-	if h[i].timestamp.EqOrdering(h[j].timestamp) {
+	if h[i].timestamp == h[j].timestamp {
 		return bytes.Compare(h[i].txnID.GetBytes(), h[j].txnID.GetBytes()) < 0
 	}
 	return h[i].timestamp.Less(h[j].timestamp)
@@ -337,14 +375,12 @@ func (h unresolvedTxnHeap) Swap(i, j int) {
 	h[i].index, h[j].index = i, j
 }
 
-func (h *unresolvedTxnHeap) Push(x interface{}) {
-	n := len(*h)
-	txn := x.(*unresolvedTxn)
-	txn.index = n
+func (h *unresolvedTxnHeap) Push(txn *unresolvedTxn) {
+	txn.index = len(*h)
 	*h = append(*h, txn)
 }
 
-func (h *unresolvedTxnHeap) Pop() interface{} {
+func (h *unresolvedTxnHeap) Pop() *unresolvedTxn {
 	old := *h
 	n := len(old)
 	txn := old[n-1]
@@ -417,27 +453,31 @@ func (uiq *unresolvedIntentQueue) Before(ts hlc.Timestamp) []*unresolvedTxn {
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) IncRef(
-	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp,
+	txnID uuid.UUID, txnKey roachpb.Key, txnIsoLevel isolation.Level, txnMinTS, ts hlc.Timestamp,
 ) bool {
-	return uiq.updateTxn(txnID, txnKey, txnMinTS, ts, +1)
+	return uiq.updateTxn(txnID, txnKey, txnIsoLevel, txnMinTS, ts, +1)
 }
 
 // DecrRef decrements the reference count of the specified transaction. It
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) DecrRef(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, -1)
+	return uiq.updateTxn(txnID, nil, 0, hlc.Timestamp{}, ts, -1)
 }
 
 // UpdateTS updates the timestamp of the specified transaction without modifying
 // its intent reference count. It returns whether the update advanced the
 // timestamp of the oldest transaction in the queue.
 func (uiq *unresolvedIntentQueue) UpdateTS(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, 0)
+	return uiq.updateTxn(txnID, nil, 0, hlc.Timestamp{}, ts, 0)
 }
 
 func (uiq *unresolvedIntentQueue) updateTxn(
-	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp, delta int,
+	txnID uuid.UUID,
+	txnKey roachpb.Key,
+	txnIsoLevel isolation.Level,
+	txnMinTS, ts hlc.Timestamp,
+	delta int,
 ) bool {
 	txn, ok := uiq.txns[txnID]
 	if !ok {
@@ -450,12 +490,13 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 		txn = &unresolvedTxn{
 			txnID:           txnID,
 			txnKey:          txnKey,
+			txnIsoLevel:     txnIsoLevel,
 			txnMinTimestamp: txnMinTS,
 			timestamp:       ts,
 			refCount:        delta,
 		}
 		uiq.txns[txn.txnID] = txn
-		heap.Push(&uiq.minHeap, txn)
+		heap.Push[*unresolvedTxn](&uiq.minHeap, txn)
 
 		// Adding a new txn can't advance the queue's earliest timestamp.
 		return false
@@ -464,20 +505,25 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 	// Will changes to the txn advance the queue's earliest timestamp?
 	wasMin := txn.index == 0
 
+	if delta < -1 || delta > 1 {
+		// Require that |delta| <= 1, which simplifies the logic here because it
+		// ensures that negative reference counts never switch to positive without
+		// passing through zero and positive reference counts never switch to
+		// negative without passing through zero. Passing through zero ensures that
+		// we hit the `!ok` branch above.
+		panic("unsupported reference count delta")
+	}
 	txn.refCount += delta
-	if txn.refCount == 0 || (txn.refCount < 0 && !uiq.allowNegRefCount) {
+	if txn.refCount == 0 {
 		// Remove txn from the queue.
-		// NB: the txn.refCount < 0 case is not exercised by the external
-		// interface of this type because currently |delta| <= 1, but it
-		// is included for robustness.
 		delete(uiq.txns, txn.txnID)
-		heap.Remove(&uiq.minHeap, txn.index)
+		heap.Remove[*unresolvedTxn](&uiq.minHeap, txn.index)
 		return wasMin
 	}
 
 	// Forward the txn's timestamp. Need to fix heap if timestamp changes.
 	if txn.timestamp.Forward(ts) {
-		heap.Fix(&uiq.minHeap, txn.index)
+		heap.Fix[*unresolvedTxn](&uiq.minHeap, txn.index)
 		return wasMin
 	}
 	return false
@@ -501,7 +547,7 @@ func (uiq *unresolvedIntentQueue) Del(txnID uuid.UUID) bool {
 
 	// Remove txn from the queue.
 	delete(uiq.txns, txn.txnID)
-	heap.Remove(&uiq.minHeap, txn.index)
+	heap.Remove[*unresolvedTxn](&uiq.minHeap, txn.index)
 	return wasMin
 }
 

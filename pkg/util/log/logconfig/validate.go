@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logconfig
 
@@ -20,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
 )
@@ -38,7 +33,10 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 	bt, bf := true, false
 	zeroDuration := time.Duration(0)
 	zeroByteSize := ByteSize(0)
-	zeroInt := int(0)
+	defaultBufferedStaleness := 5 * time.Second
+	defaultFlushTriggerSize := ByteSize(1024 * 1024)   // 1mib
+	defaultMaxBufferSize := ByteSize(50 * 1024 * 1024) // 50mib
+	bufferFmt := BufferFmtNewline
 
 	baseCommonSinkConfig := CommonSinkConfig{
 		Filter:      logpb.Severity_INFO,
@@ -46,11 +44,14 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 		Redactable:  &bt,
 		Redact:      &bf,
 		Criticality: &bf,
+		// Buffering is configured to "NONE". This is different from a zero value
+		// which buffers infinitely.
 		Buffering: CommonBufferSinkConfigWrapper{
 			CommonBufferSinkConfig: CommonBufferSinkConfig{
 				MaxStaleness:     &zeroDuration,
 				FlushTriggerSize: &zeroByteSize,
-				MaxInFlight:      &zeroInt,
+				MaxBufferSize:    &zeroByteSize,
+				Format:           &bufferFmt,
 			},
 		},
 	}
@@ -59,25 +60,56 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 		BufferedWrites:  &bt,
 		MaxFileSize:     &zeroByteSize,
 		MaxGroupSize:    &zeroByteSize,
-		FilePermissions: func() *FilePermissions { s := FilePermissions(0o644); return &s }(),
+		FilePermissions: func() *FilePermissions { s := DefaultFilePerms; return &s }(),
 		CommonSinkConfig: CommonSinkConfig{
 			Format:      func() *string { s := DefaultFileFormat; return &s }(),
 			Criticality: &bt,
+			// Buffering is configured to "NONE". We're setting this to something so
+			// that the defaults are not propagated from baseCommonSinkConfig because
+			// buffering is not supported on file sinks at the moment (#72452).
+			Buffering: CommonBufferSinkConfigWrapper{
+				CommonBufferSinkConfig: CommonBufferSinkConfig{
+					MaxStaleness:     &zeroDuration,
+					FlushTriggerSize: &zeroByteSize,
+					MaxBufferSize:    &zeroByteSize,
+					Format:           &bufferFmt,
+				},
+			},
 		},
 	}
 	baseFluentDefaults := FluentDefaults{
 		CommonSinkConfig: CommonSinkConfig{
 			Format: func() *string { s := DefaultFluentFormat; return &s }(),
+			Buffering: CommonBufferSinkConfigWrapper{
+				CommonBufferSinkConfig: CommonBufferSinkConfig{
+					MaxStaleness:     &defaultBufferedStaleness,
+					FlushTriggerSize: &defaultFlushTriggerSize,
+					MaxBufferSize:    &defaultMaxBufferSize,
+					Format:           &bufferFmt,
+				},
+			},
 		},
 	}
 	baseHTTPDefaults := HTTPDefaults{
 		CommonSinkConfig: CommonSinkConfig{
 			Format: func() *string { s := DefaultHTTPFormat; return &s }(),
+			Buffering: CommonBufferSinkConfigWrapper{
+				CommonBufferSinkConfig: CommonBufferSinkConfig{
+					MaxStaleness:     &defaultBufferedStaleness,
+					FlushTriggerSize: &defaultFlushTriggerSize,
+					MaxBufferSize:    &defaultMaxBufferSize,
+					Format:           &bufferFmt,
+				},
+			},
 		},
 		UnsafeTLS:         &bf,
 		DisableKeepAlives: &bf,
 		Method:            func() *HTTPSinkMethod { m := HTTPSinkMethod(http.MethodPost); return &m }(),
-		Timeout:           &zeroDuration,
+		Timeout: func() *time.Duration {
+			twoS := 2 * time.Second
+			return &twoS
+		}(),
+		Compression: &GzipCompression,
 	}
 
 	propagateCommonDefaults(&baseFileDefaults.CommonSinkConfig, baseCommonSinkConfig)
@@ -100,7 +132,7 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 		} else {
 			fc.prefix = prefix
 		}
-		if err := c.validateFileSinkConfig(fc, defaultLogDir); err != nil {
+		if err := c.validateFileSinkConfig(fc); err != nil {
 			fmt.Fprintf(&errBuf, "file group %q: %v\n", prefix, err)
 		}
 	}
@@ -132,15 +164,26 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 	if c.Sinks.Stderr.Filter == logpb.Severity_UNKNOWN {
 		c.Sinks.Stderr.Filter = logpb.Severity_NONE
 	}
+	// We need to know if format-options were specifically defined on the stderr sink later on,
+	// since this information is lost once propagateCommonDefaults is called.
+	stdErrFormatOptionsOriginallySet := len(c.Sinks.Stderr.FormatOptions) > 0
 	propagateCommonDefaults(&c.Sinks.Stderr.CommonSinkConfig, c.FileDefaults.CommonSinkConfig)
 	if c.Sinks.Stderr.Auditable != nil && *c.Sinks.Stderr.Auditable {
-		if *c.Sinks.Stderr.Format == "crdb-v1-tty" {
-			f := "crdb-v1-tty-count"
-			c.Sinks.Stderr.Format = &f
-		}
 		c.Sinks.Stderr.Criticality = &bt
 	}
 	c.Sinks.Stderr.Auditable = nil
+
+	// FormatOptions are format-specific. We should only copy them over to StdErr from
+	// FileDefaults if FileDefaults specifies the same format as the stderr sink. Otherwise,
+	// we are likely to error when trying to apply an unsupported format option.
+	if c.FileDefaults.CommonSinkConfig.Format != nil &&
+		!canShareFormatOptions(*c.FileDefaults.CommonSinkConfig.Format, *c.Sinks.Stderr.Format) &&
+		!stdErrFormatOptionsOriginallySet {
+		c.Sinks.Stderr.CommonSinkConfig.FormatOptions = map[string]string{}
+	}
+	if err := c.ValidateCommonSinkConfig(c.Sinks.Stderr.CommonSinkConfig); err != nil {
+		fmt.Fprintf(&errBuf, "stderr sink: %v\n", err)
+	}
 
 	// Propagate the sink-wide default filter to all channels that don't
 	// have a filter yet.
@@ -244,7 +287,7 @@ func (c *Config) Validate(defaultLogDir *string) (resErr error) {
 		} else {
 			// "default" did not exist yet. Create it.
 			fc = c.newFileSinkConfig("default")
-			if err := c.validateFileSinkConfig(fc, defaultLogDir); err != nil {
+			if err := c.validateFileSinkConfig(fc); err != nil {
 				fmt.Fprintln(&errBuf, err)
 			}
 		}
@@ -322,17 +365,21 @@ func (c *Config) newFileSinkConfig(groupName string) *FileSinkConfig {
 	return fc
 }
 
-func (c *Config) validateFileSinkConfig(fc *FileSinkConfig, defaultLogDir *string) error {
+func (c *Config) validateFileSinkConfig(fc *FileSinkConfig) error {
 	propagateFileDefaults(&fc.FileDefaults, c.FileDefaults)
 	if !fc.Buffering.IsNone() {
-		// We cannot use unimplemented.WithIssue() here because of a
-		// circular dependency.
-		err := errors.UnimplementedError(
-			errors.IssueLink{IssueURL: build.MakeIssueURL(72452)},
-			`unimplemented: "buffering" not yet supported for file-groups`)
-		err = errors.WithHint(err, `Use "buffered-writes".`)
-		err = errors.WithTelemetry(err, "#72452")
-		return err
+		if fc.BufferedWrites != nil && *fc.BufferedWrites {
+			return errors.Newf(`Unable to use "buffered-writes" in conjunction with a "buffering" configuration. ` +
+				`These configuration options are mutually exclusive.`)
+		}
+		if *fc.Auditable {
+			return errors.Newf(`File-based audit logging cannot coexist with buffering configuration. ` +
+				`Disable either the buffering configuration ("buffering") or auditable log ("auditable") configuration.`)
+		}
+		// To preserve the format of log files, avoid additional formatting in the
+		// buffering configuration.
+		fmtNone := BufferFmtNone
+		fc.Buffering.Format = &fmtNone
 	}
 	if fc.Dir != c.FileDefaults.Dir {
 		// A directory was specified explicitly. Normalize it.
@@ -359,6 +406,29 @@ func (c *Config) validateFileSinkConfig(fc *FileSinkConfig, defaultLogDir *strin
 	}
 	fc.Auditable = nil
 
+	return c.ValidateCommonSinkConfig(fc.CommonSinkConfig)
+}
+
+// ValidateCommonSinkConfig validates a CommonSinkConfig.
+func (c *Config) ValidateCommonSinkConfig(conf CommonSinkConfig) error {
+	b := conf.Buffering
+	if b.IsNone() {
+		return nil
+	}
+
+	const minSlackBytes = 1 << 20 // 1MB
+
+	if b.FlushTriggerSize != nil && b.MaxBufferSize != nil {
+		if *b.FlushTriggerSize > *b.MaxBufferSize-minSlackBytes {
+			// See comments on newBufferSink.
+			return errors.Newf(
+				"not enough slack between flush-trigger-size (%s) and max-buffer-size (%s); "+
+					"flush-trigger-size needs to be <= max-buffer-size - %s (= %s) to ensure that"+
+					"a large message does not cause the buffer to overflow without triggering a flush",
+				b.FlushTriggerSize, b.MaxBufferSize, humanizeutil.IBytes(minSlackBytes), *b.MaxBufferSize-minSlackBytes,
+			)
+		}
+	}
 	return nil
 }
 
@@ -386,7 +456,7 @@ func (c *Config) validateFluentSinkConfig(fc *FluentSinkConfig) error {
 	}
 	fc.Auditable = nil
 
-	return nil
+	return c.ValidateCommonSinkConfig(fc.CommonSinkConfig)
 }
 
 func (c *Config) validateHTTPSinkConfig(hsc *HTTPSinkConfig) error {
@@ -394,7 +464,18 @@ func (c *Config) validateHTTPSinkConfig(hsc *HTTPSinkConfig) error {
 	if hsc.Address == nil || len(*hsc.Address) == 0 {
 		return errors.New("address cannot be empty")
 	}
-	return nil
+	if *hsc.Compression != GzipCompression && *hsc.Compression != NoneCompression {
+		return errors.New("compression must be 'gzip' or 'none'")
+	}
+	// If both header types are populated, make sure theres no duplicate keys
+	if hsc.Headers != nil && hsc.FileBasedHeaders != nil {
+		for key := range hsc.Headers {
+			if _, exists := hsc.FileBasedHeaders[key]; exists {
+				return errors.Newf("headers and file-based-headers have the same key %s", key)
+			}
+		}
+	}
+	return c.ValidateCommonSinkConfig(hsc.CommonSinkConfig)
 }
 
 func normalizeDir(dir **string) error {
@@ -450,4 +531,15 @@ func propagateDefaults(target, source interface{}) {
 			tf.Set(s.Field(i))
 		}
 	}
+}
+
+// canShareFormatOptions returns true if f1 and f2 can share format options.
+// See log.FormatParsers for full list of supported formats.
+// Examples:
+//
+//	canShareFormatOptions("json", "json") => true
+//	canShareFormatOptions("crdb-v2", "crdb-v2-tty") => true
+//	canShareFormatOptions("crdb-v2", "json") => false
+func canShareFormatOptions(f1, f2 string) bool {
+	return strings.HasPrefix(f1, f2) || strings.HasPrefix(f2, f1)
 }

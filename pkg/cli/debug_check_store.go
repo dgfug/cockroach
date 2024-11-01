@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -19,19 +14,22 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/spf13/cobra"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -80,11 +78,11 @@ func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 }
 
 type replicaCheckInfo struct {
-	truncatedIndex uint64
-	appliedIndex   uint64
-	firstIndex     uint64
-	lastIndex      uint64
-	committedIndex uint64
+	truncatedIndex kvpb.RaftIndex
+	appliedIndex   kvpb.RaftIndex
+	firstIndex     kvpb.RaftIndex
+	lastIndex      kvpb.RaftIndex
+	committedIndex kvpb.RaftIndex
 }
 
 type checkInput struct {
@@ -128,7 +126,7 @@ func worker(ctx context.Context, in checkInput) checkResult {
 		res.err = err
 		return res
 	}
-	ms, err := rditer.ComputeStatsForRange(desc, eng, claimedMS.LastUpdateNanos)
+	ms, err := rditer.ComputeStatsForRange(ctx, desc, eng, claimedMS.LastUpdateNanos)
 	if err != nil {
 		res.err = err
 		return res
@@ -146,7 +144,7 @@ func checkStoreRangeStats(
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	eng, err := OpenExistingStore(dir, stopper, true /* readOnly */)
+	eng, err := OpenEngine(dir, stopper, fs.ReadOnly, storage.MustExist)
 	if err != nil {
 		return err
 	}
@@ -166,7 +164,7 @@ func checkStoreRangeStats(
 	}
 
 	go func() {
-		if err := kvserver.IterateRangeDescriptorsFromDisk(ctx, eng,
+		if err := kvstorage.IterateRangeDescriptorsFromDisk(ctx, eng,
 			func(desc roachpb.RangeDescriptor) error {
 				inCh <- checkInput{eng: eng, desc: &desc, sl: stateloader.Make(desc.RangeID)}
 				return nil
@@ -220,7 +218,7 @@ func checkStoreRaftState(
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	db, err := OpenExistingStore(dir, stopper, true /* readOnly */)
+	db, err := OpenEngine(dir, stopper, fs.ReadOnly, storage.MustExist)
 	if err != nil {
 		return err
 	}
@@ -251,21 +249,22 @@ func checkStoreRaftState(
 				if err := kv.Value.GetProto(&hs); err != nil {
 					return err
 				}
-				getReplicaInfo(rangeID).committedIndex = hs.Commit
+				getReplicaInfo(rangeID).committedIndex = kvpb.RaftIndex(hs.Commit)
 			case bytes.Equal(suffix, keys.LocalRaftTruncatedStateSuffix):
-				var trunc roachpb.RaftTruncatedState
+				var trunc kvserverpb.RaftTruncatedState
 				if err := kv.Value.GetProto(&trunc); err != nil {
 					return err
 				}
 				getReplicaInfo(rangeID).truncatedIndex = trunc.Index
 			case bytes.Equal(suffix, keys.LocalRangeAppliedStateSuffix):
-				var state enginepb.RangeAppliedState
+				var state kvserverpb.RangeAppliedState
 				if err := kv.Value.GetProto(&state); err != nil {
 					return err
 				}
 				getReplicaInfo(rangeID).appliedIndex = state.RaftAppliedIndex
 			case bytes.Equal(suffix, keys.LocalRaftLogSuffix):
-				_, index, err := encoding.DecodeUint64Ascending(detail)
+				_, uIndex, err := encoding.DecodeUint64Ascending(detail)
+				index := kvpb.RaftIndex(uIndex)
 				if err != nil {
 					return err
 				}

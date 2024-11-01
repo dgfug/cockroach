@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -75,7 +70,7 @@ type vecComparator interface {
 	set(srcVecIdx, dstVecIdx int, srcValIdx, dstValIdx int)
 
 	// setVec updates the vector at idx.
-	setVec(idx int, vec coldata.Vec)
+	setVec(idx int, vec *coldata.Vec)
 }
 
 // {{range .}}
@@ -102,7 +97,7 @@ func (c *_TYPEVecComparator) compare(vecIdx1, vecIdx2 int, valIdx1, valIdx2 int)
 	return cmp
 }
 
-func (c *_TYPEVecComparator) setVec(idx int, vec coldata.Vec) {
+func (c *_TYPEVecComparator) setVec(idx int, vec *coldata.Vec) {
 	c.vecs[idx] = vec._TYPE()
 	c.nulls[idx] = vec.Nulls()
 }
@@ -113,13 +108,7 @@ func (c *_TYPEVecComparator) set(srcVecIdx, dstVecIdx int, srcIdx, dstIdx int) {
 	} else {
 		c.nulls[dstVecIdx].UnsetNull(dstIdx)
 		// {{if .IsBytesLike}}
-		// Since flat Bytes cannot be set at arbitrary indices (data needs to be
-		// moved around), we use CopySlice to accept the performance hit.
-		// Specifically, this is a performance hit because we are overwriting the
-		// variable number of bytes in `dstVecIdx`, so we will have to either shift
-		// the bytes after that element left or right, depending on how long the
-		// source bytes slice is. Refer to the CopySlice comment for an example.
-		c.vecs[dstVecIdx].CopySlice(c.vecs[srcVecIdx], dstIdx, srcIdx, srcIdx+1)
+		c.vecs[dstVecIdx].Copy(c.vecs[srcVecIdx], dstIdx, srcIdx)
 		// {{else}}
 		v := c.vecs[srcVecIdx].Get(srcIdx)
 		c.vecs[dstVecIdx].Set(dstIdx, v)

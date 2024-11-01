@@ -142,6 +142,10 @@ define GroupBy {
     # The grouping column order type (Streaming, PartialStreaming, or
     # NoStreaming).
     groupingOrderType exec.GroupingOrderType
+
+    # If set, the estimated number of rows that this GroupBy will output
+    # (rounded up).
+    estimatedRowCount uint64
 }
 
 # ScalarGroupBy runs a scalar aggregation, i.e.  one which performs a set of
@@ -215,11 +219,17 @@ define StreamingSetOp {
 # left node to completion and possibly short-circuit if the limit is reached
 # before executing the right node. The limit is guaranteed but the short-circuit
 # behavior is not.
+#
+# If true, EnforceHomeRegion specifies that the UNION ALL operation should
+# error out if it attempts to read rows beyond the leftmost branch. This
+# should only be set if performing the UNION ALL on behalf of a
+# locality-optimized search.
 define UnionAll {
     Left exec.Node
     Right exec.Node
     ReqOrdering exec.OutputOrdering
     HardLimit uint64
+    EnforceHomeRegion bool
 }
 
 # Sort performs a resorting of the rows produced by the input node.
@@ -249,6 +259,8 @@ define IndexJoin {
     KeyCols []exec.NodeColumnOrdinal
     TableCols exec.TableColumnOrdinalSet
     ReqOrdering exec.OutputOrdering
+    Locking opt.Locking
+    LimitHint int64
 }
 
 # LookupJoin performs a lookup join.
@@ -264,7 +276,8 @@ define IndexJoin {
 # contains the lookup join conditions targeting ranges located on local nodes
 # (relative to the gateway region), and remoteLookupExpr contains the lookup
 # join conditions targeting remote nodes; lookupCols are ordinals for the table
-# columns we are retrieving.
+# columns we are retrieving. If RemoteOnlyLookups is true, all lookups target
+# rows in remote regions.
 #
 # The node produces the columns in the input and (unless join type is
 # LeftSemiJoin or LeftAntiJoin) the lookupCols, ordered by ordinal. The ON
@@ -280,9 +293,12 @@ define LookupJoin {
     RemoteLookupExpr tree.TypedExpr
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
+    IsFirstJoinInPairedJoiner bool
     IsSecondJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
-    Locking *tree.LockingItem
+    Locking opt.Locking
+    LimitHint int64
+    RemoteOnlyLookups bool
 }
 
 # InvertedJoin performs a lookup join into an inverted index.
@@ -307,6 +323,7 @@ define InvertedJoin {
     OnCond tree.TypedExpr
     IsFirstJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
+    Locking opt.Locking
 }
 
 # ZigzagJoin performs a zigzag join.
@@ -331,6 +348,9 @@ define ZigzagJoin {
     # corresponding 1-1 to RightEqCols.
     LeftEqCols []exec.TableColumnOrdinal
 
+    # Left row-level locking properties.
+    LeftLocking opt.Locking
+
     # Right table and index.
     RightTable cat.Table
     RightIndex cat.Index
@@ -345,6 +365,9 @@ define ZigzagJoin {
     # RightEqCols are the right table columns that have equality constraints,
     # corresponding 1-1 to LeftEqCols.
     RightEqCols []exec.TableColumnOrdinal
+
+    # Right row-level locking properties.
+    RightLocking opt.Locking
 
     # OnCond is an extra filter that is evaluated on the results.
     # TODO(radu): remove this (it can be a separate Select).
@@ -429,6 +452,7 @@ define Insert {
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -445,17 +469,22 @@ define Insert {
 #    insert is not processed through side-effecting expressions.
 #  - there are no self-referencing foreign keys;
 #  - all FK checks can be performed using direct lookups into unique indexes.
+#  - all uniqueness checks can be performed using direct lookups
+#    into an index (could be a key prefix and not the entire key).
 #
-# In this case, the foreign-key checks can run before (or even concurrently
-# with) the insert. If they are run before, the insert is allowed to
-# auto-commit.
+# In this case, the foreign-key and uniqueness checks can run before the insert.
+# Foreign-key checks could potentially be run concurrently with the insert since
+# they are scanning from a different index than is being mutated. If the checks
+# are run before, the insert is allowed to auto-commit.
 define InsertFastPath {
     Rows [][]tree.TypedExpr
     Table cat.Table
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
-    FkChecks []exec.InsertFastPathFKCheck
+    FkChecks []exec.InsertFastPathCheck
+    UniqChecks []exec.InsertFastPathCheck
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction.
@@ -491,6 +520,7 @@ define Update {
     ReturnCols exec.TableColumnOrdinalSet
     Checks exec.CheckOrdinalSet
     Passthrough colinfo.ResultColumns
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     AutoCommit bool
@@ -531,6 +561,7 @@ define Upsert {
     UpdateCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     Checks exec.CheckOrdinalSet
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -545,11 +576,17 @@ define Upsert {
 # The fetchCols set contains the ordinal positions of the fetch columns in
 # the target table. The input must contain those columns in the same order
 # as they appear in the table schema.
+#
+# The passthrough parameter contains all the result columns that are part of
+# the input node that the delete node needs to return (passing through from
+# the input). The pass through columns are used to return any column from the
+# USING tables that are referenced in the RETURNING clause.
 define Delete {
     Input exec.Node
     Table cat.Table
     FetchCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
+    Passthrough colinfo.ResultColumns
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -596,16 +633,12 @@ define CreateTableAs {
 
 # CreateView implements a CREATE VIEW statement.
 define CreateView {
+    CreateView *tree.CreateView
     Schema cat.Schema
-    ViewName *cat.DataSourceName
-    IfNotExists bool
-    Replace bool
-    Persistence tree.Persistence
-    Materialized bool
     ViewQuery string
     Columns colinfo.ResultColumns
-    deps opt.ViewDeps
-    typeDeps opt.ViewTypeDeps
+    deps opt.SchemaDeps
+    typeDeps opt.SchemaTypeDeps
 }
 
 # SequenceSelect implements a scan of a sequence as a data source.
@@ -658,8 +691,7 @@ define AlterTableUnsplitAll {
 define AlterTableRelocate {
     Index cat.Index
     input exec.Node
-    relocateLease bool
-    relocateNonVoters bool
+    subjectReplicas tree.RelocateSubject
 }
 
 # Buffer passes through the input rows but also saves them in a buffer, which
@@ -730,4 +762,44 @@ define Export {
     FileName tree.TypedExpr
     FileFormat string
     Options []exec.KVOption
+    NotNullCols exec.NodeColumnOrdinalSet
+}
+
+# AlterTableRelocate implements ALTER RANGE RELOCATE.
+define AlterRangeRelocate {
+    input exec.Node
+    subjectReplicas tree.RelocateSubject
+    toStoreID tree.TypedExpr
+    fromStoreID tree.TypedExpr
+}
+
+# CreateFunction implements CREATE FUNCTION.
+define CreateFunction {
+    Schema cat.Schema
+    Cr *tree.CreateRoutine
+    Deps opt.SchemaDeps
+    TypeDeps opt.SchemaTypeDeps
+    FunctionDeps opt.SchemaFunctionDeps
+}
+
+# LiteralValues allows datums to be planned directly that are type checked
+# and evaluated (i.e. literals).
+define LiteralValues {
+    Rows tree.ExprContainer
+    Columns colinfo.ResultColumns
+}
+
+# ShowCompletions implements SHOW COMPLETIONS.
+define ShowCompletions {
+    Command *tree.ShowCompletions
+}
+
+# Call implements CALL for invoking a procedure.
+define Call {
+    Proc *tree.RoutineExpr
+}
+
+# CreateTrigger implements CREATE TRIGGER.
+define CreateTrigger {
+    Ct *tree.CreateTrigger
 }

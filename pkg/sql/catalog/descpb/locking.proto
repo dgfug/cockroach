@@ -1,16 +1,11 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto2";
 package cockroach.sql.sqlbase;
-option go_package = "descpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb";
 
 // ScanLockingStrength controls the row-level locking mode used by scans.
 //
@@ -115,7 +110,7 @@ enum ScanLockingStrength {
   // on each key scanned.
   FOR_UPDATE = 4;
 }
-  
+
 // LockingWaitPolicy controls the policy used for handling conflicting locks
 // held by other active transactions when attempting to lock rows due to FOR
 // UPDATE/SHARE clauses (i.e. it represents the NOWAIT and SKIP LOCKED options).
@@ -123,12 +118,15 @@ enum ScanLockingWaitPolicy {
   // BLOCK represents the default - wait for the lock to become available.
   BLOCK = 0;
 
-  // SKIP represents SKIP LOCKED - skip rows that can't be locked.
-  //
-  // NOTE: SKIP is not currently implemented and does not make it out of the SQL
-  // optimizer without throwing an error.
-  SKIP  = 1;
+  // SKIP_LOCKED represents SKIP LOCKED - skip rows that can't be locked.
+  SKIP_LOCKED = 1;
 
   // ERROR represents NOWAIT - raise an error if a row cannot be locked.
   ERROR = 2;
+}
+
+// LockingDurability controls the durability of locks.
+enum ScanLockingDurability {
+  BEST_EFFORT = 0;
+  GUARANTEED = 1;
 }

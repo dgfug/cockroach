@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,8 +12,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 )
 
 // isAlive returns whether the node queried by db is alive.
@@ -54,33 +50,28 @@ type offsetInjector struct {
 
 // deploy installs ntp and downloads / compiles bumptime used to create a clock offset.
 func (oi *offsetInjector) deploy(ctx context.Context) error {
-	if err := oi.c.RunE(ctx, oi.c.All(), "test -x ./bumptime"); err == nil {
+	if err := oi.c.RunE(ctx, option.WithNodes(oi.c.All()), "test -x ./bumptime"); err == nil {
 		oi.deployed = true
 		return nil
 	}
 
-	if err := oi.c.Install(ctx, oi.c.All(), "ntp"); err != nil {
+	if err := oi.c.Install(ctx, oi.t.L(), oi.c.All(), "ntp"); err != nil {
 		return err
 	}
-	if err := oi.c.Install(ctx, oi.c.All(), "gcc"); err != nil {
+	if err := oi.c.Install(ctx, oi.t.L(), oi.c.All(), "gcc"); err != nil {
 		return err
 	}
-	if err := oi.c.RunL(ctx, oi.t.L(), oi.c.All(), "sudo", "service", "ntp", "stop"); err != nil {
+	if err := oi.c.RunE(ctx, option.WithNodes(oi.c.All()), "sudo", "service", "ntp", "stop"); err != nil {
 		return err
 	}
-	if err := oi.c.RunL(ctx, oi.t.L(),
-		oi.c.All(),
-		"curl",
-		"--retry", "3",
-		"--fail",
-		"--show-error",
-		"-kO",
+	if err := oi.c.RunE(ctx, option.WithNodes(oi.c.All()),
+		"curl", "--retry", "3", "--fail", "--show-error", "-kO",
 		"https://raw.githubusercontent.com/cockroachdb/jepsen/master/cockroachdb/resources/bumptime.c",
 	); err != nil {
 		return err
 	}
-	if err := oi.c.RunL(ctx, oi.t.L(),
-		oi.c.All(), "gcc", "bumptime.c", "-o", "bumptime", "&&", "rm bumptime.c",
+	if err := oi.c.RunE(ctx, option.WithNodes(oi.c.All()),
+		"gcc", "bumptime.c", "-o", "bumptime", "&&", "rm bumptime.c",
 	); err != nil {
 		return err
 	}
@@ -96,7 +87,7 @@ func (oi *offsetInjector) offset(ctx context.Context, nodeID int, s time.Duratio
 
 	oi.c.Run(
 		ctx,
-		oi.c.Node(nodeID),
+		option.WithNodes(oi.c.Node(nodeID)),
 		fmt.Sprintf("sudo ./bumptime %f", float64(s)/float64(time.Millisecond)),
 	)
 }
@@ -116,7 +107,7 @@ func (oi *offsetInjector) recover(ctx context.Context, nodeID int) {
 	for _, cmd := range syncCmds {
 		oi.c.Run(
 			ctx,
-			oi.c.Node(nodeID),
+			option.WithNodes(oi.c.Node(nodeID)),
 			cmd...,
 		)
 	}

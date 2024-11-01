@@ -1,28 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { assert } from "chai";
-import { createHashHistory } from "history";
+import { createHashHistory, createMemoryHistory } from "history";
+import merge from "lodash/merge";
 
-import { MetricConstants, INodeStatus } from "src/util/proto";
 import * as protos from "src/js/protos";
+import { MetricConstants, INodeStatus } from "src/util/proto";
 
+import { nodesReducerObj, livenessReducerObj } from "./apiReducers";
 import {
   nodeDisplayNameByIDSelector,
   selectCommissionedNodeStatuses,
   selectStoreIDsByNodeID,
   LivenessStatus,
   sumNodeStats,
+  numNodesByVersionsTagSelector,
+  nodeDisplayNameByIDSelectorWithoutAddress,
 } from "./nodes";
-import { nodesReducerObj, livenessReducerObj } from "./apiReducers";
-import { createAdminUIStore } from "./state";
+import { AdminUIState, createAdminUIStore } from "./state";
 
 function makeNodesState(
   ...addresses: { id: number; address: string; status?: LivenessStatus }[]
@@ -54,9 +51,9 @@ function makeNodesState(
   return store.getState();
 }
 
-describe("node data selectors", function() {
-  describe("display name by ID", function() {
-    it("display name is node id appended to address", function() {
+describe("node data selectors", function () {
+  describe("display name by ID", function () {
+    it("display name is node id appended to address", function () {
       const state: any = makeNodesState(
         { id: 1, address: "addressA" },
         { id: 2, address: "addressB" },
@@ -65,7 +62,7 @@ describe("node data selectors", function() {
       );
 
       const addressesByID = nodeDisplayNameByIDSelector(state);
-      assert.deepEqual(addressesByID, {
+      expect(addressesByID).toEqual({
         1: "(n1) addressA",
         2: "(n2) addressB",
         3: "(n3) addressC",
@@ -73,7 +70,7 @@ describe("node data selectors", function() {
       });
     });
 
-    it("generates unique names for re-used addresses", function() {
+    it("generates unique names for re-used addresses", function () {
       const state: any = makeNodesState(
         { id: 1, address: "addressA" },
         { id: 2, address: "addressB" },
@@ -85,7 +82,7 @@ describe("node data selectors", function() {
       );
 
       const addressesByID = nodeDisplayNameByIDSelector(state);
-      assert.deepEqual(addressesByID, {
+      expect(addressesByID).toEqual({
         1: "(n1) addressA",
         2: "(n2) addressB",
         3: "(n3) addressC",
@@ -96,7 +93,7 @@ describe("node data selectors", function() {
       });
     });
 
-    it("adds decommissioned flag to decommissioned nodes", function() {
+    it("adds decommissioned flag to decommissioned nodes", function () {
       const state: any = makeNodesState(
         {
           id: 1,
@@ -130,8 +127,8 @@ describe("node data selectors", function() {
       );
 
       const addressesByID = nodeDisplayNameByIDSelector(state);
-      assert.equal(addressesByID[1], "[decommissioned] (n1) addressA");
-      assert.deepEqual(addressesByID, {
+      expect(addressesByID[1]).toEqual("[decommissioned] (n1) addressA");
+      expect(addressesByID).toEqual({
         1: "[decommissioned] (n1) addressA",
         2: "(n2) addressB",
         3: "[decommissioned] (n3) addressC",
@@ -144,14 +141,14 @@ describe("node data selectors", function() {
       });
     });
 
-    it("returns empty collection for empty state", function() {
+    it("returns empty collection for empty state", function () {
       const store = createAdminUIStore(createHashHistory());
-      assert.deepEqual(nodeDisplayNameByIDSelector(store.getState()), {});
+      expect(nodeDisplayNameByIDSelector(store.getState())).toEqual({});
     });
   });
 
-  describe("store IDs by node ID", function() {
-    it("correctly creates storeID map", function() {
+  describe("store IDs by node ID", function () {
+    it("correctly creates storeID map", function () {
       const data = [
         {
           desc: { node_id: 1 },
@@ -177,7 +174,173 @@ describe("node data selectors", function() {
       store.dispatch(nodesReducerObj.receiveData(data));
       const state = store.getState();
 
-      assert.deepEqual(selectStoreIDsByNodeID(state), {
+      expect(selectStoreIDsByNodeID(state)).toEqual({
+        1: ["1", "2", "3"],
+        2: ["4"],
+        3: ["5", "6"],
+      });
+    });
+  });
+
+  describe("numNodesByVersionsTagSelector", () => {
+    it("correctly returns the different binary versions and the number of associated nodes", () => {
+      const data = [
+        {
+          desc: { node_id: 1 },
+          build_info: {
+            tag: "v22.1",
+          },
+        },
+        {
+          desc: { node_id: 2 },
+          build_info: {
+            tag: "v22.1",
+          },
+        },
+        {
+          desc: { node_id: 3 },
+          build_info: {
+            tag: "v21.1.7",
+          },
+        },
+      ];
+      const store = createAdminUIStore(createHashHistory());
+      store.dispatch(nodesReducerObj.receiveData(data));
+      const state = store.getState();
+      const expectedResult = new Map([
+        ["v22.1", 2],
+        ["v21.1.7", 1],
+      ]);
+      expect(numNodesByVersionsTagSelector(state)).toEqual(expectedResult);
+    });
+  });
+});
+
+describe("node data selectors without addresses", function () {
+  describe("display name by ID", function () {
+    it("display name is node id appended to address", function () {
+      const state: any = makeNodesState(
+        { id: 1, address: "addressA" },
+        { id: 2, address: "addressB" },
+        { id: 3, address: "addressC" },
+        { id: 4, address: "addressD" },
+      );
+
+      const addressesByID = nodeDisplayNameByIDSelectorWithoutAddress(state);
+      expect(addressesByID).toEqual({
+        1: "n1",
+        2: "n2",
+        3: "n3",
+        4: "n4",
+      });
+    });
+
+    it("generates unique names for re-used addresses", function () {
+      const state: any = makeNodesState(
+        { id: 1, address: "addressA" },
+        { id: 2, address: "addressB" },
+        { id: 3, address: "addressC" },
+        { id: 4, address: "addressD" },
+        { id: 5, address: "addressA" },
+        { id: 6, address: "addressC" },
+        { id: 7, address: "addressA" },
+      );
+
+      const addressesByID = nodeDisplayNameByIDSelectorWithoutAddress(state);
+      expect(addressesByID).toEqual({
+        1: "n1",
+        2: "n2",
+        3: "n3",
+        4: "n4",
+        5: "n5",
+        6: "n6",
+        7: "n7",
+      });
+    });
+
+    it("adds decommissioned flag to decommissioned nodes", function () {
+      const state: any = makeNodesState(
+        {
+          id: 1,
+          address: "addressA",
+          status: LivenessStatus.NODE_STATUS_DECOMMISSIONED,
+        },
+        { id: 2, address: "addressB" },
+        {
+          id: 3,
+          address: "addressC",
+          status: LivenessStatus.NODE_STATUS_DECOMMISSIONED,
+        },
+        { id: 4, address: "addressD", status: LivenessStatus.NODE_STATUS_DEAD },
+        {
+          id: 5,
+          address: "addressA",
+          status: LivenessStatus.NODE_STATUS_DECOMMISSIONED,
+        },
+        { id: 6, address: "addressC" },
+        { id: 7, address: "addressA" },
+        {
+          id: 8,
+          address: "addressE",
+          status: LivenessStatus.NODE_STATUS_DECOMMISSIONING,
+        },
+        {
+          id: 9,
+          address: "addressF",
+          status: LivenessStatus.NODE_STATUS_UNAVAILABLE,
+        },
+      );
+
+      const addressesByID = nodeDisplayNameByIDSelectorWithoutAddress(state);
+      expect(addressesByID[1]).toEqual("[decommissioned] n1");
+      expect(addressesByID).toEqual({
+        1: "[decommissioned] n1",
+        2: "n2",
+        3: "[decommissioned] n3",
+        4: "n4",
+        5: "[decommissioned] n5",
+        6: "n6",
+        7: "n7",
+        8: "n8",
+        9: "n9",
+      });
+    });
+
+    it("returns empty collection for empty state", function () {
+      const store = createAdminUIStore(createHashHistory());
+      expect(
+        nodeDisplayNameByIDSelectorWithoutAddress(store.getState()),
+      ).toEqual({});
+    });
+  });
+  describe("store IDs by node ID", function () {
+    it("correctly creates storeID map", function () {
+      const data = [
+        {
+          desc: { node_id: 1 },
+          store_statuses: [
+            { desc: { store_id: 1 } },
+            { desc: { store_id: 2 } },
+            { desc: { store_id: 3 } },
+          ],
+        },
+        {
+          desc: { node_id: 2 },
+          store_statuses: [{ desc: { store_id: 4 } }],
+        },
+        {
+          desc: { node_id: 3 },
+          store_statuses: [
+            { desc: { store_id: 5 } },
+            { desc: { store_id: 6 } },
+          ],
+        },
+      ];
+      const store = createAdminUIStore(createHashHistory());
+      store.dispatch(nodesReducerObj.receiveData(data));
+      const state = store.getState();
+
+      expect(selectStoreIDsByNodeID(state)).toEqual({
         1: ["1", "2", "3"],
         2: ["4"],
         3: ["5", "6"],
@@ -186,7 +349,7 @@ describe("node data selectors", function() {
   });
 });
 
-describe("selectCommissionedNodeStatuses", function() {
+describe("selectCommissionedNodeStatuses", function () {
   const nodeStatuses: INodeStatus[] = [
     {
       desc: {
@@ -197,31 +360,37 @@ describe("selectCommissionedNodeStatuses", function() {
 
   function makeStateForLiveness(livenessStatuses: {
     [id: string]: LivenessStatus;
-  }) {
-    return {
-      cachedData: {
-        nodes: {
-          data: nodeStatuses,
-          inFlight: false,
-          valid: true,
-        },
-        liveness: {
-          data: {
-            statuses: livenessStatuses,
+  }): AdminUIState {
+    const store = createAdminUIStore(createMemoryHistory());
+    return merge<AdminUIState, RecursivePartial<AdminUIState>>(
+      store.getState(),
+      {
+        cachedData: {
+          nodes: {
+            data: nodeStatuses,
+            inFlight: false,
+            valid: true,
+            unauthorized: false,
           },
-          inFlight: false,
-          valid: true,
+          liveness: {
+            data: {
+              statuses: livenessStatuses,
+            },
+            inFlight: false,
+            valid: true,
+            unauthorized: false,
+          },
         },
       },
-    };
+    );
   }
 
-  it("selects all nodes when liveness status missing", function() {
+  it("selects all nodes when liveness status missing", function () {
     const state = makeStateForLiveness({});
 
     const result = selectCommissionedNodeStatuses(state);
 
-    assert.deepEqual(result, nodeStatuses);
+    expect(result).toEqual(nodeStatuses);
   });
 
   const testCases: [string, LivenessStatus, INodeStatus[]][] = [
@@ -245,17 +414,17 @@ describe("selectCommissionedNodeStatuses", function() {
   ];
 
   testCases.forEach(([name, status, expected]) => {
-    it(name, function() {
+    it(name, function () {
       const state = makeStateForLiveness({ "1": status });
 
       const result = selectCommissionedNodeStatuses(state);
 
-      assert.deepEqual(result, expected);
+      expect(result).toEqual(expected);
     });
   });
 });
 
-describe("sumNodeStats", function() {
+describe("sumNodeStats", function () {
   // Each of these nodes only has half of its capacity "usable" for cockroach data.
   // See diagram for what these stats mean:
   // https://github.com/cockroachdb/cockroach/blob/31e4299ab73a43f539b1ba63ed86be5ee18685f6/pkg/storage/metrics.go#L145-L153
@@ -278,22 +447,22 @@ describe("sumNodeStats", function() {
     },
   ];
 
-  it("sums stats from an array of nodes", function() {
+  it("sums stats from an array of nodes", function () {
     const livenessStatusByNodeID: { [key: string]: LivenessStatus } = {
       1: LivenessStatus.NODE_STATUS_LIVE,
       2: LivenessStatus.NODE_STATUS_LIVE,
     };
     const actual = sumNodeStats(nodeStatuses, livenessStatusByNodeID);
-    assert.equal(actual.nodeCounts.healthy, 2);
-    assert.equal(actual.capacityTotal, 200);
-    assert.equal(actual.capacityUsed, 20);
+    expect(actual.nodeCounts.healthy).toBe(2);
+    expect(actual.capacityTotal).toBe(200);
+    expect(actual.capacityUsed).toBe(20);
     // usable = used + available.
-    assert.equal(actual.capacityUsable, 100);
+    expect(actual.capacityUsable).toBe(100);
   });
 
   it("returns empty stats if liveness statuses are not provided", () => {
     const { nodeCounts, ...restStats } = sumNodeStats(nodeStatuses, {});
-    Object.entries(restStats).forEach(([_, value]) => assert.equal(value, 0));
-    Object.entries(nodeCounts).forEach(([_, value]) => assert.equal(value, 0));
+    Object.entries(restStats).forEach(([_, value]) => expect(value).toBe(0));
+    Object.entries(nodeCounts).forEach(([_, value]) => expect(value).toBe(0));
   });
 });

@@ -66,12 +66,12 @@ ALTER INDEX json_inv EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 10),
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder
-FROM [SHOW EXPERIMENTAL_RANGES FROM INDEX json_inv] ORDER BY lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM INDEX json_inv WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-NULL       /10      {1}       1
-/10        /20      {2}       2
-/20        NULL     {3}       3
+start_key     end_key       replicas  lease_holder
+…/<IndexMin>  …/10          {1}       1
+…/10          …/20          {2}       2
+…/20          …/<IndexMax>  {3}       3
 
 statement ok
 ALTER TABLE json_tab VALIDATE CONSTRAINT check_c
@@ -92,7 +92,7 @@ vectorized: true
       table: json_tab@json_inv
       spans: 2 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysUt2KEzEUvvcpDudmFbNMkqk3uaq6IxZqW2cKKjpI2hzXkZqMSUYWlr67NLNiR-rYFW9Czs_3w8e5xfBthwqLt6v509kCHl7NqnX1ev4IqmJePF-Dhhfl8hV8Cc5-jHoDb14WZQEbmH7oOM8JLsQFLMurooRn70AjQ-sMLfRXCqjeo0CGEhnmWDNsvdtSCM4fRrdpcWZuUHGGjW272LdjE3eECp035MkgQ0NRN7vENxWPsd7XDLfOE6pf2wt36dpsMtiu9wxdF--Ya4Yh6mtCle_Zkbo4Uj9BvNabHZWkDfmMD838zGSaPo39jgyrVtugIBM8E5fpzVaePjU3hTWgrQEBLn4mjwyXXVQwFfgnm-I-NivnI_lMnorrNL0c0MvzUxDnpyBTCvL_pfAXm3cp5P-aAh-nLym0zgY668r44UzJXFN_1sF1fksr77ZJpi-XCZcahkLsp0_6Ymb70cHgMViMguU4WI6C-QAsfgfno-DJuPLkXsr1_sGPAAAA__-G2ntW
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJykk1-PEjEUxd_9FM19WY0lM-3gS5_QZYwkLOAMiRolm0Iv7OjQjm3HXbPhu5spoEBYsmAfmv658zsnZ24fwf0sQUD6edR_2xuQl91ePs4_9l-RPO2n12MiyftseEO-O6NvvZySTx_SLCVT0vlWx3GC5IpdkWHWTTPy7guRQEEbhQO5RAfiKzCgwIFCAhMKlTUzdM7Y5uoxFPbUA4iYQqGr2q-PfeFLBAHGKrSogIJCL4sy8DrsNUxWEwozYxHEv-qBaZkqau9VT1YUTO035AkF5-UCQSQ7VnpdEO0V3XHDdtwcERrLaYkZSoU2ivfNbTPqhEWhfwGFa1PWS-1EiCavZLOMWByxVpijkcV58ZBqRaRWhBHj79DCU87ZgfP4HOe5sR5txI8lelyOH8jxPTn-_KDYhUHxEBT__6DYOc43QSWXB5XsycWn5TJ0ldEOn9W78YFSizWvAdUC16_HmdrOcGTNLNSut8MACgcKnV_fvllvenp75bxFufzbVrskdpLEzyDxk6R4j8R2SfyQlJwktZ_2xA5J7Us9JU3289Lc3xYKBMSb0ToybQc0H8iFaxogvzP3ATv-XTW_by5LhxRu5A_soke7LHThfDED4W2Nq9WLPwEAAP__YmPR7w==
 
 # Filter with fully-specified arrays.
 query T
@@ -114,7 +114,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 4 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUUmFv0zAQ_c6vON2XbWAUO0Ga5E8ZLBORylqSSoCWCLn1MYKCHWxnqlT1v6Mk2qCgFvrldPfu3vN7krfof7QoMfu4mF3lt3B-nZfL8v3sAspslr1ZgoKbYv4OvnlrPge1gg9vsyKD8xWkVc95QnB2JxjE9dkFzIt9PGHwasKvswJefwKFDI3VdKu-k0d5hwJrhp2za_LeugHajge53qDkDBvT9WGAa4Zr6wjlFkMTWkKJS7VqqSClyUUcGWoKqmlH2Uez6dg05gEZlp0yXkIkeHTlXCRePnXRwtGXZpMZDcpouAQbvpLzyHDeBwmpYGmM9Y6h7cMvOz6oe0Ipduz_LefmgVwgfdO0gRy5SOz7ftxnm86BNZAKCX7wDT4oF2SFl1XFOR9K8tSJ50ONpxmBjP73oagQxrTJX2kPRo1PiVpaF8hF8X7AVLw4KJ-cIl-Q76zxtCd_SJnvaoak72n6YN72bk0LZ9fjM9M4H3kjoMmHaSumITfTajD4O1kcJcfHyfFRcvIHud49-xkAAP__grwnDQ==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUUlFv0zAQfudXnO5lG3hKnCBN8lPHmolI21qSSoDWaHKbaxdI7WA7W1HV_46S0LJWtDA_nO6-O3_ffZZXaH-UKDD6Mry5jO_gtB-no_TTzRmk0U10NQIJ18ngFr5ZrR6cnMDnj1ESwekEeuPa90OCk3vOIMhOzmCQ7OIhg_cd3o8S-PAVJDJUOqc7uSCL4h45Zgwro6dkrTYNtGoH4nyJwmdYqKp2DZwxnGpDKFboClcSChzJSUkJyZyM5yPDnJwsypZ2s2yvTQr1hAyvdFkvlBUgGUyQYVrJpvK4710a4_HzbeYNDc2KZaRykCqHC9DukYzFbM1Q1-7PRtbJOaHgLyzEfRT-mv2_i1g9kXGUXxelI0PG47tWNv1oWRnQCnpcgG1WB-ukcWKMF-Ox7_tNCLcZf9vEoKsRSOX_HuRjhNZwuDHMcFA7AT1-0HqwZ52_xnqqjSPjBbuGe_zdQblwTy54jVxCttLK0o7cISV_T-mcrzOGlM-p-6RW12ZKQ6On7WxXDlqiFsjJuq7LuyJWm5Z1huRi-1FeMvGjTMFhJr7PFBxlCo_tlDGclfr5ochRoP_7nP8lbA42F-TcNo-dPurnlnb0s2qeaiZLSwxv5XfqkyOzKFRhXTFF4UxN6_WbXwEAAP__n_9pnQ==
 
 # Filter with a path ending in an empty object.
 query T
@@ -136,7 +136,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 2 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMVFFv0zwUff9-xdV92YcwSpysIPwUoJmoVNaSVgJEIuTWlxFU7GI7U6Uq_x0lYVpT1mx7QOIliu-5556TY93s0f3coMD043z6anIJ_48ni-Xi_fQJLNJp-mYJEi6y2Tv47oz-4uUKPrxNsxRWkORVGMYEZ_scZY4C9nV9BrNsnGbw-hNIZKiNokv5gxyKz8iRYYQMYywYbq1Zk3PGNtC-bZyoHYqQYam3le_KvvQbQoGVNlaRJYUMFXlZbhq8qAuGa2MJxW3ruHS-1GsfnPd6MWnkZ5UXkHAsaoam8r91CobOyytCEdfshJc7lBbGerLB6Fjn6cnx573xfHj8Uq42lJFUZIOwr3FzFUn7UuprZLjYSu0EBDwM2usI9vWzw0Mwt_S13KVagdQKOBj_jextJiyJTvrmj_E90ddkPamLcuPJkg2ivvkbPN1tLRgNCRfgGvPgvLRe5PhC5nkYhs2Dv8wRSKujqsgRDj_DnbQe9axHD4-cPzzy6DDy6G9Efo_vPyKP_53I71mijNzWaEdHi3335LBZeFJX1P0dnKnsmubWrFuZ7jhreW1BkfMdyrvDRHdQY_CQzAfJz4fJ0SA5HibHg-SwR-bH5PNB8mhYefQo5aL-71cAAAD__xdB_D4=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMVVFv0zAQfudXnO5lIDwlTloQfiqsmai0raOtBIhUk1vftkBqF9vZhqr8d5R0hTa0FZ14wA9Wznf5vvv0OZcFuu85Ckw-XZ697V3A825vOBp-OHsBw-QsORmBhNNB_xy-OqOvvJzAx_fJIIEJdNIiDGOCo0WKMkUBi7I8gv6gmwzg3WeQyFAbRRdyRg7FF-TIMEKGMY4Zzq2ZknPGVqlFXdhTDyhChpmeF3557DOfEwostLGKLClkqMjLLK_y43LMcGosofhd2s2cz_TUB62NWuxU9P3CC-hwHJcMTeEfecYMnZc3hCJea6zXRdEq2Y7etjAPjfVkg3aT9-VOulaDrr1Bx_fTjeQkpwFJRTYINzlXVnXqh0zfIcMTkxcz7QRIBhNkOJzLKgp4GNT2BYvyeD0ILi1dZw-JViC1Ag7G35LdKYU3pISHSOnpO7Ke1GmWe7Jkg2hTzyqfPMwtGA0dLsBV_YPz0nqR4muZpmEYVht_kyKQVo1TkSKsK3E7pUQNKdGGlOjvXeFPdyVadyX6Z67wQ6T84Ur8P7kSH_JpDsjNjXbUGB_bmcIG0zGv5gypG1oOJWcKO6VLa6Z17TLs10D1gSLnl1m-DHp6lXLekpz9mizrSHwv0qvdSGETKdqLFB-AFO9FCjeQ-DpS1ERq7UVq7-6JN5HaT-0prly8zs39VaZQYPi4jrdsq4XVC_LGVVdpeGvua9jRj3l1Ea5l7ojhufxGXfJkZ5mu_jxTFN4WVJbPfgYAAP__L_ZcSQ==
 
 # Filter with a path ending in an empty array.
 query T
@@ -158,7 +158,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 2 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMVF1v0zAUfedXXN2XgTBKnGx8-ClAM1GprCOtBKiJkFtfjaBiF9uZJlX57ygJU5uyZpvEAy9RfM8995wc62aL7tcaBaZfLidvxxfwdDSezWefJs9glk7S93OQcJ5NP8IPZ_Q3L5fw-UOapbCEJK_CMCY42eYocxSwKOoTmGajNIN3X0EiQ20UXcif5FAskCPDCBnGWDDcWLMi54xtoG3bOFY3KEKGpd5Uviv70q8JBVbaWEWWFDJU5GW5bvCiLhiujCUUu9ZR6XypVz447fVi0shPKy8g4VjUDE3l_-gUDJ2XV4QirtkRL3cozYz1ZIOzQ53nR8ef9sbz4fFzuVxTRlKRDcK-xu1VJO1Lqa-R4WwjtRMQ8DBoryNYFC92h20NUivgYPx3srskWBIddcsf43asr8l6Uufl2pMlG0R9y7d4erOxYDQkXIBrLIPz0nqR4yuZ52EYNg_-OkcgrQ6qb3KE_c9wR61HPevRw4PmDw862g86-ndB3-P2r6Dj_yfoexYmI7cx2tHBEt89OWyWm9QVdX8CZyq7oktrVq1Md5y2vLagyPkO5d1hrDuoMbhP5oPkl8PkaJAcD5PjQXLYI_ND8ukg-WxY-exRykX95HcAAAD__3dB9BI=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMVV9v2j4Uff99iqv70t80V9gJ7I-f2EqqIbWlA6RtaqLKkNs2W7CZ7bSdUL77lFBWyAoa3cv8YOX63pxzj45zs0D3PUeJ0efzk3f9M_i_1x-NRx9PXsAoOomOxqDgeDg4ha_O6EuvJvDpQzSMYALduOA8JDhYxKhilHCRlAcwGPaiIbz_AgoZapPSmZqRQ3mBAhkGyDDEhOHcmik5Z2yVWtSF_fQeJWeY6Xnhl8c-8zmhxEIbm5KlFBmm5FWWV_mkTBhOjSWUj6W9zPlMT32rvVGL3Yp-UHgJXYFJydAU_oEnYei8uiaU4Vpj_R7Kdsm29PYE88hYT7bVafK-3ErXbtB1NujEbrqxmuQ0JJWSbfFNzpVV3foh07fI8MjkxUw7CYrBBBmO5qqKWoK3avtaF8nhY7AoQekUBBh_Q3arANEQwPcR0Ne3ZD2lx1nuyZJtBZsqVvnofm7BaOgKCa7qGpxX1ssYX6s45pxXm3gTI5BOG6dvY4R1JW6rlKAhJdiQEvy5F-L5XgTrXgR_6YXYR8BvXoT_khfhPp_hkNzcaEeNUfE0E28wHYpqplB6TcsB5Exhp3RuzbSuXYaDGqg-SMn5ZVYsg75epZy3pGa_psg6ktiJ9Go7Em8iBTuRwj2Qwp1IfANJrCMFTaT2TqTO9p5EE6nz3J7CysWr3NxdZilK5A_r8IlttbB6QV276iqNbsxdDTv-Ma8uwpXKHTE8Vd-oR57sLNPVX2aK0tuCyvK_nwEAAP__NY9UHQ==
 
 # Filter with a nested array. This index expression is not tight.
 query T
@@ -186,7 +186,7 @@ vectorized: true
                   table: json_tab@json_inv
                   spans: 4 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk9Fv2j4Qx99_f8XpXkp_85Q4oarkp7RrqlExYAnSNkE0GXLrMlE7s03FhPjfpyS0W7oSwUMi350_5-_5fFu0P1coMP48GV4NRtC7GaTT9OPwHNJ4GL-bgoTbZPwBflitvjq5gE_v4ySG3gKi-dr3Q4Kz2YwzCLLs7BzGyYtIyKC_j9zECVx_AYkMlc5pJB_Iopghx4xhafSSrNWmcm3rDYN8g8JnWKhy7Sp3xnCpDaHYoivcilDgVC5WlJDMyXg-MszJyWJVp30SHNWLQj0iw7SUygrwuO9dGVN__G3L8iaGvhWbWOUgVQ6XoN13MhYZjtdOQMRZFGC2Y6jX7o8s6-Q9oeA7drz0gXok4yi_LVaODBmPt_U_xeNNaUAriLgAW-kH66RxYo6X87nv-9UvfGXF_6_-QWMjkMpPQfgcob6B8J8bOFh-cEr5qTaOjBe0i474m4Ppw1PS3-lC7d9FeOBdlKZ4kObXca3tn3L4c0v77aMbv4BeFLwyPUKIu3Q8um6mqL1lP0bPW47oxsUpihOypVaWWnoPZfZ3GUPK76mZVavXZkkTo5f1MY05rrnakZN1TZQ3xkA1oUrg3zDvhINuOOiEw2447IT73XC_E754AWe7_34HAAD__4w7tkQ=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUVG1P2z4Qf___FKd7A_xn1DgpQvKrAg1aEVDWVNomGiG3OSAjtTPb4UGo331K0jKakYpaiuV78O_ufr7LK9rfGQoMf1ydHw0uYbc_iMbRt_M9iMLz8GQMEk5Hwwv4ZbW6cXIK37-GoxB2p9CbFJ4XEOxcX3MGfhzv7MFw1LAEDLpLSz8cwfFPkMhQ6YQu5ZwsimvkGDPMjZ6RtdqUqtfKYZA8o_AYpiovXKmOGc60IRSv6FKXEQocy2lGI5IJmY6HDBNyMs0q2FXCveqQqkdkeKKzYq6sAMlgigyjXJZSh3udI2Oqj--vSZ0rQ7fpc6gSkCqBQ9DunozFeMFQF-5vZtbJO0LB35Uy6KPwFuzz1QzUIxlHyWmaOTJkOny9pJU9fM4NaAU9LsCWJYB10jgxwcPJxPO8cgs-OPH_y92vZQRSyTZX-AShIiFYkcBwWDgBPd5Kh9-gg29DR6SNI9Px10no8S-t4YJGOH-bcGc6VctWCja1kpPTm_yBXv7pp7asuo2sgm2yeuuF7npOtV7Abs__YBKFEGfR8PK4nsh1l-VIvrl84hkPGhV0t6lgRDbXytJa_m2RvEakfb6IGVJyR_WPwerCzOjK6FnlW4vDCqhSJGRdbeW1MFArk3WG5PxtKN8j8Y1IfjsSbyL5G5GCdiS_iRRsROq2IwVNpO5GpINNPMUMbzP9dJMmKNBbrv0PttXC8oK8s2UDRPf6qYIdv-Tl893KzBLDC_lAfXJk5qlKrUtnKJwpaLH4708AAAD__8ZXD3A=
 
 # Combine predicates with OR.
 query T
@@ -208,7 +208,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 2 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzUVNFv0z4Qfv_9Fad72fbDKHHSguSnDJqJSmUtaSVAa4Tc-hhBxS62M1Wa-r-jJKxbyppuEi-8WPbdffd9l0-5W3Q_Vygw_TQZnQ8v4XQwnM6mH0ZnME1H6dsZSLjIxu_huzP6i5cL-PguzVI4XUAyL8MwJji54vnJGYyzdjBqgoM0gzefQSJDbRRdyh_kUFwhR4YRMowxZ7i2ZknOGVulbuvCodqgCBkWel36JuwLvyIUWGpjFVlSyFCRl8WqyufbnOHSWEJxXzoonC_00ge9Vi0mFf249AISjvmWoSn9b56cofPymlDEW3ZAyyNMU2M92aC_z_PiYPteqz3vbj-TixVlJBXZIGxz3DmT1JdC3yDD6VpqJyDgYXBubcBf7m7BxNLXYpNqBVIr4GD8N7L3X4Ml0UHF_DmKh_qGrCd1Uaw8WbJB1JZ9l083awtGQ8IFuEo2OC-tF3N8PZ-HYVgd8e7G_6_OqHkjkFbHC_kc4eGw7uCAUWvA6OmW8KdbEu0sif66JUcU_2FJ_K9ZcuQnzMitjXa0txge7xxWC4PUNTXbxZnSLmlizbKmaZ7jGlcHFDnfZHnzGOomVQl8COad4Ffd4KgTHHeD405w2ALzfXCvE9zvZu4_iznf_vcrAAD___KFDc0=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzUVV1v2jAUfd-vsO5L281V7AQ2yU90JdWQ2tIB0jYVVBl822YLNrOdtlPFf59MCiNZYaPay_Jg-X5wzj064eYR3PccBKSfL06POudkv93pD_ofTw9IPz1NjwdEkpNe94x8dUZfeTkmnz6kvZTsj0lrWDCWINm75KO9A9LtVZNxmWynPfL-C5FAQRuF53KKDsQlcKAQA4UERhRm1kzQOWND6XHR2FEPIBiFTM8KX6Z95nMEAYU2VqFFBRQUepnloT6ajyhMjEUQv1rbmfOZnvioUemFVqDvFl6QFofRnIIp_BPPiILz8gZBJGuDddogGnO6YbZnmPvGerRRs877ZiNdo0bXrNDx7XQDOc6xh1KhjViVc-lca3HJ9B1QODZ5MdVOEEnJGCj0ZzJEEWfRkbURP1zdoguL19lDqhWRWhFOjL9Fu1EEr4lgu4jo6Du0HtVJlnu0aKO4qmRZTx9mlhhNWlwQFyYnzkvrxRDeDYeMsXAkqxt_Hc64jIGgVn9u5EMg63rdRsFxTXBcERz_vWv85a7FK9fif-Ma30XEb64l_59ryS5_7R66mdEOa-vneSZWYzrkYU-husFyqTlT2AleWDNZ9JZhdwG0SCh0vqzyMujoZcl5i3K62kzrSHwr0tvNSKyOFG9FSnZASrYisQoSX0eK60iNrUjNzTPxOlLzpTMlwcXr3NxfZQoEsKfn8Jlj-UD4gbxx4VXq35r7Bezgxyy8CNcyd0jhTH7DNnq000yHL9cEhLcFzuevfgYAAP__02FtyQ==
 
 # Combine predicates with OR.
 query T
@@ -236,7 +236,7 @@ vectorized: true
                   table: json_tab@json_inv
                   spans: 3 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk99v0zAQx9_5K073sh8YJU46kPyUjWWiU2lLUglQGyG3OUZQZwfbnYqq_u8oCS0ElEBfLN-Pz933dLod2m9rFBh_mI6uh2M4vx2ms_Td6ALSeBS_nsEl3CWTt_DVavXJySW8fxMnMZwvIVpsfD8kOJuH2dkFTJK2c84ZBFkTuY0TuPkIEhkqndNYPpJFMUeOGcPS6BVZq03l2tUJw3yLwmdYqHLjKnfGcKUNodihK9yaUOBMLteUkMzJeD4yzMnJYl2XPWiN6k-hnpBhWkplBXjc966N8cIXx583NfS52MYqB6lyuALtvpCxyHCycQIizqIAsz1DvXG_5FgnHwgF37P_lzxUT2Qc5XfF2pEh4_G27kM83pYGtIKIC7CVbrBOGicW-Gqx8H2_esLjj19W78vGRiCV_zuRLxDqaYO_pu0cNThl1FQbR8YL2gNG_Hln-fCU8ve6UD93H3bsvjTFozTfW2tkUdjZf3BK_-MGB-3ujV_AeRS070MIcZ9OxjfNnbSih0M5pnRKvDpFYkK21MpSS2BXZX-fMaT8gZobtHpjVjQ1elW3acxJzdWOnKxrorwxhqoJVQJ_h3kvHPTDQS8c9sNhLzzohwe98NUfcLZ_9iMAAP__ygWqBA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUU21P2zAQ_r5fcbovvMyocVI2yZ8KNGhFQFlbaZtohNzmgIzUzmyHF6H-9ykJ7Ui0dKs_WPeW554nvntF-ytFgeH3q_OjwSXs9gfjyfjr-R6Mw_PwZAL7cDoaXsBPq9WNkzP49iUchbA7g94097yAYOc6iHb2YDiqB685Az-qMv1wBMc_QCJDpWO6lAuyKK6RY8QwM3pO1mpThF7LgkH8jMJjmKgsd0U4YjjXhlC8oktcSihwImcpjUjGZDoeMozJySQtYVdce6WRqEdkeKLTfKGsAMlghgzHmSy8Dvc6R8Z0goO11bkydJs8hyoGqWI4BO3uyViMlgx17v4wsk7eEQr-TsKgj8Jbsv9XMVCPZBzFp0nqyJDp8LqUVT58zgxoBT0uwBbUwTppnJji5-nU87ziCtYW3y_uT5WPQCr-dyGfIpSC_ZVghsPcCejxVul-QzrfRvpYG0em49cF9_jH1nZBo52_Tbsznai3cQk2jYuTs5vsgV6aM8Ng3kqs2yAWbENs_fTdOq0qLmC359d3TQhxNh5eHlc7V8uulm5d0kr5sEG5uw3lEdlMK0s1wm2dvEanA76MGFJ8R9XCW52bOV0ZPS9rK3dYApWBmKyrsrxyBmqVss6QXKyX7j0S34jktyPxJpK_ESloR_KbSMFGpG47UtBE6m5EOtz0nyKGt6l-ukliFOi9nYO_XKuDxQfyzhYDML7XTyXs5CUrnu9WppYYXsgH6pMjs0hUYl0yR-FMTsvlh98BAAD__z7dA0A=
 
 # More complex combination.
 query T
@@ -260,7 +260,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 6 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUklGL00AUhd_9FZf7si2OZCZFhHnKrs1ipTY1Kahsgkw71zVSZ-rMdCmU_ndJ4tJGad19CTP33O_kHJg9-l9rlJh-nk-vJzMYjCfFovg4HUKRTtO3C1Bwm2cf4Ie35mtQS_j0Ls1TGAyWkJRbzkcEV3eiupLyfZHNboaQ5dDT4qM2hOvZuI-OzoIlLpUr8QTO8nGaw80XUMjQWE0z9ZM8yjsUWDHcOLsi761rRvt2YaJ3KDnD2my2oRlXDFfWEco9hjqsCSUu1HJNOSlNLuLIUFNQ9bq1feyctIfaPCDDYqOMlxAJHv1J-OrkHM0dfat3qdGgjAYhwIbv5DwyzLZBQiJYEmN1YGi34ZjJB3VPKMWBPT33xDyQC6Rv63UgRy4S_fCPerrbOLAGEiHBN-HBB-WCLPFNWXLOm48oSx7HTYPjBIGM_s9WXCK0RV__0_Nsyfg5JQvrArko7ldLxMuz9qPn2OfkN9Z46tmfc-aHiiHpe-rel7dbt6K5s6v2N901a7l2oMmHThXdZWI6qQl4CouLcHwZji_Co7_g6vDidwAAAP__rm46Zw==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkl9P2zwUxu_fT3F0bgC9RrFTTZN8VaBBywQNSyptE4mQ2xwgW2pntgNMqN99SkpHW63d8IVlnz_Pc36Wn9H9qFFi9OXq4iQew-EozibZp4sjyKKL6GwCCs7T5BK-OaNvvJrC5w9RGsHh4RSGecv5gODgWhQHUn7MkvHpESQpbOTC19wRnIxHm62DnY05TpXNca05SUdRCqdfQSFDbUoaqzk5lNcosGDYWDMj54ztQs99QVw-oeQMK920vgsXDGfGEspn9JWvCSVO1LSmlFRJNuDIsCSvqrqXXTEP-0OlH5DhmanbuXYSFIMpMswa1d0CwYOXiY_XzsGVpdvqKdIlKF2CEGD8PVmHxYKhaf3rWM6rO0Ip1jjiEUq-YP-OEusHsp7K86r2ZMkGYpNnlY-eGgtGw1BIcN384LyyXub4Ps85590m8pyHYQfxGkEgXf6lKswRetZ3K1SGSeslDMVO6HALWrwFOjPWkw3CTdSh-H-n3WDLLnyLXUquMdrRht0uJ77ldCwWBUMq72j5R51p7YyurJn1tctr0gv1gZKcX2bF8hLrVcp5S2r--4usK4m9SuFuJbGtFO5VGuybqWB4W5vHm6pEifxlHf9hWy3sGtSd6x47uzePvezkZ9M91a2qHTG8VN9pRJ7svNKV89UMpbctLRb__QoAAP__2Jd89w==
 
 # Combined with non-JSON predicates.
 query T
@@ -281,7 +281,7 @@ vectorized: true
           table: json_tab@json_inv
           spans: 1 span
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0k--K00AUxb_7FJcLsi3OkkyyrTIgtNosFmpb04LKGmTaXJdIzcSZiSwsfXdJUmsj3dlW8dv8-51zksO9R_N9gwKjD_PJcDyFzmi8WC7eTbqwiCbR6yVIuI5nb-GrUflnK1fw_k0UR9BZweBT6fshwcUNTy66MJyOoNOR8BSCLrwEvwuzeBTF8OojSGSYq5Sm8hsZFDfIkWGADENMGBZarckYpaur-_rhOL1D4TPM8qK0zbHN7IZQoNIpaUqRYUpWZptab8CfYbJNGK6VJhS_X0_VpSq8fut1smWoSrtTThgaK28JxdWWHbjzA_cjwku52lBMMiXt-e0wv_7UoF5k-Q9kuChkbgR43PeGWnv8cr_y5pq-ZHdRXn3SrLQCBhwfisjPiXidbSxp0l7QztecC-gMeFWWEGI8Xb6oO9utH_QPzvFfKG1Je1fHqjouH7bkg9Mb4Kc3EOwbCP69gUci7hsI_1MDj_jvGuj9bQO-Wz4mU6jc0EnT5VfjSektNeNsVKnXNNdqXds021nN1QcpGdvcPm8247y5qgIewtwJB244cMKhGw6dsN-C-Z_wlRPuuZ17TrjvhvtnxU62T34GAAD__2_w9Gk=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lOFq2zAUhf_vKcSF0YQp2LKTbAgG6RqXBdq0swPb6ExR49vOm2N5krx2lLz7sJ1ksUlME5h_hGvp5jvHOpKeQf9KgIP35fridDIlnfEkmAWfLrok8C68sxkR5Ny_uiQ_tExvjbgjnz96vkc6d2T0LbdtF8nJDQtPuuR0OiadjiCvidMl74ndJVf-2PPJh69EAIVURjgVC9TAb4ABBQcouBBSyJSco9ZSFVPPZeMkegJuU4jTLDfVsIlNgsBBqggVRkAhQiPipOSN2BsIlyGFuVQI_F_3VPZkZg1r3eGSgszNihxS0EY8IPD-lpXJGPhwSbfcsC03O4Rm4i5BH0WEyrLr5tYrNyqLOP0NFM5kki9SzculCTJRlBazrVOlLNbbVNa1wvv4yUsj2OeaNVzbh7g-jxODCpXl1C1X45x0RqzIk3M-mc7elbGu6r1-nIYf5xA_gVQGldXfle5uObch16_JOS8PjR0ZmrMJzTk-NHaI601o7n8LzT3Ezyq0wfGhDWpydrucjzqTqcYXnWm7odRjxS2B0QNWt4qWuZrjtZLzsrd6vSpB5UCE2lSzb6uXSbqe0kahWGyO3DaJtZKcA0hOK8ndT3KaJLeVZNdIbJvUb5L6raTBfk-sSRq0kob7SW6TNDz26wbFfrhP5ONtHAEHe_X0dvysHyj-IB50sSmD7_KxxM7-ZMWWuheJRgqX4ieO0aBaxGmsTTwHblSOy-WrvwEAAP__mSldmQ==
 
 # The split disjunction rule allows us to use the index for this query.
 query T
@@ -313,7 +313,7 @@ vectorized: true
           table: json_tab@json_tab_pkey
           spans: [/44 - /44]
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lFFP2zAUhd_3K6z7AmhBiZ20hUiTykamdWKUpUjbxKLJbTzIVOLMdicQ6n-fkrCmKcRu1og3N_Z377HvOX0A-XsOPgRfL85ORudo_3Q0uZx8PjtAk-AseHeJKHofjj-hX5KnPxSdoi8fgjBA-1M0_L5wHJehvSsc7R2gcYj2KXqDPC9fnwYhevsNUbAg5TE7p7dMgn8FGCwgYIELkQWZ4DMmJRf51kNxcBTfge9YkKTZQuWfIwtmXDDwH0Alas7Ah0s6nbOQ0ZgJ2wELYqZoMi_K_1M5zERyS8U9WDDJaCp9ZHtecXi8UD4aYmtIIFpawBeqaiQVvWbg46W1vZjTRKoknSn7uK5kmN90LGImWJw33OhWFZjeoxsqb57Q0bJS1GtUVNXhZa_NOq_LQo2yMWmlu9LU71zTOT_kmY3d-vHHgTXqGNR04O2tgxusUyyS9M-ad7Bjnwhh48PVyr4Q7GdyF6Rx5alGiaSNxAkXignbfe7Rni_vtin_kSfp4wP0jNnZIixem-Yr1w1eLCy407A4nYSFbG9Ssr1JycqkZHeTGiQ-mtT7X5Mayq-ZtN-9SQ3NV9M-ejGTkk5Nijv_R3-mXchkxlPJar2aKju5YBZfs_KCki_EjF0IPivalD_HBVd8iJlU5S4uf4zScisXuA7jTRivw0c1GLeDsbsLTfQw0V7a0NnVv5infzJPS_f0cE8L9_VwXwsP9PBgl0nrYdOk9bRh0ke7TPpYP2nHEA5DtEzZeuLwOk4M-BOPt8qmnjaGU48bZob1CdvsHS1f_Q0AAP__NmxOwg==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lV9P4zgUxd_3U1j3BdCmSpyk_yKtVJZ2tR0BZdpKMyOmQm5zgQxt3LHdAYT63Udp6Z84xDSFoQ9VHDu_e3x1jv0E8ucYAmh9vTg9bp-Tw2a71-99Pj0ivdZp66RPGPmv2zkjPySPrxQbki__t7otcjgkje8zx_GQHFzSwcER6XTJISP_EN9PnputLvn3G2FgQcxDPGcTlBBcAgULXLDAg4EFU8FHKCUXydTTYmE7fIDAsSCKpzOVvB5YMOICIXgCFakxQgB9NhxjF1mIwnbAghAVi8YL_EplY_VwNb3DR7DghI9nk1gGhFlkCBb0piwZ2b5vOzCYW8BnalNRKnaDENAtie0mBM7c2l1lM5IqikfKrqclNpIWdESIAsOANKhWfQMYPpJbJm8zXw_mG4VlTWE9V-GGy5e1de7fS3DuNqhbaB8bjRVNI3XfXeQ5L_GpTb308s5MGYVVdWFeShjd3YXU5MIo_pUy4Jb7qGMfC2HT0vrJvhB4HT204jBXtqvLLqK6x4VCYXsvNfblcp5WrlCTPvEofu5Rea-k5qnyNVXlIqrWnq5-YDSruQrfHk3nvaKZPuHc3RPg7pkAd50Ad_8EuEVUPyfA3z8BfpFyWwmo_NEEVIqoWlun9oEJqOUqfHsC6HslgBa547sopzyWmCqeV8rRSpVosiUMb3DZAslnYoQXgo8Wa5fDzgK0eBGiVMtZuhy049WUVALZZO2CbRLVSXSbVEuR6DapXoxEvXzU8sbfneUaUGUd5RpbZVJV01Geuet-ftsdHeUbUeUCpLKRVMknZZpeMZKq-SRfJ1X3NVW1GMloqkynzCyTqTwdVdvbVJkA1s2mcvLbTjOpeeVYMJwLmR3STATTLDeflYkgzWRwVz9kIvgKymiIbL_MMJMjMpan5sPBpKuanPPXY35_FYUQgPP8K73wt_pB8gG7kcll07vl9wtu_3GaXBXXbCzRgjN2h01UKCZRnFyDIwiUmOF8_tfvAAAA__9LYx8-
 
 # We cannot use the index for this query.
 query T
@@ -331,7 +331,7 @@ vectorized: true
       table: json_tab@json_tab_pkey
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkd_Km0AQxe_7FMPcfAa2xLV3CwXzx1CLiakG2pJK2egQLMY1uyu0BN-9qJTEQkq_yzlnz8yPszc01woFBl_20SLcgbMO00P6KZpBGkTB6gASNkm8hR9G1d-tPMHnD0ESgHMC_1vruu8IXo48e5lBnIBjrto6Uoh1sAq3i2gG78HrnXWQwPIrSGRYq4J28kIGxRE5ZgwbrXIyRuleug0PwuInCpdhWTet7eWMYa40obihLW1FKPAgTxUlJAvScxcZFmRlWQ1r_7D6jS4vUv9ChmkjayPgLTKMWyvA58z3MOsYqtbejxgrz4SCd-z_QTZlZUmTnvMpxagLcHxv2pUQ4mMa75YPnfl8Wpq4j3fip7jea3ATMo2qDU1gn212u4whFWca_8aoVue01yofzoxjPOQGoSBjR5ePQ1iPVg_4GOb_DHt_hbPuze8AAAD__3Di014=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkdFvmzAQxt_3V5zupURyVJy9WZpEG6jGlIQOIm1ThyIHrhkrwdQ26qqI_30CljVUa7X6AXHfHd_9-HxAc1-iwODr9eIiXIHjh8k6-byYQBIsgvkaJFzF0RJ-GlVtrNzCl49BHICzBe9747rvCc5ueHo2gSgGx9xr60gh_GAeLi8WE_gAs67jBzFcfgOJDCuV00ruyaC4QY4pw1qrjIxRupMO_UCY_0LhMiyqurGdnDLMlCYUB7SFLQkFruW2pJhkTvrcRYY5WVmUve2R1Tu-bOo7ekSGc1U2-8oIkAy2yDCpZVdNMW0ZqsY-bTNW7ggFP8ELfRRuy_6f8KooLWnS53yMN-gCHG82DlEI8SmJVpcnYXp8nKZ4KpFh1FgBHn8Rf_YMn78FPyZTq8rQCP6lTe6zTVPepgwp39Fwq0Y1OqNrrbJ-diij3qgXcjJ26PKhCKtjy1hNcv83_VMn_qrT7DWnlOFtqR42RY4C3T9n-o_H8WD3gdyZLqLkh3robdePdfeDt7I0xHAp78gnS3pfVIWxRYbC6oba9t3vAAAA___Ayg8k
 
 statement ok
 INSERT INTO array_tab VALUES
@@ -352,12 +352,12 @@ ALTER INDEX arr_inv EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 10), 
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder
-FROM [SHOW EXPERIMENTAL_RANGES FROM INDEX arr_inv] ORDER BY lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM INDEX arr_inv WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-NULL       /10      {1}       1
-/10        /20      {2}       2
-/20        NULL     {3}       3
+start_key     end_key       replicas  lease_holder
+…/<IndexMin>  …/10          {1}       1
+…/10          …/20          {2}       2
+…/20          …/<IndexMax>  {3}       3
 
 query T
 EXPLAIN (DISTSQL)
@@ -378,7 +378,7 @@ vectorized: true
           table: array_tab@arr_inv
           spans: 1 span
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0k9Fv0zAQxt_5K6x7GQhPiZOWSX4K0ExUCu1IigDRaHLj0xQp2MF2pqEq_ztKAoyUNduE9mLJvvvd9_Vrbg_2ewUc4s8XyevlijxfLLNN9iF5QbI4id9uiCDn6fo9EcaIH5dO7Mind3Eakx2Jto3vh0hO9u0JWaeLOCVvvhABFJSWuBLf0AL_CgwoBEAhhJxCbXSB1mrTlfZ941LeAPcplKpu3PDsSlchcGiUNhINSqAg0Ymy6up5m1MotEHgt62L0rpSFc6bjXoh6uTXjeMkYpC3FHTjfunkFKwTVwg8bOkRL3coZdo4NN78UOfl0fGz0Xg2PX4jdhWmKCQazx9r_PkLImHMZamugUJWC2U58Zh_6jHfW31Mkv64_dU0Co46Y49xtlTXaBzK87JyaNB4wdje73p8UxuiFYkYJ7azR1BJvoXtNjw7Gw4gRy0FI0vBw8NiDw8r8E-94D_DusfZP2GFTx_WPR9uirbWyuLBMt092e-WDOUVDhtpdWMKvDC66GWG67rn-geJ1g1VNlyWaih1Bv-G2ST8ahoOJuFwGg4nYX8Es0N4NgnPp5Xnj1LO22c_AwAA___3ic2c
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lN9v0zAQx9_5K6x7GQhXsZOWSX4qrJmo1K2jKQJEq8lNbiMitYPt7Iem_O8oyTaWsFR0D-TB0vkun-9XZ5_vwP7KQED49Wz2fnpKXk-m0TL6NHtDonAWHi2JJMeL-QmRxsjbcyc35MvHcBGSDRmvCsYCJAd35QGZLybhgnz4RiRQUDrBU7lFC-I7cKDgA4UA1hRyo2O0VpsqdVcXTpMbEIxCqvLCNdsudRmCgEJpk6DBBCgk6GSaVfl1uaYQa4Mg_pROUutSFTtv2KqFcSU_L5wgYw7rkoIu3L3OmoJ18hJBBE-MTScghiXt8faMcqSNQ-ONurpve-WGHblRS47vllvKTYYLlAkaj7U1H49oLI05T9UVUDjSWbFVVhBJyQYoRLmsIo-zgceZd_p5NquXXrO8Y5btY3aqrtA4TI7TzKFB4_ltxw_58CY3RCsy5oLYyiFBlYgVrFbB4WGzAOm16Hcs-i2L_r_3k7-8nz4beP5L-sn3MftXP4P_0c9gn3FYoM21stgZ2eeVWEdpwKvZxuQSm4fA6sLEeGZ0XNc24bwG1RsJWtdkeRNM1UPKOoNy-zjNT0l8J-ldP4l1Sf5OUrAHKdhJYi0Sf0ryu6ThTtKo3xPvkkYv9RRUp3iR6evzNAEB7P4bPLM8fFD9IC9tdZWiH_q6xi5v8-oiXMjMIoUT-RMn6NBsU1W99jEIZwosy1e_AwAA___h0C2n
 
 # Combined with non-Array predicates.
 query T
@@ -399,7 +399,7 @@ vectorized: true
           table: array_tab@arr_inv
           spans: 1 span
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0k--K00AUxb_7FJcLsi3O0kzSVhkQutosFmq7JgUVDcu0uSyBmIkzE1FK3l2SlLWV7my7sF9K58_vnJMz3C2anzkKDL_czK9mC-hNZ_Eq_jTvQxzOw_crkHAdLT-C1Fr-ubVyDZ8_hFEIvTVMvleeFxBcbHl90YerxRR6PQkvwe_DW_D6sIymYQTvvoJEhoVKaSF_kEHxDTky9JFhgAnDUqsNGaN0c7RtL87S3yg8hllRVrbbtpnNCQUqnZKmFBmmZGWWt3oT_gqTOmG4UZpQ_Lu9UJeqHIwPbic1Q1XZnXLC0Fh5RyiGNdtz53vuR4RXcp1TRDIlPfAOw9xXNZFa32bFL2QYl7IwAgbcG_DL5rf5-mVlBUw4PhSInxPoOsstadKt8l6abl9Ab8KbpxFCzBarN-0L7f4_6O-f4x8rbUkPhsce5rh8cCDvn943P71vv-3bf0rfjwS67zt4pr4f8d_1PXpq355bPiJTqsLQSZPjNaNH6R11o2pUpTd0o9WmtemWy5ZrN1Iytjt93S1mRXfUBNyHuRP23bDvhAM3HDhh7wDm_8NDJzxyO4-c8NgNj8-KndQv_gYAAP__ZXjoOA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lO9q2zAUxb_vKcSF0YQpxJKTbAgG6ZqUGdq0swPb2EJR49vOzLE8SV5Xit992E672CSmLswfhP7c_M6JjqQHML9iEDD_cnl27C1Ib-YFy-DTWZ8E87P5yZJIcupfnBOptby_svKafP449-ekd02m3zPHcZEcPbD8qE-OFzPS60nymvA-eU-cPrnwZ3OffPhKJFBIVIgLuUED4hswoMCBggsrCqlWazRG6WLpoSz0wj8gHApRkma2mraRjREEKB2ixhAohGhlFJe8KXsDq3xFYa00gvhXvVADlQ4ntepVTkFldkteUTBW3iKI0Y4VbwZiktMdN2zHzR6hpbyO0UcZoh46dXNPWzeVWl9FyW-gcKLibJMYUW5NkMqiO2TOkA2KlsMhj6zh0eni8TSKLWrUQ143WM0L0puyIj0hhLdYvitD3PYP-uENP7yLn0Bpi3o42pflfjm3ITeqyfHnR8ReGBEvI-JdImJdPD5F5P63iNwufrYRjV8e0bgm57TL-WhSlRh81n11GkoDVrwAGN5i9WIYlek1Xmq1Lmur4UUJKidCNLZafVsNvORxyViNcvN0wXZJrJXEO5B4K8k9TOJNkttKcmoktksaNUmjVtL4sCfWJI1bSZPDJLdJmrz0342L83ATq7urKAQBzvYb7GkePyh-IG9NcSiDH-quxC7v0-JI3cjYIIVz-RNnaFFvoiQyNlqDsDrDPH_1NwAA___hR1Fo
 
 # The split disjunction rule allows us to use the index for this query.
 query T
@@ -431,50 +431,14 @@ vectorized: true
           table: array_tab@array_tab_pkey
           spans: [/1 - /1]
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lF9r2zAUxd_3KcR9acpUbNn5axhkWzyWkSWdHdjGZopiX4ohtTxJHivB333EDm1dEsVJ6YuxpPu751wd0AbUnzV44P-4nr2fzklnMg2X4bfZJQn9mf9xSTj5FCy-Ei4lv7_RfEW-f_YDn3RWZPy7sG0XycWGlReXZBGQDifvCNv-TvyAfPhJOFDIRIJzfocKvF_AgIIDFFyIKORSxKiUkNujTVU4Tf6BZ1NIs7zQ9bZO9RrBAyETlJgAhQQ1T9dVvzF7C1EZUYiFRPAeq-fiSuTWsFEdlRREoXedIwpK81sEr1fSA-p7Gk9SpdMs1tbouROgsKg9eqReFbr6O6Tbb-gys-6Sr9YYIE9QWqwp_ZDNmEt5k2Z_gUKY80x5xGK2xa62X6eFIecUQ6GQGqXl7gtkf3v3lPZfRJrtxu0dGjeX6R2X94-T0bFzUL3bUHfa37Z9XP7htqviFmbYuWac9tE7VfTOOdEfMbSLvntu9EfaP4m-_8rRv-x5GbR6XuxTnpcAVS4yhS07RxQwucV6FCUKGeO1FHElUy8XFVdtJKh0fcrqxTSrj7YGn8LMDNtm2jHSrhl2jXDXDHeNcNM2ew73jPDIDPeN8MBse2CEh2Z4-BLbo5MuLCrf_A8AAP__OQalPQ==
-
-# The split disjunction rule allows us to use the index for this query.
-query T
-EXPLAIN (DISTSQL)
-SELECT a FROM array_tab WHERE b @> '{1}' OR b @> '{2}' OR a = 1 ORDER BY a
-----
-distribution: full
-vectorized: true
-·
-• distinct
-│ distinct on: a
-│ order key: a
-│
-└── • union all
-    │
-    ├── • index join
-    │   │ table: array_tab@array_tab_pkey
-    │   │
-    │   └── • sort
-    │       │ order: +a
-    │       │
-    │       └── • inverted filter
-    │           │ inverted column: b_inverted_key
-    │           │ num spans: 1
-    │           │
-    │           └── • scan
-    │                 missing stats
-    │                 table: array_tab@arr_inv
-    │                 spans: 1 span
-    │
-    └── • scan
-          missing stats
-          table: array_tab@array_tab_pkey
-          spans: [/1 - /1]
-·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMlV9P2zwUxu_fT3F0bgC9QY2dlkKkSd1G0DoxylqkbVor5DZHEKnYme0iEOp3n5J0LSmt0yA07QbhP4_Pz-d54j6h-TXFEKPvl-fvuxewf9odXA2-nh_AIDqPPl6BgLN-7wsIrcXjtRVj-PYp6kewvz-GznDm-wHB3hOb7x1Arw-lST7fOyhmBbwDlv17GvXhww8Q6KFUMV2IOzIY_kSGHnL0MMCRh6lWEzJG6WzpKd_YjR8w9D1MZDqzxbRN7JQwxJlUOiZNMXoYkxXJNFsfzUceTpQmDFdbTxNjEzmxjVZpL3ay8r2ZDaHDcDT3UM3sos7IQ2PFDWHYnHtbWDZUGihtSTeO1uv8v_X4Vp3jP6tE9knEpBvtcomlTZ1UJ3dCP65u5nX41upHdaov23i8qY2FGRtauTpg_Ai3wty-UOemLYjaW4lW52wyftFkFzbza3GvmI7fnOlCHaq0wXh5e1UUT0oczO3WlRhPaREWti0sQuvrRN6jh4NUSBNCg_kNdpj9DXZLEK_D1JX3pC3FZ8nUkiadF3kG9mc9ekg1KAkdFoLJwMBYoW04xOGQMzZEIBkvRsEQYStdUKLju3fMr_68lh3LN-_QKvZaGL67fTy3j7_SvgqmF_Y1_yX7lt_5yV97nvibPk_szZ-nDeX6ZFIlDa39am4-2c-AKb6h4oJGzfSELrWa5GWKYS_X5RMxGVussmLQlcVSBvhczJxi7hZzpzhwi4N1MXsubpbErJ6Ycbe66eRuucUtd7srbn3kVLfd4rZT7Lu5j93cFTk5cav9ipS5M1pBzl6EtE5UKtRVWWHukK-HZTT_73cAAAD__yXI0Rs=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lVFv2joUx9_vp7DOS1vdIOIECES6EvcWrsbUlg6QtmlDyBC3jRrizHbWIcR3n5K0QJzGJbQrD4iQ5Hf-Pvodew3iRwAu9L9cX_w7uEKnvcF4Mv50cYbG_Yv--QQR9P9oeIkI52Q1k2SOPn_oj_rodI6632PTtCk6WePNyRkajtApQf8gnPzs9Ufov6-IgAEh8-gVWVIB7jfAYIAFBtgwNSDibEGFYDy5tU4fHHi_wDUN8MMolsnfUwMWjFNw1yB9GVBwYULmAR1R4lFeN8EAj0riByl-m7K7_TWL7ukKDDhnQbwMhYuIgeZgwDgiyVUd102YbgxgsdyVFJLcUnDxXsZBD1xzYxwes-cL6YcLWe_kM3aTHgy5Rzn1XNTFSvUdYL5Cd0TcFd6ebnYJm0rCTmnCHZdltVXu3xm4dBnYqrSOXcaWkhFbbx7yitVYVMd2_vFhLLXBHDWYnQuGD9cQazSc-eHPnH_78pl1XEu-rdKQlhqySsYx45Lyuv1cG58vZyvlKrXkI_PDx440jxzMslwNJVezSq6tw847jqJTmvD1o2i-1SjmdzTrcOOtI423UuOtKsZbVTI-Gt843vhGlXJ7xrf-sPGtKrm2qrTf0fh2acLXG4_fynhc5QwfURGxUNBc8bJSplKqhpMlUe-WZi0QLOYLes3ZIn02uxymoPQPjwqZ3cXZxSB8uiUkp2S5tWCfhFUS3ie1cyS8T-pUI2G7HJWd6IezLA2qqaIsbat0qdoqytZ3vVHedlNFNbSoZgVSU0tqlZMKTW9pSU45qaGSnGOlcqqRtFIVOqVn6aSyVVT7aKkKA9jRS2WWtx0XpuaFbUGzLxRWiAsjmGdZ5azCCOLCDB7qQ2EEX0BphSj2Sw_TGVFQHus3B10uJ9nnbwL2MPM9cMF8_NSe-Xr6QPICuRXJYTO-Yw8pd7KKkqPihgSCGnBJ7mmPSsqXfpgcgwtwJY_pZvPX7wAAAP__pMkU_Q==
 
 # We cannot use the index for this query.
 query T
 EXPLAIN (DISTSQL)
 SELECT a FROM array_tab WHERE (b @> '{2}' AND a = 3) OR b[0] = a ORDER BY a
 ----
-distribution: full
+distribution: local
 vectorized: true
 ·
 • filter
@@ -485,4 +449,4 @@ vectorized: true
       table: array_tab@array_tab_pkey
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkVFr2zAQx9_3KY57qQMqkeWXISg4W1xmyJxOCWwlM0OJj2JwLU-SYSX4uw_bIW0G8bbH--v-5x_-HdH9rFBi8u1htUgzCJbpZrv5sprBJlklH7eg4V6tP4O2Vr_88HoPXz8lKoEg2EP8veU8Irg5iu5mBotsCYGGO4hmM1grCPY7nsMd6H5aJgo-PIJGhrUpKNPP5FDuMESGEeYMG2sO5JyxfXwcltLiF0rOsKyb1vdxzvBgLKE8oi99RSgxM7emmQtkWJDXZTWsdQxN619LzusnQhl17M3hcPrwVu8rUqQLsnN-cR7P_yJubPms7Qsy3DS6dhJukeG69RLikMUCr5GE_0NyX1aeLNl5eIkx5hKCIBZnFwulFo87IaVMs-37_GQlDnstp_BkZ8hisePn3Vf2q-DiAvwvbhS5xtSO_kkO73KGVDzR6N-Z1h7owZrD8JlxXA-9ISjI-fE1Goe0Hp96wLflcLIspstissz_KOfdu98BAAD__xs0B0Q=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUUWFrnEAQ_d5fMcyXeLBH1HwpCwGv0VDhcpeq0IarHKtOrhLPtbsr6XH434t6sUloQrsfxHk7--a9N0fUPyvkGHy7XS7CFVh-GCfxl-UM4mAZXCUg4Dpa34BQShy2RmTw9XMQBWBZGXjfW9u-IDg7ut3ZDBYrHywBl3Axm8E6Aivb2ClcgugrP4jg0x0IZFjLglZiTxr5Bh1MGTZK5qS1VD10HBrC4hdym2FZN63p4ZRhLhUhP6IpTUXIMRFZRRGJgtS5jQwLMqKsBtpJrjf9bZsHOiDDK1m1-1pzEAwyZBg3oq_mmHYMZWv-zNNG7Ai580xg6CO3O_bvGq_LypAide68FDjiHCzLc6cgF1G0uNu4nPNwlXxMT5F6Tp_pCTxFO2Ceu7GnXmS4bg0Hz3nTiPvKiPM_RiLSjaw1vbDx1iT71aS506UMqdjRuGEtW5XTrZL50DuW64FoAArSZrx1xiKsn660UST20x6eMznvMrnvMaUM7yv5uC0L5Gifzvwvn6eD_QOx031E8Q_5ONAmh6Y3eC8qTQxvxAP5ZEjty7rUpsyRG9VS1334HQAA__8XkRFS

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,12 +12,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -36,22 +32,20 @@ func TestRenameTable(t *testing.T) {
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	counter := int64(keys.MinNonPredefinedUserDescID)
-
-	oldDBID := descpb.ID(counter)
 	if _, err := db.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
 
+	oldDBID := descpb.ID(sqlutils.QueryDatabaseID(t, db, "test"))
+
 	// Create table in 'test'.
-	counter++
 	oldName := "foo"
 	if _, err := db.Exec(`CREATE TABLE test.foo (k INT PRIMARY KEY, v int)`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the table descriptor.
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "foo")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "foo")
 	if tableDesc.GetName() != oldName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", oldName, tableDesc)
 	}
@@ -59,26 +53,18 @@ func TestRenameTable(t *testing.T) {
 		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", oldDBID, tableDesc)
 	}
 
-	// Create database test2.
-	counter++
-	newDBID := descpb.ID(counter)
-	if _, err := db.Exec(`CREATE DATABASE test2`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Move table to test2 and change its name as well.
 	newName := "bar"
-	if _, err := db.Exec(`ALTER TABLE test.foo RENAME TO test2.bar`); err != nil {
+	if _, err := db.Exec(`ALTER TABLE test.foo RENAME TO test.bar`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the table descriptor again.
-	renamedDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test2", "bar")
+	renamedDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "bar")
 	if renamedDesc.GetName() != newName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", newName, tableDesc)
 	}
-	if renamedDesc.GetParentID() != newDBID {
-		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", newDBID, tableDesc)
+	if renamedDesc.GetParentID() != oldDBID {
+		t.Fatalf("Wrong parent ID on table, expected %d, got: %+v", oldDBID, tableDesc)
 	}
 	if renamedDesc.GetID() != tableDesc.GetID() {
 		t.Fatalf("Wrong ID after rename, got %d, expected %d",
@@ -121,7 +107,7 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 		func(descriptor *descpb.Descriptor) {
 			mu.Lock()
 			defer mu.Unlock()
-			id, version, name, _, _, err := descpb.GetDescriptorMetadata(descriptor)
+			id, version, name, _, err := descpb.GetDescriptorMetadata(descriptor)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -145,7 +131,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	mu.Lock()
 	waitTableID = tableDesc.GetID()
 	mu.Unlock()

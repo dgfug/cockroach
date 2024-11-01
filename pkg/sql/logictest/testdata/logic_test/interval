@@ -373,7 +373,7 @@ subtest regression_62369
 query error "10000000000000000000000000000000000": value out of range
 SELECT INTERVAL '10000000000000000000000000000000000 year'
 
-query T
+query T nosort
 SELECT i / 2 FROM ( VALUES
   ('0 days 0.253000 seconds'::interval),
   (INTERVAL '0.000001'::interval),
@@ -400,21 +400,21 @@ SELECT i / 2 FROM ( VALUES
 
 subtest interval_session
 
-statement error setting IntervalStyle is not enabled
+statement ok
 SET intervalstyle = 'iso_8601'
 
-statement error setting IntervalStyle is not enabled
+statement ok
 SET intervalstyle = 'sql_standard'
 
 statement ok
-SET intervalstyle_enabled = 'on'
+SET intervalstyle = DEFAULT
 
-statement error context-dependent operators are not allowed in computed column\nHINT: INTERVAL to STRING casts depends on IntervalStyle; consider using to_char\(interval\)
+statement error interval::string: context-dependent operators are not allowed in STORED COMPUTED COLUMN\nHINT: INTERVAL to STRING casts depend on IntervalStyle; consider using to_char\(interval\)
 CREATE TABLE invalid_table (
   invalid_col string AS ('1 hour'::interval::string) STORED
 )
 
-statement error string::interval: context-dependent operators are not allowed in computed column\nHINT: STRING to INTERVAL casts depend on session IntervalStyle; use parse_interval\(string\) instead
+statement error string::interval: context-dependent operators are not allowed in STORED COMPUTED COLUMN\nHINT: STRING to INTERVAL casts depend on session IntervalStyle; use parse_interval\(string\) instead
 CREATE TABLE invalid_table (
   invalid_col interval AS ('1 hour'::string::interval) STORED
 )
@@ -623,3 +623,171 @@ SELECT i, i::INTERVAL FROM interval_parsing ORDER BY pk
 -10 years -22 months 1 day 01:02:03   -11-10 +1 +1:02:03
 -10 years 22 months -1 day 01:02:03   -8-2 -1 +1:02:03
 -10 years 22 months -1 day -01:02:03  -8-2 -1 -1:02:03
+
+# Could not find any regress tests for to_char in PG, so we're making our own up!
+statement ok
+CREATE TABLE intvl_tbl (id SERIAL, d1 INTERVAL);
+INSERT INTO intvl_tbl (d1) VALUES
+  ('355 months 40 days 123:45:12'),
+  ('-400 months -30 days -100:12:13')
+
+query T
+SELECT to_char(d1, 'Y,YYY YYYY YYY YY Y CC Q MM WW DDD DD J')
+   FROM intvl_tbl ORDER BY id
+----
+0,029 0029 029 29 9 00 3 07 1528 10690 40 1731873
+0,-33 -0033 -033 -33 -3 00 0 -04 -1717 -12030 -30 1708823
+
+query T
+SELECT to_char(d1, 'FMY,YYY FMYYYY FMYYY FMYY FMY FMCC FMQ FMMM FMWW FMDDD FMDD FMJ')
+   FROM intvl_tbl ORDER BY id
+----
+0,029 29 29 29 9 0 3 7 1528 10690 40 1731873
+0,-33 -33 -33 -33 -3 0 0 -4 -1717 -12030 -30 1708823
+
+query T
+SELECT to_char(d1, 'HH HH12 HH24 MI SS SSSS')
+   FROM intvl_tbl ORDER BY id
+----
+03 03 123 45 12 445512
+-04 -04 -100 -12 -13 -360733
+
+query T
+SELECT to_char(d1, E'"HH:MI:SS is" HH:MI:SS "\\"text between quote marks\\""')
+   FROM intvl_tbl ORDER BY id
+----
+HH:MI:SS is 03:45:12 "text between quote marks"
+HH:MI:SS is -04:-12:-13 "text between quote marks"
+
+query T
+SELECT to_char(d1, 'HH24--text--MI--text--SS')
+   FROM intvl_tbl ORDER BY id
+----
+123--text--45--text--12
+-100--text---12--text---13
+
+query T
+SELECT to_char(d1, 'YYYYTH YYYYth Jth')
+   FROM intvl_tbl ORDER BY id
+----
+0029TH 0029th 1731873rd
+-0033RD -0033rd 1708823rd
+
+# Test intervalstyle being respected in pg_indexes.
+
+statement ok
+CREATE TABLE intervalstyle_in_index (
+  a INT8 PRIMARY KEY, b INTERVAL,
+  INDEX idx (b) WHERE b > 'P3Y'
+)
+
+query TT
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'intervalstyle_in_index'
+AND indexname = 'idx'
+----
+idx  CREATE INDEX idx ON test.public.intervalstyle_in_index USING btree (b ASC) WHERE (b > '3-0'::INTERVAL)
+
+statement ok
+SET intervalstyle = 'iso_8601'
+
+query TT
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'intervalstyle_in_index'
+AND indexname = 'idx'
+----
+idx  CREATE INDEX idx ON test.public.intervalstyle_in_index USING btree (b ASC) WHERE (b > 'P3Y'::INTERVAL)
+
+# date_trunc
+statement ok
+SET intervalstyle = 'postgres'
+
+statement error pgcode 22023 interval units "invalid" not recognized
+SELECT date_trunc('invalid', interval '1 month')
+
+statement error pgcode 0A000 interval units "week" not supported because months usually have fractional weeks
+SELECT date_trunc('week', interval '1 month')
+
+statement error pgcode 0A000 interval units "weeks" not supported because months usually have fractional weeks
+SELECT date_trunc('weeks', interval '1 month')
+
+query TT nosort
+SELECT timespan, date_trunc(timespan, '1111 year 4 month 1 day 1 hour 1 minute 1 second 1 millisecond 1 microsecond')
+FROM (VALUES
+  ('millennia'),
+  ('millennium'),
+  ('millenniums'),
+  ('century'),
+  ('centuries'),
+  ('decade'),
+  ('decades'),
+  ('quarter'),
+  ('month'),
+  ('months'),
+  ('day'),
+  ('days'),
+  ('hour'),
+  ('hours'),
+  ('minute'),
+  ('minutes'),
+  ('second'),
+  ('seconds'),
+  ('millisecond'),
+  ('milliseconds'),
+  ('microsecond'),
+  ('microseconds'))
+AS t(timespan)
+----
+millennia     1000 years
+millennium    1000 years
+millenniums   1000 years
+century       1100 years
+centuries     1100 years
+decade        1110 years
+decades       1110 years
+quarter       1111 years 3 mons
+month         1111 years 4 mons
+months        1111 years 4 mons
+day           1111 years 4 mons 1 day
+days          1111 years 4 mons 1 day
+hour          1111 years 4 mons 1 day 01:00:00
+hours         1111 years 4 mons 1 day 01:00:00
+minute        1111 years 4 mons 1 day 01:01:00
+minutes       1111 years 4 mons 1 day 01:01:00
+second        1111 years 4 mons 1 day 01:01:01
+seconds       1111 years 4 mons 1 day 01:01:01
+millisecond   1111 years 4 mons 1 day 01:01:01.001
+milliseconds  1111 years 4 mons 1 day 01:01:01.001
+microsecond   1111 years 4 mons 1 day 01:01:01.001001
+microseconds  1111 years 4 mons 1 day 01:01:01.001001
+
+# Regression test for #83756. Interval encoding overflow should be detected
+# correctly.
+statement ok
+CREATE TABLE t83756 (i INTERVAL PRIMARY KEY);
+
+# These intervals do not overflow.
+statement ok
+INSERT INTO t83756 VALUES ('106751 days 23:47:16.854775');
+INSERT INTO t83756 VALUES ('-106751 days -23:47:16.854775');
+
+# These intervals overflow.
+# TODO(#84078): These intervals overflow due to limitations of our INTERVAL key
+# encoding. All values in the range [-178000000 years, 178000000 years] should
+# be allowed.
+statement error overflow during Encode
+INSERT INTO t83756 VALUES ('106751 days 23:47:16.854776');
+
+statement error overflow during Encode
+INSERT INTO t83756 VALUES ('-106751 days -23:47:16.854776');
+
+# These intervals overflow when multiplying the days and the number of
+# nanoseconds in a day, even though the total nanosecond calculation would not
+# overflow.
+statement error overflow during Encode
+INSERT INTO t83756 VALUES ('-3558 months 106752 days');
+
+statement error overflow during Encode
+INSERT INTO t83756 VALUES ('3558 months -106752 days');

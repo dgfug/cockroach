@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package apply_test
 
@@ -15,10 +10,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // logging is used for Example.
@@ -33,7 +29,7 @@ func setLogging(on bool) func() {
 }
 
 type cmd struct {
-	index                 uint64
+	index                 kvpb.RaftIndex
 	nonTrivial            bool
 	nonLocal              bool
 	shouldReject          bool
@@ -52,9 +48,10 @@ type appliedCmd struct {
 	*checkedCmd
 }
 
-func (c *cmd) Index() uint64   { return c.index }
-func (c *cmd) IsTrivial() bool { return !c.nonTrivial }
-func (c *cmd) IsLocal() bool   { return !c.nonLocal }
+func (c *cmd) Index() kvpb.RaftIndex { return c.index }
+func (c *cmd) IsTrivial() bool       { return !c.nonTrivial }
+func (c *cmd) IsLocal() bool         { return !c.nonLocal }
+func (c *cmd) Ctx() context.Context  { return context.Background() }
 func (c *cmd) AckErrAndFinish(_ context.Context, err error) error {
 	c.acked = true
 	c.finished = true
@@ -120,9 +117,9 @@ var _ apply.CheckedCommandList = &checkedCmdSlice{}
 var _ apply.AppliedCommandList = &appliedCmdSlice{}
 
 type testStateMachine struct {
-	batches            [][]uint64
-	applied            []uint64
-	appliedSideEffects []uint64
+	batches            [][]kvpb.RaftIndex
+	applied            []kvpb.RaftIndex
+	appliedSideEffects []kvpb.RaftIndex
 	batchOpen          bool
 }
 
@@ -130,7 +127,15 @@ func getTestStateMachine() *testStateMachine {
 	return new(testStateMachine)
 }
 
-func (sm *testStateMachine) NewBatch(ephemeral bool) apply.Batch {
+func (sm *testStateMachine) NewBatch() apply.Batch {
+	return sm.newBatch(false /* ephemeral */)
+}
+
+func (sm *testStateMachine) NewEphemeralBatch() apply.EphemeralBatch {
+	return sm.newBatch(true /* ephemeral */)
+}
+
+func (sm *testStateMachine) newBatch(ephemeral bool) apply.Batch {
 	if sm.batchOpen {
 		panic("batch not closed")
 	}
@@ -138,7 +143,7 @@ func (sm *testStateMachine) NewBatch(ephemeral bool) apply.Batch {
 	return &testBatch{sm: sm, ephemeral: ephemeral}
 }
 func (sm *testStateMachine) ApplySideEffects(
-	cmdI apply.CheckedCommand,
+	_ context.Context, cmdI apply.CheckedCommand,
 ) (apply.AppliedCommand, error) {
 	cmd := cmdI.(*checkedCmd)
 	sm.appliedSideEffects = append(sm.appliedSideEffects, cmd.index)
@@ -157,10 +162,10 @@ func (sm *testStateMachine) ApplySideEffects(
 type testBatch struct {
 	sm        *testStateMachine
 	ephemeral bool
-	staged    []uint64
+	staged    []kvpb.RaftIndex
 }
 
-func (b *testBatch) Stage(cmdI apply.Command) (apply.CheckedCommand, error) {
+func (b *testBatch) Stage(_ context.Context, cmdI apply.Command) (apply.CheckedCommand, error) {
 	cmd := cmdI.(*cmd)
 	b.staged = append(b.staged, cmd.index)
 	ccmd := checkedCmd{cmd: cmd, rejected: cmd.shouldReject}
@@ -182,27 +187,27 @@ func (b *testBatch) Close() {
 }
 
 type testDecoder struct {
-	nonTrivial            map[uint64]bool
-	nonLocal              map[uint64]bool
-	shouldReject          map[uint64]bool
-	shouldThrowErrRemoved map[uint64]bool
+	nonTrivial            map[kvpb.RaftIndex]bool
+	nonLocal              map[kvpb.RaftIndex]bool
+	shouldReject          map[kvpb.RaftIndex]bool
+	shouldThrowErrRemoved map[kvpb.RaftIndex]bool
 
 	cmds []*cmd
 }
 
 func newTestDecoder() *testDecoder {
 	return &testDecoder{
-		nonTrivial:            make(map[uint64]bool),
-		nonLocal:              make(map[uint64]bool),
-		shouldReject:          make(map[uint64]bool),
-		shouldThrowErrRemoved: make(map[uint64]bool),
+		nonTrivial:            make(map[kvpb.RaftIndex]bool),
+		nonLocal:              make(map[kvpb.RaftIndex]bool),
+		shouldReject:          make(map[kvpb.RaftIndex]bool),
+		shouldThrowErrRemoved: make(map[kvpb.RaftIndex]bool),
 	}
 }
 
 func (d *testDecoder) DecodeAndBind(_ context.Context, ents []raftpb.Entry) (bool, error) {
 	d.cmds = make([]*cmd, len(ents))
 	for i, ent := range ents {
-		idx := ent.Index
+		idx := kvpb.RaftIndex(ent.Index)
 		cmd := &cmd{
 			index:                 idx,
 			nonTrivial:            d.nonTrivial[idx],
@@ -249,9 +254,9 @@ func TestApplyCommittedEntries(t *testing.T) {
 
 	// Assert that all commands were applied in the correct batches.
 	exp := testStateMachine{
-		batches:            [][]uint64{{1, 2}, {3}, {4}, {5}, {6}},
-		applied:            []uint64{1, 2, 3, 4, 5, 6},
-		appliedSideEffects: []uint64{1, 2, 3, 4, 5, 6},
+		batches:            [][]kvpb.RaftIndex{{1, 2}, {3}, {4}, {5}, {6}},
+		applied:            []kvpb.RaftIndex{1, 2, 3, 4, 5, 6},
+		appliedSideEffects: []kvpb.RaftIndex{1, 2, 3, 4, 5, 6},
 	}
 	require.Equal(t, exp, *sm)
 
@@ -279,9 +284,9 @@ func TestApplyCommittedEntriesWithBatchSize(t *testing.T) {
 
 	// Assert that all commands were applied in the correct batches.
 	exp := testStateMachine{
-		batches:            [][]uint64{{1, 2}, {3}, {4}, {5, 6}, {7}},
-		applied:            []uint64{1, 2, 3, 4, 5, 6, 7},
-		appliedSideEffects: []uint64{1, 2, 3, 4, 5, 6, 7},
+		batches:            [][]kvpb.RaftIndex{{1, 2}, {3}, {4}, {5, 6}, {7}},
+		applied:            []kvpb.RaftIndex{1, 2, 3, 4, 5, 6, 7},
+		appliedSideEffects: []kvpb.RaftIndex{1, 2, 3, 4, 5, 6, 7},
 	}
 	require.Equal(t, exp, *sm)
 
@@ -308,7 +313,7 @@ func TestAckCommittedEntriesBeforeApplication(t *testing.T) {
 	appT := apply.MakeTask(sm, dec)
 	defer appT.Close()
 	require.NoError(t, appT.Decode(ctx, ents))
-	require.NoError(t, appT.AckCommittedEntriesBeforeApplication(ctx, 10 /* maxIndex */))
+	require.NoError(t, appT.AckCommittedEntriesBeforeApplication(ctx))
 
 	// Assert that the state machine was not updated.
 	require.Equal(t, testStateMachine{}, *sm)
@@ -325,40 +330,6 @@ func TestAckCommittedEntriesBeforeApplication(t *testing.T) {
 			exp = false // local and rejected
 		default:
 			exp = false // after first non-trivial cmd
-		}
-		require.Equal(t, exp, cmd.acked)
-		require.False(t, cmd.finished)
-	}
-
-	// Try again with a lower maximum log index.
-	appT.Close()
-	ents = makeEntries(5)
-
-	dec = newTestDecoder()
-	dec.nonLocal[2] = true
-	dec.shouldReject[3] = true
-
-	appT = apply.MakeTask(sm, dec)
-	require.NoError(t, appT.Decode(ctx, ents))
-	require.NoError(t, appT.AckCommittedEntriesBeforeApplication(ctx, 4 /* maxIndex */))
-
-	// Assert that the state machine was not updated.
-	require.Equal(t, testStateMachine{}, *sm)
-
-	// Assert that some commands were acknowledged early and that none were finished.
-	for _, cmd := range dec.cmds {
-		var exp bool
-		switch cmd.index {
-		case 1, 4:
-			exp = true // local and successful
-		case 2:
-			exp = false // remote
-		case 3:
-			exp = false // local and rejected
-		case 5:
-			exp = false // index too high
-		default:
-			t.Fatalf("unexpected index %d", cmd.index)
 		}
 		require.Equal(t, exp, cmd.acked)
 		require.False(t, cmd.finished)
@@ -383,9 +354,9 @@ func TestApplyCommittedEntriesWithErr(t *testing.T) {
 
 	// Assert that only commands up to the replica removal were applied.
 	exp := testStateMachine{
-		batches:            [][]uint64{{1, 2}, {3}},
-		applied:            []uint64{1, 2, 3},
-		appliedSideEffects: []uint64{1, 2, 3},
+		batches:            [][]kvpb.RaftIndex{{1, 2}, {3}},
+		applied:            []kvpb.RaftIndex{1, 2, 3},
+		appliedSideEffects: []kvpb.RaftIndex{1, 2, 3},
 	}
 	require.Equal(t, exp, *sm)
 

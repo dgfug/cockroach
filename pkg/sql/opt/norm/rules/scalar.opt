@@ -58,15 +58,41 @@ $item
 =>
 (SimplifyCoalesce $args)
 
-# EliminateCast discards the cast operator if its input already has a type
-# that's equivalent to the desired static type.
-
+# EliminateCast discards a cast if its input already has a type that's identical
+# to the desired static type.
+#
 # Note that CastExpr removes unnecessary casts during type-checking; this rule
 # can still be helpful if some other rule creates an unnecessary CastExpr.
-[EliminateCast, Normalize]
+#
+# EliminateCast is marked as high-priority so that it matches before FoldCast.
+[EliminateCast, Normalize, HighPriority]
 (Cast $input:* $targetTyp:* & (HasColType $input $targetTyp))
 =>
 $input
+
+# InlineAnyWithScanOfValues matches on an ANY or NOT ANY expression which was
+# generated from expressions like `column IN (WithScan)` or `column NOT IN
+# (WithScan)`, where the WITH clause definition was normalized into a VALUES
+# clause with constants or placeholders. Inlining the Values expression allows
+# other optimizations to trigger.
+[InlineAnyWithScanOfValues, Normalize]
+(Any
+    (WithScan $withScanPrivate:*)
+    $scalar:* &
+        (Let ($values $ok):(BoundValues $withScanPrivate) $ok) &
+        (CanInlineWithScanOfValues
+            $values
+            $withScanPrivate
+            $scalar
+        )
+    $anyPrivate:*
+)
+=>
+(Any
+    (InlineWithScanOfValues $values $withScanPrivate)
+    $scalar
+    $anyPrivate
+)
 
 # NormalizeInConst ensures that the In operator's tuple operand is sorted with
 # duplicates removed (since duplicates do not change the result).
@@ -119,9 +145,9 @@ $input
 # Project operator never changes the row cardinality of its input, and row
 # cardinality is the only thing that Exists cares about, so Project is a no-op.
 [EliminateExistsProject, Normalize]
-(Exists (Project $input:*) $subqueryPrivate:*)
+(Exists (Project $input:*) $existsPrivate:*)
 =>
-(Exists $input $subqueryPrivate)
+(Exists $input $existsPrivate)
 
 # EliminateExistsGroupBy discards a non-scalar GroupBy input to the Exists
 # operator. While non-scalar GroupBy (or DistinctOn) can change row cardinality,
@@ -132,9 +158,9 @@ $input
 # NOTE: EnsureDistinctOn has the side effect of error'ing if the input has
 # duplicates, so do not eliminate it.
 [EliminateExistsGroupBy, Normalize]
-(Exists (GroupBy | DistinctOn $input:*) $subqueryPrivate:*)
+(Exists (GroupBy | DistinctOn $input:*) $existsPrivate:*)
 =>
-(Exists $input $subqueryPrivate)
+(Exists $input $existsPrivate)
 
 # InlineExistsSelectTuple splits a tuple equality filter into multiple
 # (per-column) equalities, in the case where the tuple on one side is being
@@ -176,7 +202,7 @@ $input
             ...
         ]
     )
-    $subqueryPrivate:*
+    $existsPrivate:*
 )
 =>
 (Exists
@@ -187,31 +213,41 @@ $input
             (SplitTupleEq $tuple $rhs)
         )
     )
-    $subqueryPrivate
+    $existsPrivate
 )
 
-# IntroduceExistsLimit inserts a LIMIT 1 "under" Exists so as to save resources
-# to make the EXISTS determination.
+# ConvertUncorrelatedExistsToCoalesceSubquery converts an uncorrelated Exists
+# expression to a Coalesce expression with a Subquery. For example:
 #
-# This rule uses and sets a boolean "WasLimited" on the Exists
-# node to ensure the rule is only applied once. This is because the
-# rule expands to an Exists pattern that's also a valid input pattern
-# and it would recurse otherwise.
+#   SELECT EXISTS (
+#     SELECT * FROM b
+#   ) FROM a
+#   =>
+#   SELECT COALESCE(
+#     (SELECT true FROM (SELECT * FROM b) LIMIT 1),
+#     false
+#   ) FROM a
 #
-# We avoid this rule if the query is correlated because the decorrelation rules
-# get confused by the presence of a limit. (It will be worth re-considering this
-# when a general-purpose apply operator is supported - in that case it can be
-# definitely worthwhile pushing down a LIMIT 1 to limit the amount of work done
-# on every row.)
-[IntroduceExistsLimit, Normalize]
-(Exists
-    $input:* & ^(HasOuterCols $input) & ^(HasZeroOrOneRow $input)
-    $subqueryPrivate:* & ^(IsLimited $subqueryPrivate)
-)
+# This transformation simplifies execbuilder and execution code - we do not need
+# a special execution mode for uncorrelated Exists.
+#
+# Note: We can use an empty ordering for the Limit because Exists never have an
+# ordering.
+[ConvertUncorrelatedExistsToCoalesceSubquery, Normalize]
+(Exists $input:* & ^(HasOuterCols $input) $existsPrivate:*)
 =>
-(Exists
-    (Limit $input (IntConst 1) (EmptyOrdering))
-    (MakeLimited $subqueryPrivate)
+(Coalesce
+    [
+        (Subquery
+            (Project
+                (Limit $input (IntConst 1) (EmptyOrdering))
+                [ (ProjectionsItem (True) (MakeBoolCol)) ]
+                (MakeEmptyColSet)
+            )
+            (EmbeddedSubqueryPrivate $existsPrivate)
+        )
+        (False)
+    ]
 )
 
 # EliminateExistsLimit discards a Limit operator with a positive limit inside an
@@ -224,17 +260,26 @@ $input
 # Note that this rule uses HasOuterCols to ensure that it only matches
 # correlated Exists subqueries. There is no need to discard limits from
 # non-correlated Exists subqueries. Limits are preferred for non-correlated
-# Exists subqueries. See IntroduceExistsLimit above for details.
+# Exists subqueries. See ConvertUncorrelatedExistsToCoalesceSubquery above for
+# details.
 [EliminateExistsLimit, Normalize]
 (Exists
     (Limit
         $input:* & (HasOuterCols $input)
         (Const $limit:*) & (IsPositiveInt $limit)
     )
-    $subqueryPrivate:*
+    $existsPrivate:*
 )
 =>
-(Exists $input $subqueryPrivate)
+(Exists $input $existsPrivate)
+
+# EliminateConstValuesSubquery replaces a subquery with a constant value if the
+# subquery's input is a single-row, single-column Values expression with a
+# constant value.
+[EliminateConstValueSubquery, Normalize]
+(Subquery (Values [ (Tuple [ $value:(Const) ]) ]))
+=>
+$value
 
 # SimplifyCaseWhenConstValue removes branches known to not match. Any
 # branch known to match is used as the ELSE and further WHEN conditions
@@ -320,15 +365,16 @@ $input
 #        an aggregation). So it's desirable to perform this conversion in the
 #        interest of decorrelation.
 #
-# So the outcome is that we can perform uncorrelated ARRAY(...)s over any datatype,
-# and correlated ones only over the types that array_agg supports.
+# So the outcome is that we can perform uncorrelated ARRAY(...)s over any
+# datatype, and correlated ones only over the types that array_agg supports.
 #
 # Note that optbuilder should have already verified that if the input is
-# correlated, then we can array_agg over the input type.  Also note that the
-# Max1Row operator we introduce is guaranteed to be eliminated as
-# MakeArrayAggForFlatten will return a ScalarGroupBy.
+# correlated, then we can array_agg over the input type.
 [NormalizeArrayFlattenToAgg, Normalize]
-(ArrayFlatten $input:(HasOuterCols $input) $subquery:*)
+(ArrayFlatten
+    $input:*
+    $private:* & (CanNormalizeArrayFlatten $input $private)
+)
 =>
 (Coalesce
     [
@@ -340,7 +386,7 @@ $input
                         (ArrayAgg
                             (Variable
                                 $requestedCol:(SubqueryRequestedCol
-                                    $subquery
+                                    $private
                                 )
                             )
                         )
@@ -351,7 +397,7 @@ $input
                 ]
                 (MakeGrouping
                     (MakeEmptyColSet)
-                    (SubqueryOrdering $subquery)
+                    (SubqueryOrdering $private)
                 )
             )
             (MakeUnorderedSubquery)
@@ -388,3 +434,10 @@ $input
 (Not (Function $args:* $private:(FunctionPrivate "st_disjoint")))
 =>
 (MakeIntersectionFunction $args)
+
+# ConvertJSONSubscriptToFetchValue converts json subscripting
+# `[...]` into a fetch value operator `->`.
+[ConvertJSONSubscriptToFetchValue, Normalize]
+(Indirection $input:* $index:* & (IsJSON $input))
+=>
+(FetchVal $input $index)

@@ -1,16 +1,11 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.sql.sessiondatapb;
-option go_package = "sessiondatapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb";
 
 import "gogoproto/gogo.proto";
 import "sql/sessiondatapb/session_data.proto";
@@ -21,4 +16,15 @@ import "sql/sessiondatapb/local_only_session_data.proto";
 message MigratableSession {
   cockroach.sql.sessiondatapb.SessionData session_data = 1 [(gogoproto.nullable)=false];
   cockroach.sql.sessiondatapb.LocalOnlySessionData local_only_session_data = 2 [(gogoproto.nullable)=false];
+
+  // PreparedStatement represents a prepared statement in a migratable session.
+  message PreparedStatement {
+    string name = 1;
+    repeated uint32 placeholder_type_hints = 2 [
+      (gogoproto.customtype)="github.com/lib/pq/oid.Oid"
+    ];
+    string sql = 3 [(gogoproto.customname)="SQL"];
+  }
+  repeated PreparedStatement prepared_statements = 3 [(gogoproto.nullable)=false];
+
 }

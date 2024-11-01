@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantrate_test
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"regexp"
 	"runtime"
 	"sort"
@@ -20,39 +16,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/metrictestutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func TestCloser(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
+
 	st := cluster.MakeTestingClusterSettings()
 	start := timeutil.Now()
 	timeSource := timeutil.NewManualTime(start)
 	factory := tenantrate.NewLimiterFactory(&st.SV, &tenantrate.TestingKnobs{
-		TimeSource: timeSource,
-	})
-	tenant := roachpb.MakeTenantID(2)
+		QuotaPoolOptions: []quotapool.Option{quotapool.WithTimeSource(timeSource)},
+	}, fakeAuthorizer{})
+	tenant := roachpb.MustMakeTenantID(2)
 	closer := make(chan struct{})
-	ctx := context.Background()
 	limiter := factory.GetTenant(ctx, tenant, closer)
 	// First Wait call will not block.
-	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(true, 1)))
+	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.BatchInfo{WriteCount: 1, WriteBytes: 1}))
 	errCh := make(chan error, 1)
-	go func() { errCh <- limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(true, 1<<30)) }()
+	go func() { errCh <- limiter.Wait(ctx, tenantcostmodel.BatchInfo{WriteCount: 1, WriteBytes: 1 << 33}) }()
 	testutils.SucceedsSoon(t, func() error {
 		if timers := timeSource.Timers(); len(timers) != 1 {
 			return errors.Errorf("expected 1 timer, found %d", len(timers))
@@ -63,33 +67,94 @@ func TestCloser(t *testing.T) {
 	require.Regexp(t, "closer", <-errCh)
 }
 
+func TestUseAfterRelease(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cs := cluster.MakeTestingClusterSettings()
+
+	factory := tenantrate.NewLimiterFactory(&cs.SV, nil /* knobs */, fakeAuthorizer{})
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+	ctx, cancel2 := s.WithCancelOnQuiesce(ctx)
+	defer cancel2()
+
+	lim := factory.GetTenant(ctx, roachpb.MinTenantID, s.ShouldQuiesce())
+
+	// Pick a large acquisition size which will cause the quota acquisition to
+	// block ~forever. We scale it a bit to stay away from overflow.
+	const n = math.MaxInt64 / 50
+
+	rq := tenantcostmodel.BatchInfo{WriteCount: n, WriteBytes: n}
+	rs := tenantcostmodel.BatchInfo{ReadCount: n, ReadBytes: n}
+
+	// Acquire once to exhaust the burst. The bucket is now deeply in the red.
+	require.NoError(t, lim.Wait(ctx, rq))
+
+	waitErr := make(chan error, 1)
+	_ = s.RunAsyncTask(ctx, "wait", func(ctx context.Context) {
+		waitErr <- lim.Wait(ctx, rq)
+	})
+
+	_ = s.RunAsyncTask(ctx, "release", func(ctx context.Context) {
+		require.Eventually(t, func() bool {
+			return factory.Metrics().CurrentBlocked.Value() == 1
+		}, 10*time.Second, time.Nanosecond)
+		factory.Release(lim)
+	})
+
+	select {
+	case <-time.After(10 * time.Second):
+		t.Errorf("releasing limiter did not unblock acquisition")
+	case err := <-waitErr:
+		t.Logf("waiting returned: %s", err)
+		assert.Error(t, err)
+	}
+
+	lim.RecordRead(ctx, rs)
+
+	// The read bytes are still recorded to the parent, even though the limiter
+	// was already released at that point. This isn't required behavior, what's
+	// more important is that we don't crash.
+	require.Equal(t, rs.ReadBytes, factory.Metrics().ReadBytesAdmitted.Count())
+	// Write bytes got admitted only once because second attempt got aborted
+	// during Wait().
+	require.Equal(t, rq.WriteBytes, factory.Metrics().WriteBytesAdmitted.Count())
+	// This is a Gauge and we want to make sure that we don't leak an increment to
+	// it, i.e. the Wait call both added and removed despite interleaving with the
+	// gauge being unlinked from the aggregating parent.
+	require.Zero(t, factory.Metrics().CurrentBlocked.Value())
+	require.NoError(t, ctx.Err()) // didn't time out
+}
+
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
 		datadriven.RunTest(t, path, new(testState).run)
 	})
 }
 
 type testState struct {
-	initialized bool
-	tenants     map[roachpb.TenantID][]tenantrate.Limiter
-	running     map[string]*launchState
-	rl          *tenantrate.LimiterFactory
-	m           *metric.Registry
-	clock       *timeutil.ManualTime
-	settings    *cluster.Settings
-	config      tenantrate.Config
+	initialized  bool
+	tenants      map[roachpb.TenantID][]tenantrate.Limiter
+	running      map[string]*launchState
+	rl           *tenantrate.LimiterFactory
+	m            *metric.Registry
+	clock        *timeutil.ManualTime
+	settings     *cluster.Settings
+	config       tenantrate.Config
+	capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 type launchState struct {
-	id         string
-	tenantID   roachpb.TenantID
-	ctx        context.Context
-	cancel     context.CancelFunc
-	isWrite    bool
-	writeBytes int64
-	reserveCh  chan error
+	id            string
+	tenantID      roachpb.TenantID
+	ctx           context.Context
+	cancel        context.CancelFunc
+	writeRequests int64
+	writeBytes    int64
+	reserveCh     chan error
 }
 
 func (s launchState) String() string {
@@ -130,13 +195,13 @@ var t0 = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 // The argument is a yaml serialization of LimitConfigs. It returns the time as
 // of initialization (00:00:00.000). For example:
 //
-//  init
-//  requests: { rate: 1, burst: 2 }
-//  readbytes: { rate: 1024, burst: 2048 }
-//  writebytes: { rate: 1024, burst: 2048 }
-//  ----
-//  00:00:00.000
-//
+//	init
+//	rate:  1
+//	burst: 2
+//	read:  { perbatch: 1, perrequest: 1, perbyte: 1 }
+//	write: { perbatch: 1, perrequest: 1, perbyte: 1 }
+//	----
+//	00:00:00.000
 func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 	if ts.initialized {
 		d.Fatalf(t, "already ran init")
@@ -147,12 +212,12 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 	ts.clock = timeutil.NewManualTime(t0)
 	ts.settings = cluster.MakeTestingClusterSettings()
 	ts.config = tenantrate.DefaultConfig()
+	ts.capabilities = make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities)
 
-	parseSettings(t, d, &ts.config)
-
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl = tenantrate.NewLimiterFactory(&ts.settings.SV, &tenantrate.TestingKnobs{
-		TimeSource: ts.clock,
-	})
+		QuotaPoolOptions: []quotapool.Option{quotapool.WithTimeSource(ts.clock)},
+	}, ts)
 	ts.rl.UpdateConfig(ts.config)
 	ts.m = metric.NewRegistry()
 	ts.m.AddMetricStruct(ts.rl.Metrics())
@@ -163,7 +228,7 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 // yaml object representing the limits and updates accordingly. It returns
 // the current time. See init for more details as the semantics are the same.
 func (ts *testState) updateSettings(t *testing.T, d *datadriven.TestData) string {
-	parseSettings(t, d, &ts.config)
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl.UpdateConfig(ts.config)
 	return ts.formatTime()
 }
@@ -171,11 +236,10 @@ func (ts *testState) updateSettings(t *testing.T, d *datadriven.TestData) string
 // advance advances the clock by the provided duration and returns the new
 // current time.
 //
-//  advance
-//  2s
-//  ----
-//  00:00:02.000
-//
+//	advance
+//	2s
+//	----
+//	00:00:02.000
 func (ts *testState) advance(t *testing.T, d *datadriven.TestData) string {
 	dur, err := time.ParseDuration(d.Input)
 	if err != nil {
@@ -185,7 +249,7 @@ func (ts *testState) advance(t *testing.T, d *datadriven.TestData) string {
 	return ts.formatTime()
 }
 
-// launch will launch requests with provided id, tenant, and writebytes.
+// launch will launch requests with provided id, tenant, and write metrics.
 // The argument is a yaml list of such request to launch. These requests
 // are launched in parallel, no ordering should be assumed between them.
 // It is an error to launch a request with an id of an outstanding request or
@@ -198,18 +262,17 @@ func (ts *testState) advance(t *testing.T, d *datadriven.TestData) string {
 // The below example would launch two requests with ids "a" and "b"
 // corresponding to tenants 2 and 3 respectively.
 //
-//  launch
-//  - { id: a, tenant: 2, writebytes: 3}
-//  - { id: b, tenant: 3}
-//  ----
-//  [a@2, b@3]
-//
+//	launch
+//	- { id: a, tenant: 2, writebytes: 3}
+//	- { id: b, tenant: 3}
+//	----
+//	[a@2, b@3]
 func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 	var cmds []struct {
-		ID         string
-		Tenant     uint64
-		IsWrite    bool
-		WriteBytes int64
+		ID            string
+		Tenant        uint64
+		WriteRequests int64
+		WriteBytes    int64
 	}
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &cmds); err != nil {
 		d.Fatalf(t, "failed to parse launch command: %v", err)
@@ -217,10 +280,10 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 	for _, cmd := range cmds {
 		var s launchState
 		s.id = cmd.ID
-		s.tenantID = roachpb.MakeTenantID(cmd.Tenant)
+		s.tenantID = roachpb.MustMakeTenantID(cmd.Tenant)
 		s.ctx, s.cancel = context.WithCancel(context.Background())
 		s.reserveCh = make(chan error, 1)
-		s.isWrite = cmd.IsWrite
+		s.writeRequests = cmd.WriteRequests
 		s.writeBytes = cmd.WriteBytes
 		ts.running[s.id] = &s
 		lims := ts.tenants[s.tenantID]
@@ -229,9 +292,12 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 		}
 		go func() {
 			// We'll not worry about ever releasing tenant Limiters.
-			s.reserveCh <- lims[0].Wait(
-				s.ctx, tenantcostmodel.TestingRequestInfo(s.isWrite, s.writeBytes),
-			)
+			reqInfo := tenantcostmodel.BatchInfo{WriteCount: s.writeRequests, WriteBytes: s.writeBytes}
+			if s.writeRequests == 0 {
+				// Read-only request.
+				reqInfo = tenantcostmodel.BatchInfo{}
+			}
+			s.reserveCh <- lims[0].Wait(s.ctx, reqInfo)
 		}()
 	}
 	return ts.FormatRunning()
@@ -245,14 +311,13 @@ func (ts *testState) launch(t *testing.T, d *datadriven.TestData) string {
 //
 // For example:
 //
-//  await
-//  [a]
-//  ----
-//  [b@3]
-//
+//	await
+//	[a]
+//	----
+//	[b@3]
 func (ts *testState) await(t *testing.T, d *datadriven.TestData) string {
 	ids := parseStrings(t, d)
-	const awaitTimeout = time.Second
+	const awaitTimeout = 1000 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), awaitTimeout)
 	defer cancel()
 	for _, id := range ids {
@@ -262,7 +327,7 @@ func (ts *testState) await(t *testing.T, d *datadriven.TestData) string {
 		}
 		select {
 		case <-ctx.Done():
-			d.Fatalf(t, "goroutined %s failed to finish in time", id)
+			d.Fatalf(t, "goroutine %s failed to finish in time", id)
 		case err := <-ls.reserveCh:
 			if err != nil {
 				d.Fatalf(t, "expected no error for id %s, got %q", id, err)
@@ -279,11 +344,10 @@ func (ts *testState) await(t *testing.T, d *datadriven.TestData) string {
 // from the set of outstanding requests. The set of remaining requests will be
 // returned. See launch for details on the serialization of the output.
 //
-//  cancel
-//  [b]
-//  ----
-//  [a@2]
-//
+//	cancel
+//	[b]
+//	----
+//	[a@2]
 func (ts *testState) cancel(t *testing.T, d *datadriven.TestData) string {
 	ids := parseStrings(t, d)
 	for _, id := range ids {
@@ -303,31 +367,32 @@ func (ts *testState) cancel(t *testing.T, d *datadriven.TestData) string {
 }
 
 // recordRead accounts for bytes read from a request. It takes as input a
-// yaml list with fields tenant and readbytes. It returns the set of tasks
-// currently running like launch, await, and cancel.
+// yaml list with fields tenant, readrequests, and readbytes. It returns the set
+// of tasks currently running like launch, await, and cancel.
 //
 // For example:
 //
-//  record_read
-//  - { tenant: 2, readbytes: 32 }
-//  ----
-//  [a@2]
-//
+//	record_read
+//	- { tenant: 2, readrequests: 1, readbytes: 32 }
+//	----
+//	[a@2]
 func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 	var reads []struct {
-		Tenant    uint64
-		ReadBytes int64
+		Tenant       uint64
+		ReadRequests int64
+		ReadBytes    int64
 	}
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &reads); err != nil {
 		d.Fatalf(t, "failed to unmarshal reads: %v", err)
 	}
 	for _, r := range reads {
-		tid := roachpb.MakeTenantID(r.Tenant)
+		tid := roachpb.MustMakeTenantID(r.Tenant)
 		lims := ts.tenants[tid]
 		if len(lims) == 0 {
 			d.Fatalf(t, "no outstanding limiters for %v", tid)
 		}
-		lims[0].RecordRead(context.Background(), tenantcostmodel.TestingResponseInfo(r.ReadBytes))
+		lims[0].RecordRead(
+			context.Background(), tenantcostmodel.BatchInfo{ReadCount: r.ReadRequests, ReadBytes: r.ReadBytes})
 	}
 	return ts.FormatRunning()
 }
@@ -339,32 +404,37 @@ func (ts *testState) recordRead(t *testing.T, d *datadriven.TestData) string {
 //
 // For example:
 //
-//  metrics
-//  ----
-//  kv_tenant_rate_limit_current_blocked 0
-//  kv_tenant_rate_limit_current_blocked{tenant_id="2"} 0
-//  kv_tenant_rate_limit_current_blocked{tenant_id="system"} 0
-//  kv_tenant_rate_limit_num_tenants 0
-//  kv_tenant_rate_limit_read_bytes_admitted 0
-//  kv_tenant_rate_limit_read_bytes_admitted{tenant_id="2"} 0
-//  kv_tenant_rate_limit_read_bytes_admitted{tenant_id="system"} 100
-//  kv_tenant_rate_limit_read_requests_admitted 0
-//  kv_tenant_rate_limit_read_requests_admitted{tenant_id="2"} 0
-//  kv_tenant_rate_limit_read_requests_admitted{tenant_id="system"} 0
-//  kv_tenant_rate_limit_write_bytes_admitted 50
-//  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
-//  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="system"} 0
-//  kv_tenant_rate_limit_write_requests_admitted 0
-//  kv_tenant_rate_limit_write_requests_admitted{tenant_id="2"} 0
-//  kv_tenant_rate_limit_write_requests_admitted{tenant_id="system"} 0
+//	metrics
+//	----
+//	kv_tenant_rate_limit_current_blocked 0
+//	kv_tenant_rate_limit_current_blocked{tenant_id="2"} 0
+//	kv_tenant_rate_limit_current_blocked{tenant_id="system"} 0
+//	kv_tenant_rate_limit_num_tenants 0
+//	kv_tenant_rate_limit_read_bytes_admitted 0
+//	kv_tenant_rate_limit_read_bytes_admitted{tenant_id="2"} 0
+//	kv_tenant_rate_limit_read_bytes_admitted{tenant_id="system"} 100
+//	kv_tenant_rate_limit_read_requests_admitted 0
+//	kv_tenant_rate_limit_read_requests_admitted{tenant_id="2"} 0
+//	kv_tenant_rate_limit_read_requests_admitted{tenant_id="system"} 0
+//	kv_tenant_rate_limit_read_batches_admitted 0
+//	kv_tenant_rate_limit_read_batches_admitted{tenant_id="2"} 0
+//	kv_tenant_rate_limit_read_batches_admitted{tenant_id="system"} 0
+//	kv_tenant_rate_limit_write_bytes_admitted 50
+//	kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
+//	kv_tenant_rate_limit_write_bytes_admitted{tenant_id="system"} 0
+//	kv_tenant_rate_limit_write_requests_admitted 0
+//	kv_tenant_rate_limit_write_requests_admitted{tenant_id="2"} 0
+//	kv_tenant_rate_limit_write_requests_admitted{tenant_id="system"} 0
+//	kv_tenant_rate_limit_write_batches_admitted 0
+//	kv_tenant_rate_limit_write_batches_admitted{tenant_id="2"} 0
+//	kv_tenant_rate_limit_write_batches_admitted{tenant_id="system"} 0
 //
 // Or with a regular expression:
 //
-//  metrics
-//  write_bytes_admitted\{tenant_id="2"\}
-//  ----
-//  kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
-//
+//	metrics
+//	write_bytes_admitted\{tenant_id="2"\}
+//	----
+//	kv_tenant_rate_limit_write_bytes_admitted{tenant_id="2"} 50
 func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
 	// Compile the input into a regular expression.
 	re, err := regexp.Compile(d.Input)
@@ -407,11 +477,10 @@ func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
 // The following example would wait for there to be two outstanding timers at
 // 00:00:01.000 and 00:00:02.000.
 //
-//  timers
-//  ----
-//  00:00:01.000
-//  00:00:02.000
-//
+//	timers
+//	----
+//	00:00:01.000
+//	00:00:02.000
 func (ts *testState) timers(t *testing.T, d *datadriven.TestData) string {
 	// If we are rewriting the test, just sleep a bit before returning the
 	// timers.
@@ -448,16 +517,15 @@ func timesToString(times []time.Time) string {
 //
 // For example:
 //
-//  get_tenants
-//  [2, 3, 2]
-//  ----
-//  [2#2, 3#1]
-//
+//	get_tenants
+//	[2, 3, 2]
+//	----
+//	[2#2, 3#1]
 func (ts *testState) getTenants(t *testing.T, d *datadriven.TestData) string {
 	ctx := context.Background()
 	tenantIDs := parseTenantIDs(t, d)
 	for i := range tenantIDs {
-		id := roachpb.MakeTenantID(tenantIDs[i])
+		id := roachpb.MustMakeTenantID(tenantIDs[i])
 		ts.tenants[id] = append(ts.tenants[id], ts.rl.GetTenant(ctx, id, nil /* closer */))
 	}
 	return ts.FormatTenants()
@@ -469,15 +537,14 @@ func (ts *testState) getTenants(t *testing.T, d *datadriven.TestData) string {
 //
 // For example:
 //
-//  release_tenants
-//  [2, 3]
-//  ----
-//  [2#1]
-//
+//	release_tenants
+//	[2, 3]
+//	----
+//	[2#1]
 func (ts *testState) releaseTenants(t *testing.T, d *datadriven.TestData) string {
 	tenantIDs := parseTenantIDs(t, d)
 	for i := range tenantIDs {
-		id := roachpb.MakeTenantID(tenantIDs[i])
+		id := roachpb.MustMakeTenantID(tenantIDs[i])
 		lims := ts.tenants[id]
 		if len(lims) == 0 {
 			d.Fatalf(t, "no outstanding limiters for %v", id)
@@ -493,17 +560,17 @@ func (ts *testState) releaseTenants(t *testing.T, d *datadriven.TestData) string
 }
 
 // estimateIOPS takes in the description of a workload and produces an estimate
-// of the IOPS for that workload (under the default settings).
+// of the number of batches processed per second for that workload (under the
+// default settings).
 //
 // For example:
 //
-//  estimate_iops
-//  readpercentage: 50
-//  readsize: 4096
-//  writesize: 4096
-//  ----
-//  Mixed workload (50% reads; 4.0 KiB reads; 4.0 KiB writes): 256 sustained IOPS, 256 burst.
-//
+//	estimate_iops
+//	readpercentage: 50
+//	readsize: 4096
+//	writesize: 4096
+//	----
+//	Mixed workload (50% reads; 4.0 KiB reads; 4.0 KiB writes): 256 sustained IOPS, 256 burst.
 func (ts *testState) estimateIOPS(t *testing.T, d *datadriven.TestData) string {
 	var workload struct {
 		ReadPercentage int
@@ -518,9 +585,12 @@ func (ts *testState) estimateIOPS(t *testing.T, d *datadriven.TestData) string {
 	}
 	config := tenantrate.DefaultConfig()
 
+	// Assume one read or write request per batch.
 	calculateIOPS := func(rate float64) float64 {
-		readCost := config.ReadRequestUnits + float64(workload.ReadSize)*config.ReadUnitsPerByte
-		writeCost := config.WriteRequestUnits + float64(workload.WriteSize)*config.WriteUnitsPerByte
+		readCost := config.ReadBatchUnits + config.ReadRequestUnits +
+			float64(workload.ReadSize)*config.ReadUnitsPerByte
+		writeCost := config.WriteBatchUnits + config.WriteRequestUnits +
+			float64(workload.WriteSize)*config.WriteUnitsPerByte
 		readFraction := float64(workload.ReadPercentage) / 100.0
 		avgCost := readFraction*readCost + (1-readFraction)*writeCost
 		return rate / avgCost
@@ -583,6 +653,66 @@ func (ts *testState) formatTime() string {
 	return ts.clock.Now().Format(timeFormat)
 }
 
+func (ts *testState) HasCapabilityForBatch(
+	context.Context, roachpb.TenantID, *kvpb.BatchRequest,
+) error {
+	panic("unimplemented")
+}
+
+func (ts *testState) BindReader(tenantcapabilities.Reader) {}
+
+var _ tenantcapabilities.Authorizer = &testState{}
+
+func (ts *testState) HasCrossTenantRead(ctx context.Context, tenID roachpb.TenantID) bool {
+	return false
+}
+
+func (ts *testState) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanDebugProcess {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewNodeInfo {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewTSDBMetrics {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasTSDBAllMetricsCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewAllMetrics {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	if ts.capabilities[tenID].CanUseNodelocalStorage {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return ts.capabilities[tenID].ExemptFromRateLimiting
+}
+
 func parseTenantIDs(t *testing.T, d *datadriven.TestData) []uint64 {
 	var tenantIDs []uint64
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &tenantIDs); err != nil {
@@ -598,17 +728,25 @@ type SettingValues struct {
 
 	Read  Factors
 	Write Factors
+
+	Capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 // Factors for reads and writes.
 type Factors struct {
-	Base    float64
-	PerByte float64
+	PerBatch   float64
+	PerRequest float64
+	PerByte    float64
 }
 
 // parseSettings parses a SettingValues yaml and updates the given config.
 // Missing (zero) values are ignored.
-func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Config) {
+func parseSettings(
+	t *testing.T,
+	d *datadriven.TestData,
+	config *tenantrate.Config,
+	capabilties map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities,
+) {
 	var vals SettingValues
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &vals); err != nil {
 		d.Fatalf(t, "failed to unmarshal limits: %v", err)
@@ -621,10 +759,15 @@ func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Conf
 	}
 	override(&config.Rate, vals.Rate)
 	override(&config.Burst, vals.Burst)
-	override(&config.ReadRequestUnits, vals.Read.Base)
+	override(&config.ReadBatchUnits, vals.Read.PerBatch)
+	override(&config.ReadRequestUnits, vals.Read.PerRequest)
 	override(&config.ReadUnitsPerByte, vals.Read.PerByte)
-	override(&config.WriteRequestUnits, vals.Write.Base)
+	override(&config.WriteBatchUnits, vals.Write.PerBatch)
+	override(&config.WriteRequestUnits, vals.Write.PerRequest)
 	override(&config.WriteUnitsPerByte, vals.Write.PerByte)
+	for tenantID, caps := range vals.Capabilities {
+		capabilties[tenantID] = caps
+	}
 }
 
 func parseStrings(t *testing.T, d *datadriven.TestData) []string {
@@ -633,4 +776,43 @@ func parseStrings(t *testing.T, d *datadriven.TestData) []string {
 		d.Fatalf(t, "failed to parse strings: %v", err)
 	}
 	return ids
+}
+
+// fakeAuthorizer implements the tenantauthorizer.Authorizer
+// interface, but does not perform cap checks yet pretents the caller
+// is subject to rate limit checks. (For testing in this package.)
+type fakeAuthorizer struct{}
+
+var _ tenantcapabilities.Authorizer = &fakeAuthorizer{}
+
+func (fakeAuthorizer) HasCrossTenantRead(ctx context.Context, tenID roachpb.TenantID) bool {
+	return false
+}
+
+func (fakeAuthorizer) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasTSDBAllMetricsCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	return nil
+}
+func (fakeAuthorizer) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return false
+}
+func (fakeAuthorizer) HasCapabilityForBatch(
+	_ context.Context, tenID roachpb.TenantID, _ *kvpb.BatchRequest,
+) error {
+	return nil
+}
+func (fakeAuthorizer) BindReader(tenantcapabilities.Reader) {}
+
+func (fakeAuthorizer) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	return nil
 }

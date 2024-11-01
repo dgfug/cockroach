@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/sql/colexecop:EXECGEN.bzl", "eg_go_filegroup", "gen_eg_go_rules")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "colexechash",
@@ -16,15 +17,15 @@ go_library(
         "//pkg/col/coldataext",  # keep
         "//pkg/col/typeconv",  # keep
         "//pkg/sql/colexec/colexecutils",
-        "//pkg/sql/colexec/execgen",
         "//pkg/sql/colexecerror",
         "//pkg/sql/colexecop",
         "//pkg/sql/colmem",
         "//pkg/sql/memsize",
-        "//pkg/sql/rowenc",
         "//pkg/sql/sem/tree",  # keep
         "//pkg/sql/types",
         "//pkg/util/json",  # keep
+        "//pkg/util/randutil",
+        "@com_github_cockroachdb_apd_v3//:apd",  # keep
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -32,7 +33,6 @@ go_library(
 go_test(
     name = "colexechash_test",
     srcs = [
-        "dep_test.go",
         "hash_test.go",
         "hash_utils_test.go",
         "main_test.go",
@@ -43,13 +43,11 @@ go_test(
         "//pkg/col/coldataext",
         "//pkg/settings/cluster",
         "//pkg/sql/colexec/colexecutils",
-        "//pkg/sql/colexec/execgen",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
-        "//pkg/sql/rowenc",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/testutils/buildutil",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/mon",
@@ -73,3 +71,18 @@ eg_go_filegroup(
 
 # Define gen rules for individual eg.go files.
 gen_eg_go_rules(targets)
+
+disallowed_imports_test(
+    "colexechash",
+    [
+        "//pkg/sql/colexec",
+        "//pkg/sql/colexec/colexecagg",
+        "//pkg/sql/colexec/colexecbase",
+        "//pkg/sql/colexec/colexecjoin",
+        "//pkg/sql/colexec/colexecproj",
+        "//pkg/sql/colexec/colexecprojconst",
+        "//pkg/sql/colexec/colexecsel",
+        "//pkg/sql/colexec/colexecwindow",
+        "//pkg/sql/execinfra",
+    ],
+)

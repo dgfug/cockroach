@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lexbase_test
 
@@ -119,6 +114,17 @@ func testEncodeString(t *testing.T, input []byte, encode func(*bytes.Buffer, str
 
 func BenchmarkEncodeSQLString(b *testing.B) {
 	str := strings.Repeat("foo", 10000)
+	for i := 0; i < b.N; i++ {
+		lexbase.EncodeSQLStringWithFlags(bytes.NewBuffer(nil), str, lexbase.EncBareStrings)
+	}
+}
+
+func BenchmarkEncodeNonASCIISQLString(b *testing.B) {
+	builder := strings.Builder{}
+	for r := rune(0); r < 10000; r++ {
+		builder.WriteRune(r)
+	}
+	str := builder.String()
 	for i := 0; i < b.N; i++ {
 		lexbase.EncodeSQLStringWithFlags(bytes.NewBuffer(nil), str, lexbase.EncBareStrings)
 	}

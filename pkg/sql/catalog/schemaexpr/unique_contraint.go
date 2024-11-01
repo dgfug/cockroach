@@ -1,20 +1,17 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -29,23 +26,24 @@ import (
 //   - It does not include subqueries.
 //   - It does not include non-immutable, aggregate, window, or set returning
 //     functions.
-//
 func ValidateUniqueWithoutIndexPredicate(
 	ctx context.Context,
 	tn tree.TableName,
 	desc catalog.TableDescriptor,
 	pred tree.Expr,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) (string, error) {
 	expr, _, _, err := DequalifyAndValidateExpr(
 		ctx,
 		desc,
 		pred,
 		types.Bool,
-		"unique without index predicate",
+		tree.UniqueWithoutIndexPredicateExpr,
 		semaCtx,
-		tree.VolatilityImmutable,
+		volatility.Immutable,
 		&tn,
+		version,
 	)
 	if err != nil {
 		return "", err

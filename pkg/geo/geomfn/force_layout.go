@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -115,7 +111,7 @@ func forceLayout(t geom.T, layout geom.Layout, defaultZ float64, defaultM float6
 			endss,
 		).SetSRID(t.SRID()), nil
 	default:
-		return nil, errors.Newf("unknown geom.T type: %T", t)
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unknown geom.T type: %T", t)
 	}
 }
 

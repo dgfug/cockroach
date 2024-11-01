@@ -1,21 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /* eslint-disable no-useless-escape */
-import React from "react";
 import classNames from "classnames/bind";
+import React from "react";
+
 import styles from "./highlightedText.module.scss";
 
 const cx = classNames.bind(styles);
 
-export function isStringIncludesArrayElement(arr: string[], text: string) {
+export function isStringIncludesArrayElement(
+  arr: string[],
+  text: string,
+): boolean {
   let includes = false;
   arr.forEach(val => {
     if (text.toLowerCase().includes(val.toLowerCase())) {
@@ -25,12 +24,12 @@ export function isStringIncludesArrayElement(arr: string[], text: string) {
   return includes;
 }
 
-export function getWordAt(word: string, text: string) {
+export function getWordAt(word: string, text: string): number {
   const regex = new RegExp("\\b" + word.toLowerCase() + "\\b");
   return text.toLowerCase().search(regex);
 }
 
-function rebaseText(text: string, highlight: string) {
+function rebaseText(text: string, highlight: string): string {
   const search = highlight.split(" ");
   const maxLength = 425;
   const defaultCropLength = 150;
@@ -76,8 +75,12 @@ export function getHighlightedText(
   if (!highlight || highlight.length === 0) {
     return text;
   }
+  if (highlight.startsWith('"') && highlight.endsWith('"')) {
+    highlight = highlight.substring(1, highlight.length - 1);
+  }
+
   highlight = highlight.replace(
-    /[°§%()\[\]{}\\?´`'#|;:+-]+/g,
+    /[°§%()\[\]{}\\?´`'#|;:+^*-]+/g,
     "highlightNotDefined",
   );
   const search = highlight
@@ -90,7 +93,7 @@ export function getHighlightedText(
     })
     .join("|");
   const parts = isOriginalText
-    ? text.split(new RegExp(`(${search})`, "gi"))
+    ? text?.split(new RegExp(`(${search})`, "gi"))
     : rebaseText(text, highlight).split(new RegExp(`(${search})`, "gi"));
   const highlightClass = hasDarkBkg ? "_text-bold-light" : "_text-bold";
   return parts.map((part, i) => {

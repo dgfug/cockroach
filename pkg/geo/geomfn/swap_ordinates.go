@@ -1,21 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -33,7 +28,7 @@ func SwapOrdinates(geometry geo.Geometry, ords string) (geo.Geometry, error) {
 
 	newT, err := applyOnCoordsForGeomT(t, func(l geom.Layout, dst, src []float64) error {
 		if len(ords) != 2 {
-			return errors.New("invalid ordinate specification. need two letters from the set (x, y, z and m)")
+			return pgerror.Newf(pgcode.InvalidParameterValue, "invalid ordinate specification. need two letters from the set (x, y, z and m)")
 		}
 		ordsIndices, err := getOrdsIndices(l, ords)
 		if err != nil {
@@ -57,10 +52,10 @@ func getOrdsIndices(l geom.Layout, ords string) ([2]int, error) {
 	for i := 0; i < len(ords); i++ {
 		oi := findOrdIndex(ords[i], l)
 		if oi == -2 {
-			return ordIndices, errors.New("invalid ordinate specification. need two letters from the set (x, y, z and m)")
+			return ordIndices, pgerror.Newf(pgcode.InvalidParameterValue, "invalid ordinate specification. need two letters from the set (x, y, z and m)")
 		}
 		if oi == -1 {
-			return ordIndices, fmt.Errorf("geometry does not have a %s ordinate", string(ords[i]))
+			return ordIndices, pgerror.Newf(pgcode.InvalidParameterValue, "geometry does not have a %s ordinate", string(ords[i]))
 		}
 		ordIndices[i] = oi
 	}

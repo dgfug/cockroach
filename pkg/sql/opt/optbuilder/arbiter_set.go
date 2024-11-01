@@ -1,19 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/errors"
 )
 
 // arbiterSet represents a set of arbiters. Unique indexes or constraints can be
@@ -25,11 +21,11 @@ type arbiterSet struct {
 
 	// indexes contains the index arbiters in the set, as ordinals into the
 	// table's indexes.
-	indexes util.FastIntSet
+	indexes intsets.Fast
 
 	// uniqueConstraints contains the unique constraint arbiters in the set, as
 	// ordinals into the table's unique constraints.
-	uniqueConstraints util.FastIntSet
+	uniqueConstraints intsets.Fast
 }
 
 // makeArbiterSet returns an initialized arbiterSet.
@@ -104,9 +100,18 @@ func (a *arbiterSet) ContainsUniqueConstraint(uniq cat.UniqueOrdinal) bool {
 //     pred is nil.
 //   - canaryOrd is the table column ordinal of a not-null column in the
 //     constraint's table.
-//
+//   - uniqueWithoutIndex is true if this is a unique constraint enforced
+//     without an index.
+//   - uniqueOrd is the ordinal of the unique constraint (-1 for index arbiters).
 func (a *arbiterSet) ForEach(
-	f func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int),
+	f func(
+		name string,
+		conflictOrds intsets.Fast,
+		pred tree.Expr,
+		canaryOrd int,
+		uniqueWithoutIndex bool,
+		uniqueOrd int,
+	),
 ) {
 	// Call the callback for each index arbiter.
 	a.indexes.ForEach(func(i int) {
@@ -120,7 +125,7 @@ func (a *arbiterSet) ForEach(
 			pred = a.mb.parsePartialIndexPredicateExpr(i)
 		}
 
-		f(string(index.Name()), conflictOrds, pred, canaryOrd)
+		f(string(index.Name()), conflictOrds, pred, canaryOrd, false, -1)
 	})
 
 	// Call the callback for each unique constraint arbiter.
@@ -135,6 +140,132 @@ func (a *arbiterSet) ForEach(
 			pred = a.mb.parseUniqueConstraintPredicateExpr(i)
 		}
 
-		f(uniqueConstraint.Name(), conflictOrds, pred, canaryOrd)
+		f(uniqueConstraint.Name(), conflictOrds, pred, canaryOrd, uniqueConstraint.WithoutIndex(), i)
+	})
+}
+
+// removeIndex removes an index arbiter from the set.
+func (a *arbiterSet) removeIndex(idx cat.IndexOrdinal) {
+	a.indexes.Remove(idx)
+}
+
+// minArbiterSet represents a set of arbiters. It differs from arbiterSet by
+// automatically removing arbiter indexes that are made redundant by arbiter
+// unique constraints. It is only useful when an ON CONFLICT statement specifies
+// no columns or constraints. For example, consider the table and statement:
+//
+//	CREATE TABLE t (
+//	  a INT,
+//	  b INT,
+//	  UNIQUE INDEX a_b_key (a, b),
+//	  UNIQUE WITHOUT INDEX b_key (b)
+//	)
+//
+//	INSERT INTO t VALUES (1, 2) ON CONFLICT DO NOTHING
+//
+// There is no need to use both a_b_key and b_key as arbiters for the INSERT
+// statement because any conflict in a_b_key will also be a conflict in b_key.
+// Only b_key is required to be an arbiter.
+//
+// Special care is taken with partial indexes and unique constraints. An arbiter
+// index is only made redundant by a unique constraint if they are both
+// non-partial, or their partial predicates are identical. Note that in the
+// future, we could probably be smarter about this by using implication (see
+// partialidx.Implicator) to remove arbiter indexes that have predicates that do
+// not exactly match a unique constraint predicate.
+//
+// Note that minArbiterSet does not currently remove arbiter indexes that are
+// made redundant by other arbiter indexes, nor does it remove arbiter unique
+// constraints made redundant by other arbiter unique constraints. These cases
+// would only occur if a user created redundant unique indexes or unique
+// constraints, and the extra arbiters can be easily removed by removing the
+// redundant indexes and constraints from the table. The minArbiterSet is
+// designed to remove arbiter indexes that are made redundant by UNIQUE WITHOUT
+// INDEX constraints that are synthesized for partitioned and hash-sharded
+// indexes, which the user has no control over.
+type minArbiterSet struct {
+	as arbiterSet
+
+	// addUniqueConstraintCalled is set to true when addUniqueConstraint is
+	// called. When true, AddIndex will panic to avoid undefined behavior.
+	addUniqueConstraintCalled bool
+
+	// indexConflictOrdsCache caches the conflict column sets of arbiter indexes
+	// in the set.
+	indexConflictOrdsCache map[cat.IndexOrdinal]intsets.Fast
+}
+
+// makeMinArbiterSet returns an initialized arbiterSet.
+func makeMinArbiterSet(mb *mutationBuilder) minArbiterSet {
+	return minArbiterSet{
+		as: makeArbiterSet(mb),
+	}
+}
+
+// AddIndex adds an index arbiter to the set. Panics if called after
+// AddUniqueConstraint has been called.
+func (m *minArbiterSet) AddIndex(idx cat.IndexOrdinal) {
+	if m.addUniqueConstraintCalled {
+		panic(errors.AssertionFailedf("cannot call AddIndex after AddUniqueConstraint"))
+	}
+	m.as.AddIndex(idx)
+}
+
+// AddUniqueConstraint adds a unique constraint arbiter to the set. If the
+// unique constraint makes an index redundant, the index is removed from the
+// set.
+func (m *minArbiterSet) AddUniqueConstraint(uniq cat.UniqueOrdinal) {
+	m.addUniqueConstraintCalled = true
+	m.as.AddUniqueConstraint(uniq)
+
+	uniqueConstraint := m.as.mb.tab.Unique(uniq)
+	if idx, ok := m.findRedundantIndex(uniqueConstraint); ok {
+		m.as.removeIndex(idx)
+		delete(m.indexConflictOrdsCache, idx)
+	}
+}
+
+// ArbiterSet converts the minArbiterSet to an arbiterSet.
+func (m *minArbiterSet) ArbiterSet() arbiterSet {
+	return m.as
+}
+
+// findRedundantIndex returns the first arbiter index which is made redundant by
+// the unique constraint. An arbiter index is redundant if both of the following
+// hold:
+//
+//  1. Its conflict columns are a super set of the given conflict columns.
+//  2. The index and unique constraint are both non-partial, or have the same
+//     partial predicate.
+func (m *minArbiterSet) findRedundantIndex(
+	uniq cat.UniqueConstraint,
+) (_ cat.IndexOrdinal, ok bool) {
+	m.initCache()
+	// If there is only one arbiter index, check if it is made redundant by
+	// the unique constraint.
+	conflictOrds := getUniqueConstraintOrdinals(m.as.mb.tab, uniq)
+	pred, _ := uniq.Predicate()
+	// Find the first arbiter index that is made redundant by the unique
+	// constraint.
+	for i, indexConflictOrds := range m.indexConflictOrdsCache {
+		indexPred, _ := m.as.mb.tab.Index(i).Predicate()
+		if pred == indexPred && conflictOrds.SubsetOf(indexConflictOrds) {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// initCache initializes the index conflict columns cache.
+func (m *minArbiterSet) initCache() {
+	// Do nothing if the cache has already been initialized.
+	if m.indexConflictOrdsCache != nil {
+		return
+	}
+	// Cache each index's conflict columns.
+	m.indexConflictOrdsCache = make(map[cat.IndexOrdinal]intsets.Fast, m.as.indexes.Len())
+	m.as.indexes.ForEach(func(i int) {
+		index := m.as.mb.tab.Index(i)
+		m.indexConflictOrdsCache[i] = getIndexLaxKeyOrdinals(index)
 	})
 }

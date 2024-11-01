@@ -1,4 +1,4 @@
-# LogicTest: multiregion-9node-3region-3azs multiregion-9node-3region-3azs-tenant
+# LogicTest: multiregion-9node-3region-3azs multiregion-9node-3region-3azs-tenant multiregion-9node-3region-3azs-no-los
 
 statement ok
 CREATE DATABASE test_local_db
@@ -57,5 +57,40 @@ SHOW CREATE DATABASE multi_region_test_placement_restricted_db
 database_name                                     create_statement
 multi_region_test_placement_restricted_db         CREATE DATABASE multi_region_test_placement_restricted_db PRIMARY REGION "ap-southeast-2" REGIONS = "ap-southeast-2", "ca-central-1", "us-east-1" SURVIVE ZONE FAILURE PLACEMENT RESTRICTED
 
-statement error target database or schema does not exist
+statement error database "foo" does not exist
 SHOW CREATE DATABASE foo
+
+# Test that showing localities works for databases and schemas with weird
+# names.
+subtest show_tables_locality
+
+statement ok
+CREATE DATABASE "This is a fun name, no?" PRIMARY REGION "ap-southeast-2";
+USE "This is a fun name, no?";
+CREATE SCHEMA sc;
+CREATE SCHEMA "A delightful name for a schema!";
+CREATE TABLE g (i INT PRIMARY KEY) LOCALITY GLOBAL;
+CREATE TABLE "A delightful name for a schema!".rbr (i INT PRIMARY KEY) LOCALITY REGIONAL BY ROW;
+CREATE TABLE sc.rbt (i INT PRIMARY KEY) LOCALITY REGIONAL BY TABLE;
+
+query TTTTIT
+SELECT * FROM [SHOW TABLES] ORDER BY 1
+----
+A delightful name for a schema!  rbr  table  root  0  REGIONAL BY ROW
+public                           g    table  root  0  GLOBAL
+sc                               rbt  table  root  0  REGIONAL BY TABLE IN PRIMARY REGION
+
+statement ok
+use defaultdb
+
+query TTTTIT
+SELECT * FROM [SHOW TABLES FROM "This is a fun name, no?"] ORDER BY 1
+----
+A delightful name for a schema!  rbr  table  root  0  REGIONAL BY ROW
+public                           g    table  root  0  GLOBAL
+sc                               rbt  table  root  0  REGIONAL BY TABLE IN PRIMARY REGION
+
+query TTTTIT
+SHOW TABLES FROM "This is a fun name, no?"."A delightful name for a schema!"
+----
+A delightful name for a schema!  rbr  table  root  0  REGIONAL BY ROW

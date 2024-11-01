@@ -1,74 +1,56 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backupccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	math "math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
-
-func TestMaxIngestBatchSize(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-
-	testCases := []struct {
-		ingestBatchSize int64
-		maxCommandSize  int64
-		expected        int64
-	}{
-		{ingestBatchSize: 2 << 20, maxCommandSize: 64 << 20, expected: 2 << 20},
-		{ingestBatchSize: 128 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
-		{ingestBatchSize: 64 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
-		{ingestBatchSize: 63 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
-	}
-	for i, testCase := range testCases {
-		st := cluster.MakeTestingClusterSettings()
-		storageccl.IngestBatchSize.Override(ctx, &st.SV, testCase.ingestBatchSize)
-		kvserver.MaxCommandSize.Override(ctx, &st.SV, testCase.maxCommandSize)
-		if e, a := storageccl.MaxIngestBatchSize(st), testCase.expected; e != a {
-			t.Errorf("%d: expected max batch size %d, but got %d", i, e, a)
-		}
-	}
-}
 
 func slurpSSTablesLatestKey(
 	t *testing.T, dir string, paths []string, oldPrefix, newPrefix []byte,
@@ -86,8 +68,12 @@ func slurpSSTablesLatestKey(
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		sst, err := storage.NewSSTIterator(file)
+		iterOpts := storage.IterOptions{
+			KeyTypes:   storage.IterKeyTypePointsOnly,
+			LowerBound: keys.LocalMax,
+			UpperBound: keys.MaxKey,
+		}
+		sst, err := storage.NewSSTIterator([][]sstable.ReadableFile{{file}}, iterOpts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,37 +90,32 @@ func slurpSSTablesLatestKey(
 			if !sst.UnsafeKey().Less(end) {
 				break
 			}
-			var ok bool
-			var newKv storage.MVCCKeyValue
 			key := sst.UnsafeKey()
-			newKv.Value = append(newKv.Value, sst.UnsafeValue()...)
-			newKv.Key.Key = append(newKv.Key.Key, key.Key...)
-			newKv.Key.Timestamp = key.Timestamp
-			newKv.Key.Key, ok = kr.rewriteKey(newKv.Key.Key)
-			if !ok {
-				t.Fatalf("could not rewrite key: %s", newKv.Key.Key)
+			value, err := storage.DecodeMVCCValueAndErr(sst.UnsafeValue())
+			if err != nil {
+				t.Fatal(err)
 			}
-			v := roachpb.Value{RawBytes: newKv.Value}
-			v.ClearChecksum()
-			v.InitChecksum(newKv.Key.Key)
-			// NB: import data does not contain intents, so data with no timestamps
-			// is inline meta and not intents. Therefore this is not affected by the
-			// choice of interleaved or separated intents.
-			if newKv.Key.Timestamp.IsEmpty() {
-				if err := batch.PutUnversioned(newKv.Key.Key, v.RawBytes); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if err := batch.PutMVCC(newKv.Key, v.RawBytes); err != nil {
-					t.Fatal(err)
-				}
+			newKey := key
+			newKey.Key = append([]byte(nil), newKey.Key...)
+			var ok bool
+			newKey.Key, ok = kr.rewriteKey(newKey.Key)
+			if !ok {
+				t.Fatalf("could not rewrite key: %s", newKey.Key)
+			}
+			newValue := value
+			newValue.Value.RawBytes = append([]byte(nil), newValue.Value.RawBytes...)
+			newValue.Value.ClearChecksum()
+			newValue.Value.InitChecksum(newKey.Key)
+			if err := batch.PutMVCC(newKey, newValue); err != nil {
+				t.Fatal(err)
 			}
 			sst.Next()
 		}
 	}
 
 	var kvs []storage.MVCCKeyValue
-	it := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+	it, err := batch.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+	require.NoError(t, err)
 	defer it.Close()
 	for it.SeekGE(start); ; it.NextKey() {
 		if ok, err := it.Valid(); err != nil {
@@ -142,7 +123,11 @@ func slurpSSTablesLatestKey(
 		} else if !ok || !it.UnsafeKey().Less(end) {
 			break
 		}
-		kvs = append(kvs, storage.MVCCKeyValue{Key: it.Key(), Value: it.Value()})
+		val, err := storage.DecodeMVCCValueAndErr(it.Value())
+		if err != nil {
+			t.Fatal(err)
+		}
+		kvs = append(kvs, storage.MVCCKeyValue{Key: it.UnsafeKey().Clone(), Value: val.Value.RawBytes})
 	}
 	return kvs
 }
@@ -164,6 +149,7 @@ func clientKVsToEngineKVs(kvs []kv.KeyValue) []storage.MVCCKeyValue {
 
 func TestIngest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
 	t.Run("batch=default", func(t *testing.T) {
 		runTestIngest(t, func(_ *cluster.Settings) {})
@@ -172,7 +158,7 @@ func TestIngest(t *testing.T) {
 		// The test normally doesn't trigger the batching behavior, so lower
 		// the threshold to force it.
 		init := func(st *cluster.Settings) {
-			storageccl.IngestBatchSize.Override(ctx, &st.SV, 1)
+			bulk.IngestBatchSize.Override(ctx, &st.SV, 1)
 		}
 		runTestIngest(t, init)
 	})
@@ -180,6 +166,7 @@ func TestIngest(t *testing.T) {
 
 func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -201,13 +188,15 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		keySlice = append(keySlice, key)
 	}
 
+	ctx := context.Background()
+	cs := cluster.MakeTestingClusterSettings()
 	writeSST := func(t *testing.T, offsets []int) string {
-		path := strconv.FormatInt(hlc.UnixNano(), 10)
+		path := strconv.FormatInt(timeutil.Now().UnixNano(), 10)
 
-		sstFile := &storage.MemFile{}
-		sst := storage.MakeBackupSSTWriter(sstFile)
+		var sstFile bytes.Buffer
+		sst := storage.MakeBackupSSTWriter(ctx, cs, &sstFile)
 		defer sst.Close()
-		ts := hlc.NewClock(hlc.UnixNano, time.Nanosecond).Now()
+		ts := hlc.NewClockForTesting(nil).Now()
 		value := roachpb.MakeValueFromString("bar")
 		for _, idx := range offsets {
 			key := keySlice[idx]
@@ -220,7 +209,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		if err := sst.Finish(); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := ioutil.WriteFile(filepath.Join(dir, "foo", path), sstFile.Data(), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "foo", path), sstFile.Bytes(), 0644); err != nil {
 			t.Fatalf("%+v", err)
 		}
 		return path
@@ -232,9 +221,9 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	remainingAmbiguousSubReqs := int64(initialAmbiguousSubReqs)
 	knobs := base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-			TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+			TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
 				switch filterArgs.Req.(type) {
-				case *roachpb.AddSSTableRequest:
+				case *kvpb.AddSSTableRequest:
 				// No-op.
 				default:
 					return nil
@@ -243,37 +232,56 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				if r < 0 {
 					return nil
 				}
-				return roachpb.NewError(roachpb.NewAmbiguousResultError(strconv.Itoa(int(r))))
+				return kvpb.NewError(kvpb.NewAmbiguousResultErrorf("%d", r))
 			},
 		},
 	}}
 
-	ctx := context.Background()
-	args := base.TestServerArgs{Knobs: knobs, ExternalIODir: dir}
+	args := base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107812),
+
+		Knobs:         knobs,
+		ExternalIODir: dir,
+		Settings:      cs,
+	}
 	// TODO(dan): This currently doesn't work with AddSSTable on in-memory
 	// stores because RocksDB's InMemoryEnv doesn't support NewRandomRWFile
 	// (which breaks the global-seqno rewrite used when the added sstable
 	// overlaps with existing data in the RocksDB instance). #16345.
 	args.StoreSpecs = []base.StoreSpec{{InMemory: false, Path: filepath.Join(dir, "testserver")}}
-	s, _, kvDB := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(ctx)
+	srv, _, kvDB := serverutils.StartServer(t, args)
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
 	init(s.ClusterSettings())
 
-	evalCtx := tree.EvalContext{Settings: s.ClusterSettings()}
-	flowCtx := execinfra.FlowCtx{Cfg: &execinfra.ServerConfig{DB: kvDB,
-		ExternalStorage: func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
-			return cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
-				s.ClusterSettings(), blobs.TestBlobServiceClient(s.ClusterSettings().ExternalIODir), nil, nil)
-		},
-		Settings: s.ClusterSettings(),
-		Codec:    keys.SystemSQLCodec,
-	},
-		EvalCtx: &tree.EvalContext{
-			Codec:    keys.SystemSQLCodec,
+	flowCtx := execinfra.FlowCtx{
+		Cfg: &execinfra.ServerConfig{
+			DB: s.InternalDB().(descs.DB),
+			ExternalStorage: func(ctx context.Context, dest cloudpb.ExternalStorage, opts ...cloud.ExternalStorageOption) (cloud.ExternalStorage, error) {
+				return cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
+					s.ClusterSettings(), blobs.TestBlobServiceClient(s.ClusterSettings().ExternalIODir),
+					nil, /* db */
+					nil, /* limiters */
+					cloud.NilMetrics,
+					opts...)
+			},
 			Settings: s.ClusterSettings(),
-		}}
+			Codec:    s.Codec(),
+			BackupMonitor: mon.NewUnlimitedMonitor(ctx, mon.Options{
+				Name:     "test",
+				Settings: s.ClusterSettings(),
+			}),
+			BulkSenderLimiter: limit.MakeConcurrentRequestLimiter("test", math.MaxInt),
+		},
+		EvalCtx: &eval.Context{
+			Codec:    s.Codec(),
+			Settings: s.ClusterSettings(),
+		},
+	}
 
-	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://0/foo", security.RootUserName())
+	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://1/foo", username.RootUserName())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -361,17 +369,25 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				t.Fatalf("failed to rewrite key: %s", reqMidKey2)
 			}
 
-			if err := kvDB.AdminSplit(ctx, reqMidKey1, hlc.MaxTimestamp /* expirationTime */); err != nil {
+			if err := kvDB.AdminSplit(
+				ctx,
+				reqMidKey1,
+				hlc.MaxTimestamp, /* expirationTime */
+			); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.AdminSplit(ctx, reqMidKey2, hlc.MaxTimestamp /* expirationTime */); err != nil {
+			if err := kvDB.AdminSplit(
+				ctx,
+				reqMidKey2,
+				hlc.MaxTimestamp, /* expirationTime */
+			); err != nil {
 				t.Fatal(err)
 			}
 
 			atomic.StoreInt64(&remainingAmbiguousSubReqs, initialAmbiguousSubReqs)
 
 			mockRestoreDataSpec := execinfrapb.RestoreDataSpec{
-				Rekeys: rekeys,
+				TableRekeys: rekeys,
 			}
 			restoreSpanEntry := execinfrapb.RestoreSpanEntry{
 				Span: roachpb.Span{Key: first, EndKey: last.PrefixEnd()},
@@ -385,14 +401,22 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			}
 			expectedKVs := slurpSSTablesLatestKey(t, filepath.Join(dir, "foo"), slurp, srcPrefix, newPrefix)
 
-			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(ctx, &evalCtx, &flowCtx,
-				mockRestoreDataSpec)
+			mockRestoreDataProcessor := &restoreDataProcessor{
+				ProcessorBase: execinfra.ProcessorBase{
+					ProcessorBaseNoHelper: execinfra.ProcessorBaseNoHelper{
+						FlowCtx: &flowCtx,
+					},
+				},
+				spec: mockRestoreDataSpec,
+				qp:   backuputils.NewMemoryBackedQuotaPool(ctx, nil /* m */, "restore-mon", 0 /* limit */),
+			}
+			sst, res, err := mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry, nil)
 			require.NoError(t, err)
-			ssts := make(chan mergedSST, 1)
-			require.NoError(t, mockRestoreDataProcessor.openSSTs(restoreSpanEntry, ssts))
-			close(ssts)
-			sst := <-ssts
-			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(sst)
+			require.Equal(t, resumeEntry{done: true, idx: len(restoreSpanEntry.Files)}, *res)
+			rewriter, err := MakeKeyRewriterFromRekeys(flowCtx.Codec(), mockRestoreDataSpec.TableRekeys,
+				mockRestoreDataSpec.TenantRekeys, false /* restoreTenantFromStream */)
+			require.NoError(t, err)
+			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(ctx, rewriter, sst)
 			require.NoError(t, err)
 
 			clientKVs, err := kvDB.Scan(ctx, reqStartKey, reqEndKey, 0)
@@ -400,6 +424,11 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				t.Fatalf("%+v", err)
 			}
 			kvs := clientKVsToEngineKVs(clientKVs)
+			for i := range kvs {
+				if i < len(expectedKVs) {
+					expectedKVs[i].Key.Timestamp = kvs[i].Key.Timestamp
+				}
+			}
 
 			if !reflect.DeepEqual(kvs, expectedKVs) {
 				for i := 0; i < len(kvs) || i < len(expectedKVs); i++ {
@@ -418,28 +447,4 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			}
 		})
 	}
-}
-
-func newTestingRestoreDataProcessor(
-	ctx context.Context,
-	evalCtx *tree.EvalContext,
-	flowCtx *execinfra.FlowCtx,
-	spec execinfrapb.RestoreDataSpec,
-) (*restoreDataProcessor, error) {
-	rd := &restoreDataProcessor{
-		ProcessorBase: execinfra.ProcessorBase{
-			ProcessorBaseNoHelper: execinfra.ProcessorBaseNoHelper{
-				Ctx:     ctx,
-				EvalCtx: evalCtx,
-			}},
-		flowCtx: flowCtx,
-		spec:    spec,
-	}
-	var err error
-	rd.kr, err = makeKeyRewriterFromRekeys(flowCtx.Codec(), rd.spec.Rekeys)
-	if err != nil {
-		return nil, err
-	}
-
-	return rd, nil
 }

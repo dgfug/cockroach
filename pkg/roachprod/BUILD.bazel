@@ -1,9 +1,10 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "roachprod",
     srcs = [
         "clusters_cache.go",
+        "multitenant.go",
         "roachprod.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/roachprod",
@@ -11,21 +12,42 @@ go_library(
     deps = [
         "//pkg/build",
         "//pkg/cli/exit",
+        "//pkg/cmd/roachprod/grafana",
+        "//pkg/cmd/roachtest/test",
         "//pkg/roachprod/cloud",
         "//pkg/roachprod/config",
+        "//pkg/roachprod/fluentbit",
         "//pkg/roachprod/install",
+        "//pkg/roachprod/lock",
+        "//pkg/roachprod/logger",
+        "//pkg/roachprod/opentelemetry",
+        "//pkg/roachprod/prometheus",
+        "//pkg/roachprod/promhelperclient",
         "//pkg/roachprod/vm",
         "//pkg/roachprod/vm/aws",
         "//pkg/roachprod/vm/azure",
         "//pkg/roachprod/vm/gce",
         "//pkg/roachprod/vm/local",
+        "//pkg/server/debug/replay",
         "//pkg/util/ctxgroup",
         "//pkg/util/httputil",
-        "//pkg/util/log",
+        "//pkg/util/retry",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_errors//oserror",
+        "@com_github_dataexmachina_dev_side_eye_go//sideeyeclient",
         "@org_golang_x_sys//unix",
+    ],
+)
+
+go_test(
+    name = "roachprod_test",
+    srcs = ["roachprod_test.go"],
+    embed = [":roachprod"],
+    deps = [
+        "//pkg/roachprod/logger",
+        "//pkg/roachprod/vm",
+        "@com_github_stretchr_testify//assert",
     ],
 )

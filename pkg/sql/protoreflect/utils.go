@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package protoreflect
 
@@ -19,15 +14,48 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+var shorthands map[string]protoutil.Message = map[string]protoutil.Message{}
+
+// RegisterShorthands registers a shorthand alias for a given message type which
+// can be used by NewMessage to look up that message type, when it fails to find
+// a message type with that name in the fully-qualified global registry first.
+// Aliases are folded to lower-case with any '_'s removed prior to registration
+// and when being searched.
+func RegisterShorthands(msg protoutil.Message, names ...string) {
+	for _, name := range names {
+		name = foldShorthand(name)
+		if existing, ok := shorthands[name]; ok {
+			panic(errors.AssertionFailedf("shorthand %s already registered to %T", name, existing))
+		}
+		shorthands[name] = msg
+	}
+}
+
+func foldShorthand(name string) string {
+	return strings.ReplaceAll(strings.ToLower(name), "_", "")
+}
+
 // NewMessage creates a new protocol message object, given its fully
-// qualified name.
+// qualified name, or an alias previously registered via RegisterShorthands.
 func NewMessage(name string) (protoutil.Message, error) {
 	// Get the reflected type of the protocol message.
 	rt := proto.MessageType(name)
 	if rt == nil {
-		return nil, errors.Newf("unknown proto message type %s", name)
+		if msg, ok := shorthands[foldShorthand(name)]; ok {
+			fullName := proto.MessageName(msg)
+			rt = proto.MessageType(fullName)
+			if rt == nil {
+				return nil, errors.Newf("unknown proto message type %s", fullName)
+			}
+		} else {
+			return nil, errors.Newf("unknown proto message type %s", name)
+		}
 	}
 
 	// If the message is known, we should get the pointer to our message.
@@ -47,6 +75,42 @@ func NewMessage(name string) (protoutil.Message, error) {
 			name, rv.Interface())
 	}
 	return msg, nil
+}
+
+// NewJSONMessageFromFileDescriptor decodes a protobuf message from binary to JSON
+// based on the provided protoreflect.FileDescriptor
+func NewJSONMessageFromFileDescriptor(
+	name string, fd protoreflect.FileDescriptor, data []byte, resolver protodesc.Resolver,
+) (jsonb.JSON, error) {
+	//convert FileDescriptor to FileDescriptorProto
+	fdp := protodesc.ToFileDescriptorProto(fd)
+
+	//create new proto File from FileDescriptorProto
+	f, err := protodesc.NewFile(fdp, resolver)
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating protodesc.NewFile: %w")
+	}
+
+	//get MessageDescriptor from File based on provided name
+	md := f.Messages().ByName(protoreflect.Name(name))
+	if md == nil {
+		return nil, errors.Newf("message descriptor was nil for name %s", name)
+	}
+
+	//Get message to unmarshall protobuf binary from the MessageDescriptor
+	mt := dynamicpb.NewMessageType(md)
+	msg := mt.New().Interface()
+
+	//Unmarshal
+	err = protoutil.TODOUnmarshal(data, msg)
+	if err != nil {
+		return nil, err
+	}
+
+	//Format Protobuf message to JSON string
+	json := protojson.Format(msg)
+
+	return jsonb.ParseJSON(json)
 }
 
 // DecodeMessage decodes protocol message specified as its fully
@@ -94,8 +158,9 @@ func MessageToJSON(msg protoutil.Message, flags FmtFlags) (jsonb.JSON, error) {
 // Returns serialized byte representation of the protocol message.
 func JSONBMarshalToMessage(input jsonb.JSON, target protoutil.Message) ([]byte, error) {
 	json := &jsonpb.Unmarshaler{}
-	if err := json.Unmarshal(strings.NewReader(input.String()), target); err != nil {
-		return nil, errors.Wrapf(err, "unmarshaling json to %s", proto.MessageName(target))
+	jsonString := input.String()
+	if err := json.Unmarshal(strings.NewReader(jsonString), target); err != nil {
+		return nil, errors.Wrapf(err, "unmarshaling to %s json: %s", proto.MessageName(target), jsonString)
 	}
 	data, err := protoutil.Marshal(target)
 	if err != nil {

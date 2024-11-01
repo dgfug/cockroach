@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -14,6 +9,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -29,12 +25,10 @@ type RowIndexedVarContainer struct {
 	Mapping catalog.TableColMap
 }
 
-var _ tree.IndexedVarContainer = &RowIndexedVarContainer{}
+var _ eval.IndexedVarContainer = &RowIndexedVarContainer{}
 
-// IndexedVarEval implements tree.IndexedVarContainer.
-func (r *RowIndexedVarContainer) IndexedVarEval(
-	idx int, ctx *tree.EvalContext,
-) (tree.Datum, error) {
+// IndexedVarEval implements eval.IndexedVarContainer.
+func (r *RowIndexedVarContainer) IndexedVarEval(idx int) (tree.Datum, error) {
 	rowIdx, ok := r.Mapping.Get(r.Cols[idx].GetID())
 	if !ok {
 		return tree.DNull, nil
@@ -45,11 +39,6 @@ func (r *RowIndexedVarContainer) IndexedVarEval(
 // IndexedVarResolvedType implements tree.IndexedVarContainer.
 func (*RowIndexedVarContainer) IndexedVarResolvedType(idx int) *types.T {
 	panic("unsupported")
-}
-
-// IndexedVarNodeFormatter implements tree.IndexedVarContainer.
-func (*RowIndexedVarContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	return nil
 }
 
 // CannotWriteToComputedColError constructs a write error for a computed column.

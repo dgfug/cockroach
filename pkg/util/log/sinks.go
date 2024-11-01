@@ -1,18 +1,21 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
 import "github.com/cockroachdb/cockroach/pkg/cli/exit"
 
-//go:generate mockgen -package=log -source=sinks.go -destination=mock_generated.go -mock_names=logSink=MockLogSink logSink
+//go:generate mockgen -package=log -destination=mocks_generated_test.go --mock_names=TestingLogSink=MockLogSink . TestingLogSink
+
+// TestingLogSink is exported for mock generation.
+// This is painful, but it seems to be the only way, for the moment, to
+// generate this mock.
+//
+// The reason is that there's no way to inject build tags into the current
+// bazel rules for gomock.
+type TestingLogSink = logSink
 
 // sinkOutputOptions provides various options for a logSink.output call.
 type sinkOutputOptions struct {
@@ -20,9 +23,19 @@ type sinkOutputOptions struct {
 	extraFlush bool
 	// ignoreErrors disables internal error handling (i.e. fail fast).
 	ignoreErrors bool
-	// forceSync forces synchronous operation of this output operation.
-	// That is, it will block until the output has been handled.
-	forceSync bool
+	// tryForceSync attempts to force a synchronous operation of this
+	// output operation. That is, it will block until the output has been
+	// handled, so long as the underlying sink can support the operation at
+	// that moment.
+	//
+	// This isn't an ironclad guarantee, but in the vast majority of
+	// scenarios, this option will be honored.
+	//
+	// If a sink can't support a synchronous flush, it should do its
+	// best to ensure a flush is imminent which will include the log
+	// message that accompanies the tryForceSync option. It should also
+	// give some indication that it was unable to do so.
+	tryForceSync bool
 }
 
 // logSink abstracts the destination of logging events, after all
@@ -64,4 +77,4 @@ var _ logSink = (*stderrSink)(nil)
 var _ logSink = (*fileSink)(nil)
 var _ logSink = (*fluentSink)(nil)
 var _ logSink = (*httpSink)(nil)
-var _ logSink = (*bufferSink)(nil)
+var _ logSink = (*bufferedSink)(nil)

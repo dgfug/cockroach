@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -35,9 +30,10 @@ func ordinalityCanProvideOrdering(expr memo.RelExpr, required *props.OrderingCho
 // (i.e. OrdinalityPrivate.Ordering) is also ordered by the ordinality column.
 // For example, if the internal ordering is +a,+b, then the ord column numbers
 // rows in the +a,+b order and any of these required orderings can be provided:
-//   +ord
-//   +a,+ord
-//   +a,+b,+ord
+//
+//	+ord
+//	+a,+ord
+//	+a,+b,+ord
 //
 // As long as normalization rules are enabled, they will have already reduced
 // the ordering required of this operator to take into account that the

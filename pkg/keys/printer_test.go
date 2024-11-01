@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys_test
 
@@ -21,8 +16,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -30,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/stretchr/testify/require"
 )
 
 func lockTableKey(key roachpb.Key) roachpb.Key {
@@ -37,15 +35,183 @@ func lockTableKey(key roachpb.Key) roachpb.Key {
 	return k
 }
 
+func TestSafeFormatKey_SystemTenant(t *testing.T) {
+	tenSysCodec := keys.SystemSQLCodec
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"table with string index key",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeVarintAscending(nil, 1222),
+				encoding.EncodeStringAscending(nil, "handsome man"))),
+			`/Table/42/1222/‹"handsome man"›`,
+		},
+		{
+			"multi-column value",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles"))),
+			`/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+		{
+			"table with decimal index key",
+			roachpb.Key(makeKey(tenSysCodec.IndexPrefix(84, 2),
+				encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
+			`/Table/84/2/‹12.34›`,
+		},
+		{
+			"namespace table handled as standard system tenant table",
+			keys.NamespaceTableMin,
+			"/NamespaceTable/30",
+		},
+		{
+			"table index without index key",
+			tenSysCodec.IndexPrefix(42, 5),
+			"/Table/42/5",
+		},
+		{
+			"handles infinity values",
+			makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeFloatAscending(nil, math.Inf(1))),
+			"/Table/42/‹+Inf›",
+		},
+		{
+			"handles null values",
+			makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeNullAscending(nil)),
+			"/Table/42/‹NULL›",
+		},
+		{
+			"handles PrefixEnd",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeBitArrayAscending(nil, bitarray.MakeZeroBitArray(64)),
+			)).PrefixEnd(),
+			"/Table/42/‹B0000000000000000000000000000000000000000000000000000000000000000›/‹PrefixEnd›",
+		},
+		{
+			"handles /Table/Max",
+			keys.TableDataMax,
+			"/Table/Max",
+		},
+		{
+			"handles unknowns",
+			makeKey(tenSysCodec.TablePrefix(42), []byte{0x12, 'a', 0x00, 0x03}),
+			`/Table/42/‹???›`,
+		},
+		{
+			"marks safe reserved key prefix",
+			makeKey(keys.Meta1Prefix,
+				tenSysCodec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles")),
+			`/Meta1/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
+func TestSafeFormatKey_Basic(t *testing.T) {
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"ensure constants get redacted",
+			makeKey(keys.Meta2Prefix, roachpb.Key("foo")),
+			`/Meta2/‹"foo"›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
+func TestSafeFormatKey_AppTenant(t *testing.T) {
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"table with string index key",
+			roachpb.Key(makeKey(ten5Codec.IndexPrefix(42, 122),
+				encoding.EncodeStringAscending(nil, "handsome man"))),
+			`/Tenant/5/Table/42/122/‹"handsome man"›`,
+		},
+		{
+			"table with decimal index key",
+			roachpb.Key(makeKey(ten5Codec.IndexPrefix(84, 2),
+				encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
+			`/Tenant/5/Table/84/2/‹12.34›`,
+		},
+		{
+			"multi-column value",
+			roachpb.Key(makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles"))),
+			`/Tenant/5/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+		{
+			"table index without index key",
+			ten5Codec.IndexPrefix(42, 5),
+			"/Tenant/5/Table/42/5",
+		},
+		{
+			"handles infinity values",
+			makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeFloatAscending(nil, math.Inf(1))),
+			"/Tenant/5/Table/42/‹+Inf›",
+		},
+		{
+			"handles null values",
+			makeKey(ten5Codec.IndexPrefix(42, 2),
+				encoding.EncodeNullAscending(nil)),
+			"/Tenant/5/Table/42/2/‹NULL›",
+		},
+		{
+			"handles PrefixEnd",
+			roachpb.Key(makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeBitArrayAscending(nil, bitarray.MakeZeroBitArray(64)),
+			)).PrefixEnd(),
+			"/Tenant/5/Table/42/‹B0000000000000000000000000000000000000000000000000000000000000000›/‹PrefixEnd›",
+		},
+		{
+			"handles unknowns",
+			makeKey(ten5Codec.TablePrefix(42), []byte{0x12, 'a', 0x00, 0x03}),
+			`/Tenant/5/Table/42/‹???›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
 func TestPrettyPrint(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
 	duration := duration.MakeDuration(1*time.Second.Nanoseconds(), 1, 1)
 	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
 	durationDesc, _ := encoding.EncodeDurationDescending(nil, duration)
 	bitArray := bitarray.MakeBitArrayFromInt64(8, 58, 7)
 	txnID := uuid.MakeV4()
+	loqRecoveryID := uuid.MakeV4()
 
 	// Support for asserting that the ugly printer supports a key was added after
 	// most of the tests here were written.
@@ -63,21 +229,26 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{keys.StoreIdentKey(), "/Local/Store/storeIdent", revertSupportUnknown},
 		{keys.StoreGossipKey(), "/Local/Store/gossipBootstrap", revertSupportUnknown},
-		{keys.StoreClusterVersionKey(), "/Local/Store/clusterVersion", revertSupportUnknown},
+		{keys.DeprecatedStoreClusterVersionKey(), "/Local/Store/clusterVersion", revertSupportUnknown},
 		{keys.StoreNodeTombstoneKey(123), "/Local/Store/nodeTombstone/n123", revertSupportUnknown},
 		{keys.StoreCachedSettingsKey(roachpb.Key("a")), `/Local/Store/cachedSettings/"a"`, revertSupportUnknown},
+		{keys.StoreUnsafeReplicaRecoveryKey(loqRecoveryID), fmt.Sprintf(`/Local/Store/lossOfQuorumRecovery/applied/%s`, loqRecoveryID), revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryStatusKey(), "/Local/Store/lossOfQuorumRecovery/status", revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryCleanupActionsKey(), "/Local/Store/lossOfQuorumRecovery/cleanup", revertSupportUnknown},
 
 		{keys.AbortSpanKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortSpan/%q`, txnID), revertSupportUnknown},
+		{keys.ReplicatedSharedLocksTransactionLatchingKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/ReplicatedSharedLocksTransactionLatch/%q`, txnID), revertSupportUnknown},
 		{keys.RangeAppliedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeAppliedState", revertSupportUnknown},
 		{keys.RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftTruncatedState", revertSupportUnknown},
 		{keys.RangeLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLease", revertSupportUnknown},
 		{keys.RangePriorReadSummaryKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangePriorReadSummary", revertSupportUnknown},
 		{keys.RangeGCThresholdKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeGCThreshold", revertSupportUnknown},
 		{keys.RangeVersionKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeVersion", revertSupportUnknown},
+		{keys.RangeGCHintKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeGCHint", revertSupportUnknown},
 
 		{keys.RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState", revertSupportUnknown},
 		{keys.RangeTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeTombstone", revertSupportUnknown},
-		{keys.RaftLogKey(roachpb.RangeID(1000001), uint64(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001", revertSupportUnknown},
+		{keys.RaftLogKey(roachpb.RangeID(1000001), kvpb.RaftIndex(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001", revertSupportUnknown},
 		{keys.RangeLastReplicaGCTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastReplicaGCTimestamp", revertSupportUnknown},
 
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(tenSysCodec.TablePrefix(42))), `/Local/Range/Table/42`, revertSupportUnknown},
@@ -85,16 +256,16 @@ func TestPrettyPrint(t *testing.T) {
 		{keys.TransactionKey(tenSysCodec.TablePrefix(42), txnID), fmt.Sprintf(`/Local/Range/Table/42/Transaction/%q`, txnID), revertSupportUnknown},
 		{keys.RangeProbeKey(roachpb.RKey(tenSysCodec.TablePrefix(42))), `/Local/Range/Table/42/RangeProbe`, revertSupportUnknown},
 		{keys.QueueLastProcessedKey(roachpb.RKey(tenSysCodec.TablePrefix(42)), "foo"), `/Local/Range/Table/42/QueueLastProcessed/"foo"`, revertSupportUnknown},
-		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(tenSysCodec.TablePrefix(42)))), `/Local/Lock/Intent/Local/Range/Table/42/RangeDescriptor`, revertSupportUnknown},
-		{lockTableKey(tenSysCodec.TablePrefix(111)), "/Local/Lock/Intent/Table/111", revertSupportUnknown},
+		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(tenSysCodec.TablePrefix(42)))), `/Local/Lock/Local/Range/Table/42/RangeDescriptor`, revertSupportUnknown},
+		{lockTableKey(tenSysCodec.TablePrefix(111)), "/Local/Lock/Table/111", revertSupportUnknown},
 
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(ten5Codec.TenantPrefix())), `/Local/Range/Tenant/5`, revertSupportUnknown},
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(ten5Codec.TablePrefix(42))), `/Local/Range/Tenant/5/Table/42`, revertSupportUnknown},
 		{keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42))), `/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
 		{keys.TransactionKey(ten5Codec.TablePrefix(42), txnID), fmt.Sprintf(`/Local/Range/Tenant/5/Table/42/Transaction/%q`, txnID), revertSupportUnknown},
 		{keys.QueueLastProcessedKey(roachpb.RKey(ten5Codec.TablePrefix(42)), "foo"), `/Local/Range/Tenant/5/Table/42/QueueLastProcessed/"foo"`, revertSupportUnknown},
-		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42)))), `/Local/Lock/Intent/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
-		{lockTableKey(ten5Codec.TablePrefix(111)), "/Local/Lock/Intent/Tenant/5/Table/111", revertSupportUnknown},
+		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42)))), `/Local/Lock/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
+		{lockTableKey(ten5Codec.TablePrefix(111)), "/Local/Lock/Tenant/5/Table/111", revertSupportUnknown},
 
 		{keys.LocalMax, `/Meta1/""`, revertSupportUnknown}, // LocalMax == Meta1Prefix
 
@@ -114,8 +285,6 @@ func TestPrettyPrint(t *testing.T) {
 		{keys.RangeMetaKey(roachpb.RKey(makeKey(keys.Meta2Prefix, roachpb.Key("foo")))).AsRawKey(), `/Meta1/"foo"`, revertSupportUnknown},
 
 		// table
-		{keys.SystemConfigSpan.Key, "/Table/SystemConfigSpan/Start", revertSupportUnknown},
-		{keys.UserTableDataMin, "/Table/50", revertMustSupport},
 		{tenSysCodec.TablePrefix(111), "/Table/111", revertMustSupport},
 		{makeKey(tenSysCodec.TablePrefix(42), encoding.EncodeUvarintAscending(nil, 1)), `/Table/42/1`, revertMustSupport},
 		{makeKey(tenSysCodec.TablePrefix(42), roachpb.RKey("foo")), `/Table/42/"foo"`, revertSupportUnknown},
@@ -192,8 +361,8 @@ func TestPrettyPrint(t *testing.T) {
 
 		// tenant table
 		{ten5Codec.TenantPrefix(), "/Tenant/5", revertMustSupport},
-		{ten5Codec.TablePrefix(0), "/Tenant/5/Table/SystemConfigSpan/Start", revertSupportUnknown},
-		{ten5Codec.TablePrefix(keys.MinUserDescID), "/Tenant/5/Table/50", revertMustSupport},
+		{ten5Codec.TablePrefix(0), "/Tenant/5/Table/0", revertSupportUnknown},
+		{ten5Codec.TablePrefix(50), "/Tenant/5/Table/50", revertMustSupport},
 		{ten5Codec.TablePrefix(111), "/Tenant/5/Table/111", revertMustSupport},
 		{makeKey(ten5Codec.TablePrefix(42), encoding.EncodeUvarintAscending(nil, 1)), `/Tenant/5/Table/42/1`, revertMustSupport},
 		{makeKey(ten5Codec.TablePrefix(42), roachpb.RKey("foo")), `/Tenant/5/Table/42/"foo"`, revertSupportUnknown},
@@ -310,7 +479,7 @@ exp:    %s
 				t.Errorf("%d: from string expected %s, got %s", i, exp, test.key.String())
 			}
 
-			scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+			scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 			parsed, err := scanner.Scan(keyInfo)
 			if err != nil {
 				if !errors.HasType(err, (*keys.ErrUglifyUnsupported)(nil)) {
@@ -380,7 +549,7 @@ func massagePrettyPrintedSpanForTest(span string, dirs []encoding.Direction) str
 
 func TestPrettyPrintRange(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	key := makeKey([]byte("a"))
 	key2 := makeKey([]byte("z"))
 	tableKey := makeKey(tenSysCodec.TablePrefix(61), encoding.EncodeVarintAscending(nil, 4))

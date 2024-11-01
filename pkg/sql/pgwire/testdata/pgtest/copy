@@ -25,6 +25,7 @@ Query {"String": "COPY t FROM STDIN"}
 CopyData {"Data": "1\tblah\n"}
 CopyData {"Data": "2\t\n"}
 CopyData {"Data": "3\t\\N\n"}
+CopyData {"Data": "4\t\"\"\n"}
 CopyData {"Data": "\\.\n"}
 CopyDone
 Query {"String": "SELECT * FROM t ORDER BY i"}
@@ -38,12 +39,224 @@ ReadyForQuery
 {"Type":"CommandComplete","CommandTag":"DELETE 0"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
-{"Type":"CommandComplete","CommandTag":"COPY 3"}
+{"Type":"CommandComplete","CommandTag":"COPY 4"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"DataRow","Values":[{"text":"1"},{"text":"blah"}]}
 {"Type":"DataRow","Values":[{"text":"2"},null]}
 {"Type":"DataRow","Values":[{"text":"3"},null]}
+{"Type":"DataRow","Values":[{"text":"4"},{"text":"\"\""}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 4"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "COPY (SELECT * FROM t) TO STDOUT"}
+----
+
+until
+ReadyForQuery
+----
+{"Type":"CopyOutResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CopyData","Data":"3109626c61680a"}
+{"Type":"CopyData","Data":"32090a"}
+{"Type":"CopyData","Data":"33095c4e0a"}
+{"Type":"CopyData","Data":"340922220a"}
+{"Type":"CopyDone"}
+{"Type":"CommandComplete","CommandTag":"COPY 4"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "COPY (SELECT * FROM t) TO STDOUT CSV HEADER"}
+----
+
+until
+ReadyForQuery
+----
+{"Type":"CopyOutResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CopyData","Data":"692c740a"}
+{"Type":"CopyData","Data":"312c626c61680a"}
+{"Type":"CopyData","Data":"322c22220a"}
+{"Type":"CopyData","Data":"332c0a"}
+{"Type":"CopyData","Data":"342c2222222222220a"}
+{"Type":"CopyDone"}
+{"Type":"CommandComplete","CommandTag":"COPY 4"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Extra fields.
+
+send crdb_only
+Query {"String": "CREATE TABLE copy_hidden_table (id INT, nv TEXT NOT VISIBLE, t TEXT)"}
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN"}
+CopyData {"Data": "1\tblah\tbad\tpk\n"}
+CopyDone
+----
+
+until crdb_only keepErrMessage
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"ErrorResponse","Code":"22P04","Message":"expected 2 values, got 4"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN CSV"}
+CopyData {"Data": "2,blah,bad,pk\n"}
+CopyDone
+----
+
+until crdb_only keepErrMessage
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"ErrorResponse","Code":"22P04","Message":"read CSV record: record on line 1: wrong number of fields"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN"}
+CopyData {"Data": "3\tgood\n"}
+CopyDone
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Set expect_and_ignore_not_visible_columns_in_copy - now it should be allowed.
+# We insert 4 columns because the rowid column is also implicit.
+send crdb_only
+Query {"String": "SET expect_and_ignore_not_visible_columns_in_copy = true"}
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"SET"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN"}
+CopyData {"Data": "1\tblah\tgood\tpk\n"}
+CopyDone
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN CSV"}
+CopyData {"Data": "2,blah,good,pk\n"}
+CopyDone
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "COPY copy_hidden_table FROM STDIN"}
+CopyData {"Data": "4\tnow_bad\n"}
+CopyDone
+----
+
+until crdb_only keepErrMessage
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"ErrorResponse","Code":"22P04","Message":"expected 4 values, got 2"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "SELECT *, nv FROM copy_hidden_table ORDER BY id"}
+----
+
+until ignore=RowDescription crdb_only
+ReadyForQuery
+----
+{"Type":"DataRow","Values":[{"text":"1"},{"text":"good"},null]}
+{"Type":"DataRow","Values":[{"text":"2"},{"text":"good"},null]}
+{"Type":"DataRow","Values":[{"text":"3"},{"text":"good"},null]}
 {"Type":"CommandComplete","CommandTag":"SELECT 3"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send crdb_only
+Query {"String": "SET expect_and_ignore_not_visible_columns_in_copy = false"}
+----
+
+until crdb_only
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"SET"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Test cancelling copy.
+
+send
+Query {"String": "COPY t FROM STDIN"}
+CopyFail { "Message": "client received an error" }
+----
+
+until keepErrMessage
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"ErrorResponse","Code":"57014","Message":"COPY from stdin failed: client received an error"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Invalid ESCAPE syntax.
+send
+Query {"String": "COPY t FROM STDIN ESCAPE 'xxx'"}
+----
+
+until
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ErrorResponse","Code":"0A000"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "COPY t FROM STDIN ESCAPE 'x'"}
+----
+
+until
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ErrorResponse","Code":"0A000"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Header without CSV.
+send
+Query {"String": "COPY t FROM STDIN HEADER"}
+----
+
+until
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ErrorResponse","Code":"0A000"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
 # Wrong number of columns.
@@ -63,12 +276,13 @@ ReadyForQuery
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
 # Verify that only one COPY can run at once.
-send
+# This crashes PG, so only run on CRDB.
+send crdb_only
 Query {"String": "COPY t FROM STDIN"}
 Query {"String": "COPY t FROM STDIN"}
 ----
 
-until
+until crdb_only
 ErrorResponse
 ReadyForQuery
 ----
@@ -77,12 +291,13 @@ ReadyForQuery
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
 # Verify that after a COPY has started another statement cannot run.
-send
+# This crashes PG, so only run on CRDB.
+send crdb_only
 Query {"String": "COPY t FROM STDIN"}
 Query {"String": "SELECT 2"}
 ----
 
-until ignore=RowDescription
+until ignore=RowDescription crdb_only
 ErrorResponse
 ReadyForQuery
 ----
@@ -156,6 +371,45 @@ ReadyForQuery
 
 send
 Query {"String": "DELETE FROM t"}
+Query {"String": "COPY t FROM STDIN HEADER CSV"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "COPY t FROM STDIN HEADER CSV"}
+CopyData {"Data": "justonelinewithheader\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "COPY t FROM STDIN HEADER CSV"}
+CopyData {"Data": "ignore,this,entire,line\n"}
+CopyData {"Data": "1,blah\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "SELECT * FROM t ORDER BY i"}
+----
+
+until ignore=RowDescription
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"DELETE 2"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 0"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 0"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"DataRow","Values":[{"text":"1"},{"text":"blah"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "DELETE FROM t"}
 Query {"String": "COPY t FROM STDIN NULL 'NS'"}
 CopyData {"Data": "1\tblah\n"}
 CopyData {"Data": "2\t\\N\n"}
@@ -170,7 +424,7 @@ ReadyForQuery
 ReadyForQuery
 ReadyForQuery
 ----
-{"Type":"CommandComplete","CommandTag":"DELETE 2"}
+{"Type":"CommandComplete","CommandTag":"DELETE 1"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
 {"Type":"CommandComplete","CommandTag":"COPY 3"}
@@ -245,6 +499,33 @@ ReadyForQuery
 {"Type":"DataRow","Values":[{"text":"1"},{"text":"blah"}]}
 {"Type":"DataRow","Values":[{"text":"2"},null]}
 {"Type":"DataRow","Values":[{"text":"3"},null]}
+{"Type":"CommandComplete","CommandTag":"SELECT 3"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "DELETE FROM t"}
+Query {"String": "COPY t FROM STDIN CSV ESCAPE 'x'"}
+CopyData {"Data": "1,\"x\"\"\n"}
+CopyData {"Data": "2,\"xxx\",\"\n"}
+CopyData {"Data": "3,\"xxx\",xx\"\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "SELECT * FROM t ORDER BY i"}
+----
+
+until ignore=RowDescription
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"DELETE 3"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 3"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"DataRow","Values":[{"text":"1"},{"text":"\""}]}
+{"Type":"DataRow","Values":[{"text":"2"},{"text":"x\","}]}
+{"Type":"DataRow","Values":[{"text":"3"},{"text":"x\",x"}]}
 {"Type":"CommandComplete","CommandTag":"SELECT 3"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
@@ -388,6 +669,53 @@ ReadyForQuery
 {"Type":"CommandComplete","CommandTag":"SELECT 2"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
+# Test that we distinguish an empty column from a quoted empty string.
+# By default, an empty column is NULL.
+# If We specify another NULL token, then the empty column does get interpreted
+# as an empty string.
+
+send
+Query {"String": "DELETE FROM t"}
+Query {"String": "COPY t FROM STDIN WITH CSV"}
+CopyData {"Data": "1,cat\n"}
+CopyData {"Data": "2,\"\"\n"}
+CopyData {"Data": "3,\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "COPY t FROM STDIN WITH CSV NULL 'N'"}
+CopyData {"Data": "4,\"\"\n"}
+CopyData {"Data": "5,\n"}
+CopyData {"Data": "6,N\n"}
+CopyData {"Data": "7,\"N\"\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "SELECT i, length(t) FROM t ORDER BY i"}
+----
+
+until ignore=RowDescription
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"DELETE 2"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 3"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 4"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"DataRow","Values":[{"text":"1"},{"text":"3"}]}
+{"Type":"DataRow","Values":[{"text":"2"},{"text":"0"}]}
+{"Type":"DataRow","Values":[{"text":"3"},null]}
+{"Type":"DataRow","Values":[{"text":"4"},{"text":"0"}]}
+{"Type":"DataRow","Values":[{"text":"5"},{"text":"0"}]}
+{"Type":"DataRow","Values":[{"text":"6"},null]}
+{"Type":"DataRow","Values":[{"text":"7"},{"text":"1"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 7"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
 # Verify that COPY CSV input can be split up at arbitrary points.
 send
 Query {"String": "DELETE FROM t"}
@@ -415,7 +743,7 @@ ReadyForQuery
 ReadyForQuery
 ReadyForQuery
 ----
-{"Type":"CommandComplete","CommandTag":"DELETE 2"}
+{"Type":"CommandComplete","CommandTag":"DELETE 7"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
 {"Type":"CommandComplete","CommandTag":"COPY 9"}
@@ -467,15 +795,15 @@ ReadyForQuery
 # the octal-encoded input for the bytea column is properly decoded -- that is
 # because of the way CRDB and PG process bytea literals, and *not* because of
 # CSV escaping.
-# Because of https://github.com/cockroachdb/cockroach/issues/26128 we cannot
-# test the `\xAA` escape style with a bytea column.
 send
 Query {"String": "DROP TABLE IF EXISTS tb"}
 Query {"String": "CREATE TABLE tb (i INT, b BYTEA, c TEXT)"}
 Query {"String": "COPY tb FROM STDIN WITH CSV"}
 CopyData {"Data": "1,one,one\n"}
 CopyData {"Data": "2,two,two\\x54\n"}
-CopyData {"Data": "3,ab\\011\\143d,ab\\011\\143d"}
+CopyData {"Data": "3,ab\\011\\143d,ab\\011\\143d\n"}
+CopyData {"Data": "4,\"\\x6869\",hi\n"}
+CopyData {"Data": "5,\\x6869,hi\n"}
 CopyDone
 Query {"String": "SELECT i, encode(b, 'hex'), c FROM tb ORDER BY i"}
 ----
@@ -491,12 +819,14 @@ ReadyForQuery
 {"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0,0]}
-{"Type":"CommandComplete","CommandTag":"COPY 3"}
+{"Type":"CommandComplete","CommandTag":"COPY 5"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"DataRow","Values":[{"text":"1"},{"text":"6f6e65"},{"text":"one"}]}
 {"Type":"DataRow","Values":[{"text":"2"},{"text":"74776f"},{"text":"two\\x54"}]}
 {"Type":"DataRow","Values":[{"text":"3"},{"text":"6162096364"},{"text":"ab\\011\\143d"}]}
-{"Type":"CommandComplete","CommandTag":"SELECT 3"}
+{"Type":"DataRow","Values":[{"text":"4"},{"text":"6869"},{"text":"hi"}]}
+{"Type":"DataRow","Values":[{"text":"5"},{"text":"6869"},{"text":"hi"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 5"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
 # Test error cases for COPY CSV.
@@ -549,15 +879,19 @@ ReadyForQuery
 {"Type":"ReadyForQuery","TxStatus":"I"}
 
 send
+Query {"String": "SET TIME ZONE UTC"}
 Query {"String": "COPY t FROM STDIN CSV"}
 CopyData {"Data": "1,2021-09-20T06:05:04\n"}
 CopyData {"Data": "\\.\n"}
 CopyDone
 ----
 
-until ignore=RowDescription
+until ignore=RowDescription ignore=ParameterStatus
+ReadyForQuery
 ReadyForQuery
 ----
+{"Type":"CommandComplete","CommandTag":"SET"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
 {"Type":"CommandComplete","CommandTag":"COPY 1"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
@@ -571,12 +905,11 @@ CopyDone
 Query {"String": "SELECT i, t FROM t ORDER BY i"}
 ----
 
-until ignore=RowDescription
+until ignore=RowDescription ignore=ParameterStatus
 ReadyForQuery
 ReadyForQuery
 ReadyForQuery
 ----
-{"Type":"ParameterStatus","Name":"TimeZone","Value":"America/Chicago"}
 {"Type":"CommandComplete","CommandTag":"SET"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
@@ -626,4 +959,183 @@ ReadyForQuery
 {"Type":"DataRow","Values":[{"text":"{0,1}"}]}
 {"Type":"DataRow","Values":[{"text":"{2,3,4,5,6}"}]}
 {"Type":"CommandComplete","CommandTag":"SELECT 2"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+
+send crdb_only
+Query {"String": "COPY c(d) FROM STDIN WITH CSV"}
+CopyData {"Data": "\"{0,1}\"\n"}
+CopyData {"Data": "\"{2,3,4,5,6}\"\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+----
+
+
+until crdb_only ignore=RowDescription
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0]}
+{"Type":"CommandComplete","CommandTag":"COPY 2"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# SHOW LAST QUERY STATISTICS cannot be used as a statement source, so we
+# store the result as a variable in the test.
+let $copy_service_latency crdb_only
+Query {"String": "SHOW LAST QUERY STATISTICS RETURNING service_latency"}
+----
+
+send crdb_only
+Query {"String": "SELECT '$copy_service_latency'::INTERVAL > '0 seconds'::INTERVAL"}
+----
+
+until crdb_only ignore=RowDescription
+ReadyForQuery
+----
+{"Type":"DataRow","Values":[{"text":"t"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Verify that a CopyFail message does not break the conn_executor state machine.
+send
+Query {"String": "DROP TABLE IF EXISTS copy_fail_test"}
+Query {"String": "CREATE TABLE copy_fail_test(a INT PRIMARY KEY)"}
+----
+
+until ignore=NoticeResponse
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"DROP TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "COPY copy_fail_test(a) FROM STDIN"}
+CopyFail
+----
+
+until
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0]}
+{"Type":"ErrorResponse","Code":"57014"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Previously there was a bug that caused the Parse to fail with "query execution
+# canceled" since the cancellation from the CopyFail message was not cleaned up.
+send
+Parse {"Query": "SELECT count(*) FROM copy_fail_test"}
+Bind
+Execute
+Sync
+----
+
+until
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"DataRow","Values":[{"text":"0"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+
+### Tests for COPY ... TO with prepared statements.
+
+send
+Parse {"Query": "COPY (select 1) TO STDOUT"}
+Bind
+Describe {"ObjectType": "P"}
+Execute
+Sync
+----
+
+# Everything works fine with no placeholders.
+until
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"NoData"}
+{"Type":"CopyOutResponse","ColumnFormatCodes":[0]}
+{"Type":"CopyData","Data":"310a"}
+{"Type":"CopyDone"}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# We match the PostgreSQL behavior when trying to bind a placeholder in COPY TO.
+send
+Parse {"Query": "COPY (select $1::int) TO STDOUT"}
+Bind {"Parameters": [{"text":"1"}]}
+Execute
+Sync
+----
+
+until keepErrMessage
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"ErrorResponse","Code":"08P01","Message":"bind message supplies 1 parameters, but requires 0","Detail":"statement summary \"COPY (SELECT) TO STDOUT\""}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# And it's also an error to _not_ bind a placeholder.
+send
+Parse {"Query": "COPY (select $1::int) TO STDOUT"}
+Bind
+Execute
+Sync
+----
+
+until keepErrMessage noncrdb_only
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"ErrorResponse","Code":"42P02","Message":"there is no parameter $1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# CockroachDB has the same error as PostgreSQL, with a slightly different message.
+until keepErrMessage crdb_only
+ErrorResponse
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"CopyOutResponse","ColumnFormatCodes":null}
+{"Type":"ErrorResponse","Code":"42P02","Message":"COPY (SELECT $1::INT8) TO STDOUT: no value provided for placeholder: $1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+# Regression test for unsetting the eval context on the COPY's planner
+# incorrectly (#104456).
+send
+Query {"String": "CREATE TABLE t104456 (i INT8, t TEXT, ts TIMESTAMP DEFAULT now())"}
+----
+
+until
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Query {"String": "COPY t104456 (i, t) FROM STDIN"}
+CopyData {"Data": "1\tblah\n"}
+CopyData {"Data": "\\.\n"}
+CopyDone
+Query {"String": "SELECT i, t FROM t104456 ORDER BY i"}
+----
+
+until ignore=RowDescription
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CopyInResponse","ColumnFormatCodes":[0,0]}
+{"Type":"CommandComplete","CommandTag":"COPY 1"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"DataRow","Values":[{"text":"1"},{"text":"blah"}]}
+{"Type":"CommandComplete","CommandTag":"SELECT 1"}
 {"Type":"ReadyForQuery","TxStatus":"I"}

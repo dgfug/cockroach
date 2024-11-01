@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package duration
 
@@ -57,6 +52,10 @@ var positiveDurationTests = []durationTest{
 	{1, Duration{Months: 1, Days: 10, nanos: 0}, false},
 	{0, Duration{Months: 0, Days: 40, nanos: 0}, false},
 	{1, Duration{Months: 2, Days: 0, nanos: 0}, false},
+	// '106751 days 23:47:16.854775' should not overflow.
+	{1, Duration{Months: 0, Days: 106751, nanos: 85636854775000}, false},
+	// '106751 days 23:47:16.854776' should overflow.
+	{1, Duration{Months: 0, Days: 106751, nanos: 85636854776000}, true},
 	{1, Duration{Months: math.MaxInt64 - 1, Days: DaysPerMonth - 1, nanos: nanosInDay * 2}, true},
 	{1, Duration{Months: math.MaxInt64 - 1, Days: DaysPerMonth * 2, nanos: nanosInDay * 2}, true},
 	{1, Duration{Months: math.MaxInt64, Days: math.MaxInt64, nanos: nanosInMonth + nanosInDay}, true},
@@ -471,6 +470,8 @@ func TestAddMicros(t *testing.T) {
 func TestFloatMath(t *testing.T) {
 	const nanosInMinute = nanosInSecond * 60
 	const nanosInHour = nanosInMinute * 60
+	durationOutOfRange := MakeDuration(math.MaxInt64, 999999999999, 999999999999)
+	negatedDurationOutOfRange := MakeDuration(-math.MaxInt64, -999999999999, -999999999999)
 
 	tests := []struct {
 		d   Duration
@@ -519,6 +520,18 @@ func TestFloatMath(t *testing.T) {
 			2.0,
 			Duration{Months: 0, Days: 0, nanos: nanosInSecond * 0.000002},
 			Duration{Months: 0, Days: 0, nanos: nanosInSecond * 0},
+		},
+		{
+			durationOutOfRange,
+			1.0,
+			durationOutOfRange,
+			durationOutOfRange,
+		},
+		{
+			durationOutOfRange,
+			-1.0,
+			negatedDurationOutOfRange,
+			negatedDurationOutOfRange,
 		},
 	}
 

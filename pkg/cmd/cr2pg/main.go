@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // cr2pg is a program that reads CockroachDB-formatted SQL files on stdin,
 // modifies them to be Postgres compatible, and outputs them to stdout.
@@ -77,6 +72,7 @@ func main() {
 							Inverted: def.Inverted,
 							Columns:  def.Columns,
 							Storing:  def.Storing,
+							// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 						})
 					case *tree.UniqueConstraintTableDef:
 						if def.PrimaryKey {
@@ -103,6 +99,7 @@ func main() {
 							Inverted: def.Inverted,
 							Columns:  def.Columns,
 							Storing:  def.Storing,
+							// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 						})
 					default:
 						newdefs = append(newdefs, def)

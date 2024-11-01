@@ -10,6 +10,25 @@ exec-ddl
 CREATE TABLE abcd (a INT, b INT, c INT, d INT)
 ----
 
+exec-ddl
+CREATE TABLE u (u UUID PRIMARY KEY)
+----
+
+exec-ddl
+CREATE TABLE c (c CHAR PRIMARY KEY)
+----
+
+exec-ddl
+CREATE TABLE b
+(
+    k INT PRIMARY KEY,
+    j JSONB,
+    i INT,
+    s STRING,
+    arr STRING[]
+)
+----
+
 # --------------------------------------------------
 # CommuteVar
 # --------------------------------------------------
@@ -164,7 +183,7 @@ exprnorm expect=EliminateCast
 (Root
   (Project
     (Scan [ (Table "a") (Cols "i,s,arr") ])
-    [ 
+    [
       (ProjectionsItem (Cast (Var "i") "int")                                  (NewColumn "c1" "int"))
       (ProjectionsItem (Cast (Var "arr") "int[]")                              (NewColumn "c2" "int[]"))
       (ProjectionsItem (Cast (Cast (Const "[1, 2]" "string") "jsonb") "json")  (NewColumn "c3" "json"))
@@ -204,7 +223,7 @@ FROM a
 ----
 project
  ├── columns: i:8 arr:9 s:10 s:11 i:12 s:13 array:14 array:15
- ├── stable
+ ├── immutable
  ├── scan a
  │    └── columns: a.i:2 a.s:4 a.arr:5
  └── projections
@@ -214,7 +233,7 @@ project
       ├── a.s:4::VARCHAR(2) [as=s:11, outer=(4), immutable]
       ├── a.i:2::INT2::INT8 [as=i:12, outer=(2), immutable]
       ├── a.s:4::CHAR::VARCHAR [as=s:13, outer=(4), immutable]
-      ├── ARRAY[a.i:2, 2]::OIDVECTOR [as=array:14, outer=(2), stable]
+      ├── ARRAY[a.i:2, 2]::OIDVECTOR [as=array:14, outer=(2), immutable]
       └── ARRAY[a.i:2, 2]::INT2VECTOR [as=array:15, outer=(2), immutable]
 
 # --------------------------------------------------
@@ -388,10 +407,10 @@ norm expect=EliminateExistsZeroRows
 SELECT EXISTS(SELECT * FROM (VALUES (1)) WHERE false)
 ----
 values
- ├── columns: exists:2!null
+ ├── columns: exists:3!null
  ├── cardinality: [1 - 1]
  ├── key: ()
- ├── fd: ()-->(2)
+ ├── fd: ()-->(3)
  └── (false,)
 
 # --------------------------------------------------
@@ -409,18 +428,22 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: k:8!null i:9
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(8,9)
-                ├── scan a
-                │    ├── columns: k:8!null i:9
-                │    ├── key: (8)
-                │    ├── fd: (8)-->(9)
-                │    └── limit hint: 1.00
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column18:18!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(18)
+           │         ├── limit
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── scan a
+           │         │    │    └── limit hint: 1.00
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column18:18]
+           └── false
 
 # --------------------------------------------------
 # EliminateExistsGroupBy
@@ -439,20 +462,22 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── scalar-group-by
-                ├── columns: max:15
-                ├── cardinality: [1 - 1]
-                ├── key: ()
-                ├── fd: ()-->(15)
-                ├── values
-                │    ├── columns: s:11!null
-                │    ├── cardinality: [0 - 0]
-                │    ├── key: ()
-                │    └── fd: ()-->(11)
-                └── aggregations
-                     └── max [as=max:15, outer=(11)]
-                          └── s:11
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column17:17!null
+           │         ├── cardinality: [1 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(17)
+           │         ├── scalar-group-by
+           │         │    ├── cardinality: [1 - 1]
+           │         │    ├── key: ()
+           │         │    └── values
+           │         │         ├── cardinality: [0 - 0]
+           │         │         └── key: ()
+           │         └── projections
+           │              └── true [as=column17:17]
+           └── false
 
 norm expect=EliminateExistsGroupBy
 SELECT * FROM a WHERE EXISTS(SELECT DISTINCT s FROM a)
@@ -466,16 +491,22 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: s:11
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(11)
-                ├── scan a
-                │    ├── columns: s:11
-                │    └── limit hint: 1.00
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column16:16!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(16)
+           │         ├── limit
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── scan a
+           │         │    │    └── limit hint: 1.00
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column16:16]
+           └── false
 
 norm expect=EliminateExistsGroupBy
 SELECT * FROM a WHERE EXISTS(SELECT DISTINCT ON (i) s FROM a)
@@ -489,16 +520,22 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: i:9 s:11
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(9,11)
-                ├── scan a
-                │    ├── columns: i:9 s:11
-                │    └── limit hint: 1.00
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column16:16!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(16)
+           │         ├── limit
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── scan a
+           │         │    │    └── limit hint: 1.00
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column16:16]
+           └── false
 
 # Ensure that EliminateExistsGroupBy does not activate for an EnsureDistinctOn.
 norm expect-not=EliminateExistsGroupBy
@@ -513,33 +550,38 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: k:8!null xy.y:16
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(8,16)
-                ├── ensure-distinct-on
-                │    ├── columns: k:8!null xy.y:16
-                │    ├── grouping columns: k:8!null
-                │    ├── error: "more than one row returned by a subquery used as an expression"
-                │    ├── key: (8)
-                │    ├── fd: (8)-->(16)
-                │    ├── limit hint: 1.00
-                │    ├── left-join (hash)
-                │    │    ├── columns: k:8!null xy.y:16
-                │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
-                │    │    ├── scan a
-                │    │    │    ├── columns: k:8!null
-                │    │    │    └── key: (8)
-                │    │    ├── scan xy
-                │    │    │    └── columns: xy.y:16
-                │    │    └── filters
-                │    │         └── xy.y:16 = k:8 [outer=(8,16), constraints=(/8: (/NULL - ]; /16: (/NULL - ]), fd=(8)==(16), (16)==(8)]
-                │    └── aggregations
-                │         └── const-agg [as=xy.y:16, outer=(16)]
-                │              └── xy.y:16
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column21:21!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(21)
+           │         ├── limit
+           │         │    ├── columns: k:8!null
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── fd: ()-->(8)
+           │         │    ├── ensure-distinct-on
+           │         │    │    ├── columns: k:8!null
+           │         │    │    ├── grouping columns: k:8!null
+           │         │    │    ├── error: "more than one row returned by a subquery used as an expression"
+           │         │    │    ├── key: (8)
+           │         │    │    ├── limit hint: 1.00
+           │         │    │    └── left-join (hash)
+           │         │    │         ├── columns: k:8!null xy.y:16
+           │         │    │         ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-one)
+           │         │    │         ├── scan a
+           │         │    │         │    ├── columns: k:8!null
+           │         │    │         │    └── key: (8)
+           │         │    │         ├── scan xy
+           │         │    │         │    └── columns: xy.y:16
+           │         │    │         └── filters
+           │         │    │              └── xy.y:16 = k:8 [outer=(8,16), constraints=(/8: (/NULL - ]; /16: (/NULL - ]), fd=(8)==(16), (16)==(8)]
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column21:21]
+           └── false
 
 # --------------------------------------------------
 # EliminateExistsGroupBy + EliminateExistsProject
@@ -556,16 +598,22 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: i:9 s:11
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(9,11)
-                ├── scan a
-                │    ├── columns: i:9 s:11
-                │    └── limit hint: 1.00
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column17:17!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(17)
+           │         ├── limit
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── scan a
+           │         │    │    └── limit hint: 1.00
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column17:17]
+           └── false
 
 # --------------------------------------------------
 # InlineExistsSelectTuple
@@ -674,23 +722,24 @@ semi-join (hash)
  ├── scan abcd
  │    └── columns: a:1 b:2 c:3 d:4
  ├── project
- │    ├── columns: column15:15 column14:14!null
+ │    ├── columns: column16:16 column15:15!null
  │    ├── immutable
  │    ├── scan xy
  │    │    ├── columns: x:8!null y:9
  │    │    ├── key: (8)
  │    │    └── fd: (8)-->(9)
  │    └── projections
- │         ├── y:9 + 1 [as=column15:15, outer=(9), immutable]
- │         └── x:8 + 1 [as=column14:14, outer=(8), immutable]
+ │         ├── y:9 + 1 [as=column16:16, outer=(9), immutable]
+ │         └── x:8 + 1 [as=column15:15, outer=(8), immutable]
  └── filters
-      ├── a:1 = column14:14 [outer=(1,14), constraints=(/1: (/NULL - ]; /14: (/NULL - ]), fd=(1)==(14), (14)==(1)]
-      └── b:2 = column15:15 [outer=(2,15), constraints=(/2: (/NULL - ]; /15: (/NULL - ]), fd=(2)==(15), (15)==(2)]
+      ├── a:1 = column15:15 [outer=(1,15), constraints=(/1: (/NULL - ]; /15: (/NULL - ]), fd=(1)==(15), (15)==(1)]
+      └── b:2 = column16:16 [outer=(2,16), constraints=(/2: (/NULL - ]; /16: (/NULL - ]), fd=(2)==(16), (16)==(2)]
 
 # --------------------------------------------------
-# IntroduceExistsLimit
+# ConvertUncorrelatedExistsToCoalesceSubquery
 # --------------------------------------------------
-norm expect=IntroduceExistsLimit
+
+norm expect=ConvertUncorrelatedExistsToCoalesceSubquery
 SELECT * FROM a WHERE EXISTS(SELECT i FROM a)
 ----
 select
@@ -702,19 +751,87 @@ select
  │    ├── key: (1)
  │    └── fd: (1)-->(2-5)
  └── filters
-      └── exists [subquery]
-           └── limit
-                ├── columns: i:9
-                ├── cardinality: [0 - 1]
-                ├── key: ()
-                ├── fd: ()-->(9)
-                ├── scan a
-                │    ├── columns: i:9
-                │    └── limit hint: 1.00
-                └── 1
+      └── coalesce [subquery]
+           ├── subquery
+           │    └── project
+           │         ├── columns: column16:16!null
+           │         ├── cardinality: [0 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(16)
+           │         ├── limit
+           │         │    ├── cardinality: [0 - 1]
+           │         │    ├── key: ()
+           │         │    ├── scan a
+           │         │    │    └── limit hint: 1.00
+           │         │    └── 1
+           │         └── projections
+           │              └── true [as=column16:16]
+           └── false
 
-# Don't introduce a limit on correlated subqueries (when HasOuterCols is true).
-norm expect-not=IntroduceExistsLimit
+norm expect=ConvertUncorrelatedExistsToCoalesceSubquery
+SELECT EXISTS(SELECT * FROM (VALUES (1))) FROM a
+----
+project
+ ├── columns: exists:11
+ ├── scan a
+ └── projections
+      └── coalesce [as=exists:11, subquery]
+           ├── subquery
+           │    └── values
+           │         ├── columns: column10:10!null
+           │         ├── cardinality: [1 - 1]
+           │         ├── key: ()
+           │         ├── fd: ()-->(10)
+           │         └── (true,)
+           └── false
+
+norm expect=ConvertUncorrelatedExistsToCoalesceSubquery
+SELECT * FROM a a1 JOIN a a2 ON EXISTS(SELECT * FROM (VALUES (1)))
+----
+inner-join (cross)
+ ├── columns: k:1!null i:2 f:3 s:4 arr:5 k:8!null i:9 f:10 s:11 arr:12
+ ├── key: (1,8)
+ ├── fd: (1)-->(2-5), (8)-->(9-12)
+ ├── select
+ │    ├── columns: a1.k:1!null a1.i:2 a1.f:3 a1.s:4 a1.arr:5
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5)
+ │    ├── scan a [as=a1]
+ │    │    ├── columns: a1.k:1!null a1.i:2 a1.f:3 a1.s:4 a1.arr:5
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2-5)
+ │    └── filters
+ │         └── coalesce [subquery]
+ │              ├── subquery
+ │              │    └── values
+ │              │         ├── columns: column17:17!null
+ │              │         ├── cardinality: [1 - 1]
+ │              │         ├── key: ()
+ │              │         ├── fd: ()-->(17)
+ │              │         └── (true,)
+ │              └── false
+ ├── select
+ │    ├── columns: a2.k:8!null a2.i:9 a2.f:10 a2.s:11 a2.arr:12
+ │    ├── key: (8)
+ │    ├── fd: (8)-->(9-12)
+ │    ├── scan a [as=a2]
+ │    │    ├── columns: a2.k:8!null a2.i:9 a2.f:10 a2.s:11 a2.arr:12
+ │    │    ├── key: (8)
+ │    │    └── fd: (8)-->(9-12)
+ │    └── filters
+ │         └── coalesce [subquery]
+ │              ├── subquery
+ │              │    └── values
+ │              │         ├── columns: column17:17!null
+ │              │         ├── cardinality: [1 - 1]
+ │              │         ├── key: ()
+ │              │         ├── fd: ()-->(17)
+ │              │         └── (true,)
+ │              └── false
+ └── filters (true)
+
+# Don't convert Exists if it is correlated.
+norm expect-not=ConvertUncorrelatedExistsToCoalesceSubquery
 SELECT * FROM a a1 WHERE EXISTS(SELECT i FROM a a2 where a1.i = a2.i)
 ----
 semi-join (hash)
@@ -729,27 +846,6 @@ semi-join (hash)
  │    └── columns: a2.i:9
  └── filters
       └── a1.i:2 = a2.i:9 [outer=(2,9), constraints=(/2: (/NULL - ]; /9: (/NULL - ]), fd=(2)==(9), (9)==(2)]
-
-# Don't introduce a limit when the subquery has one row.
-norm expect-not=IntroduceExistsLimit
-SELECT * FROM a WHERE EXISTS(SELECT * FROM (VALUES (1)))
-----
-select
- ├── columns: k:1!null i:2 f:3 s:4 arr:5
- ├── key: (1)
- ├── fd: (1)-->(2-5)
- ├── scan a
- │    ├── columns: k:1!null i:2 f:3 s:4 arr:5
- │    ├── key: (1)
- │    └── fd: (1)-->(2-5)
- └── filters
-      └── exists [subquery]
-           └── values
-                ├── columns: column1:8!null
-                ├── cardinality: [1 - 1]
-                ├── key: ()
-                ├── fd: ()-->(8)
-                └── (1,)
 
 # --------------------------------------------------
 # EliminateExistsLimit
@@ -796,8 +892,8 @@ values
  ├── key: ()
  └── fd: ()-->(1-5)
 
-# Don't eliminate a limit from a non-correlated subquery.
-norm expect-not=EliminateExistsLimit
+# Don't eliminate a limit from an uncorrelated subquery.
+norm expect-not=EliminateExistsLimit disable=ConvertUncorrelatedExistsToCoalesceSubquery
 SELECT * FROM a WHERE EXISTS(SELECT * FROM a LIMIT 1)
 ----
 select
@@ -821,6 +917,113 @@ select
                 │    ├── fd: (8)-->(9-12)
                 │    └── limit hint: 1.00
                 └── 1
+
+# --------------------------------------------------
+# EliminateConstValueSubquery
+# --------------------------------------------------
+
+norm expect=EliminateConstValueSubquery
+SELECT (SELECT 1)
+----
+values
+ ├── columns: "?column?":2!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(2)
+ └── (1,)
+
+norm expect=EliminateConstValueSubquery
+SELECT * FROM a WHERE k = (SELECT 1)
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 arr:5
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1-5)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 arr:5
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-5)
+ └── filters
+      └── k:1 = 1 [outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+
+norm expect=EliminateConstValueSubquery
+SELECT * FROM a WHERE k >= (SELECT 1)
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 arr:5
+ ├── key: (1)
+ ├── fd: (1)-->(2-5)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 arr:5
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-5)
+ └── filters
+      └── k:1 >= 1 [outer=(1), constraints=(/1: [/1 - ]; tight)]
+
+# Cannot eliminate multi-row values subquery.
+norm expect-not=EliminateConstValueSubquery
+SELECT (VALUES (1), (2))
+----
+values
+ ├── columns: column1:2
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(2)
+ └── tuple
+      └── subquery
+           └── max1-row
+                ├── columns: column1:1!null
+                ├── error: "more than one row returned by a subquery used as an expression"
+                ├── cardinality: [1 - 1]
+                ├── key: ()
+                ├── fd: ()-->(1)
+                └── values
+                     ├── columns: column1:1!null
+                     ├── cardinality: [2 - 2]
+                     ├── (1,)
+                     └── (2,)
+
+# Cannot eliminate multi-column values subquery.
+norm expect-not=EliminateConstValueSubquery
+SELECT (1, 2) = (SELECT 1, 2)
+----
+values
+ ├── columns: "?column?":4
+ ├── cardinality: [1 - 1]
+ ├── immutable
+ ├── key: ()
+ ├── fd: ()-->(4)
+ └── tuple
+      └── eq
+           ├── (1, 2)
+           └── subquery
+                └── values
+                     ├── columns: column3:3
+                     ├── cardinality: [1 - 1]
+                     ├── key: ()
+                     ├── fd: ()-->(3)
+                     └── ((1, 2),)
+
+# Cannot eliminate non-constant values subquery.
+norm expect-not=EliminateConstValueSubquery
+SELECT (SELECT gen_random_uuid())
+----
+values
+ ├── columns: gen_random_uuid:2
+ ├── cardinality: [1 - 1]
+ ├── volatile
+ ├── key: ()
+ ├── fd: ()-->(2)
+ └── tuple
+      └── subquery
+           └── values
+                ├── columns: gen_random_uuid:1
+                ├── cardinality: [1 - 1]
+                ├── volatile
+                ├── key: ()
+                ├── fd: ()-->(1)
+                └── (gen_random_uuid(),)
 
 # --------------------------------------------------
 # SimplifyCaseWhenConstValue
@@ -1154,16 +1357,16 @@ SELECT k FROM e WHERE i IS NOT DISTINCT FROM NULL::FLOAT
 ----
 project
  ├── columns: k:1(int!null)
- ├── stats: [rows=10.0000001]
- ├── cost: 24.5400001
+ ├── stats: [rows=10]
+ ├── cost: 28.5400002
  ├── key: (1)
  ├── prune: (1)
  ├── interesting orderings: (+1)
  └── scan t.public.e@e_i_idx
       ├── columns: t.public.e.k:1(int!null) t.public.e.i:2(int)
       ├── constraint: /2/1: [/NULL - /NULL]
-      ├── stats: [rows=10.0000001, distinct(2)=1, null(2)=10]
-      ├── cost: 24.4200001
+      ├── stats: [rows=10, distinct(2)=1, null(2)=10]
+      ├── cost: 28.4200002
       ├── key: (1)
       ├── fd: ()-->(2)
       ├── prune: (1)
@@ -1175,7 +1378,7 @@ SELECT k FROM e WHERE i IS DISTINCT FROM NULL::FLOAT
 project
  ├── columns: k:1(int!null)
  ├── stats: [rows=990]
- ├── cost: 1053.54
+ ├── cost: 1057.54
  ├── key: (1)
  ├── prune: (1)
  ├── interesting orderings: (+1)
@@ -1183,7 +1386,7 @@ project
       ├── columns: t.public.e.k:1(int!null) t.public.e.i:2(int!null)
       ├── constraint: /2/1: (/NULL - ]
       ├── stats: [rows=990, distinct(2)=100, null(2)=0]
-      ├── cost: 1043.62
+      ├── cost: 1047.62
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── prune: (1)
@@ -1231,7 +1434,7 @@ project
  ├── key: (1)
  └── scan e@e_tz_idx
       ├── columns: k:1!null tz:4!null
-      ├── constraint: /4/1: [/'2017-11-12 07:35:01.000001+00:00' - ]
+      ├── constraint: /4/1: [/'2017-11-12 07:35:01.000001+00' - ]
       ├── key: (1)
       └── fd: (1)-->(4)
 
@@ -1286,16 +1489,16 @@ project
 
 # Working in concert with other norm rules
 opt
-SELECT k FROM e WHERE d - '1w'::INTERVAL > '2018-07-01'::DATE
+SELECT k FROM e WHERE i - 10 > 100
 ----
 project
  ├── columns: k:1!null
  ├── key: (1)
- └── scan e@e_d_idx
-      ├── columns: k:1!null d:5!null
-      ├── constraint: /5/1: [/'2018-07-09' - ]
+ └── scan e@e_i_idx
+      ├── columns: k:1!null i:2!null
+      ├── constraint: /2/1: [/111 - ]
       ├── key: (1)
-      └── fd: (1)-->(5)
+      └── fd: (1)-->(2)
 
 # --------------------------------------------------
 # InlineAnyValuesSingleCol
@@ -1469,6 +1672,28 @@ select
  └── filters
       └── k:1 > ANY () [outer=(1)]
 
+# DTuples should be converted to TupleExprs. This allows constraints to be built
+# for the resulting IN expression because the constraint builder requires
+# TupleExprs on the RHS of IN expressions.
+norm expect=SimplifyAnyScalarArray
+SELECT k FROM a WHERE (k, s) = ANY(ARRAY[(1, 'foo'), (2, 'bar')])
+----
+project
+ ├── columns: k:1!null
+ ├── cardinality: [0 - 2]
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null s:4!null
+      ├── cardinality: [0 - 2]
+      ├── key: (1)
+      ├── fd: (1)-->(4)
+      ├── scan a
+      │    ├── columns: k:1!null s:4
+      │    ├── key: (1)
+      │    └── fd: (1)-->(4)
+      └── filters
+           └── (k:1, s:4) IN ((1, 'foo'), (2, 'bar')) [outer=(1,4), constraints=(/1/4: [/1/'foo' - /1/'foo'] [/2/'bar' - /2/'bar']; /4: [/'bar' - /'bar'] [/'foo' - /'foo']; tight)]
+
 # --------------------------------------------------
 # SimplifyEqualsAnyTuple + SimplifyAnyScalarArray
 # --------------------------------------------------
@@ -1565,21 +1790,17 @@ project
  ├── group-by (hash)
  │    ├── columns: b.k:1!null a.k:8!null array_agg:17!null
  │    ├── grouping columns: b.k:1!null
- │    ├── key: (8)
- │    ├── fd: (1)==(8), (8)==(1), (8)-->(17), (1)-->(8,17)
- │    ├── inner-join (hash)
- │    │    ├── columns: b.k:1!null a.k:8!null
- │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
- │    │    ├── key: (8)
+ │    ├── key: (1)
+ │    ├── fd: (1)==(8), (8)==(1), (1)-->(8,17)
+ │    ├── project
+ │    │    ├── columns: a.k:8!null b.k:1!null
+ │    │    ├── key: (1)
  │    │    ├── fd: (1)==(8), (8)==(1)
  │    │    ├── scan a [as=b]
  │    │    │    ├── columns: b.k:1!null
  │    │    │    └── key: (1)
- │    │    ├── scan a
- │    │    │    ├── columns: a.k:8!null
- │    │    │    └── key: (8)
- │    │    └── filters
- │    │         └── a.k:8 = b.k:1 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
+ │    │    └── projections
+ │    │         └── b.k:1 [as=a.k:8, outer=(1)]
  │    └── aggregations
  │         ├── array-agg [as=array_agg:17, outer=(8)]
  │         │    └── a.k:8
@@ -1687,31 +1908,22 @@ project
  │    ├── grouping columns: c.k:1!null
  │    ├── key: (1)
  │    ├── fd: ()-->(25), (1)-->(25,26)
- │    ├── inner-join (hash)
- │    │    ├── columns: c.k:1!null b.k:8!null array:22 canary:25!null
- │    │    ├── multiplicity: left-rows(exactly-one), right-rows(exactly-one)
- │    │    ├── key: (8)
- │    │    ├── fd: ()-->(25), (8)-->(22), (1)==(8), (8)==(1)
- │    │    ├── scan a [as=c]
- │    │    │    ├── columns: c.k:1!null
- │    │    │    └── key: (1)
- │    │    ├── project
- │    │    │    ├── columns: canary:25!null array:22 b.k:8!null
- │    │    │    ├── key: (8)
- │    │    │    ├── fd: ()-->(25), (8)-->(22)
- │    │    │    ├── scan a [as=b]
- │    │    │    │    ├── columns: b.k:8!null
- │    │    │    │    └── key: (8)
- │    │    │    └── projections
- │    │    │         ├── true [as=canary:25]
- │    │    │         └── indirection [as=array:22, subquery]
- │    │    │              ├── array-flatten
- │    │    │              │    └── scan a
- │    │    │              │         ├── columns: k:15!null
- │    │    │              │         └── key: (15)
- │    │    │              └── 1
- │    │    └── filters
- │    │         └── b.k:8 = c.k:1 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
+ │    ├── project
+ │    │    ├── columns: c.k:1!null canary:25!null array:22
+ │    │    ├── key: (1,22)
+ │    │    ├── fd: ()-->(25)
+ │    │    ├── scan a [as=b]
+ │    │    │    ├── columns: b.k:8!null
+ │    │    │    └── key: (8)
+ │    │    └── projections
+ │    │         ├── b.k:8 [as=c.k:1, outer=(8)]
+ │    │         ├── true [as=canary:25]
+ │    │         └── indirection [as=array:22, subquery]
+ │    │              ├── array-flatten
+ │    │              │    └── scan a
+ │    │              │         ├── columns: k:15!null
+ │    │              │         └── key: (15)
+ │    │              └── 1
  │    └── aggregations
  │         ├── array-agg [as=array_agg:26, outer=(22)]
  │         │    └── array:22
@@ -1750,13 +1962,12 @@ project
  │    │    │    │    ├── cardinality: [0 - 1]
  │    │    │    │    ├── key: ()
  │    │    │    │    ├── fd: ()-->(15,24)
- │    │    │    │    ├── inner-join (hash)
- │    │    │    │    │    ├── columns: b.k:8!null a.k:15!null
+ │    │    │    │    ├── project
+ │    │    │    │    │    ├── columns: a.k:15!null
  │    │    │    │    │    ├── outer: (1)
  │    │    │    │    │    ├── cardinality: [0 - 1]
- │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    │    │    │    ├── key: ()
- │    │    │    │    │    ├── fd: ()-->(8,15), (15)==(8), (8)==(15)
+ │    │    │    │    │    ├── fd: ()-->(15)
  │    │    │    │    │    ├── select
  │    │    │    │    │    │    ├── columns: b.k:8!null
  │    │    │    │    │    │    ├── outer: (1)
@@ -1768,11 +1979,8 @@ project
  │    │    │    │    │    │    │    └── key: (8)
  │    │    │    │    │    │    └── filters
  │    │    │    │    │    │         └── b.k:8 = c.k:1 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
- │    │    │    │    │    ├── scan a
- │    │    │    │    │    │    ├── columns: a.k:15!null
- │    │    │    │    │    │    └── key: (15)
- │    │    │    │    │    └── filters
- │    │    │    │    │         └── a.k:15 = b.k:8 [outer=(8,15), constraints=(/8: (/NULL - ]; /15: (/NULL - ]), fd=(8)==(15), (15)==(8)]
+ │    │    │    │    │    └── projections
+ │    │    │    │    │         └── b.k:8 [as=a.k:15, outer=(8)]
  │    │    │    │    └── aggregations
  │    │    │    │         ├── array-agg [as=array_agg:24, outer=(15)]
  │    │    │    │         │    └── a.k:15
@@ -1802,6 +2010,50 @@ project
            └── scan a
                 ├── columns: k:8!null
                 └── key: (8)
+
+exec-ddl
+CREATE FUNCTION arr() RETURNS INT[] LANGUAGE SQL AS $$
+  SELECT ARRAY(VALUES (1), (2));
+$$
+----
+
+# Should trigger for uncorrelated ArrayFlatten subqueries within a UDF
+norm expect=NormalizeArrayFlattenToAgg format=show-scalars
+SELECT arr()
+----
+values
+ ├── columns: arr:4
+ ├── cardinality: [1 - 1]
+ ├── volatile
+ ├── key: ()
+ ├── fd: ()-->(4)
+ └── tuple
+      └── udf: arr
+           └── body
+                └── values
+                     ├── columns: array:3
+                     ├── cardinality: [1 - 1]
+                     ├── key: ()
+                     ├── fd: ()-->(3)
+                     └── tuple
+                          └── coalesce
+                               ├── subquery
+                               │    └── scalar-group-by
+                               │         ├── columns: array_agg:2
+                               │         ├── cardinality: [1 - 1]
+                               │         ├── key: ()
+                               │         ├── fd: ()-->(2)
+                               │         ├── values
+                               │         │    ├── columns: column1:1!null
+                               │         │    ├── cardinality: [2 - 2]
+                               │         │    ├── tuple
+                               │         │    │    └── const: 1
+                               │         │    └── tuple
+                               │         │         └── const: 2
+                               │         └── aggregations
+                               │              └── array-agg [as=array_agg:2, outer=(1)]
+                               │                   └── variable: column1:1
+                               └── const: ARRAY[]
 
 exec-ddl
 CREATE TABLE pg_class (
@@ -2100,3 +2352,92 @@ project
  │    └── columns: geom1:2 geom2:3
  └── projections
       └── NOT st_intersects(geom1:2, geom2:3) [as="?column?":8, outer=(2,3), immutable]
+
+# --------------------------------------------------
+# ConvertJSONSubscriptToFetchValue
+# --------------------------------------------------
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j['c'] FROM b WHERE j['a'] = '"b"'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── (b.j:2->'a') = '"b"' [outer=(2), immutable]
+ └── projections
+      └── b.j:2->'c' [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j['a']['b'] FROM b WHERE j['c'] = '1'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── (b.j:2->'c') = '1' [outer=(2), immutable]
+ └── projections
+      └── (b.j:2->'a')->'b' [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j[0] FROM b WHERE j[0][1] = '1'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── ((b.j:2->0)->1) = '1' [outer=(2), immutable]
+ └── projections
+      └── b.j:2->0 [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j[i], j[s] FROM b
+----
+project
+ ├── columns: j:8 j:9
+ ├── immutable
+ ├── scan b
+ │    └── columns: b.j:2 i:3 s:4
+ └── projections
+      ├── b.j:2->i:3 [as=j:8, outer=(2,3), immutable]
+      └── b.j:2->s:4 [as=j:9, outer=(2,4), immutable]
+
+norm expect-not=ConvertJSONSubscriptToFetchValue
+SELECT arr[1] FROM b WHERE arr[2] = 'a'
+----
+project
+ ├── columns: arr:8
+ ├── select
+ │    ├── columns: b.arr:5
+ │    ├── scan b
+ │    │    └── columns: b.arr:5
+ │    └── filters
+ │         └── b.arr:5[2] = 'a' [outer=(5)]
+ └── projections
+      └── b.arr:5[1] [as=arr:8, outer=(5)]
+
+norm expect-not=ConvertJSONSubscriptToFetchValue
+SELECT arr[1], arr[2] FROM b;
+----
+project
+ ├── columns: arr:8 arr:9
+ ├── scan b
+ │    └── columns: b.arr:5
+ └── projections
+      ├── b.arr:5[1] [as=arr:8, outer=(5)]
+      └── b.arr:5[2] [as=arr:9, outer=(5)]

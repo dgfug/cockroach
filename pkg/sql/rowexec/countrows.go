@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -35,27 +31,27 @@ var _ execinfra.RowSource = &countAggregator{}
 const countRowsProcName = "count rows"
 
 func newCountAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*countAggregator, error) {
 	ag := &countAggregator{}
 	ag.input = input
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ag.input = newInputStatCollector(input)
 		ag.ExecStatsForTrace = ag.execStatsForTrace
 	}
 
 	if err := ag.Init(
+		ctx,
 		ag,
 		post,
 		[]*types.T{types.Int},
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ag.input},
@@ -85,7 +81,7 @@ func (ag *countAggregator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMeta
 		if row == nil {
 			ret := make(rowenc.EncDatumRow, 1)
 			ret[0] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(ag.count))}
-			rendered, _, err := ag.OutputHelper.ProcessRow(ag.Ctx, ret)
+			rendered, _, err := ag.OutputHelper.ProcessRow(ag.Ctx(), ret)
 			// We're done as soon as we process our one output row, so we
 			// transition into draining state. We will, however, return non-nil
 			// error (if such occurs during rendering) separately below.

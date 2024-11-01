@@ -1,18 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package constraint
 
 import (
 	"bytes"
+	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -20,8 +17,9 @@ import (
 // SpanBoundary specifies whether a span endpoint is inclusive or exclusive of
 // its start or end key. An inclusive boundary is represented as '[' and an
 // exclusive boundary is represented as ')'. Examples:
-//   [/0 - /1]  (inclusive, inclusive)
-//   [/1 - /10) (inclusive, exclusive)
+//
+//	[/0 - /1]  (inclusive, inclusive)
+//	[/1 - /10) (inclusive, exclusive)
 type SpanBoundary bool
 
 const (
@@ -38,10 +36,11 @@ const (
 // range can be inclusive or exclusive. Each key value within the range is
 // an N-tuple of datum values, one for each constrained column. Here are some
 // examples:
-//   @1 < 100                                          : [ - /100)
-//   @1 >= 100                                         : [/100 - ]
-//   @1 >= 1 AND @1 <= 10                              : [/1 - /10]
-//   (@1 = 100 AND @2 > 10) OR (@1 > 100 AND @1 <= 101): (/100/10 - /101]
+//
+//	@1 < 100                                          : [ - /100)
+//	@1 >= 100                                         : [/100 - ]
+//	@1 >= 1 AND @1 <= 10                              : [/1 - /10]
+//	(@1 = 100 AND @2 > 10) OR (@1 > 100 AND @1 <= 101): (/100/10 - /101]
 type Span struct {
 	// Start is the starting boundary for the span.
 	start Key
@@ -72,7 +71,7 @@ func (sp *Span) IsUnconstrained() bool {
 
 // HasSingleKey is true if the span contains exactly one key. This is true when
 // the start key is the same as the end key, and both boundaries are inclusive.
-func (sp *Span) HasSingleKey(evalCtx *tree.EvalContext) bool {
+func (sp *Span) HasSingleKey(ctx context.Context, evalCtx *eval.Context) bool {
 	l := sp.start.Length()
 	if l == 0 || l != sp.end.Length() {
 		return false
@@ -81,7 +80,9 @@ func (sp *Span) HasSingleKey(evalCtx *tree.EvalContext) bool {
 		return false
 	}
 	for i, n := 0, l; i < n; i++ {
-		if sp.start.Value(i).Compare(evalCtx, sp.end.Value(i)) != 0 {
+		if cmp, err := sp.start.Value(i).Compare(ctx, evalCtx, sp.end.Value(i)); err != nil {
+			panic(err)
+		} else if cmp != 0 {
 			return false
 		}
 	}
@@ -91,13 +92,17 @@ func (sp *Span) HasSingleKey(evalCtx *tree.EvalContext) bool {
 // Prefix returns the length of the longest prefix of values for which the
 // span has the same start and end values. For example, [/1/1/1 - /1/1/2]
 // has prefix 2.
-func (sp *Span) Prefix(evalCtx *tree.EvalContext) int {
+func (sp *Span) Prefix(ctx context.Context, evalCtx *eval.Context) int {
 	start := sp.StartKey()
 	end := sp.EndKey()
 
 	for prefix := 0; ; prefix++ {
-		if start.Length() <= prefix || end.Length() <= prefix ||
-			start.Value(prefix).Compare(evalCtx, end.Value(prefix)) != 0 {
+		if start.Length() <= prefix || end.Length() <= prefix {
+			return prefix
+		}
+		if cmp, err := start.Value(prefix).Compare(ctx, evalCtx, end.Value(prefix)); err != nil {
+			panic(err)
+		} else if cmp != 0 {
 			return prefix
 		}
 	}
@@ -155,23 +160,24 @@ func (sp *Span) Init(start Key, startBoundary SpanBoundary, end Key, endBoundary
 // boundary, and an exclusive end boundary is less than an inclusive end
 // boundary. Here are examples of how various spans are ordered, with
 // equivalent extended keys shown as well (see Key.Compare comment):
-//   [     - /2  )  =  /Low      - /2/Low
-//   [     - /2/1)  =  /Low      - /2/1/Low
-//   [     - /2/1]  =  /Low      - /2/1/High
-//   [     - /2  ]  =  /Low      - /2/High
-//   [     -     ]  =  /Low      - /High
-//   [/1   - /2/1)  =  /1/Low    - /2/1/Low
-//   [/1   - /2/1]  =  /1/Low    - /2/1/High
-//   [/1   -     ]  =  /1/Low    - /High
-//   [/1/1 - /2  )  =  /1/1/Low  - /2/Low
-//   [/1/1 - /2  ]  =  /1/1/Low  - /2/High
-//   [/1/1 -     ]  =  /1/1/Low  - /High
-//   (/1/1 - /2  )  =  /1/1/High - /2/Low
-//   (/1/1 - /2  ]  =  /1/1/High - /2/High
-//   (/1/1 -     ]  =  /1/1/High - /High
-//   (/1   - /2/1)  =  /1/High   - /2/1/Low
-//   (/1   - /2/1]  =  /1/High   - /2/1/High
-//   (/1   -     ]  =  /1/High   - /High
+//
+//	[     - /2  )  =  /Low      - /2/Low
+//	[     - /2/1)  =  /Low      - /2/1/Low
+//	[     - /2/1]  =  /Low      - /2/1/High
+//	[     - /2  ]  =  /Low      - /2/High
+//	[     -     ]  =  /Low      - /High
+//	[/1   - /2/1)  =  /1/Low    - /2/1/Low
+//	[/1   - /2/1]  =  /1/Low    - /2/1/High
+//	[/1   -     ]  =  /1/Low    - /High
+//	[/1/1 - /2  )  =  /1/1/Low  - /2/Low
+//	[/1/1 - /2  ]  =  /1/1/Low  - /2/High
+//	[/1/1 -     ]  =  /1/1/Low  - /High
+//	(/1/1 - /2  )  =  /1/1/High - /2/Low
+//	(/1/1 - /2  ]  =  /1/1/High - /2/High
+//	(/1/1 -     ]  =  /1/1/High - /High
+//	(/1   - /2/1)  =  /1/High   - /2/1/Low
+//	(/1   - /2/1]  =  /1/High   - /2/1/High
+//	(/1   -     ]  =  /1/High   - /High
 func (sp *Span) Compare(keyCtx *KeyContext, other *Span) int {
 	// Span with lowest start boundary is less than the other.
 	if cmp := sp.CompareStarts(keyCtx, other); cmp != 0 {
@@ -257,7 +263,8 @@ func (sp *Span) TryIntersectWith(keyCtx *KeyContext, other *Span) bool {
 // spans cannot be expressed as a single span, then TryUnionWith will not
 // update the span and TryUnionWith returns false. This could occur if the
 // spans are disjoint, for example:
-//   [/1 - /5] UNION [/10 - /15]
+//
+//	[/1 - /5] UNION [/10 - /15]
 //
 // Otherwise, this span is updated to the merged span range and TryUnionWith
 // returns true. If the resulting span does not constrain the range [ - ], then
@@ -305,12 +312,12 @@ func (sp *Span) TryUnionWith(keyCtx *KeyContext, other *Span) bool {
 // with more constraints on columns that follow.
 //
 // Examples:
-//  - for an integer column (/1 - /5)  =>  [/2 - /4].
-//  - for a descending integer column (/5 - /1) => (/4 - /2).
-//  - for a string column, we don't have Prev so
-//      (/foo - /qux)  =>  [/foo\x00 - /qux).
-//  - for a decimal column, we don't have either Next or Prev so we can't
-//    change anything.
+//   - for an integer column (/1 - /5)  =>  [/2 - /4].
+//   - for a descending integer column (/5 - /1) => (/4 - /2).
+//   - for a string column, we don't have Prev so
+//     (/foo - /qux)  =>  [/foo\x00 - /qux).
+//   - for a decimal column, we don't have either Next or Prev so we can't
+//     change anything.
 func (sp *Span) PreferInclusive(keyCtx *KeyContext) {
 	if sp.startBoundary == ExcludeBoundary {
 		if key, ok := sp.start.Next(keyCtx); ok {
@@ -335,24 +342,23 @@ func (sp *Span) CutFront(numCols int) {
 // KeyCount returns the number of distinct keys between specified-length
 // prefixes of the start and end keys. Returns zero and false if the operation
 // is not possible. Requirements:
-//   1. The given prefix length must be at least 1.
-//   2. The boundaries must be inclusive.
-//   3. The start and end keys must have at least prefixLength values.
-//   4. The start and end keys be equal up to index [prefixLength-2].
-//   5. The datums at index [prefixLength-1] must be of the same type and:
-//      a. countable, or
-//      b. have the same value (in which case the distinct count is 1).
+//  1. The given prefix length must be at least 1.
+//  2. The boundaries must be inclusive.
+//  3. The start and end keys must have at least prefixLength values.
+//  4. The start and end keys be equal up to index [prefixLength-2].
+//  5. The datums at index [prefixLength-1] must be of the same type and:
+//     a. countable, or
+//     b. have the same value (in which case the distinct count is 1).
 //
 // Example:
 //
-//    [/'ASIA'/1/'postfix' - /'ASIA'/2].KeyCount(keyCtx, length=2) => 2, true
+//	[/'ASIA'/1/'postfix' - /'ASIA'/2].KeyCount(keyCtx, length=2) => 2, true
 //
 // Note that any extra key values beyond the given length are simply ignored.
 // Therefore, the above example will produce equivalent results if postfixes are
 // removed:
 //
-//    ['ASIA'/1 - /'ASIA'/2].KeyCount(keyCtx, length=2) => 2, true
-//
+//	['ASIA'/1 - /'ASIA'/2].KeyCount(keyCtx, length=2) => 2, true
 func (sp *Span) KeyCount(keyCtx *KeyContext, prefixLength int) (int64, bool) {
 	if prefixLength < 1 {
 		// The length must be at least one because distinct count is undefined for
@@ -395,7 +401,7 @@ func (sp *Span) KeyCount(keyCtx *KeyContext, prefixLength int) (int64, bool) {
 		start, end = end, start
 	}
 
-	return tree.MaxDistinctCount(keyCtx.EvalCtx, start, end)
+	return tree.MaxDistinctCount(keyCtx.Ctx, keyCtx.EvalCtx, start, end)
 }
 
 // Split returns a Spans object that describes an equivalent set of rows to the
@@ -410,15 +416,14 @@ func (sp *Span) KeyCount(keyCtx *KeyContext, prefixLength int) (int64, bool) {
 //
 // Example:
 //
-//    [/'ASIA'/1/'post' - /'ASIA'/3/'fix'].Split(keyCtx, length=2, limit=10)
-//    =>
-//    (
-//      [/'ASIA'/1/'post' - /'ASIA'/1],
-//      [/'ASIA'/2 - /'ASIA'/2],
-//      [/'ASIA'/3 - /'ASIA'/3/'fix'],
-//    ),
-//    true
-//
+//	[/'ASIA'/1/'post' - /'ASIA'/3/'fix'].Split(keyCtx, length=2, limit=10)
+//	=>
+//	(
+//	  [/'ASIA'/1/'post' - /'ASIA'/1],
+//	  [/'ASIA'/2 - /'ASIA'/2],
+//	  [/'ASIA'/3 - /'ASIA'/3/'fix'],
+//	),
+//	true
 func (sp *Span) Split(keyCtx *KeyContext, prefixLength int) (spans *Spans, ok bool) {
 	keyCount, ok := sp.KeyCount(keyCtx, prefixLength)
 	if !ok {
@@ -480,11 +485,12 @@ func (sp *Span) endExt() KeyExtension {
 
 // String formats a Span. Inclusivity/exclusivity is shown using
 // brackets/parens. Some examples:
-//   [1 - 2]
-//   (1/1 - 2)
-//   [ - 5/6)
-//   [1 - ]
-//   [ - ]
+//
+//	[1 - 2]
+//	(1/1 - 2)
+//	[ - 5/6)
+//	[1 - ]
+//	[ - ]
 func (sp Span) String() string {
 	var buf bytes.Buffer
 	if sp.startBoundary == IncludeBoundary {

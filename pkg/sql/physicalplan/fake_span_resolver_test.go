@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package physicalplan_test
 
@@ -20,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/physicalplanutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -32,13 +27,14 @@ import (
 func TestFakeSpanResolver(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	ctx := context.Background()
+	tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
+	ts := tc.ApplicationLayer(0)
 
 	sqlutils.CreateTable(
-		t, tc.ServerConn(0), "t",
+		t, ts.SQLConn(t), "t",
 		"k INT PRIMARY KEY, v INT",
 		100,
 		func(row int) []tree.Datum {
@@ -51,15 +47,13 @@ func TestFakeSpanResolver(t *testing.T) {
 
 	resolver := physicalplanutils.FakeResolverForTestCluster(tc)
 
-	db := tc.Server(0).DB()
+	txn := kv.NewTxn(ctx, ts.DB(), ts.DistSQLPlanningNodeID())
+	it := resolver.NewSpanResolverIterator(txn, nil)
 
-	txn := kv.NewTxn(ctx, db, tc.Server(0).NodeID())
-	it := resolver.NewSpanResolverIterator(txn)
-
-	tableDesc := catalogkv.TestingGetTableDescriptor(db, keys.SystemSQLCodec, "test", "t")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(ts.DB(), ts.Codec(), "test", "t")
 	primIdxValDirs := catalogkeys.IndexKeyValDirs(tableDesc.GetPrimaryIndex())
 
-	span := tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
+	span := tableDesc.PrimaryIndexSpan(ts.Codec())
 
 	// Make sure we see all the nodes. It will not always happen (due to
 	// randomness) but it should happen most of the time.
@@ -72,7 +66,7 @@ func TestFakeSpanResolver(t *testing.T) {
 				t.Fatal(it.Error())
 			}
 			desc := it.Desc()
-			rinfo, err := it.ReplicaInfo(ctx)
+			rinfo, _, err := it.ReplicaInfo(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -198,7 +198,7 @@ project
  ├── scan kv
  │    └── columns: k:1!null v:2 crdb_internal_mvcc_timestamp:3 tableoid:4
  └── projections
-      └── v:2::STRING || 'foo' [as=r:5]
+      └── v:2 || 'foo' [as=r:5]
 
 build
 SELECT lower(v) FROM kv
@@ -312,12 +312,12 @@ error (42P01): no data source matches pattern: bar.kv.*
 build
 SELECT kv.*[1] FROM kv
 ----
-error (42804): cannot subscript type tuple{char AS k, char AS v} because it is not an array
+error (42804): cannot subscript type tuple{char AS k, char AS v} because it is not an array or json object
 
 build
 SELECT ARRAY[]
 ----
-error (42P18): cannot determine type of empty array. Consider annotating with the desired type, for example ARRAY[]:::int[]
+error (42P18): cannot determine type of empty array. Consider casting to the desired type, for example ARRAY[]::int[]
 
 build
 SELECT FOO.k FROM kv AS foo WHERE foo.k = 'a'
@@ -1029,6 +1029,11 @@ project
 build
 SELECT @1 AS r, @2 AS s FROM a
 ----
+error (01P01): invalid syntax @1
+
+build set=allow_ordinal_column_references=true
+SELECT @1 AS r, @2 AS s FROM a
+----
 project
  ├── columns: r:5!null s:6
  ├── scan a
@@ -1263,6 +1268,10 @@ with &1
  │    │    ├── column1:6 => abc.a:1
  │    │    ├── b_default:7 => abc.b:2
  │    │    └── b_default:7 => abc.c:3
+ │    ├── return-mapping:
+ │    │    ├── column1:6 => abc.a:1
+ │    │    ├── b_default:7 => abc.b:2
+ │    │    └── b_default:7 => abc.c:3
  │    └── project
  │         ├── columns: b_default:7 column1:6!null
  │         ├── values
@@ -1317,6 +1326,10 @@ with &1
  │    └── insert abc
  │         ├── columns: abc.a:1!null b:2!null c:3!null
  │         ├── insert-mapping:
+ │         │    ├── column1:6 => abc.a:1
+ │         │    ├── column2:7 => b:2
+ │         │    └── column3:8 => c:3
+ │         ├── return-mapping:
  │         │    ├── column1:6 => abc.a:1
  │         │    ├── column2:7 => b:2
  │         │    └── column3:8 => c:3
@@ -1434,6 +1447,11 @@ SELECT v FROM inaccessible
 error (42703): column "v" does not exist
 
 build
+SELECT inaccessible.v FROM inaccessible
+----
+error (42703): column "inaccessible.v" does not exist
+
+build
 INSERT INTO inaccessible VALUES (1)
 ----
 insert inaccessible
@@ -1453,6 +1471,11 @@ build
 INSERT INTO inaccessible VALUES (1) RETURNING v
 ----
 error (42703): column "v" does not exist
+
+build
+INSERT INTO inaccessible VALUES (1) RETURNING inaccessible.v
+----
+error (42703): column "inaccessible.v" does not exist
 
 build
 INSERT INTO inaccessible(k, v) VALUES (1, 1)
@@ -1485,9 +1508,19 @@ UPDATE inaccessible SET k=k+1 WHERE v=1
 error (42703): column "v" does not exist
 
 build
+UPDATE inaccessible SET k=k+1 WHERE inaccessible.v=1
+----
+error (42703): column "inaccessible.v" does not exist
+
+build
 UPDATE inaccessible SET k=v+1
 ----
 error (42703): column "v" does not exist
+
+build
+UPDATE inaccessible SET k=inaccessible.v+1
+----
+error (42703): column "inaccessible.v" does not exist
 
 build
 UPDATE inaccessible SET v=1
@@ -1500,9 +1533,19 @@ DELETE FROM inaccessible WHERE v=1
 error (42703): column "v" does not exist
 
 build
+DELETE FROM inaccessible WHERE inaccessible.v=1
+----
+error (42703): column "inaccessible.v" does not exist
+
+build
 DELETE FROM inaccessible RETURNING v
 ----
 error (42703): column "v" does not exist
+
+build
+DELETE FROM inaccessible RETURNING inaccessible.v
+----
+error (42703): column "inaccessible.v" does not exist
 
 exec-ddl
 CREATE TABLE same_name (
@@ -1540,3 +1583,160 @@ project
  │    └── (3, 4)
  └── projections
       └── ((column1:1, column2:2) AS x, y) [as=t:3]
+
+# Regression test for #127365. Synthesized CHECK expressions should be allowed
+# to reference inaccessible columns.
+exec-ddl
+CREATE TABLE t127365 (
+  k INT PRIMARY KEY,
+  a INT,
+  -- Simulate an expression index on an ENUM column by creating an
+  -- inaccessible virtual column with a check constraint.
+  "crdb_internal_idx_expr:inaccessible" INT AS (a + 1) VIRTUAL,
+  CHECK ("crdb_internal_idx_expr" IN (10, 20, 30)),
+  INDEX ("crdb_internal_idx_expr")
+)
+----
+
+build
+SELECT * FROM t127365
+----
+project
+ ├── columns: k:1!null a:2
+ └── project
+      ├── columns: crdb_internal_idx_expr:3 k:1!null a:2 crdb_internal_mvcc_timestamp:4 tableoid:5
+      ├── scan t127365
+      │    ├── columns: k:1!null a:2 crdb_internal_mvcc_timestamp:4 tableoid:5
+      │    └── computed column expressions
+      │         └── crdb_internal_idx_expr:3
+      │              └── a:2 + 1
+      └── projections
+           └── a:2 + 1 [as=crdb_internal_idx_expr:3]
+
+build
+INSERT INTO t127365 VALUES (1, 10)
+----
+insert t127365
+ ├── columns: <none>
+ ├── insert-mapping:
+ │    ├── column1:6 => k:1
+ │    ├── column2:7 => a:2
+ │    └── crdb_internal_idx_expr_comp:8 => crdb_internal_idx_expr:3
+ ├── check columns: check1:9
+ └── project
+      ├── columns: check1:9!null column1:6!null column2:7!null crdb_internal_idx_expr_comp:8!null
+      ├── project
+      │    ├── columns: crdb_internal_idx_expr_comp:8!null column1:6!null column2:7!null
+      │    ├── values
+      │    │    ├── columns: column1:6!null column2:7!null
+      │    │    └── (1, 10)
+      │    └── projections
+      │         └── column2:7 + 1 [as=crdb_internal_idx_expr_comp:8]
+      └── projections
+           └── crdb_internal_idx_expr_comp:8 IN (10, 20, 30) [as=check1:9]
+
+build
+UPSERT INTO t127365 VALUES (1, 10)
+----
+upsert t127365
+ ├── arbiter indexes: t127365_pkey
+ ├── columns: <none>
+ ├── canary column: k:9
+ ├── fetch columns: k:9 a:10 crdb_internal_idx_expr:11
+ ├── insert-mapping:
+ │    ├── column1:6 => k:1
+ │    ├── column2:7 => a:2
+ │    └── crdb_internal_idx_expr_comp:8 => crdb_internal_idx_expr:3
+ ├── update-mapping:
+ │    ├── column2:7 => a:2
+ │    └── crdb_internal_idx_expr_comp:8 => crdb_internal_idx_expr:3
+ ├── check columns: check1:15
+ └── project
+      ├── columns: check1:15!null column1:6!null column2:7!null crdb_internal_idx_expr_comp:8!null k:9 a:10 crdb_internal_idx_expr:11 crdb_internal_mvcc_timestamp:12 tableoid:13 upsert_k:14
+      ├── project
+      │    ├── columns: upsert_k:14 column1:6!null column2:7!null crdb_internal_idx_expr_comp:8!null k:9 a:10 crdb_internal_idx_expr:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    ├── left-join (hash)
+      │    │    ├── columns: column1:6!null column2:7!null crdb_internal_idx_expr_comp:8!null k:9 a:10 crdb_internal_idx_expr:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    ├── ensure-upsert-distinct-on
+      │    │    │    ├── columns: column1:6!null column2:7!null crdb_internal_idx_expr_comp:8!null
+      │    │    │    ├── grouping columns: column1:6!null
+      │    │    │    ├── project
+      │    │    │    │    ├── columns: crdb_internal_idx_expr_comp:8!null column1:6!null column2:7!null
+      │    │    │    │    ├── values
+      │    │    │    │    │    ├── columns: column1:6!null column2:7!null
+      │    │    │    │    │    └── (1, 10)
+      │    │    │    │    └── projections
+      │    │    │    │         └── column2:7 + 1 [as=crdb_internal_idx_expr_comp:8]
+      │    │    │    └── aggregations
+      │    │    │         ├── first-agg [as=column2:7]
+      │    │    │         │    └── column2:7
+      │    │    │         └── first-agg [as=crdb_internal_idx_expr_comp:8]
+      │    │    │              └── crdb_internal_idx_expr_comp:8
+      │    │    ├── project
+      │    │    │    ├── columns: crdb_internal_idx_expr:11 k:9!null a:10 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── scan t127365
+      │    │    │    │    ├── columns: k:9!null a:10 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── crdb_internal_idx_expr:11
+      │    │    │    │    │         └── a:10 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
+      │    │    │    └── projections
+      │    │    │         └── a:10 + 1 [as=crdb_internal_idx_expr:11]
+      │    │    └── filters
+      │    │         └── column1:6 = k:9
+      │    └── projections
+      │         └── CASE WHEN k:9 IS NULL THEN column1:6 ELSE k:9 END [as=upsert_k:14]
+      └── projections
+           └── crdb_internal_idx_expr_comp:8 IN (10, 20, 30) [as=check1:15]
+
+build
+UPDATE t127365 SET a = 20 WHERE k = 1
+----
+update t127365
+ ├── columns: <none>
+ ├── fetch columns: k:6 a:7 crdb_internal_idx_expr:8
+ ├── update-mapping:
+ │    ├── a_new:11 => a:2
+ │    └── crdb_internal_idx_expr_comp:12 => crdb_internal_idx_expr:3
+ ├── check columns: check1:13
+ └── project
+      ├── columns: check1:13!null k:6!null a:7 crdb_internal_idx_expr:8 crdb_internal_mvcc_timestamp:9 tableoid:10 a_new:11!null crdb_internal_idx_expr_comp:12!null
+      ├── project
+      │    ├── columns: crdb_internal_idx_expr_comp:12!null k:6!null a:7 crdb_internal_idx_expr:8 crdb_internal_mvcc_timestamp:9 tableoid:10 a_new:11!null
+      │    ├── project
+      │    │    ├── columns: a_new:11!null k:6!null a:7 crdb_internal_idx_expr:8 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    ├── select
+      │    │    │    ├── columns: k:6!null a:7 crdb_internal_idx_expr:8 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    │    ├── project
+      │    │    │    │    ├── columns: crdb_internal_idx_expr:8 k:6!null a:7 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    │    │    ├── scan t127365
+      │    │    │    │    │    ├── columns: k:6!null a:7 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    │    │    │    └── computed column expressions
+      │    │    │    │    │         └── crdb_internal_idx_expr:8
+      │    │    │    │    │              └── a:7 + 1
+      │    │    │    │    └── projections
+      │    │    │    │         └── a:7 + 1 [as=crdb_internal_idx_expr:8]
+      │    │    │    └── filters
+      │    │    │         └── k:6 = 1
+      │    │    └── projections
+      │    │         └── 20 [as=a_new:11]
+      │    └── projections
+      │         └── a_new:11 + 1 [as=crdb_internal_idx_expr_comp:12]
+      └── projections
+           └── crdb_internal_idx_expr_comp:12 IN (10, 20, 30) [as=check1:13]
+
+build
+DELETE FROM t127365
+----
+delete t127365
+ ├── columns: <none>
+ ├── fetch columns: k:6 a:7 crdb_internal_idx_expr:8
+ └── project
+      ├── columns: crdb_internal_idx_expr:8 k:6!null a:7 crdb_internal_mvcc_timestamp:9 tableoid:10
+      ├── scan t127365
+      │    ├── columns: k:6!null a:7 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    └── computed column expressions
+      │         └── crdb_internal_idx_expr:8
+      │              └── a:7 + 1
+      └── projections
+           └── a:7 + 1 [as=crdb_internal_idx_expr:8]

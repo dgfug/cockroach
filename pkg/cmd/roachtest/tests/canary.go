@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,13 +13,13 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
@@ -36,39 +31,26 @@ import (
 // blocklist is a lists of known test errors and failures.
 type blocklist map[string]string
 
-// blocklistForVersion contains both a blocklist of known test errors and
-// failures but also an optional ignorelist for flaky tests.
-// When the test suite is run, the results are compared to this list.
+// listWithName contains both a blocklist of known test errors and
+// failures and also an optional ignorelist for flaky tests.
+// When the test suite is run, the results are compared to this blocklist.
 // Any passed test that is not on this blocklist is reported as PASS - expected
 // Any passed test that is on this blocklist is reported as PASS - unexpected
 // Any failed test that is on this blocklist is reported as FAIL - expected
-// Any failed test that is not on blocklist list is reported as FAIL - unexpected
+// Any failed test that is not on blocklist blocklist is reported as FAIL - unexpected
 // Any test on this blocklist that is not run is reported as FAIL - not run
-// Ant test in the ignorelist is reported as SKIP if it is run
-type blocklistForVersion struct {
-	versionPrefix  string
-	blocklistname  string
+// Any test in the ignorelist is reported as SKIP if it is run
+type listWithName struct {
+	blocklistName  string
 	blocklist      blocklist
-	ignorelistname string
+	ignorelistName string
 	ignorelist     blocklist
 }
 
-type blocklistsForVersion []blocklistForVersion
-
-// getLists returns the appropriate blocklist and ignorelist based on the
-// cockroach version. This check only looks to ensure that the prefix that
-// matches.
-func (b blocklistsForVersion) getLists(version string) (string, blocklist, string, blocklist) {
-	for _, info := range b {
-		if strings.HasPrefix(version, info.versionPrefix) {
-			return info.blocklistname, info.blocklist, info.ignorelistname, info.ignorelist
-		}
-	}
-	return "", nil, "", nil
-}
-
-func fetchCockroachVersion(ctx context.Context, c cluster.Cluster, nodeIndex int) (string, error) {
-	db, err := c.ConnE(ctx, nodeIndex)
+func fetchCockroachVersion(
+	ctx context.Context, l *logger.Logger, c cluster.Cluster, nodeIndex int,
+) (string, error) {
+	db, err := c.ConnE(ctx, l, nodeIndex)
 	if err != nil {
 		return "", err
 	}
@@ -125,7 +107,7 @@ func repeatRunE(
 		}
 		attempt++
 		t.L().Printf("attempt %d - %s", attempt, operation)
-		lastError = c.RunE(ctx, node, args...)
+		lastError = c.RunE(ctx, option.WithNodes(node), args...)
 		if lastError != nil {
 			t.L().Printf("error - retrying: %s", lastError)
 			continue
@@ -135,37 +117,37 @@ func repeatRunE(
 	return errors.Wrapf(lastError, "all attempts failed for %s", operation)
 }
 
-// repeatRunWithBuffer is the same function as c.RunWithBuffer but with an
+// repeatRunWithDetailsSingleNode is the same function as c.RunWithDetailsSingleNode but with an
 // automatic retry loop.
-func repeatRunWithBuffer(
+func repeatRunWithDetailsSingleNode(
 	ctx context.Context,
 	c cluster.Cluster,
 	t test.Test,
 	node option.NodeListOption,
 	operation string,
 	args ...string,
-) ([]byte, error) {
+) (install.RunResultDetails, error) {
 	var (
-		lastResult []byte
+		lastResult install.RunResultDetails
 		lastError  error
 	)
 	for attempt, r := 0, retry.StartWithCtx(ctx, canaryRetryOptions); r.Next(); {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return lastResult, ctx.Err()
 		}
 		if t.Failed() {
-			return nil, fmt.Errorf("test has failed")
+			return lastResult, fmt.Errorf("test has failed")
 		}
 		attempt++
 		t.L().Printf("attempt %d - %s", attempt, operation)
-		lastResult, lastError = c.RunWithBuffer(ctx, t.L(), node, args...)
+		lastResult, lastError = c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(node), args...)
 		if lastError != nil {
-			t.L().Printf("error - retrying: %s\n%s", lastError, string(lastResult))
+			t.L().Printf("error - retrying: %s", lastError)
 			continue
 		}
 		return lastResult, nil
 	}
-	return nil, errors.Wrapf(lastError, "all attempts failed for %s\n%s", operation, lastResult)
+	return lastResult, errors.Wrapf(lastError, "all attempts failed for %s", operation)
 }
 
 // repeatGitCloneE is the same function as c.GitCloneE but with an automatic
@@ -259,8 +241,8 @@ func repeatGetLatestTag(
 			return "", fmt.Errorf("no tags found at %s", url)
 		}
 		var releaseTags []releaseTag
-		for _, t := range tags {
-			match := releaseRegex.FindStringSubmatch(t.Name)
+		for _, tag := range tags {
+			match := releaseRegex.FindStringSubmatch(tag.Name)
 			if match == nil {
 				continue
 			}
@@ -272,7 +254,7 @@ func repeatGetLatestTag(
 				continue
 			}
 			releaseTags = append(releaseTags, releaseTag{
-				tag:      t.Name,
+				tag:      tag.Name,
 				major:    atoiOrZero(groups, "major"),
 				minor:    atoiOrZero(groups, "minor"),
 				point:    atoiOrZero(groups, "point"),
@@ -304,16 +286,15 @@ func gitCloneWithRecurseSubmodules(
 	src, dest, branch string,
 	node option.NodeListOption,
 ) error {
-	return c.RunL(ctx, l, node, "bash", "-e", "-c", fmt.Sprintf(`'
-if ! test -d %[1]s; then
-  git clone --recurse-submodules -b %[2]s --depth 1 %[3]s %[1]s
-else
-  cd %[1]s
-  git fetch origin
-  git checkout origin/%[2]s
-fi
-'`, dest,
-		branch,
-		src,
-	))
+	cmd := []string{"bash", "-e", "-c", fmt.Sprintf(`'
+		if ! test -d %[1]s; then
+	  		git clone --recurse-submodules -b %[2]s --depth 1 %[3]s %[1]s
+		else
+	  		cd %[1]s
+	  		git fetch origin
+	  		git checkout origin/%[2]s
+		fi
+	'`, dest, branch, src),
+	}
+	return errors.Wrap(c.RunE(ctx, option.WithNodes(node), cmd...), "gitCloneWithRecurseSubmodules")
 }

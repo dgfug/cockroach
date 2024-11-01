@@ -10,7 +10,7 @@ CREATE TABLE y (a INT PRIMARY KEY, b JSONB, INVERTED INDEX (b))
 
 # Tests for EXPLAIN counters.
 
-feature-allowlist
+feature-list
 sql.plan.explain
 sql.plan.explain-analyze
 sql.plan.explain-opt
@@ -55,7 +55,7 @@ sql.plan.explain-gist
 
 # Tests for hints.
 
-feature-allowlist
+feature-list
 sql.plan.hints.*
 ----
 
@@ -80,6 +80,11 @@ SELECT a FROM (VALUES ('{"a": "b"}'::jsonb)) AS a(z) INNER INVERTED JOIN y ON b 
 sql.plan.hints.inverted-join
 
 feature-usage
+SELECT x FROM (VALUES (1)) AS a(x) INNER STRAIGHT JOIN (VALUES (1)) AS b(y) ON x = y
+----
+sql.plan.hints.straight-join
+
+feature-usage
 SELECT * FROM x@x_pkey
 ----
 sql.plan.hints.index
@@ -99,7 +104,7 @@ sql.plan.hints.index.delete
 
 # Tests for tracking important setting changes.
 
-feature-allowlist
+feature-list
 sql.plan.reorder-joins.*
 sql.plan.automatic-stats.*
 ----
@@ -140,7 +145,7 @@ RESET CLUSTER SETTING sql.stats.automatic_collection.enabled
 sql.plan.automatic-stats.enabled
 
 # Test telemetry for manual statistics creation.
-feature-allowlist
+feature-list
 sql.plan.stats.created
 ----
 
@@ -150,7 +155,7 @@ CREATE STATISTICS stats FROM x
 sql.plan.stats.created
 
 # Test various planning counters.
-feature-allowlist
+feature-list
 sql.plan.cte.*
 ----
 
@@ -165,9 +170,8 @@ WITH RECURSIVE a AS (SELECT 1 UNION ALL SELECT * FROM a WHERE false) SELECT * FR
 sql.plan.cte
 sql.plan.cte.recursive
 
-feature-allowlist
+feature-list
 sql.plan.lateral-join
-sql.plan.subquery.*
 ----
 
 feature-usage
@@ -180,10 +184,18 @@ SELECT * FROM (VALUES (1), (2)) AS a(x) JOIN LATERAL (SELECT a.x+1 AS x) AS b ON
 ----
 sql.plan.lateral-join
 
+feature-list
+sql.plan.subquery
+----
+
 feature-usage
 SELECT 1 = (SELECT a FROM x LIMIT 1)
 ----
 sql.plan.subquery
+
+feature-list
+sql.plan.subquery.correlated
+----
 
 feature-usage
 SELECT x FROM (VALUES (1)) AS b(x) WHERE EXISTS(SELECT * FROM (VALUES (1)) AS a(x) WHERE a.x = b.x)
@@ -192,7 +204,7 @@ sql.plan.subquery.correlated
 
 # Test some sql.plan.ops counters, using some esoteric operators unlikely to be
 # executed in background activity).
-feature-allowlist
+feature-list
 sql.plan.ops.cast.string::inet
 sql.plan.ops.bin.jsonb - string
 sql.plan.ops.array.*
@@ -220,7 +232,7 @@ INSERT INTO x SELECT unnest(ARRAY[9, 10, 11, 12])
 sql.plan.ops.array.cons
 
 # Test a few sql.plan.opt.node counters.
-feature-allowlist
+feature-list
 sql.plan.opt.node.project-set
 ----
 
@@ -229,7 +241,7 @@ SELECT EXISTS(SELECT * FROM generate_series(1,2))
 ----
 sql.plan.opt.node.project-set
 
-feature-allowlist
+feature-list
 sql.plan.opt.node.join.algo.merge
 sql.plan.opt.node.join.type.inner
 ----
@@ -244,7 +256,7 @@ sql.plan.opt.node.join.type.inner
 
 # Tests for partial index counters.
 
-feature-allowlist
+feature-list
 sql.plan.opt.partial-index.scan
 ----
 
@@ -257,7 +269,7 @@ SELECT a FROM x@i WHERE a > 0
 ----
 sql.plan.opt.partial-index.scan
 
-feature-allowlist
+feature-list
 sql.plan.opt.partial-index.scan
 sql.plan.opt.partial-index.lookup-join
 ----
@@ -270,7 +282,7 @@ sql.plan.opt.partial-index.scan
 
 # ORDER BY nulls non-standard tests.
 
-feature-allowlist
+feature-list
 sql.plan.opt.order-by-nulls-non-standard
 ----
 

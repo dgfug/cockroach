@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -44,6 +40,7 @@ type mergeJoinerTestCase struct {
 
 func TestMergeJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -719,20 +716,21 @@ func TestMergeJoiner(t *testing.T) {
 			rightInput := distsqlutils.NewRowBuffer(c.rightTypes, c.rightInput, distsqlutils.RowBufferArgs{})
 			out := &distsqlutils.RowBuffer{}
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &ms, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(context.Background(), &flowCtx, 0 /* processorID */, &ms, leftInput, rightInput, &post)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			m.Run(context.Background())
+			m.Run(context.Background(), out)
 
 			if !out.ProducerClosed() {
 				t.Fatalf("output RowReceiver not closed")
@@ -759,6 +757,7 @@ func TestMergeJoiner(t *testing.T) {
 // Test that the joiner shuts down fine if the consumer is closed prematurely.
 func TestConsumerClosed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -825,19 +824,20 @@ func TestConsumerClosed(t *testing.T) {
 			out.ConsumerDone()
 
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
-			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(context.Background(), &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			m.Run(context.Background())
+			m.Run(context.Background(), out)
 
 			if !out.ProducerClosed() {
 				t.Fatalf("output RowReceiver not closed")
@@ -850,11 +850,12 @@ func BenchmarkMergeJoiner(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	spec := &execinfrapb.MergeJoinerSpec{
@@ -881,11 +882,11 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				m.Run(context.Background())
+				m.Run(context.Background(), disposer)
 				leftInput.Reset()
 				rightInput.Reset()
 			}
@@ -900,11 +901,11 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				m.Run(context.Background())
+				m.Run(context.Background(), disposer)
 				leftInput.Reset()
 				rightInput.Reset()
 			}
@@ -920,11 +921,11 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				m.Run(context.Background())
+				m.Run(context.Background(), disposer)
 				leftInput.Reset()
 				rightInput.Reset()
 			}

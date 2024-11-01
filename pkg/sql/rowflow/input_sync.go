@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // Input synchronizers are used by processors to merge incoming rows from
 // (potentially) multiple streams; see docs/RFCS/distributed_sql.md
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -65,6 +61,7 @@ type serialSynchronizer interface {
 type serialSynchronizerBase struct {
 	state serialSynchronizerState
 
+	ctx      context.Context
 	types    []*types.T
 	sources  []srcInfo
 	rowAlloc rowenc.EncDatumRowAlloc
@@ -78,6 +75,7 @@ func (s *serialSynchronizerBase) getSources() []srcInfo {
 
 // Start is part of the RowSource interface.
 func (s *serialSynchronizerBase) Start(ctx context.Context) {
+	s.ctx = ctx
 	for _, src := range s.sources {
 		src.src.Start(ctx)
 	}
@@ -98,7 +96,7 @@ type serialOrderedSynchronizer struct {
 	// ordering dictates the way in which rows compare. This can't be nil.
 	ordering colinfo.ColumnOrdering
 
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 	// heap of source indexes. In state notInitialized, heap holds all source
 	// indexes. Once initialized (initHeap is called), heap will be ordered by the
 	// current row from each source and will only contain source indexes of
@@ -114,7 +112,7 @@ type serialOrderedSynchronizer struct {
 	// err can be set by the Less function (used by the heap implementation)
 	err error
 
-	alloc rowenc.DatumAlloc
+	alloc tree.DatumAlloc
 
 	// metadata is accumulated from all the sources and is passed on as soon as
 	// possible.
@@ -132,7 +130,7 @@ func (s *serialOrderedSynchronizer) Len() int {
 func (s *serialOrderedSynchronizer) Less(i, j int) bool {
 	si := &s.sources[s.heap[i]]
 	sj := &s.sources[s.heap[j]]
-	cmp, err := si.row.Compare(s.types, &s.alloc, s.ordering, s.evalCtx, sj.row)
+	cmp, err := si.row.Compare(s.ctx, s.types, &s.alloc, s.ordering, s.evalCtx, sj.row)
 	if err != nil {
 		s.err = err
 		return false
@@ -233,7 +231,7 @@ func (s *serialOrderedSynchronizer) consumeMetadata(
 			src.row = row
 			return nil
 		}
-		if row == nil && meta == nil {
+		if row == nil {
 			return nil
 		}
 	}
@@ -270,7 +268,7 @@ func (s *serialOrderedSynchronizer) advanceRoot() error {
 	} else {
 		heap.Fix(s, 0)
 		// TODO(radu): this check may be costly, we could disable it in production
-		if cmp, err := oldRow.Compare(s.types, &s.alloc, s.ordering, s.evalCtx, src.row); err != nil {
+		if cmp, err := oldRow.Compare(s.ctx, s.types, &s.alloc, s.ordering, s.evalCtx, src.row); err != nil {
 			return err
 		} else if cmp > 0 {
 			return errors.Errorf(
@@ -378,6 +376,16 @@ type serialUnorderedSynchronizer struct {
 	serialSynchronizerBase
 
 	srcIndex int
+
+	// serialSrcIndexExclusiveUpperBound indicates the srcIndex to error out on
+	// should execution fail to halt prior to this input. This is only valid if
+	// non-zero.
+	serialSrcIndexExclusiveUpperBound uint32
+
+	// exceedsSrcIndexExclusiveUpperBoundErrorFunc produces the error to return to
+	// the receiver when srcIndex has incremented to match
+	// serialSrcIndexExclusiveUpperBound.
+	exceedsSrcIndexExclusiveUpperBoundErrorFunc func() error
 }
 
 var _ execinfra.RowSource = &serialUnorderedSynchronizer{}
@@ -394,6 +402,15 @@ func (u *serialUnorderedSynchronizer) Next() (rowenc.EncDatumRow, *execinfrapb.P
 		// If we see nil,nil go to next source.
 		if row == nil && metadata == nil {
 			u.srcIndex++
+			if u.serialSrcIndexExclusiveUpperBound > 0 && u.srcIndex >= int(u.serialSrcIndexExclusiveUpperBound) &&
+				(u.state == notInitialized || u.state == returningRows) {
+				// Do not return the error in the `draining` or `drainBuffered` states
+				// because we don't want to indicate that a drain operation has
+				// failed, and it is only necessary to return the error once.
+				meta := execinfrapb.GetProducerMeta()
+				meta.Err = u.exceedsSrcIndexExclusiveUpperBoundErrorFunc()
+				return nil, meta
+			}
 			continue
 		}
 
@@ -430,7 +447,11 @@ func (u *serialUnorderedSynchronizer) ConsumerClosed() {
 // sources should be consumed in index order (which is useful when you intend to
 // fuse the synchronizer and its inputs later; see FuseAggressively).
 func makeSerialSync(
-	ordering colinfo.ColumnOrdering, evalCtx *tree.EvalContext, sources []execinfra.RowSource,
+	ordering colinfo.ColumnOrdering,
+	evalCtx *eval.Context,
+	sources []execinfra.RowSource,
+	serialSrcIndexExclusiveUpperBound uint32,
+	exceedsSrcIndexExclusiveUpperBoundErrorFunc func() error,
 ) (execinfra.RowSource, error) {
 	if len(sources) < 2 {
 		return nil, errors.Errorf("only %d sources for serial synchronizer", len(sources))
@@ -461,7 +482,9 @@ func makeSerialSync(
 		sync = os
 	} else {
 		sync = &serialUnorderedSynchronizer{
-			serialSynchronizerBase: base,
+			serialSynchronizerBase:                      base,
+			serialSrcIndexExclusiveUpperBound:           serialSrcIndexExclusiveUpperBound,
+			exceedsSrcIndexExclusiveUpperBoundErrorFunc: exceedsSrcIndexExclusiveUpperBoundErrorFunc,
 		}
 	}
 

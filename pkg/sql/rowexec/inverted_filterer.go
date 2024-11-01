@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -14,7 +9,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -62,17 +59,17 @@ type invertedFilterer struct {
 
 var _ execinfra.Processor = &invertedFilterer{}
 var _ execinfra.RowSource = &invertedFilterer{}
-var _ execinfra.OpNode = &invertedFilterer{}
+var _ execopnode.OpNode = &invertedFilterer{}
 
 const invertedFiltererProcName = "inverted filterer"
 
 func newInvertedFilterer(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.InvertedFiltererSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
 	ifr := &invertedFilterer{
 		input:          input,
@@ -93,8 +90,14 @@ func newInvertedFilterer(
 	ifr.outputRow[ifr.invertedColIdx].Datum = tree.DNull
 
 	// Initialize ProcessorBase.
-	if err := ifr.ProcessorBase.Init(
-		ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	evalCtx := flowCtx.EvalCtx
+	if spec.PreFiltererSpec != nil {
+		// Only make a copy of the eval context if we're going to pass it to the
+		// ExprHelper later.
+		evalCtx = flowCtx.NewEvalCtx()
+	}
+	if err := ifr.ProcessorBase.InitWithEvalCtx(
+		ctx, ifr, post, outputColTypes, flowCtx, evalCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ifr.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -106,33 +109,32 @@ func newInvertedFilterer(
 		return nil, err
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Initialize memory monitor and row container for input rows.
-	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "inverted-filterer-limited")
+	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "inverted-filterer-limited")
 	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "inverted-filterer-disk")
 	ifr.rc = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
 		rcColTypes,
-		ifr.EvalCtx,
+		ifr.FlowCtx.EvalCtx,
 		ifr.FlowCtx.Cfg.TempStorage,
 		ifr.MemMonitor,
 		ifr.diskMonitor,
 	)
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ifr.input = newInputStatCollector(ifr.input)
 		ifr.ExecStatsForTrace = ifr.execStatsForTrace
 	}
 
 	if spec.PreFiltererSpec != nil {
-		semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
+		semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
 		var exprHelper execinfrapb.ExprHelper
 		colTypes := []*types.T{spec.PreFiltererSpec.Type}
-		if err := exprHelper.Init(spec.PreFiltererSpec.Expression, colTypes, semaCtx, ifr.EvalCtx); err != nil {
+		if err := exprHelper.Init(ctx, spec.PreFiltererSpec.Expression, colTypes, semaCtx, evalCtx); err != nil {
 			return nil, err
 		}
 		preFilterer, preFiltererState, err := invertedidx.NewBoundPreFilterer(
-			spec.PreFiltererSpec.Type, exprHelper.Expr)
+			spec.PreFiltererSpec.Type, exprHelper.Expr())
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +169,7 @@ func (ifr *invertedFilterer) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 		case ifrEmittingRows:
 			ifr.runningState, row, meta = ifr.emitRow()
 		default:
-			log.Fatalf(ifr.Ctx, "unsupported state: %d", ifr.runningState)
+			log.Fatalf(ifr.Ctx(), "unsupported state: %d", ifr.runningState)
 		}
 		if row == nil && meta == nil {
 			continue
@@ -192,9 +194,9 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		return ifrReadingInput, meta
 	}
 	if row == nil {
-		log.VEventf(ifr.Ctx, 1, "no more input rows")
+		log.VEventf(ifr.Ctx(), 1, "no more input rows")
 		evalResult := ifr.invertedEval.evaluate()
-		ifr.rc.SetupForRead(ifr.Ctx, evalResult)
+		ifr.rc.SetupForRead(ifr.Ctx(), evalResult)
 		// invertedEval had a single expression in the batch, and the results
 		// for that expression are in evalResult[0].
 		ifr.evalResult = evalResult[0]
@@ -226,11 +228,11 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 			ifr.MoveToDraining(errors.New("no datum found"))
 			return ifrStateUnknown, ifr.DrainHelper()
 		}
-		if row[ifr.invertedColIdx].Datum.ResolvedType().Family() != types.BytesFamily {
-			ifr.MoveToDraining(errors.New("inverted column should have type bytes"))
+		if row[ifr.invertedColIdx].Datum.ResolvedType().Family() != types.EncodedKeyFamily {
+			ifr.MoveToDraining(errors.New("inverted column should have type encodedkey"))
 			return ifrStateUnknown, ifr.DrainHelper()
 		}
-		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DBytes))
+		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DEncodedKey))
 	}
 	shouldAdd, err := ifr.invertedEval.prepareAddIndexRow(enc, nil /* encFull */)
 	if err != nil {
@@ -243,7 +245,7 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		// evaluator.
 		copy(ifr.keyRow, row[:ifr.invertedColIdx])
 		copy(ifr.keyRow[ifr.invertedColIdx:], row[ifr.invertedColIdx+1:])
-		keyIndex, err := ifr.rc.AddRow(ifr.Ctx, ifr.keyRow)
+		keyIndex, err := ifr.rc.AddRow(ifr.Ctx(), ifr.keyRow)
 		if err != nil {
 			ifr.MoveToDraining(err)
 			return ifrStateUnknown, ifr.DrainHelper()
@@ -271,11 +273,11 @@ func (ifr *invertedFilterer) emitRow() (
 	}
 	if ifr.resultIdx >= len(ifr.evalResult) {
 		// We are done emitting all rows.
-		return drainFunc(ifr.rc.UnsafeReset(ifr.Ctx))
+		return drainFunc(ifr.rc.UnsafeReset(ifr.Ctx()))
 	}
 	curRowIdx := ifr.resultIdx
 	ifr.resultIdx++
-	keyRow, err := ifr.rc.GetRow(ifr.Ctx, ifr.evalResult[curRowIdx], false /* skip */)
+	keyRow, err := ifr.rc.GetRow(ifr.Ctx(), ifr.evalResult[curRowIdx], false /* skip */)
 	if err != nil {
 		return drainFunc(err)
 	}
@@ -299,12 +301,12 @@ func (ifr *invertedFilterer) ConsumerClosed() {
 
 func (ifr *invertedFilterer) close() {
 	if ifr.InternalClose() {
-		ifr.rc.Close(ifr.Ctx)
+		ifr.rc.Close(ifr.Ctx())
 		if ifr.MemMonitor != nil {
-			ifr.MemMonitor.Stop(ifr.Ctx)
+			ifr.MemMonitor.Stop(ifr.Ctx())
 		}
 		if ifr.diskMonitor != nil {
-			ifr.diskMonitor.Stop(ifr.Ctx)
+			ifr.diskMonitor.Stop(ifr.Ctx())
 		}
 	}
 }
@@ -325,21 +327,21 @@ func (ifr *invertedFilterer) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (ifr *invertedFilterer) ChildCount(verbose bool) int {
-	if _, ok := ifr.input.(execinfra.OpNode); ok {
+	if _, ok := ifr.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (ifr *invertedFilterer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (ifr *invertedFilterer) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := ifr.input.(execinfra.OpNode); ok {
+		if n, ok := ifr.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to invertedFilterer is not an execinfra.OpNode")
+		panic("input to invertedFilterer is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

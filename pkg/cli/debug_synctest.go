@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -24,11 +19,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
+
+// TODO(sumeer): consider deleting this command, now that it is no longer
+// exercised by the synctest roachtest (which has been deleted). We will need
+// to confirm that users of CockroachDB are not running it as part of their
+// testing.
 
 var debugSyncTestCmd = &cobra.Command{
 	Use:   "synctest <empty-dir> <nemesis-script>",
@@ -116,13 +117,13 @@ func runSyncer(
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	db, err := OpenEngine(dir, stopper, OpenEngineOptions{})
+	db, err := OpenEngine(dir, stopper, fs.ReadWrite)
 	if err != nil {
 		if expSeq == 0 {
 			// Failed on first open, before we tried to corrupt anything. Hard stop.
 			return 0, err
 		}
-		fmt.Fprintln(stderr, "RocksDB directory", dir, "corrupted:", err)
+		fmt.Fprintln(stderr, "store directory", dir, "corrupted:", err)
 		return 0, nil // trigger reset
 	}
 
@@ -133,7 +134,7 @@ func runSyncer(
 		return encoding.EncodeUvarintAscending(buf[:0:0], uint64(seq))
 	}
 
-	check := func(kv storage.MVCCKeyValue) error {
+	check := func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
 		expKey := key()
 		if !bytes.Equal(kv.Key.Key, expKey) {
 			return errors.Errorf(
@@ -144,7 +145,9 @@ func runSyncer(
 	}
 
 	fmt.Fprintf(stderr, "verifying existing sequence numbers...")
-	if err := db.MVCCIterate(roachpb.KeyMin, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, check); err != nil {
+	err = db.MVCCIterate(ctx, roachpb.KeyMin, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind,
+		storage.IterKeyTypePointsOnly, fs.UnknownReadCategory, check)
+	if err != nil {
 		return 0, err
 	}
 	// We must not lose writes, but sometimes we get extra ones (i.e. we caught an
@@ -172,7 +175,7 @@ func runSyncer(
 	}
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, drainSignals...)
+	signal.Notify(ch, DrainSignals...)
 
 	write := func() (_ int64, err error) {
 		defer func() {

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -14,11 +9,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // savepoint captures the state in the TxnCoordSender necessary to restore that
@@ -37,10 +34,13 @@ type savepoint struct {
 
 	// seqNum represents the write seq num at the time the savepoint was created.
 	// On rollback, it configures the txn to ignore all seqnums from this value
-	// until the most recent seqnum.
+	// (inclusive) until the most recent seqnum (inclusive).
 	seqNum enginepb.TxnSeq
 
 	// txnSpanRefresher fields.
+	// TODO(mira): after we remove
+	// kv.transaction.keep_refresh_spans_on_savepoint_rollback.enabled, we won't
+	// need these two fields anymore.
 	refreshSpans   []roachpb.Span
 	refreshInvalid bool
 }
@@ -56,7 +56,7 @@ func (s *savepoint) Initial() bool {
 	return !s.active
 }
 
-// CreateSavepoint is part of the client.TxnSender interface.
+// CreateSavepoint is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) CreateSavepoint(ctx context.Context) (kv.SavepointToken, error) {
 	if tc.typ != kv.RootTxn {
 		return nil, errors.AssertionFailedf("cannot get savepoint in non-root txn")
@@ -79,6 +79,18 @@ func (tc *TxnCoordSender) CreateSavepoint(ctx context.Context) (kv.SavepointToke
 		return &initialSavepoint, nil
 	}
 
+	// If the transaction has acquired any locks, increment the write sequence on
+	// savepoint creation and assign this sequence to the savepoint. This allows
+	// us to distinguish between all operations (writes and locking reads) that
+	// happened before the savepoint and those that happened after.
+	// TODO(nvanbenschoten): once #113765 is resolved, we should make this
+	// unconditional and push it into txnSeqNumAllocator.createSavepointLocked.
+	if tc.interceptorAlloc.txnPipeliner.hasAcquiredLocks() {
+		if err := tc.interceptorAlloc.txnSeqNumAllocator.stepWriteSeqLocked(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	s := &savepoint{
 		active: true, // we've handled the not-active case above
 		txnID:  tc.mu.txn.ID,
@@ -91,7 +103,7 @@ func (tc *TxnCoordSender) CreateSavepoint(ctx context.Context) (kv.SavepointToke
 	return s, nil
 }
 
-// RollbackToSavepoint is part of the client.TxnSender interface.
+// RollbackToSavepoint is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) RollbackToSavepoint(ctx context.Context, s kv.SavepointToken) error {
 	if tc.typ != kv.RootTxn {
 		return errors.AssertionFailedf("cannot rollback savepoint in non-root txn")
@@ -105,7 +117,7 @@ func (tc *TxnCoordSender) RollbackToSavepoint(ctx context.Context, s kv.Savepoin
 	}
 
 	// We don't allow rollback to savepoint after errors (except after
-	// ConditionFailedError and WriteIntentError, which are special-cased
+	// ConditionFailedError and LockConflictError, which are special-cased
 	// elsewhere and don't move the txn to the txnError state). In particular, we
 	// cannot allow rollbacks to savepoint after ambiguous errors where it's
 	// possible for a previously-successfully written intent to have been pushed
@@ -120,21 +132,10 @@ func (tc *TxnCoordSender) RollbackToSavepoint(ctx context.Context, s kv.Savepoin
 	}
 
 	sp := s.(*savepoint)
-	err := tc.checkSavepointLocked(sp)
+	err := tc.checkSavepointLocked(sp, "rollback to")
 	if err != nil {
-		if errors.Is(err, errSavepointInvalidAfterTxnRestart) {
-			err = roachpb.NewTransactionRetryWithProtoRefreshError(
-				"cannot rollback to savepoint after a transaction restart",
-				tc.mu.txn.ID,
-				// The transaction inside this error doesn't matter.
-				roachpb.Transaction{},
-			)
-		}
 		return err
 	}
-
-	// Restore the transaction's state, in case we're rewiding after an error.
-	tc.mu.txnState = txnPending
 
 	tc.mu.active = sp.active
 
@@ -142,19 +143,28 @@ func (tc *TxnCoordSender) RollbackToSavepoint(ctx context.Context, s kv.Savepoin
 		reqInt.rollbackToSavepointLocked(ctx, *sp)
 	}
 
-	// If there's been any more writes since the savepoint was created, they'll
-	// need to be ignored.
-	if sp.seqNum < tc.interceptorAlloc.txnSeqNumAllocator.writeSeq {
+	// If the transaction has acquired any locks (before or after the savepoint),
+	// ignore all seqnums from the beginning of the savepoint (inclusive) until
+	// the most recent seqnum (inclusive). Then increment the write sequence to
+	// differentiate all future operations from this ignored sequence number
+	// range.
+	// TODO(nvanbenschoten): once #113765 is resolved, we should make this
+	// unconditional and push the write sequence increment into
+	// txnSeqNumAllocator.rollbackToSavepointLocked.
+	if tc.interceptorAlloc.txnPipeliner.hasAcquiredLocks() {
 		tc.mu.txn.AddIgnoredSeqNumRange(
 			enginepb.IgnoredSeqNumRange{
-				Start: sp.seqNum + 1, End: tc.interceptorAlloc.txnSeqNumAllocator.writeSeq,
+				Start: sp.seqNum, End: tc.interceptorAlloc.txnSeqNumAllocator.writeSeq,
 			})
+		if err := tc.interceptorAlloc.txnSeqNumAllocator.stepWriteSeqLocked(ctx); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// ReleaseSavepoint is part of the client.TxnSender interface.
+// ReleaseSavepoint is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) ReleaseSavepoint(ctx context.Context, s kv.SavepointToken) error {
 	if tc.typ != kv.RootTxn {
 		return errors.AssertionFailedf("cannot release savepoint in non-root txn")
@@ -168,16 +178,23 @@ func (tc *TxnCoordSender) ReleaseSavepoint(ctx context.Context, s kv.SavepointTo
 	}
 
 	sp := s.(*savepoint)
-	err := tc.checkSavepointLocked(sp)
-	if errors.Is(err, errSavepointInvalidAfterTxnRestart) {
-		err = roachpb.NewTransactionRetryWithProtoRefreshError(
-			"cannot release savepoint after a transaction restart",
-			tc.mu.txn.ID,
-			// The transaction inside this error doesn't matter.
-			roachpb.Transaction{},
-		)
+	return tc.checkSavepointLocked(sp, "release")
+}
+
+// CanUseSavepoint is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) CanUseSavepoint(ctx context.Context, s kv.SavepointToken) bool {
+	if tc.typ != kv.RootTxn {
+		return false
 	}
-	return err
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.txnState != txnPending {
+		return false
+	}
+	// We swallow the error here because we aren't actually performing any
+	// operation with the savepoint; only checking if we are allowed to do so.
+	sp := s.(*savepoint)
+	return tc.checkSavepointLocked(sp, "release") == nil
 }
 
 type errSavepointOperationInErrorTxn struct{}
@@ -197,23 +214,23 @@ func (tc *TxnCoordSender) assertNotFinalized() error {
 	return nil
 }
 
-var errSavepointInvalidAfterTxnRestart = errors.New("savepoint invalid after transaction restart")
-
 // checkSavepointLocked checks whether the provided savepoint is still valid.
-// Returns errSavepointInvalidAfterTxnRestart if the savepoint is not an
+// Returns a TransactionRetryWithProtoRefreshError if the savepoint is not an
 // "initial" one and the transaction has restarted since the savepoint was
 // created.
-func (tc *TxnCoordSender) checkSavepointLocked(s *savepoint) error {
+func (tc *TxnCoordSender) checkSavepointLocked(s *savepoint, op redact.SafeString) error {
 	// Only savepoints taken before any activity are allowed to be used after a
 	// transaction restart.
 	if s.Initial() {
 		return nil
 	}
-	if s.txnID != tc.mu.txn.ID {
-		return errSavepointInvalidAfterTxnRestart
-	}
-	if s.epoch != tc.mu.txn.Epoch {
-		return errSavepointInvalidAfterTxnRestart
+	if s.txnID != tc.mu.txn.ID || s.epoch != tc.mu.txn.Epoch {
+		return kvpb.NewTransactionRetryWithProtoRefreshError(
+			redact.Sprintf("cannot %s savepoint after a transaction restart", op),
+			s.txnID,
+			s.epoch,
+			tc.mu.txn,
+		)
 	}
 
 	if s.seqNum < 0 || s.seqNum > tc.interceptorAlloc.txnSeqNumAllocator.writeSeq {

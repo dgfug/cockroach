@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,7 +9,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -22,9 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,7 +32,7 @@ const duplicateUpsertErrText = "UPSERT or INSERT...ON CONFLICT command cannot af
 // cannot be inserted due to a conflict, the "excluded" data source contains
 // that row, so that its columns can be referenced in the conflict clause:
 //
-//   INSERT INTO ab VALUES (1, 2) ON CONFLICT (a) DO UPDATE b=excluded.b+1
+//	INSERT INTO ab VALUES (1, 2) ON CONFLICT (a) DO UPDATE b=excluded.b+1
 //
 // It is located in the special crdb_internal schema so that it never overlaps
 // with user data sources.
@@ -54,45 +50,45 @@ func init() {
 // begin, an input expression is constructed which outputs these columns to
 // insert into the target table:
 //
-//   1. Columns explicitly specified by the user in SELECT or VALUES expression.
+//  1. Columns explicitly specified by the user in SELECT or VALUES expression.
 //
-//   2. Columns not specified by the user, but having a default value declared
-//      in schema (or being nullable).
+//  2. Columns not specified by the user, but having a default value declared
+//     in schema (or being nullable).
 //
-//   3. Computed columns.
+//  3. Computed columns.
 //
-//   4. Mutation columns which are being added or dropped by an online schema
-//      change.
+//  4. Mutation columns which are being added or dropped by an online schema
+//     change.
 //
 // buildInsert starts by constructing the input expression, and then wraps it
 // with Project operators which add default, computed, and mutation columns. The
 // final input expression will project values for all columns in the target
 // table. For example, if this is the schema and INSERT statement:
 //
-//   CREATE TABLE abcd (
-//     a INT PRIMARY KEY,
-//     b INT,
-//     c INT DEFAULT(10),
-//     d INT AS (b+c) STORED
-//   )
-//   INSERT INTO abcd (a) VALUES (1)
+//	CREATE TABLE abcd (
+//	  a INT PRIMARY KEY,
+//	  b INT,
+//	  c INT DEFAULT(10),
+//	  d INT AS (b+c) STORED
+//	)
+//	INSERT INTO abcd (a) VALUES (1)
 //
 // Then an input expression equivalent to this would be built:
 //
-//   SELECT ins_a, ins_b, ins_c, ins_b + ins_c AS ins_d
-//   FROM (VALUES (1, NULL, 10)) AS t(ins_a, ins_b, ins_c)
+//	SELECT ins_a, ins_b, ins_c, ins_b + ins_c AS ins_d
+//	FROM (VALUES (1, NULL, 10)) AS t(ins_a, ins_b, ins_c)
 //
 // If an ON CONFLICT clause is present (or if it was an UPSERT statement), then
 // additional columns are added to the input expression:
 //
-//   1. Columns containing existing values fetched from the target table and
-//      used to detect conflicts and to formulate the key/value update commands.
+//  1. Columns containing existing values fetched from the target table and
+//     used to detect conflicts and to formulate the key/value update commands.
 //
-//   2. Columns containing updated values to set when a conflict is detected, as
-//      specified by the user.
+//  2. Columns containing updated values to set when a conflict is detected, as
+//     specified by the user.
 //
-//   3. Computed columns which will be updated when a conflict is detected and
-//      that are dependent on one or more updated columns.
+//  3. Computed columns which will be updated when a conflict is detected and
+//     that are dependent on one or more updated columns.
 //
 // A LEFT OUTER JOIN associates each row to insert with the corresponding
 // existing row (#1 above). If the row does not exist, then the existing columns
@@ -128,26 +124,26 @@ func init() {
 // Putting it all together, if this is the schema and INSERT..ON CONFLICT
 // statement:
 //
-//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   INSERT INTO abc VALUES (1, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b=10
+//	CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//	INSERT INTO abc VALUES (1, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b=10
 //
 // Then an input expression roughly equivalent to this would be built (note that
 // the DISTINCT ON is really the UpsertDistinctOn operator, which behaves a bit
 // differently than the DistinctOn operator):
 //
-//   SELECT
-//     fetch_a,
-//     fetch_b,
-//     fetch_c,
-//     CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
-//     CASE WHEN fetch_a IS NULL ins_b ELSE 10 END AS ups_b,
-//     CASE WHEN fetch_a IS NULL ins_c ELSE fetch_c END AS ups_c,
-//   FROM (
-//     SELECT DISTINCT ON (ins_a) *
-//     FROM (VALUES (1, 2, NULL), (1, 3, NULL)) AS ins(ins_a, ins_b, ins_c)
-//   )
-//   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
-//   ON ins_a = fetch_a
+//	SELECT
+//	  fetch_a,
+//	  fetch_b,
+//	  fetch_c,
+//	  CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
+//	  CASE WHEN fetch_a IS NULL ins_b ELSE 10 END AS ups_b,
+//	  CASE WHEN fetch_a IS NULL ins_c ELSE fetch_c END AS ups_c,
+//	FROM (
+//	  SELECT DISTINCT ON (ins_a) *
+//	  FROM (VALUES (1, 2, NULL), (1, 3, NULL)) AS ins(ins_a, ins_b, ins_c)
+//	)
+//	LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
+//	ON ins_a = fetch_a
 //
 // Here, the fetch_a column has been designated as the canary column, since it
 // is NOT NULL in the schema. It is used as the CASE condition to decide between
@@ -162,16 +158,16 @@ func init() {
 // input has no duplicates, and an ANTI JOIN to check whether a conflict exists.
 // For example:
 //
-//   CREATE TABLE ab (a INT PRIMARY KEY, b INT)
-//   INSERT INTO ab (a, b) VALUES (1, 2), (1, 3) ON CONFLICT DO NOTHING
+//	CREATE TABLE ab (a INT PRIMARY KEY, b INT)
+//	INSERT INTO ab (a, b) VALUES (1, 2), (1, 3) ON CONFLICT DO NOTHING
 //
 // Then an input expression roughly equivalent to this would be built:
 //
-//   SELECT x, y
-//   FROM (SELECT DISTINCT ON (x) * FROM (VALUES (1, 2), (1, 3))) AS input(x, y)
-//   WHERE NOT EXISTS(
-//     SELECT ab.a WHERE input.x = ab.a
-//   )
+//	SELECT x, y
+//	FROM (SELECT DISTINCT ON (x) * FROM (VALUES (1, 2), (1, 3))) AS input(x, y)
+//	WHERE NOT EXISTS(
+//	  SELECT ab.a WHERE input.x = ab.a
+//	)
 //
 // Note that an ordered input to the INSERT does not provide any guarantee about
 // the order in which mutations are applied, or the order of any returned rows
@@ -182,6 +178,12 @@ func init() {
 func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope) {
 	// Find which table we're working on, check the permissions.
 	tab, depName, alias, refColumns := b.resolveTableForMutation(ins.Table, privilege.INSERT)
+
+	if tab.IsVirtualTable() {
+		panic(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot insert into view \"%s\"", tab.Name(),
+		))
+	}
 
 	// It is possible to insert into specific columns using table reference
 	// syntax:
@@ -213,7 +215,11 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	}
 
 	// Check if this table has already been mutated in another subquery.
-	b.checkMultipleMutations(tab, ins.OnConflict == nil /* simpleInsert */)
+	mutType := generalMutation
+	if ins.OnConflict == nil {
+		mutType = simpleInsert
+	}
+	b.checkMultipleMutations(tab, mutType)
 
 	var mb mutationBuilder
 	if ins.OnConflict != nil && ins.OnConflict.IsUpsertAlias() {
@@ -241,7 +247,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		mb.addTargetNamedColsForInsert(ins.Columns)
 	} else {
 		values := mb.extractValuesInput(ins.Rows)
-		if values != nil {
+		if values != nil && len(values.Rows) > 0 {
 			// Target columns are implicitly targeted by VALUES expression in the
 			// same order they appear in the target table schema.
 			mb.addTargetTableColsForInsert(len(values.Rows[0]))
@@ -258,7 +264,6 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	//
 	//   INSERT INTO <table> DEFAULT VALUES
 	//
-	isUpsert := ins.OnConflict != nil && !ins.OnConflict.DoNothing
 	if !ins.DefaultValues() {
 		// Replace any DEFAULT expressions in the VALUES clause, if a VALUES clause
 		// exists:
@@ -267,34 +272,44 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		//
 		rows := mb.replaceDefaultExprs(ins.Rows)
 
-		mb.buildInputForInsert(inScope, rows, isUpsert)
+		mb.buildInputForInsert(inScope, rows)
 	} else {
-		mb.buildInputForInsert(inScope, nil /* rows */, isUpsert)
+		mb.buildInputForInsert(inScope, nil /* rows */)
 	}
 
 	// Add default columns that were not explicitly specified by name or
 	// implicitly targeted by input columns. Also add any computed columns. In
 	// both cases, include columns undergoing mutations in the write-only state.
-	mb.addSynthesizedColsForInsert(isUpsert)
+	mb.addSynthesizedColsForInsert()
 
-	var returning tree.ReturningExprs
+	// Set insertExpr. This expression is used when building uniqueness checks.
+	// See mutationBuilder.buildCheckInputScan.
+	mb.insertExpr = mb.outScope.expr
+
+	var returning *tree.ReturningExprs
 	if resultsNeeded(ins.Returning) {
-		returning = *ins.Returning.(*tree.ReturningExprs)
+		returning = ins.Returning.(*tree.ReturningExprs)
 	}
 
 	switch {
 	// Case 1: Simple INSERT statement.
 	case ins.OnConflict == nil:
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert)
+
 		// Build the final insert statement, including any returned expressions.
 		mb.buildInsert(returning)
 
 	// Case 2: INSERT..ON CONFLICT DO NOTHING.
 	case ins.OnConflict.DoNothing:
+
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert)
+
 		// Wrap the input in one ANTI JOIN per UNIQUE index, and filter out rows
 		// that have conflicts. See the buildInputForDoNothing comment for more
 		// details.
-		conflictOrds := mb.mapPublicColumnNamesToOrdinals(ins.OnConflict.Columns)
-		mb.buildInputForDoNothing(inScope, conflictOrds, ins.OnConflict.ArbiterPredicate)
+		mb.buildInputForDoNothing(inScope, ins.Table, ins.OnConflict)
 
 		// Since buildInputForDoNothing filters out rows with conflicts, always
 		// insert rows that are not filtered.
@@ -311,12 +326,32 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		if mb.needExistingRows() {
 			// Left-join each input row to the target table, using conflict columns
 			// derived from the primary index as the join condition.
-			primaryOrds := getExplicitPrimaryKeyOrdinals(mb.tab)
-			mb.buildInputForUpsert(inScope, primaryOrds, nil /* arbiterPredicate */, nil /* whereClause */)
+			mb.buildInputForUpsert(inScope, ins.Table, nil /* onConflict */)
+
+			// Project row-level BEFORE triggers for INSERT.
+			//
+			// NOTE: we avoid building INSERT triggers until after buildInputForUpsert
+			// so that there are no buffering operators between INSERT and UPDATE
+			// triggers. This helps preserve Postgres compatibility
+			if mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert) {
+				// INSERT triggers are able to modify the row being inserted, so we need
+				// to recompute the upsert columns.
+				mb.setUpsertCols(nil /* insertCols */)
+			}
 
 			// Add additional columns for computed expressions that may depend on any
 			// updated columns, as well as mutation columns with default values.
 			mb.addSynthesizedColsForUpdate()
+
+			// Project row-level BEFORE triggers for UPDATE.
+			mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate)
+		} else {
+			// Project row-level BEFORE triggers for INSERT.
+			if mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert) {
+				// INSERT triggers are able to modify the row being inserted, so we need
+				// to recompute the upsert columns.
+				mb.setUpsertCols(nil /* insertCols */)
+			}
 		}
 
 		// Build the final upsert statement, including any returned expressions.
@@ -326,8 +361,17 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	default:
 		// Left-join each input row to the target table, using the conflict columns
 		// as the join condition.
-		conflictOrds := mb.mapPublicColumnNamesToOrdinals(ins.OnConflict.Columns)
-		mb.buildInputForUpsert(inScope, conflictOrds, ins.OnConflict.ArbiterPredicate, ins.OnConflict.Where)
+		canaryCol := mb.buildInputForUpsert(inScope, ins.Table, ins.OnConflict)
+
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert)
+
+		// Add a filter from the WHERE clause if one exists. This must happen after
+		// the INSERT triggers are added, since BEFORE INSERT triggers are called
+		// for every input row, even if it doesn't end up being inserted.
+		if ins.OnConflict.Where != nil {
+			mb.buildOnConflictWhereClause(ins.OnConflict.Where, canaryCol)
+		}
 
 		// Derive the columns that will be updated from the SET expressions.
 		mb.addTargetColsForUpdate(ins.OnConflict.Exprs)
@@ -335,8 +379,22 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		// Build each of the SET expressions.
 		mb.addUpdateCols(ins.OnConflict.Exprs)
 
+		// Project row-level BEFORE triggers for UPDATE.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate)
+
 		// Build the final upsert statement, including any returned expressions.
 		mb.buildUpsert(returning)
+	}
+
+	if b.trackSchemaDeps {
+		dep := opt.SchemaDep{DataSource: tab}
+		// Track dependencies on insert columns.
+		for i := range mb.insertColIDs {
+			if mb.insertColIDs[i] != 0 && !mb.implicitInsertCols.Contains(mb.insertColIDs[i]) {
+				dep.ColumnOrdinals.Add(i)
+			}
+		}
+		b.schemaDeps = append(b.schemaDeps, dep)
 	}
 
 	return mb.outScope
@@ -347,13 +405,14 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 // fetch existing rows, and then the KV Put operation can be used to blindly
 // insert a new record or overwrite an existing record. This is possible when:
 //
-//   1. There are no secondary indexes. Existing values are needed to delete
-//      secondary index rows when the update causes them to move.
-//   2. There are no implicit partitioning columns in the primary index.
-//   3. All non-key columns (including mutation columns) have insert and update
-//      values specified for them.
-//   4. Each update value is the same as the corresponding insert value.
-//   5. There are no inbound foreign keys containing non-key columns.
+//  1. There are no secondary indexes. Existing values are needed to delete
+//     secondary index rows when the update causes them to move.
+//  2. There are no implicit partitioning columns in the primary index.
+//  3. All non-key columns (including mutation columns) have insert and update
+//     values specified for them.
+//  4. Each update value is the same as the corresponding insert value.
+//  5. There are no inbound foreign keys containing non-key columns.
+//  6. There are no UPDATE triggers on the target table.
 //
 // TODO(andyk): The fast path is currently only enabled when the UPSERT alias
 // is explicitly selected by the user. It's possible to fast path some queries
@@ -408,6 +467,17 @@ func (mb *mutationBuilder) needExistingRows() bool {
 		}
 	}
 
+	// If there are any UPDATE triggers on the target table, we must have access
+	// to both old and new values of conflicting rows.
+	for i, n := 0, mb.tab.TriggerCount(); i < n; i++ {
+		for j, m := 0, mb.tab.Trigger(i).EventCount(); j < m; j++ {
+			eventType := mb.tab.Trigger(i).Event(j).EventType
+			if eventType == tree.TriggerEventUpdate {
+				return true
+			}
+		}
+	}
+
 	return false
 }
 
@@ -449,7 +519,7 @@ func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
 			continue
 		}
 
-		panic(pgerror.Newf(pgcode.InvalidForeignKey,
+		panic(pgerror.Newf(pgcode.NotNullViolation,
 			"missing %q primary key column", col.ColName()))
 	}
 }
@@ -460,14 +530,14 @@ func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
 // Alternatively, all columns can be unspecified. If neither condition is true,
 // checkForeignKeys raises an error. Here is an example:
 //
-//   CREATE TABLE orders (
-//     id INT,
-//     cust_id INT,
-//     state STRING,
-//     FOREIGN KEY (cust_id, state) REFERENCES customers (id, state) MATCH FULL
-//   )
+//	CREATE TABLE orders (
+//	  id INT,
+//	  cust_id INT,
+//	  state STRING,
+//	  FOREIGN KEY (cust_id, state) REFERENCES customers (id, state) MATCH FULL
+//	)
 //
-//   INSERT INTO orders (cust_id) VALUES (1)
+//	INSERT INTO orders (cust_id) VALUES (1)
 //
 // This INSERT statement would trigger a static error, because only cust_id is
 // specified in the INSERT statement. Either the state column must be specified
@@ -527,7 +597,7 @@ func (mb *mutationBuilder) checkForeignKeysForInsert() {
 // used when the target columns are not explicitly specified in the INSERT
 // statement:
 //
-//   INSERT INTO t VALUES (1, 2, 3)
+//	INSERT INTO t VALUES (1, 2, 3)
 //
 // In this example, the first three columns of table t would be added as target
 // columns.
@@ -557,16 +627,12 @@ func (mb *mutationBuilder) addTargetTableColsForInsert(maxCols int) {
 
 // buildInputForInsert constructs the memo group for the input expression and
 // constructs a new output scope containing that expression's output columns.
-func (mb *mutationBuilder) buildInputForInsert(
-	inScope *scope, inputRows *tree.Select, isUpsert bool,
-) {
+func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.Select) {
 	// Handle DEFAULT VALUES case by creating a single empty row as input.
 	if inputRows == nil {
 		mb.outScope = inScope.push()
-		mb.outScope.expr = mb.b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
-			Cols: opt.ColList{},
-			ID:   mb.md.NextUniqueID(),
-		})
+		mb.outScope.expr = mb.b.factory.ConstructNoColsRow()
+		mb.inputForInsertExpr = mb.outScope.expr
 		return
 	}
 
@@ -609,10 +675,6 @@ func (mb *mutationBuilder) buildInputForInsert(
 		mb.addTargetTableColsForInsert(len(mb.outScope.cols))
 	}
 
-	if !isUpsert {
-		mb.outScope = mb.addAssignmentCasts(mb.outScope, desiredTypes)
-	}
-
 	// Loop over input columns and:
 	//   1. Type check each column
 	//   2. Check if the INSERT violates a GENERATED ALWAYS AS IDENTITY column.
@@ -622,16 +684,18 @@ func (mb *mutationBuilder) buildInputForInsert(
 		inCol := &mb.outScope.cols[i]
 		ord := mb.tabID.ColumnOrdinal(mb.targetColList[i])
 
-		if isUpsert {
-			// Type check the input column against the corresponding table column.
-			checkDatumTypeFitsColumnType(mb.tab.Column(ord), inCol.typ)
+		// Raise an error if the target column is a `GENERATED ALWAYS AS
+		// IDENTITY` column. Such a column is not allowed to be explicitly
+		// written to.
+		//
+		// TODO(janexing): Implement the OVERRIDING SYSTEM VALUE syntax for
+		// INSERT which allows a GENERATED ALWAYS AS IDENTITY column to be
+		// overwritten.
+		// See https://github.com/cockroachdb/cockroach/issues/68201.
+		if col := mb.tab.Column(ord); col.IsGeneratedAlwaysAsIdentity() {
+			colName := string(col.ColName())
+			panic(sqlerrors.NewGeneratedAlwaysAsIdentityColumnOverrideError(colName))
 		}
-
-		// Check if the input column is created with `GENERATED ALWAYS AS IDENTITY`
-		// syntax. If yes, and user does not specify the `OVERRIDING SYSTEM VALUE`
-		// syntax in the `INSERT` statement,
-		// checkColumnIsNotGeneratedAlwaysAsIdentity will raise an error.
-		checkColumnIsNotGeneratedAlwaysAsIdentity(mb.tab.Column(ord))
 
 		// Assign name of input column.
 		inCol.name = scopeColName(tree.Name(mb.md.ColumnMeta(mb.targetColList[i]).Alias))
@@ -640,6 +704,10 @@ func (mb *mutationBuilder) buildInputForInsert(
 		// into the corresponding target table column.
 		mb.insertColIDs[ord] = inCol.id
 	}
+
+	// Add assignment casts for insert columns.
+	mb.addAssignmentCasts(mb.insertColIDs)
+	mb.inputForInsertExpr = mb.outScope.expr
 }
 
 // addSynthesizedColsForInsert wraps an Insert input expression with a Project
@@ -647,7 +715,7 @@ func (mb *mutationBuilder) buildInputForInsert(
 // columns that are not yet part of the target column list. This includes all
 // write-only mutation columns, since they must always have default or computed
 // values.
-func (mb *mutationBuilder) addSynthesizedColsForInsert(isUpsert bool) {
+func (mb *mutationBuilder) addSynthesizedColsForInsert() {
 	// Start by adding non-computed columns that have not already been explicitly
 	// specified in the query. Do this before adding computed columns, since those
 	// may depend on non-computed columns.
@@ -657,24 +725,19 @@ func (mb *mutationBuilder) addSynthesizedColsForInsert(isUpsert bool) {
 		false, /* applyOnUpdate */
 	)
 
-	// Possibly round DECIMAL-related columns containing insertion values (whether
-	// synthesized or not).
-	if isUpsert {
-		mb.roundDecimalValues(mb.insertColIDs, false /* roundComputedCols */)
-	}
+	// Add assignment casts for default column values.
+	mb.addAssignmentCasts(mb.insertColIDs)
 
 	// Now add all computed columns.
 	mb.addSynthesizedComputedCols(mb.insertColIDs, false /* restrict */)
 
-	// Possibly round DECIMAL-related computed columns.
-	if isUpsert {
-		mb.roundDecimalValues(mb.insertColIDs, true /* roundComputedCols */)
-	}
+	// Add assignment casts for computed column values.
+	mb.addAssignmentCasts(mb.insertColIDs)
 }
 
 // buildInsert constructs an Insert operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildInsert(returning *tree.ReturningExprs) {
 	// Disambiguate names so that references in any expressions, such as a
 	// check constraint, refer to the correct columns.
 	mb.disambiguateColumns()
@@ -689,9 +752,11 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 
 	mb.buildFKChecksForInsert()
 
+	mb.buildRowLevelAfterTriggers(opt.InsertOp)
+
 	private := mb.makeMutationPrivate(returning != nil)
 	mb.outScope.expr = mb.b.factory.ConstructInsert(
-		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+		mb.outScope.expr, mb.uniqueChecks, mb.fastPathUniqueChecks, mb.fkChecks, private,
 	)
 
 	mb.buildReturning(returning)
@@ -701,12 +766,11 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 // one for each arbiter on the target table. See the comment header for
 // Builder.buildInsert for an example.
 func (mb *mutationBuilder) buildInputForDoNothing(
-	inScope *scope, conflictOrds util.FastIntSet, arbiterPredicate tree.Expr,
+	inScope *scope, texpr tree.TableExpr, onConflict *tree.OnConflict,
 ) {
 	// Determine the set of arbiter indexes and constraints to use to check for
 	// conflicts.
-	mb.arbiters = mb.findArbiters(conflictOrds, arbiterPredicate)
-
+	mb.arbiters = mb.findArbiters(onConflict)
 	insertColScope := mb.outScope.replace()
 	insertColScope.appendColumnsFromScope(mb.outScope)
 
@@ -715,14 +779,18 @@ func (mb *mutationBuilder) buildInputForDoNothing(
 	mb.outScope.ordering = nil
 
 	// Create an anti-join for each arbiter.
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
-		mb.buildAntiJoinForDoNothingArbiter(inScope, conflictOrds, pred)
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
+		mb.buildAntiJoinForDoNothingArbiter(inScope, texpr, conflictOrds, pred, uniqueWithoutIndex, uniqueOrd)
 	})
 
 	// Create an UpsertDistinctOn for each arbiter. This must happen after all
 	// conflicting rows are removed with the anti-joins created above, to avoid
 	// removing valid rows (see #59125).
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -748,12 +816,11 @@ func (mb *mutationBuilder) buildInputForDoNothing(
 // given insert row conflicts with an existing row in the table. If it is null,
 // then there is no conflict.
 func (mb *mutationBuilder) buildInputForUpsert(
-	inScope *scope, conflictOrds util.FastIntSet, arbiterPredicate tree.Expr, whereClause *tree.Where,
-) {
+	inScope *scope, texpr tree.TableExpr, onConflict *tree.OnConflict,
+) (canaryCol *scopeColumn) {
 	// Determine the set of arbiter indexes and constraints to use to check for
 	// conflicts.
-	mb.arbiters = mb.findArbiters(conflictOrds, arbiterPredicate)
-
+	mb.arbiters = mb.findArbiters(onConflict)
 	// TODO(mgartner): Add support for multiple arbiter indexes or constraints,
 	//  similar to buildInputForDoNothing.
 	if mb.arbiters.Len() > 1 {
@@ -768,8 +835,9 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	mb.outScope.ordering = nil
 
 	// Create an UpsertDistinctOn and a left-join for the single arbiter.
-	var canaryCol *scopeColumn
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -799,7 +867,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 
 		// Create a left-join for the arbiter.
 		mb.buildLeftJoinForUpsertArbiter(
-			inScope, conflictOrds, pred,
+			inScope, texpr, conflictOrds, pred, uniqueWithoutIndex, uniqueOrd,
 		)
 
 		// Record a not-null "canary" column. After the left-join, this will be
@@ -810,34 +878,19 @@ func (mb *mutationBuilder) buildInputForUpsert(
 		mb.canaryColID = canaryCol.id
 	})
 
-	// Add a filter from the WHERE clause if one exists.
-	if whereClause != nil {
-		where := &tree.Where{
-			Type: whereClause.Type,
-			Expr: &tree.OrExpr{
-				Left: &tree.ComparisonExpr{
-					Operator: tree.MakeComparisonOperator(tree.IsNotDistinctFrom),
-					Left:     canaryCol,
-					Right:    tree.DNull,
-				},
-				Right: whereClause.Expr,
-			},
-		}
-		mb.b.buildWhere(where, mb.outScope)
-	}
-
 	mb.targetColList = make(opt.ColList, 0, mb.tab.ColumnCount())
 	mb.targetColSet = opt.ColSet{}
+	return canaryCol
 }
 
 // setUpsertCols sets the list of columns to be updated in case of conflict.
 // There are two cases to handle:
 //
-//   1. Target columns are explicitly specified:
-//        UPSERT INTO abc (col1, col2, ...) <input-expr>
+//  1. Target columns are explicitly specified:
+//     UPSERT INTO abc (col1, col2, ...) <input-expr>
 //
-//   2. Target columns are implicitly derived:
-//        UPSERT INTO abc <input-expr>
+//  2. Target columns are implicitly derived:
+//     UPSERT INTO abc <input-expr>
 //
 // In case #1, only the columns that were specified by the user will be updated.
 // In case #2, all non-mutation columns in the table will be updated.
@@ -846,9 +899,9 @@ func (mb *mutationBuilder) buildInputForUpsert(
 // updated. This can have an impact in unusual cases where equal SQL values have
 // different representations. For example:
 //
-//   CREATE TABLE abc (a DECIMAL PRIMARY KEY, b DECIMAL)
-//   INSERT INTO abc VALUES (1, 2.0)
-//   UPSERT INTO abc VALUES (1.0, 2)
+//	CREATE TABLE abc (a DECIMAL PRIMARY KEY, b DECIMAL)
+//	INSERT INTO abc VALUES (1, 2.0)
+//	UPSERT INTO abc VALUES (1.0, 2)
 //
 // The UPSERT statement will update the value of column "b" from 2 => 2.0, but
 // will not modify column "a".
@@ -883,7 +936,7 @@ func (mb *mutationBuilder) setUpsertCols(insertCols tree.NameList) {
 
 // buildUpsert constructs an Upsert operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildUpsert(returning *tree.ReturningExprs) {
 	// Merge input insert and update columns using CASE expressions.
 	mb.projectUpsertColumns()
 
@@ -916,6 +969,8 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 
 	mb.buildFKChecksForUpsert()
 
+	mb.buildRowLevelAfterTriggers(opt.InsertOp)
+
 	private := mb.makeMutationPrivate(returning != nil)
 	mb.outScope.expr = mb.b.factory.ConstructUpsert(
 		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
@@ -928,16 +983,16 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 // inserted into the target table, or else used to update an existing row,
 // depending on whether the canary column is null. For example:
 //
-//   UPSERT INTO ab VALUES (ins_a, ins_b) ON CONFLICT (a) DO UPDATE SET b=upd_b
+//	UPSERT INTO ab VALUES (ins_a, ins_b) ON CONFLICT (a) DO UPDATE SET b=upd_b
 //
 // will cause the columns to be projected:
 //
-//   SELECT
-//     fetch_a,
-//     fetch_b,
-//     CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
-//     CASE WHEN fetch_b IS NULL ins_b ELSE upd_b END AS ups_b,
-//   FROM (SELECT ins_a, ins_b, upd_b, fetch_a, fetch_b FROM ...)
+//	SELECT
+//	  fetch_a,
+//	  fetch_b,
+//	  CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
+//	  CASE WHEN fetch_b IS NULL ins_b ELSE upd_b END AS ups_b,
+//	FROM (SELECT ins_a, ins_b, upd_b, fetch_a, fetch_b FROM ...)
 //
 // For each column, a CASE expression is created that toggles between the insert
 // and update values depending on whether the canary column is null. These
@@ -1007,25 +1062,22 @@ func (mb *mutationBuilder) projectUpsertColumns() {
 	mb.outScope = projectionsScope
 }
 
-// mapPublicColumnNamesToOrdinals returns the set of ordinal positions within
-// the target table that correspond to the given names. Mutation and system
-// columns are ignored.
-func (mb *mutationBuilder) mapPublicColumnNamesToOrdinals(names tree.NameList) util.FastIntSet {
-	var ords util.FastIntSet
-	for _, name := range names {
-		found := false
-		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-			tabCol := mb.tab.Column(i)
-			if tabCol.ColName() == name && !tabCol.IsMutation() && tabCol.Kind() != cat.System {
-				ords.Add(i)
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			panic(colinfo.NewUndefinedColumnError(string(name)))
-		}
+// buildOnConflictWhereClause adds a filter from the ON CONFLICT WHERE clause.
+// The filter applies only to conflicting rows, as indicated by the canary
+// column.
+func (mb *mutationBuilder) buildOnConflictWhereClause(
+	whereClause *tree.Where, canaryCol tree.TypedExpr,
+) {
+	where := &tree.Where{
+		Type: whereClause.Type,
+		Expr: &tree.OrExpr{
+			Left: &tree.ComparisonExpr{
+				Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
+				Left:     canaryCol,
+				Right:    tree.DNull,
+			},
+			Right: whereClause.Expr,
+		},
 	}
-	return ords
+	mb.b.buildWhere(where, mb.outScope)
 }

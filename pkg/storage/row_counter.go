@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -14,14 +9,15 @@ import (
 	"bytes"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 )
 
 // RowCounter is a helper that counts how many distinct rows appear in the KVs
-// that is is shown via `Count`. Note: the `DataSize` field of the BulkOpSummary
+// that is shown via `Count`. Note: the `DataSize` field of the BulkOpSummary
 // is *not* populated by this and should be set separately.
 type RowCounter struct {
-	roachpb.BulkOpSummary
+	kvpb.BulkOpSummary
 	prev roachpb.Key
 }
 
@@ -63,13 +59,7 @@ func (r *RowCounter) Count(key roachpb.Key) error {
 	if r.EntryCounts == nil {
 		r.EntryCounts = make(map[uint64]int64)
 	}
-	r.EntryCounts[roachpb.BulkOpSummaryID(uint64(tableID), uint64(indexID))]++
-
-	if indexID == 1 {
-		r.DeprecatedRows++
-	} else {
-		r.DeprecatedIndexEntries++
-	}
+	r.EntryCounts[kvpb.BulkOpSummaryID(uint64(tableID), uint64(indexID))]++
 
 	return nil
 }

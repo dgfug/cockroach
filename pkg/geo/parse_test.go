@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geo
 
@@ -32,7 +27,7 @@ func TestParseWKB(t *testing.T) {
 			[]byte("\x01\x01\x00\x00\x20\xA4\x0F\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\xf0\x3f"),
 			4326,
 			geopb.SpatialObject{},
-			"wkb: unknown type: 536870913",
+			"error parsing WKB: wkb: unknown type: 536870913",
 		},
 		{
 			"Normal WKB should take the SRID",
@@ -355,7 +350,7 @@ func TestParseGeometry(t *testing.T) {
 		{
 			"invalid",
 			Geometry{},
-			`syntax error: invalid keyword at line 1, pos 0
+			`error parsing EWKT: syntax error: invalid keyword at line 1, pos 0
 LINE 1: invalid
         ^`,
 		},
@@ -571,7 +566,7 @@ func TestParseGeography(t *testing.T) {
 		{
 			"invalid",
 			Geography{},
-			`syntax error: invalid keyword at line 1, pos 0
+			`error parsing EWKT: syntax error: invalid keyword at line 1, pos 0
 LINE 1: invalid
         ^`,
 		},
@@ -642,6 +637,17 @@ func TestParseHash(t *testing.T) {
 				Max: -120.9375,
 			},
 		}},
+		// In PostGIS the parsing is case-insensitive.
+		{"F", 1, geohash.Box{
+			Lat: geohash.Range{
+				Min: 45,
+				Max: 90,
+			},
+			Lon: geohash.Range{
+				Min: -90,
+				Max: -45,
+			},
+		}},
 	}
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("%s[:%d]", tc.h, tc.p), func(t *testing.T) {
@@ -664,7 +670,7 @@ func TestParseHash(t *testing.T) {
 		{
 			"-",
 			10,
-			`geohash decode '-': invalid character at index 0`,
+			`invalid GeoHash: geohash decode '-': invalid character at index 0`,
 		},
 	}
 	for _, tc := range errorCases {

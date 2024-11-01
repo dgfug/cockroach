@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
@@ -18,14 +13,16 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/unique"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,6 +61,9 @@ func TestJSONOrdering(t *testing.T) {
 	// We test here that every element in order sorts before every one that comes
 	// after it, and is equal to itself.
 	sources := []string{
+		// In Postgres's sorting rules, the empty array comes before everything,
+		// even null.
+		`[]`,
 		`null`,
 		`"a"`,
 		`"aa"`,
@@ -74,10 +74,8 @@ func TestJSONOrdering(t *testing.T) {
 		`100`,
 		`false`,
 		`true`,
-		// In Postgres's sorting rules, the empty array comes before everything (even null),
-		// so this is a departure.
-		// Shorter arrays sort before longer arrays (this is the same as in Postgres).
-		`[]`,
+		// Shorter arrays sort before longer arrays (this is the same as in
+		// Postgres).
 		`[1]`,
 		`[2]`,
 		`[1, 2]`,
@@ -86,8 +84,9 @@ func TestJSONOrdering(t *testing.T) {
 		`{}`,
 		`{"a": 1}`,
 		`{"a": 2}`,
-		// In Postgres, keys which are shorter sort before keys which are longer. This
-		// is not true for us (right now). TODO(justin): unclear if it should be.
+		// In Postgres, keys which are shorter sort before keys which are
+		// longer. This is not true for us (right now).
+		// TODO(justin): unclear if it should be.
 		`{"aa": 1}`,
 		`{"b": 1}`,
 		`{"b": 2}`,
@@ -145,6 +144,17 @@ func TestJSONOrdering(t *testing.T) {
 	}
 }
 
+// parseJSONImpls lists set of parse json implementation configurations.
+// This is done as a slice to ensure stable ordering when iterating.
+var parseJSONImpls = []struct {
+	name string
+	typ  parseJSONImplType
+	opts []ParseOption
+}{
+	{name: "gostd", typ: useStdGoJSON, opts: []ParseOption{WithGoStandardParser()}},
+	{name: "lexer", typ: useFastJSONParser, opts: []ParseOption{WithFastJSONParser()}},
+}
+
 func TestJSONRoundTrip(t *testing.T) {
 	testCases := []string{
 		`1`,
@@ -156,9 +166,9 @@ func TestJSONRoundTrip(t *testing.T) {
 		`true`,
 		` true `,
 		`
-
-        true
-        `,
+		
+		  true
+		  `,
 		`false`,
 		`"hello"`,
 		`"hel\"\n\r\tlo"`,
@@ -210,75 +220,231 @@ func TestJSONRoundTrip(t *testing.T) {
 		`"\uffff"`,
 		`"\\"`,
 		`"\""`,
-		// We don't expect to get any invalid UTF8, but check one anyway. We could do
-		// a validation that the input is valid UTF8, but that seems wasteful when it
-		// should be checked higher up.
-		string([]byte{'"', 0xa7, '"'}),
 		`[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]`,
+		string([]byte{'"', 0x7f, '"'}), // DEL character does not need escaping.
+		string([]byte{'"', 0x7F, '"'}), // DEL character does not need escaping.
 	}
-	for i, tc := range testCases {
-		j, err := ParseJSON(tc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// We don't include the actual string here because TeamCity doesn't handle
-		// test names with emojis in them well.
-		runDecodedAndEncoded(t, fmt.Sprintf("%d", i), j, func(t *testing.T, j JSON) {
-			s := j.String()
 
-			j2, err := ParseJSON(s)
-			if err != nil {
-				t.Fatalf("error while parsing %v: %s", s, err)
+	// Add 2 more tests with random JSON containing large strings.
+	// We want to make sure that we exercise code that reads blocks
+	// of data in memory.
+	rng, _ := randutil.NewTestRand()
+	testCases = append(testCases,
+		jsonString(randomJSONString(rng, randConfig{maxLen: 1 << 13})).String(),
+		jsonString(randomJSONString(rng, randConfig{maxLen: 1 << 13, escapeProb: 0.25})).String(),
+	)
+
+	for _, impl := range parseJSONImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			for i, tc := range testCases {
+				j, err := ParseJSON(tc, impl.opts...)
+				if err != nil {
+					t.Fatal(err, tc)
+				}
+				// We don't include the actual string here because TeamCity doesn't handle
+				// test names with emojis in them well.
+				runDecodedAndEncoded(t, fmt.Sprintf("%d", i), j, func(t *testing.T, j JSON) {
+					s := j.String()
+					j2, err := ParseJSON(s, impl.opts...)
+					if err != nil {
+						t.Fatalf("error while parsing %v: %s", s, err)
+					}
+					c, err := j.Compare(j2)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if c != 0 {
+						t.Fatalf("%v should equal %v", tc, s)
+					}
+					s2 := j2.String()
+					if s != s2 {
+						t.Fatalf("%v should equal %v", s, s2)
+					}
+				})
 			}
-			c, err := j.Compare(j2)
+		})
+	}
+
+	for _, impl := range parseJSONImpls {
+		t.Run(fmt.Sprintf("invalid utf/%s", impl.name), func(t *testing.T) {
+			// We don't expect to get any invalid UTF8, but check one anyway. We could do
+			// a validation that the input is valid UTF8, but that seems wasteful when it
+			// should be checked higher up.
+			invalid := string([]byte{'"', 0xa7, '"'})
+
+			j, err := ParseJSON(invalid, impl.opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if c != 0 {
-				t.Fatalf("%v should equal %v", tc, s)
-			}
-			s2 := j2.String()
-			if s != s2 {
-				t.Fatalf("%v should equal %v", s, s2)
-			}
+
+			expect := string([]rune{'"', utf8.RuneError, '"'})
+			runDecodedAndEncoded(t, "invalid utf", j, func(t *testing.T, j JSON) {
+				j2, err := ParseJSON(j.String())
+				if err != nil {
+					t.Fatalf("error while parsing %v: %s", j.String(), err)
+				}
+				require.Equal(t, expect, j2.String())
+			})
 		})
 	}
 }
 
 func TestJSONErrors(t *testing.T) {
-	testCases := []struct {
-		input string
-		msg   string
-	}{
-		{`true false`, `trailing characters after JSON document`},
-		{`trues`, `trailing characters after JSON document`},
-		{`1 2 3`, `trailing characters after JSON document`},
+	type testCaseDef struct {
+		input     string
+		implName  string
+		opts      []ParseOption
+		expectErr string
+	}
+	testCase := func(input, expectErr string, impl parseJSONImplType) testCaseDef {
+		return testCaseDef{
+			input:     input,
+			implName:  parseJSONImpls[impl].name,
+			opts:      parseJSONImpls[impl].opts,
+			expectErr: expectErr,
+		}
+	}
+	trailingChars := errTrailingCharacters.Error()
+
+	testCases := []testCaseDef{
+		testCase(`true false`, trailingChars, useStdGoJSON),
+		testCase(`true false`, trailingChars, useFastJSONParser),
+		testCase(`trues`, trailingChars, useStdGoJSON),
+		testCase(`trues`, trailingChars, useFastJSONParser),
+		testCase(`1 2 3`, trailingChars, useStdGoJSON),
+		testCase(`1 2 3`, trailingChars, useFastJSONParser),
+		testCase(`[1, 2, 3]]`, trailingChars, useStdGoJSON),
+		testCase(`[1, 2, 3]]`, trailingChars, useFastJSONParser),
+		testCase(`[1, 2, 3]   }   `, trailingChars, useStdGoJSON),
+		testCase(`[1, 2, 3]   }   `, trailingChars, useFastJSONParser),
 		// Here the decoder just grabs the 0 and leaves the 1. JSON numbers can't have
 		// leading 0s.
-		{`01`, `trailing characters after JSON document`},
-		{`{foo: 1}`, `invalid character 'f' looking for beginning of object key string`},
-		{`{'foo': 1}`, `invalid character '\'' looking for beginning of object key string`},
-		{`{"foo": 01}`, `invalid character '1' after object key:value pair`},
-		{`{`, `unexpected EOF`},
-		{`"\v"`, `invalid character 'v' in string escape code`},
-		{`"\x00"`, `invalid character 'x' in string escape code`},
-		{string([]byte{'"', '\n', '"'}), `invalid character`},
-		{string([]byte{'"', 8, '"'}), `invalid character`},
+		testCase(`01`, trailingChars, useStdGoJSON),
+		testCase(`01`, trailingChars, useFastJSONParser),
+		testCase(`--01`, `invalid character '-' in numeric literal`, useStdGoJSON),
+		testCase(`--01`, `invalid JSON token`, useFastJSONParser),
+		testCase(`-`, `unexpected EOF`, useStdGoJSON),
+		testCase(`-`, `unable to decode JSON`, useFastJSONParser),
+
+		testCase(`{foo: 1}`,
+			`invalid character 'f' looking for beginning of object key string`, useStdGoJSON),
+		testCase(`{foo: 1}`, `
+...|{foo: 1}|...
+...|.^......|...: invalid JSON token`, useFastJSONParser),
+
+		testCase(`{'foo': 1}`,
+			`invalid character '\\'' looking for beginning of object key string`, useStdGoJSON),
+		testCase(`{'foo': 1}`, `
+...|{'foo': 1}|...
+...|.^.........|...: invalid JSON token`, useFastJSONParser),
+
+		testCase(`{"foo": 01}`,
+			`invalid character '1' after object key:value pair`, useStdGoJSON),
+		testCase(`{"foo": 01}`, `
+...|{"foo": 01}|...
+...|.........^.|...: stateObjectComma: expecting comma`, useFastJSONParser),
+
+		testCase(`{`, `unexpected EOF`, useStdGoJSON),
+		testCase(`{`, `unable to decode JSON`, useFastJSONParser),
+
+		testCase(`"\v"`, `invalid character 'v' in string escape code`, useStdGoJSON),
+		testCase(`"\v"`, `
+...|"\v"|...
+...|^...|...: invalid string literal token`, useFastJSONParser),
+
+		testCase(`"\x00"`, `invalid character 'x' in string escape code`, useStdGoJSON),
+		testCase(`"\x00"`, `
+...|"\x00"|...
+...|^.....|...: invalid string literal token`, useFastJSONParser),
+
+		testCase(string([]byte{'"', '\n', '"'}), `invalid character`, useStdGoJSON),
+		testCase(string([]byte{'"', '\n', '"'}), `while decoding 3 bytes at offset 0`, useFastJSONParser),
+
+		testCase(string([]byte{'"', 8, '"'}), `invalid character`, useStdGoJSON),
+		testCase(string([]byte{'"', 8, '"'}), `while decoding 3 bytes at offset 0`, useFastJSONParser),
+
+		testCase(`{"a":["b","c"]}]`, trailingChars, useStdGoJSON),
+		testCase(`{"a":["b","c"]}]`, trailingChars, useFastJSONParser),
+
+		testCase(`\u`, `unable to decode JSON: invalid character .* looking for beginning of value`, useStdGoJSON),
+		testCase(`\u`, `invalid JSON token`, useFastJSONParser),
+		testCase(`\u1`, `unable to decode JSON: invalid character .* looking for beginning of value`, useStdGoJSON),
+		testCase(`\u1`, `invalid JSON token`, useFastJSONParser),
+		testCase(`\u111z`, `unable to decode JSON: invalid character .* looking for beginning of value`, useStdGoJSON),
+		testCase(`\u111z`, `invalid JSON token`, useFastJSONParser),
+
+		// Trailing "," should not be allowed.
+		testCase(`[,]`, `invalid character ','`, useStdGoJSON),
+		testCase(`[,]`, `unexpected comma`, useFastJSONParser),
+		testCase(`[1,]`, `invalid character ']'`, useStdGoJSON),
+		testCase(`[1,]`, `unexpected comma`, useFastJSONParser),
+		testCase(`[1, [2,]]`, `invalid character ']'`, useStdGoJSON),
+		testCase(`[1, [2,]]`, `unexpected comma`, useFastJSONParser),
+		testCase(`[1, [2, 3],]`, `invalid character ']'`, useStdGoJSON),
+		testCase(`[1, [2, 3],]`, `unexpected comma`, useFastJSONParser),
+		testCase(`{"k":,}`, `invalid character ','`, useStdGoJSON),
+		testCase(`{"k":,}`, `unexpected object token ","`, useFastJSONParser),
+		testCase(`{"k": [1,]}`, `invalid character ']'`, useStdGoJSON),
+		testCase(`{"k": [1,]}`, `unexpected comma`, useFastJSONParser),
+		testCase(`{"b": false, }`, `invalid character '}' looking for beginning of object key`, useStdGoJSON),
+		testCase(`{"b": false, }`, `stateObjectString: missing string key`, useFastJSONParser),
+		testCase(`[1, {"a":"b",}]`, `invalid character '}'`, useStdGoJSON),
+		testCase(`[1, {"a":"b",}]`, `stateObjectString: missing string key`, useFastJSONParser),
+		testCase(`[1, {"a":"b"},]`, `invalid character ']'`, useStdGoJSON),
+		testCase(`[1, {"a":"b"},]`, `unexpected comma`, useFastJSONParser),
 	}
 	for _, tc := range testCases {
-		t.Run(tc.input, func(t *testing.T) {
-			j, err := ParseJSON(tc.input)
+		t.Run(fmt.Sprintf("%s/%s", tc.implName, tc.input), func(t *testing.T) {
+			j, err := ParseJSON(tc.input, tc.opts...)
 			if err == nil {
-				t.Fatalf("expected parsing '%v' to error with '%s', but no error occurred and parsed as %s", tc.input, tc.msg, j)
+				t.Fatalf("expected parsing '%v' to error with '%s', but no error occurred and parsed as %s",
+					tc.input, tc.expectErr, j)
 			}
-			if !strings.Contains(err.Error(), tc.msg) {
-				t.Fatalf("expected error message to be '%s', but was '%s'", tc.msg, err.Error())
-			}
+			require.Regexp(t, tc.expectErr, err)
 			if !pgerror.HasCandidateCode(err) {
 				t.Fatalf("expected parsing '%s' to provide a pg error code", tc.input)
 			}
 		})
 	}
+}
+
+// Not a true fuzz test, but we'll generate some number of random JSON objects,
+// with or without errors, and attempt to parse them using both standard and
+// fast parsers.
+func TestParseJSONFuzz(t *testing.T) {
+	const errProb = 0.005         // ~0.5% chance of an error.
+	const fuzzTargetErrors = 1000 // ~90k inputs.
+
+	rng, seed := randutil.NewTestRand()
+	t.Log("test seed ", seed)
+	numInputs := 0
+	for numErrors := 0; numErrors < fuzzTargetErrors; {
+		inputJson, err := RandGen(rng)
+		require.NoError(t, err)
+
+		jsonStr := AsStringWithErrorChance(inputJson, rng, errProb)
+		numInputs++
+
+		fastJson, fastErr := ParseJSON(jsonStr, WithFastJSONParser())
+		stdJson, stdErr := ParseJSON(jsonStr, WithGoStandardParser())
+
+		if fastErr == nil && stdErr == nil {
+			// No errors -- both JSONs must be identical.
+			// Note: we can't compare against inputJSON since jsonStr (generated with
+			// error probability), sometimes drops array/object elements.
+			eq, err := fastJson.Compare(stdJson)
+			require.NoError(t, err)
+			require.Equal(t, 0, eq, "unequal JSON objects: std<%s> fast<%s>",
+				asString(stdJson), asString(fastJson))
+		} else {
+			numErrors++
+			// Both parsers must produce an error.
+			require.Errorf(t, fastErr, "expected fast parser error for input: %s", jsonStr)
+			require.Errorf(t, stdErr, "expected std parser error for input: %s", jsonStr)
+		}
+	}
+
+	t.Logf("Executed fuzz test against %d inputs", numInputs)
 }
 
 func TestJSONSize(t *testing.T) {
@@ -447,31 +613,29 @@ func TestArrayBuilderWithCounter(t *testing.T) {
 }
 
 func TestNewObjectBuilderWithCounter(t *testing.T) {
-	json := jsonTestShorthand
-
 	testCases := []struct {
 		input    [][]interface{}
 		expected JSON
 	}{
 		{
 			input:    [][]interface{}{},
-			expected: json(`{}`),
+			expected: parseJSON(t, `{}`),
 		},
 		{
 			input:    [][]interface{}{{"key1", "val1"}},
-			expected: json(`{"key1": "val1"}`),
+			expected: parseJSON(t, `{"key1": "val1"}`),
 		},
 		{
 			input:    [][]interface{}{{"key1", "val1"}, {"key2", "val2"}},
-			expected: json(`{"key1": "val1", "key2": "val2"}`),
+			expected: parseJSON(t, `{"key1": "val1", "key2": "val2"}`),
 		},
 		{
 			input:    [][]interface{}{{"key1", []interface{}{1, 2, 3, 4}}},
-			expected: json(`{"key1": [1, 2, 3, 4]}`),
+			expected: parseJSON(t, `{"key1": [1, 2, 3, 4]}`),
 		},
 		{
 			input:    [][]interface{}{{"key1", nil}, {"key2", 1}, {"key3", -1.27}, {"key4", "abcd"}},
-			expected: json(`{"key1": null, "key2": 1, "key3": -1.27, "key4": "abcd"}`),
+			expected: parseJSON(t, `{"key1": null, "key2": 1, "key3": -1.27, "key4": "abcd"}`),
 		},
 	}
 
@@ -501,6 +665,17 @@ func TestNewObjectBuilderWithCounter(t *testing.T) {
 }
 
 func TestBuildJSONObject(t *testing.T) {
+	checkJSONObjectsEqual := func(t *testing.T, expected, found JSON) {
+		t.Helper()
+		c, err := found.Compare(expected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c != 0 {
+			t.Fatalf("expected %v to equal %v", found, expectError)
+		}
+	}
+
 	testCases := []struct {
 		input []string
 	}{
@@ -523,28 +698,62 @@ func TestBuildJSONObject(t *testing.T) {
 				t.Fatal(err)
 			}
 			result := b.Build()
-			c, err := result.Compare(expectedResult)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if c != 0 {
-				t.Fatalf("expected %v to equal %v", result, expectedResult)
-			}
+			checkJSONObjectsEqual(t, expectedResult, result)
+
+			t.Run("fixedKeys", func(t *testing.T) {
+				uniqueKeys := func() (keys []string) {
+					for k := range m {
+						keys = append(keys, k)
+					}
+					return keys
+				}()
+
+				fkb, err := NewFixedKeysObjectBuilder(uniqueKeys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := 0; i < 5; i++ {
+					for k, v := range m {
+						if err := fkb.Set(k, v.(JSON)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					result, err := fkb.Build()
+					if err != nil {
+						t.Fatal(err)
+					}
+					checkJSONObjectsEqual(t, expectedResult, result)
+				}
+			})
 		})
 	}
 }
 
-func jsonTestShorthand(s string) JSON {
-	j, err := ParseJSON(s)
-	if err != nil {
-		panic(fmt.Sprintf("bad json: %s", s))
-	}
+func TestBuildFixedKeysJSONObjectErrors(t *testing.T) {
+	t.Run("require_unique_keys", func(t *testing.T) {
+		_, err := NewFixedKeysObjectBuilder([]string{"a", "b", "c", "a", "d"})
+		require.Error(t, err)
+	})
+	t.Run("requires_all_keys_set", func(t *testing.T) {
+		b, err := NewFixedKeysObjectBuilder([]string{"a", "b", "c"})
+		require.NoError(t, err)
+		require.NoError(t, b.Set("a", jsonNull{}))
+		require.NoError(t, b.Set("b", jsonNull{}))
+		_, err = b.Build()
+		require.Error(t, err)
+	})
+}
+
+func parseJSON(tb testing.TB, s string) JSON {
+	tb.Helper()
+	// Pick random implementation to use.
+	impl := parseJSONImpls[rand.Intn(len(parseJSONImpls))]
+	j, err := ParseJSON(s, impl.opts...)
+	require.NoError(tb, err, "using %s implementation to parse `%s`", impl.name, s)
 	return j
 }
 
 func TestJSONFetch(t *testing.T) {
-	// Shorthand for tests.
-	json := jsonTestShorthand
 	cases := map[string][]struct {
 		key      string
 		expected JSON
@@ -555,14 +764,14 @@ func TestJSONFetch(t *testing.T) {
 		},
 		`{"foo": 1, "bar": "baz"}`: {
 			{``, nil},
-			{`foo`, json(`1`)},
-			{`bar`, json(`"baz"`)},
+			{`foo`, parseJSON(t, `1`)},
+			{`bar`, parseJSON(t, `"baz"`)},
 			{`baz`, nil},
 		},
 		`{"foo": [1, 2, 3], "bar": {"a": "b"}}`: {
 			{``, nil},
-			{`foo`, json(`[1, 2, 3]`)},
-			{`bar`, json(`{"a": "b"}`)},
+			{`foo`, parseJSON(t, `[1, 2, 3]`)},
+			{`bar`, parseJSON(t, `{"a": "b"}`)},
 			{`baz`, nil},
 		},
 		`["a"]`: {{``, nil}, {`0`, nil}, {`a`, nil}},
@@ -663,7 +872,6 @@ func TestJSONFetchFromBig(t *testing.T) {
 }
 
 func TestJSONFetchIdx(t *testing.T) {
-	json := jsonTestShorthand
 	cases := map[string][]struct {
 		idx      int
 		expected JSON
@@ -674,33 +882,33 @@ func TestJSONFetchIdx(t *testing.T) {
 		`["a", "b", "c"]`: {
 			// Negative indices count from the back.
 			{-4, nil},
-			{-3, json(`"a"`)},
-			{-2, json(`"b"`)},
-			{-1, json(`"c"`)},
-			{0, json(`"a"`)},
-			{1, json(`"b"`)},
-			{2, json(`"c"`)},
+			{-3, parseJSON(t, `"a"`)},
+			{-2, parseJSON(t, `"b"`)},
+			{-1, parseJSON(t, `"c"`)},
+			{0, parseJSON(t, `"a"`)},
+			{1, parseJSON(t, `"b"`)},
+			{2, parseJSON(t, `"c"`)},
 			{3, nil},
 		},
 		`[1, 2, {"foo":"bar"}]`: {
-			{0, json(`1`)},
-			{1, json(`2`)},
-			{2, json(`{"foo":"bar"}`)},
+			{0, parseJSON(t, `1`)},
+			{1, parseJSON(t, `2`)},
+			{2, parseJSON(t, `{"foo":"bar"}`)},
 		},
 		// Trigger the offset-value
 		`[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40]`: {
-			{0, json(`0`)},
-			{1, json(`1`)},
-			{2, json(`2`)},
-			{10, json(`10`)},
-			{35, json(`35`)},
+			{0, parseJSON(t, `0`)},
+			{1, parseJSON(t, `1`)},
+			{2, parseJSON(t, `2`)},
+			{10, parseJSON(t, `10`)},
+			{35, parseJSON(t, `35`)},
 		},
 		// Scalar values can be indexed.
-		`null`:  {{-2, nil}, {-1, json(`null`)}, {0, json(`null`)}, {1, nil}},
-		`true`:  {{-2, nil}, {-1, json(`true`)}, {0, json(`true`)}, {1, nil}},
-		`false`: {{-2, nil}, {-1, json(`false`)}, {0, json(`false`)}, {1, nil}},
-		`"foo"`: {{-2, nil}, {-1, json(`"foo"`)}, {0, json(`"foo"`)}, {1, nil}},
-		`123`:   {{-2, nil}, {-1, json(`123`)}, {0, json(`123`)}, {1, nil}},
+		`null`:  {{-2, nil}, {-1, parseJSON(t, `null`)}, {0, parseJSON(t, `null`)}, {1, nil}},
+		`true`:  {{-2, nil}, {-1, parseJSON(t, `true`)}, {0, parseJSON(t, `true`)}, {1, nil}},
+		`false`: {{-2, nil}, {-1, parseJSON(t, `false`)}, {0, parseJSON(t, `false`)}, {1, nil}},
+		`"foo"`: {{-2, nil}, {-1, parseJSON(t, `"foo"`)}, {0, parseJSON(t, `"foo"`)}, {1, nil}},
+		`123`:   {{-2, nil}, {-1, parseJSON(t, `123`)}, {0, parseJSON(t, `123`)}, {1, nil}},
 	}
 
 	for k, tests := range cases {
@@ -803,6 +1011,30 @@ func TestJSONExists(t *testing.T) {
 			})
 		}
 	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		left, err := Random(20, rng)
+		require.NoError(t, err)
+		right := randomJSONString(rng, defaultRandConfig)
+		require.NoError(t, err)
+
+		var exists bool
+		exists, err = left.Exists(right)
+		require.NoError(t, err)
+
+		// Test that we get the same result with the encoded form of the JSON.
+		b, err := EncodeJSON(nil, left)
+		require.NoError(t, err)
+		j, err := FromEncoding(b)
+		require.NoError(t, err)
+
+		existsEncoded, err := j.Exists(right)
+		require.NoError(t, err)
+
+		require.Equal(t, exists, existsEncoded, "expected encoded/non-encoded Exists to match but didn't: %s %s", left, right)
+	}
 }
 
 func TestJSONStripNulls(t *testing.T) {
@@ -871,7 +1103,6 @@ func TestJSONStripNulls(t *testing.T) {
 }
 
 func TestJSONFetchPath(t *testing.T) {
-	json := jsonTestShorthand
 	cases := map[string][]struct {
 		path     []string
 		expected JSON
@@ -880,36 +1111,36 @@ func TestJSONFetchPath(t *testing.T) {
 			{[]string{`a`}, nil},
 		},
 		`{"foo": "bar"}`: {
-			{[]string{`foo`}, json(`"bar"`)},
+			{[]string{`foo`}, parseJSON(t, `"bar"`)},
 			{[]string{`goo`}, nil},
 		},
 		`{"foo": {"bar": "baz"}}`: {
-			{[]string{`foo`}, json(`{"bar": "baz"}`)},
-			{[]string{`foo`, `bar`}, json(`"baz"`)},
+			{[]string{`foo`}, parseJSON(t, `{"bar": "baz"}`)},
+			{[]string{`foo`, `bar`}, parseJSON(t, `"baz"`)},
 			{[]string{`foo`, `baz`}, nil},
 		},
 		`{"foo": [1, 2, {"bar": "baz"}]}`: {
-			{[]string{`foo`}, json(`[1, 2, {"bar": "baz"}]`)},
-			{[]string{`foo`, `0`}, json(`1`)},
-			{[]string{`foo`, `1`}, json(`2`)},
-			{[]string{`foo`, `2`}, json(`{"bar": "baz"}`)},
-			{[]string{`foo`, `2`, "bar"}, json(`"baz"`)},
-			{[]string{`foo`, `-1`, "bar"}, json(`"baz"`)},
+			{[]string{`foo`}, parseJSON(t, `[1, 2, {"bar": "baz"}]`)},
+			{[]string{`foo`, `0`}, parseJSON(t, `1`)},
+			{[]string{`foo`, `1`}, parseJSON(t, `2`)},
+			{[]string{`foo`, `2`}, parseJSON(t, `{"bar": "baz"}`)},
+			{[]string{`foo`, `2`, "bar"}, parseJSON(t, `"baz"`)},
+			{[]string{`foo`, `-1`, "bar"}, parseJSON(t, `"baz"`)},
 			{[]string{`foo`, `3`}, nil},
 			{[]string{`foo`, `3`, "bar"}, nil},
 		},
 		`[1, 2, [1, 2, [1, 2]]]`: {
 			{[]string{`"foo"`}, nil},
-			{[]string{`0`}, json(`1`)},
-			{[]string{`1`}, json(`2`)},
+			{[]string{`0`}, parseJSON(t, `1`)},
+			{[]string{`1`}, parseJSON(t, `2`)},
 			{[]string{`0`, `0`}, nil},
-			{[]string{`2`}, json(`[1, 2, [1, 2]]`)},
-			{[]string{`2`, `0`}, json(`1`)},
-			{[]string{`2`, `1`}, json(`2`)},
-			{[]string{`2`, `2`}, json(`[1, 2]`)},
-			{[]string{`2`, `2`, `0`}, json(`1`)},
-			{[]string{`2`, `2`, `1`}, json(`2`)},
-			{[]string{`-1`, `-1`, `-1`}, json(`2`)},
+			{[]string{`2`}, parseJSON(t, `[1, 2, [1, 2]]`)},
+			{[]string{`2`, `0`}, parseJSON(t, `1`)},
+			{[]string{`2`, `1`}, parseJSON(t, `2`)},
+			{[]string{`2`, `2`}, parseJSON(t, `[1, 2]`)},
+			{[]string{`2`, `2`, `0`}, parseJSON(t, `1`)},
+			{[]string{`2`, `2`, `1`}, parseJSON(t, `2`)},
+			{[]string{`-1`, `-1`, `-1`}, parseJSON(t, `2`)},
 		},
 	}
 
@@ -1059,15 +1290,15 @@ func TestJSONDeepSet(t *testing.T) {
 	}
 
 	for k, tests := range cases {
-		j := jsonTestShorthand(k)
+		j := parseJSON(t, k)
 		for _, tc := range tests {
 			t.Run(fmt.Sprintf(`set(%s, %s, %s)`, k, tc.path, tc.to), func(t *testing.T) {
-				result, err := DeepSet(j, tc.path, jsonTestShorthand(tc.to), tc.createMissing)
+				result, err := DeepSet(j, tc.path, parseJSON(t, tc.to), tc.createMissing)
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				cmp, err := result.Compare(jsonTestShorthand(tc.expected))
+				cmp, err := result.Compare(parseJSON(t, tc.expected))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1081,7 +1312,6 @@ func TestJSONDeepSet(t *testing.T) {
 }
 
 func TestJSONRemoveString(t *testing.T) {
-	json := jsonTestShorthand
 	cases := map[string][]struct {
 		key      string
 		ok       bool
@@ -1089,22 +1319,22 @@ func TestJSONRemoveString(t *testing.T) {
 		errMsg   string
 	}{
 		`{}`: {
-			{key: ``, ok: false, expected: json(`{}`)},
-			{key: `foo`, ok: false, expected: json(`{}`)},
+			{key: ``, ok: false, expected: parseJSON(t, `{}`)},
+			{key: `foo`, ok: false, expected: parseJSON(t, `{}`)},
 		},
 		`{"foo": 1, "bar": "baz"}`: {
-			{key: ``, ok: false, expected: json(`{"foo": 1, "bar": "baz"}`)},
-			{key: `foo`, ok: true, expected: json(`{"bar": "baz"}`)},
-			{key: `bar`, ok: true, expected: json(`{"foo": 1}`)},
-			{key: `baz`, ok: false, expected: json(`{"foo": 1, "bar": "baz"}`)},
+			{key: ``, ok: false, expected: parseJSON(t, `{"foo": 1, "bar": "baz"}`)},
+			{key: `foo`, ok: true, expected: parseJSON(t, `{"bar": "baz"}`)},
+			{key: `bar`, ok: true, expected: parseJSON(t, `{"foo": 1}`)},
+			{key: `baz`, ok: false, expected: parseJSON(t, `{"foo": 1, "bar": "baz"}`)},
 		},
 		// Deleting a string key from an array never has any effect.
 		`["a", "b", "c"]`: {
-			{key: ``, ok: false, expected: json(`["a", "b", "c"]`)},
-			{key: `foo`, ok: false, expected: json(`["a", "b", "c"]`)},
-			{key: `0`, ok: false, expected: json(`["a", "b", "c"]`)},
-			{key: `1`, ok: false, expected: json(`["a", "b", "c"]`)},
-			{key: `-1`, ok: false, expected: json(`["a", "b", "c"]`)},
+			{key: ``, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
+			{key: `foo`, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
+			{key: `0`, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
+			{key: `1`, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
+			{key: `-1`, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
 		},
 		`5`:     {{key: `a`, errMsg: "cannot delete from scalar"}},
 		`"b"`:   {{key: `a`, errMsg: "cannot delete from scalar"}},
@@ -1149,7 +1379,6 @@ func TestJSONRemoveString(t *testing.T) {
 }
 
 func TestJSONRemoveIndex(t *testing.T) {
-	json := jsonTestShorthand
 	cases := map[string][]struct {
 		idx      int
 		ok       bool
@@ -1160,24 +1389,24 @@ func TestJSONRemoveIndex(t *testing.T) {
 			{idx: 0, errMsg: "cannot delete from object using integer"},
 		},
 		`["a", "b", "c"]`: {
-			{idx: -4, ok: false, expected: json(`["a", "b", "c"]`)},
-			{idx: -3, ok: true, expected: json(`["b", "c"]`)},
-			{idx: -2, ok: true, expected: json(`["a", "c"]`)},
-			{idx: -1, ok: true, expected: json(`["a", "b"]`)},
-			{idx: 0, ok: true, expected: json(`["b", "c"]`)},
-			{idx: 1, ok: true, expected: json(`["a", "c"]`)},
-			{idx: 2, ok: true, expected: json(`["a", "b"]`)},
-			{idx: 3, ok: false, expected: json(`["a", "b", "c"]`)},
+			{idx: -4, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
+			{idx: -3, ok: true, expected: parseJSON(t, `["b", "c"]`)},
+			{idx: -2, ok: true, expected: parseJSON(t, `["a", "c"]`)},
+			{idx: -1, ok: true, expected: parseJSON(t, `["a", "b"]`)},
+			{idx: 0, ok: true, expected: parseJSON(t, `["b", "c"]`)},
+			{idx: 1, ok: true, expected: parseJSON(t, `["a", "c"]`)},
+			{idx: 2, ok: true, expected: parseJSON(t, `["a", "b"]`)},
+			{idx: 3, ok: false, expected: parseJSON(t, `["a", "b", "c"]`)},
 		},
 		`[{}, {"a":"b"}, {"c":"d"}]`: {
-			{idx: 0, ok: true, expected: json(`[{"a":"b"},{"c":"d"}]`)},
-			{idx: 1, ok: true, expected: json(`[{},{"c":"d"}]`)},
-			{idx: 2, ok: true, expected: json(`[{},{"a":"b"}]`)},
+			{idx: 0, ok: true, expected: parseJSON(t, `[{"a":"b"},{"c":"d"}]`)},
+			{idx: 1, ok: true, expected: parseJSON(t, `[{},{"c":"d"}]`)},
+			{idx: 2, ok: true, expected: parseJSON(t, `[{},{"a":"b"}]`)},
 		},
 		`[]`: {
-			{idx: -1, ok: false, expected: json(`[]`)},
-			{idx: 0, ok: false, expected: json(`[]`)},
-			{idx: 1, ok: false, expected: json(`[]`)},
+			{idx: -1, ok: false, expected: parseJSON(t, `[]`)},
+			{idx: 0, ok: false, expected: parseJSON(t, `[]`)},
+			{idx: 1, ok: false, expected: parseJSON(t, `[]`)},
 		},
 		`5`:     {{idx: 0, errMsg: "cannot delete from scalar"}},
 		`"b"`:   {{idx: 0, errMsg: "cannot delete from scalar"}},
@@ -1245,13 +1474,15 @@ func TestEncodeDecodeJSONInvertedIndex(t *testing.T) {
 	}
 
 	for _, c := range testCases {
-		enc, err := EncodeInvertedIndexKeys(nil, jsonTestShorthand(c.value))
+		enc, err := EncodeInvertedIndexKeys(nil, parseJSON(t, c.value))
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		for j, path := range enc {
-			str := encoding.PrettyPrintValue(nil, path, "/")
+			var buf redact.StringBuilder
+			encoding.PrettyPrintValue(&buf, nil, path, "/")
+			str := buf.String()
 			if str != c.expEnc[j] {
 				t.Errorf("unexpected encoding mismatch for %v. expected [%s], got [%s]",
 					c.value, c.expEnc[j], str)
@@ -1318,7 +1549,7 @@ func TestEncodeJSONInvertedIndex(t *testing.T) {
 			nil)}},
 		{`[["a"]]`, [][]byte{bytes.Join([][]byte{jsonPrefix, arrayPrefix, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "a")},
 			nil)}},
-		{`{"a":["b","c"]}]`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "b")}, nil),
+		{`{"a":["b","c"]}`, [][]byte{bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "b")}, nil),
 			bytes.Join([][]byte{jsonPrefix, aEncoding, objectSeparator, arrayPrefix, terminator, encoding.EncodeStringAscending(nil, "c")}, nil)}},
 		{`[]`, [][]byte{bytes.Join([][]byte{jsonPrefix, terminator, emptyArrayEncoding},
 			nil)}},
@@ -1334,9 +1565,9 @@ func TestEncodeJSONInvertedIndex(t *testing.T) {
 	}
 
 	for _, c := range testCases {
-		enc, err := EncodeInvertedIndexKeys(nil, jsonTestShorthand(c.value))
+		enc, err := EncodeInvertedIndexKeys(nil, parseJSON(t, c.value))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatal(err, c.value)
 		}
 		// Make sure that the expected encoding slice is sorted, as well as the
 		// output of the function under test, because the function under test can
@@ -1462,7 +1693,7 @@ func TestEncodeContainingJSONInvertedIndexSpans(t *testing.T) {
 
 	// Run pre-defined test cases from above.
 	for _, c := range testCases {
-		indexedValue, value := jsonTestShorthand(c.indexedValue), jsonTestShorthand(c.value)
+		indexedValue, value := parseJSON(t, c.indexedValue), parseJSON(t, c.value)
 
 		// First check that evaluating `indexedValue @> value` matches the expected
 		// result.
@@ -1652,7 +1883,7 @@ func TestEncodeContainedJSONInvertedIndexSpans(t *testing.T) {
 
 	// Run pre-defined test cases from above.
 	for _, c := range testCases {
-		indexedValue, value := jsonTestShorthand(c.indexedValue), jsonTestShorthand(c.value)
+		indexedValue, value := parseJSON(t, c.indexedValue), parseJSON(t, c.value)
 
 		// First check that evaluating `indexedValue <@ value` matches the expected
 		// result.
@@ -1696,6 +1927,112 @@ func TestEncodeContainedJSONInvertedIndexSpans(t *testing.T) {
 	}
 }
 
+func TestEncodeExistsJSONInvertedIndexSpans(t *testing.T) {
+	testCases := []struct {
+		indexedValue string
+		value        string
+		expected     bool
+	}{
+		// This test uses EncodeInvertedIndexKeys and EncodeExistsInvertedIndexSpans
+		// to determine if the spans produced from the string key will include or
+		// excludes the keys produced by the JSON value, indicated by exists.
+		// Then, if indexedValue ? value, expected is true.
+
+		// First we test that the spans will include expected results.
+		{`{"a": "a"}`, `a`, true},
+		{`{"a": null}`, `a`, true},
+		{`{"a": []}`, `a`, true},
+		{`{"a": {}}`, `a`, true},
+		{`{"a": 3}`, `a`, true},
+		{`["a"]`, `a`, true},
+		{`["a", "a"]`, `a`, true},
+		{`["b", "a"]`, `a`, true},
+		{`"a"`, `a`, true},
+
+		// Test negative cases.
+		// The number 1 doesn't have key string-1.
+		{`1`, `1`, false},
+		// Null doesn't have key string-null.
+		{`null`, `null`, false},
+		// [] doesn't have key string-null.
+		{`[]`, `null`, false},
+		{`["a"]`, `argh`, false},
+		{`["argh"]`, `a`, false},
+		{`{}`, `null`, false},
+		{`{}`, `a`, false},
+		{`{"a":"a"}`, `argh`, false},
+		{`{"argh":"a"}`, `a`, false},
+	}
+
+	runTest := func(indexedValue JSON, value string, expected bool) {
+		keys, err := EncodeInvertedIndexKeys(nil, indexedValue)
+		require.NoError(t, err)
+
+		invertedExpr, err := EncodeExistsInvertedIndexSpans(nil, value)
+		require.NoError(t, err)
+
+		spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
+		if !ok {
+			t.Fatalf("invertedExpr %v is not a SpanExpression", invertedExpr)
+		}
+
+		// Spans should always be tight for exists.
+		if !spanExpr.Tight {
+			t.Errorf("For %s, expected tight=true, but got false", value)
+		}
+
+		// Spans should never be unique for exists.
+		if spanExpr.Unique {
+			t.Errorf("For %s, expected unique=false, but got true", value)
+		}
+
+		containsKeys, err := spanExpr.ContainsKeys(keys)
+		require.NoError(t, err)
+
+		if containsKeys != expected {
+			if expected {
+				t.Errorf("expected spans of %s to include %s but they did not", value, indexedValue)
+			} else {
+				t.Errorf("expected spans of %s not to include %s but they did", value, indexedValue)
+			}
+		}
+	}
+
+	// Run pre-defined test cases from above.
+	for _, c := range testCases {
+		indexedValue, value := parseJSON(t, c.indexedValue), c.value
+
+		// First check that evaluating `indexedValue ? value` matches the expected
+		// result.
+		actual, err := indexedValue.Exists(value)
+		require.NoError(t, err)
+		if actual != c.expected {
+			t.Fatalf(
+				"expected value of %s ? %s did not match actual value. Expected: %v. Got: %v",
+				c.indexedValue, c.value, c.expected, actual,
+			)
+		}
+		runTest(indexedValue, value, c.expected)
+	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		// Generate two random JSONs and evaluate the result of `left ? right`.
+		left, err := Random(20, rng)
+		require.NoError(t, err)
+		right := randomJSONString(rng, defaultRandConfig)
+		require.NoError(t, err)
+
+		var exists bool
+		exists, err = left.Exists(right)
+		require.NoError(t, err)
+
+		// Now check that we get the same result with the inverted index spans.
+		runTest(left, right, exists)
+	}
+}
+
 func TestNumInvertedIndexEntries(t *testing.T) {
 	testCases := []struct {
 		value    string
@@ -1721,7 +2058,7 @@ func TestNumInvertedIndexEntries(t *testing.T) {
 		{`[{"a": [1, 2], "b": 2}, {"a": [1, 3], "b": 3}]`, 5},
 	}
 	for _, c := range testCases {
-		n, err := NumInvertedIndexEntries(jsonTestShorthand(c.value))
+		n, err := NumInvertedIndexEntries(parseJSON(t, c.value))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1799,10 +2136,10 @@ func TestConcat(t *testing.T) {
 	}
 
 	for k, tcs := range cases {
-		left := jsonTestShorthand(k)
+		left := parseJSON(t, k)
 		runDecodedAndEncoded(t, k, left, func(t *testing.T, left JSON) {
 			for _, tc := range tcs {
-				right := jsonTestShorthand(tc.concatWith)
+				right := parseJSON(t, tc.concatWith)
 				runDecodedAndEncoded(t, tc.concatWith, right, func(t *testing.T, right JSON) {
 					if tc.expected == expectError {
 						result, err := left.Concat(right)
@@ -1815,7 +2152,7 @@ func TestConcat(t *testing.T) {
 							t.Fatal(err)
 						}
 
-						expectedResult := jsonTestShorthand(tc.expected)
+						expectedResult := parseJSON(t, tc.expected)
 
 						cmp, err := result.Compare(expectedResult)
 						if err != nil {
@@ -2017,10 +2354,10 @@ func TestPositiveRandomJSONContains(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !c {
-			t.Fatal(fmt.Sprintf("%s should contain %s", j, subdoc))
+			t.Fatalf("%s should contain %s", j, subdoc)
 		}
 		if !slowContains(j, subdoc) {
-			t.Fatal(fmt.Sprintf("%s should slowContains %s", j, subdoc))
+			t.Fatalf("%s should slowContains %s", j, subdoc)
 		}
 	}
 }
@@ -2095,7 +2432,7 @@ func TestPretty(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		j := jsonTestShorthand(tc.input)
+		j := parseJSON(t, tc.input)
 		runDecodedAndEncoded(t, tc.input, j, func(t *testing.T, j JSON) {
 			pretty, err := Pretty(j)
 			if err != nil {
@@ -2135,7 +2472,7 @@ func TestHasContainerLeaf(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		j := jsonTestShorthand(tc.input)
+		j := parseJSON(t, tc.input)
 		runDecodedAndEncoded(t, tc.input, j, func(t *testing.T, j JSON) {
 			result, err := j.HasContainerLeaf()
 			if err != nil {
@@ -2334,7 +2671,7 @@ func BenchmarkFetchKey(b *testing.B) {
 }
 
 func BenchmarkJSONNumInvertedIndexEntries(b *testing.B) {
-	j := jsonTestShorthand(sampleJSON)
+	j := parseJSON(b, sampleJSON)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = NumInvertedIndexEntries(j)
@@ -2418,7 +2755,7 @@ func TestJSONRemovePath(t *testing.T) {
 				if tc.ok != ok {
 					t.Fatalf("expected %t, got %t", tc.ok, ok)
 				}
-				cmp, err := result.Compare(jsonTestShorthand(tc.expected))
+				cmp, err := result.Compare(parseJSON(t, tc.expected))
 				if err != nil {
 					t.Fatal(err)
 				}

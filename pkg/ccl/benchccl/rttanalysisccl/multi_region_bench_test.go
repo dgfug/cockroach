@@ -1,22 +1,60 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysisccl
 
 import (
+	gosql "database/sql"
+	"net/url"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/bench/rttanalysis"
+	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 )
+
+const numNodes = 4
+
+// RunRoundTripBenchmarkMultiRegion sets up a multi-region db run the RoundTripBenchTestCase test cases
+// and counts how many round trips the Stmt specified by the test case performs.
+var reg = rttanalysis.NewRegistry(numNodes, rttanalysis.MakeClusterConstructor(func(
+	tb testing.TB, knobs base.TestingKnobs,
+) (*gosql.DB, *gosql.DB, func()) {
+	cluster, _, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+		tb, numNodes, knobs,
+	)
+	db := cluster.ServerConn(0)
+	// Eventlog is async, and introduces jitter in the benchmark.
+	if _, err := db.Exec("SET CLUSTER SETTING server.eventlog.enabled = false"); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE USER testuser"); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.Exec("GRANT admin TO testuser"); err != nil {
+		tb.Fatal(err)
+	}
+	url, testuserCleanup := sqlutils.PGUrl(
+		tb, cluster.Server(0).ApplicationLayer().AdvSQLAddr(), "rttanalysisccl", url.User("testuser"),
+	)
+	conn, err := gosql.Open("postgres", url.String())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return conn, nil, func() {
+		cleanup()
+		testuserCleanup()
+	}
+}))
+
+func TestBenchmarkExpectation(t *testing.T) { reg.RunExpectations(t) }
 
 const (
 	multipleTableFixture = `
-CREATE DATABASE test PRIMARY REGION "us-east1" REGIONS "us-east1", "us-east2", "us-east3";
+BEGIN; CREATE DATABASE test PRIMARY REGION "us-east1" REGIONS "us-east1", "us-east2", "us-east3"; COMMIT;
 USE test;
 CREATE TABLE test11 (p int) LOCALITY REGIONAL BY TABLE IN "us-east1";
 CREATE TABLE test12 (p int) LOCALITY REGIONAL BY TABLE IN "us-east1";
@@ -31,8 +69,9 @@ CREATE TABLE test42 (p int) LOCALITY REGIONAL BY TABLE IN "us-east2";
 `
 )
 
-func BenchmarkAlterRegions(b *testing.B) {
-	tests := []rttanalysis.RoundTripBenchTestCase{
+func BenchmarkAlterRegions(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("AlterRegions", []rttanalysis.RoundTripBenchTestCase{
 		{
 			Name:  "alter empty database add region",
 			Setup: `CREATE DATABASE test PRIMARY REGION "us-east1"`,
@@ -57,13 +96,12 @@ func BenchmarkAlterRegions(b *testing.B) {
 			Stmt:  `ALTER DATABASE test ADD REGION "us-east4"`,
 			Reset: "DROP DATABASE test",
 		},
-	}
-
-	RunRoundTripBenchmarkMultiRegion(b, tests)
+	})
 }
 
-func BenchmarkAlterPrimaryRegion(b *testing.B) {
-	tests := []rttanalysis.RoundTripBenchTestCase{
+func BenchmarkAlterPrimaryRegion(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("AlterPrimaryRegion", []rttanalysis.RoundTripBenchTestCase{
 		{
 			Name:  "alter empty database set initial primary region",
 			Setup: "CREATE DATABASE test",
@@ -101,13 +139,12 @@ CREATE TABLE test10 (p int);
 			Stmt:  `ALTER DATABASE test SET PRIMARY REGION "us-east2"`,
 			Reset: "DROP DATABASE test",
 		},
-	}
-
-	RunRoundTripBenchmarkMultiRegion(b, tests)
+	})
 }
 
-func BenchmarkAlterSurvivalGoals(b *testing.B) {
-	tests := []rttanalysis.RoundTripBenchTestCase{
+func BenchmarkAlterSurvivalGoals(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("AlterSurvivalGoals", []rttanalysis.RoundTripBenchTestCase{
 		{
 			Name:  "alter empty database from zone to region",
 			Setup: `CREATE DATABASE test PRIMARY REGION "us-east1" REGIONS "us-east2","us-east3"`,
@@ -133,13 +170,12 @@ ALTER DATABASE test SURVIVE REGION FAILURE`,
 			Stmt:  `ALTER DATABASE test SURVIVE ZONE FAILURE`,
 			Reset: "DROP DATABASE test",
 		},
-	}
-
-	RunRoundTripBenchmarkMultiRegion(b, tests)
+	})
 }
 
-func BenchmarkAlterTableLocality(b *testing.B) {
-	tests := []rttanalysis.RoundTripBenchTestCase{
+func BenchmarkAlterTableLocality(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("AlterTableLocality", []rttanalysis.RoundTripBenchTestCase{
 		{
 			Name: "alter from global to regional by table",
 			Setup: `
@@ -200,7 +236,5 @@ CREATE TABLE test (p int) LOCALITY REGIONAL BY ROW;
 			Stmt:  `ALTER TABLE test SET LOCALITY GLOBAL`,
 			Reset: "DROP DATABASE test",
 		},
-	}
-
-	RunRoundTripBenchmarkMultiRegion(b, tests)
+	})
 }

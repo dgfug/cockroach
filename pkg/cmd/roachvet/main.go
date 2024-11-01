@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Command roachvet is a vettool which includes all of the standard analysis
 // passes included in go vet as well as the `shadow` pass and some first-party
@@ -14,13 +9,16 @@
 package main
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/deferunlockcheck"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/errcmp"
+	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/errwrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/fmtsafe"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/forbiddenmethod"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/hash"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/leaktestcall"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/nilness"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/nocopy"
+	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/redactcheck"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/returnerrcheck"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/timer"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/unconvert"
@@ -35,7 +33,6 @@ import (
 	"golang.org/x/tools/go/analysis/passes/copylock"
 	"golang.org/x/tools/go/analysis/passes/errorsas"
 	"golang.org/x/tools/go/analysis/passes/httpresponse"
-	"golang.org/x/tools/go/analysis/passes/loopclosure"
 	"golang.org/x/tools/go/analysis/passes/lostcancel"
 	"golang.org/x/tools/go/analysis/passes/nilfunc"
 	"golang.org/x/tools/go/analysis/passes/printf"
@@ -59,12 +56,15 @@ func main() {
 		hash.Analyzer,
 		leaktestcall.Analyzer,
 		nocopy.Analyzer,
+		redactcheck.Analyzer,
 		returnerrcheck.Analyzer,
 		timer.Analyzer,
 		unconvert.Analyzer,
 		fmtsafe.Analyzer,
 		errcmp.Analyzer,
-		nilness.CRDBAnalyzer,
+		nilness.Analyzer,
+		errwrap.Analyzer,
+		deferunlockcheck.Analyzer,
 	)
 
 	// Standard go vet analyzers:
@@ -79,7 +79,6 @@ func main() {
 		copylock.Analyzer,
 		errorsas.Analyzer,
 		httpresponse.Analyzer,
-		loopclosure.Analyzer,
 		lostcancel.Analyzer,
 		nilfunc.Analyzer,
 		printf.Analyzer,

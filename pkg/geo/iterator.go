@@ -1,16 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geo
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	"github.com/twpayne/go-geom"
 )
@@ -55,7 +52,7 @@ func (it *GeomTIterator) Next() (geom.T, bool, error) {
 		case EmptyBehaviorError:
 			return nil, false, NewEmptyGeometryError()
 		default:
-			return nil, false, errors.Newf("programmer error: unknown behavior: %T", it.emptyBehavior)
+			return nil, false, errors.AssertionFailedf("programmer error: unknown behavior: %T", it.emptyBehavior)
 		}
 	}
 }
@@ -112,7 +109,7 @@ func (it *GeomTIterator) next() (geom.T, bool, error) {
 			it.subIt = nil
 		}
 	default:
-		return nil, false, errors.Newf("unknown type: %T", t)
+		return nil, false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown type: %T", t)
 	}
 }
 

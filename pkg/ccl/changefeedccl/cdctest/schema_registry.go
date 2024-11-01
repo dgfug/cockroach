@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdctest
 
@@ -25,8 +22,9 @@ import (
 
 // SchemaRegistry is the kafka schema registry used in tests.
 type SchemaRegistry struct {
-	server *httptest.Server
-	mu     struct {
+	server     *httptest.Server
+	statusCode int
+	mu         struct {
 		syncutil.Mutex
 		idAlloc  int32
 		schemas  map[int32]string
@@ -42,14 +40,28 @@ func StartTestSchemaRegistry() *SchemaRegistry {
 	return r
 }
 
+// StartErrorTestSchemaRegistry creates and starts schema registry for
+// tests which will return the supplied statusCode on each request.
+func StartErrorTestSchemaRegistry(statusCode int) *SchemaRegistry {
+	r := makeTestSchemaRegistry()
+	r.statusCode = statusCode
+	r.server.Start()
+	return r
+}
+
 // StartTestSchemaRegistryWithTLS creates and starts schema registry
 // for tests with TLS enabled.
-func StartTestSchemaRegistryWithTLS(certificate *tls.Certificate) (*SchemaRegistry, error) {
+func StartTestSchemaRegistryWithTLS(
+	certificate *tls.Certificate, requireClientCert bool,
+) (*SchemaRegistry, error) {
 	r := makeTestSchemaRegistry()
 	if certificate != nil {
 		r.server.TLS = &tls.Config{
 			Certificates: []tls.Certificate{*certificate},
 		}
+	}
+	if requireClientCert {
+		r.server.TLS.ClientAuth = tls.RequireAnyClientCert
 	}
 	r.server.StartTLS()
 	return r, nil
@@ -101,6 +113,13 @@ func (r *SchemaRegistry) registerSchema(subject string, schema string) int32 {
 	return id
 }
 
+// RegistrationCount returns the number of Registration requests received.
+func (r *SchemaRegistry) RegistrationCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int(r.mu.idAlloc)
+}
+
 var (
 	// We are slightly stricter than confluent here as they allow
 	// a trailing slash.
@@ -109,6 +128,11 @@ var (
 
 // requestHandler routes requests based on the Method and Path of the request.
 func (r *SchemaRegistry) requestHandler(hw http.ResponseWriter, hr *http.Request) {
+	if r.statusCode != 0 {
+		hw.WriteHeader(r.statusCode)
+		return
+	}
+
 	path := hr.URL.Path
 	method := hr.Method
 

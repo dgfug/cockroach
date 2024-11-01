@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package pprompt provides a facility to prompt a user for a password
 // securely (i.e. without echoing the password) from an interactive
@@ -26,8 +21,11 @@ import (
 
 // PromptForPassword prompts for a password.
 // This is meant to be used when using a password.
-func PromptForPassword() (string, error) {
-	fmt.Print("Enter password: ")
+func PromptForPassword(prompt string) (string, error) {
+	if prompt == "" {
+		prompt = "Enter password: "
+	}
+	fmt.Print(prompt)
 	password, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err

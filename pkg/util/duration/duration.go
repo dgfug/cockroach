@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package duration
 
@@ -17,18 +12,24 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 )
 
 const (
 	// MicrosPerMilli is the amount of microseconds in a millisecond.
 	MicrosPerMilli = 1000
-	// MillisPerSec is the amount of seconds in a millisecond.
+	// MillisPerSec is the amount of milliseconds in a second.
 	MillisPerSec = 1000
+	// MicrosPerSec is the amount of microseconds in a second.
+	MicrosPerSec = MicrosPerMilli * MillisPerSec
 	// SecsPerMinute is the amount of seconds in a minute.
 	SecsPerMinute = 60
 	// SecsPerHour is the amount of seconds in an hour.
@@ -55,16 +56,12 @@ const (
 	nanosInMonth  = DaysPerMonth * nanosInDay
 	nanosInSecond = 1000 * 1000 * 1000
 	nanosInMicro  = 1000
-
-	// Used in overflow calculations.
-	maxYearsInDuration = math.MaxInt64 / nanosInMonth
-	minYearsInDuration = math.MinInt64 / nanosInMonth
 )
 
 var (
-	bigDaysInMonth  = big.NewInt(DaysPerMonth)
-	bigNanosInDay   = big.NewInt(nanosInDay)
-	bigNanosInMonth = big.NewInt(nanosInMonth)
+	bigDaysInMonth  = apd.NewBigInt(DaysPerMonth)
+	bigNanosInDay   = apd.NewBigInt(nanosInDay)
+	bigNanosInMonth = apd.NewBigInt(nanosInMonth)
 )
 
 // errEncodeOverflow is returned by Encode when the sortNanos returned would
@@ -298,18 +295,18 @@ func FromFloat64(x float64) Duration {
 	return d.normalize().round()
 }
 
-// FromBigInt converts a big.Int number of nanoseconds to a duration. Inverse
+// FromBigInt converts an apd.BigInt number of nanoseconds to a duration. Inverse
 // conversion of AsBigInt. Boolean false if the result overflows.
-func FromBigInt(src *big.Int) (Duration, bool) {
-	var rem big.Int
-	var monthsDec big.Int
+func FromBigInt(src *apd.BigInt) (Duration, bool) {
+	var rem apd.BigInt
+	var monthsDec apd.BigInt
 	monthsDec.QuoRem(src, bigNanosInMonth, &rem)
 	if !monthsDec.IsInt64() {
 		return Duration{}, false
 	}
 
-	var daysDec big.Int
-	var nanosRem big.Int
+	var daysDec apd.BigInt
+	var nanosRem apd.BigInt
 	daysDec.QuoRem(&rem, bigNanosInDay, &nanosRem)
 	// Note: we do not need to check for overflow of daysDec because any
 	// excess bits were spilled into months above already.
@@ -359,14 +356,14 @@ func (d Duration) AsFloat64() float64 {
 		float64(numMonthsInYear*DaysPerMonth*SecsPerDay)
 }
 
-// AsBigInt converts a duration to a big.Int with the number of nanoseconds.
-func (d Duration) AsBigInt(dst *big.Int) {
+// AsBigInt converts a duration to an apd.BigInt with the number of nanoseconds.
+func (d Duration) AsBigInt(dst *apd.BigInt) {
 	dst.SetInt64(d.Months)
 	dst.Mul(dst, bigDaysInMonth)
-	dst.Add(dst, big.NewInt(d.Days))
+	dst.Add(dst, apd.NewBigInt(d.Days))
 	dst.Mul(dst, bigNanosInDay)
 	// Uses rounded instead of nanos here to remove any on-disk nanos.
-	dst.Add(dst, big.NewInt(d.rounded()))
+	dst.Add(dst, apd.NewBigInt(d.rounded()))
 }
 
 const (
@@ -687,17 +684,26 @@ func (d Duration) StringNanos() string {
 // (using Decode) and the first int will approximately sort a collection of
 // encoded Durations.
 func (d Duration) Encode() (sortNanos int64, months int64, days int64, err error) {
-	// The number of whole years equivalent to any value of Duration always fits
-	// in an int64. Use this to compute a conservative estimate of overflow.
+	// Calculate the total nanoseconds while checking for int64 overflow as:
 	//
-	// TODO(dan): Compute overflow exactly, then document that EncodeBigInt can be
-	// used in overflow cases.
-	years := d.Months/12 + d.Days/DaysPerMonth/12 + d.nanos/nanosInMonth/12
-	if years > maxYearsInDuration || years < minYearsInDuration {
+	//   totalNanos = d.Months*nanosInMonth + d.Days*nanosInDay * d.nanos
+	//
+	monthNanos, ok := arith.MulHalfPositiveWithOverflow(d.Months, nanosInMonth)
+	if !ok {
 		return 0, 0, 0, errEncodeOverflow
 	}
-
-	totalNanos := d.Months*nanosInMonth + d.Days*nanosInDay + d.nanos
+	dayNanos, ok := arith.MulHalfPositiveWithOverflow(d.Days, nanosInDay)
+	if !ok {
+		return 0, 0, 0, errEncodeOverflow
+	}
+	totalNanos, ok := arith.AddWithOverflow(monthNanos, dayNanos)
+	if !ok {
+		return 0, 0, 0, errEncodeOverflow
+	}
+	totalNanos, ok = arith.AddWithOverflow(totalNanos, d.nanos)
+	if !ok {
+		return 0, 0, 0, errEncodeOverflow
+	}
 	return totalNanos, d.Months, d.Days, nil
 }
 
@@ -726,6 +732,11 @@ func Decode(sortNanos int64, months int64, days int64) (Duration, error) {
 
 // Add returns the time t+d, using a configurable mode.
 func Add(t time.Time, d Duration) time.Time {
+	if t == pgdate.TimeInfinity || t == pgdate.TimeNegativeInfinity {
+		// "infinity"/"-infinity" add/subtract any duration results in itself.
+		return t
+	}
+
 	// Fast path adding units < 1 day.
 	// Avoiding AddDate(0,0,0) is required to prevent changing times
 	// on DST boundaries.
@@ -810,6 +821,16 @@ func (d Duration) Div(x int64) Duration {
 
 // MulFloat returns a Duration representing a time length of d*x.
 func (d Duration) MulFloat(x float64) Duration {
+	// Have a couple of special cases to avoid rounding errors with very large
+	// intervals.
+	// TODO(#26932): once we correctly error out on intervals out of range, this
+	// could be removed.
+	switch x {
+	case 1:
+		return d
+	case -1:
+		return MakeDuration(-d.nanos, -d.Days, -d.Months)
+	}
 	monthInt, monthFrac := math.Modf(float64(d.Months) * x)
 	dayInt, dayFrac := math.Modf((float64(d.Days) * x) + (monthFrac * DaysPerMonth))
 
@@ -822,6 +843,16 @@ func (d Duration) MulFloat(x float64) Duration {
 
 // DivFloat returns a Duration representing a time length of d/x.
 func (d Duration) DivFloat(x float64) Duration {
+	// Have a couple of special cases to avoid rounding errors with very large
+	// intervals.
+	// TODO(#26932): once we correctly error out on intervals out of range, this
+	// could be removed.
+	switch x {
+	case 1:
+		return d
+	case -1:
+		return MakeDuration(-d.nanos, -d.Days, -d.Months)
+	}
 	// In order to keep it compatible with PostgreSQL, we use the same logic.
 	// Refer to https://github.com/postgres/postgres/blob/e56bce5d43789cce95d099554ae9593ada92b3b7/src/backend/utils/adt/timestamp.c#L3266-L3304.
 	month := int32(float64(d.Months) / x)
@@ -1015,4 +1046,56 @@ func Truncate(d time.Duration, r time.Duration) time.Duration {
 		panic(errors.AssertionFailedf("zero passed as resolution"))
 	}
 	return d - (d % r)
+}
+
+// ParseInterval parses the given interval in the given style.
+func ParseInterval(
+	style IntervalStyle, s string, itm types.IntervalTypeMetadata,
+) (Duration, error) {
+	// At this time the only supported interval formats are:
+	// - SQL standard.
+	// - Postgres compatible.
+	// - iso8601 format (with designators only), see interval.go for
+	//   sources of documentation.
+	// - Golang time.parseDuration compatible.
+
+	// If it's a blank string, exit early.
+	if len(s) == 0 {
+		return Duration{}, makeParseError(s, types.Interval, nil)
+	}
+	if s[0] == 'P' {
+		// If it has a leading P we're most likely working with an iso8601
+		// interval.
+		dur, err := iso8601ToDuration(s)
+		if err != nil {
+			return Duration{}, makeParseError(s, types.Interval, err)
+		}
+		return dur, nil
+	}
+	if strings.IndexFunc(s, unicode.IsLetter) == -1 {
+		// If it has no letter, then we're most likely working with a SQL standard
+		// interval, as both postgres and golang have letter(s) and iso8601 has been tested.
+		dur, err := sqlStdToDuration(s, itm)
+		if err != nil {
+			return Duration{}, makeParseError(s, types.Interval, err)
+		}
+		return dur, nil
+	}
+
+	// We're either a postgres string or a Go duration.
+	// Our postgres syntax parser also supports golang, so just use that for both.
+	dur, err := parseDuration(style, s, itm)
+	if err != nil {
+		return Duration{}, makeParseError(s, types.Interval, err)
+	}
+	return dur, nil
+}
+
+func makeParseError(s string, typ *types.T, err error) error {
+	if err != nil {
+		return pgerror.Wrapf(err, pgcode.InvalidTextRepresentation,
+			"could not parse %q as type %s", s, typ)
+	}
+	return pgerror.Newf(pgcode.InvalidTextRepresentation,
+		"could not parse %q as type %s", s, typ)
 }

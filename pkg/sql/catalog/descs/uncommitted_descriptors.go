@@ -1,308 +1,198 @@
-// Copyright 2021 The Cockroach Authors.
+// Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
-// uncommittedDescriptor is a descriptor that has been modified in the current
-// transaction.
-type uncommittedDescriptor struct {
-	immutable catalog.Descriptor
-
-	// mutable generally holds the descriptor as it was read from the database.
-	// In the rare case that this struct corresponds to a singleton which is
-	// added to optimize for special cases of system descriptors.
-	// It should be accessed through getMutable() which will construct a new
-	// value in cases where it is nil.
-	mutable catalog.MutableDescriptor
-}
-
-// GetName implements the catalog.NameEntry interface.
-func (u *uncommittedDescriptor) GetName() string {
-	return u.immutable.GetName()
-}
-
-// GetParentID implements the catalog.NameEntry interface.
-func (u *uncommittedDescriptor) GetParentID() descpb.ID {
-	return u.immutable.GetParentID()
-}
-
-// GetParentSchemaID implements the catalog.NameEntry interface.
-func (u uncommittedDescriptor) GetParentSchemaID() descpb.ID {
-	return u.immutable.GetParentSchemaID()
-}
-
-// GetID implements the catalog.NameEntry interface.
-func (u uncommittedDescriptor) GetID() descpb.ID {
-	return u.immutable.GetID()
-}
-
-// getMutable is how the mutable descriptor should be accessed. It constructs
-// a new descriptor in the case that this descriptor is a cached, in-memory
-// singleton for a system descriptor.
-func (u *uncommittedDescriptor) getMutable() catalog.MutableDescriptor {
-	if u.mutable != nil {
-		return u.mutable
-	}
-	return u.immutable.NewBuilder().BuildExistingMutable()
-}
-
-var _ catalog.NameEntry = (*uncommittedDescriptor)(nil)
-
-// uncommittedDescriptors is the data structure holding all
-// uncommittedDescriptor objects for a Collection.
-//
-// Immutable descriptors can be freely looked up.
-// Mutable descriptors can be:
-// 1. added into it,
-// 2. checked out of it,
-// 3. checked back in to it.
-//
-// An error will be triggered by:
-// - checking out a mutable descriptor that hasn't yet been added,
-// - checking in a descriptor that has been added but not yet checked out,
-// - any checked-out-but-not-checked-in mutable descriptors at commit time.
-//
+// uncommittedDescriptors is the data structure holding all uncommitted
+// descriptors for a Collection.
+// This allows a transaction to see its own modifications while bypassing the
+// descriptor lease mechanism. The lease mechanism will have its own transaction
+// to read the descriptor and will hang waiting for the uncommitted changes to
+// the descriptor if this transaction is PRIORITY HIGH. These descriptors are
+// local to this Collection and their state is thus not visible to other
+// transactions.
 type uncommittedDescriptors struct {
 
-	// Descriptors modified by the uncommitted transaction affiliated with this
-	// Collection. This allows a transaction to see its own modifications while
-	// bypassing the descriptor lease mechanism. The lease mechanism will have its
-	// own transaction to read the descriptor and will hang waiting for the
-	// uncommitted changes to the descriptor. These descriptors are local to this
-	// Collection and invisible to other transactions.
-	descs nstree.Map
+	// These maps store the descriptors which have undergone mutations in the
+	// current transaction:
+	// - original stores the original state of such descriptors in storage, unless
+	//   they are new.
+	// - uncommitted stores the uncommitted state of such descriptors, that is to
+	//   say the state they were in when the AddUncommittedDescriptor method was
+	//   called, which is done (among other things) when the mutated descriptor
+	//   is persisted to storage via WriteDescToBatch. These descriptors are
+	//   immutable and this map serves as the reference when querying this layer.
+	// - mutable stores the mutable descriptors associated with the uncommitted
+	//   descriptors in this collection. These are always the same in-memory
+	//   objects for each ID for the duration of the transaction.
+	uncommitted       nstree.NameMap
+	original, mutable nstree.IDMap
 
-	// descNames is the set of names which a read or written
-	// descriptor took on at some point in its lifetime. Everything added to
-	// uncommittedDescriptors is added to descNames as well
-	// as all of the known draining names. The idea is that if we find that
-	// a name is not in the above map but is in the set, then we can avoid
-	// doing a lookup.
-	//
-	// TODO(postamar): better uncommitted namespace changes handling after 22.1.
-	descNames nstree.Set
-
-	// addedSystemDatabase is used to mark whether the optimization to add the
-	// system database to the set of uncommitted descriptors has occurred.
-	addedSystemDatabase bool
+	// memAcc is the actual account of an injected, upstream monitor
+	// to track memory usage of uncommittedDescriptors.
+	memAcc mon.BoundAccount
 }
 
-func (ud *uncommittedDescriptors) reset() {
-	ud.descs.Clear()
-	ud.descNames.Clear()
-	ud.addedSystemDatabase = false
+func makeUncommittedDescriptors(monitor *mon.BytesMonitor) uncommittedDescriptors {
+	return uncommittedDescriptors{
+		memAcc: monitor.MakeBoundAccount(),
+	}
 }
 
-// add adds a descriptor to the set of uncommitted descriptors and returns
-// an immutable copy of that descriptor.
-func (ud *uncommittedDescriptors) add(mut catalog.MutableDescriptor) (catalog.Descriptor, error) {
-	uNew, err := makeUncommittedDescriptor(mut)
-	if err != nil {
-		return nil, err
+// reset zeroes the object for re-use in a new transaction.
+func (ud *uncommittedDescriptors) reset(ctx context.Context) {
+	ud.original.Clear()
+	ud.uncommitted.Clear()
+	ud.mutable.Clear()
+	ud.memAcc.Clear(ctx)
+	old := *ud
+	*ud = uncommittedDescriptors{
+		original:    old.original,
+		uncommitted: old.uncommitted,
+		mutable:     old.mutable,
+		memAcc:      old.memAcc,
 	}
-	for _, n := range uNew.immutable.GetDrainingNames() {
-		ud.descNames.Add(n)
-	}
-	ud.descs.Upsert(uNew)
-	return uNew.immutable, err
 }
 
-// checkOut checks out an uncommitted mutable descriptor for use in the
-// transaction. This descriptor should later be checked in again.
-func (ud *uncommittedDescriptors) checkOut(id descpb.ID) (catalog.MutableDescriptor, error) {
-	if id == keys.SystemDatabaseID {
-		ud.maybeAddSystemDatabase()
+// getOriginalByID returns the original version of the uncommitted descriptor
+// with this ID, if it exists.
+func (ud *uncommittedDescriptors) getOriginalByID(id descpb.ID) catalog.Descriptor {
+	if e := ud.original.Get(id); e != nil {
+		return e.(catalog.Descriptor)
 	}
-	entry := ud.descs.GetByID(id)
-	if entry == nil {
-		return nil, errors.NewAssertionErrorWithWrappedErrf(
-			errors.New("descriptor hasn't been added yet"),
-			"cannot check in uncommitted descriptor with ID %d",
-			id)
-
-	}
-	u := entry.(*uncommittedDescriptor)
-	return u.getMutable(), nil
+	return nil
 }
 
-// checkIn checks in an uncommitted mutable descriptor that was previously
-// checked out.
-func (ud *uncommittedDescriptors) checkIn(mut catalog.MutableDescriptor) error {
-	// TODO(postamar): actually check that the descriptor has been checked out.
-	_, err := ud.add(mut)
-	return err
+// getUncommittedByID returns the uncommitted descriptor for this ID, if it
+// exists.
+func (ud *uncommittedDescriptors) getUncommittedByID(id descpb.ID) catalog.Descriptor {
+	if e := ud.uncommitted.GetByID(id); e != nil {
+		return e.(catalog.Descriptor)
+	}
+	return nil
 }
 
-func makeUncommittedDescriptor(desc catalog.MutableDescriptor) (*uncommittedDescriptor, error) {
-	version := desc.GetVersion()
-	origVersion := desc.OriginalVersion()
-	if version != origVersion && version != origVersion+1 {
-		return nil, errors.AssertionFailedf(
-			"descriptor %d version %d not compatible with cluster version %d",
-			desc.GetID(), version, origVersion)
+// getUncommittedMutableByID returns the uncommitted descriptor for this ID, if
+// it exists, in mutable form. This mutable descriptor is owned by the
+// collection.
+func (ud *uncommittedDescriptors) getUncommittedMutableByID(
+	id descpb.ID,
+) catalog.MutableDescriptor {
+	if me := ud.mutable.Get(id); me != nil && ud.uncommitted.GetByID(id) != nil {
+		return me.(catalog.MutableDescriptor)
 	}
-
-	mutable, err := maybeRefreshCachedFieldsOnTypeDescriptor(desc)
-	if err != nil {
-		return nil, err
-	}
-
-	return &uncommittedDescriptor{
-		mutable:   mutable,
-		immutable: mutable.ImmutableCopy(),
-	}, nil
+	return nil
 }
 
-// maybeRefreshCachedFieldsOnTypeDescriptor refreshes the cached fields on a
-// Mutable if the given descriptor is a type descriptor and works as a pass
-// through for all other descriptors. Mutable type descriptors are refreshed to
-// reconstruct enumMetadata. This ensures that tables hydration following a
-// type descriptor update (in the same txn) happens using the modified fields.
-func maybeRefreshCachedFieldsOnTypeDescriptor(
-	desc catalog.MutableDescriptor,
+// getUncommittedByName returns the uncommitted descriptor for this name key, if
+// it exists.
+func (ud *uncommittedDescriptors) getUncommittedByName(
+	parentID, parentSchemaID descpb.ID, name string,
+) catalog.NameEntry {
+	return ud.uncommitted.GetByName(parentID, parentSchemaID, name)
+}
+
+// iterateUncommittedByID applies fn to the uncommitted descriptors in ascending
+// sequence of IDs.
+func (ud *uncommittedDescriptors) iterateUncommittedByID(
+	fn func(desc catalog.Descriptor) error,
+) error {
+	return ud.uncommitted.IterateByID(func(entry catalog.NameEntry) error {
+		return fn(entry.(catalog.Descriptor))
+	})
+}
+
+// ensureMutable is called when mutable descriptors are queried by the
+// collection. This is a prerequisite to accepting any subsequent
+// AddUncommittedDescriptor calls for any of these descriptors.
+// Calling this does not change the results of any queries on this layer.
+func (ud *uncommittedDescriptors) ensureMutable(
+	ctx context.Context, original catalog.Descriptor,
 ) (catalog.MutableDescriptor, error) {
-	typeDesc, ok := desc.(catalog.TypeDescriptor)
-	if ok {
-		return typedesc.UpdateCachedFieldsOnModifiedMutable(typeDesc)
+	if e := ud.mutable.Get(original.GetID()); e != nil {
+		return e.(catalog.MutableDescriptor), nil
 	}
-	return desc, nil
+	mut := original.NewBuilder().BuildExistingMutable()
+	newBytes := mut.ByteSize()
+	ud.mutable.Upsert(mut)
+	original = original.NewBuilder().BuildImmutable()
+	newBytes += original.ByteSize()
+	ud.original.Upsert(original)
+	if err := ud.memAcc.Grow(ctx, newBytes); err != nil {
+		return nil, errors.Wrap(err, "memory usage exceeds limit for uncommittedDescriptors")
+	}
+	return mut, nil
 }
 
-// getByID looks up an uncommitted descriptor by ID.
-func (ud *uncommittedDescriptors) getByID(id descpb.ID) catalog.Descriptor {
-	if id == keys.SystemDatabaseID && !ud.addedSystemDatabase {
-		ud.maybeAddSystemDatabase()
-	}
-	entry := ud.descs.GetByID(id)
-	if entry == nil {
-		return nil
-	}
-	return entry.(*uncommittedDescriptor).immutable
-}
-
-// getByName returns a descriptor for the requested name if the requested name
-// is for a descriptor modified within the transaction affiliated with the
-// Collection.
-//
-// The first return value "hasKnownRename" is true when there is a known
-// rename of that descriptor, so it would be invalid to miss the cache and go to
-// KV (where the descriptor prior to the rename may still exist).
-func (ud *uncommittedDescriptors) getByName(
-	dbID descpb.ID, schemaID descpb.ID, name string,
-) (hasKnownRename bool, desc catalog.Descriptor) {
-	if dbID == 0 && schemaID == 0 && name == systemschema.SystemDatabaseName {
-		ud.maybeAddSystemDatabase()
-	}
-	// Walk latest to earliest so that a DROP followed by a CREATE with the same
-	// name will result in the CREATE being seen.
-	if got := ud.descs.GetByName(dbID, schemaID, name); got != nil {
-		return false, got.(*uncommittedDescriptor).immutable
-	}
-	// Check whether the set is empty to avoid allocating the NameInfo.
-	if ud.descNames.Empty() {
-		return false, nil
-	}
-	return ud.descNames.Contains(descpb.NameInfo{
-		ParentID:       dbID,
-		ParentSchemaID: schemaID,
-		Name:           name,
-	}), nil
-}
-
-func (ud *uncommittedDescriptors) iterateNewVersionByID(
-	fn func(entry catalog.NameEntry, originalVersion lease.IDVersion) error,
-) error {
-	return ud.descs.IterateByID(func(entry catalog.NameEntry) error {
-		mut := entry.(*uncommittedDescriptor).mutable
-		if mut == nil || mut.IsNew() || !mut.IsUncommittedVersion() {
-			return nil
+// upsert adds an uncommitted descriptor to this layer.
+// This is called exclusively by the Collection's AddUncommittedDescriptor
+// method.
+func (ud *uncommittedDescriptors) upsert(
+	ctx context.Context, mut catalog.MutableDescriptor,
+) (err error) {
+	original := ud.getOriginalByID(mut.GetID())
+	// Perform some sanity checks to ensure the version counters are correct.
+	if original == nil {
+		if !mut.IsNew() {
+			return errors.New("non-new descriptor does not exist in storage yet")
 		}
-		return fn(entry, lease.NewIDVersionPrev(mut.OriginalName(), mut.OriginalID(), mut.OriginalVersion()))
-	})
-}
-
-func (ud *uncommittedDescriptors) iterateImmutableByID(
-	fn func(imm catalog.Descriptor) error,
-) error {
-	return ud.descs.IterateByID(func(entry catalog.NameEntry) error {
-		return fn(entry.(*uncommittedDescriptor).immutable)
-	})
-}
-
-func (ud *uncommittedDescriptors) getUncommittedTables() (tables []catalog.TableDescriptor) {
-	_ = ud.iterateImmutableByID(func(imm catalog.Descriptor) error {
-		table, ok := imm.(catalog.TableDescriptor)
-		if ok && imm.IsUncommittedVersion() {
-			tables = append(tables, table)
+		if mut.GetVersion() != 1 {
+			return errors.New("new descriptor version should be 1")
 		}
-		return nil
-	})
-	return tables
-}
-
-func (ud *uncommittedDescriptors) getUncommittedDescriptorsForValidation() (
-	descs []catalog.Descriptor,
-) {
-	_ = ud.iterateImmutableByID(func(imm catalog.Descriptor) error {
-		// TODO(postamar): only return descriptors with !IsUncommittedVersion()
-		// This requires safeguard mechanisms like actually enforcing uncommitted
-		// descriptor check=out and check-in rules.
-		descs = append(descs, imm)
-		return nil
-	})
-	return descs
-}
-
-func (ud *uncommittedDescriptors) hasUncommittedTables() (has bool) {
-	_ = ud.iterateImmutableByID(func(desc catalog.Descriptor) error {
-		if _, has = desc.(catalog.TableDescriptor); has {
-			return iterutil.StopIteration()
+	} else {
+		if mut.IsNew() {
+			return errors.New("new descriptor already exists in storage")
 		}
-		return nil
-	})
-	return has
-}
-
-func (ud *uncommittedDescriptors) hasUncommittedTypes() (has bool) {
-	_ = ud.iterateImmutableByID(func(desc catalog.Descriptor) error {
-		if _, has = desc.(catalog.TypeDescriptor); has {
-			return iterutil.StopIteration()
+		if mut.GetVersion() != original.GetVersion()+1 {
+			return errors.Newf("expected uncommitted version %d, instead got %d",
+				original.GetVersion()+1, mut.GetVersion())
 		}
-		return nil
-	})
-	return has
-}
-
-var systemUncommittedDatabase = &uncommittedDescriptor{
-	immutable: dbdesc.NewBuilder(systemschema.SystemDB.DatabaseDesc()).
-		BuildImmutableDatabase(),
-	// Note that the mutable field is left as nil. We'll generate a new
-	// value lazily when this is needed, which ought to be exceedingly rare.
-}
-
-func (ud *uncommittedDescriptors) maybeAddSystemDatabase() {
-	if !ud.addedSystemDatabase {
-		ud.addedSystemDatabase = true
-		ud.descs.Upsert(systemUncommittedDatabase)
 	}
+	// Refresh the cached fields on mutable type descriptors.
+	if typ, ok := mut.(*typedesc.Mutable); ok {
+		mut, err = typedesc.UpdateCachedFieldsOnModifiedMutable(typ)
+		if err != nil {
+			return err
+		}
+	}
+	// Add the descriptors to the uncommitted descriptors layer.
+	var newBytes int64
+	if mut.IsNew() {
+		newBytes += mut.ByteSize()
+	}
+	ud.mutable.Upsert(mut)
+	// Upserting a descriptor into the "uncommitted" set implies
+	// this descriptor is going to be written to storage very soon. We
+	// compute what the raw bytes of this descriptor in storage is going to
+	// look like when that write happens, so that any further update to this
+	// descriptor, which will be retrieved from the "uncommitted" set, will
+	// carry the correct raw bytes in storage with it.
+	var val roachpb.Value
+	if err = val.SetProto(mut.DescriptorProto()); err != nil {
+		return err
+	}
+	rawBytesInStorageAfterPendingWrite := val.TagAndDataBytes()
+	uncommittedBuilder := mut.NewBuilder()
+	uncommittedBuilder.SetRawBytesInStorage(rawBytesInStorageAfterPendingWrite)
+	uncommitted := uncommittedBuilder.BuildImmutable()
+	newBytes += uncommitted.ByteSize()
+	ud.uncommitted.Upsert(uncommitted, uncommitted.SkipNamespace())
+	if err = ud.memAcc.Grow(ctx, newBytes); err != nil {
+		return errors.Wrap(err, "memory usage exceeds limit for uncommittedDescriptors")
+	}
+	return nil
 }

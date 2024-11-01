@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package limit
 
@@ -46,7 +41,7 @@ func MakeConcurrentRequestLimiter(spanName string, limit int) ConcurrentRequestL
 // is forced to block.
 func (l *ConcurrentRequestLimiter) Begin(ctx context.Context) (Reservation, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "limiter begin")
 	}
 
 	res, err := l.sem.TryAcquire(ctx, 1)
@@ -63,4 +58,9 @@ func (l *ConcurrentRequestLimiter) Begin(ctx context.Context) (Reservation, erro
 // SetLimit adjusts the size of the pool.
 func (l *ConcurrentRequestLimiter) SetLimit(newLimit int) {
 	l.sem.UpdateCapacity(uint64(newLimit))
+}
+
+// Available returns available limiter quota.
+func (l *ConcurrentRequestLimiter) Available() uint64 {
+	return l.sem.ApproximateQuota()
 }

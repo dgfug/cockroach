@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -14,13 +9,14 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 var showEstimatedRowCountClusterSetting = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
 	"sql.show_tables.estimated_row_count.enabled",
 	"whether the estimated_row_count is shown on SHOW TABLES. Turning this off "+
 		"will improve SHOW TABLES performance.",
@@ -29,8 +25,9 @@ var showEstimatedRowCountClusterSetting = settings.RegisterBoolSetting(
 
 // delegateShowTables implements SHOW TABLES which returns all the tables.
 // Privileges: None.
-//   Notes: postgres does not have a SHOW TABLES statement.
-//          mysql only returns tables you have privileges on.
+//
+//	Notes: postgres does not have a SHOW TABLES statement.
+//	       mysql only returns tables you have privileges on.
 func (d *delegator) delegateShowTables(n *tree.ShowTables) (tree.Statement, error) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
 	_, name, err := d.catalog.ResolveSchema(d.ctx, flags, &n.ObjectNamePrefix)
@@ -42,7 +39,7 @@ func (d *delegator) delegateShowTables(n *tree.ShowTables) (tree.Statement, erro
 	// name to have an explicit catalog but no explicit schema. This would arise
 	// when doing SHOW TABLES FROM <db>. Without this logic, we would not show the
 	// tables from other schemas than public.
-	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == tree.PublicSchemaName &&
+	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == catconstants.PublicSchemaName &&
 		n.ExplicitSchema && !n.ExplicitCatalog && n.SchemaName == name.CatalogName {
 		name.SchemaName, name.ExplicitSchema = "", false
 	}
@@ -77,7 +74,7 @@ LEFT JOIN %[1]s.pg_catalog.pg_roles AS rl on (pc.relowner = rl.oid)
 JOIN %[1]s.pg_catalog.pg_namespace AS ns ON (ns.oid = pc.relnamespace)
 %[4]s
 %[6]s
-LEFT JOIN crdb_internal.tables AS ct ON (pc.oid::int8 = ct.table_id)
+LEFT JOIN crdb_internal.tables AS ct ON (pc.oid::int8 = ct.table_id AND ct.database_name = %[7]s AND ct.drop_time IS NULL)
 WHERE pc.relkind IN ('r', 'v', 'S', 'm') %[2]s
 ORDER BY schema_name, table_name
 `
@@ -94,11 +91,12 @@ ORDER BY schema_name, table_name
 	var comment string
 	if n.WithComment {
 		descJoin = fmt.Sprintf(
-			`LEFT JOIN %s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0)`,
-			&name.CatalogName,
+			`LEFT JOIN %[1]s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0 AND pd.classoid = %[2]d)`,
+			&name.CatalogName, catconstants.PgCatalogClassTableID,
 		)
 		comment = `, COALESCE(pd.description, '') AS comment`
 	}
+
 	query := fmt.Sprintf(
 		getTablesQuery,
 		&name.CatalogName,
@@ -107,6 +105,7 @@ ORDER BY schema_name, table_name
 		descJoin,
 		estimatedRowCount,
 		estimatedRowCountJoin,
+		lexbase.EscapeSQLString(string(name.CatalogName)),
 	)
-	return parse(query)
+	return d.parse(query)
 }

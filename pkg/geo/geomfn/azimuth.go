@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -14,7 +9,8 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -37,7 +33,7 @@ func Azimuth(a geo.Geometry, b geo.Geometry) (*float64, error) {
 
 	aPoint, ok := aGeomT.(*geom.Point)
 	if !ok {
-		return nil, errors.Newf("arguments must be POINT geometries")
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "arguments must be POINT geometries")
 	}
 
 	bGeomT, err := b.AsGeomT()
@@ -47,11 +43,11 @@ func Azimuth(a geo.Geometry, b geo.Geometry) (*float64, error) {
 
 	bPoint, ok := bGeomT.(*geom.Point)
 	if !ok {
-		return nil, errors.Newf("arguments must be POINT geometries")
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "arguments must be POINT geometries")
 	}
 
 	if aPoint.Empty() || bPoint.Empty() {
-		return nil, errors.Newf("cannot call ST_Azimuth with POINT EMPTY")
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "cannot call ST_Azimuth with POINT EMPTY")
 	}
 
 	if aPoint.X() == bPoint.X() && aPoint.Y() == bPoint.Y() {

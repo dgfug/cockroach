@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package constraint
 
@@ -91,18 +86,20 @@ func (c *Columns) Equals(other *Columns) bool {
 	return true
 }
 
-// IsPrefixOf returns true if the columns in c are a prefix of the columns in
-// other.
-func (c *Columns) IsPrefixOf(other *Columns) bool {
-	if c.firstCol != other.firstCol || len(c.otherCols) > len(other.otherCols) {
-		return false
+// PrefixLength returns the length of the common prefix between the columns in c
+// and the columns in other.
+func (c *Columns) PrefixLength(other *Columns) int {
+	if c.firstCol != other.firstCol {
+		return 0
 	}
-	for i := range c.otherCols {
+	length := 1
+	for i := 0; i < len(c.otherCols) && i < len(other.otherCols); i++ {
 		if c.otherCols[i] != other.otherCols[i] {
-			return false
+			break
 		}
+		length++
 	}
-	return true
+	return length
 }
 
 // IsStrictSuffixOf returns true if the columns in c are a strict suffix of the

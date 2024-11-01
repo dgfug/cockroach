@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
@@ -16,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"gopkg.in/yaml.v2"
@@ -91,7 +87,7 @@ func TestLocalityMatchScore(t *testing.T) {
 			}
 		}
 
-		actual := math.Round(localityMatchScore(zone, locality)*100) / 100
+		actual := math.Round(localityMatchScore(cat.AsZone(zone), locality)*100) / 100
 		if actual != tc.expected {
 			t.Errorf("locality=%v, constraints=%v, leasePrefs=%v: expected %v, got %v",
 				tc.locality, tc.constraints, tc.leasePrefs, tc.expected, actual)

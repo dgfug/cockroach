@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -145,13 +140,19 @@ func (ex *connExecutor) execRelease(
 
 	if entry.commitOnRelease {
 		res.ResetStmtType((*tree.CommitTransaction)(nil))
-		err := ex.commitSQLTransactionInternal(ctx, s)
+		err := ex.commitSQLTransactionInternal(ctx)
 		if err == nil {
 			return eventTxnReleased{}, nil
 		}
 		// Committing the transaction failed. We'll go to state RestartWait if
 		// it's a retriable error, or to state RollbackWait otherwise.
 		if errIsRetriable(err) {
+			// For certain retryable errors, we should turn them into client visible
+			// errors, since the client needs to retry now.
+			var conversionError error
+			if err, conversionError = ex.convertRetriableErrorIntoUserVisibleError(ctx, err); conversionError != nil {
+				return ex.makeErrEvent(conversionError, s)
+			}
 			// Add the savepoint back. We want to allow a ROLLBACK TO SAVEPOINT
 			// cockroach_restart (that's the whole point of commitOnRelease).
 			env.push(*entry)

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -17,22 +12,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -51,15 +49,13 @@ const (
 // which the processing of a queue may time out. It is an escape hatch to raise
 // the timeout for queues.
 var queueGuaranteedProcessingTimeBudget = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
 	"kv.queue.process.guaranteed_time_budget",
 	"the guaranteed duration before which the processing of a queue may "+
 		"time out",
 	defaultProcessTimeout,
+	settings.WithVisibility(settings.Reserved),
 )
-
-func init() {
-	queueGuaranteedProcessingTimeBudget.SetVisibility(settings.Reserved)
-}
 
 func defaultProcessTimeoutFunc(cs *cluster.Settings, _ replicaInQueue) time.Duration {
 	return queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
@@ -69,9 +65,27 @@ func defaultProcessTimeoutFunc(cs *cluster.Settings, _ replicaInQueue) time.Dura
 // or calculate a range checksum) while processing should have a timeout which
 // is a function of the size of the range and the maximum allowed rate of data
 // transfer that adheres to a minimum timeout specified in a cluster setting.
+// When the queue contains different types of work items, with different rates,
+// the timeout of all items is set according to the minimum rate of the
+// different types, to prevent slower items from causing faster items appearing
+// after them in the queue to time-out.
 //
-// The parameter controls which rate to use.
-func makeRateLimitedTimeoutFunc(rateSetting *settings.ByteSizeSetting) queueProcessTimeoutFunc {
+// The parameter controls which rate(s) to use.
+func makeRateLimitedTimeoutFunc(rateSettings *settings.ByteSizeSetting) queueProcessTimeoutFunc {
+	return makeRateLimitedTimeoutFuncByPermittedSlowdown(permittedRangeScanSlowdown, rateSettings)
+}
+
+// permittedRangeScanSlowdown is the factor of the above the estimated duration
+// for a range scan given the configured rate which we use to configure
+// the operations's timeout.
+const permittedRangeScanSlowdown = 10
+
+// makeRateLimitedTimeoutFuncByPermittedSlowdown creates a timeout function based on a permitted
+// slowdown factor on the estimated queue processing duration based on the given rate settings.
+// See makeRateLimitedTimeoutFunc for more information.
+func makeRateLimitedTimeoutFuncByPermittedSlowdown(
+	permittedSlowdown int, rateSettings *settings.ByteSizeSetting,
+) queueProcessTimeoutFunc {
 	return func(cs *cluster.Settings, r replicaInQueue) time.Duration {
 		minimumTimeout := queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
 		// NB: In production code this will type assertion will always succeed.
@@ -81,11 +95,9 @@ func makeRateLimitedTimeoutFunc(rateSetting *settings.ByteSizeSetting) queueProc
 		if !ok {
 			return minimumTimeout
 		}
-		snapshotRate := rateSetting.Get(&cs.SV)
-		stats := repl.GetMVCCStats()
-		totalBytes := stats.KeyBytes + stats.ValBytes + stats.IntentBytes + stats.SysBytes
-		estimatedDuration := time.Duration(totalBytes/snapshotRate) * time.Second
-		timeout := estimatedDuration * permittedRangeScanSlowdown
+		minSnapshotRate := rateSettings.Get(&cs.SV)
+		estimatedDuration := time.Duration(repl.GetMVCCStats().Total()/minSnapshotRate) * time.Second
+		timeout := estimatedDuration * time.Duration(permittedSlowdown)
 		if timeout < minimumTimeout {
 			timeout = minimumTimeout
 		}
@@ -93,17 +105,12 @@ func makeRateLimitedTimeoutFunc(rateSetting *settings.ByteSizeSetting) queueProc
 	}
 }
 
-// permittedRangeScanSlowdown is the factor of the above the estimated duration
-// for a range scan given the configured rate which we use to configure
-// the operations's timeout.
-const permittedRangeScanSlowdown = 10
-
-// a purgatoryError indicates a replica processing failure which indicates
-// the replica can be placed into purgatory for faster retries when the
-// failure condition changes.
-type purgatoryError interface {
+// PurgatoryError indicates a replica processing failure which indicates the
+// replica can be placed into purgatory for faster retries than the replica
+// scanner's interval.
+type PurgatoryError interface {
 	error
-	purgatoryErrorMarker() // dummy method for unique interface
+	PurgatoryErrorMarker() // dummy method for unique interface
 }
 
 // processCallback is a hook that is called when a replica finishes processing.
@@ -240,9 +247,8 @@ type replicaInQueue interface {
 	IsInitialized() bool
 	IsDestroyed() (DestroyReason, error)
 	Desc() *roachpb.RangeDescriptor
-	maybeInitializeRaftGroup(context.Context)
-	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *roachpb.Error)
-	LeaseStatusAt(context.Context, hlc.ClockTimestamp) kvserverpb.LeaseStatus
+	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *kvpb.Error)
+	CurrentLeaseStatus(context.Context) kvserverpb.LeaseStatus
 }
 
 type queueImpl interface {
@@ -257,6 +263,12 @@ type queueImpl interface {
 	// (vs. it being a no-op or an error).
 	process(context.Context, *Replica, spanconfig.StoreReader) (processed bool, err error)
 
+	// processScheduled is called after async task was created to run process.
+	// This function is called by the process loop synchronously. This method is
+	// called regardless of process being called or not since replica validity
+	// checks are done asynchronously.
+	postProcessScheduled(ctx context.Context, replica replicaInQueue, priority float64)
+
 	// timer returns a duration to wait between processing the next item
 	// from the queue. The duration of the last processing of a replica
 	// is supplied as an argument. If no replicas have finished processing
@@ -268,6 +280,11 @@ type queueImpl interface {
 	// purgatory due to failures. If purgatoryChan returns nil, failing
 	// replicas are not sent to purgatory.
 	purgatoryChan() <-chan time.Time
+
+	// updateChan returns a channel that is signalled whenever there is an update
+	// to the cluster state that might impact the replicas in the queue's
+	// purgatory.
+	updateChan() <-chan time.Time
 }
 
 // queueProcessTimeoutFunc controls the timeout for queue processing for a
@@ -287,27 +304,24 @@ type queueConfig struct {
 	// on a range level and use it to ensure that only one node in the cluster
 	// processes that range.
 	needsLease bool
-	// needsRaftInitialized controls whether the Raft group will be initialized
-	// (if not already initialized) when deciding whether to process this
-	// replica.
-	needsRaftInitialized bool
-	// needsSystemConfig controls whether this queue requires a valid copy of the
-	// system config to operate on a replica. Not all queues require it, and it's
+	// needsSpanConfigs controls whether this queue requires a valid copy of the
+	// span configs to operate on a replica. Not all queues require it, and it's
 	// unsafe for certain queues to wait on it. For example, a raft snapshot may
-	// be needed in order to make it possible for the system config to become
-	// available (as observed in #16268), so the raft snapshot queue can't
-	// require the system config to already be available.
-	needsSystemConfig bool
+	// be needed in order to make it possible for the span config range to
+	// become available (as observed in #16268), so the raft snapshot queue
+	// can't require the span configs to already be available.
+	needsSpanConfigs bool
 	// acceptsUnsplitRanges controls whether this queue can process ranges that
 	// need to be split due to zone config settings. Ranges are checked before
 	// calling queueImpl.shouldQueue and queueImpl.process.
 	// This is to avoid giving the queue a replica that spans multiple config
 	// zones (which might make the action of the queue ambiguous - e.g. we don't
 	// want to try to replicate a range until we know which zone it is in and
-	// therefore how many replicas are required).
+	// therefore how many replicas are required). If needsSpanConfig is not set
+	// then this setting is ignored.
 	acceptsUnsplitRanges bool
-	// processDestroyedReplicas controls whether or not we want to process replicas
-	// that have been destroyed but not GCed.
+	// processDestroyedReplicas controls whether or not we want to process
+	// replicas that have been destroyed but not GCed.
 	processDestroyedReplicas bool
 	// processTimeout returns the timeout for processing a replica.
 	processTimeoutFunc queueProcessTimeoutFunc
@@ -315,12 +329,28 @@ type queueConfig struct {
 	successes *metric.Counter
 	// failures is a counter of replicas which failed processing.
 	failures *metric.Counter
+	// storeFailures is a counter of replicas that failed processing due to a
+	// StoreBenignError. These errors must be counted independently of the above
+	// failures metric.
+	storeFailures *metric.Counter
 	// pending is a gauge measuring current replica count pending.
 	pending *metric.Gauge
-	// processingNanos is a counter measuring total nanoseconds spent processing replicas.
+	// processingNanos is a counter measuring total nanoseconds spent processing
+	// replicas.
 	processingNanos *metric.Counter
 	// purgatory is a gauge measuring current replica count in purgatory.
 	purgatory *metric.Gauge
+	// disabledConfig is a reference to the cluster setting that controls enabling
+	// and disabling queues.
+	disabledConfig *settings.BoolSetting
+	// skipIfReplicaHasExternalFilesConfig is a reference to the
+	// clsuter setting that controls whether replicas should be
+	// processed in this queue if they have external files. May
+	// be nil.
+	//
+	// skipIfReplicaHasExternalFilesConfig is only consulted after
+	// shouldQueue returns true for the given replica.
+	skipIfReplicaHasExternalFilesConfig *settings.BoolSetting
 }
 
 // baseQueue is the base implementation of the replicaQueue interface. Queue
@@ -347,7 +377,7 @@ type queueConfig struct {
 //
 // Replicas are added asynchronously through `MaybeAddAsync` or `AddAsync`.
 // MaybeAddAsync checks the various requirements selected by the queue config
-// (needsSystemConfig, needsLease, acceptsUnsplitRanges) as well as the
+// (needsSpanConfigs, needsLease, acceptsUnsplitRanges) as well as the
 // queueImpl's `shouldQueue`. AddAsync does not check any of this and accept a
 // priority directly instead of getting it from `shouldQueue`. These methods run
 // with shared a maximum concurrency of `addOrMaybeAddSemSize`. If the maximum
@@ -378,7 +408,7 @@ type queueConfig struct {
 //
 // A queueImpl can opt into a purgatory by returning a non-nil channel from the
 // `purgatoryChan` method. A replica is put into purgatory when the `process`
-// method returns an error with a `purgatoryError` as an entry somewhere in the
+// method returns an error with a `PurgatoryError` as an entry somewhere in the
 // `Cause` chain. A replica in purgatory is not processed again until the
 // channel is signaled, at which point every replica in purgatory is immediately
 // processed. This catchup is run without the `timer` rate limiting but shares
@@ -412,10 +442,9 @@ type baseQueue struct {
 		syncutil.Mutex                                    // Protects all variables in the mu struct
 		replicas       map[roachpb.RangeID]*replicaItem   // Map from RangeID to replicaItem
 		priorityQ      priorityQueue                      // The priority queue
-		purgatory      map[roachpb.RangeID]purgatoryError // Map of replicas to processing errors
+		purgatory      map[roachpb.RangeID]PurgatoryError // Map of replicas to processing errors
 		stopped        bool
-		// Some tests in this package disable queues.
-		disabled bool
+		disabled       bool
 	}
 }
 
@@ -442,9 +471,9 @@ func newBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *b
 	ambient := store.cfg.AmbientCtx
 	ambient.AddLogTag(name, nil)
 
-	if !cfg.acceptsUnsplitRanges && !cfg.needsSystemConfig {
+	if !cfg.acceptsUnsplitRanges && !cfg.needsSpanConfigs {
 		log.Fatalf(ambient.AnnotateCtx(context.Background()),
-			"misconfigured queue: acceptsUnsplitRanges=false requires needsSystemConfig=true; got %+v", cfg)
+			"misconfigured queue: acceptsUnsplitRanges=false requires needsSpanConfigs=true; got %+v", cfg)
 	}
 
 	bq := baseQueue{
@@ -468,6 +497,10 @@ func newBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *b
 		},
 	}
 	bq.mu.replicas = map[roachpb.RangeID]*replicaItem{}
+	bq.SetDisabled(!cfg.disabledConfig.Get(&store.cfg.Settings.SV))
+	cfg.disabledConfig.SetOnChange(&store.cfg.Settings.SV, func(ctx context.Context) {
+		bq.SetDisabled(!cfg.disabledConfig.Get(&store.cfg.Settings.SV))
+	})
 
 	return &bq
 }
@@ -567,10 +600,11 @@ func (bq *baseQueue) Async(
 	ctx context.Context, opName string, wait bool, fn func(ctx context.Context, h queueHelper),
 ) {
 	if log.V(3) {
-		log.InfofDepth(ctx, 2, "%s", log.Safe(opName))
+		log.InfofDepth(ctx, 2, "%s", redact.Safe(opName))
 	}
 	opName += " (" + bq.name + ")"
-	if err := bq.store.stopper.RunAsyncTaskEx(context.Background(),
+	bgCtx := bq.AnnotateCtx(context.Background())
+	if err := bq.store.stopper.RunAsyncTaskEx(bgCtx,
 		stop.TaskOpts{
 			TaskName:   opName,
 			Sem:        bq.addOrMaybeAddSem,
@@ -579,7 +613,7 @@ func (bq *baseQueue) Async(
 		func(ctx context.Context) {
 			fn(ctx, baseQueueHelper{bq})
 		}); err != nil && bq.addLogN.ShouldLog() {
-		log.Infof(ctx, "rate limited in %s: %s", log.Safe(opName), err)
+		log.Infof(ctx, "rate limited in %s: %s", redact.Safe(opName), err)
 	}
 }
 
@@ -598,62 +632,48 @@ func (bq *baseQueue) MaybeAddAsync(
 // for other operations to finish instead of turning into a noop (because
 // unlikely MaybeAdd, Add is not subject to being called opportunistically).
 func (bq *baseQueue) AddAsync(ctx context.Context, repl replicaInQueue, prio float64) {
-	bq.Async(ctx, "Add", false /* wait */, func(ctx context.Context, h queueHelper) {
+	bq.Async(ctx, "Add", true /* wait */, func(ctx context.Context, h queueHelper) {
 		h.Add(ctx, repl, prio)
 	})
 }
 
 func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.ClockTimestamp) {
 	ctx = repl.AnnotateCtx(ctx)
-	// Load the system config if it's needed.
-	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
-		var err error
-		confReader, err = bq.store.GetConfReader()
-		if err != nil {
-			if errors.Is(err, errSysCfgUnavailable) && log.V(1) {
-				log.Warningf(ctx, "unable to retrieve system config, skipping: %v", err)
-			}
-			return
-		}
+	ctx = bq.AnnotateCtx(ctx)
+
+	ctx, undo := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+	defer undo()
+	if fn := bq.store.TestingKnobs().BaseQueueInterceptor; fn != nil {
+		// Passes the context and baseQueue parameters to the interceptor to verify
+		// the correct setting of the pprof label within the context.
+		fn(ctx, bq)
 	}
 
 	bq.mu.Lock()
-	stopped := bq.mu.stopped || bq.mu.disabled
+	stopped := bq.mu.stopped
+	disabled := bq.mu.disabled
 	bq.mu.Unlock()
 
 	if stopped {
 		return
 	}
 
-	if !repl.IsInitialized() {
-		return
-	}
-
-	if bq.needsRaftInitialized {
-		repl.maybeInitializeRaftGroup(ctx)
-	}
-
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to span configs, but queue does not
-		// accept unsplit ranges.
-		if log.V(1) {
-			log.Infof(ctx, "split needed; not adding")
-		}
-		return
-	}
-
-	if bq.needsLease {
-		// Check to see if either we own the lease or do not know who the lease
-		// holder is.
-		st := repl.LeaseStatusAt(ctx, now)
-		if st.IsValid() && !st.OwnedBy(repl.StoreID()) {
-			if log.V(1) {
-				log.Infof(ctx, "needs lease; not adding: %v", st.Lease)
-			}
+	if disabled {
+		// The disabled queue bypass is used in tests which enable manual
+		// replication, however still require specific range(s) to be processed
+		// through the queue.
+		bypassDisabled := bq.store.TestingKnobs().BaseQueueDisabledBypassFilter
+		if bypassDisabled == nil || !bypassDisabled(repl.GetRangeID()) {
 			return
 		}
 	}
+
+	// Load the system config if it's needed.
+	confReader, err := bq.replicaCanBeProcessed(ctx, repl, false /* acquireLeaseIfNeeded */)
+	if err != nil {
+		return
+	}
+
 	// NB: in production code, this type assertion is always true. In tests,
 	// it may not be and shouldQueue will be passed a nil realRepl. These tests
 	// know what they're getting into so that's fine.
@@ -662,7 +682,21 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 	if !should {
 		return
 	}
-	if _, err := bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority); !isExpectedQueueError(err) {
+
+	extConf := bq.skipIfReplicaHasExternalFilesConfig
+	if extConf != nil && extConf.Get(&bq.store.cfg.Settings.SV) {
+		hasExternal, err := realRepl.HasExternalBytes()
+		if err != nil {
+			log.Warningf(ctx, "could not determine if %s has external bytes: %s", realRepl, err)
+			return
+		}
+		if hasExternal {
+			log.VInfof(ctx, 1, "skipping %s for %s because it has external bytes", bq.name, realRepl)
+			return
+		}
+	}
+	_, err = bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority)
+	if !isExpectedQueueError(err) {
 		log.Errorf(ctx, "unable to add: %+v", err)
 	}
 }
@@ -689,10 +723,16 @@ func (bq *baseQueue) addInternal(
 	}
 
 	if bq.mu.disabled {
-		if log.V(3) {
-			log.Infof(ctx, "queue disabled")
+		// The disabled queue bypass is used in tests which enable manual
+		// replication, however still require specific range(s) to be processed
+		// through the queue.
+		bypassDisabled := bq.store.TestingKnobs().BaseQueueDisabledBypassFilter
+		if bypassDisabled == nil || !bypassDisabled(desc.RangeID) {
+			if log.V(3) {
+				log.Infof(ctx, "queue disabled")
+			}
+			return false, errQueueDisabled
 		}
-		return false, errQueueDisabled
 	}
 
 	// If the replica is currently in purgatory, don't re-add it.
@@ -789,6 +829,9 @@ func (bq *baseQueue) MaybeRemove(rangeID roachpb.RangeID) {
 // stopper signals exit.
 func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 	ctx := bq.AnnotateCtx(context.Background())
+	ctx, undo := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+	defer undo()
+
 	done := func() {
 		bq.mu.Lock()
 		bq.mu.stopped = true
@@ -828,28 +871,10 @@ func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 					// Acquire from the process semaphore.
 					bq.processSem <- struct{}{}
 
-					repl := bq.pop()
+					repl, priority := bq.pop()
 					if repl != nil {
-						annotatedCtx := repl.AnnotateCtx(ctx)
-						if stopper.RunAsyncTaskEx(annotatedCtx, stop.TaskOpts{
-							TaskName: bq.processOpName() + " [outer]",
-						},
-							func(ctx context.Context) {
-								// Release semaphore when finished processing.
-								defer func() { <-bq.processSem }()
-
-								start := timeutil.Now()
-								err := bq.processReplica(ctx, repl)
-
-								duration := timeutil.Since(start)
-								bq.recordProcessDuration(ctx, duration)
-
-								bq.finishProcessingReplica(ctx, stopper, repl, err)
-							}) != nil {
-							// Release semaphore on task failure.
-							<-bq.processSem
-							return
-						}
+						bq.processOneAsyncAndReleaseSem(ctx, repl, stopper)
+						bq.impl.postProcessScheduled(ctx, repl, priority)
 					} else {
 						// Release semaphore if no replicas were available.
 						<-bq.processSem
@@ -874,6 +899,38 @@ func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 	}
 }
 
+// processOneAsyncAndReleaseSem processes a replica if possible and releases the
+// processSem when the processing is complete.
+func (bq *baseQueue) processOneAsyncAndReleaseSem(
+	ctx context.Context, repl replicaInQueue, stopper *stop.Stopper,
+) {
+	ctx = repl.AnnotateCtx(ctx)
+	taskName := bq.processOpName() + " [outer]"
+	// Validate that the replica is still in a state that can be processed. If
+	// it is no longer processable, return immediately.
+	if _, err := bq.replicaCanBeProcessed(ctx, repl, false /*acquireLeaseIfNeeded */); err != nil {
+		bq.finishProcessingReplica(ctx, stopper, repl, err)
+		<-bq.processSem
+		return
+	}
+	if err := stopper.RunAsyncTaskEx(ctx, stop.TaskOpts{TaskName: taskName},
+		func(ctx context.Context) {
+			// Release semaphore when finished processing.
+			defer func() { <-bq.processSem }()
+			start := timeutil.Now()
+			err := bq.processReplica(ctx, repl)
+			bq.recordProcessDuration(ctx, timeutil.Since(start))
+			bq.finishProcessingReplica(ctx, stopper, repl, err)
+		}); err != nil {
+		// Release semaphore if we can't start the task, normally this only
+		// happens during a system shutdown. If the func is started this will
+		// never return an error.
+		bq.finishProcessingReplica(ctx, stopper, repl, err)
+		log.Warningf(ctx, "%s: task did not start %v", taskName, err)
+		<-bq.processSem
+	}
+}
+
 // lastProcessDuration returns the duration of the last processing attempt.
 func (bq *baseQueue) lastProcessDuration() time.Duration {
 	return time.Duration(atomic.LoadInt64(&bq.processDur))
@@ -895,73 +952,30 @@ func (bq *baseQueue) recordProcessDuration(ctx context.Context, dur time.Duratio
 // ctx should already be annotated by both bq.AnnotateCtx() and
 // repl.AnnotateCtx().
 func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) error {
-	// Load the system config if it's needed.
-	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
-		var err error
-		confReader, err = bq.store.GetConfReader()
-		if errors.Is(err, errSysCfgUnavailable) {
-			if log.V(1) {
-				log.Warningf(ctx, "unable to retrieve conf reader, skipping: %v", err)
-			}
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to zone configs, but queue does
-		// not accept unsplit ranges.
-		log.VEventf(ctx, 3, "split needed; skipping")
-		return nil
-	}
 
 	ctx, span := tracing.EnsureChildSpan(ctx, bq.Tracer, bq.processOpName())
 	defer span.Finish()
-	return contextutil.RunWithTimeout(ctx, fmt.Sprintf("%s queue process replica %d", bq.name, repl.GetRangeID()),
+
+	log.VEventf(ctx, 1, "processing replica")
+
+	// Load the system config if it's needed.
+	conf, err := bq.replicaCanBeProcessed(ctx, repl, true /* acquireLeaseIfNeeded */)
+	if err != nil {
+		if errors.Is(err, errMarkNotAcquirableLease) {
+			return nil
+		}
+		log.VErrEventf(ctx, 2, "replica can not be processed now: %s", err)
+		return err
+	}
+
+	return timeutil.RunWithTimeout(ctx, redact.Sprintf("%s queue process replica %d", bq.name, repl.GetRangeID()),
 		bq.processTimeoutFunc(bq.store.ClusterSettings(), repl), func(ctx context.Context) error {
-			log.VEventf(ctx, 1, "processing replica")
-
-			if !repl.IsInitialized() {
-				// We checked this when adding the replica, but we need to check it again
-				// in case this is a different replica with the same range ID (see #14193).
-				// This is possible in the case where the replica was enqueued while not
-				// having a replica ID, perhaps due to a pre-emptive snapshot, and has
-				// since been removed and re-added at a different replica ID.
-				return errors.New("cannot process uninitialized replica")
-			}
-
-			if reason, err := repl.IsDestroyed(); err != nil {
-				if !bq.queueConfig.processDestroyedReplicas || reason == destroyReasonRemoved {
-					log.VEventf(ctx, 3, "replica destroyed (%s); skipping", err)
-					return nil
-				}
-			}
-
-			// If the queue requires a replica to have the range lease in
-			// order to be processed, check whether this replica has range lease
-			// and renew or acquire if necessary.
-			if bq.needsLease {
-				if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
-					switch v := pErr.GetDetail().(type) {
-					case *roachpb.NotLeaseHolderError, *roachpb.RangeNotFoundError:
-						log.VEventf(ctx, 3, "%s; skipping", v)
-						return nil
-					default:
-						log.VErrEventf(ctx, 2, "could not obtain lease: %s", pErr)
-						return errors.Wrapf(pErr.GoError(), "%s: could not obtain lease", repl)
-					}
-				}
-			}
-
 			log.VEventf(ctx, 3, "processing...")
 			// NB: in production code, this type assertion is always true. In tests,
 			// it may not be and shouldQueue will be passed a nil realRepl. These tests
 			// know what they're getting into so that's fine.
 			realRepl, _ := repl.(*Replica)
-			processed, err := bq.impl.process(ctx, realRepl, confReader)
+			processed, err := bq.impl.process(ctx, realRepl, conf)
 			if err != nil {
 				return err
 			}
@@ -973,19 +987,105 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 		})
 }
 
-type benignError struct {
-	cause error
+// errMarkNotAcquirableLease Special case lease acquisition errors for cases
+// where the lease can't be acquired.
+var errMarkNotAcquirableLease = errors.New("lease can't be acquired")
+
+// replicaCanBeProcessed validates that all the conditions for running this
+// queue are satisfied according to the queue configuration and the status of
+// the replica and its span config. This normalizes the logic for deciding
+// whether a queue can be processed. It returns an err if the replica can not be
+// processed right now. In some cases we want to attempt to acquire or renew a
+// lease if we don't currently have it and the queue requires a lease. This will
+// only return a nil SpanConfig if the queue does not require span configs.
+func (bq *baseQueue) replicaCanBeProcessed(
+	ctx context.Context, repl replicaInQueue, acquireLeaseIfNeeded bool,
+) (spanconfig.StoreReader, error) {
+	if !repl.IsInitialized() {
+		// We checked this when adding the replica, but we need to check it again
+		// in case this is a different replica with the same range ID (see #14193).
+		// This is possible in the case where the replica was enqueued while not
+		// having a replica ID, perhaps due to a pre-emptive snapshot, and has
+		// since been removed and re-added at a different replica ID.
+		return nil, errors.New("cannot process uninitialized replica")
+	}
+
+	// The replica GC queue can process destroyed replicas if it is stuck in
+	// destroyReasonMergePending for too long.
+	if reason, err := repl.IsDestroyed(); err != nil {
+		if !bq.queueConfig.processDestroyedReplicas || reason == destroyReasonRemoved {
+			log.VEventf(ctx, 3, "replica destroyed (%s); skipping", err)
+			return nil, errors.Wrap(err, "cannot process destroyed replica")
+		}
+	}
+
+	// The conf is only populated if the queue requires a span config. Otherwise
+	// nil is always returned.
+	var confReader spanconfig.StoreReader
+	if bq.needsSpanConfigs {
+		var err error
+		confReader, err = bq.store.GetConfReader(ctx)
+		if err != nil {
+			if log.V(1) || !errors.Is(err, errSpanConfigsUnavailable) {
+				log.Warningf(ctx, "unable to retrieve conf reader, skipping: %v", err)
+			}
+			return nil, err
+		}
+
+		if !bq.acceptsUnsplitRanges {
+			// Queue does not accept unsplit ranges. Check to see if the range needs to
+			// be spilt because of a span config.
+			needsSplit, err := confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey)
+			if err != nil {
+				log.Warningf(ctx, "unable to compute NeedsSplit, skipping: %v", err)
+				return nil, err
+			}
+			if needsSplit {
+				log.VEventf(ctx, 3, "split needed; skipping")
+				return nil, errors.New("split needed; skipping")
+			}
+		}
+	}
+
+	// If the queue requires a replica to have the range lease in
+	// order to be processed, check whether this replica has range lease
+	// and renew or acquire if necessary.
+	if bq.needsLease {
+		if acquireLeaseIfNeeded {
+			_, pErr := repl.redirectOnOrAcquireLease(ctx)
+			if pErr != nil {
+				switch v := pErr.GetDetail().(type) {
+				case *kvpb.NotLeaseHolderError, *kvpb.RangeNotFoundError:
+					log.VEventf(ctx, 3, "%s; skipping", v)
+					return nil, errMarkNotAcquirableLease
+				}
+				log.VErrEventf(ctx, 2, "could not obtain lease: %s", pErr)
+				return nil, errors.Wrapf(pErr.GoError(), "%s: could not obtain lease", repl)
+			}
+
+			// TODO(baptist): Should this be added to replicaInQueue?
+			realRepl, _ := repl.(*Replica)
+			pErr = realRepl.maybeSwitchLeaseType(ctx)
+			if pErr != nil {
+				return nil, pErr.GoError()
+			}
+		} else {
+			// Don't process if we don't own the lease.
+			st := repl.CurrentLeaseStatus(ctx)
+			if st.IsValid() && !st.OwnedBy(repl.StoreID()) {
+				log.VEventf(ctx, 1, "needs lease; not adding: %v", st.Lease)
+				// NB: this is an expected error, so make sure it doesn't get
+				// logged loudly.
+				return nil, benignerror.New(errors.Newf("needs lease, not adding: %v", st.Lease))
+			}
+		}
+	}
+	return confReader, nil
 }
 
-func (be *benignError) Error() string { return be.cause.Error() }
-func (be *benignError) Cause() error  { return be.cause }
-
-func isBenign(err error) bool {
-	return errors.HasType(err, (*benignError)(nil))
-}
-
-func isPurgatoryError(err error) (purgatoryError, bool) {
-	var purgErr purgatoryError
+// IsPurgatoryError returns true iff the given error is a purgatory error.
+func IsPurgatoryError(err error) (PurgatoryError, bool) {
+	var purgErr PurgatoryError
 	return purgErr, errors.As(err, &purgErr)
 }
 
@@ -1069,19 +1169,24 @@ func (bq *baseQueue) finishProcessingReplica(
 
 	// Handle failures.
 	if err != nil {
-		benign := isBenign(err)
+		benign := benignerror.IsBenign(err)
+		storeBenign := benignerror.IsStoreBenign(err)
 
 		// Increment failures metric.
 		//
 		// TODO(tschottdorf): once we start asserting zero failures in tests
 		// (and production), move benign failures into a dedicated category.
 		bq.failures.Inc(1)
+		if storeBenign {
+			bq.storeFailures.Inc(1)
+			requeue = true
+		}
 
 		// Determine whether a failure is a purgatory error. If it is, add
 		// the failing replica to purgatory. Note that even if the item was
 		// scheduled to be requeued, we ignore this if we add the replica to
 		// purgatory.
-		if purgErr, ok := isPurgatoryError(err); ok {
+		if purgErr, ok := IsPurgatoryError(err); ok {
 			bq.mu.Lock()
 			bq.addToPurgatoryLocked(ctx, stopper, repl, purgErr)
 			bq.mu.Unlock()
@@ -1103,7 +1208,7 @@ func (bq *baseQueue) finishProcessingReplica(
 // addToPurgatoryLocked adds the specified replica to the purgatory queue, which
 // holds replicas which have failed processing.
 func (bq *baseQueue) addToPurgatoryLocked(
-	ctx context.Context, stopper *stop.Stopper, repl replicaInQueue, purgErr purgatoryError,
+	ctx context.Context, stopper *stop.Stopper, repl replicaInQueue, purgErr PurgatoryError,
 ) {
 	bq.mu.AssertHeld()
 
@@ -1141,60 +1246,24 @@ func (bq *baseQueue) addToPurgatoryLocked(
 	}
 
 	// Otherwise, create purgatory and start processing.
-	bq.mu.purgatory = map[roachpb.RangeID]purgatoryError{
+	bq.mu.purgatory = map[roachpb.RangeID]PurgatoryError{
 		repl.GetRangeID(): purgErr,
 	}
 
 	workerCtx := bq.AnnotateCtx(context.Background())
 	_ = stopper.RunAsyncTaskEx(workerCtx, stop.TaskOpts{TaskName: bq.name + ".purgatory", SpanOpt: stop.SterileRootSpan}, func(ctx context.Context) {
 		ticker := time.NewTicker(purgatoryReportInterval)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-bq.impl.purgatoryChan():
-				func() {
-					// Acquire from the process semaphore, release when done.
-					bq.processSem <- struct{}{}
-					defer func() { <-bq.processSem }()
-
-					// Remove all items from purgatory into a copied slice.
-					bq.mu.Lock()
-					ranges := make([]*replicaItem, 0, len(bq.mu.purgatory))
-					for rangeID := range bq.mu.purgatory {
-						item := bq.mu.replicas[rangeID]
-						if item == nil {
-							log.Fatalf(ctx, "r%d is in purgatory but not in replicas", rangeID)
-						}
-						item.setProcessing()
-						ranges = append(ranges, item)
-						bq.removeFromPurgatoryLocked(item)
-					}
-					bq.mu.Unlock()
-
-					for _, item := range ranges {
-						repl, err := bq.getReplica(item.rangeID)
-						if err != nil || item.replicaID != repl.ReplicaID() {
-							continue
-						}
-						annotatedCtx := repl.AnnotateCtx(ctx)
-						if stopper.RunTask(
-							annotatedCtx, bq.processOpName(), func(ctx context.Context) {
-								err := bq.processReplica(ctx, repl)
-								bq.finishProcessingReplica(ctx, stopper, repl, err)
-							}) != nil {
-							return
-						}
-					}
-				}()
-
-				// Clean up purgatory, if empty.
-				bq.mu.Lock()
-				if len(bq.mu.purgatory) == 0 {
-					log.Infof(ctx, "purgatory is now empty")
-					bq.mu.purgatory = nil
-					bq.mu.Unlock()
+			case <-bq.impl.updateChan():
+				if bq.processReplicasInPurgatory(ctx, stopper) {
 					return
 				}
-				bq.mu.Unlock()
+			case <-bq.impl.purgatoryChan():
+				if bq.processReplicasInPurgatory(ctx, stopper) {
+					return
+				}
 			case <-ticker.C:
 				// Report purgatory status.
 				bq.mu.Lock()
@@ -1210,31 +1279,98 @@ func (bq *baseQueue) addToPurgatoryLocked(
 				return
 			}
 		}
-	})
+	},
+	)
+}
+
+// processReplicasInPurgatory processes replicas currently in the queue's
+// purgatory.
+func (bq *baseQueue) processReplicasInPurgatory(
+	ctx context.Context, stopper *stop.Stopper,
+) (purgatoryCleared bool) {
+	func() {
+		// Acquire from the process semaphore, release when done.
+		bq.processSem <- struct{}{}
+		defer func() { <-bq.processSem }()
+
+		// Remove all items from purgatory into a copied slice.
+		bq.mu.Lock()
+		ranges := make([]*replicaItem, 0, len(bq.mu.purgatory))
+		for rangeID := range bq.mu.purgatory {
+			item := bq.mu.replicas[rangeID]
+			if item == nil {
+				log.Fatalf(ctx, "r%d is in purgatory but not in replicas", rangeID)
+			}
+			item.setProcessing()
+			ranges = append(ranges, item)
+			bq.removeFromPurgatoryLocked(item)
+		}
+		bq.mu.Unlock()
+
+		for _, item := range ranges {
+			repl, err := bq.getReplica(item.rangeID)
+			if err != nil || item.replicaID != repl.ReplicaID() {
+				bq.mu.Lock()
+				bq.removeFromReplicaSetLocked(item.rangeID)
+				bq.mu.Unlock()
+				continue
+			}
+			annotatedCtx := repl.AnnotateCtx(ctx)
+			if stopper.RunTask(
+				annotatedCtx, bq.processOpName(), func(ctx context.Context) {
+					if _, err := bq.replicaCanBeProcessed(ctx, repl, false); err != nil {
+						bq.finishProcessingReplica(ctx, stopper, repl, err)
+					} else {
+						err = bq.processReplica(ctx, repl)
+						bq.finishProcessingReplica(ctx, stopper, repl, err)
+					}
+				},
+			) != nil {
+				// NB: We do not need to worry about removing any unprocessed replicas
+				// from the replica set here, as RunTask will only return an error when
+				// the stopper is quiescing or stopping -- meaning the process is
+				// shutting down.
+				return
+			}
+		}
+	}()
+
+	// Clean up purgatory, if empty.
+	bq.mu.Lock()
+	if len(bq.mu.purgatory) == 0 {
+		log.Infof(ctx, "purgatory is now empty")
+		bq.mu.purgatory = nil
+		bq.mu.Unlock()
+		return true /* purgatoryCleared */
+	}
+	bq.mu.Unlock()
+	return false /* purgatoryCleared */
 }
 
 // pop dequeues the highest priority replica, if any, in the queue. The
 // replicaItem corresponding to the returned Replica will be moved to the
 // "processing" state and should be cleaned up by calling
 // finishProcessingReplica once the Replica has finished processing.
-func (bq *baseQueue) pop() replicaInQueue {
+func (bq *baseQueue) pop() (replicaInQueue, float64) {
 	bq.mu.Lock()
 	for {
 		if bq.mu.priorityQ.Len() == 0 {
 			bq.mu.Unlock()
-			return nil
+			return nil, 0
 		}
 		item := heap.Pop(&bq.mu.priorityQ).(*replicaItem)
 		if item.processing {
 			log.Fatalf(bq.AnnotateCtx(context.Background()), "%s pulled processing item from heap: %v", bq.name, item)
 		}
+		// We are saving priority because the state is reset by setProcessing()
+		priority := item.priority
 		item.setProcessing()
 		bq.pending.Update(int64(bq.mu.priorityQ.Len()))
 		bq.mu.Unlock()
 
 		repl, _ := bq.getReplica(item.rangeID)
 		if repl != nil && item.replicaID == repl.ReplicaID() {
-			return repl
+			return repl, priority
 		}
 		// Replica not found or was recreated with a new replica ID, remove from
 		// set and try again.
@@ -1299,18 +1435,22 @@ func (bq *baseQueue) removeFromReplicaSetLocked(rangeID roachpb.RangeID) {
 // DrainQueue locks the queue and processes the remaining queued replicas. It
 // processes the replicas in the order they're queued in, one at a time.
 // Exposed for testing only.
-func (bq *baseQueue) DrainQueue(stopper *stop.Stopper) {
+func (bq *baseQueue) DrainQueue(ctx context.Context, stopper *stop.Stopper) {
 	// Lock processing while draining. This prevents the main process
 	// loop from racing with this method and ensures that any replicas
 	// queued up when this method was called will be processed by the
 	// time it returns.
 	defer bq.lockProcessing()()
 
-	ctx := bq.AnnotateCtx(context.Background())
-	for repl := bq.pop(); repl != nil; repl = bq.pop() {
+	ctx = bq.AnnotateCtx(ctx)
+	for repl, _ := bq.pop(); repl != nil; repl, _ = bq.pop() {
 		annotatedCtx := repl.AnnotateCtx(ctx)
-		err := bq.processReplica(annotatedCtx, repl)
-		bq.finishProcessingReplica(annotatedCtx, stopper, repl, err)
+		if _, err := bq.replicaCanBeProcessed(annotatedCtx, repl, false); err != nil {
+			bq.finishProcessingReplica(annotatedCtx, stopper, repl, err)
+		} else {
+			err = bq.processReplica(annotatedCtx, repl)
+			bq.finishProcessingReplica(annotatedCtx, stopper, repl, err)
+		}
 	}
 }
 

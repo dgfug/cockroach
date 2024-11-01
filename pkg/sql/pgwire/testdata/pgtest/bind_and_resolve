@@ -1,10 +1,10 @@
-# Test binding calls which reference names via either types or oid casts work
-# after a bizarre turn of events whereby we used to set the planner txn to nil.
-# The long and the short of it is that we totally abuse the planner when
-# performing BIND and the fact that it continues to carry a transaction that
-# does not correspond to the connExecutor's transaction is, generally, a big
-# problem. Before the changes made in the commit adding this test, this test
-# would result in a nil pointer panic.
+# Test binding calls which reference names via either types or oid casts work.
+# Before the changes made in the commit adding this test, this test would result
+# in a nil pointer panic, since the txn was not initialized correctly.
+
+# TODO(richardjcai): Support let command similar to logic tests to
+# programmatically get the table id.
+# The first table created has id 54.
 
 send
 Query {"String": "CREATE TABLE t (a INT PRIMARY KEY)"}
@@ -40,7 +40,7 @@ ReadyForQuery
 
 # This is crdb_only because Postgres does not support AS OF SYSTEM TIME.
 send crdb_only
-Query {"String": "BEGIN AS OF SYSTEM TIME '1s'"}
+Query {"String": "BEGIN AS OF SYSTEM TIME '0s'"}
 Sync
 ----
 
@@ -64,7 +64,7 @@ until crdb_only
 ReadyForQuery
 ----
 {"Type":"BindComplete"}
-{"Type":"DataRow","Values":[{"text":"52"}]}
+{"Type":"DataRow","Values":[{"text":"104"}]}
 {"Type":"CommandComplete","CommandTag":"SELECT 1"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 

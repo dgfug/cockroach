@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -364,6 +359,10 @@ func TestTypes(t *testing.T) {
 		{Oid, MakeScalar(OidFamily, oid.T_oid, 0, 0, emptyLocale)},
 		{RegClass, MakeScalar(OidFamily, oid.T_regclass, 0, 0, emptyLocale)},
 
+		{RefCursor, &T{InternalType: InternalType{
+			Family: RefCursorFamily, Oid: oid.T_refcursor, Locale: &emptyLocale}}},
+		{RefCursor, MakeScalar(RefCursorFamily, oid.T_refcursor, 0, 0, emptyLocale)},
+
 		// STRING
 		{MakeString(0), String},
 		{MakeString(0), &T{InternalType: InternalType{
@@ -645,6 +644,94 @@ func TestEquivalent(t *testing.T) {
 	}
 }
 
+func TestIdentical(t *testing.T) {
+	testCases := []struct {
+		typ1      *T
+		typ2      *T
+		identical bool
+	}{
+		// ARRAY
+		{IntArray, IntArray, true},
+		{Int2Vector, Int2Vector, true},
+		{Int2Vector, IntArray, false},
+		{OidVector, MakeArray(Oid), false},
+		{MakeArray(Int), MakeArray(Int), true},
+		{MakeArray(Int), IntArray, true},
+		{MakeArray(Int), MakeArray(Int4), false},
+		{MakeArray(String), MakeArray(String), true},
+		{MakeArray(String), MakeArray(MakeChar(10)), false},
+		{MakeArray(String), MakeArray(MakeArray(String)), false},
+		{MakeArray(IntArray), IntArray, false},
+
+		// BIT
+		{MakeBit(1), MakeBit(1), true},
+		{MakeBit(1), MakeBit(2), false},
+		{MakeBit(1), MakeVarBit(1), false},
+		{MakeVarBit(10), Any, false},
+		{VarBit, Bytes, false},
+
+		// COLLATEDSTRING
+		{MakeCollatedString(String, "en"), MakeCollatedString(String, "en"), true},
+		{MakeCollatedString(String, "en_us"), MakeCollatedString(String, "en_US"), true},
+		{MakeCollatedString(String, "en_us"), MakeCollatedString(String, "en-US"), true},
+		{MakeCollatedString(String, "en_us"), MakeCollatedString(String, "de"), false},
+		{MakeCollatedString(String, "en"), MakeCollatedString(MakeVarChar(10), "en"), false},
+		{MakeCollatedString(String, "en"), String, false},
+		{MakeCollatedString(String, "en"), AnyCollatedString, false},
+		{AnyCollatedString, MakeCollatedString(String, "en"), false},
+		{MakeCollatedString(String, "en"), MakeCollatedString(String, "de"), false},
+
+		// DECIMAL
+		{Decimal, Decimal, true},
+		{Decimal, MakeDecimal(3, 2), false},
+		{MakeDecimal(3, 2), MakeDecimal(3, 2), true},
+		{MakeDecimal(3, 2), MakeDecimal(3, 0), false},
+		{Any, MakeDecimal(10, 0), false},
+		{Decimal, Float, false},
+
+		// INT
+		{Int2, Int2, true},
+		{Int4, Int4, true},
+		{Int2, Int4, false},
+		{Int4, Int, false},
+		{Int, Any, false},
+		{Int, IntArray, false},
+
+		// TUPLE
+		{MakeTuple([]*T{}), MakeTuple([]*T{}), true},
+		{MakeTuple([]*T{Int4, String}), MakeTuple([]*T{Int4, String}), true},
+		{MakeTuple([]*T{Int, String}), MakeTuple([]*T{Int4, String}), false},
+		{MakeTuple([]*T{Int, String}), AnyTuple, false},
+		{AnyTuple, MakeTuple([]*T{Int, String}), false},
+		{MakeLabeledTuple([]*T{Int4, String}, []string{"label1", "label2"}),
+			MakeLabeledTuple([]*T{Int4, String}, []string{"label1", "label2"}), true},
+		{MakeLabeledTuple([]*T{Int4, String}, []string{"label1", "label2"}),
+			MakeLabeledTuple([]*T{Int4, String}, []string{"label1", "label4"}), false},
+		{MakeTuple([]*T{String, Int}), MakeTuple([]*T{Int, String}), false},
+
+		// ENUM
+		{MakeEnum(15210, 15213), MakeEnum(15210, 15213), true},
+		{MakeEnum(15210, 15213), MakeEnum(15150, 15213), false},
+
+		// UNKNOWN
+		{Unknown, &T{InternalType: InternalType{
+			Family: UnknownFamily, Oid: oid.T_unknown, Locale: &emptyLocale}}, true},
+		{Any, Unknown, false},
+		{Unknown, Int, false},
+	}
+
+	for _, tc := range testCases {
+		if tc.identical && !tc.typ1.Identical(tc.typ2) {
+			t.Errorf("expected <%v> to be identical to <%v>",
+				tc.typ1.DebugString(), tc.typ2.DebugString())
+		}
+		if !tc.identical && tc.typ1.Identical(tc.typ2) {
+			t.Errorf("expected <%v> to not be identical to <%v>",
+				tc.typ1.DebugString(), tc.typ2.DebugString())
+		}
+	}
+}
+
 // TestMarshalCompat tests backwards-compatibility during marshal.
 func TestMarshalCompat(t *testing.T) {
 	intElemType := IntFamily
@@ -680,6 +767,9 @@ func TestMarshalCompat(t *testing.T) {
 		// FLOAT
 		{Float, InternalType{Family: FloatFamily, Oid: oid.T_float8, Width: 64}},
 		{Float4, InternalType{Family: FloatFamily, Oid: oid.T_float4, Width: 32, VisibleType: visibleREAL}},
+
+		// REFCURSOR
+		{RefCursor, InternalType{Family: RefCursorFamily, Oid: oid.T_refcursor}},
 
 		// STRING
 		{MakeString(10), InternalType{Family: StringFamily, Oid: oid.T_text, Width: 10}},
@@ -743,6 +833,9 @@ func TestUnmarshalCompat(t *testing.T) {
 		{InternalType{Family: IntFamily, VisibleType: visibleBIT}, Int},
 		{InternalType{Family: IntFamily, Width: 20}, Int},
 		{InternalType{Family: IntFamily}, Int},
+
+		// REFCURSOR
+		{InternalType{Family: RefCursorFamily, Oid: oid.T_refcursor}, RefCursor},
 
 		// STRING
 		{InternalType{Family: StringFamily}, String},
@@ -973,122 +1066,189 @@ func TestOidSetDuringUpgrade(t *testing.T) {
 }
 
 func TestSQLStandardName(t *testing.T) {
-	for _, typ := range Scalar {
+	for _, typ := range append([]*T{Any, AnyArray}, Scalar...) {
 		t.Run(typ.Name(), func(t *testing.T) {
 			require.NotEmpty(t, typ.SQLStandardName())
 		})
 	}
 }
 
-func TestCanonicalType(t *testing.T) {
+func TestWithoutTypeModifiers(t *testing.T) {
 	testCases := []struct {
-		typ      *T
+		t        *T
 		expected *T
 	}{
-		// BOOL
-		{Bool, Bool},
-
-		// INT
-		{Int, Int},
-		{Int4, Int},
-		{Int2, Int},
-
-		// FLOAT
-		{Float, Float},
-		{Float4, Float},
-
-		// DECIMAL
-		{Decimal, Decimal},
-		{MakeDecimal(10, 0), Decimal},
+		// Types with modifiers.
+		{MakeBit(2), typeBit},
+		{MakeVarBit(2), VarBit},
+		{MakeString(2), String},
+		{MakeVarChar(2), VarChar},
+		{MakeChar(2), typeBpChar},
+		{QChar, typeQChar},
+		{MakeCollatedString(MakeString(2), "en"), MakeCollatedString(String, "en")},
+		{MakeCollatedString(MakeVarChar(2), "en"), MakeCollatedString(VarChar, "en")},
+		{MakeCollatedString(MakeChar(2), "en"), MakeCollatedString(typeBpChar, "en")},
+		{MakeCollatedString(QChar, "en"), MakeCollatedString(typeQChar, "en")},
 		{MakeDecimal(5, 1), Decimal},
+		{MakeTime(2), Time},
+		{MakeTimeTZ(2), TimeTZ},
+		{MakeTimestamp(2), Timestamp},
+		{MakeTimestampTZ(2), TimestampTZ},
+		{MakeInterval(IntervalTypeMetadata{Precision: 3, PrecisionIsSet: true}),
+			Interval},
+		{MakeArray(MakeDecimal(5, 1)), DecimalArray},
+		{MakeTuple([]*T{MakeString(2), Time, MakeDecimal(5, 1)}),
+			MakeTuple([]*T{String, Time, Decimal})},
+		{MakeGeography(geopb.ShapeType_Point, 3857), Geography},
+		{MakeGeometry(geopb.ShapeType_PointZ, 4326), Geometry},
 
-		// DATE
-		{Date, Date},
-
-		// TIMESTAMP
-		{Timestamp, Timestamp},
-		{MakeTimestamp(10), Timestamp},
-
-		// TIMESTAMPTZ
-		{TimestampTZ, TimestampTZ},
-		{MakeTimestampTZ(10), TimestampTZ},
-
-		// TIME
-		{Time, Time},
-		{MakeTime(10), Time},
-
-		// TIMETZ
-		{TimeTZ, TimeTZ},
-		{MakeTimeTZ(10), TimeTZ},
-
-		// INTERVAL
-		{Interval, Interval},
-		{MakeInterval(IntervalTypeMetadata{Precision: 10, PrecisionIsSet: true}), Interval},
-
-		// STRING
-		{String, String},
-		{MakeString(10), String},
-
-		// BYTES
+		// Types without modifiers.
+		{Bool, Bool},
 		{Bytes, Bytes},
-
-		// COLLATEDSTRING
-		// Collated strings do not have a canonical type.
-		{MakeCollatedString(String, "en-US"), MakeCollatedString(String, "en-US")},
-
-		// OID
-		{Oid, Oid},
-
-		// UNKNOWN
-		{Unknown, Unknown},
-
-		// UUID
-		{Uuid, Uuid},
-
-		// INET
-		{INet, INet},
-
-		// JSON
-		{Jsonb, Jsonb},
-
-		// BIT
-		{VarBit, VarBit},
-		{MakeVarBit(10), VarBit},
-		{MakeBit(10), VarBit},
-
-		// GEOMETRY
-		{Geometry, Geometry},
-		{MakeGeometry(geopb.ShapeType_MultiPoint, 4325), Geometry},
-
-		// GEOGRAPHY
+		{MakeCollatedString(Name, "en"), MakeCollatedString(Name, "en")},
+		{Date, Date},
+		{Float, Float},
+		{Float4, Float4},
 		{Geography, Geography},
-		{MakeGeography(geopb.ShapeType_MultiPoint, 4325), Geography},
-
-		// ENUM
-		// Enums do not have a canonical type.
-		{MakeEnum(15210, 15213), MakeEnum(15210, 15213)},
-
-		// BOX2D
-		{Box2D, Box2D},
-
-		// ANY
-		{Any, Any},
-
-		// ARRAY
-		{IntArray, IntArray},
-		{MakeArray(Int4), IntArray},
-		{DecimalArray, DecimalArray},
-		{MakeArray(MakeDecimal(10, 2)), DecimalArray},
-
-		// TUPLE
-		{MakeTuple([]*T{Int, Decimal}), MakeTuple([]*T{Int, Decimal})},
-		{MakeTuple([]*T{Int4, MakeDecimal(10, 2)}), MakeTuple([]*T{Int, Decimal})},
+		{Geometry, Geometry},
+		{INet, INet},
+		{Int, Int},
+		{Int4, Int4},
+		{Int2, Int2},
+		{Jsonb, Jsonb},
+		{Name, Name},
+		{Uuid, Uuid},
+		{RefCursor, RefCursor},
 	}
 
 	for _, tc := range testCases {
-		actual := tc.typ.CanonicalType()
-		if !actual.Identical(tc.expected) {
-			t.Errorf("expect <%v>, got <%v>", tc.expected.DebugString(), actual.DebugString())
+		t.Run(tc.t.SQLString(), func(t *testing.T) {
+			if actual := tc.t.WithoutTypeModifiers(); !actual.Identical(tc.expected) {
+				t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), actual.DebugString())
+			}
+		})
+	}
+}
+
+func TestDelimiter(t *testing.T) {
+	testCases := []struct {
+		t        *T
+		expected string
+	}{
+		{Unknown, ","},
+		{Bool, ","},
+		{VarBit, ","},
+		{Int, ","},
+		{Int4, ","},
+		{Int2, ","},
+		{Float, ","},
+		{Float4, ","},
+		{Decimal, ","},
+		{String, ","},
+		{VarChar, ","},
+		{QChar, ","},
+		{Name, ","},
+		{RefCursor, ","},
+		{Bytes, ","},
+		{Date, ","},
+		{Time, ","},
+		{TimeTZ, ","},
+		{Timestamp, ","},
+		{TimestampTZ, ","},
+		{Interval, ","},
+		{Jsonb, ","},
+		{Uuid, ","},
+		{INet, ","},
+		{Geometry, ":"},
+		{Geography, ":"},
+		{Box2D, ","},
+		{Void, ","},
+		{EncodedKey, ","},
+	}
+
+	for _, tc := range testCases {
+		if actual := tc.t.Delimiter(); actual != tc.expected {
+			t.Errorf("%v: expected <%v>, got <%v>", tc.t.Family(), tc.expected, actual)
 		}
+	}
+}
+
+// Prior to the patch which introduced this test, the below calls would
+// have panicked.
+func TestEnumWithoutTypeMetaNameDoesNotPanicInSQLString(t *testing.T) {
+	typ := MakeEnum(100100, 100101)
+	require.Equal(t, "@100100", typ.SQLString())
+	arrayType := MakeArray(typ)
+	require.Equal(t, "@100100[]", arrayType.SQLString())
+}
+
+func TestSQLStringForError(t *testing.T) {
+	const userDefinedOID = oidext.CockroachPredefinedOIDMax + 500
+	userDefinedEnum := MakeEnum(userDefinedOID, userDefinedOID+3)
+	nonUserDefinedEnum := MakeEnum(500, 503)
+	userDefinedTuple := &T{
+		InternalType: InternalType{
+			Family: TupleFamily, Oid: userDefinedOID, TupleContents: []*T{Int}, Locale: &emptyLocale,
+		},
+		TypeMeta: UserDefinedTypeMetadata{Name: &UserDefinedTypeName{Name: "foo"}},
+	}
+	arrayWithUserDefinedContent := MakeArray(userDefinedEnum)
+
+	testCases := []struct {
+		typ      *T
+		expected string
+	}{
+		{ // Case 1: un-redacted
+			typ:      Int,
+			expected: "INT8",
+		},
+		{ // Case 2: un-redacted
+			typ:      Float,
+			expected: "FLOAT8",
+		},
+		{ // Case 3: un-redacted
+			typ:      Decimal,
+			expected: "DECIMAL",
+		},
+		{ // Case 4: un-redacted
+			typ:      String,
+			expected: "STRING",
+		},
+		{ // Case 5: un-redacted
+			typ:      TimestampTZ,
+			expected: "TIMESTAMPTZ",
+		},
+		{ // Case 6: un-redacted
+			typ:      nonUserDefinedEnum,
+			expected: "@500",
+		},
+		{ // Case 7: redacted because user-defined
+			typ:      userDefinedEnum,
+			expected: "USER DEFINED ENUM: ‹@100500›",
+		},
+		{ // Case 8: un-redacted
+			typ:      MakeTuple([]*T{Int, Float}),
+			expected: "RECORD",
+		},
+		{ // Case 9: un-redacted because contents are not visible
+			typ:      MakeTuple([]*T{Int, userDefinedEnum}),
+			expected: "RECORD",
+		},
+		{ // Case 10: redacted because user-defined
+			typ:      userDefinedTuple,
+			expected: "USER DEFINED RECORD: ‹foo›",
+		},
+		{ // Case 11: un-redacted
+			typ:      MakeArray(Int),
+			expected: "INT8[]",
+		},
+		{ // Case 12: redacted element type
+			typ:      arrayWithUserDefinedContent,
+			expected: "USER DEFINED ARRAY: ‹@100500[]›",
+		},
+	}
+
+	for i, tc := range testCases {
+		require.Equalf(t, tc.expected, string(tc.typ.SQLStringForError()), "test case %d", i+1)
 	}
 }

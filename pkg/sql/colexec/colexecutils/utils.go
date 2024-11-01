@@ -1,21 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
@@ -102,7 +102,7 @@ type AppendOnlyBufferedBatch struct {
 
 	allocator   *colmem.Allocator
 	length      int
-	colVecs     []coldata.Vec
+	colVecs     []*coldata.Vec
 	colsToStore []int
 	// sel is the selection vector on this batch. Note that it is stored
 	// separately from embedded coldata.Batch because we need to be able to
@@ -137,12 +137,12 @@ func (b *AppendOnlyBufferedBatch) Width() int {
 }
 
 // ColVec implements the coldata.Batch interface.
-func (b *AppendOnlyBufferedBatch) ColVec(i int) coldata.Vec {
+func (b *AppendOnlyBufferedBatch) ColVec(i int) *coldata.Vec {
 	return b.colVecs[i]
 }
 
 // ColVecs implements the coldata.Batch interface.
-func (b *AppendOnlyBufferedBatch) ColVecs() []coldata.Vec {
+func (b *AppendOnlyBufferedBatch) ColVecs() []*coldata.Vec {
 	return b.colVecs
 }
 
@@ -168,12 +168,12 @@ func (b *AppendOnlyBufferedBatch) SetSelection(useSel bool) {
 }
 
 // AppendCol implements the coldata.Batch interface.
-func (b *AppendOnlyBufferedBatch) AppendCol(coldata.Vec) {
+func (b *AppendOnlyBufferedBatch) AppendCol(*coldata.Vec) {
 	colexecerror.InternalError(errors.AssertionFailedf("AppendCol is prohibited on AppendOnlyBufferedBatch"))
 }
 
 // ReplaceCol implements the coldata.Batch interface.
-func (b *AppendOnlyBufferedBatch) ReplaceCol(coldata.Vec, int) {
+func (b *AppendOnlyBufferedBatch) ReplaceCol(*coldata.Vec, int) {
 	colexecerror.InternalError(errors.AssertionFailedf("ReplaceCol is prohibited on AppendOnlyBufferedBatch"))
 }
 
@@ -218,14 +218,14 @@ func (b *AppendOnlyBufferedBatch) AppendTuples(batch coldata.Batch, startIdx, en
 	})
 }
 
-// MaybeAllocateUint64Array makes sure that the passed in array is allocated, of
+// MaybeAllocateUint32Array makes sure that the passed in array is allocated, of
 // the desired length and zeroed out.
-func MaybeAllocateUint64Array(array []uint64, length int) []uint64 {
+func MaybeAllocateUint32Array(array []uint32, length int) []uint32 {
 	if cap(array) < length {
-		return make([]uint64, length)
+		return make([]uint32, length)
 	}
 	array = array[:length]
-	for n := 0; n < length; n += copy(array[n:], ZeroUint64Column) {
+	for n := 0; n < length; n += copy(array[n:], ZeroUint32Column) {
 	}
 	return array
 }
@@ -242,15 +242,15 @@ func MaybeAllocateBoolArray(array []bool, length int) []bool {
 	return array
 }
 
-// MaybeAllocateLimitedUint64Array is an optimized version of
-// MaybeAllocateUint64Array that can *only* be used when length is at most
+// MaybeAllocateLimitedUint32Array is an optimized version of
+// MaybeAllocateUint32Array that can *only* be used when length is at most
 // coldata.MaxBatchSize.
-func MaybeAllocateLimitedUint64Array(array []uint64, length int) []uint64 {
+func MaybeAllocateLimitedUint32Array(array []uint32, length int) []uint32 {
 	if cap(array) < length {
-		return make([]uint64, length)
+		return make([]uint32, length)
 	}
 	array = array[:length]
-	copy(array, ZeroUint64Column)
+	copy(array, ZeroUint32Column)
 	return array
 }
 
@@ -270,9 +270,9 @@ var (
 	// ZeroBoolColumn is zeroed out boolean slice of coldata.MaxBatchSize
 	// length.
 	ZeroBoolColumn = make([]bool, coldata.MaxBatchSize)
-	// ZeroUint64Column is zeroed out uint64 slice of coldata.MaxBatchSize
+	// ZeroUint32Column is zeroed out uint64 slice of coldata.MaxBatchSize
 	// length.
-	ZeroUint64Column = make([]uint64, coldata.MaxBatchSize)
+	ZeroUint32Column = make([]uint32, coldata.MaxBatchSize)
 )
 
 // HandleErrorFromDiskQueue takes in non-nil error emitted by colcontainer.Queue
@@ -305,9 +305,6 @@ func UpdateBatchState(batch coldata.Batch, length int, usesSel bool, sel []int) 
 	if usesSel {
 		copy(batch.Selection()[:length], sel[:length])
 	}
-	// Note: when usesSel is true, we have to set the length on the batch
-	// **after** setting the selection vector because we might use the values
-	// in the selection vector to maintain invariants (like for flat bytes).
 	batch.SetLength(length)
 }
 
@@ -320,4 +317,24 @@ func init() {
 	for i := range DefaultSelectionVector {
 		DefaultSelectionVector[i] = i
 	}
+}
+
+// AccountForMetadata registers the memory footprint of meta with the memory
+// account and returns the total new memory usage.
+func AccountForMetadata(
+	ctx context.Context, memAcc *mon.BoundAccount, meta []execinfrapb.ProducerMetadata,
+) int64 {
+	var newMemUsage int64
+	for i := range meta {
+		// Perform the memory accounting for the LeafTxnFinalState metadata
+		// since it might be of non-trivial size.
+		if ltfs := meta[i].LeafTxnFinalState; ltfs != nil {
+			memUsage := roachpb.Spans(ltfs.RefreshSpans).MemUsageUpToLen()
+			if err := memAcc.Grow(ctx, memUsage); err != nil {
+				colexecerror.InternalError(err)
+			}
+			newMemUsage += memUsage
+		}
+	}
+	return newMemUsage
 }

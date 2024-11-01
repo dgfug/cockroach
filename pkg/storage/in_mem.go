@@ -1,35 +1,15 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
 import (
 	"context"
 
-	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 )
-
-// InMemFromFS allocates and returns new, opened in-memory engine. Engine
-// uses provided in mem file system and base directory to store data. The
-// caller must call obtained engine's Close method when engine is no longer
-// needed.
-func InMemFromFS(ctx context.Context, fs vfs.FS, dir string, opts ...ConfigOption) Engine {
-	// TODO(jackson): Replace this function with a special Location
-	// constructor that allows both specifying a directory and supplying your
-	// own VFS?
-	eng, err := Open(ctx, Location{dir: dir, fs: fs}, opts...)
-	if err != nil {
-		panic(err)
-	}
-	return eng
-}
 
 // The ForTesting functions randomize the settings for separated intents. This
 // is a bit peculiar for tests outside the storage package, since they usually
@@ -47,18 +27,10 @@ func InMemFromFS(ctx context.Context, fs vfs.FS, dir string, opts ...ConfigOptio
 // Close method when the engine is no longer needed. This method randomizes
 // whether separated intents are written.
 func NewDefaultInMemForTesting(opts ...ConfigOption) Engine {
-	eng, err := Open(context.Background(), InMemory(), ForTesting, MaxSize(1<<20), CombineOptions(opts...))
-	if err != nil {
-		panic(err)
-	}
-	return eng
-}
-
-// NewInMemForTesting is just like NewDefaultInMemForTesting but allows to
-// deterministically define whether it separates intents from MVCC data.
-func NewInMemForTesting(enableSeparatedIntents bool, opts ...ConfigOption) Engine {
-	eng, err := Open(context.Background(), InMemory(),
-		SetSeparatedIntents(!enableSeparatedIntents), MaxSize(1<<20), CombineOptions(opts...))
+	eng, err := Open(
+		context.Background(), InMemory(), cluster.MakeTestingClusterSettings(),
+		ForTesting, MaxSizeBytes(1<<20), CombineOptions(opts...),
+	)
 	if err != nil {
 		panic(err)
 	}

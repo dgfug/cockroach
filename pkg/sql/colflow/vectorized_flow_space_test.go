@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow_test
 
@@ -25,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -36,7 +31,7 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
@@ -45,6 +40,7 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 		},
 		DiskMonitor: testDiskMonitor,
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 	}
 
 	oneInput := []execinfrapb.InputSyncSpec{
@@ -77,11 +73,14 @@ func TestVectorizeInternalMemorySpaceError(t *testing.T) {
 				if len(tc.spec.Input) > 1 {
 					sources = append(sources, colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 0 /* numTuples */, nil /* opToInitialize */))
 				}
-				memMon := mon.NewMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
+				memMon := mon.NewMonitor(mon.Options{
+					Name:     "MemoryMonitor",
+					Settings: st,
+				})
 				if success {
-					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+					memMon.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 				} else {
-					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+					memMon.Start(ctx, nil, mon.NewStandaloneBudget(1))
 				}
 				defer memMon.Stop(ctx)
 				acc := memMon.MakeBoundAccount()
@@ -112,7 +111,7 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
@@ -121,7 +120,10 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 		},
 		DiskMonitor: testDiskMonitor,
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 	}
+	var monitorRegistry colexecargs.MonitorRegistry
+	defer monitorRegistry.Close(ctx)
 
 	oneInput := []execinfrapb.InputSyncSpec{
 		{ColumnTypes: []*types.T{types.Int}},
@@ -199,10 +201,13 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 				if len(tc.spec.Input) > 1 {
 					sources = append(sources, colexecop.NewRepeatableBatchSource(testAllocator, batch, typs))
 				}
-				memMon := mon.NewMonitor("MemoryMonitor", mon.MemoryResource, nil, nil, 0, math.MaxInt64, st)
+				memMon := mon.NewMonitor(mon.Options{
+					Name:     "MemoryMonitor",
+					Settings: st,
+				})
 				flowCtx.Cfg.TestingKnobs = execinfra.TestingKnobs{}
 				if expectNoMemoryError {
-					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+					memMon.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 					if !success {
 						// These are the cases that we expect in-memory operators to hit a
 						// memory error. To enable testing this case, force disk spills. We
@@ -211,7 +216,7 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 						flowCtx.Cfg.TestingKnobs.ForceDiskSpill = true
 					}
 				} else {
-					memMon.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+					memMon.Start(ctx, nil, mon.NewStandaloneBudget(1))
 					flowCtx.Cfg.TestingKnobs.ForceDiskSpill = true
 				}
 				defer memMon.Stop(ctx)
@@ -222,17 +227,12 @@ func TestVectorizeAllocatorSpaceError(t *testing.T) {
 					Inputs:              colexectestutils.MakeInputs(sources),
 					StreamingMemAccount: &acc,
 					FDSemaphore:         colexecop.NewTestingSemaphore(256),
+					MonitorRegistry:     &monitorRegistry,
 				}
-				// The disk spilling infrastructure relies on different memory
-				// accounts, so if the spilling is supported, we do *not* want to use
-				// streaming memory account.
-				args.TestingKnobs.UseStreamingMemAccountForBuffering = !tc.spillingSupported
 				var (
 					result *colexecargs.NewColOperatorResult
 					err    error
 				)
-				args.MonitorRegistry = &colexecargs.MonitorRegistry{}
-				defer args.MonitorRegistry.Close(ctx)
 				// The memory error can occur either during planning or during
 				// execution, and we want to actually execute the "query" only
 				// if there was no error during planning. That is why we have

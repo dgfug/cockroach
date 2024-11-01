@@ -13,13 +13,12 @@ query TT
 SHOW CREATE TABLE serial
 ----
 serial  CREATE TABLE public.serial (
-        a INT8 NOT NULL DEFAULT unique_rowid(),
-        b INT8 NULL DEFAULT 7:::INT8,
-        c INT8 NOT NULL DEFAULT unique_rowid(),
-        CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
-        UNIQUE INDEX serial_c_key (c ASC),
-        FAMILY "primary" (a, b, c)
-)
+          a INT8 NOT NULL DEFAULT unique_rowid(),
+          b INT8 NULL DEFAULT 7:::INT8,
+          c INT8 NOT NULL DEFAULT unique_rowid(),
+          CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
+          UNIQUE INDEX serial_c_key (c ASC)
+        )
 
 statement ok
 INSERT INTO serial (a, b) VALUES (1, 2), (DEFAULT, DEFAULT), (DEFAULT, 3)
@@ -51,13 +50,12 @@ query TT
 SHOW CREATE TABLE smallbig
 ----
 smallbig  CREATE TABLE public.smallbig (
-          a INT8 NOT NULL DEFAULT unique_rowid(),
-          b INT8 NOT NULL DEFAULT unique_rowid(),
-          c INT8 NULL,
-          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-          CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC),
-          FAMILY "primary" (a, b, c, rowid)
-)
+            a INT8 NOT NULL DEFAULT unique_rowid(),
+            b INT8 NOT NULL DEFAULT unique_rowid(),
+            c INT8 NULL,
+            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+            CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC)
+          )
 
 query III
 SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT c) FROM smallbig
@@ -74,14 +72,13 @@ query TT
 SHOW CREATE TABLE serials
 ----
 serials  CREATE TABLE public.serials (
-         a INT8 NOT NULL DEFAULT unique_rowid(),
-         b INT8 NOT NULL DEFAULT unique_rowid(),
-         c INT8 NOT NULL DEFAULT unique_rowid(),
-         d INT8 NULL,
-         rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-         CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC),
-         FAMILY "primary" (a, b, c, d, rowid)
-)
+           a INT8 NOT NULL DEFAULT unique_rowid(),
+           b INT8 NOT NULL DEFAULT unique_rowid(),
+           c INT8 NOT NULL DEFAULT unique_rowid(),
+           d INT8 NULL,
+           rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+           CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC)
+         )
 
 statement ok
 INSERT INTO serials (d) VALUES (9), (9)
@@ -117,13 +114,12 @@ query TT
 SHOW CREATE TABLE serial
 ----
 serial  CREATE TABLE public.serial (
-        a INT8 NOT NULL DEFAULT nextval('public.serial_a_seq'::REGCLASS),
-        b INT8 NULL DEFAULT 7:::INT8,
-        c INT8 NOT NULL DEFAULT nextval('public.serial_c_seq2'::REGCLASS),
-        CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
-        UNIQUE INDEX serial_c_key (c ASC),
-        FAMILY "primary" (a, b, c)
-)
+          a INT8 NOT NULL DEFAULT nextval('public.serial_a_seq'::REGCLASS),
+          b INT8 NULL DEFAULT 7:::INT8,
+          c INT8 NOT NULL DEFAULT nextval('public.serial_c_seq2'::REGCLASS),
+          CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
+          UNIQUE INDEX serial_c_key (c ASC)
+        )
 
 query TT
 SHOW CREATE SEQUENCE serial_a_seq
@@ -160,13 +156,12 @@ query TT
 SHOW CREATE TABLE smallbig
 ----
 smallbig  CREATE TABLE public.smallbig (
-          a INT8 NOT NULL DEFAULT nextval('public.smallbig_a_seq'::REGCLASS),
-          b INT8 NOT NULL DEFAULT nextval('public.smallbig_b_seq'::REGCLASS),
-          c INT8 NULL,
-          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-          CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC),
-          FAMILY "primary" (a, b, c, rowid)
-)
+            a INT8 NOT NULL DEFAULT nextval('public.smallbig_a_seq'::REGCLASS),
+            b INT8 NOT NULL DEFAULT nextval('public.smallbig_b_seq'::REGCLASS),
+            c INT8 NULL,
+            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+            CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC)
+          )
 
 query III
 SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT c) FROM smallbig
@@ -183,14 +178,13 @@ query TT
 SHOW CREATE TABLE serials
 ----
 serials  CREATE TABLE public.serials (
-         a INT8 NOT NULL DEFAULT nextval('public.serials_a_seq'::REGCLASS),
-         b INT8 NOT NULL DEFAULT nextval('public.serials_b_seq'::REGCLASS),
-         c INT8 NOT NULL DEFAULT nextval('public.serials_c_seq'::REGCLASS),
-         d INT8 NULL,
-         rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-         CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC),
-         FAMILY "primary" (a, b, c, d, rowid)
-)
+           a INT8 NOT NULL DEFAULT nextval('public.serials_a_seq'::REGCLASS),
+           b INT8 NOT NULL DEFAULT nextval('public.serials_b_seq'::REGCLASS),
+           c INT8 NOT NULL DEFAULT nextval('public.serials_c_seq'::REGCLASS),
+           d INT8 NULL,
+           rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+           CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC)
+         )
 
 statement ok
 INSERT INTO serials (d) VALUES (9), (9)
@@ -222,23 +216,22 @@ query TT
 SHOW CREATE TABLE serial
 ----
 serial  CREATE TABLE public.serial (
-        a INT8 NOT NULL DEFAULT nextval('public.serial_a_seq1'::REGCLASS),
-        b INT8 NULL DEFAULT 7:::INT8,
-        c INT8 NOT NULL DEFAULT nextval('public.serial_c_seq3'::REGCLASS),
-        CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
-        UNIQUE INDEX serial_c_key (c ASC),
-        FAMILY "primary" (a, b, c)
-)
+          a INT8 NOT NULL DEFAULT nextval('public.serial_a_seq'::REGCLASS),
+          b INT8 NULL DEFAULT 7:::INT8,
+          c INT8 NOT NULL DEFAULT nextval('public.serial_c_seq2'::REGCLASS),
+          CONSTRAINT serial_pkey PRIMARY KEY (a ASC),
+          UNIQUE INDEX serial_c_key (c ASC)
+        )
 
 query TT
-SHOW CREATE SEQUENCE serial_a_seq1
+SHOW CREATE SEQUENCE serial_a_seq
 ----
-serial_a_seq1  CREATE SEQUENCE public.serial_a_seq1 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
+serial_a_seq  CREATE SEQUENCE public.serial_a_seq MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
 
 query TT
 SELECT pg_get_serial_sequence('serial', 'a'), pg_get_serial_sequence('serial', 'b')
 ----
-public.serial_a_seq1  NULL
+public.serial_a_seq  NULL
 
 statement error relation "non_existent_tbl" does not exist
 SELECT pg_get_serial_sequence('non_existent_tbl', 'a')
@@ -252,7 +245,18 @@ create table serial_2 ("capITALS" SERIAL)
 query T
 SELECT pg_get_serial_sequence('serial_2', 'capITALS')
 ----
-public.serial_2_capITALS_seq
+public."serial_2_capITALS_seq"
+
+statement ok
+create schema "schema-hyphen"
+
+statement ok
+create table "schema-hyphen"."Serial_3" ("capITALS" SERIAL)
+
+query T
+SELECT pg_get_serial_sequence('"schema-hyphen"."Serial_3"', 'capITALS')
+----
+"schema-hyphen"."Serial_3_capITALS_seq"
 
 statement ok
 INSERT INTO serial (a, b) VALUES (0, 2), (DEFAULT, DEFAULT), (DEFAULT, 3)
@@ -278,13 +282,12 @@ query TT
 SHOW CREATE TABLE "serial_MixedCase"
 ----
 "serial_MixedCase"  CREATE TABLE public."serial_MixedCase" (
-                    a INT8 NOT NULL DEFAULT nextval('public."serial_MixedCase_a_seq"'::REGCLASS),
-                    b INT8 NULL DEFAULT 7:::INT8,
-                    c INT8 NOT NULL DEFAULT nextval('public."serial_MixedCase_c_seq"'::REGCLASS),
-                    CONSTRAINT "serial_MixedCase_pkey" PRIMARY KEY (a ASC),
-                    UNIQUE INDEX "serial_MixedCase_c_key" (c ASC),
-                    FAMILY "primary" (a, b, c)
-)
+                      a INT8 NOT NULL DEFAULT nextval('public."serial_MixedCase_a_seq"'::REGCLASS),
+                      b INT8 NULL DEFAULT 7:::INT8,
+                      c INT8 NOT NULL DEFAULT nextval('public."serial_MixedCase_c_seq"'::REGCLASS),
+                      CONSTRAINT "serial_MixedCase_pkey" PRIMARY KEY (a ASC),
+                      UNIQUE INDEX "serial_MixedCase_c_key" (c ASC)
+                    )
 
 statement error multiple default values specified for column "a" of table "s1"
 CREATE TABLE s1 (a SERIAL DEFAULT 7)
@@ -305,13 +308,12 @@ query TT
 SHOW CREATE TABLE smallbig
 ----
 smallbig  CREATE TABLE public.smallbig (
-          a INT2 NOT NULL DEFAULT nextval('public.smallbig_a_seq1'::REGCLASS),
-          b INT8 NOT NULL DEFAULT nextval('public.smallbig_b_seq1'::REGCLASS),
-          c INT8 NULL,
-          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-          CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC),
-          FAMILY "primary" (a, b, c, rowid)
-)
+            a INT2 NOT NULL DEFAULT nextval('public.smallbig_a_seq'::REGCLASS),
+            b INT8 NOT NULL DEFAULT nextval('public.smallbig_b_seq'::REGCLASS),
+            c INT8 NULL,
+            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+            CONSTRAINT smallbig_pkey PRIMARY KEY (rowid ASC)
+          )
 
 query III
 SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT c) FROM smallbig
@@ -328,14 +330,13 @@ query TT
 SHOW CREATE TABLE serials
 ----
 serials  CREATE TABLE public.serials (
-         a INT2 NOT NULL DEFAULT nextval('public.serials_a_seq1'::REGCLASS),
-         b INT4 NOT NULL DEFAULT nextval('public.serials_b_seq1'::REGCLASS),
-         c INT8 NOT NULL DEFAULT nextval('public.serials_c_seq1'::REGCLASS),
-         d INT8 NULL,
-         rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-         CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC),
-         FAMILY "primary" (a, b, c, d, rowid)
-)
+           a INT2 NOT NULL DEFAULT nextval('public.serials_a_seq'::REGCLASS),
+           b INT4 NOT NULL DEFAULT nextval('public.serials_b_seq'::REGCLASS),
+           c INT8 NOT NULL DEFAULT nextval('public.serials_c_seq'::REGCLASS),
+           d INT8 NULL,
+           rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+           CONSTRAINT serials_pkey PRIMARY KEY (rowid ASC)
+         )
 
 statement ok
 INSERT INTO serials (d) VALUES (9), (9)

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -14,7 +9,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,14 +65,14 @@ func runHTTP(protocPath, genDocPath, protocFlags, outPath string) error {
 	if err := os.MkdirAll(outPath, 0777); err != nil {
 		return err
 	}
-	tmpJSON, err := ioutil.TempDir("", "docgen-*")
+	tmpJSON, err := os.MkdirTemp("", "docgen-*")
 	if err != nil {
 		return err
 	}
 	// gen-doc wants a file on disk to use as its template. Make and
 	// cleanup a temp file.
 	jsonTmpl := filepath.Join(tmpJSON, "json.tmpl")
-	if err := ioutil.WriteFile(jsonTmpl, []byte(tmplJSON), 0666); err != nil {
+	if err := os.WriteFile(jsonTmpl, []byte(tmplJSON), 0666); err != nil {
 		return err
 	}
 	defer func() {
@@ -103,7 +97,7 @@ func runHTTP(protocPath, genDocPath, protocFlags, outPath string) error {
 		fmt.Println(string(out))
 		return err
 	}
-	dataFile, err := ioutil.ReadFile(filepath.Join(tmpJSON, "http.json"))
+	dataFile, err := os.ReadFile(filepath.Join(tmpJSON, "http.json"))
 	if err != nil {
 		return err
 	}
@@ -253,7 +247,7 @@ func execHTTPTmpl(tmpl *template.Template, data interface{}, path string) error 
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, buf.Bytes(), 0666)
+	return os.WriteFile(path, buf.Bytes(), 0666)
 }
 
 type protoData struct {

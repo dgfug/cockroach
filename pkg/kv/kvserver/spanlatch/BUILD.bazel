@@ -7,6 +7,7 @@ go_library(
         "doc.go",
         "list.go",
         "manager.go",
+        "settings.go",
         "signal.go",
         ":latch_interval_btree.go",  # keep
     ],
@@ -14,15 +15,21 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/poison",
         "//pkg/kv/kvserver/spanset",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
+        "//pkg/settings",
+        "//pkg/settings/cluster",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "@com_github_cockroachdb_crlib//crtime",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -35,14 +42,19 @@ go_test(
         ":latch_interval_btree_test.go",  # keep
     ],
     embed = [":spanlatch"],
+    shard_count = 16,
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/poison",
         "//pkg/kv/kvserver/spanset",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/timeutil",  # keep
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
     ],
 )

@@ -1,23 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanset_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/stretchr/testify/require"
 )
@@ -46,13 +44,31 @@ func TestReadWriterDeclareLockTable(t *testing.T) {
 		},
 	}
 	for fnName, fn := range fns {
-		for _, sa := range []spanset.SpanAccess{spanset.SpanReadOnly, spanset.SpanReadWrite} {
+		for _, str := range []lock.Strength{lock.None, lock.Shared, lock.Exclusive, lock.Intent} {
 			for _, mvcc := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s,access=%s,mvcc=%t", fnName, sa, mvcc), func(t *testing.T) {
+				if !mvcc && (str == lock.Shared || str == lock.Exclusive) {
+					// Invalid combination.
+					continue
+				}
+				t.Run(fmt.Sprintf("%s,strength=%s,mvcc=%t", fnName, str, mvcc), func(t *testing.T) {
 					span := roachpb.Span{Key: startKey, EndKey: endKey}
+					var sa spanset.SpanAccess
+					var latchTs hlc.Timestamp
+					switch str {
+					case lock.None:
+						sa, latchTs = spanset.SpanReadOnly, ts
+					case lock.Shared:
+						sa, latchTs = spanset.SpanReadOnly, hlc.MaxTimestamp
+					case lock.Exclusive:
+						sa, latchTs = spanset.SpanReadWrite, ts
+					case lock.Intent:
+						sa, latchTs = spanset.SpanReadWrite, ts
+					default:
+						t.Fatal("unexpected")
+					}
 					ss := spanset.New()
 					if mvcc {
-						ss.AddMVCC(sa, span, ts)
+						ss.AddMVCC(sa, span, latchTs)
 					} else {
 						ss.AddNonMVCC(sa, span)
 					}
@@ -60,14 +76,16 @@ func TestReadWriterDeclareLockTable(t *testing.T) {
 					defer b.Close()
 					rw := fn(ss, b)
 
-					require.NoError(t, rw.MVCCIterate(ltStartKey, ltEndKey, storage.MVCCKeyIterKind, nil))
-					require.Error(t, rw.MVCCIterate(ltEndKey, ltEndKey.Next(), storage.MVCCKeyIterKind, nil))
+					require.NoError(t, rw.MVCCIterate(context.Background(), ltStartKey, ltEndKey,
+						storage.MVCCKeyIterKind, storage.IterKeyTypePointsOnly, fs.UnknownReadCategory, nil))
+					require.Error(t, rw.MVCCIterate(context.Background(), ltEndKey, ltEndKey.Next(),
+						storage.MVCCKeyIterKind, storage.IterKeyTypePointsOnly, fs.UnknownReadCategory, nil))
 
 					err := rw.PutUnversioned(ltStartKey, []byte("value"))
-					if sa == spanset.SpanReadWrite {
-						require.NoError(t, err)
-					} else {
+					if str == lock.None {
 						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
 					}
 					require.Error(t, rw.PutUnversioned(ltEndKey, []byte("value")))
 				})

@@ -1,7 +1,7 @@
 statement ok
 CREATE USER user1
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -13,7 +13,7 @@ user1     ·        {}
 statement ok
 DROP USER user1
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -24,7 +24,7 @@ testuser  ·        {}
 statement ok
 CREATE USER user1
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -36,7 +36,7 @@ user1     ·        {}
 statement ok
 DROP USER USEr1
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -44,10 +44,10 @@ admin     ·        {}
 root      ·        {admin}
 testuser  ·        {}
 
-statement error user user1 does not exist
+statement error user "user1" does not exist
 DROP USER user1
 
-statement error user user1 does not exist
+statement error user "user1" does not exist
 DROP USER usER1
 
 statement ok
@@ -83,7 +83,7 @@ CREATE USER user3
 statement ok
 CREATE USER user4
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -98,7 +98,7 @@ user4     ·        {}
 statement ok
 DROP USER user1,user2
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -108,10 +108,10 @@ testuser  ·        {}
 user3     ·        {}
 user4     ·        {}
 
-statement error user user1 does not exist
+statement error user "user1" does not exist
 DROP USER user1,user3
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -127,24 +127,28 @@ CREATE USER user1
 statement ok
 CREATE TABLE foo(x INT);
 GRANT SELECT ON foo TO user3;
-GRANT SELECT, CONNECT ON DATABASE test TO user1
+GRANT CONNECT ON DATABASE test TO user1
 
 statement error cannot drop roles/users user1, user3: grants still exist on test, test.public.foo
 DROP USER IF EXISTS user1,user3
 
-statement error cannot drop roles/users user1, user3: grants still exist on test
+statement ok
 REVOKE SELECT ON foo FROM user3;
+
+statement error cannot drop roles/users user1, user3: grants still exist on test
 DROP USER IF EXISTS user1,user3
 
 statement ok
-REVOKE SELECT, CONNECT ON DATABASE test FROM user1;
+REVOKE CONNECT ON DATABASE test FROM user1;
+
+statement ok
 DROP USER IF EXISTS user1,user3
 
 statement ok
 PREPARE du AS DROP USER user4;
 EXECUTE du
 
-query TTT colnames
+query TTT colnames,rowsort
 SHOW USERS
 ----
 username  options  member_of
@@ -174,3 +178,32 @@ INSERT INTO system.scheduled_jobs (schedule_name, owner, executor_type,execution
 statement error pq: cannot drop role/user user1; it owns 1 scheduled jobs.
 DROP USER user1
 
+# Verify that schemas are fully qualified in the error message.
+subtest same_schema_name
+
+statement ok
+CREATE ROLE schema_owner
+
+statement ok
+GRANT admin TO schema_owner
+
+statement ok
+SET ROLE schema_owner
+
+statement ok
+CREATE SCHEMA the_schema
+
+statement ok
+USE defaultdb
+
+statement ok
+CREATE SCHEMA the_schema
+
+statement ok
+RESET ROLE;
+RESET DATABASE
+
+statement error role schema_owner cannot be dropped because some objects depend on it\nowner of schema defaultdb.the_schema\nowner of schema test.the_schema
+DROP ROLE schema_owner
+
+subtest end

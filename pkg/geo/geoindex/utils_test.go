@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geoindex
 
@@ -27,12 +22,12 @@ func nameArg(t *testing.T, d *datadriven.TestData) string {
 	return name
 }
 
-func s2Config(t *testing.T, d *datadriven.TestData) S2Config {
+func s2Config(t *testing.T, d *datadriven.TestData) geopb.S2Config {
 	var minLevel, maxLevel, maxCells int
 	d.ScanArgs(t, "minlevel", &minLevel)
 	d.ScanArgs(t, "maxlevel", &maxLevel)
 	d.ScanArgs(t, "maxcells", &maxCells)
-	return S2Config{
+	return geopb.S2Config{
 		MinLevel: int32(minLevel),
 		MaxLevel: int32(maxLevel),
 		LevelMod: 1,
@@ -51,7 +46,14 @@ func keysToString(keys []Key, bbox geopb.BoundingBox, err error) string {
 	for _, k := range keys {
 		cells = append(cells, k.String())
 	}
-	return fmt.Sprintf("%s\nBoundingBox: %s", strings.Join(cells, ", "), bbox.String())
+	return fmt.Sprintf(
+		"%s\nBoundingBox: lo_x:%.6f hi_x:%.6f lo_y:%.6f hi_y:%.6f",
+		strings.Join(cells, ", "),
+		bbox.LoX,
+		bbox.HiX,
+		bbox.LoY,
+		bbox.HiY,
+	)
 }
 
 func cellUnionToString(cells s2.CellUnion) string {

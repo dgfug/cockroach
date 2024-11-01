@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -36,20 +31,20 @@ type metadata struct {
 // Depending on the context, values of a particular Optgen type are represented
 // as different Go types. Here are the three contexts:
 //
-//   field type: Go type used for a struct field having the Optgen type
-//   param type: Go type used when a value of the Optgen type is passed as a
-//               strongly-typed parameter (i.e. of same type as itself)
-//   dynamic param type: Go type used when a value of the Optgen type is passed
-//                       as a dynamic type (i.e. interface{} or opt.Expr)
+//	field type: Go type used for a struct field having the Optgen type
+//	param type: Go type used when a value of the Optgen type is passed as a
+//	            strongly-typed parameter (i.e. of same type as itself)
+//	dynamic param type: Go type used when a value of the Optgen type is passed
+//	                    as a dynamic type (i.e. interface{} or opt.Expr)
 //
 // Here are some examples:
 //
-//                 Field Type         Param Type         Dynamic Param Type
-//   ScalarExpr    opt.ScalarExpr     opt.ScalarExpr     opt.ScalarExpr
-//   FiltersExpr   memo.FiltersExpr   memo.FiltersExpr   *memo.FiltersExpr
-//   ConstExpr     *memo.ConstExpr    *memo.ConstExpr    *memo.ConstExpr
-//   ScanPrivate   memo.ScanPrivate   *memo.ScanPrivate  *memo.ScanPrivate
-//   ColSet        opt.ColSet         opt.ColSet         *opt.ColSet
+//	              Field Type         Param Type         Dynamic Param Type
+//	ScalarExpr    opt.ScalarExpr     opt.ScalarExpr     opt.ScalarExpr
+//	FiltersExpr   memo.FiltersExpr   memo.FiltersExpr   *memo.FiltersExpr
+//	ConstExpr     *memo.ConstExpr    *memo.ConstExpr    *memo.ConstExpr
+//	ScanPrivate   memo.ScanPrivate   *memo.ScanPrivate  *memo.ScanPrivate
+//	ColSet        opt.ColSet         opt.ColSet         *opt.ColSet
 //
 // The reason for these different representations is to avoid extra Go object
 // allocations. In particular, when a non-pointer field is cast directly to an
@@ -131,8 +126,7 @@ type typeDef struct {
 
 // isListType is true if this type is represented as a Go slice. For example:
 //
-//   type FiltersExpr []FiltersItem
-//
+//	type FiltersExpr []FiltersItem
 func (t *typeDef) isListType() bool {
 	return t.listItemType != nil
 }
@@ -140,12 +134,11 @@ func (t *typeDef) isListType() bool {
 // asField returns the Go type used when this Optgen type is used as a field in
 // a struct. For example:
 //
-//   type SomeExpr struct {
-//     expr    opt.ScalarExpr
-//     filters FiltersExpr
-//     var     *VariablExpr
-//   }
-//
+//	type SomeExpr struct {
+//	  expr    opt.ScalarExpr
+//	  filters FiltersExpr
+//	  var     *VariablExpr
+//	}
 func (t *typeDef) asField() string {
 	// If the type is a pointer (but not an interface), then prefix with "*".
 	if t.isPointer && !t.isInterface {
@@ -157,9 +150,8 @@ func (t *typeDef) asField() string {
 // asParam returns the Go type used to pass this Optgen type around as a
 // parameter. For example:
 //
-//   func SomeFunc(expr opt.ScalarExpr, filters FiltersExpr)
-//   func SomeFunc(scanPrivate *ScanPrivate)
-//
+//	func SomeFunc(expr opt.ScalarExpr, filters FiltersExpr)
+//	func SomeFunc(scanPrivate *ScanPrivate)
 func (t *typeDef) asParam() string {
 	// Non-interface pointers and by-ref structs need to be prefixed with "*".
 	if (t.isPointer && !t.isInterface) || !t.passByVal {
@@ -172,10 +164,9 @@ func (t *typeDef) asParam() string {
 // The pkg parameter is used to correctly qualify type names. For example, if
 // pkg is "memo", then:
 //
-//   memo.RelExpr     => RelExpr
-//   opt.ScalarExpr   => opt.ScalarExpr
-//   memo.ScanPrivate => ScanPrivate
-//
+//	memo.RelExpr     => RelExpr
+//	opt.ScalarExpr   => opt.ScalarExpr
+//	memo.ScanPrivate => ScanPrivate
 func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 	md := &metadata{
 		compiled:  compiled,
@@ -185,68 +176,82 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 
 	// Add all types used in Optgen defines here.
 	md.types = map[string]*typeDef{
-		"RelExpr":             {fullName: "memo.RelExpr", isExpr: true, isInterface: true},
-		"Expr":                {fullName: "opt.Expr", isExpr: true, isInterface: true},
-		"ScalarExpr":          {fullName: "opt.ScalarExpr", isExpr: true, isInterface: true},
-		"Operator":            {fullName: "opt.Operator", passByVal: true},
-		"ColumnID":            {fullName: "opt.ColumnID", passByVal: true},
-		"ColSet":              {fullName: "opt.ColSet", passByVal: true},
-		"ColList":             {fullName: "opt.ColList", passByVal: true},
-		"OptionalColList":     {fullName: "opt.OptionalColList", passByVal: true},
-		"TableID":             {fullName: "opt.TableID", passByVal: true},
-		"SchemaID":            {fullName: "opt.SchemaID", passByVal: true},
-		"SequenceID":          {fullName: "opt.SequenceID", passByVal: true},
-		"UniqueID":            {fullName: "opt.UniqueID", passByVal: true},
-		"WithID":              {fullName: "opt.WithID", passByVal: true},
-		"Ordering":            {fullName: "opt.Ordering", passByVal: true},
-		"OrderingChoice":      {fullName: "props.OrderingChoice", passByVal: true},
-		"GroupingOrder":       {fullName: "memo.GroupingOrder", passByVal: true},
-		"TupleOrdinal":        {fullName: "memo.TupleOrdinal", passByVal: true},
-		"ScanLimit":           {fullName: "memo.ScanLimit", passByVal: true},
-		"ScanFlags":           {fullName: "memo.ScanFlags", passByVal: true},
-		"JoinFlags":           {fullName: "memo.JoinFlags", passByVal: true},
-		"WindowFrame":         {fullName: "memo.WindowFrame", passByVal: true},
-		"FKCascades":          {fullName: "memo.FKCascades", passByVal: true},
-		"ExplainOptions":      {fullName: "tree.ExplainOptions", passByVal: true},
-		"StatementReturnType": {fullName: "tree.StatementReturnType", passByVal: true},
-		"StatementType":       {fullName: "tree.StatementType", passByVal: true},
-		"ShowTraceType":       {fullName: "tree.ShowTraceType", passByVal: true},
-		"bool":                {fullName: "bool", passByVal: true},
-		"int":                 {fullName: "int", passByVal: true},
-		"int64":               {fullName: "int64", passByVal: true},
-		"string":              {fullName: "string", passByVal: true},
-		"Type":                {fullName: "types.T", isPointer: true},
-		"Datum":               {fullName: "tree.Datum", isInterface: true},
-		"TypedExpr":           {fullName: "tree.TypedExpr", isInterface: true},
-		"Statement":           {fullName: "tree.Statement", isInterface: true},
-		"Subquery":            {fullName: "tree.Subquery", isPointer: true, usePointerIntern: true},
-		"CreateTable":         {fullName: "tree.CreateTable", isPointer: true, usePointerIntern: true},
-		"CreateStats":         {fullName: "tree.CreateStats", isPointer: true, usePointerIntern: true},
-		"TableName":           {fullName: "tree.TableName", isPointer: true, usePointerIntern: true},
-		"Constraint":          {fullName: "constraint.Constraint", isPointer: true, usePointerIntern: true},
-		"FuncProps":           {fullName: "tree.FunctionProperties", isPointer: true, usePointerIntern: true},
-		"FuncOverload":        {fullName: "tree.Overload", isPointer: true, usePointerIntern: true},
-		"PhysProps":           {fullName: "physical.Required", isPointer: true},
-		"Presentation":        {fullName: "physical.Presentation", passByVal: true},
-		"RelProps":            {fullName: "props.Relational"},
-		"RelPropsPtr":         {fullName: "props.Relational", isPointer: true, usePointerIntern: true},
-		"ScalarProps":         {fullName: "props.Scalar"},
-		"FuncDepSet":          {fullName: "props.FuncDepSet"},
-		"JoinMultiplicity":    {fullName: "props.JoinMultiplicity"},
-		"OpaqueMetadata":      {fullName: "opt.OpaqueMetadata", isInterface: true},
-		"JobCommand":          {fullName: "tree.JobCommand", passByVal: true},
-		"ScheduleCommand":     {fullName: "tree.ScheduleCommand", passByVal: true},
-		"IndexOrdinal":        {fullName: "cat.IndexOrdinal", passByVal: true},
-		"IndexOrdinals":       {fullName: "cat.IndexOrdinals", passByVal: true},
-		"UniqueOrdinals":      {fullName: "cat.UniqueOrdinals", passByVal: true},
-		"ViewDeps":            {fullName: "opt.ViewDeps", passByVal: true},
-		"ViewTypeDeps":        {fullName: "opt.ViewTypeDeps", passByVal: true},
-		"LockingItem":         {fullName: "tree.LockingItem", isPointer: true},
-		"MaterializeClause":   {fullName: "tree.MaterializeClause", passByVal: true},
-		"SpanExpression":      {fullName: "inverted.SpanExpression", isPointer: true, usePointerIntern: true},
-		"InvertedSpans":       {fullName: "inverted.Spans", passByVal: true},
-		"Persistence":         {fullName: "tree.Persistence", passByVal: true},
-		"PreFiltererState":    {fullName: "invertedexpr.PreFiltererStateForInvertedFilterer", isPointer: true, usePointerIntern: true},
+		"RelExpr":              {fullName: "memo.RelExpr", isExpr: true, isInterface: true},
+		"Expr":                 {fullName: "opt.Expr", isExpr: true, isInterface: true},
+		"ScalarExpr":           {fullName: "opt.ScalarExpr", isExpr: true, isInterface: true},
+		"RelListExpr":          {fullName: "memo.RelListExpr"},
+		"Operator":             {fullName: "opt.Operator", passByVal: true},
+		"ColumnID":             {fullName: "opt.ColumnID", passByVal: true},
+		"ColSet":               {fullName: "opt.ColSet", passByVal: true},
+		"ColList":              {fullName: "opt.ColList", passByVal: true},
+		"OptionalColList":      {fullName: "opt.OptionalColList", passByVal: true},
+		"TableID":              {fullName: "opt.TableID", passByVal: true},
+		"SchemaID":             {fullName: "opt.SchemaID", passByVal: true},
+		"SequenceID":           {fullName: "opt.SequenceID", passByVal: true},
+		"UniqueID":             {fullName: "opt.UniqueID", passByVal: true},
+		"WithID":               {fullName: "opt.WithID", passByVal: true},
+		"UDFDefinition":        {fullName: "memo.UDFDefinition", isPointer: true},
+		"StoredProcTxnOp":      {fullName: "tree.StoredProcTxnOp", passByVal: true},
+		"TransactionModes":     {fullName: "tree.TransactionModes", passByVal: true},
+		"Ordering":             {fullName: "opt.Ordering", passByVal: true},
+		"OrderingChoice":       {fullName: "props.OrderingChoice", passByVal: true},
+		"GroupingOrder":        {fullName: "memo.GroupingOrder", passByVal: true},
+		"TupleOrdinal":         {fullName: "memo.TupleOrdinal", passByVal: true},
+		"ScanLimit":            {fullName: "memo.ScanLimit", passByVal: true},
+		"ScanFlags":            {fullName: "memo.ScanFlags", passByVal: true},
+		"JoinFlags":            {fullName: "memo.JoinFlags", passByVal: true},
+		"WindowFrame":          {fullName: "memo.WindowFrame", passByVal: true},
+		"FKCascades":           {fullName: "memo.FKCascades", passByVal: true},
+		"AfterTriggers":        {fullName: "memo.AfterTriggers", isPointer: true},
+		"ExplainOptions":       {fullName: "tree.ExplainOptions", passByVal: true},
+		"StatementReturnType":  {fullName: "tree.StatementReturnType", passByVal: true},
+		"StatementType":        {fullName: "tree.StatementType", passByVal: true},
+		"ShowTraceType":        {fullName: "tree.ShowTraceType", passByVal: true},
+		"ShowCompletions":      {fullName: "tree.ShowCompletions", isPointer: true, usePointerIntern: true},
+		"bool":                 {fullName: "bool", passByVal: true},
+		"int":                  {fullName: "int", passByVal: true},
+		"int64":                {fullName: "int64", passByVal: true},
+		"string":               {fullName: "string", passByVal: true},
+		"Type":                 {fullName: "types.T", isPointer: true},
+		"Datum":                {fullName: "tree.Datum", isInterface: true},
+		"TypedExpr":            {fullName: "tree.TypedExpr", isInterface: true},
+		"Statement":            {fullName: "tree.Statement", isInterface: true},
+		"Subquery":             {fullName: "tree.Subquery", isPointer: true, usePointerIntern: true},
+		"CreateTable":          {fullName: "tree.CreateTable", isPointer: true, usePointerIntern: true},
+		"CreateRoutine":        {fullName: "tree.CreateRoutine", isPointer: true, usePointerIntern: true},
+		"CreateTrigger":        {fullName: "tree.CreateTrigger", isPointer: true, usePointerIntern: true},
+		"CreateStats":          {fullName: "tree.CreateStats", isPointer: true, usePointerIntern: true},
+		"TableName":            {fullName: "tree.TableName", isPointer: true, usePointerIntern: true},
+		"Constraint":           {fullName: "constraint.Constraint", isPointer: true, usePointerIntern: true},
+		"FuncProps":            {fullName: "tree.FunctionProperties", isPointer: true, usePointerIntern: true},
+		"FuncOverload":         {fullName: "tree.Overload", isPointer: true, usePointerIntern: true},
+		"PhysProps":            {fullName: "physical.Required", isPointer: true},
+		"Presentation":         {fullName: "physical.Presentation", passByVal: true},
+		"RelProps":             {fullName: "props.Relational"},
+		"RelPropsPtr":          {fullName: "props.Relational", isPointer: true, usePointerIntern: true},
+		"ScalarProps":          {fullName: "props.Scalar"},
+		"FuncDepSet":           {fullName: "props.FuncDepSet"},
+		"JoinMultiplicity":     {fullName: "props.JoinMultiplicity"},
+		"OpaqueMetadata":       {fullName: "opt.OpaqueMetadata", isInterface: true},
+		"JobCommand":           {fullName: "tree.JobCommand", passByVal: true},
+		"ScheduleCommand":      {fullName: "tree.ScheduleCommand", passByVal: true},
+		"IndexOrdinal":         {fullName: "cat.IndexOrdinal", passByVal: true},
+		"IndexOrdinals":        {fullName: "cat.IndexOrdinals", passByVal: true},
+		"RelocateSubject":      {fullName: "tree.RelocateSubject", passByVal: true},
+		"UniqueOrdinals":       {fullName: "cat.UniqueOrdinals", passByVal: true},
+		"SchemaDeps":           {fullName: "opt.SchemaDeps", passByVal: true},
+		"SchemaTypeDeps":       {fullName: "opt.SchemaTypeDeps", passByVal: true},
+		"SchemaFunctionDeps":   {fullName: "opt.SchemaFunctionDeps", passByVal: true},
+		"Locking":              {fullName: "opt.Locking", passByVal: true},
+		"CTEMaterializeClause": {fullName: "tree.CTEMaterializeClause", passByVal: true},
+		"SpanExpression":       {fullName: "inverted.SpanExpression", isPointer: true, usePointerIntern: true},
+		"InvertedSpans":        {fullName: "inverted.Spans", passByVal: true},
+		"Persistence":          {fullName: "tree.Persistence", passByVal: true},
+		"PreFiltererState":     {fullName: "invertedexpr.PreFiltererStateForInvertedFilterer", isPointer: true, usePointerIntern: true},
+		"Volatility":           {fullName: "volatility.V", passByVal: true},
+		"LiteralRows":          {fullName: "opt.LiteralRows", isExpr: true, isPointer: true},
+		"Distribution":         {fullName: "physical.Distribution", passByVal: true},
+		"TreeCreateView":       {fullName: "tree.CreateView", isPointer: true, usePointerIntern: true},
 	}
 
 	// Add types of generated op and private structs.
@@ -339,16 +344,16 @@ func (m *metadata) lookupType(friendlyName string) *typeDef {
 // particular, fields named "_" are mapped to the name of a Go embedded field,
 // which is equal to the field's type name:
 //
-//   define Scan {
-//     _ ScanPrivate
-//   }
+//	define Scan {
+//	  _ ScanPrivate
+//	}
 //
 // gets compiled into:
 //
-//   type ScanExpr struct {
-//	   ScanPrivate
-//     ...
-//   }
+//	  type ScanExpr struct {
+//		   ScanPrivate
+//	    ...
+//	  }
 //
 // Note that the field's type name is always a simple alphanumeric identifier
 // with no package specified (that's only specified in the fullName field of the
@@ -365,12 +370,12 @@ func (m *metadata) fieldName(field *lang.DefineFieldExpr) string {
 // unexported fields are omitted from the result. For example, for the Project
 // operator:
 //
-//   define Project {
-//     Input            RelExpr
-//     Projections      ProjectionsExpr
-//     Passthrough      ColSet
-//     internalFuncDeps FuncDepSet
-//  }
+//	 define Project {
+//	   Input            RelExpr
+//	   Projections      ProjectionsExpr
+//	   Passthrough      ColSet
+//	   internalFuncDeps FuncDepSet
+//	}
 //
 // The Input and Projections fields are children, but the Passthrough and
 // the internalFuncDeps fields will not be returned.
@@ -390,11 +395,11 @@ func (m *metadata) childFields(define *lang.DefineExpr) lang.DefineFieldsExpr {
 // privateField returns the private field for an operator define expression, if
 // one exists. For example, for the Project operator:
 //
-//   define Project {
-//     Input       RelExpr
-//     Projections ProjectionsExpr
-//     Passthrough ColSet
-//  }
+//	 define Project {
+//	   Input       RelExpr
+//	   Projections ProjectionsExpr
+//	   Passthrough ColSet
+//	}
 //
 // The Passthrough field is the private field. If no private field exists for
 // the operator, then privateField returns nil.
@@ -446,7 +451,7 @@ func (m *metadata) hasUnexportedFields(define *lang.DefineExpr) bool {
 // should be taken when loading that field from an instance in order to pass it
 // elsewhere as a parameter (like to a function). For example:
 //
-//   f.ConstructUnion(union.Left, union.Right, &union.SetPrivate)
+//	f.ConstructUnion(union.Left, union.Right, &union.SetPrivate)
 //
 // The Left and Right fields are passed by value, but the SetPrivate is passed
 // by reference.
@@ -460,9 +465,9 @@ func fieldLoadPrefix(typ *typeDef) string {
 // fieldStorePrefix is the inverse of fieldLoadPrefix, used when a value being
 // used as a parameter is stored into a field:
 //
-//   union.Left = left
-//   union.Right = right
-//   union.SetPrivate = *setPrivate
+//	union.Left = left
+//	union.Right = right
+//	union.SetPrivate = *setPrivate
 //
 // Since SetPrivate values are passed by reference, they must be dereferenced
 // before copying them to a target field.
@@ -477,11 +482,11 @@ func fieldStorePrefix(typ *typeDef) string {
 // type should be taken when loading that field from an instance in order to
 // pass it as a dynamic parameter (like interface{} or opt.Expr). For example:
 //
-//   f.ConstructDynamic(
-//     project.Input,
-//     &project.Projections,
-//     &project.Passthrough,
-//   )
+//	f.ConstructDynamic(
+//	  project.Input,
+//	  &project.Projections,
+//	  &project.Passthrough,
+//	)
 //
 // Note that normally the Projections and Passthrough fields would be passed by
 // value, but here their addresses are passed in order to avoid Go allocating an
@@ -501,11 +506,10 @@ func dynamicFieldLoadPrefix(typ *typeDef) string {
 // in order to avoid an extra allocation when passing as an interface. For
 // example:
 //
-//   var val interface{}
-//   project.Input = val.(RelExpr)
-//   project.Filers = *val.(*FiltersExpr)
-//   project.Projections = *val.(*opt.ColSet)
-//
+//	var val interface{}
+//	project.Input = val.(RelExpr)
+//	project.Filers = *val.(*FiltersExpr)
+//	project.Projections = *val.(*opt.ColSet)
 func castFromDynamicParam(param string, typ *typeDef) string {
 	if typ.isInterface {
 		// Interfaces are passed as interfaces for both param and dynamic param

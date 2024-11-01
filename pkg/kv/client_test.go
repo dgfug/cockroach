@@ -1,14 +1,11 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-/* Package client_test tests clients against a fully-instantiated
+/*
+	Package client_test tests clients against a fully-instantiated
+
 cockroach cluster (a single node, but bootstrapped, gossiped, etc.).
 */
 package kv_test
@@ -25,10 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -43,12 +43,13 @@ import (
 )
 
 // testUser has valid client certs.
-var testUser = security.TestUser
+var testUser = username.TestUser
 
 // checkKVs verifies that a KeyValue slice contains the expected keys and
 // values. The values can be either integers or strings; the expected results
 // are passed as alternating keys and values, e.g:
-//   checkScanResult(t, result, key1, val1, key2, val2)
+//
+//	checkScanResult(t, result, key1, val1, key2, val2)
 func checkKVs(t *testing.T, kvs []kv.KeyValue, expected ...interface{}) {
 	t.Helper()
 	expLen := len(expected) / 2
@@ -100,10 +101,10 @@ func TestClientRetryNonTxn(t *testing.T) {
 	}{
 		m: make(map[string]struct{}),
 	}
-	filter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+	filter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		mu.Lock()
 		defer mu.Unlock()
-		pushArg, ok := args.Req.(*roachpb.PushTxnRequest)
+		pushArg, ok := args.Req.(*kvpb.PushTxnRequest)
 		if !ok || !strings.HasPrefix(string(pushArg.PusheeTxn.Key), "key-") {
 			return nil
 		}
@@ -119,20 +120,20 @@ func TestClientRetryNonTxn(t *testing.T) {
 			},
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, args)
+	s := serverutils.StartServerOnly(t, args)
 	defer s.Stopper().Stop(context.Background())
 
 	testCases := []struct {
-		args        roachpb.Request
+		args        kvpb.Request
 		canPush     bool
 		expAttempts int
 	}{
 		// Write/write conflicts.
-		{&roachpb.PutRequest{}, true, 2},
-		{&roachpb.PutRequest{}, false, 1},
+		{&kvpb.PutRequest{}, true, 2},
+		{&kvpb.PutRequest{}, false, 1},
 		// Read/write conflicts.
-		{&roachpb.GetRequest{}, true, 1},
-		{&roachpb.GetRequest{}, false, 1},
+		{&kvpb.GetRequest{}, true, 1},
+		{&kvpb.GetRequest{}, false, 1},
 	}
 	// Lay down a write intent using a txn and attempt to access the same
 	// key from our test client, with priorities set up so that the Push
@@ -166,9 +167,9 @@ func TestClientRetryNonTxn(t *testing.T) {
 				// We must try the non-txn put or get in a goroutine because
 				// it might have to retry and will only succeed immediately in
 				// the event we can push.
-				go func() {
+				go func(i int, args kvpb.Request) {
 					var err error
-					if _, ok := test.args.(*roachpb.GetRequest); ok {
+					if _, ok := args.(*kvpb.GetRequest); ok {
 						_, err = db.Get(nonTxnCtx, key)
 					} else {
 						err = db.Put(nonTxnCtx, key, "value")
@@ -179,8 +180,8 @@ func TestClientRetryNonTxn(t *testing.T) {
 					}
 					doneCall <- errors.Wrapf(
 						err, "%d: expected success on non-txn call to %s",
-						i, test.args.Method())
-				}()
+						i, args.Method())
+				}(i, test.args)
 				// Block until the non-transactional client has pushed us at
 				// least once.
 				testutils.SucceedsSoon(t, func() error {
@@ -215,7 +216,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 			t.Fatalf("%d: expected success getting %q: %s", i, key, err)
 		}
 
-		if _, isGet := test.args.(*roachpb.GetRequest); isGet || test.canPush {
+		if _, isGet := test.args.(*kvpb.GetRequest); isGet || test.canPush {
 			if !bytes.Equal(gr.ValueBytes(), []byte("txn-value")) {
 				t.Errorf("%d: expected \"txn-value\"; got %q", i, gr.ValueBytes())
 			}
@@ -235,7 +236,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 func TestClientRunTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -293,7 +294,7 @@ func TestClientRunTransaction(t *testing.T) {
 func TestClientGetAndPutProto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -323,7 +324,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 func TestClientGetAndPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -346,7 +347,7 @@ func TestClientGetAndPut(t *testing.T) {
 func TestClientPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -370,7 +371,7 @@ func TestClientCPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	db := createTestClient(t, s)
 	key := testUser + "/key"
@@ -439,7 +440,7 @@ func TestClientCPutInline(t *testing.T) {
 func TestClientEmptyValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -469,7 +470,7 @@ func TestClientEmptyValues(t *testing.T) {
 func TestClientBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 	ctx := context.Background()
@@ -726,7 +727,7 @@ func concurrentIncrements(db *kv.DB, t *testing.T) {
 func TestConcurrentIncrements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -747,10 +748,10 @@ func TestReadConsistencyTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	for _, rc := range []roachpb.ReadConsistencyType{
-		roachpb.CONSISTENT,
-		roachpb.READ_UNCOMMITTED,
-		roachpb.INCONSISTENT,
+	for _, rc := range []kvpb.ReadConsistencyType{
+		kvpb.CONSISTENT,
+		kvpb.READ_UNCOMMITTED,
+		kvpb.INCONSISTENT,
 	} {
 		t.Run(rc.String(), func(t *testing.T) {
 			ctx := context.Background()
@@ -759,16 +760,16 @@ func TestReadConsistencyTypes(t *testing.T) {
 			// Mock out DistSender's sender function to check the read consistency for
 			// outgoing BatchRequests and return an empty reply.
 			factory := kv.NonTransactionalFactoryFunc(
-				func(_ context.Context, ba roachpb.BatchRequest,
-				) (*roachpb.BatchResponse, *roachpb.Error) {
+				func(_ context.Context, ba *kvpb.BatchRequest,
+				) (*kvpb.BatchResponse, *kvpb.Error) {
 					if ba.ReadConsistency != rc {
-						return nil, roachpb.NewErrorf("BatchRequest has unexpected ReadConsistency %s", ba.ReadConsistency)
+						return nil, kvpb.NewErrorf("BatchRequest has unexpected ReadConsistency %s", ba.ReadConsistency)
 					}
 					return ba.CreateReply(), nil
 				})
 
-			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-			db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+			clock := hlc.NewClockForTesting(nil)
+			db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 			prepWithRC := func() *kv.Batch {
 				b := &kv.Batch{}
@@ -813,7 +814,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 func TestTxn_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -905,20 +906,21 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	// Mock out sender function to check that created transactions
 	// have the observed timestamp set for the configured node ID.
 	factory := kv.MakeMockTxnSenderFactory(
-		func(_ context.Context, _ *roachpb.Transaction, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(_ context.Context, _ *roachpb.Transaction, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 			return ba.CreateReply(), nil
 		})
 
 	setup := func(nodeID roachpb.NodeID) *kv.DB {
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-		dbCtx := kv.DefaultDBContext(stopper)
+		st := cluster.MakeTestingClusterSettings()
+		clock := hlc.NewClockForTesting(nil)
+		dbCtx := kv.DefaultDBContext(st, stopper)
 		var c base.NodeIDContainer
 		if nodeID != 0 {
 			c.Set(context.Background(), nodeID)
 		}
-		dbCtx.NodeID = base.NewSQLIDContainer(0, &c)
+		dbCtx.NodeID = base.NewSQLIDContainerForNode(&c)
 
-		db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+		db := kv.NewDBWithContext(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, dbCtx)
 		return db
 	}
 
@@ -937,7 +939,9 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
 			db := setup(test.nodeID)
 			now := db.Clock().NowAsClockTimestamp()
-			kvTxn := roachpb.MakeTransaction("unnamed", nil /*baseKey*/, roachpb.NormalUserPriority, now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds())
+			kvTxn := roachpb.MakeTransaction(
+				"unnamed", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
+				now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID), 0, false /* omitInRangefeeds */)
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
 			ots := txn.TestingCloneTxn().ObservedTimestamps
 			if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {
@@ -1083,11 +1087,11 @@ func TestRollbackWithCanceledContextInsidious(t *testing.T) {
 	key := roachpb.Key("a")
 	ctx, cancel := context.WithCancel(context.Background())
 	var rollbacks int
-	storeKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	storeKnobs.TestingRequestFilter = func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if !ba.IsSingleEndTxnRequest() {
 			return nil
 		}
-		et := ba.Requests[0].GetInner().(*roachpb.EndTxnRequest)
+		et := ba.Requests[0].GetInner().(*kvpb.EndTxnRequest)
 		if !et.Commit && et.Key.Equal(key) {
 			rollbacks++
 			cancel()

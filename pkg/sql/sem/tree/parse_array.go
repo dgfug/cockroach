@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -27,16 +22,63 @@ var extraTextError = pgerror.Newf(pgcode.InvalidTextRepresentation, "extra text 
 var nestedArraysNotSupportedError = unimplemented.NewWithIssueDetail(32552, "strcast", "nested arrays not supported")
 var malformedError = pgerror.Newf(pgcode.InvalidTextRepresentation, "malformed array")
 
-var isQuoteChar = func(ch byte) bool {
+func isQuoteChar(ch byte) bool {
 	return ch == '"'
 }
 
-var isControlChar = func(ch byte) bool {
+func isControlChar(ch byte) bool {
 	return ch == '{' || ch == '}' || ch == ',' || ch == '"'
 }
 
-var isElementChar = func(r rune) bool {
+func isElementChar(r rune) bool {
 	return r != '{' && r != '}' && r != ','
+}
+
+// isSpaceInParseArray returns true if the rune is a space. To match Postgres,
+// 0x85 and 0xA0 are not treated as whitespace.
+func isSpaceInParseArray(r rune) bool {
+	if r != 0x85 && r != 0xA0 && unicode.IsSpace(r) {
+		return true
+	}
+	return false
+}
+
+var asciiSpace = [256]uint8{'\t': 1, '\n': 1, '\v': 1, '\f': 1, '\r': 1, ' ': 1}
+
+// trimSpaceInParseArray returns a slice of the string s, with all leading
+// and trailing white space removed, as defined by Postgres COPY. This is a
+// reimplementation of strings.TrimSpace from the standard library.
+func trimSpaceInParseArray(s string) string {
+	// Fast path for ASCII: look for the first ASCII non-space byte
+	start := 0
+	for ; start < len(s); start++ {
+		c := s[start]
+		if c >= utf8.RuneSelf {
+			// If we run into a non-ASCII byte, fall back to the
+			// slower unicode-aware method on the remaining bytes
+			return strings.TrimFunc(s[start:], isSpaceInParseArray)
+		}
+		if asciiSpace[c] == 0 {
+			break
+		}
+	}
+
+	// Now look for the first ASCII non-space byte from the end
+	stop := len(s)
+	for ; stop > start; stop-- {
+		c := s[stop-1]
+		if c >= utf8.RuneSelf {
+			return strings.TrimFunc(s[start:stop], isSpaceInParseArray)
+		}
+		if asciiSpace[c] == 0 {
+			break
+		}
+	}
+
+	// At this point s[start:stop] starts and ends with an ASCII
+	// non-space bytes, so we're done. Non-ASCII cases have already
+	// been handled above.
+	return s[start:stop]
 }
 
 // gobbleString advances the parser for the remainder of the current string
@@ -72,7 +114,7 @@ func (p *parseState) gobbleString(isTerminatingChar func(ch byte) bool) (out str
 
 type parseState struct {
 	s                string
-	ctx              ParseTimeContext
+	ctx              ParseContext
 	dependsOnContext bool
 	result           *DArray
 	t                *types.T
@@ -84,7 +126,7 @@ func (p *parseState) advance() {
 }
 
 func (p *parseState) eatWhitespace() {
-	for unicode.IsSpace(p.peek()) {
+	for isSpaceInParseArray(p.peek()) {
 		p.advance()
 	}
 }
@@ -107,7 +149,7 @@ func (p *parseState) parseUnquotedString() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	return trimSpaceInParseArray(out), nil
 }
 
 func (p *parseState) parseElement() error {
@@ -152,9 +194,9 @@ func (p *parseState) parseElement() error {
 // parameter of the array to parse.
 //
 // The dependsOnContext return value indicates if we had to consult the
-// ParseTimeContext (either for the time or the local timezone).
+// ParseContext (either for the time or the local timezone).
 func ParseDArrayFromString(
-	ctx ParseTimeContext, s string, t *types.T,
+	ctx ParseContext, s string, t *types.T,
 ) (_ *DArray, dependsOnContext bool, _ error) {
 	ret, dependsOnContext, err := doParseDArrayFromString(ctx, s, t)
 	if err != nil {
@@ -167,9 +209,9 @@ func ParseDArrayFromString(
 // except the error it returns isn't prettified as a parsing error.
 //
 // The dependsOnContext return value indicates if we had to consult the
-// ParseTimeContext (either for the time or the local timezone).
+// ParseContext (either for the time or the local timezone).
 func doParseDArrayFromString(
-	ctx ParseTimeContext, s string, t *types.T,
+	ctx ParseContext, s string, t *types.T,
 ) (_ *DArray, dependsOnContext bool, _ error) {
 	parser := parseState{
 		s:      s,
@@ -189,7 +231,7 @@ func doParseDArrayFromString(
 			return nil, false, err
 		}
 		parser.eatWhitespace()
-		for parser.peek() == ',' {
+		for string(parser.peek()) == t.Delimiter() {
 			parser.advance()
 			parser.eatWhitespace()
 			if err := parser.parseElement(); err != nil {

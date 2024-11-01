@@ -1,17 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -21,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -70,6 +68,57 @@ func TestInitInsecure(t *testing.T) {
 		}
 		if c.insecure != startCtx.serverInsecure {
 			t.Fatalf("%d: expected %v, but found %v", i, c.insecure, startCtx.serverInsecure)
+		}
+	}
+}
+
+func TestExternalIODirSpec(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Avoid leaking configuration changes after the tests end.
+	// In addition to the usual initCLIDefaults, we need to reset
+	// the serverCfg because --store modifies it in a way that
+	// initCLIDefaults does not restore.
+	defer func(save server.Config) { serverCfg = save }(serverCfg)
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := filepath.Join
+	defaultStoreDir := j(cwd, "cockroach-data")
+
+	testCases := []struct {
+		args     []string
+		expected string
+	}{
+		{[]string{}, j(defaultStoreDir, "extern")},
+		{[]string{`--store=type=mem,size=1G`}, ``},
+		{[]string{`--store=type=mem,size=1G`, `--store=path=foo`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--store=path=foo`, `--store=type=mem,size=1G`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--store=path=foo`, `--store=path=bar`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--external-io-dir=`}, ``},
+		{[]string{`--external-io-dir=foo`}, j(cwd, "foo")},
+		{[]string{`--external-io-dir=disabled`}, j(cwd, "disabled")},
+		{[]string{`--external-io-dir=`, `--store=path=foo`}, ``},
+	}
+	for i, c := range testCases {
+		// Reset the context and insecure flag for every test case.
+		initCLIDefaults()
+		if err := f.Parse(c.args); err != nil {
+			t.Error(err)
+			continue
+		}
+		if err := extraStoreFlagInit(startCmd); err != nil {
+			t.Error(err)
+			continue
+		}
+		if startCtx.externalIODir != c.expected {
+			t.Errorf("%d: expected:\n%q\ngot:\n%s", i, c.expected, startCtx.externalIODir)
 		}
 	}
 }
@@ -127,9 +176,14 @@ func TestStartArgChecking(t *testing.T) {
 	}
 	for i, c := range testCases {
 		// Reset the context and insecure flag for every test case.
+		initCLIDefaults()
 		err := f.Parse(c.args)
-		if !testutils.IsError(err, c.expected) {
-			t.Errorf("%d: expected %q, but found %v", i, c.expected, err)
+		var err2 error
+		if err == nil {
+			err2 = extraStoreFlagInit(startCmd)
+		}
+		if !testutils.IsError(err, c.expected) && !testutils.IsError(err2, c.expected) {
+			t.Errorf("%d: expected %q, but found %v / %v", i, c.expected, err, err2)
 		}
 	}
 }
@@ -148,7 +202,7 @@ func TestAddrWithDefaultHost(t *testing.T) {
 	}
 
 	for _, test := range testData {
-		addr, err := addrWithDefaultHost(test.inAddr)
+		addr, err := addr.AddrWithDefaultLocalhost(test.inAddr)
 		if err != nil {
 			t.Error(err)
 		} else if addr != test.outAddr {

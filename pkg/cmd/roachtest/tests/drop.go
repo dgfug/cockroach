@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -19,7 +14,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -33,20 +30,20 @@ func registerDrop(r registry.Registry) {
 	// rows). Next, it issues a `DROP` for the whole database, and sets the GC TTL
 	// to one second.
 	runDrop := func(ctx context.Context, t test.Test, c cluster.Cluster, warehouses, nodes int) {
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, nodes))
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Range(1, nodes))
-		c.Start(ctx, c.Range(1, nodes), option.StartArgs("-e", "COCKROACH_MEMPROF_INTERVAL=15s"))
+		settings := install.MakeClusterSettings()
+		settings.Env = append(settings.Env, "COCKROACH_MEMPROF_INTERVAL=15s")
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), settings)
 
-		m := c.NewMonitor(ctx, c.Range(1, nodes))
+		m := c.NewMonitor(ctx, c.All())
 		m.Go(func(ctx context.Context) error {
 			t.WorkerStatus("importing TPCC fixture")
-			c.Run(ctx, c.Node(1), tpccImportCmd(warehouses))
+			c.Run(ctx, option.WithNodes(c.Node(1)), tpccImportCmd("", warehouses, "{pgurl:1}"))
 
 			// Don't open the DB connection until after the data has been imported.
 			// Otherwise the ALTER TABLE query below might fail to find the
 			// tpcc.order_line table that we just imported (!) due to what seems to
 			// be a problem with table descriptor leases (#24374).
-			db := c.Conn(ctx, 1)
+			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
 
 			run := func(maybeExperimental bool, stmtStr string, args ...interface{}) {
@@ -83,7 +80,7 @@ func registerDrop(r registry.Registry) {
 			}
 
 			for j := 1; j <= nodes; j++ {
-				size, err := getDiskUsageInBytes(ctx, c, t.L(), j)
+				size, err := roachtestutil.GetDiskUsageInBytes(ctx, c, t.L(), j)
 				if err != nil {
 					return err
 				}
@@ -122,7 +119,7 @@ func registerDrop(r registry.Registry) {
 				sizeReport = ""
 				allNodesSpaceCleared = true
 				for j := 1; j <= nodes; j++ {
-					size, err := getDiskUsageInBytes(ctx, c, t.L(), j)
+					size, err := roachtestutil.GetDiskUsageInBytes(ctx, c, t.L(), j)
 					if err != nil {
 						return err
 					}
@@ -146,7 +143,7 @@ func registerDrop(r registry.Registry) {
 			if !allNodesSpaceCleared {
 				sizeReport += fmt.Sprintf("disk space usage has not dropped below %s on all nodes.",
 					humanizeutil.IBytes(int64(maxSizeBytes)))
-				t.Fatalf(sizeReport)
+				t.Fatal(sizeReport)
 			}
 
 			return nil
@@ -158,9 +155,12 @@ func registerDrop(r registry.Registry) {
 	numNodes := 9
 
 	r.Add(registry.TestSpec{
-		Name:    fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
-		Owner:   registry.OwnerKV,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Name:             fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
+		Owner:            registry.OwnerKV,
+		Cluster:          r.MakeClusterSpec(numNodes),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// NB: this is likely not going to work out in `-local` mode. Edit the
 			// numbers during iteration.

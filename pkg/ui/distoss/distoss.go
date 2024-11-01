@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package distoss embeds the assets for the OSS version of the web UI into the
 // Cockroach binary.
@@ -21,14 +16,14 @@ import (
 	_ "embed"
 
 	"github.com/cockroachdb/cockroach/pkg/ui"
-	"github.com/cockroachdb/cockroach/pkg/util/targz"
+	"github.com/cockroachdb/cockroach/pkg/util/assetbundle"
 )
 
-//go:embed assets.tar.gz
+//go:embed assets.tar.zst
 var assets []byte
 
 func init() {
-	fs, err := targz.AsFS(bytes.NewBuffer(assets))
+	fs, err := assetbundle.AsFS(bytes.NewBuffer(assets))
 	if err != nil {
 		panic(err)
 	}

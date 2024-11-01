@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cliccl
 
@@ -12,24 +9,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/baseccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/cliccl/cliflagsccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/securityccl/fipsccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 )
 
@@ -78,45 +79,92 @@ AES128_CTR:be235...   # AES-128 encryption with store key ID
 		RunE: clierrorplus.MaybeDecorateError(runEncryptionActiveKey),
 	}
 
+	encryptionDecryptCmd := &cobra.Command{
+		Use:   "encryption-decrypt <directory> <in-file> [out-file]",
+		Short: "decrypt a file from an encrypted store",
+		Long: `Decrypts a file from an encrypted store, and outputs it to the
+specified path.
+
+If out-file is not specified, the command will output the decrypted contents to
+stdout.
+`,
+		Args: cobra.MinimumNArgs(2),
+		RunE: clierrorplus.MaybeDecorateError(runDecrypt),
+	}
+
+	encryptionRegistryList := &cobra.Command{
+		Use:   "encryption-registry-list <directory>",
+		Short: "list files in the encryption-at-rest file registry",
+		Long: `Prints a list of files in an Encryption At Rest file registry, along
+with their env type and encryption settings (if applicable).
+`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: clierrorplus.MaybeDecorateError(runList),
+	}
+
+	checkFipsCmd := &cobra.Command{
+		Use:   "enterprise-check-fips",
+		Short: "print diagnostics for FIPS-ready configuration",
+		Long: `
+Performs various tests of this binary's ability to operate in FIPS-ready
+mode in the current environment.
+`,
+
+		RunE: clierrorplus.MaybeDecorateError(runCheckFips),
+	}
+
 	// Add commands to the root debug command.
 	// We can't add them to the lists of commands (eg: DebugCmdsForPebble) as cli init() is called before us.
 	cli.DebugCmd.AddCommand(encryptionStatusCmd)
 	cli.DebugCmd.AddCommand(encryptionActiveKeyCmd)
+	cli.DebugCmd.AddCommand(encryptionDecryptCmd)
+	cli.DebugCmd.AddCommand(encryptionRegistryList)
+	cli.DebugCmd.AddCommand(checkFipsCmd)
 
 	// Add the encryption flag to commands that need it.
+	// For the encryption-status command.
 	f := encryptionStatusCmd.Flags()
-	cli.VarFlag(f, &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	cliflagcfg.VarFlag(f, &encryptionSpecs, cliflagsccl.EnterpriseEncryption)
 	// And other flags.
 	f.BoolVar(&encryptionStatusOpts.activeStoreIDOnly, "active-store-key-id-only", false,
 		"print active store key ID and exit")
+	// For the encryption-decrypt command.
+	f = encryptionDecryptCmd.Flags()
+	cliflagcfg.VarFlag(f, &encryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	// For the encryption-registry-list command.
+	f = encryptionRegistryList.Flags()
+	cliflagcfg.VarFlag(f, &encryptionSpecs, cliflagsccl.EnterpriseEncryption)
 
 	// Add encryption flag to all OSS debug commands that want it.
-	for _, cmd := range cli.DebugCmdsForPebble {
-		// storeEncryptionSpecs is in start.go.
-		cli.VarFlag(cmd.Flags(), &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	for _, cmd := range cli.DebugCommandsRequiringEncryption {
+		// encryptionSpecs is in start.go.
+		cliflagcfg.VarFlag(cmd.Flags(), &encryptionSpecs, cliflagsccl.EnterpriseEncryption)
 	}
 
 	// init has already run in cli/debug.go since this package imports it, so
 	// DebugPebbleCmd already has all its subcommands. We could traverse those
 	// here. But we don't need to by using PersistentFlags.
-	cli.VarFlag(cli.DebugPebbleCmd.PersistentFlags(),
-		&storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	cliflagcfg.VarFlag(cli.DebugPebbleCmd.PersistentFlags(),
+		&encryptionSpecs, cliflagsccl.EnterpriseEncryption)
 
-	cli.PopulateStorageConfigHook = fillEncryptionOptionsForStore
+	cli.PopulateEnvConfigHook = fillEncryptionOptionsForStore
+	cli.EncryptedStorePathsHook = func() []string {
+		var res []string
+		for _, spec := range encryptionSpecs.Specs {
+			res = append(res, spec.Path)
+		}
+		return res
+	}
 }
 
-// fillEncryptionOptionsForStore fills the StorageConfig fields
+// fillEncryptionOptionsForStore fills the EnvConfig fields
 // based on the --enterprise-encryption flag value.
-func fillEncryptionOptionsForStore(cfg *base.StorageConfig) error {
-	opts, err := baseccl.EncryptionOptionsForStore(cfg.Dir, storeEncryptionSpecs)
+func fillEncryptionOptionsForStore(dir string, cfg *fs.EnvConfig) error {
+	opts, err := baseccl.EncryptionOptionsForStore(dir, encryptionSpecs)
 	if err != nil {
 		return err
 	}
-
-	if opts != nil {
-		cfg.EncryptionOptions = opts
-		cfg.UseFileRegistry = true
-	}
+	cfg.EncryptionOptions = opts
 	return nil
 }
 
@@ -160,7 +208,7 @@ func runEncryptionStatus(cmd *cobra.Command, args []string) error {
 
 	dir := args[0]
 
-	db, err := cli.OpenExistingStore(dir, stopper, true /* readOnly */)
+	db, err := cli.OpenEngine(dir, stopper, fs.ReadOnly, storage.MustExist)
 	if err != nil {
 		return err
 	}
@@ -305,7 +353,7 @@ func getActiveEncryptionkey(dir string) (string, string, error) {
 	}
 
 	// Open the file registry. Return plaintext if it does not exist.
-	contents, err := ioutil.ReadFile(registryFile)
+	contents, err := os.ReadFile(registryFile)
 	if err != nil {
 		if oserror.IsNotExist(err) {
 			return enginepbccl.EncryptionType_Plaintext.String(), "", nil
@@ -335,4 +383,45 @@ func getActiveEncryptionkey(dir string) (string, string, error) {
 	}
 
 	return setting.EncryptionType.String(), setting.KeyId, nil
+}
+
+func runCheckFips(cmd *cobra.Command, args []string) error {
+	if runtime.GOOS != "linux" {
+		return errors.New("FIPS-ready mode is only supported on linux")
+	}
+	// Our FIPS-ready deployments have three major requirements:
+	// 1. This binary is built with the golang-fips toolchain and running on linux
+	// 2. FIPS mode is enabled in the kernel.
+	// 3. We can dynamically load the OpenSSL library (which must be the same major version that was present at
+	//    build time). Verifying that the OpenSSL library is FIPS-compliant is outside the scope of this command.
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetBorder(false)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	emit := func(label string, status bool, detail string) {
+		statusSymbol := "❌"
+		if status {
+			statusSymbol = "✅"
+		}
+		table.Append([]string{label, statusSymbol, detail})
+	}
+
+	emit("FIPS-ready build", fipsccl.IsCompileTimeFIPSReady(), "")
+	buildOpenSSLVersion, soname, err := fipsccl.BuildOpenSSLVersion()
+	if err == nil {
+		table.Append([]string{"Build-time OpenSSL Version", "", buildOpenSSLVersion})
+		table.Append([]string{"OpenSSL library filename", "", soname})
+	}
+
+	isKernelEnabled, err := fipsccl.IsKernelEnabled()
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	emit("Kernel FIPS mode enabled", isKernelEnabled, detail)
+
+	emit("OpenSSL loaded", fipsccl.IsOpenSSLLoaded(), "")
+	emit("FIPS ready", fipsccl.IsFIPSReady(), "")
+
+	table.Render()
+	return nil
 }

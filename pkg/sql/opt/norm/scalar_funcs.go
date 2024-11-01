@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -16,10 +11,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // NeedSortedUniqueList returns true if the given list is composed entirely of
@@ -110,9 +106,13 @@ func (c *CustomFuncs) IsConstValueEqual(const1, const2 opt.ScalarExpr) bool {
 	case opt.ConstOp:
 		datum1 := const1.(*memo.ConstExpr).Value
 		datum2 := const2.(*memo.ConstExpr).Value
-		return datum1.Compare(c.f.evalCtx, datum2) == 0
+		cmp, err := datum1.Compare(c.f.ctx, c.f.evalCtx, datum2)
+		if err != nil {
+			panic(err)
+		}
+		return cmp == 0
 	default:
-		panic(errors.AssertionFailedf("unexpected Op type: %v", log.Safe(op1)))
+		panic(errors.AssertionFailedf("unexpected Op type: %v", redact.Safe(op1)))
 	}
 }
 
@@ -138,17 +138,19 @@ func (c *CustomFuncs) UnifyComparison(
 	// means we don't lose any information needed to generate spans, and combined
 	// with monotonicity means that it's safe to convert the RHS to the type of
 	// the LHS.
-	convertedDatum, err := tree.PerformCast(c.f.evalCtx, cnst.Value, desiredType)
+	convertedDatum, err := eval.PerformCast(c.f.ctx, c.f.evalCtx, cnst.Value, desiredType)
 	if err != nil {
 		return nil, false
 	}
 
-	convertedBack, err := tree.PerformCast(c.f.evalCtx, convertedDatum, originalType)
+	convertedBack, err := eval.PerformCast(c.f.ctx, c.f.evalCtx, convertedDatum, originalType)
 	if err != nil {
 		return nil, false
 	}
 
-	if convertedBack.Compare(c.f.evalCtx, cnst.Value) != 0 {
+	if cmp, err := convertedBack.Compare(c.f.ctx, c.f.evalCtx, cnst.Value); err != nil {
+		panic(err)
+	} else if cmp != 0 {
 		return nil, false
 	}
 
@@ -210,11 +212,29 @@ func (c *CustomFuncs) OpsAreSame(left, right opt.Operator) bool {
 
 // ConvertConstArrayToTuple converts a constant ARRAY datum to the equivalent
 // homogeneous tuple, so ARRAY[1, 2, 3] becomes (1, 2, 3).
-func (c *CustomFuncs) ConvertConstArrayToTuple(scalar opt.ScalarExpr) opt.ScalarExpr {
-	darr := scalar.(*memo.ConstExpr).Value.(*tree.DArray)
+func (c *CustomFuncs) ConvertConstArrayToTuple(arr *memo.ConstExpr) opt.ScalarExpr {
+	darr := arr.Value.(*tree.DArray)
 	elems := make(memo.ScalarListExpr, len(darr.Array))
 	ts := make([]*types.T, len(darr.Array))
 	for i, delem := range darr.Array {
+		// Convert DTuples to TupleExprs with constant elements. This allows
+		// constraints to be built for the resulting IN expression because the
+		// constraint builder requires TupleExprs on the RHS of IN expressions.
+		// TODO(mgartner): Consider updating the constraint builder to build
+		// constraints for IN expression with DTuples, and eliminating this
+		// special case.
+		if t, ok := delem.(*tree.DTuple); ok {
+			typ := t.ResolvedType()
+			typs := typ.TupleContents()
+			exprs := make(memo.ScalarListExpr, len(t.D))
+			for i := range t.D {
+				exprs[i] = c.f.ConstructConstVal(t.D[i], typs[i])
+			}
+			elems[i] = c.f.ConstructTuple(exprs, typ)
+			ts[i] = typ
+			continue
+		}
+
 		elems[i] = c.f.ConstructConstVal(delem, delem.ResolvedType())
 		ts[i] = darr.ParamTyp
 	}
@@ -269,25 +289,16 @@ func (c *CustomFuncs) SubqueryCmp(sub *memo.SubqueryPrivate) opt.Operator {
 	return sub.Cmp
 }
 
+// EmbeddedSubqueryPrivate returns the SubqueryPrivate embedded in the given
+// ExistsPrivate.
+func (c *CustomFuncs) EmbeddedSubqueryPrivate(ex *memo.ExistsPrivate) *memo.SubqueryPrivate {
+	return &ex.SubqueryPrivate
+}
+
 // MakeArrayAggCol returns a ColumnID with the given type and an "array_agg"
 // label.
 func (c *CustomFuncs) MakeArrayAggCol(typ *types.T) opt.ColumnID {
 	return c.mem.Metadata().AddColumn("array_agg", typ)
-}
-
-// IsLimited indicates whether a limit was pushed under the subquery
-// already. See e.g. the rule IntroduceExistsLimit.
-func (c *CustomFuncs) IsLimited(sub *memo.SubqueryPrivate) bool {
-	return sub.WasLimited
-}
-
-// MakeLimited specifies that the subquery has a limit set
-// already. This prevents e.g. the rule IntroduceExistsLimit from
-// applying twice.
-func (c *CustomFuncs) MakeLimited(sub *memo.SubqueryPrivate) *memo.SubqueryPrivate {
-	newSub := *sub
-	newSub.WasLimited = true
-	return &newSub
 }
 
 // InlineValues converts a Values operator to a tuple. If there are
@@ -367,4 +378,10 @@ func (c *CustomFuncs) SplitTupleEq(lhs, rhs *memo.TupleExpr) memo.FiltersExpr {
 		res[i] = c.f.ConstructFiltersItem(c.f.ConstructEq(lhs.Elems[i], rhs.Elems[i]))
 	}
 	return res
+}
+
+// CanNormalizeArrayFlatten returns true if the input is correlated or if the
+// ArrayFlatten exists within a UDF.
+func (c *CustomFuncs) CanNormalizeArrayFlatten(input memo.RelExpr, p *memo.SubqueryPrivate) bool {
+	return c.HasOuterCols(input) || p.WithinUDF
 }

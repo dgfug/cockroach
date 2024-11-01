@@ -1,0 +1,24 @@
+// Copyright 2022 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+:global {
+  @import "uplot/dist/uPlot.min";
+}
+
+.bargraph {
+  height: 100%;
+  :global(.uplot) {
+    display: flex;
+    flex-direction: column;
+    :global(.u-legend) {
+      text-align: left;
+      font-size: 10px;
+      margin-top: 20px;
+      z-index: 1;
+      width: fit-content;
+      padding: 10px;
+    }
+  }
+}

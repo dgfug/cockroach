@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,82 +10,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
-
-// expressionCarrier handles visiting sub-expressions.
-type expressionCarrier interface {
-	// walkExprs explores all sub-expressions held by this object, if
-	// any.
-	walkExprs(func(desc string, index int, expr tree.TypedExpr))
-}
-
-// tableWriter handles writing kvs and forming table rows.
-//
-// Usage:
-//   err := tw.init(txn, evalCtx)
-//   // Handle err.
-//   for {
-//      values := ...
-//      row, err := tw.row(values)
-//      // Handle err.
-//   }
-//   err := tw.finalize()
-//   // Handle err.
-type tableWriter interface {
-	expressionCarrier
-
-	// init provides the tableWriter with a Txn and optional monitor to write to
-	// and returns an error if it was misconfigured.
-	init(context.Context, *kv.Txn, *tree.EvalContext, *settings.Values) error
-
-	// row performs a sql row modification (tableInserter performs an insert,
-	// etc). It batches up writes to the init'd txn and periodically sends them.
-	//
-	// The passed Datums is not used after `row` returns.
-	//
-	// The PartialIndexUpdateHelper is used to determine which partial indexes
-	// to avoid updating when performing row modification. This is necessary
-	// because not all rows are indexed by partial indexes.
-	//
-	// The traceKV parameter determines whether the individual K/V operations
-	// should be logged to the context. We use a separate argument here instead
-	// of a Value field on the context because Value access in context.Context
-	// is rather expensive and the tableWriter interface is used on the
-	// inner loop of table accesses.
-	row(context.Context, tree.Datums, row.PartialIndexUpdateHelper, bool /* traceKV */) error
-
-	// flushAndStartNewBatch is called at the end of each batch but the last.
-	// This should flush the current batch.
-	flushAndStartNewBatch(context.Context) error
-
-	// finalize flushes out any remaining writes. It is called after all calls
-	// to row.
-	finalize(context.Context) error
-
-	// tableDesc returns the TableDescriptor for the table that the tableWriter
-	// will modify.
-	tableDesc() catalog.TableDescriptor
-
-	// close frees all resources held by the tableWriter.
-	close(context.Context)
-
-	// desc returns a name suitable for describing the table writer in
-	// the output of EXPLAIN.
-	desc() string
-
-	// enable auto commit in call to finalize().
-	enableAutoCommit()
-}
 
 type autoCommitOpt int
 
@@ -113,6 +47,9 @@ type tableWriterBase struct {
 	// lockTimeout specifies the maximum amount of time that the writer will
 	// wait while attempting to acquire a lock on a key.
 	lockTimeout time.Duration
+	// deadlockTimeout specifies the amount of time that the writer will wait
+	// on a lock before checking if there is a race condition.
+	deadlockTimeout time.Duration
 	// maxBatchSize determines the maximum number of entries in the KV batch
 	// for a mutation operation. By default, it will be set to 10k but can be
 	// a different value in tests.
@@ -140,37 +77,52 @@ type tableWriterBase struct {
 	// If set, mutations.MaxBatchSize and row.getKVBatchSize will be overridden
 	// to use the non-test value.
 	forceProductionBatchSizes bool
-	// sv settings values for cluster settings
-	sv *settings.Values
+	// Adapter to make expose a kv.Batch as a Putter
+	putter row.KVBatchAdapter
+	// originID is an identifier for the cluster that originally wrote the data
+	// being written by the table writer during Logical Data Replication.
+	originID uint32
+	// originTimestamp is the timestamp the data written by this table writer were
+	// originally written with before being replicated via Logical Data
+	// Replication.
+	originTimestamp hlc.Timestamp
 }
 
 var maxBatchBytes = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
 	"sql.mutations.mutation_batch_byte_size",
 	"byte size - in key and value lengths -- for mutation batches",
 	4<<20,
 )
 
+// init initializes the tableWriterBase with a Txn.
 func (tb *tableWriterBase) init(
-	txn *kv.Txn,
-	tableDesc catalog.TableDescriptor,
-	evalCtx *tree.EvalContext,
-	settings *settings.Values,
-) {
+	txn *kv.Txn, tableDesc catalog.TableDescriptor, evalCtx *eval.Context,
+) error {
+	if txn.Type() != kv.RootTxn {
+		return errors.AssertionFailedf("unexpectedly non-root txn is used by the table writer")
+	}
 	tb.txn = txn
 	tb.desc = tableDesc
 	tb.lockTimeout = 0
+	tb.deadlockTimeout = 0
+	tb.originID = 0
+	tb.originTimestamp = hlc.Timestamp{}
 	if evalCtx != nil {
 		tb.lockTimeout = evalCtx.SessionData().LockTimeout
+		tb.deadlockTimeout = evalCtx.SessionData().DeadlockTimeout
+		tb.originID = evalCtx.SessionData().OriginIDForLogicalDataReplication
+		tb.originTimestamp = evalCtx.SessionData().OriginTimestampForLogicalDataReplication
 	}
-	tb.forceProductionBatchSizes = evalCtx != nil && evalCtx.TestingKnobs.ForceProductionBatchSizes
+	tb.forceProductionBatchSizes = evalCtx != nil && evalCtx.TestingKnobs.ForceProductionValues
 	tb.maxBatchSize = mutations.MaxBatchSize(tb.forceProductionBatchSizes)
 	batchMaxBytes := int(maxBatchBytes.Default())
 	if evalCtx != nil {
 		batchMaxBytes = int(maxBatchBytes.Get(&evalCtx.Settings.SV))
 	}
 	tb.maxBatchByteSize = mutations.MaxBatchByteSize(batchMaxBytes, tb.forceProductionBatchSizes)
-	tb.sv = settings
 	tb.initNewBatch()
+	return nil
 }
 
 // setRowsWrittenLimit should be called before finalize whenever the
@@ -187,22 +139,12 @@ func (tb *tableWriterBase) setRowsWrittenLimit(sd *sessiondata.SessionData) {
 // flushAndStartNewBatch shares the common flushAndStartNewBatch() code between
 // tableWriters.
 func (tb *tableWriterBase) flushAndStartNewBatch(ctx context.Context) error {
+	log.VEventf(ctx, 2, "writing batch with %d requests", len(tb.b.Requests()))
 	if err := tb.txn.Run(ctx, tb.b); err != nil {
 		return row.ConvertBatchError(ctx, tb.desc, tb.b)
 	}
-	// Do admission control for response processing. This is the shared write
-	// path for most SQL mutations.
-	responseAdmissionQ := tb.txn.DB().SQLKVResponseAdmissionQ
-	if responseAdmissionQ != nil {
-		requestAdmissionHeader := tb.txn.AdmissionHeader()
-		responseAdmission := admission.WorkInfo{
-			TenantID:   roachpb.SystemTenantID,
-			Priority:   admission.WorkPriority(requestAdmissionHeader.Priority),
-			CreateTime: requestAdmissionHeader.CreateTime,
-		}
-		if _, err := responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
-			return err
-		}
+	if err := tb.tryDoResponseAdmission(ctx); err != nil {
+		return err
 	}
 	tb.initNewBatch()
 	tb.rowsWritten += int64(tb.currentBatchSize)
@@ -225,18 +167,38 @@ func (tb *tableWriterBase) finalize(ctx context.Context) (err error) {
 		// Also, we don't want to try to commit here if the deadline is expired.
 		// If we bubble back up to SQL then maybe we can get a fresh deadline
 		// before committing.
-		!tb.txn.DeadlineLikelySufficient(tb.sv) {
+		!tb.txn.DeadlineLikelySufficient() {
 		log.Event(ctx, "autocommit enabled")
+		log.VEventf(ctx, 2, "writing batch with %d requests and committing", len(tb.b.Requests()))
 		// An auto-txn can commit the transaction with the batch. This is an
 		// optimization to avoid an extra round-trip to the transaction
 		// coordinator.
 		err = tb.txn.CommitInBatch(ctx, tb.b)
 	} else {
+		log.VEventf(ctx, 2, "writing batch with %d requests", len(tb.b.Requests()))
 		err = tb.txn.Run(ctx, tb.b)
 	}
 	tb.lastBatchSize = tb.currentBatchSize
 	if err != nil {
 		return row.ConvertBatchError(ctx, tb.desc, tb.b)
+	}
+	return tb.tryDoResponseAdmission(ctx)
+}
+
+func (tb *tableWriterBase) tryDoResponseAdmission(ctx context.Context) error {
+	// Do admission control for response processing. This is the shared write
+	// path for most SQL mutations.
+	responseAdmissionQ := tb.txn.DB().SQLKVResponseAdmissionQ
+	if responseAdmissionQ != nil {
+		requestAdmissionHeader := tb.txn.AdmissionHeader()
+		responseAdmission := admission.WorkInfo{
+			TenantID:   roachpb.SystemTenantID,
+			Priority:   admissionpb.WorkPriority(requestAdmissionHeader.Priority),
+			CreateTime: requestAdmissionHeader.CreateTime,
+		}
+		if _, err := responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -247,7 +209,15 @@ func (tb *tableWriterBase) enableAutoCommit() {
 
 func (tb *tableWriterBase) initNewBatch() {
 	tb.b = tb.txn.NewBatch()
+	tb.putter.Batch = tb.b
 	tb.b.Header.LockTimeout = tb.lockTimeout
+	tb.b.Header.DeadlockTimeout = tb.deadlockTimeout
+	if tb.originID != 0 {
+		tb.b.Header.WriteOptions = &kvpb.WriteOptions{
+			OriginID:        tb.originID,
+			OriginTimestamp: tb.originTimestamp,
+		}
+	}
 }
 
 func (tb *tableWriterBase) clearLastBatch(ctx context.Context) {

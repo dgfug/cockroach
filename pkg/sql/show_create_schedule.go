@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,13 +12,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -33,12 +27,12 @@ var showCreateTableColumns = colinfo.ResultColumns{
 }
 
 const (
-	scheduleID = iota
-	createStmt
+	scheduleIDIdx = iota
+	createStmtIdx
 )
 
 func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.ScheduledJob, error) {
-	env := jobSchedulerEnv(params)
+	env := JobSchedulerEnv(params.ExecCfg().JobsKnobs())
 	var schedules []*jobs.ScheduledJob
 	var rows []tree.Datums
 	var cols colinfo.ResultColumns
@@ -49,10 +43,10 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 			return nil, err
 		}
 
-		datums, columns, err := params.ExecCfg().InternalExecutor.QueryRowExWithCols(
+		datums, columns, err := params.p.InternalSQLTxn().QueryRowExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.EvalContext().Txn, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = $1", env.ScheduledJobsTableName()),
 			tree.NewDInt(tree.DInt(sjID)))
 		if err != nil {
@@ -61,10 +55,10 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 		rows = append(rows, datums)
 		cols = columns
 	} else {
-		datums, columns, err := params.ExecCfg().InternalExecutor.QueryBufferedExWithCols(
+		datums, columns, err := params.p.InternalSQLTxn().QueryBufferedExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.EvalContext().Txn, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s", env.ScheduledJobsTableName()))
 		if err != nil {
 			return nil, err
@@ -86,12 +80,9 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 func (p *planner) ShowCreateSchedule(
 	ctx context.Context, n *tree.ShowCreateSchedules,
 ) (planNode, error) {
-	// Only admin users can execute SHOW CREATE SCHEDULE
-	if userIsAdmin, err := p.UserHasAdminRole(ctx, p.User()); err != nil {
+	// Only privileged users can execute SHOW CREATE SCHEDULE
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA); err != nil {
 		return nil, err
-	} else if !userIsAdmin {
-		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-			"user %s does not have admin role", p.User())
 	}
 
 	sqltelemetry.IncrementShowCounter(sqltelemetry.CreateSchedule)
@@ -113,15 +104,14 @@ func (p *planner) ShowCreateSchedule(
 					return nil, err
 				}
 
-				createStmtStr, err := ex.GetCreateScheduleStatement(ctx,
-					scheduledjobs.ProdJobSchedulerEnv, p.Txn(), sj, p.ExecCfg().InternalExecutor)
+				createStmtStr, err := ex.GetCreateScheduleStatement(ctx, p.InternalSQLTxn(), scheduledjobs.ProdJobSchedulerEnv, sj)
 				if err != nil {
 					return nil, err
 				}
 
 				row := tree.Datums{
-					scheduleID: tree.NewDInt(tree.DInt(sj.ScheduleID())),
-					createStmt: tree.NewDString(createStmtStr),
+					scheduleIDIdx: tree.NewDInt(tree.DInt(sj.ScheduleID())),
+					createStmtIdx: tree.NewDString(createStmtStr),
 				}
 				rows = append(rows, row)
 			}

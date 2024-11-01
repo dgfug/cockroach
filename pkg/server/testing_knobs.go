@@ -1,32 +1,29 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
+	"context"
 	"net"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // TestingKnobs groups testing knobs for the Server.
 type TestingKnobs struct {
 	// DisableAutomaticVersionUpgrade, if set, temporarily disables the server's
-	// automatic version upgrade mechanism.
-	DisableAutomaticVersionUpgrade int32 // accessed atomically
+	// automatic version upgrade mechanism (until the channel is closed).
+	DisableAutomaticVersionUpgrade chan struct{}
 	// DefaultZoneConfigOverride, if set, overrides the default zone config
 	// defined in `pkg/config/zone.go`.
 	DefaultZoneConfigOverride *zonepb.ZoneConfig
@@ -58,39 +55,39 @@ type TestingKnobs struct {
 	// server fails to start.
 	RPCListener net.Listener
 
-	// BinaryVersionOverride overrides the binary version the CRDB server thinks
-	// it's running.
+	// ClusterVersionOverride can be used to override the version of the cluster
+	// (assuming that one has to be created).
 	//
-	// This is consulted when bootstrapping clusters, opting to do it at the
-	// override instead of clusterversion.BinaryVersion (if this server is the
-	// one bootstrapping the cluster). This can als be used by tests to
-	// essentially that a new cluster is not starting from scratch, but instead
-	// is "created" by a node starting up with engines that had already been
-	// bootstrapped, at this BinaryVersionOverride. For example, it allows
-	// convenient creation of a cluster from a 2.1 binary, but that's running at
-	// version 2.0.
+	// Normally (when this knob isn't used), the cluster is initialized at
+	// cluster.Settings.Version.LatestVersion().
 	//
-	// It's also used when advertising this server's binary version when sending
-	// out join requests.
+	// When ClusterVersionOverride is set, the cluster will be at this version
+	// once initialization is complete. Note that we cannot bootstrap clusters at
+	// arbitrary versions - we can only bootstrap clusters at the Latest version
+	// and at final versions of previous supported releases. The cluster will be
+	// bootstrapped at the most recent bootstrappable version that is at most
+	// ClusterVersionOverride; after all the servers in the test cluster have been
+	// started, `SET CLUSTER SETTING version = ClusterVersionOverride` will be run
+	// to step through the upgrades until the specified version.
+	//
+	// ClusterVersionOverride is also used when advertising this server's binary
+	// version when sending out join requests.
 	//
 	// NB: When setting this, you probably also want to set
 	// DisableAutomaticVersionUpgrade.
-	//
-	// TODO(irfansharif): Update users of this testing knob to use the
-	// appropriate clusterversion.Handle instead.
-	BinaryVersionOverride roachpb.Version
+	ClusterVersionOverride roachpb.Version
 	// An (additional) callback invoked whenever a
 	// node is permanently removed from the cluster.
-	OnDecommissionedCallback func(livenesspb.Liveness)
-	// StickyEngineRegistry manages the lifecycle of sticky in memory engines,
-	// which can be enabled via base.StoreSpec.StickyInMemoryEngineID.
+	OnDecommissionedCallback func(id roachpb.NodeID)
+	// StickyVFSRegistry manages the lifecycle of sticky in memory engines,
+	// which can be enabled via base.StoreSpec.StickyVFSID.
 	//
-	// When supplied to a TestCluster, StickyEngineIDs will be associated auto-
+	// When supplied to a TestCluster, StickyVFSIDs will be associated auto-
 	// matically to the StoreSpecs used.
-	StickyEngineRegistry StickyInMemEnginesRegistry
-	// Clock Source used to an inject a custom clock for testing the server. It is
+	StickyVFSRegistry fs.StickyRegistry
+	// WallClock is used to inject a custom clock for testing the server. It is
 	// typically either an hlc.HybridManualClock or hlc.ManualClock.
-	ClockSource func() int64
+	WallClock hlc.WallClock
 
 	// ImportTimeseriesFile, if set, is a file created via `DumpRaw` that written
 	// back to the KV layer upon server start.
@@ -102,10 +99,56 @@ type TestingKnobs struct {
 	// a custom function that counts the number of times the sleep function is called.
 	DrainSleepFn func(time.Duration)
 
-	// TenantBlobClientFactory supplies a BlobClientFactory for
-	// use by tenants. By default, tenants have no blob client
-	// factory.
-	TenantBlobClientFactory blobs.BlobClientFactory
+	// BlobClientFactory supplies a BlobClientFactory for
+	// use by servers.
+	BlobClientFactory blobs.BlobClientFactory
+
+	// StubTimeNow allows tests to override the timeutil.Now() function used
+	// in the jobs endpoint to calculate earliest_retained_time.
+	StubTimeNow func() time.Time
+
+	// RequireGracefulDrain, if set, causes a shutdown to fail with a log.Fatal
+	// if the server is not gracefully drained prior to its stopper shutting down.
+	RequireGracefulDrain bool
+
+	// DrainReportCh, if set, is a channel that will be notified when
+	// the SQL service shuts down.
+	DrainReportCh chan struct{}
+
+	// ShutdownTenantConnectorEarlyIfNoRecordPresent, if set, will cause the
+	// tenant connector to be shut down early if no record is present in the
+	// system.tenants table. This is useful for tests that want to verify that
+	// the tenant connector can't start when the record doesn't exist.
+	ShutdownTenantConnectorEarlyIfNoRecordPresent bool
+
+	// IterateNodesDialCallback is used to mock dial errors in a cluster
+	// fan-out. It is invoked by the dialFn argument of server.iterateNodes.
+	IterateNodesDialCallback func(nodeID roachpb.NodeID) error
+
+	// IterateNodesNodeCallback is used to mock errors of the rpc invoked
+	// on a remote node in a cluster fan-out. It is invoked by the nodeFn argument
+	// of server.iterateNodes.
+	IterateNodesNodeCallback func(ctx context.Context, nodeID roachpb.NodeID) error
+
+	// DialNodeCallback is used to mock dial errors when dialing a node. It is
+	// invoked by the dialNode method of server.serverIterator.
+	DialNodeCallback func(ctx context.Context, nodeID roachpb.NodeID) error
+
+	// DisableSettingsWatcher disables the watcher that monitors updates
+	// to system.settings.
+	DisableSettingsWatcher bool
+
+	TenantAutoUpgradeInfo chan struct {
+		Status    int
+		UpgradeTo roachpb.Version
+	}
+
+	// TenantAutoUpgradeLoopFrequency indicates how often the tenant
+	// auto upgrade loop will check if the tenant can be auto-upgraded.
+	TenantAutoUpgradeLoopFrequency time.Duration
+
+	// EnvironmentSampleInterval overrides base.DefaultMetricsSampleInterval when used to construct sampleEnvironmentCfg.
+	EnvironmentSampleInterval time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

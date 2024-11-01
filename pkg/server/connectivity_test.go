@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server_test
 
@@ -46,7 +41,7 @@ func TestClusterConnectivity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// TODO(irfansharif): Teach TestServer to accept a list of join addresses
+	// TODO(irfansharif): Teach testServer to accept a list of join addresses
 	// instead of just one.
 
 	var testConfigurations = []struct {
@@ -125,6 +120,17 @@ func TestClusterConnectivity(t *testing.T) {
 		// We're going to manually control initialization in this test.
 		NoAutoInitializeCluster: true,
 		StoreSpecs:              []base.StoreSpec{{InMemory: true}},
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				ContextTestingKnobs: rpc.ContextTestingKnobs{
+					// Disable the special RPC loopback dial logic.
+					// This is needed because the test starts to perform
+					// RPC dials before the PreStart() function is called,
+					// and that is where the loopback dial function is defined.
+					NoLoopbackDialer: true,
+				},
+			},
+		},
 	}
 
 	for i, test := range testConfigurations {
@@ -188,21 +194,21 @@ func TestClusterConnectivity(t *testing.T) {
 
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go func() {
+			go func(bootstrapNode int) {
 				defer wg.Done()
 
 				// Attempt to bootstrap the cluster through the configured node.
-				bootstrapNode := test.bootstrapNode
 				testutils.SucceedsSoon(t, func() (e error) {
 					ctx := context.Background()
 					serv := tc.Server(bootstrapNode)
 
-					dialOpts, err := tc.Server(bootstrapNode).RPCContext().GRPCDialOptions()
+					target := serv.AdvRPCAddr()
+					dialOpts, err := tc.Server(bootstrapNode).RPCContext().GRPCDialOptions(ctx, target, rpc.SystemClass)
 					if err != nil {
 						return err
 					}
 
-					conn, err := grpc.DialContext(ctx, serv.ServingRPCAddr(), dialOpts...)
+					conn, err := grpc.DialContext(ctx, target, dialOpts...)
 					if err != nil {
 						return err
 					}
@@ -218,14 +224,14 @@ func TestClusterConnectivity(t *testing.T) {
 				// Wait to get a real cluster ID (doesn't always get populated
 				// right after bootstrap).
 				testutils.SucceedsSoon(t, func() error {
-					clusterID := tc.Server(bootstrapNode).ClusterID()
+					clusterID := tc.Server(bootstrapNode).StorageClusterID()
 					if clusterID.Equal(uuid.UUID{}) {
 						return errors.New("cluster ID still not recorded")
 					}
 					return nil
 				})
 
-				clusterID := tc.Server(bootstrapNode).ClusterID()
+				clusterID := tc.Server(bootstrapNode).StorageClusterID()
 				testutils.SucceedsSoon(t, func() error {
 					var nodeIDs []roachpb.NodeID
 					var storeIDs []roachpb.StoreID
@@ -234,7 +240,7 @@ func TestClusterConnectivity(t *testing.T) {
 					// network actually do (by checking they discover the right
 					// cluster ID). Also collect node/store IDs for below.
 					for i := 0; i < numNodes; i++ {
-						if got := tc.Server(i).ClusterID(); got != clusterID {
+						if got := tc.Server(i).StorageClusterID(); got != clusterID {
 							return errors.Newf("mismatched cluster IDs; %s (for node %d) != %s (for node %d)",
 								clusterID.String(), bootstrapNode, got.String(), i)
 						}
@@ -266,7 +272,7 @@ func TestClusterConnectivity(t *testing.T) {
 
 					return nil
 				})
-			}()
+			}(test.bootstrapNode)
 
 			// Start the test cluster. This is a blocking call, and expects the
 			// configured number of servers in the cluster to be fully
@@ -305,8 +311,8 @@ func TestJoinVersionGate(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		for i := 0; i < numNodes; i++ {
-			clusterID := tc.Server(0).ClusterID()
-			got := tc.Server(i).ClusterID()
+			clusterID := tc.Server(0).StorageClusterID()
+			got := tc.Server(i).StorageClusterID()
 
 			if got != clusterID {
 				return errors.Newf("mismatched cluster IDs; %s (for node %d) != %s (for node %d)", clusterID.String(), 0, got.String(), i)
@@ -315,24 +321,24 @@ func TestJoinVersionGate(t *testing.T) {
 		return nil
 	})
 
-	var newVersion = clusterversion.TestingBinaryVersion
+	var newVersion = clusterversion.Latest.Version()
 	var oldVersion = prev(newVersion)
 
 	knobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
-			BinaryVersionOverride: oldVersion,
+			ClusterVersionOverride: oldVersion,
 		},
 	}
 
 	oldVersionServerArgs := commonArg
 	oldVersionServerArgs.Knobs = knobs
-	oldVersionServerArgs.JoinAddr = tc.Servers[0].ServingRPCAddr()
+	oldVersionServerArgs.JoinAddr = tc.Servers[0].AdvRPCAddr()
 
 	serv, err := tc.AddServer(oldVersionServerArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer serv.Stop()
+	defer serv.Stop(context.Background())
 
 	ctx := context.Background()
 	if err := serv.Start(ctx); !errors.Is(errors.Cause(err), server.ErrIncompatibleBinaryVersion) {
@@ -372,19 +378,23 @@ func TestDecommissionedNodeCannotConnect(t *testing.T) {
 
 			// Within a short period of time, the cluster (n1, n2) will refuse to reach out to n3.
 			_, err := clusterSrv.RPCContext().GRPCDialNode(
-				decomSrv.RPCAddr(), decomSrv.NodeID(), rpc.DefaultClass,
+				decomSrv.RPCAddr(), decomSrv.NodeID(), decomSrv.Locality(), rpc.DefaultClass,
 			).Connect(ctx)
 			s, ok := grpcstatus.FromError(errors.UnwrapAll(err))
 			if !ok || s.Code() != codes.FailedPrecondition {
+				// NB: errors.Wrapf(nil, ...) returns nil.
+				// nolint:errwrap
 				return errors.Errorf("expected failed precondition for n%d->n%d, got %v", clusterSrv.NodeID(), decomSrv.NodeID(), err)
 			}
 
 			// And similarly, n3 will be refused by n1, n2.
 			_, err = decomSrv.RPCContext().GRPCDialNode(
-				clusterSrv.RPCAddr(), clusterSrv.NodeID(), rpc.DefaultClass,
+				clusterSrv.RPCAddr(), clusterSrv.NodeID(), clusterSrv.Locality(), rpc.DefaultClass,
 			).Connect(ctx)
 			s, ok = grpcstatus.FromError(errors.UnwrapAll(err))
 			if !ok || s.Code() != codes.PermissionDenied {
+				// NB: errors.Wrapf(nil, ...) returns nil.
+				// nolint:errwrap
 				return errors.Errorf("expected permission denied for n%d->n%d, got %v", decomSrv.NodeID(), clusterSrv.NodeID(), err)
 			}
 		}
@@ -394,6 +404,8 @@ func TestDecommissionedNodeCannotConnect(t *testing.T) {
 		_, err := decomSrv.DB().Scan(ctx, scratchKey, keys.MaxKey, 1)
 		s, ok := grpcstatus.FromError(errors.UnwrapAll(err))
 		if !ok || s.Code() != codes.PermissionDenied {
+			// NB: errors.Wrapf(nil, ...) returns nil.
+			// nolint:errwrap
 			return errors.Errorf("expected permission denied for scan, got %v", err)
 		}
 		return nil

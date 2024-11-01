@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ledger
 
@@ -48,7 +43,7 @@ var ledgerCustomerTypes = []*types.T{
 func (w *ledger) ledgerCustomerInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
-	rng.Seed(w.seed + int64(rowIdx))
+	rng.Seed(RandomSeed.Seed() + int64(rowIdx))
 
 	return []interface{}{
 		rowIdx,                // id
@@ -85,7 +80,7 @@ var ledgerTransactionColTypes = []*types.T{
 func (w *ledger) ledgerTransactionInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
-	rng.Seed(w.seed + int64(rowIdx))
+	rng.Seed(RandomSeed.Seed() + int64(rowIdx))
 
 	h := w.hashPool.Get().(hash.Hash64)
 	defer w.hashPool.Put(h)
@@ -105,7 +100,7 @@ func (w *ledger) ledgerTransactionInitialRow(rowIdx int) []interface{} {
 }
 
 func (w *ledger) ledgerTransactionSplitRow(splitIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(w.seed + int64(splitIdx)))
+	rng := rand.New(rand.NewSource(RandomSeed.Seed() + int64(splitIdx)))
 	u := uuid.FromUint128(uint128.FromInts(rng.Uint64(), rng.Uint64()))
 	return []interface{}{
 		paymentIDPrefix + u.String(),
@@ -115,7 +110,7 @@ func (w *ledger) ledgerTransactionSplitRow(splitIdx int) []interface{} {
 func (w *ledger) ledgerEntryInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
-	rng.Seed(w.seed + int64(rowIdx))
+	rng.Seed(RandomSeed.Seed() + int64(rowIdx))
 
 	// Alternate.
 	debit := rowIdx%2 == 0
@@ -157,7 +152,7 @@ func (w *ledger) ledgerEntrySplitRow(splitIdx int) []interface{} {
 func (w *ledger) ledgerSessionInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
-	rng.Seed(w.seed + int64(rowIdx))
+	rng.Seed(RandomSeed.Seed() + int64(rowIdx))
 
 	return []interface{}{
 		randSessionID(rng),   // session_id
@@ -168,7 +163,7 @@ func (w *ledger) ledgerSessionInitialRow(rowIdx int) []interface{} {
 }
 
 func (w *ledger) ledgerSessionSplitRow(splitIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(w.seed + int64(splitIdx)))
+	rng := rand.New(rand.NewSource(RandomSeed.Seed() + int64(splitIdx)))
 	return []interface{}{
 		randSessionID(rng),
 	}

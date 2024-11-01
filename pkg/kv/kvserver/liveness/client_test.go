@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package liveness_test
 
@@ -19,10 +14,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,9 +53,7 @@ func TestNodeLivenessAppearsAtStart(t *testing.T) {
 		nodeID := tc.Server(i).NodeID()
 		nl := tc.Server(i).NodeLiveness().(*liveness.NodeLiveness)
 
-		if live, err := nl.IsLive(nodeID); err != nil {
-			t.Fatal(err)
-		} else if !live {
+		if !nl.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.IsAliveNotification) {
 			t.Fatalf("node %d not live", nodeID)
 		}
 
@@ -83,9 +73,9 @@ func TestNodeLivenessAppearsAtStart(t *testing.T) {
 	}
 }
 
-// TestGetLivenessesFromKV verifies that fetching liveness records from KV
+// TestScanNodeVitalityFromKV verifies that fetching liveness records from KV
 // directly retrieves all the records we expect.
-func TestGetLivenessesFromKV(t *testing.T) {
+func TestScanNodeVitalityFromKV(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -99,39 +89,30 @@ func TestGetLivenessesFromKV(t *testing.T) {
 	for i := 0; i < tc.NumServers(); i++ {
 		nodeID := tc.Server(i).NodeID()
 		nl := tc.Server(i).NodeLiveness().(*liveness.NodeLiveness)
+		require.True(t, nl.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.IsAliveNotification))
 
-		if live, err := nl.IsLive(nodeID); err != nil {
-			t.Fatal(err)
-		} else if !live {
-			t.Fatalf("node %d not live", nodeID)
-		}
-
-		livenesses, err := nl.GetLivenessesFromKV(ctx)
+		livenesses, err := nl.ScanNodeVitalityFromKV(ctx)
 		assert.Nil(t, err)
 		assert.Equal(t, len(livenesses), tc.NumServers())
 
 		var nodeIDs []roachpb.NodeID
-		for _, liveness := range livenesses {
-			nodeIDs = append(nodeIDs, liveness.NodeID)
+		for nodeID, liveness := range livenesses {
+			nodeIDs = append(nodeIDs, nodeID)
 
 			// We expect epoch=1 as nodes first create a liveness record at epoch=0,
 			// and then increment it during their first heartbeat.
-			if liveness.Epoch != 1 {
-				t.Fatalf("expected epoch=1, got epoch=%d", liveness.Epoch)
-			}
-			if !liveness.Membership.Active() {
-				t.Fatalf("expected membership=active, got membership=%s", liveness.Membership)
-			}
+			require.Equal(t, int64(1), liveness.GetInternalLiveness().Epoch)
+			require.Equal(t, livenesspb.MembershipStatus_ACTIVE, liveness.MembershipStatus())
+			// The scan will also update the cache, verify the epoch is updated there also.
+			require.Equal(t, int64(1), nl.GetNodeVitalityFromCache(nodeID).GenLiveness().Epoch)
 		}
 
 		sort.Slice(nodeIDs, func(i, j int) bool {
 			return nodeIDs[i] < nodeIDs[j]
 		})
 		for i := range nodeIDs {
-			expNodeID := roachpb.NodeID(i + 1) // Node IDs are 1-indexed.
-			if nodeIDs[i] != expNodeID {
-				t.Fatalf("expected nodeID=%d, got %d", expNodeID, nodeIDs[i])
-			}
+			// Node IDs are 1-indexed.
+			require.Equal(t, roachpb.NodeID(i+1), nodeIDs[i])
 		}
 	}
 
@@ -147,7 +128,9 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 			Store: &kvserver.StoreTestingKnobs{
 				// Disable replica rebalancing to ensure that the liveness range
 				// does not get out of the first node (we'll be shutting down nodes).
-				DisableReplicaRebalancing: true,
+				ReplicaPlannerKnobs: plan.ReplicaPlannerTestingKnobs{
+					DisableReplicaRebalancing: true,
+				},
 				// Disable LBS because when the scan is happening at the rate it's happening
 				// below, it's possible that one of the system ranges trigger a split.
 				DisableLoadBasedSplitting: true,
@@ -174,14 +157,9 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	ctx = logtags.AddTag(ctx, "in test", nil)
 
 	log.Infof(ctx, "setting zone config to disable replication")
-	// Allow for inserting zone configs without having to go through (or
-	// duplicate the logic from) the CLI.
-	config.TestingSetupZoneConfigHook(tc.Stopper())
-	zoneConfig := zonepb.DefaultZoneConfig()
-	// Force just one replica per range to ensure that we can shut down
-	// nodes without endangering the liveness range.
-	zoneConfig.NumReplicas = proto.Int32(1)
-	config.TestingSetZoneConfig(keys.MetaRangesID, zoneConfig)
+	if _, err := tc.Conns[0].Exec(`ALTER RANGE meta CONFIGURE ZONE using num_replicas = 1`); err != nil {
+		t.Fatal(err)
+	}
 
 	log.Infof(ctx, "starting 3 more nodes")
 	tc.AddAndStartServer(t, serverArgs)
@@ -193,7 +171,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	tc.WaitForNodeLiveness(t)
 	log.Infof(ctx, "waiting done")
 
-	firstServer := tc.Server(0).(*server.TestServer)
+	firstServer := tc.Server(0)
 
 	liveNodeID := firstServer.NodeID()
 
@@ -220,10 +198,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	log.Infof(ctx, "checking status map")
 
 	// See what comes up in the status.
-	admin, err := tc.GetAdminClient(ctx, t, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	admin := tc.GetAdminClient(t, 0)
 
 	type testCase struct {
 		nodeID         roachpb.NodeID
@@ -251,7 +226,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 				// doesn't allow durations below 1m15s, which is much too long
 				// for a test.
 				// We do this in every SucceedsSoon attempt, so we'll be good.
-				kvserver.TimeUntilStoreDead.Override(ctx, &firstServer.ClusterSettings().SV, kvserver.TestTimeUntilStoreDead)
+				liveness.TimeUntilNodeDead.Override(ctx, &firstServer.ClusterSettings().SV, liveness.TestTimeUntilNodeDead)
 
 				log.Infof(ctx, "checking expected status (%s) for node %d", expectedStatus, nodeID)
 				resp, err := admin.Liveness(ctx, &serverpb.LivenessRequest{})
@@ -285,14 +260,13 @@ func TestNodeLivenessDecommissionedCallback(t *testing.T) {
 	tArgs := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				OnDecommissionedCallback: func(rec livenesspb.Liveness) {
+				OnDecommissionedCallback: func(id roachpb.NodeID) {
 					cb.Lock()
 					if cb.m == nil {
 						cb.m = map[roachpb.NodeID]bool{}
 					}
-					cb.m[rec.NodeID] = rec.Membership == livenesspb.MembershipStatus_DECOMMISSIONED
+					cb.m[id] = true
 					cb.Unlock()
-
 				},
 			},
 		},
@@ -331,6 +305,115 @@ func TestNodeLivenessDecommissionedCallback(t *testing.T) {
 			}
 			return nil
 		})
-
 	}
+}
+
+func getActiveNodes(nl *liveness.NodeLiveness) []roachpb.NodeID {
+	var nodes []roachpb.NodeID
+	for id, nv := range nl.ScanNodeVitalityFromCache() {
+		if !nv.IsDecommissioning() && !nv.IsDecommissioned() {
+			nodes = append(nodes, id)
+		}
+	}
+
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+	return nodes
+}
+
+// TestGetActiveNodes tests ScanNodeVitalityFromCache() and is similar to the
+// code used within the store_pool for computing the number of active node.
+func TestGetActiveNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	// This test starts a 5 node cluster and is prone to overload remote execution
+	// during race and deadlock builds.
+	skip.UnderRace(t)
+	skip.UnderDeadlock(t)
+
+	numNodes := 5
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	// At this point StartTestCluster has waited for all nodes to become live.
+	nl1 := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness)
+	require.Equal(t, []roachpb.NodeID{1, 2, 3, 4, 5}, getActiveNodes(nl1))
+
+	// Mark n5 as decommissioning, which should reduce node count.
+	_, err := nl1.SetMembershipStatus(ctx, 5, livenesspb.MembershipStatus_DECOMMISSIONING)
+	require.NoError(t, err)
+	// Since we are already checking the expected membership status below, there
+	// is no benefit to additionally checking the returned statusChanged flag, as
+	// it can be inaccurate if the write experiences an AmbiguousResultError.
+	// Checking for nil error and the expected status is sufficient.
+	testutils.SucceedsSoon(t, func() error {
+		l, ok := nl1.GetLiveness(5)
+		if !ok || !l.Membership.Decommissioning() {
+			return errors.Errorf("expected n5 to be decommissioning")
+		}
+		numNodes -= 1
+		return nil
+	})
+	require.Equal(t, []roachpb.NodeID{1, 2, 3, 4}, getActiveNodes(nl1))
+
+	// Mark n5 as decommissioning -> decommissioned, which should not change node count.
+	_, err = nl1.SetMembershipStatus(ctx, 5, livenesspb.MembershipStatus_DECOMMISSIONED)
+	require.NoError(t, err)
+	testutils.SucceedsSoon(t, func() error {
+		l, ok := nl1.GetLiveness(5)
+		if !ok || !l.Membership.Decommissioned() {
+			return errors.Errorf("expected n5 to be decommissioned")
+		}
+		return nil
+	})
+	require.Equal(t, []roachpb.NodeID{1, 2, 3, 4}, getActiveNodes(nl1))
+}
+
+// TestLivenessRangeGetsPeriodicallyCompacted tests that the liveness range
+// gets compacted when we set the liveness range compaction interval.
+func TestLivenessRangeGetsPeriodicallyCompacted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	// Enable the liveness range compaction and set the interval to 1s to speed
+	// up the test.
+	c := tc.Server(0).SystemLayer().SQLConn(t)
+	_, err := c.ExecContext(ctx, "set cluster setting kv.liveness_range_compact.interval='1s'")
+	require.NoError(t, err)
+
+	// Get the original file number of the sstable for the liveness range. We
+	// expect to see this file number change as the liveness range gets compacted.
+	livenessFileNumberQuery := "WITH replicas(n) AS (SELECT unnest(replicas) FROM " +
+		"crdb_internal.ranges_no_leases WHERE range_id = 2), sstables AS (SELECT " +
+		"(crdb_internal.sstable_metrics(n, n, start_key, end_key)).* " +
+		"FROM crdb_internal.ranges_no_leases, replicas WHERE range_id = 2) " +
+		"SELECT file_num FROM sstables"
+
+	sqlDB := tc.ApplicationLayer(0).SQLConn(t)
+	var original_file_num string
+	testutils.SucceedsSoon(t, func() error {
+		rows := sqlDB.QueryRow(livenessFileNumberQuery)
+		if err := rows.Scan(&original_file_num); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	// Expect that the liveness file number changes.
+	testutils.SucceedsSoon(t, func() error {
+		var current_file_num string
+		rows := sqlDB.QueryRow(livenessFileNumberQuery)
+		if err := rows.Scan(&current_file_num); err != nil {
+			return err
+		}
+		if current_file_num == original_file_num {
+			return errors.Errorf("Liveness compaction hasn't happened yet")
+		}
+		return nil
+	})
 }

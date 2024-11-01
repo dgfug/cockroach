@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package uuid
 
@@ -14,7 +9,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/errors"
@@ -94,39 +88,20 @@ func (u *UUID) UnmarshalJSON(data []byte) error {
 	return err
 }
 
-// MakeV4 calls Must(NewV4)
+// MakeV4 calls NewV4.
 func MakeV4() UUID {
-	return Must(NewV4())
+	return NewV4()
 }
-
-// FastMakeV4 generates a UUID using a fast but not cryptographically secure
-// source of randomness.
-func FastMakeV4() UUID {
-	u, err := fastGen.NewV4()
-	if err != nil {
-		panic(errors.Wrap(err, "should never happen with math/rand.Rand"))
-	}
-	return u
-}
-
-// defaultRandReader is an io.Reader that calls through to "math/rand".Read
-// which is safe for concurrent use.
-type defaultRandReader struct{}
-
-func (r defaultRandReader) Read(p []byte) (n int, err error) {
-	return rand.Read(p)
-}
-
-// fastGen is a non-cryptographically secure Generator.
-var fastGen = NewGenWithReader(defaultRandReader{})
 
 // NewPopulatedUUID returns a populated UUID.
 func NewPopulatedUUID(r interface {
-	Int63() int64
+	Uint32() uint32
 }) *UUID {
 	var u UUID
-	binary.LittleEndian.PutUint64(u[:8], uint64(r.Int63()))
-	binary.LittleEndian.PutUint64(u[8:], uint64(r.Int63()))
+	binary.LittleEndian.PutUint32(u[:4], r.Uint32())
+	binary.LittleEndian.PutUint32(u[4:8], r.Uint32())
+	binary.LittleEndian.PutUint32(u[8:12], r.Uint32())
+	binary.LittleEndian.PutUint32(u[12:], r.Uint32())
 	return &u
 }
 

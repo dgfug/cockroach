@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package hlc
 
@@ -20,9 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -44,37 +41,37 @@ const (
 func ExampleNewClock() {
 	// Initialize a new clock, using the local
 	// physical clock.
-	c := NewClock(UnixNano, time.Nanosecond)
+	c := NewClockWithSystemTimeSource(time.Nanosecond, time.Nanosecond, PanicLogger)
 	// Update the state of the hybrid clock.
 	s := c.Now()
 	time.Sleep(50 * time.Nanosecond)
-	t := Timestamp{WallTime: UnixNano()}
+	t := Timestamp{WallTime: timeutil.Now().UnixNano()}
 	// The sanity checks below will usually never be triggered.
 
 	if s.Less(t) || !t.Less(s) {
-		log.Fatalf(context.Background(), "The later timestamp is smaller than the earlier one")
+		panic("The later timestamp is smaller than the earlier one")
 	}
 
 	if t.WallTime-s.WallTime > 0 {
-		log.Fatalf(context.Background(), "HLC timestamp %s deviates from physical clock %s", s, t)
+		panic(fmt.Sprintf("HLC timestamp %s deviates from physical clock %s", s, t))
 	}
 
 	if s.Logical > 0 {
-		log.Fatalf(context.Background(), "Trivial timestamp has logical component")
+		panic("Trivial timestamp has logical component")
 	}
 
 	fmt.Printf("The Unix Epoch is now approximately %dns old.\n", t.WallTime)
 }
 
 func TestHLCLess(t *testing.T) {
-	m := NewManualClock(1)
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 	a := c.Now()
 	b := a
 	if a.Less(b) || b.Less(a) {
 		t.Errorf("expected %+v == %+v", a, b)
 	}
-	m.Increment(1)
+	m.Advance(1)
 	b = c.Now()
 	if !a.Less(b) {
 		t.Errorf("expected %+v < %+v", a, b)
@@ -86,14 +83,14 @@ func TestHLCLess(t *testing.T) {
 }
 
 func TestHLCLessEq(t *testing.T) {
-	m := NewManualClock(1)
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 	a := c.Now()
 	b := a
 	if !a.LessEq(b) || !b.LessEq(a) {
 		t.Errorf("expected %+v == %+v", a, b)
 	}
-	m.Increment(1)
+	m.Advance(1)
 	b = c.Now()
 	if !a.LessEq(b) || b.LessEq(a) {
 		t.Errorf("expected %+v < %+v", a, b)
@@ -105,14 +102,14 @@ func TestHLCLessEq(t *testing.T) {
 }
 
 func TestHLCEqual(t *testing.T) {
-	m := NewManualClock(1)
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 	a := c.Now()
 	b := a
 	if a != b {
 		t.Errorf("expected %+v == %+v", a, b)
 	}
-	m.Increment(1)
+	m.Advance(1)
 	b = c.Now()
 	if a == b {
 		t.Errorf("expected %+v < %+v", a, b)
@@ -134,14 +131,6 @@ func isErrSimilar(expected *regexp.Regexp, actual error) bool {
 }
 
 func TestHLCPhysicalClockJump(t *testing.T) {
-	var fatal bool
-	defer log.ResetExitFunc()
-	log.SetExitFunc(true /* hideStack */, func(r exit.Code) {
-		if r == exit.FatalError() {
-			fatal = true
-		}
-	})
-
 	testCases := []struct {
 		name       string
 		actualJump time.Duration
@@ -195,9 +184,9 @@ func TestHLCPhysicalClockJump(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
-
-			m := NewManualClock(1)
-			c := NewClock(m.UnixNano, test.maxOffset)
+			l := logger.NewTestLogger(t)
+			m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+			c := NewClock(m, test.maxOffset, test.maxOffset, l)
 			var tickerDuration time.Duration
 			tickerCh := make(chan time.Time)
 			tickProcessedCh := make(chan struct{})
@@ -231,41 +220,41 @@ func TestHLCPhysicalClockJump(t *testing.T) {
 				t.Error("expected an error when starting monitor goroutine twice")
 			}
 
-			fatal = false
 			t0 := c.Now()
-			a.Equal(false, fatal)
+			a.Equal(false, l.FatalCalled())
 
 			// forward jump check should be disabled unless set to true. This should
 			// not fatal even though it is a large jump
-			m.Increment(int64(test.maxOffset))
-			fatal = false
+			m.Advance(test.maxOffset)
+			a.Equal(false, l.FatalCalled())
+
 			t1 := c.Now()
 			a.True(t0.Less(t1), fmt.Sprintf("expected %+v < %+v", t0, t1))
-			a.Equal(false, fatal)
+			a.Equal(false, l.FatalCalled())
 
 			forwardJumpCheckEnabledCh <- true
 			<-tickProcessedCh
 
-			m.Increment(int64(test.actualJump))
+			m.Advance(test.actualJump)
 			tickerCh <- timeutil.Now()
 			<-tickProcessedCh
 
-			fatal = false
+			l.ResetFatal()
 			t2 := c.Now()
 			a.True(t1.Less(t2), fmt.Sprintf("expected %+v < %+v", t1, t2))
 			// This should not fatal as tickerCh has ticked
-			a.Equal(false, fatal)
+			a.Equal(false, l.FatalCalled())
 			// After ticker ticks, last physical time should be equal to physical now
 			lastPhysicalTime := atomic.LoadInt64(&c.lastPhysicalTime)
 			physicalNow := c.PhysicalNow()
 			a.Equal(lastPhysicalTime, physicalNow)
 
 			// Potentially a fatal jump depending on the test case
-			fatal = false
-			m.Increment(int64(test.actualJump))
+			l.ResetFatal()
+			m.Advance(test.actualJump)
 			t3 := c.Now()
 			a.True(t2.Less(t3), fmt.Sprintf("expected %+v < %+v", t2, t3))
-			a.Equal(test.isFatal, fatal)
+			a.Equal(test.isFatal, l.FatalCalled())
 
 			a.True(
 				tickerDuration <= test.maxOffset,
@@ -277,20 +266,20 @@ func TestHLCPhysicalClockJump(t *testing.T) {
 			)
 
 			// A jump by maxOffset is surely fatal
-			fatal = false
-			m.Increment(int64(test.maxOffset))
+			l.ResetFatal()
+			m.Advance(test.maxOffset)
 			t4 := c.Now()
 			a.True(t3.Less(t4), fmt.Sprintf("expected %+v < %+v", t3, t4))
-			a.Equal(true, fatal)
+			a.Equal(true, l.FatalCalled())
 
 			// disable forward jump check
 			forwardJumpCheckEnabledCh <- false
 			<-tickProcessedCh
-			fatal = false
-			m.Increment(int64(test.actualJump))
+			l.ResetFatal()
+			m.Advance(test.actualJump)
 			t5 := c.Now()
 			a.True(t4.Less(t5), fmt.Sprintf("expected %+v < %+v", t4, t5))
-			a.Equal(false, fatal)
+			a.Equal(false, l.FatalCalled())
 		})
 	}
 }
@@ -298,8 +287,8 @@ func TestHLCPhysicalClockJump(t *testing.T) {
 // TestHLCClock performs a complete test of all basic phenomena,
 // including backward jumps in local physical time and clock offset.
 func TestHLCClock(t *testing.T) {
-	m := NewManualClock(1)
-	c := NewClock(m.UnixNano, 1000*time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	c := NewClock(m, 1000*time.Nanosecond, 1000*time.Nanosecond, PanicLogger)
 	expectedHistory := []struct {
 		// The physical time that this event should take place at.
 		wallClock int64
@@ -326,7 +315,7 @@ func TestHLCClock(t *testing.T) {
 
 	var current ClockTimestamp
 	for i, step := range expectedHistory {
-		m.Set(step.wallClock)
+		m.AdvanceTo(timeutil.Unix(0, step.wallClock))
 		switch step.event {
 		case SEND:
 			current = c.NowAsClockTimestamp()
@@ -349,12 +338,12 @@ func TestHLCClock(t *testing.T) {
 // TestExampleManualClock shows how a manual clock can be
 // used as a physical clock. This is useful for testing.
 func TestExampleManualClock(t *testing.T) {
-	m := NewManualClock(10)
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 10))
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 	if wallNanos := c.Now().WallTime; wallNanos != 10 {
 		t.Fatalf("unexpected wall time: %d", wallNanos)
 	}
-	m.Increment(10)
+	m.Advance(10)
 	if wallNanos := c.Now().WallTime; wallNanos != 20 {
 		t.Fatalf("unexpected wall time: %d", wallNanos)
 	}
@@ -364,26 +353,26 @@ func TestExampleManualClock(t *testing.T) {
 // TestHybridManualClock.
 func TestHybridManualClock(t *testing.T) {
 	m := NewHybridManualClock()
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 
 	// We do a two sided test to make sure that the physical clock matches
 	// the hybrid value. Since we cant pull a value off both clocks at the same
 	// time, we use two LessOrEqual comparisons with reverse order, to establish
 	// that the values are roughly equal.
-	require.LessOrEqual(t, c.Now().WallTime, UnixNano())
-	require.LessOrEqual(t, UnixNano(), c.Now().WallTime)
+	require.LessOrEqual(t, c.Now().WallTime, timeutil.Now().UnixNano())
+	require.LessOrEqual(t, timeutil.Now().UnixNano(), c.Now().WallTime)
 
 	inc := time.Second.Nanoseconds()
 	m.Increment(inc)
-	require.LessOrEqual(t, c.Now().WallTime, UnixNano()+inc)
-	require.LessOrEqual(t, UnixNano()+inc, c.Now().WallTime)
+	require.LessOrEqual(t, c.Now().WallTime, timeutil.Now().UnixNano()+inc)
+	require.LessOrEqual(t, timeutil.Now().UnixNano()+inc, c.Now().WallTime)
 }
 
 // TestHybridManualClockPause test the Pause() functionality of the
 // HybridManualClock.
 func TestHybridManualClockPause(t *testing.T) {
 	m := NewHybridManualClock()
-	c := NewClock(m.UnixNano, time.Nanosecond)
+	c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 	now := c.Now().WallTime
 	time.Sleep(10 * time.Millisecond)
 	require.Less(t, now, c.Now().WallTime)
@@ -396,19 +385,19 @@ func TestHybridManualClockPause(t *testing.T) {
 	m.Increment(inc)
 	require.Equal(t, now+inc, c.Now().WallTime)
 	m.Resume()
-	trueNow := UnixNano()
+	trueNow := timeutil.Now().UnixNano()
 	require.LessOrEqual(t, trueNow+inc, c.Now().WallTime)
 	time.Sleep(10 * time.Millisecond)
 	require.Less(t, trueNow+inc, c.Now().WallTime)
 }
 
 func TestHLCMonotonicityCheck(t *testing.T) {
-	m := NewManualClock(100000)
-	c := NewClock(m.UnixNano, 100*time.Nanosecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 100000))
+	c := NewClock(m, 100*time.Nanosecond, 100*time.Nanosecond, PanicLogger)
 
 	// Update the state of the hybrid clock.
 	firstTime := c.Now()
-	m.Increment((-110 * time.Nanosecond).Nanoseconds())
+	m.Backwards(110 * time.Nanosecond)
 	secondTime := c.Now()
 
 	{
@@ -419,7 +408,7 @@ func TestHLCMonotonicityCheck(t *testing.T) {
 		}
 	}
 
-	m.Increment((-10 * time.Nanosecond).Nanoseconds())
+	m.Backwards(10 * time.Nanosecond)
 	thirdTime := c.Now()
 
 	{
@@ -432,15 +421,6 @@ func TestHLCMonotonicityCheck(t *testing.T) {
 }
 
 func TestHLCEnforceWallTimeWithinBoundsInNow(t *testing.T) {
-	var fatal bool
-	defer log.ResetExitFunc()
-	log.SetExitFunc(true /* hideStack */, func(r exit.Code) {
-		defer log.Flush()
-		if r == exit.FatalError() {
-			fatal = true
-		}
-	})
-
 	testCases := []struct {
 		name               string
 		physicalTime       int64
@@ -470,26 +450,17 @@ func TestHLCEnforceWallTimeWithinBoundsInNow(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
-			m := NewManualClock(test.physicalTime)
-			c := NewClock(m.UnixNano, time.Nanosecond)
+			l := logger.NewTestLogger(t)
+			c := NewClock(timeutil.NewManualTime(timeutil.Unix(0, test.physicalTime)),
+				time.Nanosecond, time.Nanosecond, l)
 			c.mu.wallTimeUpperBound = test.wallTimeUpperBound
-			fatal = false
 			c.Now()
-			a.Equal(test.isFatal, fatal)
+			a.Equal(test.isFatal, l.FatalCalled())
 		})
 	}
 }
 
 func TestHLCEnforceWallTimeWithinBoundsInUpdate(t *testing.T) {
-	var fatal bool
-	defer log.ResetExitFunc()
-	log.SetExitFunc(true /* hideStack */, func(r exit.Code) {
-		defer log.Flush()
-		if r == exit.FatalError() {
-			fatal = true
-		}
-	})
-
 	testCases := []struct {
 		name               string
 		messageWallTime    int64
@@ -520,13 +491,13 @@ func TestHLCEnforceWallTimeWithinBoundsInUpdate(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
-			m := NewManualClock(test.messageWallTime)
-			c := NewClock(m.UnixNano, time.Nanosecond)
+			l := logger.NewTestLogger(t)
+			c := NewClock(timeutil.NewManualTime(timeutil.Unix(0, test.messageWallTime)),
+				time.Nanosecond, time.Nanosecond, l)
 			c.mu.wallTimeUpperBound = test.wallTimeUpperBound
-			fatal = false
 			err := c.UpdateAndCheckMaxOffset(ctx, ClockTimestamp{WallTime: test.messageWallTime})
 			a.Nil(err)
-			a.Equal(test.isFatal, fatal)
+			a.Equal(test.isFatal, l.FatalCalled())
 		})
 	}
 }
@@ -535,8 +506,8 @@ func TestHLCEnforceWallTimeWithinBoundsInUpdate(t *testing.T) {
 // update a clock using a timestamp too far in the future.
 func TestClock_UpdateAndCheckMaxOffset_UntrustworthyValue(t *testing.T) {
 	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	m := NewManualClock(t0.UnixNano())
-	c := NewClock(m.UnixNano, 500*time.Millisecond)
+	m := timeutil.NewManualTime(t0)
+	c := NewClock(m, 500*time.Millisecond, 500*time.Millisecond, PanicLogger)
 	require.NoError(t, c.UpdateAndCheckMaxOffset(context.Background(), ClockTimestamp{
 		WallTime: t0.Add(499 * time.Millisecond).UnixNano(),
 	}))
@@ -594,8 +565,8 @@ func TestResetAndRefreshHLCUpperBound(t *testing.T) {
 				persistedUpperBound = d
 				return nil
 			}
-			m := NewManualClock(1)
-			c := NewClock(m.UnixNano, time.Nanosecond)
+			m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+			c := NewClock(m, time.Nanosecond, time.Nanosecond, PanicLogger)
 			// Test Refresh Upper Bound
 			err := c.RefreshHLCUpperBound(persistFn, test.delta)
 			a.True(
@@ -634,10 +605,10 @@ func TestLateStartForwardClockJump(t *testing.T) {
 	// after the last call to hlc.Clock.Now, that time would register as
 	// a forward clock jump (because the background goroutine to keep
 	// the HLC clock fresh was not yet running).
-	m := NewManualClock(1)
-	c := NewClock(m.UnixNano, 500*time.Millisecond)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	c := NewClock(m, 500*time.Millisecond, 500*time.Millisecond, PanicLogger)
 	c.Now()
-	m.Increment(int64(time.Second))
+	m.Advance(time.Second)
 
 	// Control channels for the clock monitor: active it immediately,
 	// then wait for the first tick. We use a real ticker because the
@@ -657,12 +628,12 @@ func TestLateStartForwardClockJump(t *testing.T) {
 }
 
 func TestSleepUntil(t *testing.T) {
-	m := NewManualClock(100000)
-	c := NewClock(m.UnixNano, 0)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 100000))
+	c := NewClock(m, 0, 0, PanicLogger)
 
 	before := c.Now()
-	waitDur := int64(1000)
-	waitUntil := before.Add(waitDur, 0)
+	waitDur := time.Duration(1000)
+	waitUntil := before.Add(waitDur.Nanoseconds(), 0)
 
 	doneC := make(chan struct{}, 1)
 	go func() {
@@ -674,15 +645,15 @@ func TestSleepUntil(t *testing.T) {
 	for waitLeft := waitDur; waitLeft > 0; waitLeft -= step {
 		require.Empty(t, doneC)
 
-		m.Increment(step)
+		m.Advance(step)
 		time.Sleep(1 * time.Millisecond)
 	}
 	<-doneC
 }
 
 func TestSleepUntilContextCancellation(t *testing.T) {
-	m := NewManualClock(100000)
-	c := NewClock(m.UnixNano, 0)
+	m := timeutil.NewManualTime(timeutil.Unix(0, 100000))
+	c := NewClock(m, 0, 0, PanicLogger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
@@ -723,10 +694,9 @@ func BenchmarkUpdate(b *testing.B) {
 
 	b.StartTimer()
 	for n := 0; n < b.N; n++ {
-		clock := NewClock(func() int64 { return 0 }, time.Second)
+		clock := NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Second, time.Second, PanicLogger)
 		wg := sync.WaitGroup{}
 		for w := 0; w < concurrency; w++ {
-			w := w // make sure we don't close over the loop variable
 			wg.Add(1)
 			go func() {
 				for _, timestamp := range timestamps[w] {
@@ -736,5 +706,98 @@ func BenchmarkUpdate(b *testing.B) {
 			}()
 		}
 		wg.Wait()
+	}
+}
+
+func BenchmarkDecimalToHLC(b *testing.B) {
+	rng, _ := randutil.NewTestRand()
+	inputs := make([]*apd.Decimal, b.N)
+	for n := 0; n < b.N; n++ {
+		dec, cond, err := apd.NewFromString(fmt.Sprintf("%d.%010d", rng.Int63(), rng.Int31()))
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := cond.GoError(apd.DefaultTraps); err != nil {
+			b.Fatal(err)
+		}
+		inputs[n] = dec
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_, err := DecimalToHLC(inputs[n])
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestDecimalToHLC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var testCases = []struct {
+		name     string
+		input    string
+		expected Timestamp
+		err      bool
+	}{
+		{
+			name:     "no logical clock",
+			input:    "123456789",
+			expected: Timestamp{WallTime: 123456789},
+		},
+		{
+			name:     "empty logical clock",
+			input:    "123456789.0000000000",
+			expected: Timestamp{WallTime: 123456789},
+		},
+		{
+			name:     "logical clock present",
+			input:    "123456789.0000000123",
+			expected: Timestamp{WallTime: 123456789, Logical: 123},
+		},
+		{
+			name:     "physical clock too large",
+			input:    "18446744073709551616", // 1<<64, too large for (signed) int64
+			expected: Timestamp{},
+			err:      true,
+		},
+		{
+			name:     "negative physical clock",
+			input:    "-123456789.0000000000",
+			expected: Timestamp{},
+			err:      true,
+		},
+		{
+			name:     "logical clock too large, but within 10 digits",
+			input:    "123456789.9999999999",
+			expected: Timestamp{},
+			err:      true,
+		},
+		{
+			name:     "logical clock too large, more than 10 digits",
+			input:    "123456789.00000000001",
+			expected: Timestamp{},
+			err:      true,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dec, cond, err := apd.NewFromString(testCase.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cond.GoError(apd.DefaultTraps); err != nil {
+				t.Fatal(err)
+			}
+			actual, err := DecimalToHLC(dec)
+			if err == nil && testCase.err {
+				t.Fatal("expected an error but got none")
+			}
+			if err != nil && !testCase.err {
+				t.Fatalf("expected no error but got one: %v", err)
+			}
+			if !actual.Equal(testCase.expected) {
+				t.Fatalf("incorrect timestamp: expected parsing %q to get %q, got %q", testCase.input, testCase.expected.String(), actual.String())
+			}
+		})
 	}
 }

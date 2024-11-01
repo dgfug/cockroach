@@ -15,12 +15,13 @@ go_library(
         "//pkg/cli/exit",
         "//pkg/cmd/docgen/extract",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/tree",
         "//pkg/util/envutil",
         "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_golang_commonmark_markdown//:markdown",
         "@com_github_spf13_cobra//:cobra",
+        "@com_gitlab_golang_commonmark_markdown//:markdown",
     ],
 )
 

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 package filetabletest
 
 import (
@@ -15,18 +10,19 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sort"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud/userfile/filetable"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/stretchr/testify/require"
@@ -100,16 +96,18 @@ func checkMetadataEntryExists(
 
 func TestListAndDeleteFiles(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, _, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
-		executor, security.RootUserName())
+		executor, username.RootUserName())
 	require.NoError(t, err)
 
 	// Create first test file with multiple chunks.
@@ -151,16 +149,18 @@ func TestListAndDeleteFiles(t *testing.T) {
 
 func TestReadWriteFile(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
-		executor, security.RootUserName())
+		executor, username.RootUserName())
 	require.NoError(t, err)
 
 	testFileName := "testfile"
@@ -169,8 +169,9 @@ func TestReadWriteFile(t *testing.T) {
 		reader, size, err := fileTableReadWriter.ReadFile(ctx, filename, 0)
 		require.NoError(t, err)
 		require.Equal(t, int64(len(expected)), size)
-		got, err := ioutil.ReadAll(reader)
+		got, err := ioctx.ReadAll(ctx, reader)
 		require.NoError(t, err)
+		require.NoError(t, reader.Close(ctx))
 		return bytes.Equal(got, expected)
 	}
 
@@ -312,7 +313,7 @@ func TestReadWriteFile(t *testing.T) {
 	// FileTable creation.
 	t.Run("no-db-or-schema-qualified-table-name", func(t *testing.T) {
 		_, err := filetable.NewFileToTableSystem(ctx, "foo",
-			executor, security.RootUserName())
+			executor, username.RootUserName())
 		testutils.IsError(err, "could not resolve db or schema name")
 	})
 }
@@ -323,11 +324,12 @@ func TestReadWriteFile(t *testing.T) {
 // file and payload tables.
 func TestUserGrants(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	conn, err := sqlDB.Conn(ctx)
 	require.NoError(t, err)
@@ -339,9 +341,10 @@ func TestUserGrants(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
-	johnUser := security.MakeSQLUsernameFromPreNormalizedString("john")
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
+	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
 	require.NoError(t, err)
@@ -355,9 +358,10 @@ func TestUserGrants(t *testing.T) {
 	reader, size, err := fileTableReadWriter.ReadFile(ctx, "file1", 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(expected)), size)
-	got, err := ioutil.ReadAll(reader)
+	got, err := ioctx.ReadAll(ctx, reader)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(got, expected))
+	require.NoError(t, reader.Close(ctx))
 
 	// Delete file to test DELETE privilege.
 	require.NoError(t, fileTableReadWriter.DeleteFile(ctx, "file1"))
@@ -400,11 +404,12 @@ func getTableGrantees(ctx context.Context, tablename string, conn *gosql.Conn) (
 // tables once they have been created/written to.
 func TestDifferentUserDisallowed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	conn, err := sqlDB.Conn(ctx)
 	require.NoError(t, err)
@@ -422,9 +427,10 @@ func TestDifferentUserDisallowed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user john.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
-	johnUser := security.MakeSQLUsernameFromPreNormalizedString("john")
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
+	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
 	require.NoError(t, err)
@@ -452,11 +458,12 @@ func TestDifferentUserDisallowed(t *testing.T) {
 // access the tables once they have been created/written to.
 func TestDifferentRoleDisallowed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	conn, err := sqlDB.Conn(ctx)
 	require.NoError(t, err)
@@ -480,9 +487,10 @@ func TestDifferentRoleDisallowed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Operate under non-admin user john.
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
-	johnUser := security.MakeSQLUsernameFromPreNormalizedString("john")
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
+	johnUser := username.MakeSQLUsernameFromPreNormalizedString("john")
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
 		executor, johnUser)
 	require.NoError(t, err)
@@ -509,16 +517,18 @@ func TestDifferentRoleDisallowed(t *testing.T) {
 // internal queries wrt the database it is given.
 func TestDatabaseScope(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	executor := filetable.MakeInternalFileToTableExecutor(s.InternalExecutor().(*sql.
-		InternalExecutor), kvDB)
+	executor := filetable.MakeInternalFileToTableExecutor(
+		s.InternalDB().(isql.DB),
+	)
 	fileTableReadWriter, err := filetable.NewFileToTableSystem(ctx, qualifiedTableName,
-		executor, security.RootUserName())
+		executor, username.RootUserName())
 	require.NoError(t, err)
 
 	// Verify defaultdb has the file we wrote.
@@ -528,15 +538,16 @@ func TestDatabaseScope(t *testing.T) {
 	oldDBReader, oldDBSize, err := fileTableReadWriter.ReadFile(ctx, "file1", 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(uploadedContent)), oldDBSize)
-	oldDBContent, err := ioutil.ReadAll(oldDBReader)
+	oldDBContent, err := ioctx.ReadAll(ctx, oldDBReader)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(uploadedContent, oldDBContent))
+	require.NoError(t, oldDBReader.Close(ctx))
 
 	// Switch database and attempt to read the file.
 	_, err = sqlDB.Exec(`CREATE DATABASE newdb`)
 	require.NoError(t, err)
 	newFileTableReadWriter, err := filetable.NewFileToTableSystem(ctx,
-		"newdb.file_table_read_writer", executor, security.RootUserName())
+		"newdb.file_table_read_writer", executor, username.RootUserName())
 	require.NoError(t, err)
 	_, _, err = newFileTableReadWriter.ReadFile(ctx, "file1", 0)
 	require.True(t, oserror.IsNotExist(err))

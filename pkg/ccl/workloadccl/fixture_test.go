@@ -1,39 +1,37 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadccl_test
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/option"
 )
 
 const fixtureTestGenRows = 10
@@ -42,6 +40,9 @@ type fixtureTestGen struct {
 	flags workload.Flags
 	val   string
 	empty string
+	// tableAutoStatsEnabled, if set, enables auto stats collection at the table
+	// level.
+	tableAutoStatsEnabled bool
 }
 
 func makeTestWorkload() workload.Flagser {
@@ -53,7 +54,8 @@ func makeTestWorkload() workload.Flagser {
 }
 
 var fixtureTestMeta = workload.Meta{
-	Name: `fixture`,
+	Name:    `fixture`,
+	Version: `0.0.1`,
 	New: func() workload.Generator {
 		return makeTestWorkload()
 	},
@@ -66,9 +68,13 @@ func init() {
 func (fixtureTestGen) Meta() workload.Meta     { return fixtureTestMeta }
 func (g fixtureTestGen) Flags() workload.Flags { return g.flags }
 func (g fixtureTestGen) Tables() []workload.Table {
+	schema := `(key INT PRIMARY KEY, value INT)`
+	if g.tableAutoStatsEnabled {
+		schema += ` WITH (sql_stats_automatic_collection_enabled = true)`
+	}
 	return []workload.Table{{
 		Name:   `fx`,
-		Schema: `(key INT PRIMARY KEY, value INT)`,
+		Schema: schema,
 		InitialRows: workload.Tuples(
 			fixtureTestGenRows,
 			func(rowIdx int) []interface{} {
@@ -86,25 +92,38 @@ func (g fixtureTestGen) Tables() []workload.Table {
 
 func TestFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
-	gcsBucket := os.Getenv(`GS_BUCKET`)
-	gcsKey := os.Getenv(`GS_JSONKEY`)
-	if gcsBucket == "" || gcsKey == "" {
-		skip.IgnoreLint(t, "GS_BUCKET and GS_JSONKEY env vars must be set")
+	// This test is brittle and requires manual intervention to run.
+	// COCKROACH_FIXTURE_TEST_STORAGE_PROVIDER must be specified.
+	// Depending on the cloud provider you may need to change authentication parameters.
+	// In addition, the bucket name defaults to "fixture-test" and you must ensure that this
+	// bucket exists in the cloud provider.
+	// Also note, that after the test runs, it leaves test fixtures around, so, please clean
+	// those up manually.
+	storageProvider := envutil.EnvOrDefaultString("COCKROACH_FIXTURE_TEST_STORAGE_PROVIDER", "")
+	authParams := envutil.EnvOrDefaultString("COCKROACH_FIXTURE_TEST_AUTH_PARAMS", "AUTH=implicit")
+	bucket := envutil.EnvOrDefaultString("COCKROACH_FIXTURE_TEST_BUCKET", "fixture-test")
+
+	if storageProvider == "" {
+		skip.IgnoreLint(t, "COCKROACH_FIXTURE_TEST_STORAGE_PROVIDER env var must be set")
 	}
 
-	source, err := google.JWTConfigFromJSON([]byte(gcsKey), storage.ScopeReadWrite)
+	config := workloadccl.FixtureConfig{
+		StorageProvider: storageProvider,
+		AuthParams:      authParams,
+		Bucket:          bucket,
+		Basename:        fmt.Sprintf(`TestFixture-%d`, timeutil.Now().UnixNano()),
+		CSVServerURL:    "",
+		TableStats:      false,
+	}
+	es, err := workloadccl.GetStorage(ctx, config)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
-	gcs, err := storage.NewClient(ctx,
-		option.WithScopes(storage.ScopeReadWrite),
-		option.WithTokenSource(source.TokenSource(ctx)))
-	if err != nil {
-		t.Fatalf(`%+v`, err)
-	}
-	defer func() { _ = gcs.Close() }()
+	defer func() { _ = es.Close() }()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
@@ -116,16 +135,11 @@ func TestFixture(t *testing.T) {
 		t.Fatalf(`%+v`, err)
 	}
 
-	config := workloadccl.FixtureConfig{
-		GCSBucket: gcsBucket,
-		GCSPrefix: fmt.Sprintf(`TestFixture-%d`, timeutil.Now().UnixNano()),
+	if _, err := workloadccl.GetFixture(ctx, es, config, gen); !testutils.IsError(err, `non zero files`) {
+		t.Fatalf(`expected "non zero files" error but got: %+v`, err)
 	}
 
-	if _, err := workloadccl.GetFixture(ctx, gcs, config, gen); !testutils.IsError(err, `fixture not found`) {
-		t.Fatalf(`expected "fixture not found" error but got: %+v`, err)
-	}
-
-	fixtures, err := workloadccl.ListFixtures(ctx, gcs, config)
+	fixtures, err := workloadccl.ListFixtures(ctx, es, config)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
@@ -134,21 +148,21 @@ func TestFixture(t *testing.T) {
 	}
 
 	const filesPerNode = 1
-	fixture, err := workloadccl.MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
+	fixture, err := workloadccl.MakeFixture(ctx, db, es, config, gen, filesPerNode)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
 
-	_, err = workloadccl.MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
+	_, err = workloadccl.MakeFixture(ctx, db, es, config, gen, filesPerNode)
 	if !testutils.IsError(err, `already exists`) {
 		t.Fatalf(`expected 'already exists' error got: %+v`, err)
 	}
 
-	fixtures, err = workloadccl.ListFixtures(ctx, gcs, config)
+	fixtures, err = workloadccl.ListFixtures(ctx, es, config)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
-	if len(fixtures) != 1 || !strings.Contains(fixtures[0], flag) {
+	if len(fixtures) != 1 {
 		t.Errorf(`expected exactly one %s fixture but got: %+v`, flag, fixtures)
 	}
 
@@ -162,6 +176,8 @@ func TestFixture(t *testing.T) {
 
 func TestImportFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	defer func(oldRefreshInterval, oldAsOf time.Duration) {
@@ -171,13 +187,23 @@ func TestImportFixture(t *testing.T) {
 	stats.DefaultRefreshInterval = time.Millisecond
 	stats.DefaultAsOfTime = 10 * time.Millisecond
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	// Disable auto stats collection on all tables. This is needed because we
+	// run only one auto stats job at a time, and collecting auto stats on
+	// system tables can significantly delay the collection of stats on the
+	// fixture after the IMPORT is done.
+	st := cluster.MakeTestingClusterSettings()
+	stats.AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
+	stats.AutomaticStatisticsOnSystemTables.Override(ctx, &st.SV, false)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Settings:          st,
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(base.TestTenantProbabilistic, 113916),
+	})
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
-	sqlDB.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=true`)
-
 	gen := makeTestWorkload()
+	// Enable auto stats only on the table being imported.
+	gen.(*fixtureTestGen).tableAutoStatsEnabled = true
 	flag := fmt.Sprintf(`val=%d`, timeutil.Now().UnixNano())
 	if err := gen.Flags().Parse([]string{"--" + flag}); err != nil {
 		t.Fatalf(`%+v`, err)
@@ -207,11 +233,17 @@ func TestImportFixture(t *testing.T) {
 
 func TestImportFixtureCSVServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	ts := httptest.NewServer(workload.CSVMux(workload.Registered()))
 	defer ts.Close()
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: `d`})
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			UseDatabase: `d`,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
@@ -230,4 +262,40 @@ func TestImportFixtureCSVServer(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.CheckQueryResults(t,
 		`SELECT count(*) FROM d.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
+}
+
+func TestImportFixtureNodeCount(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	const (
+		nodes        = 3
+		filesPerNode = 1
+	)
+
+	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.Conns[0]
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	gen := makeTestWorkload()
+	flag := fmt.Sprintf("--val=%d", timeutil.Now().UnixNano())
+	require.NoError(t, gen.Flags().Parse([]string{flag}))
+
+	sqlDB.Exec(t, "CREATE DATABASE ingest")
+	_, err := workloadccl.ImportFixture(
+		ctx, db, gen, "ingest", filesPerNode, false, /* injectStats */
+		``, /* csvServer */
+	)
+	require.NoError(t, err)
+
+	var desc string
+	sqlDB.QueryRow(t, "SELECT description FROM crdb_internal.jobs WHERE job_type = 'IMPORT'").Scan(&desc)
+
+	expectedFiles := math.Ceil(float64(fixtureTestGenRows) / float64(nodes))
+	actualFiles := strings.Count(desc, "workload://")
+	require.Equal(t, int(expectedFiles), actualFiles)
 }

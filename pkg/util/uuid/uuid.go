@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
@@ -24,11 +19,28 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/errors"
 )
 
 // Size of a UUID in bytes.
 const Size = 16
+
+// RFC4122StrSize of a size of the RFC-4122 string representation of UUID.
+const RFC4122StrSize = 36
+
+// Bytes represents a byte slice which is intended to be interpreted as a binary
+// encoding of a UUID.
+type Bytes []byte
+
+// GetUUID constructs a UUID from the bytes. If the data is not valid, a zero
+// value will be returned.
+func (b Bytes) GetUUID() UUID { return FromBytesOrNil(b) }
+
+// String returns the string representation of the underlying UUID.
+func (b Bytes) String() string {
+	return b.GetUUID().String()
+}
 
 // UUID is an array type to represent the value of a UUID, as defined in RFC-4122.
 type UUID [Size]byte
@@ -81,9 +93,12 @@ func TimestampFromV1(u UUID) (Timestamp, error) {
 // String parse helpers.
 var urnPrefix = []byte("urn:uuid:")
 
-// Nil is the nil UUID, as specified in RFC-4122, that has all 128 bits set to
+// Nil is the nil UUID, as specified in RFC-4122, which has all 128 bits set to
 // zero.
 var Nil = UUID{}
+
+// Max is the maximum possible UUID, which has all 128 bits set to 1.
+var Max = FromUint128(uint128.FromInts(math.MaxUint64, math.MaxUint64))
 
 // Predefined namespace UUIDs.
 var (
@@ -131,7 +146,7 @@ func (u *UUID) bytesMut() []byte {
 // String returns a canonical RFC-4122 string representation of the UUID:
 // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
 func (u UUID) String() string {
-	buf := make([]byte, 36)
+	buf := make([]byte, RFC4122StrSize)
 	u.StringBytes(buf)
 	return string(buf)
 }
@@ -139,7 +154,7 @@ func (u UUID) String() string {
 // StringBytes writes the result of String directly into a buffer, which must
 // have a length of at least 36.
 func (u UUID) StringBytes(buf []byte) {
-	_ = buf[:36]
+	_ = buf[:RFC4122StrSize]
 	hex.Encode(buf[0:8], u[0:4])
 	buf[8] = '-'
 	hex.Encode(buf[9:13], u[4:6])
@@ -175,7 +190,8 @@ func (u *UUID) SetVariant(v byte) {
 // Must is a helper that wraps a call to a function returning (UUID, error)
 // and panics if the error is non-nil. It is intended for use in variable
 // initializations such as
-//  var packageUUID = uuid.Must(uuid.FromString("123e4567-e89b-12d3-a456-426655440000"))
+//
+//	var packageUUID = uuid.Must(uuid.FromString("123e4567-e89b-12d3-a456-426655440000"))
 func Must(u UUID, err error) UUID {
 	if err != nil {
 		panic(err)

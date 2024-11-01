@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colinfo
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // CheckDatumTypeFitsColumnType verifies that a given scalar value
@@ -51,6 +47,7 @@ func CanHaveCompositeKeyEncoding(typ *types.T) bool {
 	switch typ.Family() {
 	case types.FloatFamily,
 		types.DecimalFamily,
+		types.JsonFamily,
 		types.CollatedStringFamily:
 		return true
 	case types.ArrayFamily:
@@ -74,18 +71,24 @@ func CanHaveCompositeKeyEncoding(typ *types.T) bool {
 		types.UuidFamily,
 		types.INetFamily,
 		types.TimeFamily,
-		types.JsonFamily,
 		types.TimeTZFamily,
 		types.BitFamily,
 		types.GeometryFamily,
 		types.GeographyFamily,
 		types.EnumFamily,
-		types.Box2DFamily:
+		types.Box2DFamily,
+		types.PGLSNFamily,
+		types.PGVectorFamily,
+		types.RefCursorFamily,
+		types.VoidFamily,
+		types.EncodedKeyFamily,
+		types.TSQueryFamily,
+		types.TSVectorFamily:
 		return false
 	case types.UnknownFamily,
 		types.AnyFamily:
-		fallthrough
-	default:
 		return true
+	default:
+		panic(errors.AssertionFailedf("unsupported column family for type %s", typ.SQLString()))
 	}
 }

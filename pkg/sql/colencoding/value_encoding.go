@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colencoding
 
@@ -14,7 +9,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -27,7 +22,7 @@ import (
 // coldata.TypedVecs.
 // See the analog in rowenc/column_type_encoding.go.
 func DecodeTableValueToCol(
-	da *rowenc.DatumAlloc,
+	da *tree.DatumAlloc,
 	vecs *coldata.TypedVecs,
 	vecIdx int,
 	rowIdx int,
@@ -60,7 +55,7 @@ func DecodeTableValueToCol(
 		// original buffer.
 		buf, b, err = encoding.DecodeBoolValue(origBuf)
 		vecs.BoolCols[colIdx][rowIdx] = b
-	case types.BytesFamily, types.StringFamily:
+	case types.BytesFamily, types.StringFamily, types.EnumFamily:
 		var data []byte
 		buf, data, err = encoding.DecodeUntaggedBytesValue(buf)
 		vecs.BytesCols[colIdx].Set(rowIdx, data)
@@ -111,7 +106,7 @@ func DecodeTableValueToCol(
 	// Types backed by tree.Datums.
 	default:
 		var d tree.Datum
-		d, buf, err = rowenc.DecodeUntaggedDatum(da, valTyp, buf)
+		d, buf, err = valueside.DecodeUntaggedDatum(da, valTyp, buf)
 		if err != nil {
 			return buf, err
 		}

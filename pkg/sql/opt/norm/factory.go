@@ -1,26 +1,30 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package norm implements normalization for queries.
 package norm
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins" // register all builtins in builtins:init() for memo package
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util/sentryutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // ReplaceFunc is the callback function passed to the Factory.Replace method.
@@ -62,7 +66,8 @@ type AppliedRuleFunc func(ruleName opt.RuleName, source, target opt.Expr)
 // Optgen DSL, the factory always calls the `onConstruct` method as its last
 // step, in order to allow any custom manual code to execute.
 type Factory struct {
-	evalCtx *tree.EvalContext
+	ctx     context.Context
+	evalCtx *eval.Context
 
 	// mem is the Memo data structure that the factory builds.
 	mem *memo.Memo
@@ -92,6 +97,10 @@ type Factory struct {
 	// methods. It is incremented when a constructor function is called, and
 	// decremented when a constructor function returns.
 	constructorStackDepth int
+
+	// disabledRules is a set of rules that are not allowed to run, used when
+	// rules are disabled during testing to prevent rule cycles.
+	disabledRules intsets.Fast
 }
 
 // maxConstructorStackDepth is the maximum allowed depth of a constructor call
@@ -102,24 +111,34 @@ type Factory struct {
 // normalization rules are applied when this limit is reached, and the
 // onMaxConstructorStackDepthExceeded method is called. This can result in an
 // expression that is not fully optimized.
-const maxConstructorStackDepth = 10000
+const maxConstructorStackDepth = 10_000
+
+// Injecting this builtins dependency in the init function allows the memo
+// package to access builtin properties without importing the builtins package.
+func init() {
+	memo.GetBuiltinProperties = builtinsregistry.GetBuiltinProperties
+}
 
 // Init initializes a Factory structure with a new, blank memo structure inside.
 // This must be called before the factory can be used (or reused).
 //
 // By default, a factory only constant-folds immutable operators; this can be
 // changed using FoldingControl().AllowStableFolds().
-func (f *Factory) Init(evalCtx *tree.EvalContext, catalog cat.Catalog) {
+func (f *Factory) Init(ctx context.Context, evalCtx *eval.Context, catalog cat.Catalog) {
 	// Initialize (or reinitialize) the memo.
 	mem := f.mem
 	if mem == nil {
 		mem = &memo.Memo{}
 	}
-	mem.Init(evalCtx)
+	mem.Init(ctx, evalCtx)
+	mem.SetReplacer(func(e opt.Expr, replace memo.ReplaceFunc) opt.Expr {
+		return f.Replace(e, ReplaceFunc(replace))
+	})
 
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*f = Factory{
+		ctx:     ctx,
 		mem:     mem,
 		evalCtx: evalCtx,
 		catalog: catalog,
@@ -148,7 +167,16 @@ func (f *Factory) DetachMemo() *memo.Memo {
 	m := f.mem
 	f.mem = nil
 	m.Detach()
-	f.Init(f.evalCtx, nil /* catalog */)
+	f.Init(f.ctx, f.evalCtx, nil /* catalog */)
+	return m
+}
+
+// ReleaseMemo is just like DetachMemo but it doesn't call Detach on the memo
+// preserving any statistics information for explain purposes (distinct, null
+// count etc).
+func (f *Factory) ReleaseMemo() *memo.Memo {
+	m := f.mem
+	f.mem = nil
 	return m
 }
 
@@ -157,6 +185,35 @@ func (f *Factory) DetachMemo() *memo.Memo {
 // are applied).
 func (f *Factory) DisableOptimizations() {
 	f.NotifyOnMatchedRule(func(opt.RuleName) bool { return false })
+}
+
+// DisableOptimizationRules disables a specific set of transformation rules.
+func (f *Factory) DisableOptimizationRules(disabledRules intsets.Fast) {
+	f.NotifyOnMatchedRule(func(rule opt.RuleName) bool {
+		return !disabledRules.Contains(int(rule))
+	})
+}
+
+// DisableOptimizationRulesTemporarily disables a specific set transformation
+// rules during the execution of the given function fn. A MatchedRuleFunc
+// previously set by NotifyOnMatchedRule is not invoked during execution of fn,
+// but will be invoked for future rule matches after fn returns.
+func (f *Factory) DisableOptimizationRulesTemporarily(disabledRules intsets.Fast, fn func()) {
+	originalMatchedRule := f.matchedRule
+	f.DisableOptimizationRules(disabledRules)
+	fn()
+	f.matchedRule = originalMatchedRule
+}
+
+// DisableOptimizationsTemporarily disables all transformation rules during the
+// execution of the given function fn. A MatchedRuleFunc previously set by
+// NotifyOnMatchedRule is not invoked during execution of fn, but will be
+// invoked for future rule matches after fn returns.
+func (f *Factory) DisableOptimizationsTemporarily(fn func()) {
+	originalMatchedRule := f.matchedRule
+	f.DisableOptimizations()
+	fn()
+	f.matchedRule = originalMatchedRule
 }
 
 // NotifyOnMatchedRule sets a callback function which is invoked each time a
@@ -175,6 +232,14 @@ func (f *Factory) NotifyOnAppliedRule(appliedRule AppliedRuleFunc) {
 	f.appliedRule = appliedRule
 }
 
+// SetDisabledRules is used to prevent normalization rule cycles when rules are
+// disabled during testing. SetDisabledRules does not prevent rules from
+// matching - rather, it notifies the Factory that rules have been prevented
+// from matching using NotifyOnMatchedRule.
+func (f *Factory) SetDisabledRules(disabledRules intsets.Fast) {
+	f.disabledRules = disabledRules
+}
+
 // Memo returns the memo structure that the factory is operating upon.
 func (f *Factory) Memo() *memo.Memo {
 	return f.mem
@@ -191,8 +256,8 @@ func (f *Factory) CustomFuncs() *CustomFuncs {
 	return &f.funcs
 }
 
-// EvalContext returns the *tree.EvalContext of the factory.
-func (f *Factory) EvalContext() *tree.EvalContext {
+// EvalContext returns the *eval.Context of the factory.
+func (f *Factory) EvalContext() *eval.Context {
 	return f.evalCtx
 }
 
@@ -213,17 +278,17 @@ func (f *Factory) EvalContext() *tree.EvalContext {
 //
 // Sample usage:
 //
-//   var replaceFn ReplaceFunc
-//   replaceFn = func(e opt.Expr) opt.Expr {
-//     if e.Op() == opt.PlaceholderOp {
-//       return f.ConstructConst(evalPlaceholder(e))
-//     }
+//	var replaceFn ReplaceFunc
+//	replaceFn = func(e opt.Expr) opt.Expr {
+//	  if e.Op() == opt.PlaceholderOp {
+//	    return f.ConstructConst(evalPlaceholder(e))
+//	  }
 //
-//     // Copy e, calling replaceFn on its inputs recursively.
-//     return f.CopyAndReplaceDefault(e, replaceFn)
-//   }
+//	  // Copy e, calling replaceFn on its inputs recursively.
+//	  return f.CopyAndReplaceDefault(e, replaceFn)
+//	}
 //
-//   f.CopyAndReplace(from, fromProps, replaceFn)
+//	f.CopyAndReplace(from, fromProps, replaceFn)
 //
 // NOTE: Callers must take care to always create brand new copies of non-
 // singleton source nodes rather than referencing existing nodes. The source
@@ -232,20 +297,9 @@ func (f *Factory) EvalContext() *tree.EvalContext {
 func (f *Factory) CopyAndReplace(
 	from memo.RelExpr, fromProps *physical.Required, replace ReplaceFunc,
 ) {
-	if !f.mem.IsEmpty() {
-		panic(errors.AssertionFailedf("destination memo must be empty"))
-	}
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 
-	// Copy the next scalar rank to the target memo so that new scalar
-	// expressions built with the new memo will not share scalar ranks with
-	// existing expressions.
-	f.mem.CopyNextRankFrom(from.Memo())
-
-	// Copy all metadata to the target memo so that referenced tables and
-	// columns can keep the same ids they had in the "from" memo. Scalar
-	// expressions in the metadata cannot have placeholders, so we simply copy
-	// the expressions without replacement.
-	f.mem.Metadata().CopyFrom(from.Memo().Metadata(), f.CopyScalarWithoutPlaceholders)
+	f.CopyMetadataFrom(from.Memo())
 
 	// Perform copy and replacement, and store result as the root of this
 	// factory's memo.
@@ -253,10 +307,32 @@ func (f *Factory) CopyAndReplace(
 	f.Memo().SetRoot(to, fromProps)
 }
 
-// CopyScalarWithoutPlaceholders returns a copy of the given scalar expression.
+// CopyMetadataFrom copies the metadata from the given memo to this factory's
+// memo. This allows expressions copied from the original memo to reference the
+// same tables and columns that they did before.
+func (f *Factory) CopyMetadataFrom(from *memo.Memo) {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
+
+	if !f.mem.IsEmpty() {
+		panic(errors.AssertionFailedf("destination memo must be empty"))
+	}
+
+	// Copy the next scalar rank to the target memo so that new scalar
+	// expressions built with the new memo will not share scalar ranks with
+	// existing expressions.
+	f.mem.CopyNextRankFrom(from)
+
+	// Copy all metadata to the target memo so that referenced tables and
+	// columns can keep the same ids they had in the "from" memo. Scalar
+	// expressions in the metadata cannot have placeholders, so we simply copy
+	// the expressions without replacement.
+	f.mem.Metadata().CopyFrom(from.Metadata(), f.CopyWithoutAssigningPlaceholders)
+}
+
+// CopyWithoutAssigningPlaceholders returns a copy of the given scalar expression.
 // It does not attempt to replace placeholders with values.
-func (f *Factory) CopyScalarWithoutPlaceholders(e opt.Expr) opt.Expr {
-	return f.CopyAndReplaceDefault(e, f.CopyScalarWithoutPlaceholders)
+func (f *Factory) CopyWithoutAssigningPlaceholders(e opt.Expr) opt.Expr {
+	return f.CopyAndReplaceDefault(e, f.CopyWithoutAssigningPlaceholders)
 }
 
 // AssignPlaceholders is used just before execution of a prepared Memo. It makes
@@ -284,11 +360,33 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 	var replaceFn ReplaceFunc
 	replaceFn = func(e opt.Expr) opt.Expr {
 		if placeholder, ok := e.(*memo.PlaceholderExpr); ok {
-			d, err := e.(*memo.PlaceholderExpr).Value.Eval(f.evalCtx)
+			d, err := eval.Expr(f.ctx, f.evalCtx, e.(*memo.PlaceholderExpr).Value)
 			if err != nil {
 				panic(err)
 			}
 			return f.ConstructConstVal(d, placeholder.DataType())
+		}
+		// A recursive CTE may have the stats change on its Initial expression
+		// after placeholder assignment, if that happens we need to
+		// propagate that change to the Binding expression and rebuild
+		// everything.
+		if rcte, ok := e.(*memo.RecursiveCTEExpr); ok {
+			newInitial := f.CopyAndReplaceDefault(rcte.Initial, replaceFn).(memo.RelExpr)
+			if newInitial != rcte.Initial {
+				newBinding := f.ConstructFakeRel(&memo.FakeRelPrivate{
+					Props: MakeBindingPropsForRecursiveCTE(
+						props.AnyCardinality, rcte.Binding.Relational().OutputCols,
+						newInitial.Relational().Statistics().RowCount)})
+				if id := rcte.WithBindingID(); id != 0 {
+					f.Metadata().AddWithBinding(id, newBinding)
+				}
+				return f.ConstructRecursiveCTE(
+					newBinding,
+					newInitial,
+					f.invokeReplace(rcte.Recursive, replaceFn).(memo.RelExpr),
+					&rcte.RecursiveCTEPrivate,
+				)
+			}
 		}
 		return f.CopyAndReplaceDefault(e, replaceFn)
 	}
@@ -302,7 +400,7 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 // function returns. It is used to verify that the stack depth is correctly
 // decremented for each constructor function.
 func (f *Factory) CheckConstructorStackDepth() {
-	if util.CrdbTestBuild && f.constructorStackDepth != 0 {
+	if buildutil.CrdbTestBuild && f.constructorStackDepth != 0 {
 		panic(errors.AssertionFailedf(
 			"expected constructor stack depth %v to be 0",
 			f.constructorStackDepth,
@@ -318,10 +416,10 @@ func (f *Factory) onMaxConstructorStackDepthExceeded() {
 		"optimizer factory constructor call stack exceeded max depth of %v",
 		maxConstructorStackDepth,
 	)
-	if util.CrdbTestBuild {
+	if buildutil.CrdbTestBuild {
 		panic(err)
 	}
-	errorutil.SendReport(f.evalCtx.Ctx(), &f.evalCtx.Settings.SV, err)
+	sentryutil.SendReport(f.ctx, &f.evalCtx.Settings.SV, err)
 }
 
 // onConstructRelational is called as a final step by each factory method that
@@ -334,10 +432,10 @@ func (f *Factory) onConstructRelational(rel memo.RelExpr) memo.RelExpr {
 	// the logical properties of the group in question.
 	if rel.Op() != opt.ValuesOp {
 		relational := rel.Relational()
-		// We can do this if we only contain leak-proof operators. As an example of
+		// We can do this if we only contain leakproof operators. As an example of
 		// an immutable operator that should not be folded: a Limit on top of an
 		// empty input has to error out if the limit turns out to be negative.
-		if relational.Cardinality.IsZero() && relational.VolatilitySet.IsLeakProof() {
+		if relational.Cardinality.IsZero() && relational.VolatilitySet.IsLeakproof() {
 			if f.matchedRule == nil || f.matchedRule(opt.SimplifyZeroCardinalityGroup) {
 				values := f.funcs.ConstructEmptyValues(relational.OutputCols)
 				if f.appliedRule != nil {
@@ -373,11 +471,20 @@ func (f *Factory) ConstructZeroValues() memo.RelExpr {
 	})
 }
 
+// ConstructNoColsRow constructs a Values operator with no columns and one row.
+func (f *Factory) ConstructNoColsRow() memo.RelExpr {
+	return f.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
+		Cols: opt.ColList{},
+		ID:   f.Metadata().NextUniqueID(),
+	})
+}
+
 // ConstructJoin constructs the join operator that corresponds to the given join
 // operator type.
 func (f *Factory) ConstructJoin(
 	joinOp opt.Operator, left, right memo.RelExpr, on memo.FiltersExpr, private *memo.JoinPrivate,
 ) memo.RelExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 	switch joinOp {
 	case opt.InnerJoinOp:
 		return f.ConstructInnerJoin(left, right, on, private)
@@ -400,7 +507,7 @@ func (f *Factory) ConstructJoin(
 	case opt.AntiJoinApplyOp:
 		return f.ConstructAntiJoinApply(left, right, on, private)
 	}
-	panic(errors.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
+	panic(errors.AssertionFailedf("unexpected join operator: %v", redact.Safe(joinOp)))
 }
 
 // ConstructConstVal constructs one of the constant value operators from the
@@ -409,6 +516,7 @@ func (f *Factory) ConstructJoin(
 // Null operators require the static type to be specified, so that rewrites do
 // not change it.
 func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 	if d == tree.DNull {
 		return f.ConstructNull(t)
 	}
@@ -420,4 +528,60 @@ func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
 		return memo.FalseSingleton
 	}
 	return f.ConstructConst(d, t)
+}
+
+// ConstructConstFilter builds a filter that constrains the given column to one
+// of the given set of constant values. This is performed by either constructing
+// an equality expression or an IN expression.
+func (f *Factory) ConstructConstFilter(col opt.ColumnID, values tree.Datums) memo.FiltersItem {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
+	if len(values) == 1 {
+		return f.ConstructFiltersItem(f.ConstructEq(
+			f.ConstructVariable(col),
+			f.ConstructConstVal(values[0], values[0].ResolvedType()),
+		))
+	}
+	elems := make(memo.ScalarListExpr, len(values))
+	elemTypes := make([]*types.T, len(values))
+	for i := range values {
+		typ := values[i].ResolvedType()
+		elems[i] = f.ConstructConstVal(values[i], typ)
+		elemTypes[i] = typ
+	}
+	return f.ConstructFiltersItem(f.ConstructIn(
+		f.ConstructVariable(col),
+		f.ConstructTuple(elems, types.MakeTuple(elemTypes)),
+	))
+}
+
+// ----------------------------------------------------------------------
+//
+// Convenience functions.
+//
+// ----------------------------------------------------------------------
+
+// RemapCols remaps columns IDs in the input ScalarExpr by replacing occurrences
+// of the keys of colMap with the corresponding values. If column IDs are
+// encountered in the input ScalarExpr that are not keys in colMap, they are not
+// remapped.
+func (f *Factory) RemapCols(scalar opt.ScalarExpr, colMap opt.ColMap) opt.ScalarExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
+
+	// Recursively walk the scalar sub-tree looking for references to columns
+	// that need to be replaced and then replace them appropriately.
+	var replace ReplaceFunc
+	replace = func(e opt.Expr) opt.Expr {
+		switch t := e.(type) {
+		case *memo.VariableExpr:
+			dstCol, ok := colMap.Get(int(t.Col))
+			if !ok {
+				// The column ID is not in colMap so no replacement is required.
+				return e
+			}
+			return f.ConstructVariable(opt.ColumnID(dstCol))
+		}
+		return f.Replace(e, replace)
+	}
+
+	return replace(scalar).(opt.ScalarExpr)
 }

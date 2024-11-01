@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
@@ -16,10 +11,11 @@ import (
 	"testing"
 	"unicode"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
@@ -50,15 +46,15 @@ func TestCodecMarshalUnmarshal(t *testing.T) {
 				}
 			},
 			func() interface{} { return &grpc_health_v1.HealthCheckRequest{} }},
-		{"roachpb.GetRequest",
+		{"kvpb.GetRequest",
 			func() interface{} {
-				return &roachpb.GetRequest{
-					RequestHeader: roachpb.RequestHeader{
+				return &kvpb.GetRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key: roachpb.Key("turtle"),
 					},
 				}
 			},
-			func() interface{} { return &roachpb.GetRequest{} }},
+			func() interface{} { return &kvpb.GetRequest{} }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			input := test.filledMsgBuilder()

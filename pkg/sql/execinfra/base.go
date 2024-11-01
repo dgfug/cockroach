@@ -1,18 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package execinfra contains the common interfaces for colexec and rowexec.
 package execinfra
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -22,9 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
@@ -41,6 +34,16 @@ type ConsumerStatus uint32
 const (
 	// NeedMoreRows indicates that the consumer is still expecting more rows.
 	NeedMoreRows ConsumerStatus = iota
+	// SwitchToAnotherPortal indicates that we received exec command for a
+	// different portal, and may come back to continue executing the current
+	// portal later. If the cluster setting session variable
+	// multiple_active_portals_enabled is set to be true, we do nothing and
+	// return the control to the connExecutor.
+	//
+	// Note that currently multiple active portals don't support the distributed
+	// execution, so this status can only be reached during the local execution.
+	// This is tracked by #100822.
+	SwitchToAnotherPortal
 	// DrainRequested indicates that the consumer will not process any more data
 	// rows, but will accept trailing metadata from the producer.
 	DrainRequested
@@ -85,6 +88,9 @@ type RowReceiver interface {
 	// and they might not all be aware of the last status returned).
 	//
 	// Implementations of Push() must be thread-safe.
+	// TODO(yuzefovich): some implementations (DistSQLReceiver and
+	// copyingRowReceiver) are not actually thread-safe. Figure out whether we
+	// want to fix them or to update the contract.
 	Push(row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata) ConsumerStatus
 }
 
@@ -112,7 +118,7 @@ type RowSource interface {
 
 	// Start prepares the RowSource for future Next() calls and takes in the
 	// context in which these future calls should operate. Start needs to be
-	// called before Next/ConsumerDone/ConsumerClosed.
+	// called before Next and ConsumerDone.
 	//
 	// RowSources that consume other RowSources are expected to Start() their
 	// inputs.
@@ -157,8 +163,9 @@ type RowSource interface {
 	ConsumerDone()
 
 	// ConsumerClosed informs the source that the consumer is done and will not
-	// make any more calls to Next(). Must only be called once on a given
-	// RowSource.
+	// make any more calls to Next(). Must be called at least once on a given
+	// RowSource and can be called multiple times. Implementations must support
+	// the case when Start was never called.
 	//
 	// Like ConsumerDone(), if the consumer of the source stops consuming rows
 	// before Next indicates that there are no more rows, ConsumerDone() and/or
@@ -189,8 +196,12 @@ func Run(ctx context.Context, src RowSource, dst RowReceiver) {
 			switch dst.Push(row, meta) {
 			case NeedMoreRows:
 				continue
+			case SwitchToAnotherPortal:
+				// Do nothing here and return the control to the connExecutor to execute
+				// the other portal, i.e. we leave the current portal open.
+				return
 			case DrainRequested:
-				DrainAndForwardMetadata(ctx, src, dst)
+				drainAndForwardMetadata(ctx, src, dst)
 				dst.ProducerDone()
 				return
 			case ConsumerClosed:
@@ -205,24 +216,16 @@ func Run(ctx context.Context, src RowSource, dst RowReceiver) {
 	}
 }
 
-// Releasable is an interface for objects than can be Released back into a
-// memory pool when finished.
-type Releasable interface {
-	// Release allows this object to be returned to a memory pool. Objects must
-	// not be used after Release is called.
-	Release()
-}
-
-// DrainAndForwardMetadata calls src.ConsumerDone() (thus asking src for
+// drainAndForwardMetadata calls src.ConsumerDone() (thus asking src for
 // draining metadata) and then forwards all the metadata to dst.
 //
 // When this returns, src has been properly closed (regardless of the presence
 // or absence of an error). dst, however, has not been closed; someone else must
 // call dst.ProducerDone() when all producers have finished draining.
 //
-// It is OK to call DrainAndForwardMetadata() multiple times concurrently on the
+// It is OK to call drainAndForwardMetadata() multiple times concurrently on the
 // same dst (as RowReceiver.Push() is guaranteed to be thread safe).
-func DrainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver) {
+func drainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver) {
 	src.ConsumerDone()
 	for {
 		row, meta := src.Next()
@@ -244,23 +247,20 @@ func DrainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver
 			src.ConsumerClosed()
 			return
 		case NeedMoreRows:
+		case SwitchToAnotherPortal:
+			panic("current consumer is drained, cannot be paused and switched to another portal")
 		case DrainRequested:
 		}
 	}
 }
 
-// GetTraceData returns the trace data.
-func GetTraceData(ctx context.Context) []tracingpb.RecordedSpan {
-	if sp := tracing.SpanFromContext(ctx); sp != nil {
-		return sp.GetRecording(tracing.RecordingVerbose)
-	}
-	return nil
-}
-
 // GetTraceDataAsMetadata returns the trace data as execinfrapb.ProducerMetadata
-// object.
-func GetTraceDataAsMetadata(span *tracing.Span) *execinfrapb.ProducerMetadata {
-	if trace := span.GetRecording(tracing.RecordingVerbose); len(trace) > 0 {
+// object when called not on the gateway.
+func GetTraceDataAsMetadata(flowCtx *FlowCtx, span *tracing.Span) *execinfrapb.ProducerMetadata {
+	if flowCtx.Gateway {
+		return nil
+	}
+	if trace := span.GetConfiguredRecording(); len(trace) > 0 {
 		meta := execinfrapb.GetProducerMeta()
 		meta.TraceData = trace
 		return meta
@@ -269,12 +269,16 @@ func GetTraceDataAsMetadata(span *tracing.Span) *execinfrapb.ProducerMetadata {
 }
 
 // SendTraceData collects the tracing information from the ctx and pushes it to
-// dst. The ConsumerStatus returned by dst is ignored.
+// dst when called not on the gateway. The ConsumerStatus returned by dst is
+// ignored.
 //
 // Note that the tracing data is distinct between different processors, since
-// each one gets its own trace "recording group".
-func SendTraceData(ctx context.Context, dst RowReceiver) {
-	if rec := GetTraceData(ctx); rec != nil {
+// each one gets its own "detached" tracing span (when not on the gateway).
+func SendTraceData(ctx context.Context, flowCtx *FlowCtx, dst RowReceiver) {
+	if flowCtx.Gateway {
+		return
+	}
+	if rec := tracing.SpanFromContext(ctx).GetConfiguredRecording(); rec != nil {
 		dst.Push(nil /* row */, &execinfrapb.ProducerMetadata{TraceData: rec})
 	}
 }
@@ -302,50 +306,26 @@ func GetLeafTxnFinalState(ctx context.Context, txn *kv.Txn) *roachpb.LeafTxnFina
 	if txnMeta.Txn.ID == uuid.Nil {
 		return nil
 	}
-	return &txnMeta
+	return txnMeta
 }
 
-// DrainAndClose is a version of DrainAndForwardMetadata that drains multiple
-// sources. These sources are assumed to be the only producers left for dst, so
-// dst is closed once they're all exhausted (this is different from
-// DrainAndForwardMetadata).
+// DrainAndClose drains and closes the source and then closes the dst too. It
+// also propagates the tracing metadata if there is any in the context. src is
+// assumed to be the only producer for dst.
 //
 // If cause is specified, it is forwarded to the consumer before all the drain
 // metadata. This is intended to have been the error, if any, that caused the
 // draining.
-//
-// pushTrailingMeta is called after draining the sources and before calling
-// dst.ProducerDone(). It gives the caller the opportunity to push some trailing
-// metadata (e.g. tracing information and txn updates, if applicable).
-//
-// srcs can be nil.
-//
-// All errors are forwarded to the producer.
 func DrainAndClose(
-	ctx context.Context,
-	dst RowReceiver,
-	cause error,
-	pushTrailingMeta func(context.Context),
-	srcs ...RowSource,
+	ctx context.Context, flowCtx *FlowCtx, src RowSource, dst RowReceiver, cause error,
 ) {
 	if cause != nil {
 		// We ignore the returned ConsumerStatus and rely on the
-		// DrainAndForwardMetadata() calls below to close srcs in all cases.
+		// drainAndForwardMetadata() call below to close the source.
 		_ = dst.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: cause})
 	}
-	if len(srcs) > 0 {
-		var wg sync.WaitGroup
-		for _, input := range srcs[1:] {
-			wg.Add(1)
-			go func(input RowSource) {
-				DrainAndForwardMetadata(ctx, input, dst)
-				wg.Done()
-			}(input)
-		}
-		DrainAndForwardMetadata(ctx, srcs[0], dst)
-		wg.Wait()
-	}
-	pushTrailingMeta(ctx)
+	drainAndForwardMetadata(ctx, src, dst)
+	SendTraceData(ctx, flowCtx, dst)
 	dst.ProducerDone()
 }
 
@@ -416,16 +396,6 @@ func (rb *rowSourceBase) consumerDone() {
 		uint32(NeedMoreRows), uint32(DrainRequested))
 }
 
-// consumerClosed helps processors implement RowSource.ConsumerClosed. The name
-// is only used for debug messages.
-func (rb *rowSourceBase) consumerClosed(name string) {
-	status := ConsumerStatus(atomic.LoadUint32((*uint32)(&rb.ConsumerStatus)))
-	if status == ConsumerClosed {
-		logcrash.ReportOrPanic(context.Background(), nil, "%s already closed", log.Safe(name))
-	}
-	atomic.StoreUint32((*uint32)(&rb.ConsumerStatus), uint32(ConsumerClosed))
-}
-
 // RowChannel is a thin layer over a RowChannelMsg channel, which can be used to
 // transfer rows between goroutines.
 type RowChannel struct {
@@ -473,6 +443,12 @@ func (rc *RowChannel) Push(
 	switch consumerStatus {
 	case NeedMoreRows:
 		rc.dataChan <- RowChannelMsg{Row: row, Meta: meta}
+	case SwitchToAnotherPortal:
+		// We currently don't expect this status, so we propagate an assertion
+		// failure as metadata.
+		m := execinfrapb.GetProducerMeta()
+		m.Err = errors.AssertionFailedf("multiple active portals are not expected with the row channel")
+		rc.dataChan <- RowChannelMsg{Meta: m}
 	case DrainRequested:
 		// If we're draining, only forward metadata.
 		if meta != nil {
@@ -520,7 +496,7 @@ func (rc *RowChannel) ConsumerDone() {
 
 // ConsumerClosed is part of the RowSource interface.
 func (rc *RowChannel) ConsumerClosed() {
-	rc.consumerClosed("RowChannel")
+	atomic.StoreUint32((*uint32)(&rc.ConsumerStatus), uint32(ConsumerClosed))
 	numSenders := atomic.LoadInt32(&rc.numSenders)
 	// Drain (at most) numSenders messages in case senders are blocked trying to
 	// emit a row.

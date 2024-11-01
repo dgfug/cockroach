@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
 import (
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -37,7 +32,7 @@ const jEntryLen = 4
 // JSON value, but check it just to be safe.
 func checkLength(length int) error {
 	if length > maxByteLength {
-		return errors.AssertionFailedf("JSON value too large: %d bytes", errors.Safe(length))
+		return errors.Newf("JSON value too large: %d bytes", errors.Safe(length))
 	}
 	return nil
 }
@@ -262,17 +257,14 @@ func decodeJSONObject(containerHeader uint32, b []byte) ([]byte, JSON, error) {
 	result := make(jsonObject, length)
 	// Decode the keys.
 	for i := 0; i < length; i++ {
-		var nextJSON JSON
-		b, nextJSON, err = decodeJSONValue(keyJEntries[i], b)
-		if err != nil {
-			return b, nil, err
-		}
-		if key, ok := nextJSON.(jsonString); ok {
-			result[i].k = key
-		} else {
+		e := keyJEntries[i]
+		if e.typCode != stringTag {
 			return b, nil, errors.AssertionFailedf(
-				"key encoded as non-string: %T", nextJSON)
+				"key encoded as non-string: %d", errors.Safe(e.typCode))
 		}
+		// Inline string decoding from decodeJSONValue. This avoids the cost to pass
+		// through a JSON interface.
+		b, result[i].k = b[e.length:], jsonString(b[:e.length])
 	}
 
 	// Decode the values.
@@ -287,10 +279,10 @@ func decodeJSONObject(containerHeader uint32, b []byte) ([]byte, JSON, error) {
 	return b, result, nil
 }
 
-func decodeJSONNumber(b []byte) ([]byte, JSON, error) {
+func decodeJSONNumber(b []byte) ([]byte, jsonNumber, error) {
 	b, d, err := encoding.DecodeUntaggedDecimalValue(b)
 	if err != nil {
-		return b, nil, err
+		return b, jsonNumber{}, err
 	}
 	return b, jsonNumber(d), nil
 }

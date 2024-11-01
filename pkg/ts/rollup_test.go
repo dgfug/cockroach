@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -24,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/kr/pretty"
 )
@@ -111,6 +107,8 @@ func TestComputeRollupFromData(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
+			defer log.Scope(t).Close(t)
+
 			rollups := computeRollupsFromData(tc.input, 50)
 			internal, err := rollups.toInternal(1000, 50)
 			if err != nil {
@@ -161,6 +159,8 @@ func TestComputeRollupFromData(t *testing.T) {
 
 func TestRollupBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	tm := newTestModelRunner(t)
 	tm.Start()
 	defer tm.Stop()
@@ -247,6 +247,8 @@ func TestRollupBasic(t *testing.T) {
 
 func TestRollupMemoryConstraint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	tm := newTestModelRunner(t)
 	tm.Start()
 	defer tm.Stop()
@@ -264,16 +266,12 @@ func TestRollupMemoryConstraint(t *testing.T) {
 
 	// Construct a memory monitor that will be used to measure the high-water
 	// mark of memory usage for the rollup process.
-	adjustedMon := mon.NewMonitor(
-		"timeseries-test-worker-adjusted",
-		mon.MemoryResource,
-		nil,
-		nil,
-		1,
-		math.MaxInt64,
-		cluster.MakeTestingClusterSettings(),
-	)
-	adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+	adjustedMon := mon.NewMonitor(mon.Options{
+		Name:      "timeseries-test-worker-adjusted",
+		Increment: 1,
+		Settings:  cluster.MakeTestingClusterSettings(),
+	})
+	adjustedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 	defer adjustedMon.Stop(context.Background())
 
 	// Roll up time series with the new monitor to measure high-water mark
@@ -319,7 +317,7 @@ func TestRollupMemoryConstraint(t *testing.T) {
 
 		// Restart monitor to clear query memory options.
 		adjustedMon.Stop(context.Background())
-		adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+		adjustedMon.StartNoReserved(context.Background(), tm.workerMemMonitor)
 
 		qmc := MakeQueryMemoryContext(adjustedMon, adjustedMon, QueryMemoryOptions{
 			// Large budget, but not maximum to avoid overflows.

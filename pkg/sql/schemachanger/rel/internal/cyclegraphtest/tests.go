@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cyclegraphtest
 
@@ -45,9 +40,13 @@ var (
 	databaseTests = []reltest.DatabaseTest{
 		{
 			Data: []string{"container1"}, // recursively will add it all, test that
-			Indexes: [][][]rel.Attr{
-				nil,
-				{{s}, {c}, {name}},
+			Indexes: [][]rel.Index{
+				{{}},
+				{
+					{Attrs: []rel.Attr{s}},
+					{Attrs: []rel.Attr{c}},
+					{Attrs: []rel.Attr{name}},
+				},
 			},
 			QueryCases: []reltest.QueryTest{
 				{
@@ -62,6 +61,7 @@ var (
 						{container1, message1},
 						{container2, message2},
 					},
+					UnsatisfiableIndexes: []int{1},
 				},
 				{
 					Name: "oneOf member",

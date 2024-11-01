@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -16,7 +11,6 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,12 +18,15 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -39,11 +36,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -82,7 +81,7 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 	}
 
 	rUnsafe := errors.New("some error")
-	safeErr := sql.WithAnonymizedStatement(rUnsafe, stmt1.AST, vt)
+	safeErr := sql.WithAnonymizedStatement(rUnsafe, stmt1.AST, vt, nil /* ClientNoticeSender */)
 
 	const expMessage = "some error"
 	actMessage := safeErr.Error()
@@ -90,38 +89,24 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 		t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
 	}
 
-	const expSafeRedactedMessage = `some error
-(1) while executing: INSERT INTO _(_, _) VALUES ('_', '_', __more2__)
-Wraps: (2) attached stack trace
-  -- stack trace:
-  | github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting
-  | 	...conn_executor_test.go:NN
-  | testing.tRunner
-  | 	...testing.go:NN
-  | runtime.goexit
-  | 	...asm_amd64.s:NN
-Wraps: (3) some error
-Error types: (1) *safedetails.withSafeDetails (2) *withstack.withStack (3) *errutil.leafError`
+	const expSafeRedactedMsgPrefix = `some error
+(1) while executing: INSERT INTO _(_, _) VALUES ('_', '_', __more1_10__)`
 
-	// Edit non-determinstic stack trace filenames from the message.
-	actSafeRedactedMessage := fileref.ReplaceAllString(
-		redact.Sprintf("%+v", safeErr).Redact().StripMarkers(), "...$2:NN")
+	actSafeRedactedMessage := string(redact.Sprintf("%+v", safeErr))
 
-	if actSafeRedactedMessage != expSafeRedactedMessage {
+	if !strings.HasPrefix(actSafeRedactedMessage, expSafeRedactedMsgPrefix) {
 		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
-			A:        difflib.SplitLines(expSafeRedactedMessage),
-			B:        difflib.SplitLines(actSafeRedactedMessage),
-			FromFile: "Expected",
+			A:        difflib.SplitLines(expSafeRedactedMsgPrefix),
+			B:        difflib.SplitLines(actSafeRedactedMessage[:len(expSafeRedactedMsgPrefix)]),
+			FromFile: "Expected Message Prefix",
 			FromDate: "",
-			ToFile:   "Actual",
+			ToFile:   "Actual Message Prefix",
 			ToDate:   "",
 			Context:  1,
 		})
 		t.Errorf("Diff:\n%s", diff)
 	}
 }
-
-var fileref = regexp.MustCompile(`((?:[a-zA-Z0-9\._@-]*/)*)([a-zA-Z0-9._@-]*\.(?:go|s)):\d+`)
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
 // in that txn being rolled back.
@@ -134,13 +119,13 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	aborter := NewTxnAborter()
 	defer aborter.Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, mainDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
-			t, s.ServingSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))
+			t, s.AdvSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(username.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -165,7 +150,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 		t.Run(state, func(t *testing.T) {
 			// Create a low-level lib/pq connection so we can close it at will.
 			pgURL, cleanupDB := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), state, url.User(security.RootUser))
+				t, s.AdvSQLAddr(), state, url.User(username.RootUser))
 			defer cleanupDB()
 			c, err := pq.Open(pgURL.String())
 			if err != nil {
@@ -326,19 +311,26 @@ func TestErrorOnRollback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	const targetKeyString string = "/Table/53/1/1/0"
+	getTargetKey := func(s serverutils.TestServerInterface, tableID uint32) string {
+		if s.TenantController().StartedDefaultTestTenant() {
+			return fmt.Sprintf("/Tenant/%d/Table/%d/1/1/0", serverutils.TestTenantID().ToUint64(), tableID)
+		}
+		return fmt.Sprintf("/Table/%d/1/1/0", tableID)
+	}
+	var targetKeyString atomic.Value
+	targetKeyString.Store("")
 	var injectedErr int64
 
 	// We're going to inject an error into our EndTxn.
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if !fArgs.Req.IsSingleRequest() {
 						return nil
 					}
 					req := fArgs.Req.Requests[0]
-					etReq, ok := req.GetInner().(*roachpb.EndTxnRequest)
+					etReq, ok := req.GetInner().(*kvpb.EndTxnRequest)
 					// We only inject the error once. Turns out that during the
 					// life of the test there's two EndTxns being sent - one is
 					// the direct result of the test's call to tx.Rollback(),
@@ -346,11 +338,11 @@ func TestErrorOnRollback(t *testing.T) {
 					// triggered by the fact that, on the server side, the
 					// transaction's context gets canceled at the SQL layer.
 					if ok &&
-						etReq.Header().Key.String() == targetKeyString &&
+						etReq.Header().Key.String() == targetKeyString.Load().(string) &&
 						atomic.LoadInt64(&injectedErr) == 0 {
 
 						atomic.StoreInt64(&injectedErr, 1)
-						return roachpb.NewErrorf("test injected error")
+						return kvpb.NewErrorf("test injected error")
 					}
 					return nil
 				},
@@ -361,12 +353,13 @@ func TestErrorOnRollback(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	if _, err := sqlDB.Exec(`
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	tdb.Exec(t, `
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
-`); err != nil {
-		t.Fatal(err)
-	}
+`)
+	tableID := sqlutils.QueryTableID(t, sqlDB, "t", "public", "test")
+	targetKeyString.Store(getTargetKey(s, tableID))
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
@@ -420,7 +413,7 @@ func TestHalloweenProblemAvoidance(t *testing.T) {
 	defer mutations.ResetMaxBatchSizeForTests()
 	numRows := smallerKvBatchSize + smallerInsertBatchSize + 10
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Insecure = true
 	params.Knobs.DistSQL = &execinfra.TestingKnobs{
 		TableReaderBatchBytesLimit: 10,
@@ -429,23 +422,35 @@ func TestHalloweenProblemAvoidance(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
-	if _, err := db.Exec(`
-CREATE DATABASE t;
-CREATE TABLE t.test (x FLOAT);
-`); err != nil {
-		t.Fatal(err)
+	for _, s := range []string{
+		`SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = true;`,
+		`CREATE DATABASE t;`,
+		`CREATE TABLE t.test (x FLOAT);`,
+	} {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if _, err := db.Exec(
-		`INSERT INTO t.test(x) SELECT generate_series(1, $1)::FLOAT`,
-		numRows); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now slightly modify the values in duplicate rows.
-	// We choose a float +0.1 to ensure that none of the derived
-	// values become duplicate of already-present values.
-	if _, err := db.Exec(`
+	for _, isoLevel := range []tree.IsolationLevel{
+		tree.ReadCommittedIsolation,
+		tree.RepeatableReadIsolation,
+		tree.SerializableIsolation,
+	} {
+		t.Run(isoLevel.String(), func(t *testing.T) {
+			if _, err := db.Exec("DELETE FROM t.test"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(
+				`INSERT INTO t.test(x) SELECT generate_series(1, $1)::FLOAT`,
+				numRows); err != nil {
+				t.Fatal(err)
+			}
+			// Now slightly modify the values in duplicate rows.
+			// We choose a float +0.1 to ensure that none of the derived
+			// values become duplicate of already-present values.
+			q := fmt.Sprintf(`
+BEGIN TRANSACTION ISOLATION LEVEL %s;
 INSERT INTO t.test(x)
     -- the if ensures that no row is processed two times.
 SELECT IF(x::INT::FLOAT = x,
@@ -454,19 +459,24 @@ SELECT IF(x::INT::FLOAT = x,
              'NOOPE', 'insert saw its own writes: ' || x::STRING || ' (it is halloween today)')::FLOAT)
        + 0.1
   FROM t.test
-`); err != nil {
-		t.Fatal(err)
-	}
+  -- the function used here is implemented by using the internal executor.
+  WHERE has_table_privilege('root', ((x+.1)/(x+1) + 1)::int::oid, 'INSERT') IS NULL;
+COMMIT;`, isoLevel.String())
+			if _, err := db.Exec(q); err != nil {
+				t.Fatal(err)
+			}
 
-	// Finally verify that no rows has been operated on more than once.
-	row := db.QueryRow(`SELECT count(DISTINCT x) FROM t.test`)
-	var cnt int
-	if err := row.Scan(&cnt); err != nil {
-		t.Fatal(err)
-	}
+			// Finally verify that no rows has been operated on more than once.
+			row := db.QueryRow(`SELECT count(DISTINCT x) FROM t.test`)
+			var cnt int
+			if err := row.Scan(&cnt); err != nil {
+				t.Fatal(err)
+			}
 
-	if cnt != 2*numRows {
-		t.Fatalf("expected %d rows in final table, got %d", 2*numRows, cnt)
+			if cnt != 2*numRows {
+				t.Fatalf("expected %d rows in final table, got %d", 2*numRows, cnt)
+			}
+		})
 	}
 }
 
@@ -474,17 +484,17 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Insecure = true
 
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	// Prepare a session with a custom application name.
 	pgURL := url.URL{
 		Scheme:   "postgres",
-		User:     url.User(security.RootUser),
-		Host:     s.ServingSQLAddr(),
+		User:     url.User(username.RootUser),
+		Host:     s.AdvSQLAddr(),
 		RawQuery: "sslmode=disable&application_name=mytest",
 	}
 	rawSQL, err := gosql.Open("postgres", pgURL.String())
@@ -514,6 +524,43 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	}
 }
 
+func TestPrepareStatisticsMetadata(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer s.Stopper().Stop(context.Background())
+	defer sqlDB.Close()
+
+	// PREPARE a prepared statement.
+	stmt, err := sqlDB.Prepare("SELECT $1::int")
+	require.NoError(t, err)
+
+	// EXECUTE the prepared statement
+	_, err = stmt.Exec(3)
+	require.NoError(t, err)
+
+	// Verify that query and querySummary are equal in crdb_internal.statement_statistics.metadata.
+	rows, err := sqlDB.Query(`SELECT metadata->>'query', metadata->>'querySummary' FROM crdb_internal.statement_statistics WHERE metadata->>'query' LIKE 'SELECT _::INT8'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var query, summary string
+	for rows.Next() {
+		if err := rows.Scan(&query, &summary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(query) < 1 {
+		t.Fatal("unable to retrieve query metadata")
+	}
+	if query != summary {
+		t.Fatalf("query is not consistent with querySummary")
+	}
+}
+
 func TestQueryProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -528,8 +575,14 @@ func TestQueryProgress(t *testing.T) {
 	var queryRunningAtomic, scannedBatchesAtomic int64
 	stalled, unblock := make(chan struct{}), make(chan struct{})
 
-	tableKey := keys.SystemSQLCodec.TablePrefix(keys.MinNonPredefinedUserDescID + 1)
-	tableSpan := roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
+	// We'll populate the key for the knob after we create the table.
+	var tableKey atomic.Value
+	tableKey.Store(roachpb.Key(""))
+	getTableKey := func() roachpb.Key { return tableKey.Load().(roachpb.Key) }
+	spanFromKey := func(k roachpb.Key) roachpb.Span {
+		return roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
+	}
+	getTableSpan := func() roachpb.Span { return spanFromKey(getTableKey()) }
 
 	// Install a store filter which, if queryRunningAtomic is 1, will count scan
 	// requests issued to the test table and then, on the `stallAfterScans` one,
@@ -546,10 +599,10 @@ func TestQueryProgress(t *testing.T) {
 				TableReaderBatchBytesLimit: 1500,
 			},
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(_ context.Context, req roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 					if req.IsSingleRequest() {
-						scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
-						if ok && tableSpan.ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
+						scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
+						if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 							i := atomic.AddInt64(&scannedBatchesAtomic, 1)
 							if i == stallAfterScans {
 								close(stalled)
@@ -584,7 +637,9 @@ func TestQueryProgress(t *testing.T) {
 	var tableID descpb.ID
 	ctx := context.Background()
 	require.NoError(t, rawDB.QueryRow(`SELECT id FROM system.namespace WHERE name = 'test'`).Scan(&tableID))
-	s.ExecutorConfig().(sql.ExecutorConfig).TableStatsCache.InvalidateTableStats(ctx, tableID)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	execCfg.TableStatsCache.InvalidateTableStats(ctx, tableID)
+	tableKey.Store(execCfg.Codec.TablePrefix(uint32(tableID)))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -595,7 +650,7 @@ func TestQueryProgress(t *testing.T) {
 		// stalled ch as expected.
 		defer func() {
 			select {
-			case <-stalled: //stalled was closed as expected.
+			case <-stalled: // stalled was closed as expected.
 			default:
 				panic("expected stalled to have been closed during execution")
 			}
@@ -707,8 +762,8 @@ func TestRetriableErrorDuringPrepare(t *testing.T) {
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				BeforePrepare: func(ctx context.Context, stmt string, txn *kv.Txn) error {
 					if strings.Contains(stmt, uniqueString) && atomic.AddInt64(&failed, 1) <= numToFail {
-						return roachpb.NewTransactionRetryWithProtoRefreshError("boom",
-							txn.ID(), *txn.TestingCloneTxn())
+						return kvpb.NewTransactionRetryWithProtoRefreshError("boom",
+							txn.ID(), txn.Epoch(), *txn.TestingCloneTxn())
 					}
 					return nil
 				},
@@ -723,6 +778,151 @@ func TestRetriableErrorDuringPrepare(t *testing.T) {
 	stmt, err := sqlDB.Prepare("SELECT " + uniqueString)
 	require.NoError(t, err)
 	defer func() { _ = stmt.Close() }()
+}
+
+// TestStatementCancelRollback confirms that rollbacks because of statement
+// timeouts are *always* asynchronous.
+func TestStatementCancelRollback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	// This test is on the slower side, so skip under duress.
+	skip.UnderDuress(t)
+
+	for _, useStatementTimeout := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Cancel with statement timeout=%t", useStatementTimeout),
+			func(t *testing.T) {
+				hookEnabled := atomic.Bool{}
+				rollbackCompleted := make(chan struct{})
+				rollbackExpected := make(chan struct{})
+				var codec keys.SQLCodec
+				var queryCtx context.Context
+				var cancelFn context.CancelFunc
+				if useStatementTimeout {
+					queryCtx, cancelFn = context.WithCancel(ctx)
+				} else {
+					queryCtx, cancelFn = context.WithTimeout(ctx, 10*time.Second)
+				}
+				defer cancelFn()
+				s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						Store: &kvserver.StoreTestingKnobs{
+							TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+								// Once the hook is enabled we are expecting a txn rollback involving
+								// the system.descriptor / system.namespace key, because the first thing
+								// accessed by the txn one of those tables (depending on if retries occur).
+								if hookEnabled.Load() {
+									if request.IsSingleEndTxnRequest() {
+										if !request.Requests[0].GetEndTxn().Commit {
+											_, tblID, err := codec.DecodeTablePrefix(request.Header.Txn.TxnMeta.Key)
+											if err != nil {
+												return nil
+											}
+											if tblID == keys.DescriptorTableID || tblID == keys.NamespaceTableID {
+												// This channel will only be closed once the "synchronous" rollback returns.
+												<-rollbackExpected
+												close(rollbackCompleted)
+												hookEnabled.Swap(false)
+											}
+										}
+									}
+								}
+								return nil
+							},
+						},
+					},
+				})
+				codec = s.ApplicationLayer().Codec()
+				defer s.Stopper().Stop(context.Background())
+				conn, err := sqlDB.Conn(context.Background())
+				require.NoError(t, err)
+
+				hookEnabled.Swap(true)
+				if useStatementTimeout {
+					_, err = conn.ExecContext(queryCtx, "SET statement_timeout='1s'")
+					require.NoError(t, err)
+				}
+				_, err = conn.ExecContext(queryCtx, "CREATE TABLE t1(n int);SELECT * FROM pg_sleep(20)")
+				expectedError := "query execution canceled due to statement timeout"
+				if !useStatementTimeout {
+					expectedError = "pq: query execution canceled"
+				}
+				require.ErrorContains(t,
+					err,
+					expectedError,
+					"expected timeout error")
+				// Because the rollback is asynchronous due to the timeout, we expected
+				// to just return here. Any rollbacks involving the descriptor/namespace key a
+				// above are  *blocked*.
+				close(rollbackExpected)
+				// Confirm the async rollback happened.
+				select {
+				case <-rollbackCompleted:
+				case <-time.After(time.Minute):
+					t.Fatal("dead")
+				}
+			})
+	}
+}
+
+// TestRetriableErrorDuringUpgradedTransaction ensures that a retriable error
+// that happens during a transaction that was upgraded from an implicit
+// transaction into an explicit transaction does not cause the BEGIN to be
+// re-executed.
+func TestRetriableErrorDuringUpgradedTransaction(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var retryCount int64
+	const numToRetry = 2 // only fail on the first two attempts
+	filter := newDynamicRequestFilter()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: filter.filter,
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+	codec := s.ApplicationLayer().Codec()
+
+	conn, err := sqlDB.Conn(context.Background())
+	require.NoError(t, err)
+	testDB := sqlutils.MakeSQLRunner(conn)
+
+	var fooTableId uint32
+	testDB.Exec(t, "SET enable_implicit_transaction_for_batch_statements = true")
+	testDB.Exec(t, "CREATE TABLE bar (a INT PRIMARY KEY)")
+	testDB.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY)")
+	testDB.QueryRow(t, "SELECT 'foo'::regclass::oid").Scan(&fooTableId)
+
+	// Inject an error that will happen during execution.
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+		if ba.Txn == nil {
+			return nil
+		}
+		if req, ok := ba.GetArg(kvpb.ConditionalPut); ok {
+			put := req.(*kvpb.ConditionalPutRequest)
+			_, tableID, err := codec.DecodeTablePrefix(put.Key)
+			if err != nil || tableID != fooTableId {
+				return nil
+			}
+			if atomic.AddInt64(&retryCount, 1) <= numToRetry {
+				return kvpb.NewErrorWithTxn(
+					kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "injected retry error"), ba.Txn,
+				)
+			}
+		}
+		return nil
+	})
+
+	testDB.Exec(t, "INSERT INTO bar VALUES(2); BEGIN; INSERT INTO foo VALUES(1); COMMIT;")
+	require.Equal(t, numToRetry+1, int(retryCount))
+
+	var x int
+	testDB.QueryRow(t, "select * from foo").Scan(&x)
+	require.Equal(t, 1, x)
+	testDB.QueryRow(t, "select * from bar").Scan(&x)
+	require.Equal(t, 2, x)
 }
 
 // This test ensures that when in an explicit transaction and statement
@@ -742,6 +942,7 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
+	codec := s.ApplicationLayer().Codec()
 
 	testDB := sqlutils.MakeSQLRunner(sqlDB)
 	testDB.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
@@ -754,7 +955,7 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	// transaction state evolves appropriately.
 
 	// Use pgx so that we can introspect error codes returned from cockroach.
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "", url.User("root"))
+	pgURL, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "", url.User("root"))
 	defer cleanup()
 	conf, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
@@ -773,19 +974,19 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	require.NoError(t, err)
 
 	// Inject an error that will happen during planning.
-	filter.setFilter(func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
-		if req, ok := ba.GetArg(roachpb.Get); ok {
-			get := req.(*roachpb.GetRequest)
-			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(get.Key)
+		if req, ok := ba.GetArg(kvpb.Get); ok {
+			get := req.(*kvpb.GetRequest)
+			_, tableID, err := codec.DecodeTablePrefix(get.Key)
 			if err != nil || tableID != keys.NamespaceTableID {
 				err = nil
 				return nil
 			}
-			return roachpb.NewErrorWithTxn(
-				roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
+			return kvpb.NewErrorWithTxn(
+				kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
 		}
 		return nil
 	})
@@ -869,13 +1070,13 @@ func TestUnqualifiedIntSizeRace(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Insecure: true,
 	})
 	defer s.Stopper().Stop(ctx)
 
 	// Connect to the cluster via the PGWire client.
-	p, err := pgtest.NewPGTest(ctx, s.SQLAddr(), security.RootUser)
+	p, err := pgtest.NewPGTest(ctx, s.SQLAddr(), username.RootUser)
 	require.NoError(t, err)
 
 	require.NoError(t, p.SendOneLine(`Query {"String": "SET default_int_size = 8"}`))
@@ -909,7 +1110,7 @@ func TestTrimSuspendedPortals(t *testing.T) {
 	ctx := context.Background()
 
 	var stmtBuff *sql.StmtBuf
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				// get a handle to the statement buffer during the Bind phase
@@ -929,7 +1130,7 @@ func TestTrimSuspendedPortals(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	// Connect to the cluster via the PGWire client.
-	p, err := pgtest.NewPGTest(ctx, s.SQLAddr(), security.RootUser)
+	p, err := pgtest.NewPGTest(ctx, s.SQLAddr(), username.RootUser)
 	require.NoError(t, err)
 
 	// Setup the portal.
@@ -1014,12 +1215,13 @@ func TestShowLastQueryStatisticsUnknown(t *testing.T) {
 }
 
 // TestTransactionDeadline tests that the transaction deadline is set correctly:
-// - In a single-tenant environment, the transaction deadline should use the leased
-//   descriptor expiration.
-// - In a multi-tenant environment, the transaction deadline should be set to
-//   min(sqlliveness.Session expiry, lease descriptor expiration).
+//   - In a single-tenant environment, the transaction deadline should use the leased
+//     descriptor expiration.
+//   - In a multi-tenant environment, the transaction deadline should be set to
+//     min(sqlliveness.Session expiry, lease descriptor expiration).
 func TestTransactionDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var mu struct {
@@ -1031,7 +1233,7 @@ func TestTransactionDeadline(t *testing.T) {
 	// This will be used in the tests for accessing mu.
 	locked := func(f func()) { mu.Lock(); defer mu.Unlock(); f() }
 	// Set up a kvserverbase.ReplicaRequestFilter which will extract the deadline for the test transaction.
-	checkTransactionDeadlineFilter := func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	checkTransactionDeadlineFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
@@ -1042,12 +1244,12 @@ func TestTransactionDeadline(t *testing.T) {
 			return nil
 		}
 
-		if args, ok := ba.GetArg(roachpb.EndTxn); ok {
-			et := args.(*roachpb.EndTxnRequest)
-			if et.Deadline == nil {
+		if args, ok := ba.GetArg(kvpb.EndTxn); ok {
+			et := args.(*kvpb.EndTxnRequest)
+			if et.Deadline.IsEmpty() {
 				return nil
 			}
-			mu.txnDeadline = *et.Deadline
+			mu.txnDeadline = et.Deadline
 		}
 		return nil
 	}
@@ -1087,14 +1289,11 @@ func TestTransactionDeadline(t *testing.T) {
 			SessionOverride: sessionOverrideKnob,
 		},
 	}
-	testClusterArgs := base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: knobs,
-		},
-	}
-	tc := serverutils.StartNewTestCluster(t, 1, testClusterArgs)
-	defer tc.Stopper().Stop(ctx)
-	s := tc.Server(0)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		Knobs:             knobs,
+	})
+	defer s.Stopper().Stop(ctx)
 
 	// Setup a dynamic session override which will be used in subsequent tests to ensure the transaction
 	// deadline is set accurately. Use clusterSQLLiveness for bootstrapping the tenant.
@@ -1110,12 +1309,15 @@ CREATE DATABASE t1;
 CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 `)
 
+	type fakeSession = sqllivenesstestutils.FakeSession
 	t.Run("session_expiry_overrides_lease_deadline", func(t *testing.T) {
 		// Deliberately set the sessionDuration to be less than the lease duration
 		// to confirm that the sessionDuration overrides the lease duration while
 		// setting the transaction deadline.
 		sessionDuration := base.DefaultDescriptorLeaseDuration - time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := fakeSession{
+			ExpTS: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1130,7 +1332,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		}
 		err = txn.Commit()
 		require.NoError(t, err)
-		locked(func() { require.True(t, fs.Expiration().EqOrdering(mu.txnDeadline)) })
+		locked(func() { require.Equal(t, fs.Expiration(), mu.txnDeadline) })
 	})
 
 	t.Run("lease_deadline_overrides_session_expiry", func(t *testing.T) {
@@ -1138,7 +1340,9 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// to confirm that the lease duration overrides the session duration while
 		// setting the transaction deadline
 		sessionDuration := base.DefaultDescriptorLeaseDuration + time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := fakeSession{
+			ExpTS: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1157,22 +1361,6 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		locked(func() { require.True(t, mu.txnDeadline.Less(fs.Expiration())) })
 	})
 
-	t.Run("expired session leads to clear error", func(t *testing.T) {
-		// In this test we use an intentionally expired session in the tenant
-		// and observe that we get a clear error indicating that the session
-		// was expired.
-		sessionDuration := -time.Nanosecond
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
-		defer setClientSessionOverride(&fs)()
-		txn, err := sqlConn.Begin()
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = txn.ExecContext(ctx, "UPSERT INTO t1.test(k, v) VALUES (1, 'abc')")
-		require.Regexp(t, `liveness session expired (\S+) before transaction`, err)
-		require.NoError(t, txn.Rollback())
-	})
-
 	t.Run("single_tenant_ignore_session_expiry", func(t *testing.T) {
 		// In this test, we check that the session expiry is ignored in a single-tenant
 		// environment. To verify this, we deliberately set the session duration to be
@@ -1182,7 +1370,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// the session expiry should be ignored.
 		// Open a DB connection on the server and not the tenant to test that the session
 		// expiry is ignored outside of the multi-tenant environment.
-		dbConn := serverutils.OpenDBConn(t, s.ServingSQLAddr(), "" /* useDatabase */, false /* insecure */, s.Stopper())
+		dbConn := s.SystemLayer().SQLConn(t)
 		defer dbConn.Close()
 		// Set up a dummy database and table to write into for the test.
 		if _, err := dbConn.Exec(`CREATE DATABASE t1;
@@ -1192,7 +1380,9 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		}
 
 		// Inject an already expired session to observe that it has no effect.
-		fs := &fakeSession{exp: s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0)}
+		fs := &fakeSession{
+			ExpTS: s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(fs)()
 		txn, err := dbConn.Begin()
 		if err != nil {
@@ -1215,6 +1405,8 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 func TestShowLastQueryStatistics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t, "measure planning latency which is slower than usual under race")
 
 	ctx := context.Background()
 	params := base.TestServerArgs{}
@@ -1251,8 +1443,11 @@ ALTER TABLE t1 ADD COLUMN b INT DEFAULT 1`,
 	}
 
 	for _, tc := range testCases {
-		if _, err := sqlConn.Exec(tc.stmt); err != nil {
-			require.NoError(t, err, "executing %s  ", tc.stmt)
+		stmts := strings.Split(tc.stmt, ";")
+		for _, s := range stmts {
+			if _, err := sqlConn.Exec(s); err != nil {
+				require.NoError(t, err, "executing %s  ", s)
+			}
 		}
 
 		rows, err := sqlConn.Query("SHOW LAST QUERY STATISTICS RETURNING parse_latency, plan_latency, exec_latency, service_latency, post_commit_jobs_latency")
@@ -1339,8 +1534,20 @@ func TestInjectRetryErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Enable enterprise features to test READ COMMITTED retries.
+	defer ccl.TestingEnableEnterprise()()
+
 	ctx := context.Background()
 	params := base.TestServerArgs{}
+
+	var readCommittedStmtRetries atomic.Int64
+	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
+		OnReadCommittedStmtRetry: func(retryReason error) {
+			if strings.Contains(retryReason.Error(), "inject_retry_errors_enabled") {
+				readCommittedStmtRetries.Add(1)
+			}
+		},
+	}
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	defer db.Close()
@@ -1373,6 +1580,12 @@ func TestInjectRetryErrors(t *testing.T) {
 			tx, err := db.BeginTx(ctx, nil)
 			require.NoError(t, err)
 
+			// Verify that SHOW is exempt from error injection.
+			var s string
+			err = tx.QueryRow("SHOW inject_retry_errors_enabled").Scan(&s)
+			require.NoError(t, err)
+			require.Equal(t, "on", s)
+
 			if attemptCount == 5 {
 				_, err = tx.Exec("SET LOCAL inject_retry_errors_enabled = 'false'")
 				require.NoError(t, err)
@@ -1390,6 +1603,422 @@ func TestInjectRetryErrors(t *testing.T) {
 		}
 		require.Equal(t, 5, txRes)
 	})
+
+	t.Run("insert_outside_of_txn", func(t *testing.T) {
+		// Add a special test for INSERTs in an implicit txn, since the 1PC
+		// optimization leads to different transaction commit semantics.
+		_, err := db.ExecContext(ctx, "CREATE TABLE t (a INT)")
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, "INSERT INTO t VALUES(1::INT)")
+		require.NoError(t, err)
+		var res int
+		err = db.QueryRow("SELECT a FROM t LIMIT 1").Scan(&res)
+		require.NoError(t, err)
+		require.Equal(t, 1, res)
+		_, err = db.ExecContext(ctx, "DROP TABLE t")
+		require.NoError(t, err)
+	})
+
+	t.Run("read_committed_txn", func(t *testing.T) {
+		readCommittedStmtRetries.Store(0)
+
+		tx, err := db.BeginTx(ctx, &gosql.TxOptions{Isolation: gosql.LevelReadCommitted})
+		require.NoError(t, err)
+
+		var txRes int
+		err = tx.QueryRow("SELECT $1::int8", 3).Scan(&txRes)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		require.Equal(t, 3, txRes)
+		require.Equal(t, int64(3), readCommittedStmtRetries.Load())
+	})
+
+	t.Run("read_committed_txn_retries_exceeded", func(t *testing.T) {
+		readCommittedStmtRetries.Store(0)
+
+		// inject_retry_errors_enabled is hardcoded to always inject an error
+		// 3 times, so if we lower max_retries_for_read_committed,
+		// the error should bubble up to the client.
+		_, err := db.Exec("SET max_retries_for_read_committed = 2")
+		require.NoError(t, err)
+		tx, err := db.BeginTx(ctx, &gosql.TxOptions{Isolation: gosql.LevelReadCommitted})
+		require.NoError(t, err)
+
+		var txRes int
+		err = tx.QueryRow("SELECT $1::int8", 3).Scan(&txRes)
+
+		require.Error(t, err)
+		pqErr := (*pq.Error)(nil)
+		require.ErrorAs(t, err, &pqErr)
+		require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
+		require.ErrorContains(t, pqErr, "read committed retry limit exceeded")
+		require.NoError(t, tx.Rollback())
+		require.Equal(t, int64(2), readCommittedStmtRetries.Load())
+	})
+
+	t.Run("read_committed_txn_already_sent_results", func(t *testing.T) {
+		readCommittedStmtRetries.Store(0)
+
+		// Choose a small results_buffer_size and make sure the statement retry
+		// does not occur.
+		pgURL, cleanupFn := sqlutils.PGUrl(
+			t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+		defer cleanupFn()
+		q := pgURL.Query()
+		q.Add("results_buffer_size", "4")
+		pgURL.RawQuery = q.Encode()
+		smallBufferDB, err := gosql.Open("postgres", pgURL.String())
+		require.NoError(t, err)
+		defer smallBufferDB.Close()
+
+		_, err = smallBufferDB.Exec("SET inject_retry_errors_enabled = 'true'")
+		require.NoError(t, err)
+
+		tx, err := smallBufferDB.BeginTx(ctx, &gosql.TxOptions{Isolation: gosql.LevelReadCommitted})
+		require.NoError(t, err)
+
+		var txRes int
+		err = tx.QueryRow("SELECT $1::int8", 3).Scan(&txRes)
+		require.Error(t, err)
+		pqErr := (*pq.Error)(nil)
+		require.ErrorAs(t, err, &pqErr)
+		require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
+		require.ErrorContains(t, pqErr, "cannot automatically retry since some results were already sent to the client")
+		require.NoError(t, tx.Rollback())
+		require.Equal(t, int64(0), readCommittedStmtRetries.Load())
+	})
+}
+
+func TestInjectRetryOnCommitErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	defer db.Close()
+
+	_, err := db.Exec("SET inject_retry_errors_on_commit_enabled = 'true'")
+	require.NoError(t, err)
+
+	t.Run("test_injection_failure_on_commit_without_savepoints", func(t *testing.T) {
+		var txRes int
+		for attemptCount := 1; attemptCount <= 10; attemptCount++ {
+			tx, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+
+			// Verify that SHOW is exempt from error injection.
+			var s string
+			err = tx.QueryRow("SHOW inject_retry_errors_on_commit_enabled").Scan(&s)
+			require.NoError(t, err)
+
+			if attemptCount == 5 {
+				_, err = tx.Exec("SET inject_retry_errors_on_commit_enabled = 'false'")
+				require.NoError(t, err)
+			}
+
+			err = tx.QueryRow("SELECT $1::int8", attemptCount).Scan(&txRes)
+			require.NoError(t, err)
+			err = tx.Commit()
+			if attemptCount >= 5 {
+				require.NoError(t, err)
+				break
+			} else {
+				pqErr := (*pq.Error)(nil)
+				require.ErrorAs(t, err, &pqErr)
+				require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
+				// We should not expect a rollback on commit errors.
+			}
+		}
+		require.Equal(t, 5, txRes)
+	})
+}
+
+func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	var shouldBlock atomic.Bool
+	blockingInternalTxns := make(chan struct{})
+	g := ctxgroup.WithContext(ctx)
+	params := base.TestServerArgs{}
+	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
+		AfterExecute: func(ctx context.Context, stmt string, isInternal bool, err error) {
+			if isInternal && shouldBlock.Load() {
+				<-blockingInternalTxns
+			}
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	defer sqlDB.Close()
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	selectQuery := "SELECT * FROM t.foo"
+	selectInternalQueryActive := `SELECT count(*) FROM crdb_internal.cluster_queries WHERE query = '` + selectQuery + `'`
+	selectUserQueryActive := `SELECT count(*) FROM [SHOW STATEMENTS] WHERE query = '` + selectQuery + `'`
+
+	sqlServer := s.SQLServer().(*sql.Server)
+	testDB := sqlutils.MakeSQLRunner(sqlDB)
+	testDB.Exec(t, "CREATE DATABASE t")
+	testDB.Exec(t, "CREATE TABLE t.foo (i INT PRIMARY KEY)")
+	testDB.Exec(t, "INSERT INTO t.foo VALUES (1)")
+
+	// Don't let internal transactions finish until the we're done counting
+	// the metrics. Use a closure so that the blockingInternalTxns channel
+	// can be closed with a defer.
+	func() {
+		shouldBlock.Store(true)
+		defer close(blockingInternalTxns)
+		prevInternalTxnsOpen := sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value()
+		prevInternalActiveStatements := sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value()
+
+		// Begin a user-initiated transaction.
+		testTx := testDB.Begin(t)
+
+		// Check that the number of open transactions has incremented, but not the
+		// internal metric.
+		require.Equal(t, int64(1), sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+		require.Equal(t, prevInternalTxnsOpen, sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value())
+
+		// Create a state of contention. Use a cancellable context so that the
+		// other queries that get blocked on this one don't deadlock if the test
+		// aborts.
+		_, err := testTx.ExecContext(ctx, "SELECT * FROM t.foo WHERE i = 1 FOR UPDATE")
+		require.NoError(t, err)
+
+		// Execute internal statement (this case is identical to opening an internal
+		// transaction).
+		g.GoCtx(func(ctx context.Context) error {
+			_, err := s.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+				ctx,
+				"test-internal-active-stmt-wait",
+				nil,
+				sessiondata.NodeUserSessionDataOverride,
+				selectQuery)
+			if err != nil {
+				return errors.Wrapf(err, "expected internal SELECT query to be successful, but encountered an error")
+			}
+			return nil
+		})
+
+		// Check that the internal statement is active.
+		testutils.SucceedsSoon(t, func() error {
+			row := testDB.QueryStr(t, selectInternalQueryActive)
+			if row[0][0] == "0" {
+				return errors.New("internal select query is not active yet")
+			}
+			return nil
+		})
+
+		testutils.SucceedsSoon(t, func() error {
+			// Check that the number of open user transactions has not incremented. Open
+			// transaction count already at one from initial user-initiated transaction.
+			if sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value() != 1 {
+				return errors.Newf("Wrong SQLTxnsOpen value. Expected: %d. Actual: %d", 1, sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+			}
+			// Check that the number of active user statements has not incremented.
+			if sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value() != 0 {
+				return errors.Newf("Wrong SQLActiveStatements value. Expected: %d. Actual: %d", 0, sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+			}
+			// The internal metrics should have updated.
+			if v := sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value(); v <= prevInternalTxnsOpen {
+				return errors.Newf("Wrong InternalSQLTxnsOpen value. Expected: greater than %d. Actual: %d", prevInternalTxnsOpen, v)
+			}
+			if v := sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value(); v <= prevInternalActiveStatements {
+				return errors.Newf("Wrong InternalSQLActiveStatements value. Expected: greater than %d. Actual: %d", prevInternalActiveStatements, v)
+			}
+			return nil
+		})
+
+		require.Equal(t, int64(1), sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+		require.Equal(t, int64(0), sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+		require.Less(t, prevInternalTxnsOpen, sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value())
+		require.Less(t, prevInternalActiveStatements, sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value())
+
+		// Create active user-initiated statement.
+		g.GoCtx(func(ctx context.Context) error {
+			_, err := sqlDB.Exec(selectQuery)
+			if err != nil {
+				return errors.Wrapf(err, "expected user SELECT query to be successful, but encountered an error")
+			}
+			return nil
+		})
+
+		// Check that the user statement is active.
+		testutils.SucceedsSoon(t, func() error {
+			row := testDB.QueryStr(t, selectUserQueryActive)
+			if row[0][0] == "0" {
+				return errors.New("user select query is not active yet")
+			}
+			return nil
+		})
+
+		testutils.SucceedsSoon(t, func() error {
+			// Check that the number of open user transactions has incremented. Second
+			// db connection creates an implicit user-initiated transaction.
+			if sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value() != 2 {
+				return errors.Newf("Wrong SQLTxnsOpen value. Expected: %d. Actual: %d", 2, sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+			}
+			// Check that the number of active user statements has incremented.
+			if sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value() != 1 {
+				return errors.Newf("Wrong SQLActiveStatements value. Expected: %d. Actual: %d", 1, sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+			}
+			return nil
+		})
+
+		require.Equal(t, int64(2), sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+		require.Equal(t, int64(1), sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+
+		// Commit the initial user-initiated transaction. The internal and user
+		// select queries are no longer in contention.
+		require.NoError(t, testTx.Commit())
+	}()
+
+	// Check that both the internal & user statements are no longer active.
+	testutils.SucceedsSoon(t, func() error {
+		userRow := testDB.QueryStr(t, selectUserQueryActive)
+		internalRow := testDB.QueryStr(t, selectInternalQueryActive)
+
+		if userRow[0][0] != "0" {
+			return errors.New("user select query is still active")
+		} else if internalRow[0][0] != "0" {
+			return errors.New("internal select query is still active")
+		}
+		return nil
+	})
+
+	testutils.SucceedsSoon(t, func() error {
+		// Check that the number of open transactions has decremented by 2 (should
+		// decrement for initial user transaction and user statement executed
+		// on second db connection).
+		if sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value() != 0 {
+			return errors.Newf("Wrong SQLTxnsOpen value. Expected: %d. Actual: %d", 0, sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+		}
+		// Check that the number of active statements has decremented by 1 (should
+		// not decrement for the internal active statement).
+		if sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value() != 0 {
+			return errors.Newf("Wrong SQLActiveStatements value. Expected: %d. Actual: %d", 0, sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+		}
+		return nil
+	})
+
+	require.Equal(t, int64(0), sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
+	require.Equal(t, int64(0), sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
+
+	// Wait for both goroutine queries to finish before calling defer.
+	require.NoError(t, g.Wait())
+}
+
+// TestEmptyTxnIsBeingCorrectlyCounted tests that SQL Active Transaction
+// metric correctly handles empty transactions.
+func TestEmptyTxnIsBeingCorrectlyCounted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	s, conn, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+	openSQLTxnCountPreEmptyTxns := s.SQLServer().(*sql.Server).Metrics.EngineMetrics.SQLTxnsOpen.Value()
+	numOfEmptyTxns := int64(100)
+
+	// Since we constantly have background transactions running, it introduces
+	// some uncertainties and makes it difficult to compare the exact value of
+	// sql.txns.open metrics. To account for the uncertainties, we execute a
+	// large number of empty transactions. Then we compare the sql.txns.open
+	// metrics before and after executing the batch empty transactions. We assert
+	// that the delta between two observations is less than the size of the batch.
+	for i := int64(0); i < numOfEmptyTxns; i++ {
+		sqlConn.Exec(t, "BEGIN;COMMIT;")
+	}
+
+	openSQLTxnCountPostEmptyTxns := s.SQLServer().(*sql.Server).Metrics.EngineMetrics.SQLTxnsOpen.Value()
+	require.Less(t, openSQLTxnCountPostEmptyTxns-openSQLTxnCountPreEmptyTxns, numOfEmptyTxns,
+		"expected the sql.txns.open counter to be properly decremented "+
+			"after executing empty transactions, but it was not")
+}
+
+// TestSessionTotalActiveTime tests that a session's total active time is
+// correctly being recorded as transactions are executed.
+func TestSessionTotalActiveTime(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	srv, mainDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	_, err := mainDB.Exec(fmt.Sprintf("CREATE USER %s", username.TestUser))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rawSQL := s.SQLConn(t, serverutils.User(username.TestUser))
+
+	getSessionWithTestUser := func() *serverpb.Session {
+		sessions := s.SQLServer().(*sql.Server).GetExecutorConfig().SessionRegistry.SerializeAll()
+		for _, s := range sessions {
+			if s.Username == username.TestUser {
+				return &s
+			}
+		}
+		t.Fatalf("expected session with username %s", username.TestUser)
+		return nil
+	}
+
+	sqlDB := sqlutils.MakeSQLRunner(rawSQL)
+	sqlDB.Exec(t, "SELECT 1")
+	session := getSessionWithTestUser()
+	activeTimeNanos := session.TotalActiveTime.Nanoseconds()
+
+	// We will execute different types of transactions.
+	// After each execution, verify the total active time has increased, but is no
+	// longer increasing after the transaction has completed.
+	testCases := []struct {
+		Query string
+		// SessionActiveAfterExecution signifies that the active time should still be active after this query.
+		SessionActiveAfterExecution bool
+	}{
+		{"SELECT 1", false},
+		// Test explicit transaction.
+		{"BEGIN", true},
+		{"SELECT 1", true},
+		{"SELECT  1, 2", true},
+		{"COMMIT", false},
+		{"BEGIN", true},
+		{"SELECT crdb_internal.force_retry('1s')", true},
+		{"COMMIT", false},
+	}
+
+	for _, tc := range testCases {
+		sqlDB.Exec(t, tc.Query)
+		if tc.Query == "crdb_internal.force_retry('1s'" {
+			continue
+		}
+		// Check that the total active time has increased.
+		session = getSessionWithTestUser()
+		require.Greater(t, session.TotalActiveTime.Nanoseconds(), activeTimeNanos)
+
+		activeTimeNanos = session.TotalActiveTime.Nanoseconds()
+		session = getSessionWithTestUser()
+
+		if tc.SessionActiveAfterExecution {
+			require.Greater(t, session.TotalActiveTime.Nanoseconds(), activeTimeNanos)
+		} else {
+			require.Equal(t, activeTimeNanos, session.TotalActiveTime.Nanoseconds())
+		}
+
+		activeTimeNanos = session.TotalActiveTime.Nanoseconds()
+	}
 }
 
 // dynamicRequestFilter exposes a filter method which is a
@@ -1413,33 +2042,22 @@ func (f *dynamicRequestFilter) setFilter(filter kvserverbase.ReplicaRequestFilte
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter.
-func (f *dynamicRequestFilter) filter(
-	ctx context.Context, request roachpb.BatchRequest,
-) *roachpb.Error {
+func (f *dynamicRequestFilter) filter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return f.v.Load().(kvserverbase.ReplicaRequestFilter)(ctx, request)
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter that does nothing.
-func noopRequestFilter(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+func noopRequestFilter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return nil
 }
-
-type fakeSession struct{ exp hlc.Timestamp }
-
-func (f fakeSession) ID() sqlliveness.SessionID { return "foo" }
-func (f fakeSession) Expiration() hlc.Timestamp { return f.exp }
-func (f fakeSession) RegisterCallbackForSessionExpiry(func(ctx context.Context)) {
-	panic("unimplemented")
-}
-
-var _ sqlliveness.Session = (*fakeSession)(nil)
 
 func getTxnID(t *testing.T, tx *gosql.Tx) (id string) {
 	t.Helper()
 	sqlutils.MakeSQLRunner(tx).QueryRow(t, `
-SELECT id
-  FROM crdb_internal.node_transactions
- WHERE session_id = (SELECT * FROM [SHOW session_id])`,
+SELECT id 
+  FROM crdb_internal.node_transactions a
+  JOIN [SHOW session_id] b ON a.session_id = b.session_id
+`,
 	).Scan(&id)
 	return id
 }

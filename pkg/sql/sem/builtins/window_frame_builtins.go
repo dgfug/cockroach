@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -15,7 +10,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
@@ -36,13 +32,14 @@ type indexedValue struct {
 // It assumes that the frame bounds will never go back, i.e. non-decreasing
 // sequences of frame start and frame end indices.
 type slidingWindow struct {
-	values  ring.Buffer
-	evalCtx *tree.EvalContext
-	cmp     func(*tree.EvalContext, tree.Datum, tree.Datum) int
+	values  ring.Buffer[*indexedValue]
+	evalCtx *eval.Context
+	cmp     func(context.Context, *eval.Context, tree.Datum, tree.Datum) (int, error)
 }
 
 func makeSlidingWindow(
-	evalCtx *tree.EvalContext, cmp func(*tree.EvalContext, tree.Datum, tree.Datum) int,
+	evalCtx *eval.Context,
+	cmp func(context.Context, *eval.Context, tree.Datum, tree.Datum) (int, error),
 ) *slidingWindow {
 	return &slidingWindow{
 		evalCtx: evalCtx,
@@ -55,21 +52,25 @@ func makeSlidingWindow(
 // deque always contains unique values sorted in descending order of their
 // "priority" (when we encounter duplicates, we always keep the one with the
 // largest idx).
-func (sw *slidingWindow) add(iv *indexedValue) {
+func (sw *slidingWindow) add(ctx context.Context, iv *indexedValue) error {
 	for i := sw.values.Len() - 1; i >= 0; i-- {
-		if sw.cmp(sw.evalCtx, sw.values.Get(i).(*indexedValue).value, iv.value) > 0 {
+		cmp, err := sw.cmp(ctx, sw.evalCtx, sw.values.Get(i).value, iv.value)
+		if err != nil {
+			return err
+		} else if cmp > 0 {
 			break
 		}
 		sw.values.RemoveLast()
 	}
 	sw.values.AddLast(iv)
+	return nil
 }
 
 // removeAllBefore removes all values from the beginning of the deque that have
 // indices smaller than given 'idx'. This operation corresponds to shifting the
 // start of the frame up to 'idx'.
 func (sw *slidingWindow) removeAllBefore(idx int) {
-	for sw.values.Len() > 0 && sw.values.Get(0).(*indexedValue).idx < idx {
+	for sw.values.Len() > 0 && sw.values.Get(0).idx < idx {
 		sw.values.RemoveFirst()
 	}
 }
@@ -77,7 +78,7 @@ func (sw *slidingWindow) removeAllBefore(idx int) {
 func (sw *slidingWindow) string() string {
 	var builder strings.Builder
 	for i := 0; i < sw.values.Len(); i++ {
-		builder.WriteString(fmt.Sprintf("(%v, %v)\t", sw.values.Get(i).(*indexedValue).value, sw.values.Get(i).(*indexedValue).idx))
+		builder.WriteString(fmt.Sprintf("(%v, %v)\t", sw.values.Get(i).value, sw.values.Get(i).idx))
 	}
 	return builder.String()
 }
@@ -93,7 +94,7 @@ type slidingWindowFunc struct {
 
 // Compute implements WindowFunc interface.
 func (w *slidingWindowFunc) Compute(
-	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
+	ctx context.Context, evalCtx *eval.Context, wfr *eval.WindowFrameRun,
 ) (tree.Datum, error) {
 	frameStartIdx, err := wfr.FrameStartIdx(ctx, evalCtx)
 	if err != nil {
@@ -129,7 +130,10 @@ func (w *slidingWindowFunc) Compute(
 			if res == nil {
 				res = args[0]
 			} else {
-				if w.sw.cmp(evalCtx, args[0], res) > 0 {
+				cmp, err := w.sw.cmp(ctx, evalCtx, args[0], res)
+				if err != nil {
+					return nil, err
+				} else if cmp > 0 {
 					res = args[0]
 				}
 			}
@@ -163,7 +167,10 @@ func (w *slidingWindowFunc) Compute(
 			// case of a window frame with no non-null values is handled below.
 			continue
 		}
-		w.sw.add(&indexedValue{value: value, idx: idx})
+		err = w.sw.add(ctx, &indexedValue{value: value, idx: idx})
+		if err != nil {
+			return nil, err
+		}
 	}
 	w.prevEnd = frameEndIdx
 
@@ -174,14 +181,7 @@ func (w *slidingWindowFunc) Compute(
 
 	// The datum with "highest priority" within the frame is at the very front
 	// of the deque.
-	return w.sw.values.GetFirst().(*indexedValue).value, nil
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	return w.sw.values.GetFirst().value, nil
 }
 
 // Reset implements tree.WindowFunc interface.
@@ -191,7 +191,7 @@ func (w *slidingWindowFunc) Reset(context.Context) {
 }
 
 // Close implements WindowFunc interface.
-func (w *slidingWindowFunc) Close(context.Context, *tree.EvalContext) {
+func (w *slidingWindowFunc) Close(context.Context, *eval.Context) {
 	w.sw = nil
 }
 
@@ -199,7 +199,7 @@ func (w *slidingWindowFunc) Close(context.Context, *tree.EvalContext) {
 // a frame. It assumes that the frame bounds will never go back, i.e.
 // non-decreasing sequences of frame start and frame end indices.
 type slidingWindowSumFunc struct {
-	agg                tree.AggregateFunc // one of the four SumAggregates
+	agg                eval.AggregateFunc // one of the four SumAggregates
 	prevStart, prevEnd int
 
 	// lastNonNullIdx is the index of the latest non-null value seen in the
@@ -210,7 +210,7 @@ type slidingWindowSumFunc struct {
 
 const noNonNullSeen = -1
 
-func newSlidingWindowSumFunc(agg tree.AggregateFunc) *slidingWindowSumFunc {
+func newSlidingWindowSumFunc(agg eval.AggregateFunc) *slidingWindowSumFunc {
 	return &slidingWindowSumFunc{
 		agg:            agg,
 		lastNonNullIdx: noNonNullSeen,
@@ -220,7 +220,7 @@ func newSlidingWindowSumFunc(agg tree.AggregateFunc) *slidingWindowSumFunc {
 // removeAllBefore subtracts the values from all the rows that are no longer in
 // the frame.
 func (w *slidingWindowSumFunc) removeAllBefore(
-	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
+	ctx context.Context, evalCtx *eval.Context, wfr *eval.WindowFrameRun,
 ) error {
 	frameStartIdx, err := wfr.FrameStartIdx(ctx, evalCtx)
 	if err != nil {
@@ -265,7 +265,7 @@ func (w *slidingWindowSumFunc) removeAllBefore(
 
 // Compute implements WindowFunc interface.
 func (w *slidingWindowSumFunc) Compute(
-	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
+	ctx context.Context, evalCtx *eval.Context, wfr *eval.WindowFrameRun,
 ) (tree.Datum, error) {
 	frameStartIdx, err := wfr.FrameStartIdx(ctx, evalCtx)
 	if err != nil {
@@ -347,7 +347,7 @@ func (w *slidingWindowSumFunc) Reset(ctx context.Context) {
 }
 
 // Close implements WindowFunc interface.
-func (w *slidingWindowSumFunc) Close(ctx context.Context, _ *tree.EvalContext) {
+func (w *slidingWindowSumFunc) Close(ctx context.Context, _ *eval.Context) {
 	w.agg.Close(ctx)
 }
 
@@ -358,7 +358,7 @@ type avgWindowFunc struct {
 
 // Compute implements WindowFunc interface.
 func (w *avgWindowFunc) Compute(
-	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
+	ctx context.Context, evalCtx *eval.Context, wfr *eval.WindowFrameRun,
 ) (tree.Datum, error) {
 	sum, err := w.sum.Compute(ctx, evalCtx, wfr)
 	if err != nil {
@@ -424,6 +424,6 @@ func (w *avgWindowFunc) Reset(ctx context.Context) {
 }
 
 // Close implements WindowFunc interface.
-func (w *avgWindowFunc) Close(ctx context.Context, evalCtx *tree.EvalContext) {
+func (w *avgWindowFunc) Close(ctx context.Context, evalCtx *eval.Context) {
 	w.sum.Close(ctx, evalCtx)
 }

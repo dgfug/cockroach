@@ -1,10 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package engineccl
 
@@ -13,11 +10,14 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // FileCipherStreamCreator wraps the KeyManager interface and provides functions to create a
@@ -29,8 +29,10 @@ type FileCipherStreamCreator struct {
 }
 
 const (
-	// The difference is 4 bytes, which are supplied by the counter.
 	ctrBlockSize = 16
+	// DEPRECATED: The V1 implementation had a distinction between a 12-byte
+	// "nonce" and a 4-byte "counter". This was incorrect and we now treat the
+	// IV/nonce as a single 128-bit value.
 	ctrNonceSize = 12
 )
 
@@ -39,34 +41,61 @@ const (
 func (c *FileCipherStreamCreator) CreateNew(
 	ctx context.Context,
 ) (*enginepbccl.EncryptionSettings, FileStream, error) {
-	key, err := c.keyManager.ActiveKey(ctx)
+	key, err := c.keyManager.ActiveKeyForWriter(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	settings := &enginepbccl.EncryptionSettings{}
 	if key == nil || key.Info.EncryptionType == enginepbccl.EncryptionType_Plaintext {
 		settings.EncryptionType = enginepbccl.EncryptionType_Plaintext
-		stream := &filePlainStream{}
-		return settings, stream, nil
+	} else {
+		settings.EncryptionType = key.Info.EncryptionType
+		settings.KeyId = key.Info.KeyId
+		settings.Nonce = make([]byte, ctrNonceSize)
+		_, err = rand.Read(settings.Nonce)
+		if err != nil {
+			return nil, nil, err
+		}
+		counterBytes := make([]byte, 4)
+		if _, err = rand.Read(counterBytes); err != nil {
+			return nil, nil, err
+		}
+		// Does not matter how we convert 4 random bytes into uint32
+		settings.Counter = binary.LittleEndian.Uint32(counterBytes)
 	}
-	settings.EncryptionType = key.Info.EncryptionType
-	settings.KeyId = key.Info.KeyId
-	settings.Nonce = make([]byte, ctrNonceSize)
-	_, err = rand.Read(settings.Nonce)
+
+	fcs, err := createFileCipherStream(settings, key)
 	if err != nil {
 		return nil, nil, err
 	}
-	counterBytes := make([]byte, 4)
-	if _, err = rand.Read(counterBytes); err != nil {
-		return nil, nil, err
+	return settings, fcs, nil
+}
+
+func createFileCipherStream(
+	settings *enginepbccl.EncryptionSettings, key *enginepbccl.SecretKey,
+) (FileStream, error) {
+	switch settings.EncryptionType {
+	case enginepbccl.EncryptionType_Plaintext:
+		return &filePlainStream{}, nil
+
+	case enginepbccl.EncryptionType_AES128_CTR, enginepbccl.EncryptionType_AES192_CTR, enginepbccl.EncryptionType_AES256_CTR:
+		ctrCS, err := newCTRBlockCipherStream(key, settings.Nonce, settings.Counter)
+		if err != nil {
+			return nil, err
+		}
+		return &fileCipherStream{bcs: ctrCS}, nil
+
+	case enginepbccl.EncryptionType_AES_128_CTR_V2, enginepbccl.EncryptionType_AES_192_CTR_V2, enginepbccl.EncryptionType_AES_256_CTR_V2:
+		var iv [ctrBlockSize]byte
+		copy(iv[:ctrNonceSize], settings.Nonce)
+		binary.BigEndian.PutUint32(iv[ctrNonceSize:ctrNonceSize+4], settings.Counter)
+		fcs, err := newFileCipherStreamV2(key.Key, iv[:])
+		if err != nil {
+			return nil, err
+		}
+		return fcs, nil
 	}
-	// Does not matter how we convert 4 random bytes into uint32
-	settings.Counter = binary.LittleEndian.Uint32(counterBytes)
-	ctrCS, err := newCTRBlockCipherStream(key, settings.Nonce, settings.Counter)
-	if err != nil {
-		return nil, nil, err
-	}
-	return settings, &fileCipherStream{bcs: ctrCS}, nil
+	return nil, fmt.Errorf("unknown encryption type %s", settings.EncryptionType)
 }
 
 // CreateExisting creates a FileStream for an existing file by looking up the key described by
@@ -81,11 +110,7 @@ func (c *FileCipherStreamCreator) CreateExisting(
 	if err != nil {
 		return nil, err
 	}
-	ctrCS, err := newCTRBlockCipherStream(key, settings.Nonce, settings.Counter)
-	if err != nil {
-		return nil, err
-	}
-	return &fileCipherStream{bcs: ctrCS}, nil
+	return createFileCipherStream(settings, key)
 }
 
 // FileStream encrypts/decrypts byte slices at arbitrary file offsets.
@@ -192,7 +217,77 @@ func (s *cTRBlockCipherStream) transform(blockIndex uint64, data []byte, scratch
 	binary.BigEndian.PutUint32(iv[len(iv):len(iv)+4], blockCounter)
 	iv = iv[0 : len(iv)+4]
 	s.cBlock.Encrypt(iv, iv)
-	for i := 0; i < ctrBlockSize; i++ {
-		data[i] = data[i] ^ iv[i]
+	subtle.XORBytes(data, data, iv)
+}
+
+type fileCipherStreamV2 struct {
+	aesBlock cipher.Block
+	// High and low portions of the 128-bit IV (big-endian).
+	ivHi, ivLo uint64
+	mu         struct {
+		syncutil.Mutex
+		// If ctr is non-nil, it is ready to use at fileOffset. This is
+		// effectively a single-entry cache; it would be reasonable to change it
+		// to a map from fileOffset to CTR objects to track multiple sequential
+		// "cursors".
+		fileOffset int64
+		ctr        cipher.Stream
 	}
+}
+
+func newFileCipherStreamV2(key, iv []byte) (*fileCipherStreamV2, error) {
+	aesBlock, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return &fileCipherStreamV2{
+		aesBlock: aesBlock,
+		ivHi:     binary.BigEndian.Uint64(iv[:8]),
+		ivLo:     binary.BigEndian.Uint64(iv[8:]),
+	}, nil
+}
+
+func (s *fileCipherStreamV2) Encrypt(fileOffset int64, data []byte) {
+	var ctr cipher.Stream
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.mu.fileOffset == fileOffset {
+			ctr = s.mu.ctr
+			s.mu.ctr = nil
+		}
+	}()
+	if ctr == nil {
+		// We need to create a new CTR object seeked to the correct position.
+		// This means we reimplement some of the IV math that appears inside the
+		// CTR implementation.
+		blockIndex := uint64(fileOffset / int64(ctrBlockSize))
+		blockOffset := int(fileOffset % int64(ctrBlockSize))
+		// Add the block index to the 128-bit IV. Overflow in the "hi" portion
+		// just wraps around so we can use plain uint64 addition instead of
+		// bits.Add64.
+		blockIVLo, carry := bits.Add64(s.ivLo, blockIndex, 0)
+		blockIVHi := s.ivHi + carry
+		var iv [ctrBlockSize]byte
+		binary.BigEndian.PutUint64(iv[0:8], blockIVHi)
+		binary.BigEndian.PutUint64(iv[8:], blockIVLo)
+		ctr = cipher.NewCTR(s.aesBlock, iv[:])
+		if blockOffset != 0 {
+			// If our read was not block-aligned, consume and discard the partial block.
+			var scratch [ctrBlockSize]byte
+			ctr.XORKeyStream(scratch[0:blockOffset], scratch[0:blockOffset])
+		}
+	}
+	ctr.XORKeyStream(data, data)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Save our CTR object for reuse in case the next operation follows directly
+	// after this one.
+	s.mu.ctr = ctr
+	s.mu.fileOffset = fileOffset + int64(len(data))
+}
+
+func (s *fileCipherStreamV2) Decrypt(fileOffset int64, data []byte) {
+	// For CTR mode, encryption and decryption are the same.
+	s.Encrypt(fileOffset, data)
 }

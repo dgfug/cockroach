@@ -1,21 +1,17 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import Long from "long";
 
 import { INodeStatus } from "../../util";
-import Long from "long";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 
 type INodesResponse = cockroach.server.serverpb.INodesResponse;
 
-export const getNodeStatus = () => {
-  const nodeResp: INodeStatus = {
+export const getNodeStatus = (): INodeStatus => {
+  return {
     desc: {
       node_id: 1,
       address: {
@@ -65,10 +61,10 @@ export const getNodeStatus = () => {
       "admission.wait_durations.kv-stores-p75": 0,
       "admission.wait_durations.sql-kv-response-p75": 0,
       "admission.wait_durations.sql-sql-response-p75": 0,
-      "admission.wait_sum.kv": 0,
-      "admission.wait_sum.kv-stores": 0,
-      "admission.wait_sum.sql-kv-response": 0,
-      "admission.wait_sum.sql-sql-response": 0,
+      "admission.wait_durations.kv-sum": 0,
+      "admission.wait_durations.kv-stores-sum": 0,
+      "admission.wait_durations.sql-kv-response-sum": 0,
+      "admission.wait_durations.sql-sql-response-sum": 0,
       "build.timestamp": 1610970297,
       "changefeed.buffer_entries.in": 0,
       "changefeed.buffer_entries.out": 0,
@@ -90,7 +86,8 @@ export const getNodeStatus = () => {
       "changefeed.poll_request_nanos-p99.999": 0,
       "changefeed.processing_nanos": 0,
       "changefeed.running": 0,
-      "changefeed.table_metadata_nanos": 0,
+      "changefeed.schemafeed.table_metadata_nanos": 0,
+      "changefeed.schemafeed.table_history_scans": 0,
       "clock-offset.meannanos": 68000,
       "clock-offset.stddevnanos": 245000,
       "distsender.batches": 8006,
@@ -305,7 +302,8 @@ export const getNodeStatus = () => {
       "round-trip-latency-p99.999": 1114111,
       "rpc.heartbeats.failed": 0,
       "rpc.heartbeats.initializing": 0,
-      "rpc.heartbeats.loops.exited": 0,
+      "rpc.heartbeats.connection_failures": 0,
+      "rpc.heartbeats.round-trip.latency": 0,
       "rpc.heartbeats.loops.started": 1,
       "rpc.heartbeats.nominal": 1,
       "schedules.error": 0,
@@ -405,6 +403,10 @@ export const getNodeStatus = () => {
       "sql.feature_flag_denial": 0,
       "sql.hydrated_table_cache.hits": 0,
       "sql.hydrated_table_cache.misses": 0,
+      "sql.hydrated_udf_cache.hits": 0,
+      "sql.hydrated_udf_cache.misses": 0,
+      "sql.hydrated_schema_cache.hits": 0,
+      "sql.hydrated_schema_cache.misses": 0,
       "sql.insert.count": 0,
       "sql.insert.count.internal": 343,
       "sql.insert.started.count": 0,
@@ -607,8 +609,12 @@ export const getNodeStatus = () => {
       "sys.host.disk.write.time": 42461472554,
       "sys.host.net.recv.bytes": 89868354,
       "sys.host.net.recv.packets": 26750,
+      "sys.host.net.recv.err": 15,
+      "sys.host.net.recv.dropped": 20,
       "sys.host.net.send.bytes": 89604637,
       "sys.host.net.send.packets": 27605,
+      "sys.host.net.send.err": 1,
+      "sys.host.net.send.dropped": 15,
       "sys.rss": 242069504,
       "sys.uptime": 1790,
       "timeseries.write.bytes": 14810484,
@@ -646,7 +652,6 @@ export const getNodeStatus = () => {
       "txn.restarts.txnpush": 0,
       "txn.restarts.unknown": 0,
       "txn.restarts.writetooold": 0,
-      "txn.restarts.writetoooldmulti": 0,
     },
     store_statuses: [
       {
@@ -802,7 +807,6 @@ export const getNodeStatus = () => {
           "queue.tsmaintenance.process.success": 3,
           "queue.tsmaintenance.processingnanos": 174301000,
           "raft.commandsapplied": 0,
-          "raft.enqueued.pending": 0,
           "raft.entrycache.accesses": 485,
           "raft.entrycache.bytes": 217172,
           "raft.entrycache.hits": 331,
@@ -895,7 +899,6 @@ export const getNodeStatus = () => {
           "requests.slow.raft": 0,
           "rocksdb.block.cache.hits": 52720,
           "rocksdb.block.cache.misses": 4276,
-          "rocksdb.block.cache.pinned-usage": 0,
           "rocksdb.block.cache.usage": 2034335,
           "rocksdb.bloom.filter.prefix.checked": 916,
           "rocksdb.bloom.filter.prefix.useful": 839,
@@ -960,15 +963,12 @@ export const getNodeStatus = () => {
     ],
     activity: {
       "1": {
-        incoming: Long.fromString("46834"),
-        outgoing: Long.fromString("56573"),
         latency: Long.fromString("2846186"),
       },
     },
     total_system_memory: Long.fromString("17179869184"),
     num_cpus: 4,
   };
-  return nodeResp;
 };
 
 export const getNodesResponse = (): INodesResponse => {

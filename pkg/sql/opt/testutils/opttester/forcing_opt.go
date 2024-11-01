@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/errors"
 )
 
 // forcingOptimizer is a wrapper around an Optimizer which adds low-level
@@ -55,28 +52,28 @@ type forcingOptimizer struct {
 
 // newForcingOptimizer creates a forcing optimizer that stops applying any rules
 // after <steps> rules are matched. If ignoreNormRules is true, normalization
-// rules don't count against this limit. If disableCheckExpr is true, expression
-// validation in CheckExpr will not run.
+// rules don't count against this limit.
 func newForcingOptimizer(
-	tester *OptTester, steps int, ignoreNormRules bool, disableCheckExpr bool,
+	tester *OptTester, steps int, ignoreNormRules bool,
 ) (*forcingOptimizer, error) {
 	fo := &forcingOptimizer{
 		remaining:   steps,
 		lastMatched: opt.InvalidRuleName,
 	}
-	fo.o.Init(&tester.evalCtx, tester.catalog)
+	fo.o.Init(context.Background(), &tester.evalCtx, tester.catalog)
 	fo.o.Factory().FoldingControl().AllowStableFolds()
 	fo.coster.Init(&fo.o, &fo.groups)
 	fo.o.SetCoster(&fo.coster)
+	fo.o.Factory().SetDisabledRules(tester.Flags.DisableRules)
 
 	fo.o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
+		if tester.Flags.DisableRules.Contains(int(ruleName)) {
+			return false
+		}
 		if ignoreNormRules && ruleName.IsNormalize() {
 			return true
 		}
 		if fo.remaining == 0 {
-			return false
-		}
-		if tester.Flags.DisableRules.Contains(int(ruleName)) {
 			return false
 		}
 		fo.remaining--
@@ -101,7 +98,7 @@ func newForcingOptimizer(
 		fo.groups.AddGroup(expr)
 	})
 
-	if disableCheckExpr {
+	if tester.Flags.DisableCheckExpr {
 		fo.o.Memo().DisableCheckExpr()
 	}
 
@@ -121,9 +118,20 @@ func (fo *forcingOptimizer) Optimize() opt.Expr {
 	return expr
 }
 
-// LookupPath returns the path of the given node.
+// LookupPath returns the path of the given node. If a path is not found, it
+// returns nil.
 func (fo *forcingOptimizer) LookupPath(target opt.Expr) []memoLoc {
 	return fo.groups.FindPath(fo.o.Memo().RootExpr(), target)
+}
+
+// MustLookupPath returns the path of the given node. If a path is not found, it
+// panics.
+func (fo *forcingOptimizer) MustLookupPath(target opt.Expr) []memoLoc {
+	path := fo.LookupPath(target)
+	if path == nil {
+		panic(errors.AssertionFailedf("could not find path to expr (%s)", target.Op()))
+	}
+	return path
 }
 
 // RestrictToExpr sets up the optimizer to restrict the result to only those
@@ -166,12 +174,30 @@ func (fc *forcingCoster) RestrictGroupToMember(loc memoLoc) {
 
 // ComputeCost is part of the xform.Coster interface.
 func (fc *forcingCoster) ComputeCost(e memo.RelExpr, required *physical.Required) memo.Cost {
+	// Always compute the cost even in the case that memo.MaxCost is returned
+	// below. This ensures that Memoize[Expr] functions in the statistics
+	// builder are still invoked even when a particular expression path is
+	// required via fc.restricted. Because groupIDs are assigned in
+	// Memoize[Expr] functions, invoking these functions in the same order and
+	// number is critical for expressions to be assigned the same groupID for
+	// each step of the forcing optimizer, and thus, allowing the restricted
+	// path mechanism to function properly. If some Memoize[Expr] functions are
+	// not called, then the groupIDs in the restricted path will not match the
+	// groupIDs of the expressions in the memo to restrict to.
+	cost := fc.inner.ComputeCost(e, required)
 	if fc.restricted != nil {
 		loc := fc.groups.MemoLoc(e)
 		if mIdx, ok := fc.restricted[loc.group]; ok && loc.member != mIdx {
-			return memo.MaxCost
+			cost = memo.MaxCost
 		}
 	}
 
-	return fc.inner.ComputeCost(e, required)
+	return cost
+}
+
+// MaybeGetBestCostRelation is part of the xform.Coster interface.
+func (fc *forcingCoster) MaybeGetBestCostRelation(
+	grp memo.RelExpr, required *physical.Required,
+) (best memo.RelExpr, ok bool) {
+	return fc.o.MaybeGetBestCostRelation(grp, required)
 }

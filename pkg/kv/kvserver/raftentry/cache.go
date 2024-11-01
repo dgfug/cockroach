@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package raftentry provides a cache for entries to avoid extra
 // deserializations.
@@ -17,10 +12,11 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Cache is a specialized data structure for storing deserialized raftpb.Entry
@@ -99,11 +95,11 @@ const partitionSize = int32(unsafe.Sizeof(partition{}))
 // implement the below interface.
 type rangeCache interface {
 	add(ent []raftpb.Entry) (bytesAdded, entriesAdded int32)
-	truncateFrom(lo uint64) (bytesRemoved, entriesRemoved int32)
-	clearTo(hi uint64) (bytesRemoved, entriesRemoved int32)
-	get(index uint64) (raftpb.Entry, bool)
-	scan(ents []raftpb.Entry, lo, hi, maxBytes uint64) (
-		_ []raftpb.Entry, bytes uint64, nextIdx uint64, exceededMaxBytes bool)
+	truncateFrom(lo kvpb.RaftIndex) (bytesRemoved, entriesRemoved int32)
+	clearTo(hi kvpb.RaftIndex) (bytesRemoved, entriesRemoved int32)
+	get(index kvpb.RaftIndex) (raftpb.Entry, bool)
+	scan(ents []raftpb.Entry, lo, hi kvpb.RaftIndex, maxBytes uint64) (
+		_ []raftpb.Entry, bytes uint64, nextIdx kvpb.RaftIndex, exceededMaxBytes bool)
 }
 
 // ringBuf implements rangeCache.
@@ -188,7 +184,7 @@ func (c *Cache) Add(id roachpb.RangeID, ents []raftpb.Entry, truncate bool) {
 		// Note that ents[0].Index may not even be in the cache
 		// at this point. `truncateFrom` will still remove any entries
 		// it may have at indexes >= truncIdx, as instructed.
-		truncIdx := ents[0].Index
+		truncIdx := kvpb.RaftIndex(ents[0].Index)
 		bytesRemoved, entriesRemoved = p.truncateFrom(truncIdx)
 	}
 	if add {
@@ -198,7 +194,7 @@ func (c *Cache) Add(id roachpb.RangeID, ents []raftpb.Entry, truncate bool) {
 }
 
 // Clear removes all entries on the given range with index less than hi.
-func (c *Cache) Clear(id roachpb.RangeID, hi uint64) {
+func (c *Cache) Clear(id roachpb.RangeID, hi kvpb.RaftIndex) {
 	c.mu.Lock()
 	p := c.getPartLocked(id, false /* create */, false /* recordUse */)
 	if p == nil {
@@ -214,7 +210,7 @@ func (c *Cache) Clear(id roachpb.RangeID, hi uint64) {
 
 // Get returns the entry for the specified index and true for the second return
 // value. If the index is not present in the cache, false is returned.
-func (c *Cache) Get(id roachpb.RangeID, idx uint64) (e raftpb.Entry, ok bool) {
+func (c *Cache) Get(id roachpb.RangeID, idx kvpb.RaftIndex) (e raftpb.Entry, ok bool) {
 	c.metrics.Accesses.Inc(1)
 	c.mu.Lock()
 	p := c.getPartLocked(id, false /* create */, true /* recordUse */)
@@ -227,6 +223,7 @@ func (c *Cache) Get(id roachpb.RangeID, idx uint64) (e raftpb.Entry, ok bool) {
 	e, ok = p.get(idx)
 	if ok {
 		c.metrics.Hits.Inc(1)
+		c.metrics.ReadBytes.Inc(int64(e.Size()))
 	}
 	return e, ok
 }
@@ -238,8 +235,8 @@ func (c *Cache) Get(id roachpb.RangeID, idx uint64) (e raftpb.Entry, ok bool) {
 // cache miss occurs. The returned size reflects the size of the returned
 // entries.
 func (c *Cache) Scan(
-	ents []raftpb.Entry, id roachpb.RangeID, lo, hi, maxBytes uint64,
-) (_ []raftpb.Entry, bytes uint64, nextIdx uint64, exceededMaxBytes bool) {
+	ents []raftpb.Entry, id roachpb.RangeID, lo, hi kvpb.RaftIndex, maxBytes uint64,
+) (_ []raftpb.Entry, bytes uint64, nextIdx kvpb.RaftIndex, exceededMaxBytes bool) {
 	c.metrics.Accesses.Inc(1)
 	c.mu.Lock()
 	p := c.getPartLocked(id, false /* create */, true /* recordUse */)
@@ -251,9 +248,11 @@ func (c *Cache) Scan(
 	defer p.mu.RUnlock()
 
 	ents, bytes, nextIdx, exceededMaxBytes = p.scan(ents, lo, hi, maxBytes)
+	// Track all bytes that are returned to caller, but only consider an access a
+	// "hit" if it returns all requested entries or stops short because of a
+	// maximum bytes limit.
+	c.metrics.ReadBytes.Inc(int64(bytes))
 	if nextIdx == hi || exceededMaxBytes {
-		// Only consider an access a "hit" if it returns all requested entries or
-		// stops short because of a maximum bytes limit.
 		c.metrics.Hits.Inc(1)
 	}
 	return ents, bytes, nextIdx, exceededMaxBytes

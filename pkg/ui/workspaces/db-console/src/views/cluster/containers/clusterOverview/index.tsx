@@ -1,13 +1,10 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { util } from "@cockroachlabs/cluster-ui";
+import { Skeleton } from "antd";
 import classNames from "classnames";
 import d3 from "d3";
 import React from "react";
@@ -15,14 +12,14 @@ import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
-import { AdminUIState } from "src/redux/state";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
-import { Bytes as formatBytes } from "src/util/format";
-import createChartComponent from "src/views/shared/util/d3-react";
-import capacityChart from "./capacity";
-import spinner from "assets/spinner.gif";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
+import { nodeSumsSelector } from "src/redux/nodes";
+import { AdminUIState } from "src/redux/state";
 import EmailSubscription from "src/views/dashboard/emailSubscription";
+import OverviewListAlerts from "src/views/shared/containers/alerts/overviewListAlerts";
+import createChartComponent from "src/views/shared/util/d3-react";
+
+import capacityChart from "./capacity";
 import "./cluster.styl";
 import {
   CapacityUsageTooltip,
@@ -30,6 +27,7 @@ import {
   UsableTooltip,
   LiveNodesTooltip,
   SuspectNodesTooltip,
+  DrainingNodesTooltip,
   DeadNodesTooltip,
   TotalRangesTooltip,
   UnderReplicatedRangesTooltip,
@@ -46,6 +44,7 @@ interface CapacityUsageProps {
 const formatPercentage = d3.format("0.1%");
 
 function renderCapacityUsage(props: CapacityUsageProps) {
+  const { Bytes } = util;
   const { usedCapacity, usableCapacity } = props;
   const usedPercentage =
     usableCapacity !== 0 ? usedCapacity / usableCapacity : 0;
@@ -68,21 +67,21 @@ function renderCapacityUsage(props: CapacityUsageProps) {
       <UsedTooltip>Used</UsedTooltip>
     </div>,
     <div className="capacity-usage cluster-summary__metric storage-used">
-      {formatBytes(usedCapacity)}
+      {Bytes(usedCapacity)}
     </div>,
     <div className="capacity-usage cluster-summary__label storage-usable">
       <UsableTooltip>Usable</UsableTooltip>
     </div>,
     <div className="capacity-usage cluster-summary__metric storage-usable">
-      {formatBytes(usableCapacity)}
+      {Bytes(usableCapacity)}
     </div>,
   ];
 }
 
 const mapStateToCapacityUsageProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const { capacityUsed, capacityUsable } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { capacityUsed, capacityUsable } = nodeSums;
     return {
       usedCapacity: capacityUsed,
       usableCapacity: capacityUsable,
@@ -94,10 +93,11 @@ interface NodeLivenessProps {
   liveNodes: number;
   suspectNodes: number;
   deadNodes: number;
+  drainingNodes: number;
 }
 
 function renderNodeLiveness(props: NodeLivenessProps) {
-  const { liveNodes, suspectNodes, deadNodes } = props;
+  const { liveNodes, suspectNodes, deadNodes, drainingNodes } = props;
   const suspectClasses = classNames(
     "node-liveness",
     "cluster-summary__metric",
@@ -105,6 +105,15 @@ function renderNodeLiveness(props: NodeLivenessProps) {
     {
       warning: suspectNodes > 0,
       disabled: suspectNodes === 0,
+    },
+  );
+  const drainingClasses = classNames(
+    "node-liveness",
+    "cluster-summary__metric",
+    "draining-nodes",
+    {
+      warning: drainingNodes > 0,
+      disabled: drainingNodes === 0,
     },
   );
   const deadClasses = classNames(
@@ -136,6 +145,14 @@ function renderNodeLiveness(props: NodeLivenessProps) {
         Nodes
       </SuspectNodesTooltip>
     </div>,
+    <div className={drainingClasses}>{drainingNodes}</div>,
+    <div className="node-liveness cluster-summary__label draining-nodes">
+      <DrainingNodesTooltip>
+        Draining
+        <br />
+        Nodes
+      </DrainingNodesTooltip>
+    </div>,
     <div className={deadClasses}>{deadNodes}</div>,
     <div className="node-liveness cluster-summary__label dead-nodes">
       <DeadNodesTooltip>
@@ -148,13 +165,14 @@ function renderNodeLiveness(props: NodeLivenessProps) {
 }
 
 const mapStateToNodeLivenessProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const { nodeCounts } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { nodeCounts } = nodeSums;
     return {
       liveNodes: nodeCounts.healthy,
       suspectNodes: nodeCounts.suspect,
       deadNodes: nodeCounts.dead,
+      drainingNodes: nodeCounts.draining,
     };
   },
 );
@@ -219,13 +237,9 @@ function renderReplicationStatus(props: ReplicationStatusProps) {
 }
 
 const mapStateToReplicationStatusProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const {
-      totalRanges,
-      underReplicatedRanges,
-      unavailableRanges,
-    } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { totalRanges, underReplicatedRanges, unavailableRanges } = nodeSums;
     return {
       totalRanges: totalRanges,
       underReplicatedRanges: underReplicatedRanges,
@@ -263,21 +277,22 @@ class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
   }
 
   render() {
-    const children = [];
-
-    if (this.props.loading) {
-      children.push(<img className="visualization__spinner" src={spinner} />);
-    } else {
-      children.push(
-        ...renderCapacityUsage(this.props.capacityUsage),
-        ...renderNodeLiveness(this.props.nodeLiveness),
-        ...renderReplicationStatus(this.props.replicationStatus),
-      );
-    }
+    const children = [
+      ...renderCapacityUsage(this.props.capacityUsage),
+      ...renderNodeLiveness(this.props.nodeLiveness),
+      ...renderReplicationStatus(this.props.replicationStatus),
+    ];
 
     return (
       <section className="cluster-summary">
-        {React.Children.toArray(children)}
+        <Skeleton
+          loading={this.props.loading}
+          active
+          // This styling is necessary because this section is a grid.
+          style={{ gridColumn: "1 / span all" }}
+        >
+          {React.Children.toArray(children)}
+        </Skeleton>
       </section>
     );
   }
@@ -311,6 +326,7 @@ export default class ClusterOverview extends React.Component<any, any> {
       <div className="cluster-page">
         <Helmet title="Cluster Overview" />
         <EmailSubscription />
+        <OverviewListAlerts />
         <section className="section cluster-overview">
           <ClusterSummaryConnected />
         </section>

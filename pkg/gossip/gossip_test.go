@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
@@ -14,13 +9,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -33,19 +28,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	defer stopper.Stop(ctx)
+	g := NewTest(1, stopper, metric.NewRegistry())
 	slice := []byte("b")
 	if err := g.AddInfo("s", slice, time.Hour); err != nil {
 		t.Fatal(err)
@@ -56,17 +50,59 @@ func TestGossipInfoStore(t *testing.T) {
 	if _, err := g.GetInfo("s2"); err == nil {
 		t.Errorf("expected error fetching nonexistent key \"s2\"")
 	}
+
+	g.mu.Lock()
+	if info := g.mu.is.getInfo("s"); info == nil || info.TTLStamp == math.MaxInt64 {
+		t.Errorf("expected info to be present and have finite TTL: %+v", info)
+	}
+	g.mu.Unlock()
+
+	if err := g.AddInfoIfNotRedundant("s", slice); err != nil {
+		t.Error(err)
+	}
+	if val, err := g.GetInfo("s"); !bytes.Equal(val, slice) || err != nil {
+		t.Errorf("error fetching string: %v", err)
+	}
+
+	g.mu.Lock()
+	if info := g.mu.is.getInfo("s"); info == nil || info.TTLStamp != math.MaxInt64 {
+		t.Errorf("expected info be updated with an infinite TTL: %+v", info)
+	}
+	g.mu.Unlock()
+
+	slice2 := []byte("b2")
+	err := g.BulkAddInfoIfNotRedundant([]InfoToAdd{
+		{Key: "s", Val: slice},
+		{Key: "s2", Val: slice2},
+	})
+	if err != nil {
+		t.Error(err)
+	}
+	if val, err := g.GetInfo("s"); !bytes.Equal(val, slice) || err != nil {
+		t.Errorf("error fetching string: %v", err)
+	}
+	if val, err := g.GetInfo("s2"); !bytes.Equal(val, slice2) || err != nil {
+		t.Errorf("error fetching string: %v", err)
+	}
+
+	g.mu.Lock()
+	if info := g.mu.is.getInfo("s"); info == nil || info.TTLStamp != math.MaxInt64 {
+		t.Errorf("expected info be updated with an infinite TTL: %+v", info)
+	}
+	if info := g.mu.is.getInfo("s2"); info == nil || info.TTLStamp != math.MaxInt64 {
+		t.Errorf("expected info be written with an infinite TTL: %+v", info)
+	}
+	g.mu.Unlock()
 }
 
 // TestGossipMoveNode verifies that if a node is moved to a new address, it
 // gets properly updated in gossip.
 func TestGossipMoveNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	defer stopper.Stop(ctx)
+	g := NewTest(1, stopper, metric.NewRegistry())
 	var nodes []*roachpb.NodeDescriptor
 	for i := 1; i <= 3; i++ {
 		node := &roachpb.NodeDescriptor{
@@ -106,8 +142,9 @@ func TestGossipMoveNode(t *testing.T) {
 
 func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
 	addresses := []util.UnresolvedAddr{
 		util.MakeUnresolvedAddr("tcp", "127.0.0.1:9000"),
@@ -115,10 +152,7 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 		util.MakeUnresolvedAddr("tcp", "localhost:9004"),
 	}
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	server := rpc.NewServer(rpcContext)
-	g := NewTest(0, nil, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	g := NewTest(0, stopper, metric.NewRegistry())
 	g.setAddresses(addresses)
 
 	// Using specified addresses, fetch bootstrap addresses 3 times
@@ -140,10 +174,9 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 
 func TestGossipLocalityResolver(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
+	defer stopper.Stop(ctx)
 
 	gossipLocalityAdvertiseList := roachpb.Locality{}
 	tier := roachpb.Tier{}
@@ -178,7 +211,7 @@ func TestGossipLocalityResolver(t *testing.T) {
 	var node2LocalityList []roachpb.LocalityAddress
 	node2LocalityList = append(node2LocalityList, nodeLocalityAddress2)
 
-	g := NewTestWithLocality(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), gossipLocalityAdvertiseList, zonepb.DefaultZoneConfigRef())
+	g := NewTestWithLocality(1, stopper, metric.NewRegistry(), gossipLocalityAdvertiseList)
 	node1 := &roachpb.NodeDescriptor{
 		NodeID:          1,
 		Address:         node1PublicAddressRPC,
@@ -198,7 +231,7 @@ func TestGossipLocalityResolver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nodeAddress, err := g.GetNodeIDAddress(node1.NodeID)
+	nodeAddress, _, err := g.GetNodeIDAddress(node1.NodeID)
 	if err != nil {
 		t.Error(err)
 	}
@@ -206,7 +239,7 @@ func TestGossipLocalityResolver(t *testing.T) {
 		t.Fatalf("expected: %s but got: %s address", node1PrivateAddress, *nodeAddress)
 	}
 
-	nodeAddress, err = g.GetNodeIDAddress(node2.NodeID)
+	nodeAddress, _, err = g.GetNodeIDAddress(node2.NodeID)
 	if err != nil {
 		t.Error(err)
 	}
@@ -215,7 +248,7 @@ func TestGossipLocalityResolver(t *testing.T) {
 		t.Fatalf("expected: %s but got: %s address", node2PublicAddressRPC, *nodeAddress)
 	}
 
-	nodeAddressSQL, err := g.GetNodeIDSQLAddress(node2.NodeID)
+	nodeAddressSQL, _, err := g.GetNodeIDSQLAddress(node2.NodeID)
 	if err != nil {
 		t.Error(err)
 	}
@@ -233,11 +266,11 @@ func TestGossipRaceLogStatus(t *testing.T) {
 	// Shared cluster ID by all gossipers (this ensures that the gossipers
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 
 	local.mu.Lock()
-	peer := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
-	local.startClientLocked(peer.mu.is.NodeAddr)
+	peer, _ := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
+	local.startClientLocked(peer.mu.is.NodeAddr, roachpb.Locality{}, localCtx)
 	local.mu.Unlock()
 
 	// Race gossiping against LogStatus.
@@ -283,7 +316,7 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.mu.Lock()
 	localAddr := local.mu.is.NodeAddr
 	local.mu.Unlock()
@@ -292,9 +325,9 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 		// After creating a new node, join it to the first node to ensure that the
 		// network is connected (and thus all nodes know each other's addresses)
 		// before we start the actual test.
-		newPeer := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		newPeer, peerCtx := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
 		newPeer.mu.Lock()
-		newPeer.startClientLocked(localAddr)
+		newPeer.startClientLocked(localAddr, roachpb.Locality{}, peerCtx)
 		newPeer.mu.Unlock()
 		peers = append(peers, newPeer)
 	}
@@ -324,7 +357,7 @@ func TestGossipOutgoingLimitEnforced(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range peers {
-		local.tightenNetwork(context.Background())
+		local.tightenNetwork(context.Background(), localCtx)
 	}
 
 	if outgoing := local.outgoing.gauge.Value(); outgoing > int64(maxPeers) {
@@ -343,12 +376,12 @@ func TestGossipMostDistant(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	connect := func(from, to *Gossip) {
+	connect := func(from, to *Gossip, fromCtx *rpc.Context) {
 		to.mu.Lock()
 		addr := to.mu.is.NodeAddr
 		to.mu.Unlock()
 		from.mu.Lock()
-		from.startClientLocked(addr)
+		from.startClientLocked(addr, roachpb.Locality{}, fromCtx)
 		from.mu.Unlock()
 	}
 
@@ -379,12 +412,13 @@ func TestGossipMostDistant(t *testing.T) {
 			//
 			//   1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
 			nodes := make([]*Gossip, n)
+			nodesCtx := make([]*rpc.Context, n)
 			for i := range nodes {
-				nodes[i] = startGossip(clusterID, roachpb.NodeID(i+1), stopper, t, metric.NewRegistry())
+				nodes[i], nodesCtx[i] = startGossip(clusterID, roachpb.NodeID(i+1), stopper, t, metric.NewRegistry())
 				if i == 0 {
 					continue
 				}
-				connect(nodes[i], nodes[i-1])
+				connect(nodes[i], nodes[i-1], nodesCtx[i])
 			}
 
 			// Wait for n1 to determine that n10 is the most distant node.
@@ -415,7 +449,7 @@ func TestGossipMostDistant(t *testing.T) {
 			// Connect the network in a loop. This will cut the distance to the most
 			// distant node in half.
 			log.Infof(context.Background(), "connecting from n%d to n%d", c.from, c.to)
-			connect(nodes[c.from], nodes[c.to])
+			connect(nodes[c.from], nodes[c.to], nodesCtx[c.from])
 
 			// Wait for n1 to determine that n6 is now the most distant hops from 9
 			// to 5 and change the most distant node to n6.
@@ -424,7 +458,7 @@ func TestGossipMostDistant(t *testing.T) {
 				g.mu.Lock()
 				var buf bytes.Buffer
 				_ = g.mu.is.visitInfos(func(key string, i *Info) error {
-					if i.NodeID != 1 && IsNodeIDKey(key) {
+					if i.NodeID != 1 && IsNodeDescKey(key) {
 						fmt.Fprintf(&buf, "n%d: hops=%d\n", i.NodeID, i.Hops)
 					}
 					return nil
@@ -467,7 +501,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -475,18 +509,22 @@ func TestGossipNoForwardSelf(t *testing.T) {
 	// Start one loopback client plus enough additional clients to fill the
 	// incoming clients.
 	peers := []*Gossip{local}
+	peerCtx := []*rpc.Context{localCtx}
+
 	local.server.mu.Lock()
 	maxSize := local.server.mu.incoming.maxSize
 	local.server.mu.Unlock()
 	for i := 0; i < maxSize; i++ {
-		peers = append(peers, startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry()))
+		g, gCtx := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		peers = append(peers, g)
+		peerCtx = append(peerCtx, gCtx)
 	}
 
-	for _, peer := range peers {
-		c := newClient(log.AmbientContext{Tracer: tracing.NewTracer()}, local.GetNodeAddr(), makeMetrics())
+	for i, peer := range peers {
+		c := newClient(log.MakeTestingAmbientCtxWithNewTracer(), local.GetNodeAddr(), roachpb.Locality{}, makeMetrics())
 
 		testutils.SucceedsSoon(t, func() error {
-			conn, err := peer.rpcContext.GRPCUnvalidatedDial(c.addr.String()).Connect(ctx)
+			conn, err := peerCtx[i].GRPCUnvalidatedDial(c.addr.String(), c.locality).Connect(ctx)
 			if err != nil {
 				return err
 			}
@@ -515,13 +553,13 @@ func TestGossipNoForwardSelf(t *testing.T) {
 		local.server.mu.Lock()
 		maxSize := local.server.mu.incoming.maxSize
 		local.server.mu.Unlock()
-		peer := startGossip(clusterID, roachpb.NodeID(i+maxSize+2), stopper, t, metric.NewRegistry())
+		peer, peerCtx := startGossip(clusterID, roachpb.NodeID(i+maxSize+2), stopper, t, metric.NewRegistry())
 
 		for {
 			localAddr := local.GetNodeAddr()
-			c := newClient(log.AmbientContext{Tracer: tracing.NewTracer()}, localAddr, makeMetrics())
+			c := newClient(log.MakeTestingAmbientCtxWithNewTracer(), localAddr, roachpb.Locality{}, makeMetrics())
 			peer.mu.Lock()
-			c.startLocked(peer, disconnectedCh, peer.rpcContext, stopper, peer.rpcContext.NewBreaker(""))
+			c.startLocked(peer, disconnectedCh, peerCtx, stopper)
 			peer.mu.Unlock()
 
 			disconnectedClient := <-disconnectedCh
@@ -552,13 +590,13 @@ func TestGossipCullNetwork(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.SetCullInterval(5 * time.Millisecond)
 
 	local.mu.Lock()
 	for i := 0; i < minPeers; i++ {
-		peer := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
-		local.startClientLocked(*peer.GetNodeAddr())
+		peer, peerCtx := startGossip(clusterID, roachpb.NodeID(i+2), stopper, t, metric.NewRegistry())
+		local.startClientLocked(*peer.GetNodeAddr(), roachpb.Locality{}, peerCtx)
 	}
 	local.mu.Unlock()
 
@@ -573,7 +611,7 @@ func TestGossipCullNetwork(t *testing.T) {
 		t.Fatalf("condition failed to evaluate within %s: %s", slowGossipDuration, err)
 	}
 
-	local.manage()
+	local.manage(localCtx)
 
 	if err := retry.ForDuration(slowGossipDuration, func() error {
 		// Verify that a client is closed within the cull interval.
@@ -596,7 +634,7 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
 	local.SetStallInterval(5 * time.Millisecond)
 
 	// Make sure we have the sentinel to ensure that its absence is not the
@@ -606,14 +644,14 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 	}
 
 	peerStopper := stop.NewStopper()
-	peer := startGossip(clusterID, 2, peerStopper, t, metric.NewRegistry())
+	peer, _ := startGossip(clusterID, 2, peerStopper, t, metric.NewRegistry())
 
 	peerNodeID := peer.NodeID.Get()
 	peerAddr := peer.GetNodeAddr()
 	peerAddrStr := peerAddr.String()
 
 	local.mu.Lock()
-	local.startClientLocked(*peerAddr)
+	local.startClientLocked(*peerAddr, roachpb.Locality{}, localCtx)
 	local.mu.Unlock()
 
 	testutils.SucceedsSoon(t, func() error {
@@ -634,8 +672,8 @@ func TestGossipOrphanedStallDetection(t *testing.T) {
 		return errors.Errorf("n%d descriptor not yet available", peerNodeID)
 	})
 
-	local.bootstrap()
-	local.manage()
+	local.bootstrap(localCtx)
+	local.manage(localCtx)
 
 	peerStopper.Stop(context.Background())
 
@@ -679,6 +717,8 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 	var clusterIDs []uuid.UUID
 	var addrs []net.Addr
 
+	ctx := context.Background()
+
 	// Create three gossip nodes, init the first two with no bootstrap
 	// hosts, but unique cluster IDs. The third host has the first two
 	// hosts as bootstrap hosts, but has the same cluster ID as the
@@ -690,7 +730,7 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 			select {
 			case <-stopper.ShouldQuiesce():
 			default:
-				stopper.Stop(context.Background())
+				stopper.Stop(ctx)
 			}
 		}()
 
@@ -702,23 +742,22 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 			clusterID = clusterIDs[0]
 		}
 		clusterIDs = append(clusterIDs, clusterID)
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-		rpcContext := rpc.NewInsecureTestingContextWithClusterID(clock, stopper, clusterID)
+		clock := hlc.NewClockForTesting(nil)
+		rpcContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
 
-		server := rpc.NewServer(rpcContext)
+		server, err := rpc.NewServer(ctx, rpcContext)
+		require.NoError(t, err)
 
 		// node ID must be non-zero
-		gnode := NewTest(
-			roachpb.NodeID(i+1), rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+		gnode := NewTest(roachpb.NodeID(i+1), stopper, metric.NewRegistry())
+		RegisterGossipServer(server, gnode)
 		g = append(g, gnode)
 		gnode.SetStallInterval(interval)
 		gnode.SetBootstrapInterval(interval)
 		gnode.clusterID.Set(context.Background(), clusterIDs[i])
 
 		ln, err := netutil.ListenAndServeGRPC(stopper, server, util.IsolatedTestAddr)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		addrs = append(addrs, ln.Addr())
 
 		// Only the third node has addresses.
@@ -729,7 +768,7 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 				addresses = append(addresses, util.MakeUnresolvedAddr("tcp", addrs[j].String()))
 			}
 		}
-		gnode.Start(ln.Addr(), addresses)
+		gnode.Start(ln.Addr(), addresses, rpcContext)
 	}
 
 	// Wait for connections.
@@ -751,7 +790,7 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 	})
 
 	// Kill node 0 to force node 2 to bootstrap with node 1.
-	stoppers[0].Stop(context.Background())
+	stoppers[0].Stop(ctx)
 	// Wait for twice the bootstrap interval, and verify that
 	// node 2 still has not connected to node 1.
 	time.Sleep(2 * interval)
@@ -774,13 +813,13 @@ func TestGossipPropagation(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
-	remote := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	remote, remoteCtx := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
 	remote.mu.Lock()
 	rAddr := remote.mu.is.NodeAddr
 	remote.mu.Unlock()
-	local.manage()
-	remote.manage()
+	local.manage(localCtx)
+	remote.manage(remoteCtx)
 
 	mustAdd := func(g *Gossip, key string, val []byte, ttl time.Duration) {
 		if err := g.AddInfo(key, val, ttl); err != nil {
@@ -797,7 +836,7 @@ func TestGossipPropagation(t *testing.T) {
 			// Restart the client connection in the loop. It might have failed due to
 			// a heartbeat timeout.
 			local.mu.Lock()
-			local.startClientLocked(rAddr)
+			local.startClientLocked(rAddr, roachpb.Locality{}, localCtx)
 			local.mu.Unlock()
 			return fmt.Errorf("unable to find local to remote client")
 		}
@@ -812,7 +851,7 @@ func TestGossipPropagation(t *testing.T) {
 	getInfo := func(g *Gossip, key string) *Info {
 		g.mu.RLock()
 		defer g.mu.RUnlock()
-		return g.mu.is.Infos[key]
+		return g.mu.is.getInfo(key)
 	}
 
 	var localInfo *Info
@@ -843,6 +882,26 @@ func TestGossipPropagation(t *testing.T) {
 		}
 		return nil
 	})
+
+	mustClear := func(g *Gossip, key string) {
+		if _, err := g.tryClearInfoWithTTL(key, 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Clear both entries. Verify that both are removed from the gossip network.
+	mustClear(local, "local")
+	mustClear(remote, "remote")
+	testutils.SucceedsSoon(t, func() error {
+		for gName, g := range map[string]*Gossip{"local": local, "remote": remote} {
+			for _, key := range []string{"local", "remote"} {
+				if getInfo(g, key) != nil {
+					return fmt.Errorf("%s info %q not cleared", gName, key)
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // Test whether propagation of an info that was generated by a prior
@@ -852,7 +911,9 @@ func TestGossipPropagation(t *testing.T) {
 // n1: decommissioned
 // n2: gossip node-liveness:1
 // n3: node-liveness range lease acquired (does not gossip node-liveness:1
-//     record because it is unchanged)
+//
+//	record because it is unchanged)
+//
 // n2: restarted
 //   - connects as gossip client to n3
 //   - sends a batch of gossip records to n3
@@ -868,13 +929,13 @@ func TestGossipLoopbackInfoPropagation(t *testing.T) {
 	// don't talk to servers from unrelated tests by accident).
 	clusterID := uuid.MakeV4()
 
-	local := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
-	remote := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
+	local, localCtx := startGossip(clusterID, 1, stopper, t, metric.NewRegistry())
+	remote, remoteCtx := startGossip(clusterID, 2, stopper, t, metric.NewRegistry())
 	remote.mu.Lock()
 	rAddr := remote.mu.is.NodeAddr
 	remote.mu.Unlock()
-	local.manage()
-	remote.manage()
+	local.manage(localCtx)
+	remote.manage(remoteCtx)
 
 	// Add a gossip info for "foo" on remote, that was generated by local. This
 	// simulates what happens if local was to gossip an info, and later restart
@@ -900,7 +961,7 @@ func TestGossipLoopbackInfoPropagation(t *testing.T) {
 
 	// Start a client connection to the remote node.
 	local.mu.Lock()
-	local.startClientLocked(rAddr)
+	local.startClientLocked(rAddr, roachpb.Locality{}, localCtx)
 	local.mu.Unlock()
 
 	getInfo := func(g *Gossip, key string) *Info {
@@ -915,6 +976,84 @@ func TestGossipLoopbackInfoPropagation(t *testing.T) {
 		}
 		if getInfo(local, "foo") == nil {
 			return fmt.Errorf("foo not propagated")
+		}
+		return nil
+	})
+}
+
+// TestServerSendsHighStampsDiff tests that the server sends high water stamps
+// diffs to the client rather than sending the whole map.
+func TestServerSendsHighStampsDiff(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.Background())
+
+	// Shared cluster ID by all gossipers (this ensures that the gossipers
+	// don't talk to servers from unrelated tests by accident).
+	clusterID := uuid.MakeV4()
+
+	// Start local and remote gossip servers.
+	local, localCxt := startGossip(clusterID, 1 /* nodeID */, stopper, t, metric.NewRegistry())
+	remote, remoteCxt := startGossip(clusterID, 2 /* nodeID */, stopper, t, metric.NewRegistry())
+	local.manage(localCxt)
+	remote.manage(remoteCxt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a client to the remote node.
+	c := newClient(log.MakeTestingAmbientCtxWithNewTracer(), remote.GetNodeAddr(), roachpb.Locality{}, makeMetrics())
+
+	conn, err := localCxt.GRPCUnvalidatedDial(c.addr.String(), roachpb.Locality{}).Connect(ctx)
+	require.NoError(t, err)
+
+	stream, err := NewGossipClient(conn).Gossip(ctx)
+	require.NoError(t, err)
+
+	requestGossip := func(g *Gossip, stream Gossip_GossipClient) Response {
+		err := c.requestGossip(g, stream)
+		require.NoError(t, err)
+		resp := &Response{}
+		resp, err = stream.Recv()
+		require.NoError(t, err)
+		return *resp
+	}
+
+	// Expect that the server will return its high water stamps in the response.
+	testutils.SucceedsSoon(t, func() error {
+		resp := requestGossip(local, stream)
+		local.mu.Lock()
+		currentHighStamps := remote.mu.is.getHighWaterStamps()
+		local.mu.Unlock()
+		if !reflect.DeepEqual(resp.HighWaterStamps, currentHighStamps) {
+			return errors.Errorf(
+				"Expected to receive the server's high water stamps: %+v but received %+v instead.",
+				remote.mu.is.getHighWaterStamps(), resp.HighWaterStamps)
+		}
+		return nil
+	})
+
+	// Since the server high water stamps haven't changed, expect the server to
+	// return an empty map.
+	resp := requestGossip(local, stream)
+	require.Empty(t, resp.HighWaterStamps)
+
+	// Add some info to the server. This causes an increase in the high water
+	// time stamp.
+	err = remote.AddInfo("remote", nil, time.Hour)
+	require.NoError(t, err)
+
+	testutils.SucceedsSoon(t, func() error {
+		resp := requestGossip(local, stream)
+		local.mu.Lock()
+		currentHighStamps := remote.mu.is.getHighWaterStamps()
+		local.mu.Unlock()
+
+		if !reflect.DeepEqual(resp.HighWaterStamps, currentHighStamps) {
+			return errors.Errorf(
+				"Expected to receive the server's high water stamps: %+v but received %+v instead.",
+				remote.mu.is.getHighWaterStamps(), resp.HighWaterStamps)
 		}
 		return nil
 	})

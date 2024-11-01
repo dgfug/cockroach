@@ -66,6 +66,10 @@ define ScanPrivate {
     # rows.
     HardLimit ScanLimit
 
+    # Distribution specifies the leaseholder regions of the scanned rows if
+    # they can be statically determined.
+    Distribution Distribution
+
     # Flags modify how the table is scanned, such as which index is used to scan.
     Flags ScanFlags
 
@@ -73,9 +77,14 @@ define ScanPrivate {
     # leave this unset (Strength = ForNone), which indicates that no row-level
     # locking will be performed while scanning the table. Stronger locking modes
     # are used by SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial
-    # row retrieval of DELETE and UPDATE statements. The locking item's Targets
-    # list will always be empty when part of a ScanPrivate.
-    Locking LockingItem
+    # row retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the Scan when
+    # handling conflicting locks held by other active transactions. Most scans
+    # leave the policy set to its default (WaitPolicy = Block), but different
+    # wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP LOCKED/NOWAIT
+    # statements to react differently to conflicting locks.
+    Locking Locking
 
     # LocalityOptimized is true if this scan is a child of a
     # LocalityOptimizedSearch operator, indicating that it either contains all
@@ -156,6 +165,14 @@ define ValuesPrivate {
     ID UniqueID
 }
 
+# LiteralValues is a version of values where the exprs have already been type checked
+# and are real Datums that don't need evaluation.
+[Relational]
+define LiteralValues {
+    Rows LiteralRows
+    Cols ColList
+}
+
 # Select filters rows from its input result set, based on the boolean filter
 # predicate expression. Rows which do not match the filter are discarded. While
 # the Filter operand can be any boolean expression, normalization rules will
@@ -211,6 +228,11 @@ define InvertedFilterPrivate {
 
     # PreFiltererState represents the optional pre-filtering state.
     PreFiltererState PreFiltererState
+
+    # PKCols is the set of primary key columns in the underlying table of the
+    # input inverted index scan.. It is used to build FDs for the
+    # InvertedFilter.
+    PKCols ColSet
 
     # The InvertedColumn is the id of the inverted column in the input. It is
     # used during execution to map rows from the input to their corresponding
@@ -309,6 +331,20 @@ define IndexJoinPrivate {
     # Cols specifies the set of columns that the index join operator projects.
     # This may be a subset of the columns that the table contains.
     Cols ColSet
+
+    # Locking represents the row-level locking mode of the IndexJoin in the
+    # lookup table's primary index. Most index joins leave this unset (Strength
+    # = ForNone), which indicates that no row-level locking will be performed
+    # while joining with the table's index. Stronger locking modes are used by
+    # SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial row
+    # retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the IndexJoin
+    # when handling conflicting locks held by other active transactions. Most
+    # index joins leave the policy set to its default (WaitPolicy = Block), but
+    # different wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP
+    # LOCKED/NOWAIT statements to react differently to conflicting locks.
+    Locking Locking
 }
 
 # LookupJoin represents a join between an input expression and an index. The
@@ -346,6 +382,18 @@ define LookupJoinPrivate {
     # TODO(rytaft): consider removing this field in favor of using LookupExpr
     # in all cases.
     KeyCols ColList
+
+    # DerivedEquivCols is the set of lookup join equijoin columns which are part
+    # of synthesized equality constraints based on another equality join
+    # condition and a computed index key column in the lookup table. Since these
+    # columns are not reducing the selectivity of the join, but are just added
+    # to facilitate index lookups, they should not be used in determining join
+    # selectivity. DerivedEquivCols could also include predicates derived from
+    # foreign key constraints which are used to facilitate index lookups. The
+    # additional terms should not affect selectivity so that we have consistent
+    # join relation stats for fairness in costing lookup join vs. joins which do
+    # not use these predicates.
+    DerivedEquivCols ColSet
 
     # LookupExpr represents the part of the join condition used to perform
     # the lookup into the index. It should only be set when KeyCols is empty.
@@ -402,9 +450,21 @@ define LookupJoinPrivate {
     # table (and thus each left row matches with at most one table row).
     LookupColsAreTableKey bool
 
-    # IsSecondJoinInPairedJoiner is true if this is the second join of a
-    # paired-joiner used for left joins.
+    # At most one of Is{First,Second}JoinInPairedJoiner can be true.
+    #
+    # IsFirstJoinInPairedJoiner is true if this is the first (i.e., lower in the
+    # plan tree) join of a paired-joiner used for left joins.
+    IsFirstJoinInPairedJoiner bool
+
+    # IsSecondJoinInPairedJoiner is true if this is the second (i.e., higher in
+    # the plan tree) join of a paired-joiner used for left joins.
     IsSecondJoinInPairedJoiner bool
+
+    # ContinuationCol is the column ID of the continuation column when
+    # IsFirstJoinInPairedJoiner is true. The continuation column is a boolean
+    # column that indicates whether an output row is a continuation of a group
+    # corresponding to a single left input row.
+    ContinuationCol ColumnID
 
     # LocalityOptimized is true if this lookup join is part of a locality
     # optimized search strategy. For semi, inner, and left joins, this means
@@ -416,10 +476,44 @@ define LookupJoinPrivate {
     # this lookup join.
     LocalityOptimized bool
 
-    # ConstFilters contains the constant filters that are represented as equality
-    # conditions on the KeyCols. These filters are needed by the statistics code to
-    # correctly estimate selectivity.
-    ConstFilters FiltersExpr
+    # ChildOfLocalityOptimizedSearch is true if this join is nested under a
+    # LocalityOptimizedSearchExpr. This differs from the LocalityOptimized
+    # flag above as that case handles a REGIONAL BY ROW (or otherwise row
+    # partitioned) tables as the lookup table. This flag handles the case
+    # with a REGIONAL BY ROW table as the input table. The flag is used for
+    # static locality checks of the `enforce_home_region` setting and to avoid
+    # infinite rewrite rule recursion in rules
+    # GenerateLocalityOptimizedSearchOfLocalityOptimizedJoin and
+    # GenerateLocalityOptimizedSearchOfLOJs. Both the LocalityOptimized flag
+    # and ChildOfLocalityOptimizedSearch may be set (e.g. in the case where
+    # both the input table and lookup table have REGIONAL BY ROW partitioning).
+    ChildOfLocalityOptimizedSearch bool
+
+    # AllLookupFilters synthesizes all the filters that are represented as
+    # equality conditions on the KeyCols, as well as the filters in LookupExpr
+    # and RemoteLookupExpr. These filters are needed by the statistics code to
+    # correctly estimate selectivity as well as by the logicalPropsBuilder for
+    # calculating logical properties.
+    AllLookupFilters FiltersExpr
+
+    # Locking represents the row-level locking mode of the LookupJoin in the
+    # lookup table. Most lookup joins leave this unset (Strength = ForNone),
+    # which indicates that no row-level locking will be performed while joining
+    # with the table. Stronger locking modes are used by SELECT .. FOR [KEY]
+    # UPDATE/SHARE statements and by the initial row retrieval of DELETE and
+    # UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the LookupJoin
+    # when handling conflicting locks held by other active transactions. Most
+    # lookup joins leave the policy set to its default (WaitPolicy = Block), but
+    # different wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP
+    # LOCKED/NOWAIT statements to react differently to conflicting locks.
+    Locking Locking
+
+    # RemoteOnlyLookups is true when this join is defined with only lookups
+    # that read into remote regions, though the lookups are defined in
+    # LookupExpr, not RemoteLookupExpr.
+    RemoteOnlyLookups bool
     _ JoinPrivate
 }
 
@@ -479,6 +573,21 @@ define InvertedJoinPrivate {
     # equality conditions on the PrefixKeyCols. These filters are needed by the
     # statistics code to correctly estimate selectivity.
     ConstFilters FiltersExpr
+
+    # Locking represents the row-level locking mode of the InvertedJoin in the
+    # lookup table. Most inverted joins leave this unset (Strength = ForNone),
+    # which indicates that no row-level locking will be performed while joining
+    # with the table. Stronger locking modes are used by SELECT .. FOR [KEY]
+    # UPDATE/SHARE statements and by the initial row retrieval of DELETE and
+    # UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the
+    # InvertedJoin when handling conflicting locks held by other active
+    # transactions. Most inverted joins leave the policy set to its default
+    # (WaitPolicy = Block), but different wait policies are used by SELECT ..
+    # FOR UPDATE/SHARE SKIP LOCKED/NOWAIT statements to react differently to
+    # conflicting locks.
+    Locking Locking
     _ JoinPrivate
 }
 
@@ -570,6 +679,22 @@ define ZigzagJoinPrivate {
     FixedVals ScalarListExpr
     LeftFixedCols ColList
     RightFixedCols ColList
+
+    # LeftLocking and RightLocking represent the row-level locking modes of the
+    # scans over the ZigzagJoin's two tables. Most zigzag joins leave these
+    # unset (Strength = ForNone), which indicates that no row-level locking will
+    # be performed while joining the two tables. Stronger locking modes are used
+    # by SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial row
+    # retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking modes also dictates the policy used by the
+    # ZigzagJoin when handling conflicting locks held by other active
+    # transactions. Most zigzag joins leave the policies set to the default
+    # (WaitPolicy = Block), but different wait policies are used by SELECT ..
+    # FOR UPDATE/SHARE SKIP LOCKED/NOWAIT statements to react differently to
+    # conflicting locks.
+    LeftLocking Locking
+    RightLocking Locking
 
     # Cols is the set of columns produced by the zigzag join. This set can
     # contain columns from either side's index.
@@ -1042,17 +1167,20 @@ define Offset {
     Ordering OrderingChoice
 }
 
-# TopK returns the top K, where K is a constant, rows from the input set according to its
-# sort ordering, discarding the remaining rows. The Limit is a constant
-# positive integer; the operator returns at most Limit rows. Rows can be sorted by one
-# or more of the input columns, each of which can be sorted in either ascending
-# or descending order. See the Ordering field in the PhysicalProps struct.
+# TopK returns the top K, where K is a constant, rows from the input set
+# according to its sort ordering, discarding the remaining rows. The Limit is a
+# constant positive integer; the operator returns at most Limit rows. Rows can
+# be sorted by one or more of the input columns, each of which can be sorted in
+# either ascending or descending order. See the Ordering field in the
+# PhysicalProps struct.
 #
 # Unlike the Limit relational operator, TopK does not require its input to be
-# ordered. TopK can be used to substitute a Limit that requires its input to be
-# ordered and performs best when the input is not already ordered. TopK scans the
-# input, storing the K rows that best meet the ordering requirement in a max
-# heap, then sorts the K rows.
+# ordered. However, if the input is known to have a partial ordering of the
+# required ordering, TopK can take advantage of optimizations. TopK can be used
+# to substitute a Limit that requires its input to be ordered and performs best
+# when the input is not already fully ordered. TopK scans the input, storing the
+# K rows that best meet the ordering requirement in a max heap, then sorts the K
+# rows.
 [Relational]
 define TopK {
     Input RelExpr
@@ -1062,7 +1190,14 @@ define TopK {
 [Private]
 define TopKPrivate {
     K int64
+
+    # Ordering is the required order in which the K rows should be sorted when output.
     Ordering OrderingChoice
+
+    # PartialOrdering is an optional ordering imposed on the input that is
+    # a partial order of Ordering and allows TopK to take advantage of partial
+    # ordering optimizations.
+    PartialOrdering OrderingChoice
 }
 
 # Max1Row enforces that its input must return at most one row. If the input
@@ -1091,6 +1226,26 @@ define OrdinalityPrivate {
 
     # ColID holds the id of the column introduced by this operator.
     ColID ColumnID
+
+    # ForDuplicateRemoval is `true` when the Ordinality is built as part of a
+    # query rewrite in order to remove duplicate entries, and the value returned
+    # by the Ordinality operation does not matter, as long as it's unique. It is
+    # `false` if this is built from a WITH ORDINALITY clause, where the value
+    # returned does matter. For example, in the following case, pushing the `x=3`
+    # filter into the Ordinality would yield a value for the `ordinality` column
+    # of `1`, while the correct result is `3`:
+    #
+    # SELECT * FROM UNNEST(ARRAY[1, 2, 3]) WITH ORDINALITY AS foo(x) WHERE x = 3;
+    #   x | ordinality
+    # ----+-------------
+    #   3 |          3
+    #
+    # The `ForDuplicateRemoval` flag can be examined to avoid pushing the
+    # filter in such cases.
+    # TODO(msirek): The internally-generated unique tagging of rows for
+    # duplicate removal could be separated off into a new operator, such as
+    # `UniqueKey`, in the future.
+    ForDuplicateRemoval bool
 }
 
 # ProjectSet represents a relational operator which zips through a list of
@@ -1163,9 +1318,11 @@ define WithPrivate {
     # it in the EXPLAIN plan).
     OriginalExpr Statement
 
-    # Mtr is used to specify whether or not to override the optimizer's
-    # default decision for materializing or not materializing tables.
-    Mtr MaterializeClause
+    # Mtr is the materialization behavior of the CTE, specified by MATERIALIZED,
+    # NOT MATERIALIZED, or an empty materialize clause. These modes partially
+    # affect whether or not a CTE is inlined during normalization. See
+    # CanInlineWith.
+    Mtr CTEMaterializeClause
 
     # Ordering specifies the order required of the binding, and thus controls
     # the order in which the rows are materialized. Can only be used when Mtr is
@@ -1211,6 +1368,10 @@ define WithScanPrivate {
     # most cases the column set is sufficient to do this, but various rules make
     # it possible to construct WithScan expressions with no columns.
     ID UniqueID
+
+    # Mtr is the materialization behavior of the CTE referenced by the WithScan.
+    # It matches the Mtr field of the WithPrivate with a matching WithID.
+    Mtr CTEMaterializeClause
 }
 
 # RecursiveCTE implements the logic of a recursive CTE:
@@ -1268,6 +1429,14 @@ define RecursiveCTEPrivate {
     Deduplicate bool
 }
 
+# Barrier is a relational operator that simply passes through its input columns
+# with no changes. It serves as an optimization barrier, and is not included in
+# the final execution plan.
+[Relational]
+define Barrier {
+    Input RelExpr
+}
+
 # FakeRel is a mock relational operator used for testing and as a dummy binding
 # relation for building cascades; its logical properties are pre-determined and
 # stored in the private. It can be used as the child of an operator for which we
@@ -1280,14 +1449,4 @@ define FakeRel {
 [Private]
 define FakeRelPrivate {
     Props RelPropsPtr
-}
-
-# NormCycleTestRel is a relational operator for testing that normalization rule
-# cycles are detected by the Factory and a stack overflow is prevented. Two
-# rules for this expression, NormCycleTestRelTrueToFalse and
-# NormCycleTestRelFalseToTrue, create a normalization rule cycle. See the cycle
-# test file for tests that use this expression.
-[Relational]
-define NormCycleTestRel {
-    Scalar ScalarExpr
 }

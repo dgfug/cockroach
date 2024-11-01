@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowcontainer
 
@@ -15,10 +10,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -32,6 +28,9 @@ import (
 
 // SortableRowContainer is a container used to store rows and optionally sort
 // these.
+// NOTE: methods of this interface are **not** safe for concurrent use. However,
+// separate RowIterators can be created to perform reads of the rows in the
+// container concurrently.
 type SortableRowContainer interface {
 	Len() int
 	// AddRow adds a row to the container. If an error is returned, then the
@@ -58,7 +57,7 @@ type SortableRowContainer interface {
 	// InitTopK is called. Once InitTopK is called, callers should not call
 	// AddRow. Iterators created after calling InitTopK are guaranteed to read the
 	// top k rows only.
-	InitTopK()
+	InitTopK(context.Context)
 	// MaybeReplaceMax checks whether the given row belongs in the top k rows,
 	// potentially evicting a row in favor of the given row.
 	MaybeReplaceMax(context.Context, rowenc.EncDatumRow) error
@@ -84,7 +83,7 @@ type IndexedRowContainer interface {
 	ReorderableRowContainer
 
 	// GetRow returns a row at the given index or an error.
-	GetRow(ctx context.Context, idx int) (tree.IndexedRow, error)
+	GetRow(ctx context.Context, idx int) (eval.IndexedRow, error)
 }
 
 // DeDupingRowContainer is a container that de-duplicates rows added to the
@@ -104,22 +103,27 @@ type DeDupingRowContainer interface {
 	Close(context.Context)
 }
 
-// RowIterator is a simple iterator used to iterate over sqlbase.EncDatumRows.
+// RowIterator is a simple iterator used to iterate over rows buffered in the
+// SortableRowContainer.
+//
 // Example use:
-// 	var i RowIterator
-// 	for i.Rewind(); ; i.Next() {
-// 		if ok, err := i.Valid(); err != nil {
-// 			// Handle error.
-// 		} else if !ok {
+//
+//	var i RowIterator
+//	for i.Rewind(); ; i.Next() {
+//		if ok, err := i.Valid(); err != nil {
+//			// Handle error.
+//		} else if !ok {
 //			break
-// 		}
-//		row, err := i.Row()
+//		}
+//		row, err := i.EncRow()
 //		if err != nil {
 //			// Handle error.
 //		}
 //		// Do something.
-// 	}
+//	}
 //
+// Multiple iterators can be created in order to iterate over the same container
+// concurrently.
 type RowIterator interface {
 	// Rewind seeks to the first row.
 	Rewind()
@@ -130,11 +134,20 @@ type RowIterator interface {
 	Valid() (bool, error)
 	// Next advances the iterator to the next row in the iteration.
 	Next()
+	// EncRow returns the current row. The returned row is only valid until the
+	// next call to Rewind() or Next(). However, EncDatums in the row won't be
+	// modified, so shallow copying is sufficient.
+	EncRow() (rowenc.EncDatumRow, error)
 	// Row returns the current row. The returned row is only valid until the
-	// next call to Rewind() or Next().
-	Row() (rowenc.EncDatumRow, error)
+	// next call to Rewind() or Next(). However, tree.Datums in the row won't be
+	// modified, so shallow copying is sufficient.
+	//
+	// NOTE: it does *not* copy the row: callers must copy the row if they wish
+	// to mutate it.
+	Row() (tree.Datums, error)
 
 	// Close frees up resources held by the iterator.
+	// NOTE: unsafe for concurrent calls on different iterators.
 	Close()
 }
 
@@ -149,29 +162,32 @@ type MemRowContainer struct {
 	scratchRow    tree.Datums
 	scratchEncRow rowenc.EncDatumRow
 
-	evalCtx *tree.EvalContext
+	// ctx is only stored to be passed in MemRowContainer.Less.
+	ctx     context.Context
+	evalCtx *eval.Context
 
-	datumAlloc rowenc.DatumAlloc
+	datumAlloc tree.DatumAlloc
 }
 
 var _ heap.Interface = &MemRowContainer{}
 var _ IndexedRowContainer = &MemRowContainer{}
 
-// Init initializes the MemRowContainer. The MemRowContainer uses evalCtx.Mon
-// to track memory usage.
+// Init initializes the MemRowContainer. The MemRowContainer uses the planner's
+// monitor to track memory usage.
+//
+// Note that eval context will **not** be mutated.
 func (mc *MemRowContainer) Init(
-	ordering colinfo.ColumnOrdering, types []*types.T, evalCtx *tree.EvalContext,
+	ordering colinfo.ColumnOrdering, types []*types.T, evalCtx *eval.Context,
 ) {
-	mc.InitWithMon(ordering, types, evalCtx, evalCtx.Mon)
+	mc.InitWithMon(ordering, types, evalCtx, evalCtx.Planner.Mon())
 }
 
 // InitWithMon initializes the MemRowContainer with an explicit monitor. Only
 // use this if the default MemRowContainer.Init() function is insufficient.
+//
+// Note that eval context will **not** be mutated.
 func (mc *MemRowContainer) InitWithMon(
-	ordering colinfo.ColumnOrdering,
-	types []*types.T,
-	evalCtx *tree.EvalContext,
-	mon *mon.BytesMonitor,
+	ordering colinfo.ColumnOrdering, types []*types.T, evalCtx *eval.Context, mon *mon.BytesMonitor,
 ) {
 	acc := mon.MakeBoundAccount()
 	mc.RowContainer.Init(acc, colinfo.ColTypeInfoFromColTypes(types), 0 /* rowCapacity */)
@@ -184,21 +200,21 @@ func (mc *MemRowContainer) InitWithMon(
 
 // Less is part of heap.Interface and is only meant to be used internally.
 func (mc *MemRowContainer) Less(i, j int) bool {
-	cmp := colinfo.CompareDatums(mc.ordering, mc.evalCtx, mc.At(i), mc.At(j))
+	cmp := colinfo.CompareDatums(mc.ctx, mc.ordering, mc.evalCtx, mc.At(i), mc.At(j))
 	if mc.invertSorting {
 		cmp = -cmp
 	}
 	return cmp < 0
 }
 
-// EncRow returns the idx-th row as an EncDatumRow. The slice itself is reused
-// so it is only valid until the next call to EncRow.
-func (mc *MemRowContainer) EncRow(idx int) rowenc.EncDatumRow {
+// getEncRow populates the given EncDatumRow with the values of the idx-th row.
+// The behavior is undefined if the given row is of a different width than the
+// rows stored in the container.
+func (mc *MemRowContainer) getEncRow(encRow rowenc.EncDatumRow, idx int) {
 	datums := mc.At(idx)
 	for i, d := range datums {
-		mc.scratchEncRow[i] = rowenc.DatumToEncDatum(mc.types[i], d)
+		encRow[i] = rowenc.DatumToEncDatum(mc.types[i], d)
 	}
-	return mc.scratchEncRow
 }
 
 // AddRow adds a row to the container.
@@ -222,6 +238,7 @@ func (mc *MemRowContainer) Sort(ctx context.Context) {
 	mc.invertSorting = false
 	var cancelChecker cancelchecker.CancelChecker
 	cancelChecker.Reset(ctx)
+	mc.ctx = ctx
 	sort.Sort(mc, &cancelChecker)
 }
 
@@ -242,7 +259,7 @@ func (mc *MemRowContainer) Pop() interface{} { panic("unimplemented") }
 // smaller. Assumes InitTopK was called.
 func (mc *MemRowContainer) MaybeReplaceMax(ctx context.Context, row rowenc.EncDatumRow) error {
 	max := mc.At(0)
-	cmp, err := row.CompareToDatums(mc.types, &mc.datumAlloc, mc.ordering, mc.evalCtx, max)
+	cmp, err := row.CompareToDatums(ctx, mc.types, &mc.datumAlloc, mc.ordering, mc.evalCtx, max)
 	if err != nil {
 		return err
 	}
@@ -257,22 +274,25 @@ func (mc *MemRowContainer) MaybeReplaceMax(ctx context.Context, row rowenc.EncDa
 		if err := mc.Replace(ctx, 0, mc.scratchRow); err != nil {
 			return err
 		}
+		mc.ctx = ctx
 		heap.Fix(mc, 0)
 	}
 	return nil
 }
 
 // InitTopK rearranges the rows in the MemRowContainer into a Max-Heap.
-func (mc *MemRowContainer) InitTopK() {
+func (mc *MemRowContainer) InitTopK(ctx context.Context) {
 	mc.invertSorting = true
+	mc.ctx = ctx
 	heap.Init(mc)
 }
 
 // memRowIterator is a RowIterator that iterates over a MemRowContainer. This
 // iterator doesn't iterate over a snapshot of MemRowContainer.
 type memRowIterator struct {
-	*MemRowContainer
-	curIdx int
+	container     *MemRowContainer
+	curIdx        int
+	scratchEncRow rowenc.EncDatumRow
 }
 
 var _ RowIterator = &memRowIterator{}
@@ -281,7 +301,7 @@ var _ RowIterator = &memRowIterator{}
 // MemRowContainer. Note that this iterator doesn't iterate over a snapshot
 // of MemRowContainer.
 func (mc *MemRowContainer) NewIterator(_ context.Context) RowIterator {
-	return &memRowIterator{MemRowContainer: mc}
+	return &memRowIterator{container: mc, scratchEncRow: make(rowenc.EncDatumRow, len(mc.types))}
 }
 
 // Rewind implements the RowIterator interface.
@@ -291,7 +311,7 @@ func (i *memRowIterator) Rewind() {
 
 // Valid implements the RowIterator interface.
 func (i *memRowIterator) Valid() (bool, error) {
-	return i.curIdx < i.Len(), nil
+	return i.curIdx < i.container.Len(), nil
 }
 
 // Next implements the RowIterator interface.
@@ -299,9 +319,18 @@ func (i *memRowIterator) Next() {
 	i.curIdx++
 }
 
+// EncRow implements the RowIterator interface.
+func (i *memRowIterator) EncRow() (rowenc.EncDatumRow, error) {
+	datums := i.container.At(i.curIdx)
+	for colidx, d := range datums {
+		i.scratchEncRow[colidx] = rowenc.DatumToEncDatum(i.container.types[colidx], d)
+	}
+	return i.scratchEncRow, nil
+}
+
 // Row implements the RowIterator interface.
-func (i *memRowIterator) Row() (rowenc.EncDatumRow, error) {
-	return i.EncRow(i.curIdx), nil
+func (i *memRowIterator) Row() (tree.Datums, error) {
+	return i.container.At(i.curIdx), nil
 }
 
 // Close implements the RowIterator interface.
@@ -311,7 +340,8 @@ func (i *memRowIterator) Close() {}
 // This iterator doesn't iterate over a snapshot of MemRowContainer and deletes
 // rows as soon as they are iterated over to free up memory eagerly.
 type memRowFinalIterator struct {
-	*MemRowContainer
+	container     *MemRowContainer
+	scratchEncRow rowenc.EncDatumRow
 
 	ctx context.Context
 }
@@ -321,36 +351,43 @@ type memRowFinalIterator struct {
 // of MemRowContainer and that it deletes rows as soon as they are iterated
 // over.
 func (mc *MemRowContainer) NewFinalIterator(ctx context.Context) RowIterator {
-	return memRowFinalIterator{MemRowContainer: mc, ctx: ctx}
+	return &memRowFinalIterator{container: mc, scratchEncRow: make(rowenc.EncDatumRow, len(mc.types)), ctx: ctx}
 }
 
 // GetRow implements IndexedRowContainer.
-func (mc *MemRowContainer) GetRow(ctx context.Context, pos int) (tree.IndexedRow, error) {
-	return IndexedRow{Idx: pos, Row: mc.EncRow(pos)}, nil
+func (mc *MemRowContainer) GetRow(ctx context.Context, pos int) (eval.IndexedRow, error) {
+	mc.getEncRow(mc.scratchEncRow, pos)
+	return IndexedRow{Idx: pos, Row: mc.scratchEncRow}, nil
 }
 
-var _ RowIterator = memRowFinalIterator{}
+var _ RowIterator = &memRowFinalIterator{}
 
 // Rewind implements the RowIterator interface.
-func (i memRowFinalIterator) Rewind() {}
+func (i *memRowFinalIterator) Rewind() {}
 
 // Valid implements the RowIterator interface.
-func (i memRowFinalIterator) Valid() (bool, error) {
-	return i.Len() > 0, nil
+func (i *memRowFinalIterator) Valid() (bool, error) {
+	return i.container.Len() > 0, nil
 }
 
 // Next implements the RowIterator interface.
-func (i memRowFinalIterator) Next() {
-	i.PopFirst(i.ctx)
+func (i *memRowFinalIterator) Next() {
+	i.container.PopFirst(i.ctx)
+}
+
+// EncRow implements the RowIterator interface.
+func (i *memRowFinalIterator) EncRow() (rowenc.EncDatumRow, error) {
+	i.container.getEncRow(i.scratchEncRow, 0)
+	return i.scratchEncRow, nil
 }
 
 // Row implements the RowIterator interface.
-func (i memRowFinalIterator) Row() (rowenc.EncDatumRow, error) {
-	return i.EncRow(0), nil
+func (i *memRowFinalIterator) Row() (tree.Datums, error) {
+	return i.container.At(0), nil
 }
 
 // Close implements the RowIterator interface.
-func (i memRowFinalIterator) Close() {}
+func (i *memRowFinalIterator) Close() {}
 
 // DiskBackedRowContainer is a ReorderableRowContainer that uses a
 // MemRowContainer to store rows and spills back to disk automatically if
@@ -373,8 +410,8 @@ type DiskBackedRowContainer struct {
 	// Encoding helpers for de-duplication:
 	// encodings keeps around the DatumEncoding equivalents of the encoding
 	// directions in ordering to avoid conversions in hot paths.
-	encodings  []descpb.DatumEncoding
-	datumAlloc rowenc.DatumAlloc
+	encodings  []catenumpb.DatumEncoding
+	datumAlloc tree.DatumAlloc
 	scratchKey []byte
 
 	spilled bool
@@ -390,20 +427,20 @@ var _ DeDupingRowContainer = &DiskBackedRowContainer{}
 
 // Init initializes a DiskBackedRowContainer.
 // Arguments:
-//  - ordering is the output ordering; the order in which rows should be sorted.
-//  - types is the schema of rows that will be added to this container.
-//  - evalCtx defines the context in which to evaluate comparisons, only used
-//    when storing rows in memory.
-//  - engine is the store used for rows when spilling to disk.
-//  - memoryMonitor is used to monitor the DiskBackedRowContainer's memory usage.
-//    If this monitor denies an allocation, the DiskBackedRowContainer will
-//    spill to disk.
-//  - diskMonitor is used to monitor the DiskBackedRowContainer's disk usage if
-//    and when it spills to disk.
+//   - ordering is the output ordering; the order in which rows should be sorted.
+//   - types is the schema of rows that will be added to this container.
+//   - evalCtx defines the context in which to evaluate comparisons, only used
+//     when storing rows in memory. It will **not** be mutated.
+//   - engine is the store used for rows when spilling to disk.
+//   - memoryMonitor is used to monitor the DiskBackedRowContainer's memory usage.
+//     If this monitor denies an allocation, the DiskBackedRowContainer will
+//     spill to disk.
+//   - diskMonitor is used to monitor the DiskBackedRowContainer's disk usage if
+//     and when it spills to disk.
 func (f *DiskBackedRowContainer) Init(
 	ordering colinfo.ColumnOrdering,
 	types []*types.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	engine diskmap.Factory,
 	memoryMonitor *mon.BytesMonitor,
 	diskMonitor *mon.BytesMonitor,
@@ -414,7 +451,7 @@ func (f *DiskBackedRowContainer) Init(
 	f.src = &mrc
 	f.engine = engine
 	f.diskMonitor = diskMonitor
-	f.encodings = make([]descpb.DatumEncoding, len(ordering))
+	f.encodings = make([]catenumpb.DatumEncoding, len(ordering))
 	for i, orderInfo := range ordering {
 		f.encodings[i] = rowenc.EncodingDirToDatumEncoding(orderInfo.Direction)
 	}
@@ -514,8 +551,8 @@ func (f *DiskBackedRowContainer) Reorder(
 }
 
 // InitTopK is part of the SortableRowContainer interface.
-func (f *DiskBackedRowContainer) InitTopK() {
-	f.src.InitTopK()
+func (f *DiskBackedRowContainer) InitTopK(ctx context.Context) {
+	f.src.InitTopK(ctx)
 }
 
 // MaybeReplaceMax is part of the SortableRowContainer interface.
@@ -593,7 +630,12 @@ func (f *DiskBackedRowContainer) SpillToDisk(ctx context.Context) error {
 	if f.UsingDisk() {
 		return errors.New("already using disk")
 	}
-	drc := MakeDiskRowContainer(f.diskMonitor, f.mrc.types, f.mrc.ordering, f.engine)
+	drc, err := MakeDiskRowContainer(ctx, f.diskMonitor, f.mrc.types, f.mrc.ordering, f.engine)
+	if err != nil {
+		return err
+	}
+	f.src = &drc
+	f.drc = &drc
 	if f.deDuplicate {
 		drc.DoDeDuplicate()
 		// After spilling to disk we don't need this map to de-duplicate. The
@@ -609,7 +651,7 @@ func (f *DiskBackedRowContainer) SpillToDisk(ctx context.Context) error {
 		} else if !ok {
 			break
 		}
-		memRow, err := i.Row()
+		memRow, err := i.EncRow()
 		if err != nil {
 			return err
 		}
@@ -618,9 +660,6 @@ func (f *DiskBackedRowContainer) SpillToDisk(ctx context.Context) error {
 		}
 	}
 	f.mrc.Clear(ctx)
-
-	f.src = &drc
-	f.drc = &drc
 	f.spilled = true
 	return nil
 }
@@ -639,7 +678,7 @@ type DiskBackedIndexedRowContainer struct {
 
 	scratchEncRow rowenc.EncDatumRow
 	storedTypes   []*types.T
-	datumAlloc    rowenc.DatumAlloc
+	datumAlloc    tree.DatumAlloc
 	rowAlloc      rowenc.EncDatumRowAlloc
 	idx           uint64 // the index of the next row to be added into the container
 
@@ -652,7 +691,7 @@ type DiskBackedIndexedRowContainer struct {
 	firstCachedRowPos int
 	nextPosToCache    int
 	// indexedRowsCache is the cache of up to maxCacheSize contiguous rows.
-	indexedRowsCache ring.Buffer
+	indexedRowsCache ring.Buffer[eval.IndexedRow]
 	// maxCacheSize indicates the maximum number of rows to be cached. It is
 	// initialized to maxIndexedRowsCacheSize and dynamically adjusted if OOM
 	// error is encountered.
@@ -672,18 +711,18 @@ var _ IndexedRowContainer = &DiskBackedIndexedRowContainer{}
 // with the given engine as the underlying store that rows are stored on when
 // it spills to disk.
 // Arguments:
-//  - ordering is the output ordering; the order in which rows should be sorted.
-//  - types is the schema of rows that will be added to this container.
-//  - evalCtx defines the context in which to evaluate comparisons, only used
-//    when storing rows in memory.
-//  - engine is the underlying store that rows are stored on when the container
-//    spills to disk.
-//  - memoryMonitor is used to monitor this container's memory usage.
-//  - diskMonitor is used to monitor this container's disk usage.
+//   - ordering is the output ordering; the order in which rows should be sorted.
+//   - types is the schema of rows that will be added to this container.
+//   - evalCtx defines the context in which to evaluate comparisons, only used
+//     when storing rows in memory.
+//   - engine is the underlying store that rows are stored on when the container
+//     spills to disk.
+//   - memoryMonitor is used to monitor this container's memory usage.
+//   - diskMonitor is used to monitor this container's disk usage.
 func NewDiskBackedIndexedRowContainer(
 	ordering colinfo.ColumnOrdering,
 	typs []*types.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	engine diskmap.Factory,
 	memoryMonitor *mon.BytesMonitor,
 	diskMonitor *mon.BytesMonitor,
@@ -771,7 +810,7 @@ const maxIndexedRowsCacheSize = 4096
 // iterator along with the index of the row it currently points at.
 func (f *DiskBackedIndexedRowContainer) GetRow(
 	ctx context.Context, pos int,
-) (tree.IndexedRow, error) {
+) (eval.IndexedRow, error) {
 	var rowWithIdx rowenc.EncDatumRow
 	var err error
 	if f.UsingDisk() {
@@ -785,7 +824,7 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 		if pos >= f.firstCachedRowPos && pos < f.nextPosToCache {
 			requestedRowCachePos := pos - f.firstCachedRowPos
 			f.hitCount++
-			return f.indexedRowsCache.Get(requestedRowCachePos).(tree.IndexedRow), nil
+			return f.indexedRowsCache.Get(requestedRowCachePos), nil
 		}
 		f.missCount++
 		if f.diskRowIter == nil {
@@ -814,7 +853,7 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 				return nil, errors.Errorf("row at pos %d not found", pos)
 			}
 			if f.idxRowIter == f.nextPosToCache {
-				rowWithIdx, err = f.diskRowIter.Row()
+				rowWithIdx, err = f.diskRowIter.EncRow()
 				if err != nil {
 					return nil, err
 				}
@@ -862,13 +901,15 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 					return nil, errors.Errorf("unexpected last column type: should be DInt but found %T", idx)
 				}
 				if f.idxRowIter == pos {
-					return f.indexedRowsCache.GetLast().(tree.IndexedRow), nil
+					return f.indexedRowsCache.GetLast(), nil
 				}
 			}
 			f.idxRowIter++
 		}
 	}
-	rowWithIdx = f.DiskBackedRowContainer.mrc.EncRow(pos)
+	mrc := f.DiskBackedRowContainer.mrc
+	mrc.getEncRow(mrc.scratchEncRow, pos)
+	rowWithIdx = mrc.scratchEncRow
 	row, rowIdx := rowWithIdx[:len(rowWithIdx)-1], rowWithIdx[len(rowWithIdx)-1].Datum
 	if idx, ok := rowIdx.(*tree.DInt); ok {
 		return IndexedRow{int(*idx), row}, nil
@@ -928,7 +969,7 @@ func (f *DiskBackedIndexedRowContainer) reuseFirstRowInCache(
 // NOTE: this method should only be used for testing purposes.
 func (f *DiskBackedIndexedRowContainer) getRowWithoutCache(
 	ctx context.Context, pos int,
-) tree.IndexedRow {
+) eval.IndexedRow {
 	if !f.UsingDisk() {
 		panic(errors.Errorf("getRowWithoutCache is called when the container is using memory"))
 	}
@@ -949,7 +990,7 @@ func (f *DiskBackedIndexedRowContainer) getRowWithoutCache(
 			panic(errors.AssertionFailedf("row at pos %d not found", pos))
 		}
 		if f.idxRowIter == pos {
-			rowWithIdx, err := f.diskRowIter.Row()
+			rowWithIdx, err := f.diskRowIter.EncRow()
 			if err != nil {
 				panic(err)
 			}
@@ -991,4 +1032,14 @@ func (ir IndexedRow) GetDatums(startColIdx, endColIdx int) (tree.Datums, error) 
 		datums = append(datums, ir.Row[idx].Datum)
 	}
 	return datums, nil
+}
+
+// Get implements tree.ExprContainer interface.
+func (r *RowContainer) Get(i, j int) tree.Expr {
+	return r.At(i)[j]
+}
+
+// NumRows implements tree.ExprContainer interface.
+func (r *RowContainer) NumRows() int {
+	return r.Len()
 }

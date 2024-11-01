@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,13 +9,19 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -35,22 +36,29 @@ func CreateTestTableDescriptor(
 	ctx context.Context,
 	parentID, id descpb.ID,
 	schema string,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
+	txn *kv.Txn,
+	collection *descs.Collection,
 ) (*tabledesc.Mutable, error) {
 	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
 	if err != nil {
 		return nil, err
 	}
-	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	evalCtx := eval.MakeTestingEvalContext(st)
+	sessionData := &sessiondata.SessionData{
+		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
+			EnableUniqueWithoutIndexConstraints: true,
+		},
+	}
 	switch n := stmt.AST.(type) {
 	case *tree.CreateTable:
-		db := dbdesc.NewInitial(parentID, "test", security.RootUserName())
+		db := dbdesc.NewInitial(parentID, "test", username.RootUserName())
 		desc, err := NewTableDesc(
 			ctx,
 			nil, /* txn */
-			nil, /* vs */
+			NewSkippingCacheSchemaResolver(collection, sessiondata.NewStack(sessionData), txn, nil),
 			st,
 			n,
 			db,
@@ -59,28 +67,24 @@ func CreateTestTableDescriptor(
 			nil,             /* regionConfig */
 			hlc.Timestamp{}, /* creationTime */
 			privileges,
-			nil, /* affected */
+			make(map[descpb.ID]*tabledesc.Mutable),
 			&semaCtx,
 			&evalCtx,
-			&sessiondata.SessionData{
-				LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-					EnableUniqueWithoutIndexConstraints: true,
-					HashShardedIndexesEnabled:           true,
-				},
-			}, /* sessionData */
+			sessionData,
 			tree.PersistencePermanent,
 		)
 		return desc, err
 	case *tree.CreateSequence:
 		desc, err := NewSequenceTableDesc(
 			ctx,
+			nil, /* planner */
+			st,
 			n.Name.Table(),
 			n.Options,
 			parentID, keys.PublicSchemaID, id,
 			hlc.Timestamp{}, /* creationTime */
 			privileges,
 			tree.PersistencePermanent,
-			nil,   /* params */
 			false, /* isMultiRegion */
 		)
 		return desc, err
@@ -116,17 +120,18 @@ func (r *StmtBufReader) AdvanceOne() {
 // interface{} so that external packages can call NewInternalPlanner and pass
 // the result) and executes a sql statement through the DistSQLPlanner.
 func (dsp *DistSQLPlanner) Exec(
-	ctx context.Context, localPlanner interface{}, sql string, distribute bool,
+	ctx context.Context,
+	localPlanner interface{},
+	stmt statements.Statement[tree.Statement],
+	distribute bool,
 ) error {
-	stmt, err := parser.ParseOne(sql)
-	if err != nil {
-		return err
-	}
 	p := localPlanner.(*planner)
-	p.stmt = makeStatement(stmt, ClusterWideID{} /* queryID */)
+	p.stmt = makeStatement(stmt, clusterunique.ID{}, /* queryID */
+		tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&p.execCfg.Settings.SV)))
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
+	defer p.curPlan.close(ctx)
 	rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
 		return nil
 	})
@@ -139,15 +144,18 @@ func (dsp *DistSQLPlanner) Exec(
 		p.txn,
 		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
-		execCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
+	distributionType := DistributionType(LocalDistribution)
+	if distribute {
+		distributionType = FullDistribution
+	}
 	evalCtx := p.ExtendedEvalContext()
-	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, p.txn, distribute)
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, p.txn,
+		distributionType)
 	planCtx.stmtType = recv.stmtType
 
-	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv)()
+	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv, nil /* finishedSetupFn */)
 	return rw.Err()
 }

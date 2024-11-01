@@ -1,12 +1,7 @@
-// Copyright 2021 The Cockroach Authors.
+// Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuild
 
@@ -14,33 +9,108 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 )
 
-// Dependencies contains all the dependencies required by the builder.
+// Dependencies contains all the external dependencies required by the scbuild
+// package and its children.
 type Dependencies interface {
+	scbuildstmt.ClusterAndSessionInfo
+	scbuildstmt.Telemetry
+
+	// CatalogReader returns a CatalogReader implementation.
 	CatalogReader() CatalogReader
+
+	// TableReader returns a TableReader implementation.
+	TableReader() TableReader
+
+	// AuthorizationAccessor returns an AuthorizationAccessor implementation.
 	AuthorizationAccessor() AuthorizationAccessor
 
-	// Codec returns the current session data, as in execCfg.
-	// So far this is used only to build a tree.EvalContext.
+	// ClusterID returns the ID of the cluster.
+	// So far this is used only to build a eval.Context, for the purpose
+	// of checking whether CCL features are enabled.
+	ClusterID() uuid.UUID
+
+	// Codec returns the current SQL codec.
 	Codec() keys.SQLCodec
-
-	// SessionData returns the current session data, as in execCtx.
-	SessionData() *sessiondata.SessionData
-
-	// ClusterSettings returns the current cluster settings, as in execCfg.
-	ClusterSettings() *cluster.Settings
 
 	// Statements returns the statements behind this schema change.
 	Statements() []string
+
+	// SemaCtx returns the tree.SemaContext for the schema change statement.
+	SemaCtx() *tree.SemaContext
+
+	// AstFormatter returns something that can format AST nodes.
+	AstFormatter() AstFormatter
+
+	// FeatureChecker returns something that checks schema feature flags.
+	FeatureChecker() FeatureChecker
+
+	// IndexPartitioningCCLCallback returns the CCL callback for creating
+	// partitioning descriptors for indexes.
+	IndexPartitioningCCLCallback() CreatePartitioningCCLCallback
+
+	// DescriptorCommentGetter returns a CommentCache
+	// Implementation.
+	DescriptorCommentGetter() CommentGetter
+
+	// ZoneConfigGetter returns a zone config reader.
+	ZoneConfigGetter() scdecomp.ZoneConfigGetter
+
+	// ClientNoticeSender returns a eval.ClientNoticeSender.
+	ClientNoticeSender() eval.ClientNoticeSender
+
+	// EventLogger returns an EventLogger.
+	EventLogger() EventLogger
+
+	// DescIDGenerator returns a DescIDGenerator.
+	DescIDGenerator() eval.DescIDGenerator
+
+	// ReferenceProviderFactory returns a ReferenceProviderFactory.
+	ReferenceProviderFactory() ReferenceProviderFactory
+
+	// TemporarySchemaProvider returns a TemporarySchemaProvider.
+	TemporarySchemaProvider() TemporarySchemaProvider
+
+	// NodesStatusInfo returns a NodesStatusInfo.
+	NodesStatusInfo() NodesStatusInfo
+
+	// RegionProvider returns a RegionProvider.
+	RegionProvider() RegionProvider
 }
+
+// CreatePartitioningCCLCallback is the type of the CCL callback for creating
+// partitioning descriptors for indexes.
+type CreatePartitioningCCLCallback func(
+	ctx context.Context,
+	st *cluster.Settings,
+	evalCtx *eval.Context,
+	columnLookupFn func(tree.Name) (catalog.Column, error),
+	oldNumImplicitColumns int,
+	oldKeyColumnNames []string,
+	partBy *tree.PartitionBy,
+	allowedNewColumnNames []tree.Name,
+	allowImplicitPartitioning bool,
+) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error)
 
 // CatalogReader should implement descriptor resolution, namespace lookups, and
 // all such catalog read operations for the builder. The following contract must
@@ -48,18 +118,27 @@ type Dependencies interface {
 // - errors are panicked;
 // - caches are avoided at all times, we read straight from storage;
 // - MayResolve* methods return zero values if nothing could be found;
-// - MayResolve* methods ignore dropped or offline descriptors;
-// - MustReadDescriptor does not;
+// - MayResolve* methods ignore dropped and offline descriptors*;
+// - MustReadDescriptor searches all public, offline, and dropped descriptors;
 // - MustReadDescriptor panics if the descriptor was not found.
+//
+// *: MayResolveSchema allows us to resolve an offline schema descriptor if needed.
 type CatalogReader interface {
 	tree.TypeReferenceResolver
 	tree.QualifiedNameResolver
+	tree.FunctionReferenceResolver
 
 	// MayResolveDatabase looks up a database by name.
 	MayResolveDatabase(ctx context.Context, name tree.Name) catalog.DatabaseDescriptor
 
 	// MayResolveSchema looks up a schema by name.
-	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+	// If withOffline is set, we include offline schema descs into our search.
+	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix, withOffline bool) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+
+	// MayResolvePrefix looks up a database and schema given the prefix at best
+	// effort, meaning the prefix may not have explicit catalog and schema name.
+	// It fails if the db or schema represented by the prefix does not exist.
+	MayResolvePrefix(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
 
 	// MayResolveTable looks up a table by name.
 	MayResolveTable(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
@@ -67,85 +146,127 @@ type CatalogReader interface {
 	// MayResolveType looks up a type by name.
 	MayResolveType(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor)
 
-	// ReadObjectNamesAndIDs looks up the namespace entries for a schema.
-	ReadObjectNamesAndIDs(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) (tree.TableNames, descpb.IDs)
+	// MayResolveIndex looks up a table containing index with provided index name.
+	// The resolving contract is that:
+	// (1) if table name is provided, table is resolved and index is searched within the table.
+	// (2) if table name is not given, but schema name (in CRDB, db name can be
+	// the schema name here) is present, schema is resolved first, then all tables
+	// are looped to searched for the index.
+	// (3) if only index name is present, all tables in all schemas on current
+	// search path are looped to look up the index.
+	// It's possible that index does not exist, in which case it won't panic but
+	// "found=false" is returned.
+	MayResolveIndex(ctx context.Context, tableIndexName tree.TableIndexName) (
+		found bool, prefix catalog.ResolvedObjectPrefix, tbl catalog.TableDescriptor, idx catalog.Index,
+	)
+
+	// GetAllSchemasInDatabase gets all schemas in a database.
+	GetAllSchemasInDatabase(ctx context.Context, database catalog.DatabaseDescriptor) nstree.Catalog
+
+	// GetAllObjectsInSchema gets all non-dropped objects in a schema.
+	GetAllObjectsInSchema(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) nstree.Catalog
 
 	// MustReadDescriptor looks up a descriptor by ID.
 	MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor
 }
 
+// TableReader implements functions for inspecting tables during the build phase,
+// checking their contents for example to determine if they are empty.
+type TableReader interface {
+	// IsTableEmpty returns if the table is empty.
+	IsTableEmpty(ctx context.Context, id descpb.ID, primaryIndexID descpb.IndexID) bool
+}
+
 // AuthorizationAccessor for checking authorization (e.g. desc privileges).
 type AuthorizationAccessor interface {
-
 	// CheckPrivilege verifies that the current user has `privilege` on
 	// `descriptor`.
 	CheckPrivilege(
-		ctx context.Context, descriptor catalog.Descriptor, privilege privilege.Kind,
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind,
 	) error
 
-	// HasAdminRole verifies if a user has an admin role.
+	// HasAdminRole verifies if current user has an admin role.
 	HasAdminRole(ctx context.Context) (bool, error)
 
 	// HasOwnership returns true iff the role, or any role the role is a member
 	// of, has ownership privilege of the desc.
-	HasOwnership(ctx context.Context, descriptor catalog.Descriptor) (bool, error)
+	HasOwnership(ctx context.Context, privilegeObject privilege.Object) (bool, error)
+
+	// CheckPrivilegeForUser verifies that `user` has `privilege` on `descriptor`.
+	CheckPrivilegeForUser(
+		ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername,
+	) error
+
+	// MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct
+	// and indirect) and returns a map of "role" -> "isAdmin".
+	MemberOfWithAdminOption(ctx context.Context, member username.SQLUsername) (map[username.SQLUsername]bool, error)
+
+	// HasPrivilege checks if the `user` has `privilege` on `privilegeObject`.
+	HasPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind, user username.SQLUsername) (bool, error)
+
+	// HasAnyPrivilege returns true if user has any privileges at all.
+	HasAnyPrivilege(ctx context.Context, privilegeObject privilege.Object) (bool, error)
+
+	// HasGlobalPrivilegeOrRoleOption returns a bool representing whether the current user
+	// has a global privilege or the corresponding legacy role option.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
+
+	// CheckRoleExists returns nil if `role` exists.
+	CheckRoleExists(ctx context.Context, role username.SQLUsername) error
 }
 
-func mustReadDatabase(
-	ctx context.Context, d Dependencies, id descpb.ID,
-) catalog.DatabaseDescriptor {
-	desc := d.CatalogReader().MustReadDescriptor(ctx, id)
-	db, err := catalog.AsDatabaseDescriptor(desc)
-	onErrPanic(err)
-	return db
+// AstFormatter provides interfaces for formatting AST nodes.
+type AstFormatter interface {
+	// FormatAstAsRedactableString formats a tree.Statement into SQL with fully
+	// qualified names, where parts can be redacted.
+	FormatAstAsRedactableString(statement tree.Statement, annotations *tree.Annotations) redact.RedactableString
 }
 
-func mustReadSchema(ctx context.Context, d Dependencies, id descpb.ID) catalog.SchemaDescriptor {
-	desc := d.CatalogReader().MustReadDescriptor(ctx, id)
-	schema, err := catalog.AsSchemaDescriptor(desc)
-	onErrPanic(err)
-	return schema
+// CommentGetter see scdecomp.CommentGetter.
+type CommentGetter scdecomp.CommentGetter
+
+// SchemaResolverFactory is used to construct a new schema resolver with
+// injected dependencies.
+type SchemaResolverFactory func(
+	descCollection *descs.Collection,
+	sessionDataStack *sessiondata.Stack,
+	txn *kv.Txn,
+	authAccessor AuthorizationAccessor,
+) resolver.SchemaResolver
+
+// EventLogger contains the dependencies required for logging schema change
+// events.
+type EventLogger interface {
+
+	// LogEvent writes an event into the event log which signals the start of a
+	// schema change.
+	LogEvent(
+		ctx context.Context, details eventpb.CommonSQLEventDetails, event logpb.EventPayload,
+	) error
 }
 
-func mustReadTable(ctx context.Context, d Dependencies, id descpb.ID) catalog.TableDescriptor {
-	desc := d.CatalogReader().MustReadDescriptor(ctx, id)
-	table, err := catalog.AsTableDescriptor(desc)
-	onErrPanic(err)
-	return table
+// ReferenceProvider provides all referenced objects with in current DDL
+// statement. For example, CREATE VIEW and CREATE FUNCTION both could reference
+// other objects, and cross-references need to probably tracked.
+type ReferenceProvider interface {
+	scbuildstmt.ReferenceProvider
 }
 
-func mustReadType(ctx context.Context, d Dependencies, id descpb.ID) catalog.TypeDescriptor {
-	desc := d.CatalogReader().MustReadDescriptor(ctx, id)
-	typ, err := catalog.AsTypeDescriptor(desc)
-	onErrPanic(err)
-	return typ
+// ReferenceProviderFactory is used to construct a new ReferenceProvider which
+// provide all dependencies required by the statement.
+type ReferenceProviderFactory interface {
+	NewReferenceProvider(ctx context.Context, stmt tree.Statement) (ReferenceProvider, error)
 }
 
-func semaCtx(d Dependencies) *tree.SemaContext {
-	semaCtx := tree.MakeSemaContext()
-	semaCtx.Annotations = nil
-	semaCtx.SearchPath = d.SessionData().SearchPath
-	semaCtx.IntervalStyleEnabled = d.SessionData().IntervalStyleEnabled
-	semaCtx.DateStyleEnabled = d.SessionData().DateStyleEnabled
-	semaCtx.TypeResolver = d.CatalogReader()
-	semaCtx.TableNameResolver = d.CatalogReader()
-	semaCtx.DateStyle = d.SessionData().GetDateStyle()
-	semaCtx.IntervalStyle = d.SessionData().GetIntervalStyle()
-	return &semaCtx
-}
+// Export dependency interfaces.
+// These are defined in the scbuildstmts package instead of scbuild to avoid
+// circular import dependencies.
+type (
+	// FeatureChecker contains operations for checking if a schema change
+	// feature is allowed by the database administrator.
+	FeatureChecker = scbuildstmt.SchemaFeatureChecker
 
-func evalCtx(ctx context.Context, d Dependencies) *tree.EvalContext {
-	return &tree.EvalContext{
-		SessionDataStack:   sessiondata.NewStack(d.SessionData()),
-		Context:            ctx,
-		Planner:            &faketreeeval.DummyEvalPlanner{},
-		PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
-		SessionAccessor:    &faketreeeval.DummySessionAccessor{},
-		ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
-		Sequence:           &faketreeeval.DummySequenceOperators{},
-		Tenant:             &faketreeeval.DummyTenantOperator{},
-		Regions:            &faketreeeval.DummyRegionOperator{},
-		Settings:           d.ClusterSettings(),
-		Codec:              d.Codec(),
-	}
-}
+	TemporarySchemaProvider = scbuildstmt.TemporarySchemaProvider
+	NodesStatusInfo         = scbuildstmt.NodeStatusInfo
+	RegionProvider          = scbuildstmt.RegionProvider
+)

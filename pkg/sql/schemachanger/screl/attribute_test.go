@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package screl
 
@@ -18,31 +13,31 @@ import (
 )
 
 func TestGetAttribute(t *testing.T) {
-	seqElem := &scpb.SequenceDependency{
-		TableID:    1,
-		ColumnID:   2,
-		SequenceID: 3,
+	cn := &scpb.ColumnName{
+		TableID:  1,
+		ColumnID: 2,
+		Name:     "foo",
 	}
-	seqElemDiff := &scpb.SequenceDependency{
-		TableID:    1,
-		ColumnID:   4,
-		SequenceID: 3,
+	cnDiff := &scpb.ColumnName{
+		TableID:  1,
+		ColumnID: 4,
+		Name:     "foo",
 	}
 
 	// Sanity: Validate basic string conversion, equality,
 	// and inequality.
-	expectedStr := `SequenceDependency:{DescID: 3, ColumnID: 2, ReferencedDescID: 1}`
-	require.Equal(t, expectedStr, ElementString(seqElem), "Attribute string conversion is broken.")
-	require.True(t, EqualElements(seqElem, seqElem))
-	require.False(t, EqualElements(seqElem, seqElemDiff))
+	expectedStr := `ColumnName:{DescID: 1, Name: foo, ColumnID: 2}`
+	require.Equal(t, expectedStr, ElementString(cn), "Attribute string conversion is broken.")
+	require.True(t, EqualElementKeys(cn, cn))
+	require.False(t, EqualElementKeys(cn, cnDiff))
 
 	// Sanity: Validate type references, then check if type comparisons
 	// work.
-	typeBackRef := &scpb.TypeReference{DescID: 1, TypeID: 3}
-	expectedStr = `TypeReference:{DescID: 1, ReferencedDescID: 3}`
-	require.Equal(t, expectedStr, ElementString(typeBackRef), "Attribute string conversion is broken.")
-	require.False(t, EqualElements(seqElem, typeBackRef))
-	require.False(t, EqualElements(typeBackRef, seqElem))
+	so := &scpb.SequenceOwner{TableID: 1, ColumnID: 2, SequenceID: 3}
+	expectedStr = `SequenceOwner:{DescID: 1, ColumnID: 2, ReferencedDescID: 3}`
+	require.Equal(t, expectedStr, ElementString(so), "Attribute string conversion is broken.")
+	require.False(t, EqualElementKeys(so, cn))
+	require.False(t, EqualElementKeys(so, cnDiff))
 }
 
 func BenchmarkCompareElements(b *testing.B) {
@@ -50,23 +45,15 @@ func BenchmarkCompareElements(b *testing.B) {
 		&scpb.Column{},
 		&scpb.PrimaryIndex{},
 		&scpb.SecondaryIndex{},
-		&scpb.SequenceDependency{},
-		&scpb.UniqueConstraint{},
 		&scpb.CheckConstraint{},
 		&scpb.Sequence{},
-		&scpb.DefaultExpression{},
 		&scpb.View{},
-		&scpb.TypeReference{},
 		&scpb.Table{},
-		&scpb.OutboundForeignKey{},
-		&scpb.InboundForeignKey{},
-		&scpb.RelationDependedOnBy{},
-		&scpb.SequenceOwnedBy{},
 	}
 	for i := 0; i < int(float64(b.N)/float64(len(elements)*len(elements))); i++ {
 		for _, a := range elements {
 			for _, b := range elements {
-				CompareElements(a, b)
+				Schema.CompareOn(equalityAttrs, a, b)
 			}
 		}
 	}

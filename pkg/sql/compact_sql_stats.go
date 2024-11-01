@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,14 +11,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
@@ -41,47 +36,37 @@ var _ jobs.Resumer = &sqlStatsCompactionResumer{}
 func (r *sqlStatsCompactionResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	log.Infof(ctx, "starting sql stats compaction job")
 	p := execCtx.(JobExecContext)
-	ie := p.ExecCfg().InternalExecutor
-	db := p.ExecCfg().DB
 
 	var (
-		scheduledJobID int64
+		scheduledJobID jobspb.ScheduleID
 		err            error
 	)
 
-	if err = db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		scheduledJobID, err = r.getScheduleID(ctx, ie, txn, scheduledjobs.ProdJobSchedulerEnv)
+	if err = p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		scheduledJobID, err = r.getScheduleID(ctx, txn, scheduledjobs.ProdJobSchedulerEnv)
 		if err != nil {
 			return err
 		}
 
-		if scheduledJobID != jobs.InvalidScheduleID {
-			r.sj, err = jobs.LoadScheduledJob(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID, ie, txn)
+		if scheduledJobID != jobspb.InvalidScheduleID {
+			schedules := jobs.ScheduledJobTxn(txn)
+			r.sj, err = schedules.Load(ctx, scheduledjobs.ProdJobSchedulerEnv, scheduledJobID)
 			if err != nil {
 				return err
 			}
 			r.sj.SetScheduleStatus(string(jobs.StatusRunning))
-			return r.sj.Update(ctx, ie, txn)
+
+			return schedules.Update(ctx, r.sj)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
 
-	// We check for concurrently running SQL Stats compaction jobs. We only allow
-	// one job to be running at the same time.
-	if err := persistedsqlstats.CheckExistingCompactionJob(ctx, r.job, ie, nil /* txn */); err != nil {
-		if errors.Is(err, persistedsqlstats.ErrConcurrentSQLStatsCompaction) {
-			log.Infof(ctx, "exiting due to a running sql stats compaction job")
-		}
-		return err
-	}
-
 	statsCompactor := persistedsqlstats.NewStatsCompactor(
 		r.st,
-		ie,
-		db,
-		ie.s.ServerMetrics.StatsMetrics.SQLStatsRemovedRows,
+		p.ExecCfg().InternalDB,
+		p.ExecCfg().InternalDB.server.ServerMetrics.StatsMetrics.SQLStatsRemovedRows,
 		p.ExecCfg().SQLStatsTestingKnobs)
 	if err = statsCompactor.DeleteOldestEntries(ctx); err != nil {
 		return err
@@ -89,61 +74,63 @@ func (r *sqlStatsCompactionResumer) Resume(ctx context.Context, execCtx interfac
 
 	return r.maybeNotifyJobTerminated(
 		ctx,
-		ie,
-		p.ExecCfg(),
+		p.ExecCfg().InternalDB,
+		p.ExecCfg().JobsKnobs(),
 		jobs.StatusSucceeded)
 }
 
 // OnFailOrCancel implements the jobs.Resumer interface.
-func (r *sqlStatsCompactionResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
+func (r *sqlStatsCompactionResumer) OnFailOrCancel(
+	ctx context.Context, execCtx interface{}, _ error,
+) error {
 	p := execCtx.(JobExecContext)
 	execCfg := p.ExecCfg()
-	ie := execCfg.InternalExecutor
-	return r.maybeNotifyJobTerminated(ctx, ie, execCfg, jobs.StatusFailed)
+	return r.maybeNotifyJobTerminated(ctx, execCfg.InternalDB, execCfg.JobsKnobs(), jobs.StatusFailed)
+}
+
+// CollectProfile implements the jobs.Resumer interface.
+func (r *sqlStatsCompactionResumer) CollectProfile(_ context.Context, _ interface{}) error {
+	return nil
 }
 
 // maybeNotifyJobTerminated will notify the job termination
 // (with termination status).
 func (r *sqlStatsCompactionResumer) maybeNotifyJobTerminated(
-	ctx context.Context, ie sqlutil.InternalExecutor, exec *ExecutorConfig, status jobs.Status,
+	ctx context.Context, db isql.DB, jobKnobs *jobs.TestingKnobs, status jobs.Status,
 ) error {
 	log.Infof(ctx, "sql stats compaction job terminated with status = %s", status)
-	if r.sj != nil {
-		env := scheduledjobs.ProdJobSchedulerEnv
-		if knobs, ok := exec.DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
-			if knobs.JobSchedulerEnv != nil {
-				env = knobs.JobSchedulerEnv
-			}
-		}
-		if err := jobs.NotifyJobTermination(
-			ctx, env, r.job.ID(), status, r.job.Details(), r.sj.ScheduleID(),
-			ie, nil /* txn */); err != nil {
-			return err
-		}
-
+	if r.sj == nil {
 		return nil
 	}
-	return nil
+	return db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		env := scheduledjobs.ProdJobSchedulerEnv
+		if jobKnobs != nil && jobKnobs.JobSchedulerEnv != nil {
+			env = jobKnobs.JobSchedulerEnv
+		}
+		return jobs.NotifyJobTermination(
+			ctx, txn, env, r.job.ID(), status, r.job.Details(), r.sj.ScheduleID(),
+		)
+	})
 }
 
 func (r *sqlStatsCompactionResumer) getScheduleID(
-	ctx context.Context, ie sqlutil.InternalExecutor, txn *kv.Txn, env scheduledjobs.JobSchedulerEnv,
-) (scheduleID int64, _ error) {
-	row, err := ie.QueryRowEx(ctx, "lookup-sql-stats-schedule", txn,
-		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
+	ctx context.Context, txn isql.Txn, env scheduledjobs.JobSchedulerEnv,
+) (scheduleID jobspb.ScheduleID, _ error) {
+	row, err := txn.QueryRowEx(ctx, "lookup-sql-stats-schedule", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf("SELECT created_by_id FROM %s WHERE id=$1 AND created_by_type=$2", env.SystemJobsTableName()),
 		r.job.ID(), jobs.CreatedByScheduledJobs,
 	)
 	if err != nil {
-		return jobs.InvalidScheduleID, errors.Wrap(err, "fail to look up scheduled information")
+		return jobspb.InvalidScheduleID, errors.Wrap(err, "fail to look up scheduled information")
 	}
 
 	if row == nil {
 		// Compaction not triggered by a scheduled job.
-		return jobs.InvalidScheduleID, nil
+		return jobspb.InvalidScheduleID, nil
 	}
 
-	scheduleID = int64(tree.MustBeDInt(row[0]))
+	scheduleID = jobspb.ScheduleID(tree.MustBeDInt(row[0]))
 	return scheduleID, nil
 }
 
@@ -171,18 +158,19 @@ func (e *scheduledSQLStatsCompactionExecutor) OnDrop(
 	scheduleControllerEnv scheduledjobs.ScheduleControllerEnv,
 	env scheduledjobs.JobSchedulerEnv,
 	schedule *jobs.ScheduledJob,
-	txn *kv.Txn,
-) error {
-	return persistedsqlstats.ErrScheduleUndroppable
+	txn isql.Txn,
+	descsCol *descs.Collection,
+) (int, error) {
+	return 0, persistedsqlstats.ErrScheduleUndroppable
 }
 
 // ExecuteJob implements the jobs.ScheduledJobExecutor interface.
 func (e *scheduledSQLStatsCompactionExecutor) ExecuteJob(
 	ctx context.Context,
+	txn isql.Txn,
 	cfg *scheduledjobs.JobExecutionConfig,
 	env scheduledjobs.JobSchedulerEnv,
 	sj *jobs.ScheduledJob,
-	txn *kv.Txn,
 ) error {
 	if err := e.createSQLStatsCompactionJob(ctx, cfg, sj, txn); err != nil {
 		e.metrics.NumFailed.Inc(1)
@@ -193,16 +181,16 @@ func (e *scheduledSQLStatsCompactionExecutor) ExecuteJob(
 }
 
 func (e *scheduledSQLStatsCompactionExecutor) createSQLStatsCompactionJob(
-	ctx context.Context, cfg *scheduledjobs.JobExecutionConfig, sj *jobs.ScheduledJob, txn *kv.Txn,
+	ctx context.Context, cfg *scheduledjobs.JobExecutionConfig, sj *jobs.ScheduledJob, txn isql.Txn,
 ) error {
-	p, cleanup := cfg.PlanHookMaker("invoke-sql-stats-compact", txn, security.NodeUserName())
+	p, cleanup := cfg.PlanHookMaker(ctx, "invoke-sql-stats-compact", txn.KV(), username.NodeUserName())
 	defer cleanup()
 
 	_, err :=
 		persistedsqlstats.CreateCompactionJob(ctx, &jobs.CreatedByInfo{
-			ID:   sj.ScheduleID(),
+			ID:   int64(sj.ScheduleID()),
 			Name: jobs.CreatedByScheduledJobs,
-		}, txn, cfg.InternalExecutor, p.(*planner).ExecCfg().JobRegistry)
+		}, txn, p.(*planner).ExecCfg().JobRegistry)
 
 	if err != nil {
 		return err
@@ -214,13 +202,12 @@ func (e *scheduledSQLStatsCompactionExecutor) createSQLStatsCompactionJob(
 // NotifyJobTermination implements the jobs.ScheduledJobExecutor interface.
 func (e *scheduledSQLStatsCompactionExecutor) NotifyJobTermination(
 	ctx context.Context,
+	txn isql.Txn,
 	jobID jobspb.JobID,
 	jobStatus jobs.Status,
 	details jobspb.Details,
 	env scheduledjobs.JobSchedulerEnv,
 	sj *jobs.ScheduledJob,
-	ex sqlutil.InternalExecutor,
-	txn *kv.Txn,
 ) error {
 	if jobStatus == jobs.StatusFailed {
 		jobs.DefaultHandleFailedRun(sj, "sql stats compaction %d failed", jobID)
@@ -244,22 +231,19 @@ func (e *scheduledSQLStatsCompactionExecutor) Metrics() metric.Struct {
 
 // GetCreateScheduleStatement implements the jobs.ScheduledJobExecutor interface.
 func (e *scheduledSQLStatsCompactionExecutor) GetCreateScheduleStatement(
-	ctx context.Context,
-	env scheduledjobs.JobSchedulerEnv,
-	txn *kv.Txn,
-	sj *jobs.ScheduledJob,
-	ex sqlutil.InternalExecutor,
+	ctx context.Context, txn isql.Txn, env scheduledjobs.JobSchedulerEnv, sj *jobs.ScheduledJob,
 ) (string, error) {
 	return "SELECT crdb_internal.schedule_sql_stats_compact()", nil
 }
 
 func init() {
+	// Do not include the cost of stats compaction in tenant accounting.
 	jobs.RegisterConstructor(jobspb.TypeAutoSQLStatsCompaction, func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
 		return &sqlStatsCompactionResumer{
 			job: job,
 			st:  settings,
 		}
-	})
+	}, jobs.DisablesTenantCostControl)
 
 	jobs.RegisterScheduledJobExecutorFactory(
 		tree.ScheduledSQLStatsCompactionExecutor.InternalName(),

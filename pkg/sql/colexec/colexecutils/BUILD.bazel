@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "colexecutils",
@@ -6,7 +7,9 @@ go_library(
         "bool_vec_to_sel.go",
         "cancel_checker.go",
         "deselector.go",
+        "deserializer.go",
         "operator.go",
+        "overloads_bin_util.go",
         "spilling_buffer.go",
         "spilling_queue.go",
         "utils.go",
@@ -15,16 +18,22 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/col/coldata",
+        "//pkg/col/colserde",
+        "//pkg/roachpb",
         "//pkg/sql/colcontainer",
         "//pkg/sql/colexecerror",
         "//pkg/sql/colexecop",
         "//pkg/sql/colmem",
+        "//pkg/sql/execinfrapb",
+        "//pkg/sql/sem/eval",
+        "//pkg/sql/sem/tree",
         "//pkg/sql/sqlerrors",
         "//pkg/sql/types",
-        "//pkg/util",
         "//pkg/util/cancelchecker",
         "//pkg/util/log",
+        "//pkg/util/metamorphic",
         "//pkg/util/mon",
+        "@com_github_apache_arrow_go_arrow//array",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_marusama_semaphore//:semaphore",
     ],
@@ -35,7 +44,6 @@ go_test(
     srcs = [
         "bool_vec_to_sel_test.go",
         "cancel_checker_test.go",
-        "dep_test.go",
         "deselector_test.go",
         "main_test.go",
         "spilling_buffer_test.go",
@@ -54,9 +62,8 @@ go_test(
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
         "//pkg/sql/randgen",
-        "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/types",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/colcontainerutils",
         "//pkg/testutils/skip",
         "//pkg/util/cancelchecker",
@@ -67,5 +74,12 @@ go_test(
         "//pkg/util/randutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
+    ],
+)
+
+disallowed_imports_test(
+    "colexecutils",
+    disallowed_prefixes = [
+        "pkg/sql/colexec/",
     ],
 )

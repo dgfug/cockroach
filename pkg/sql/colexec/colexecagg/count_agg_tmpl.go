@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -43,26 +38,25 @@ func newCount_COUNTKIND_AGGKINDAggAlloc(
 type count_COUNTKIND_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
+	col coldata.Int64s
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
-	col    []int64
 	curAgg int64
 }
 
 var _ AggregateFunc = &count_COUNTKIND_AGGKINDAgg{}
 
-func (a *count_COUNTKIND_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *count_COUNTKIND_AGGKINDAgg) SetOutput(vec *coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
 	a.col = vec.Int64()
 }
 
+// {{end}}
+
 func (a *count_COUNTKIND_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 	// {{if not (eq .CountKind "Rows")}}
 	// If this is a COUNT(col) aggregator and there are nulls in this batch,
@@ -71,7 +65,7 @@ func (a *count_COUNTKIND_AGGKINDAgg) Compute(
 	nulls := vecs[inputIdxs[0]].Nulls()
 	// {{end}}
 	// {{if not (eq "_AGGKIND" "Window")}}
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -146,8 +140,11 @@ func (a *count_COUNTKIND_AGGKINDAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
+	col := a.col
+	// {{else}}
+	col := a.vec.Int64()
 	// {{end}}
-	a.col[outputIdx] = a.curAgg
+	col[outputIdx] = a.curAgg
 }
 
 // {{if eq "_AGGKIND" "Ordered"}}
@@ -171,7 +168,7 @@ func (a *count_COUNTKIND_AGGKINDAgg) Reset() {
 // Remove implements the slidingWindowAggregateFunc interface (see
 // window_aggregator_tmpl.go).
 func (a *count_COUNTKIND_AGGKINDAgg) Remove(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int,
 ) {
 	nulls := vecs[inputIdxs[0]].Nulls()
 	if nulls.MaybeHasNulls() {

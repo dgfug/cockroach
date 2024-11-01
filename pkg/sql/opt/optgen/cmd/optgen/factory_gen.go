@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -53,18 +48,17 @@ func (g *factoryGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 // genConstructFuncs generates the factory Construct functions for each
 // expression type. The code is similar to this:
 //
-//   // ConstructSelect constructs an expression for the Select operator.
-//   func (_f *Factory) ConstructSelect(
-//     input memo.RelExpr,
-//     filters memo.FiltersExpr,
-//   ) memo.RelExpr {
+//	// ConstructSelect constructs an expression for the Select operator.
+//	func (_f *Factory) ConstructSelect(
+//	  input memo.RelExpr,
+//	  filters memo.FiltersExpr,
+//	) memo.RelExpr {
 //
-//     ... normalization rule code goes here ...
+//	  ... normalization rule code goes here ...
 //
-//     nd := _f.mem.MemoizeSelect(input, filters)
-//     return _f.onConstructRelational(nd)
-//   }
-//
+//	  nd := _f.mem.MemoizeSelect(input, filters)
+//	  return _f.onConstructRelational(nd)
+//	}
 func (g *factoryGen) genConstructFuncs() {
 	defines := g.compiled.Defines.
 		WithoutTag("Enforcer").
@@ -96,6 +90,8 @@ func (g *factoryGen) genConstructFuncs() {
 		}
 
 		g.w.nest(" {\n")
+
+		g.w.writeIndent("opt.MaybeInjectOptimizerTestingPanic(_f.ctx, _f.evalCtx)\n")
 
 		if define.Tags.Contains("ListItem") {
 			g.w.writeIndent("item := memo.%s{", define.Name)
@@ -136,6 +132,13 @@ func (g *factoryGen) genConstructFuncs() {
 
 			g.w.writeIndent("SKIP_RULES:\n")
 
+			if define.Name == "Scan" {
+				// The name of the scanPrivate element
+				spName := unTitle(g.md.fieldName(fields[0]))
+				g.w.write("_tabMeta := _f.Memo().Metadata().TableMeta(%s.Table)\n", spName)
+				g.w.write("%s.Distribution.FromIndexScan(_f.ctx, _f.evalCtx, _tabMeta, %s.Index, %s.Constraint)\n",
+					spName, spName, spName)
+			}
 			g.w.writeIndent("e := _f.mem.Memoize%s(", define.Name)
 			for i, field := range fields {
 				if i != 0 {
@@ -183,6 +186,7 @@ func (g *factoryGen) genReplace() {
 	g.w.writeIndent("// achieved by moving the factory.Replace call to the top of the replace\n")
 	g.w.writeIndent("// function rather than bottom.\n")
 	g.w.nestIndent("func (f *Factory) Replace(e opt.Expr, replace ReplaceFunc) opt.Expr {\n")
+	g.w.writeIndent("opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)\n")
 	g.w.writeIndent("switch t := e.(type) {\n")
 
 	defines := g.compiled.Defines.WithoutTag("Enforcer").WithoutTag("ListItem").WithoutTag("Private")
@@ -329,6 +333,7 @@ func (g *factoryGen) genCopyAndReplaceDefault() {
 	g.w.writeIndent("// function. See comments for CopyAndReplace for more details.\n")
 	g.w.nestIndent("func (f *Factory) CopyAndReplaceDefault(src opt.Expr, replace ReplaceFunc) (dst opt.Expr)")
 	g.w.nest("{\n")
+	g.w.writeIndent("opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)\n")
 	g.w.writeIndent("switch t := src.(type) {\n")
 
 	defines := g.compiled.Defines.
@@ -473,20 +478,20 @@ func (g *factoryGen) genCopyAndReplaceDefault() {
 // constructs expressions from a dynamic type and arguments. The code looks
 // similar to this:
 //
-//   func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Node {
-//     switch op {
-//     case opt.ProjectOp:
-//       return f.ConstructProject(
-//         args[0].(memo.RelNode),
-//         *args[1].(*memo.ProjectionsExpr),
-//         *args[2].(*opt.ColSet),
-//       )
+//	func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Node {
+//	  switch op {
+//	  case opt.ProjectOp:
+//	    return f.ConstructProject(
+//	      args[0].(memo.RelNode),
+//	      *args[1].(*memo.ProjectionsExpr),
+//	      *args[2].(*opt.ColSet),
+//	    )
 //
-//     ... cases for other ops ...
-//   }
-//
+//	  ... cases for other ops ...
+//	}
 func (g *factoryGen) genDynamicConstruct() {
 	g.w.nestIndent("func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Expr {\n")
+	g.w.writeIndent("opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)\n")
 	g.w.writeIndent("switch op {\n")
 
 	defines := g.compiled.Defines.

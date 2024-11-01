@@ -1,15 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import moment from "moment";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import { fromNumber } from "long";
+import moment from "moment-timezone";
+
 import {
   NanoToMilli,
   MilliToNano,
@@ -18,18 +15,11 @@ import {
   TimestampToNumber,
   LongToMoment,
   DurationToNumber,
+  NumberToDuration,
+  makeTimestamp,
 } from "./convert";
-import { fromNumber } from "long";
-
-type Timestamp = protos.google.protobuf.ITimestamp;
 
 const SECONDS = [0, 1, 2, 3, 4, 5, 100, 200, 300];
-
-function makeTimestamp(unixTs: number): Timestamp {
-  return new protos.google.protobuf.Timestamp({
-    seconds: fromNumber(unixTs),
-  });
-}
 
 describe("Test convert functions", (): void => {
   describe("NanoToMilli", (): void => {
@@ -111,6 +101,23 @@ describe("Test convert functions", (): void => {
 
     it("should return the provided default value if Duration is null", (): void => {
       expect(DurationToNumber(null, 5)).toEqual(5);
+    });
+  });
+
+  describe("NumberToDuration", (): void => {
+    it("should convert a number representing seconds to a Duration", (): void => {
+      SECONDS.forEach((seconds: number) => {
+        const duration = NumberToDuration(seconds);
+        expect(DurationToNumber(duration)).toEqual(seconds);
+      });
+    });
+
+    it("should convert a number representing seconds and milliseconds to a Duration", (): void => {
+      const MixedTimes = [0.005, 11.035, 1.003, 0, 0.025];
+      MixedTimes.forEach((time: number) => {
+        const duration = NumberToDuration(time);
+        expect(DurationToNumber(duration)).toEqual(time);
+      });
     });
   });
 });

@@ -1,4 +1,9 @@
-@import '../core/index.module.scss';
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+@import "../core/index.module.scss";
 
 @mixin icon-color($color: $colors--neutral-7) {
   svg {
@@ -94,7 +99,9 @@
   @include icon-color($colors--primary-text);
   border: solid 1px $colors--neutral-4;
 
-  &:hover, &:active, &:focus {
+  &:hover,
+  &:active,
+  &:focus {
     color: $colors--primary-text;
     @include icon-color($colors--primary-text);
     background: $colors--neutral-1;
@@ -143,7 +150,6 @@
   flex: 1;
   font-weight: normal;
 }
-
 
 .crl-button__icon {
   display: flex;

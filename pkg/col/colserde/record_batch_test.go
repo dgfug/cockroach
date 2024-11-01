@@ -1,17 +1,13 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colserde_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -23,22 +19,21 @@ import (
 	"github.com/apache/arrow/go/arrow"
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/apache/arrow/go/arrow/memory"
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -107,6 +102,20 @@ func randomDataFromType(rng *rand.Rand, t *types.T, n int, nullProbability float
 		}
 		builder.(*array.Float64Builder).AppendValues(data, valid)
 	case types.BytesFamily:
+		if t.Family() == types.EnumFamily {
+			enumMeta := t.TypeMeta.EnumData
+			if enumMeta == nil {
+				panic(errors.AssertionFailedf("unexpectedly empty enum metadata in RandomVec"))
+			}
+			builder = array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+			data := make([][]byte, n)
+			reps := enumMeta.PhysicalRepresentations
+			for i := range data {
+				data[i] = reps[rng.Intn(len(reps))]
+			}
+			builder.(*array.BinaryBuilder).AppendValues(data, valid)
+			break
+		}
 		// Bytes can be represented 3 different ways. As variable-length bytes,
 		// variable-length strings, or fixed-width bytes.
 		representation := rng.Intn(2)
@@ -218,7 +227,7 @@ func randomDataFromType(rng *rand.Rand, t *types.T, n int, nullProbability float
 		)
 		for i := range data {
 			d := randgen.RandDatum(rng, t, false /* nullOk */)
-			data[i], err = rowenc.EncodeTableValue(data[i], descpb.ColumnID(encoding.NoColumnID), d, scratch)
+			data[i], err = valueside.Encode(data[i], valueside.NoColumnID, d, scratch)
 			if err != nil {
 				panic(err)
 			}
@@ -243,7 +252,7 @@ func TestRecordBatchSerializer(t *testing.T) {
 		firstCol := b.NewArray().Data()
 		b.AppendValues([]int64{3}, nil /* valid */)
 		secondCol := b.NewArray().Data()
-		_, _, err = s.Serialize(&bytes.Buffer{}, []*array.Data{firstCol, secondCol}, firstCol.Len())
+		_, _, err = s.Serialize(&bytes.Buffer{}, []array.Data{*firstCol, *secondCol}, firstCol.Len())
 		require.True(t, testutils.IsError(err, "mismatched data lengths"), err)
 	})
 }
@@ -260,7 +269,7 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 
 	var (
 		typs            = make([]*types.T, rng.Intn(maxTypes)+1)
-		data            = make([]*array.Data, len(typs))
+		data            = make([]array.Data, len(typs))
 		dataLen         = rng.Intn(maxDataLen) + 1
 		nullProbability = rng.Float64()
 		buf             = bytes.Buffer{}
@@ -268,7 +277,7 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 
 	for i := range typs {
 		typs[i] = randgen.RandType(rng)
-		data[i] = randomDataFromType(rng, typs[i], dataLen, nullProbability)
+		data[i] = *randomDataFromType(rng, typs[i], dataLen, nullProbability)
 	}
 
 	s, err := colserde.NewRecordBatchSerializer(typs)
@@ -279,13 +288,13 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 	// Run Serialize/Deserialize in a loop to test reuse.
 	for i := 0; i < 2; i++ {
 		buf.Reset()
-		dataCopy := append([]*array.Data{}, data...)
+		dataCopy := append([]array.Data{}, data...)
 		_, _, err := s.Serialize(&buf, dataCopy, dataLen)
 		require.NoError(t, err)
 		if buf.Len()%8 != 0 {
 			t.Fatal("message length must align to 8 byte boundary")
 		}
-		var deserializedData []*array.Data
+		var deserializedData []array.Data
 		_, err = s.Deserialize(&deserializedData, buf.Bytes())
 		require.NoError(t, err)
 
@@ -323,7 +332,7 @@ func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
 	src := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	dest := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	bytesVec := src.ColVec(0).Bytes()
-	maxValueLen := coldata.BytesInitialAllocationFactor * 8
+	maxValueLen := coldata.BytesMaxInlineLength * 8
 	value := make([]byte, maxValueLen)
 	for i := 0; i < coldata.BatchSize(); i++ {
 		value = value[:rng.Intn(maxValueLen)]
@@ -333,8 +342,9 @@ func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
 	}
 	src.SetLength(coldata.BatchSize())
 
-	c, err := colserde.NewArrowBatchConverter(typs)
+	c, err := colserde.NewArrowBatchConverter(typs, colserde.BiDirectional, testMemAcc)
 	require.NoError(t, err)
+	defer c.Close(context.Background())
 	r, err := colserde.NewRecordBatchSerializer(typs)
 	require.NoError(t, err)
 	require.NoError(t, roundTripBatch(src, dest, c, r))
@@ -343,12 +353,13 @@ func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
 	newMemorySize := colmem.GetBatchMemSize(dest)
 
 	// We expect that the original and the new memory sizes are relatively close
-	// to each other (do not differ by more than a third). We cannot guarantee
-	// more precise bound here because the capacities of the underlying []byte
-	// slices is unpredictable. However, this check is sufficient to ensure that
-	// we don't double count memory under `Bytes.data`.
+	// to each other, specifically newMemorySize must less than
+	// 4/3*originalMemorySize. We cannot guarantee more precise bound here because
+	// the capacities of the underlying []byte slices is unpredictable. However,
+	// this check is sufficient to ensure that we don't double count memory under
+	// `Bytes.data`.
 	const maxDeviation = float64(0.33)
-	deviation := math.Abs(float64(originalMemorySize-newMemorySize) / (float64(originalMemorySize)))
+	deviation := float64(newMemorySize-originalMemorySize) / float64(originalMemorySize)
 	require.GreaterOrEqualf(t, maxDeviation, deviation,
 		"new memory size %d is too far away from original %d", newMemorySize, originalMemorySize)
 }
@@ -359,7 +370,7 @@ func BenchmarkRecordBatchSerializerInt64(b *testing.B) {
 	var (
 		typs             = []*types.T{types.Int}
 		buf              = bytes.Buffer{}
-		deserializedData []*array.Data
+		deserializedData []array.Data
 	)
 
 	s, err := colserde.NewRecordBatchSerializer(typs)
@@ -368,8 +379,8 @@ func BenchmarkRecordBatchSerializerInt64(b *testing.B) {
 	for _, dataLen := range []int{1, 16, 256, 2048, 4096} {
 		// Only calculate useful bytes.
 		numBytes := int64(dataLen * 8)
-		data := []*array.Data{randomDataFromType(rng, typs[0], dataLen, 0 /* nullProbability */)}
-		dataCopy := make([]*array.Data, len(data))
+		data := []array.Data{*randomDataFromType(rng, typs[0], dataLen, 0 /* nullProbability */)}
+		dataCopy := make([]array.Data, len(data))
 		b.Run(fmt.Sprintf("Serialize/dataLen=%d", dataLen), func(b *testing.B) {
 			b.SetBytes(numBytes)
 			for i := 0; i < b.N; i++ {

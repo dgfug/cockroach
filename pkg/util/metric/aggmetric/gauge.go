@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package aggmetric
 
@@ -16,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/gogo/protobuf/proto"
+	"github.com/google/btree"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 )
 
@@ -35,6 +31,29 @@ var _ metric.PrometheusExportable = (*AggGauge)(nil)
 // NewGauge constructs a new AggGauge.
 func NewGauge(metadata metric.Metadata, childLabels ...string) *AggGauge {
 	g := &AggGauge{g: *metric.NewGauge(metadata)}
+	g.init(childLabels)
+	return g
+}
+
+// NewFunctionalGauge constructs a new AggGauge whose value is determined when
+// asked for by calling the provided function with the current values of every
+// child of the AggGauge.
+func NewFunctionalGauge(
+	metadata metric.Metadata, f func(childValues []int64) int64, childLabels ...string,
+) *AggGauge {
+	g := &AggGauge{}
+	gaugeFn := func() int64 {
+		values := make([]int64, 0)
+		g.childSet.mu.Lock()
+		defer g.childSet.mu.Unlock()
+		g.childSet.mu.tree.Ascend(func(item btree.Item) (wantMore bool) {
+			cg := item.(*Gauge)
+			values = append(values, cg.Value())
+			return true
+		})
+		return f(values)
+	}
+	g.g = *metric.NewFunctionalGauge(metadata, gaugeFn)
 	g.init(childLabels)
 	return g
 }
@@ -88,6 +107,19 @@ func (g *AggGauge) AddChild(labelVals ...string) *Gauge {
 	return child
 }
 
+// AddFunctionalChild adds a Gauge to this AggGauge where the value is
+// determined when asked for. This method panics if a Gauge already exists for
+// this set of labelVals.
+func (g *AggGauge) AddFunctionalChild(fn func() int64, labelVals ...string) *Gauge {
+	child := &Gauge{
+		parent:           g,
+		labelValuesSlice: labelValuesSlice(labelVals),
+		fn:               fn,
+	}
+	g.add(child)
+	return child
+}
+
 // Gauge is a child of a AggGauge. When it is incremented or decremented, so
 // too is the parent. When metrics are collected by prometheus, each of the
 // children will appear with a distinct label, however, when cockroach
@@ -96,6 +128,7 @@ type Gauge struct {
 	labelValuesSlice
 	parent *AggGauge
 	value  int64
+	fn     func() int64
 }
 
 // ToPrometheusMetric constructs a prometheus metric for this Gauge.
@@ -107,15 +140,21 @@ func (g *Gauge) ToPrometheusMetric() *io_prometheus_client.Metric {
 	}
 }
 
-// Destroy is used to destroy the gauge associated with this child. The value of
-// the Gauge will be decremented from its parent.
-func (g *Gauge) Destroy() {
-	g.Update(0)
+// Unlink unlinks this child from the parent, i.e. the parent will no longer
+// track this child (i.e. won't generate labels for it, etc). However, the child
+// will continue to be functional and reference the parent, meaning updates to
+// it will be reflected in the aggregate stored in the parent.
+//
+// See tenantrate.TestUseAfterRelease.
+func (g *Gauge) Unlink() {
 	g.parent.remove(g)
 }
 
 // Value returns the gauge's current value.
 func (g *Gauge) Value() int64 {
+	if g.fn != nil {
+		return g.fn()
+	}
 	return atomic.LoadInt64(&g.value)
 }
 
@@ -134,6 +173,11 @@ func (g *Gauge) Dec(i int64) {
 func (g *Gauge) Update(val int64) {
 	old := atomic.SwapInt64(&g.value, val)
 	g.parent.g.Inc(val - old)
+}
+
+// UpdateFn updates the function on the gauge.
+func (g *Gauge) UpdateFn(fn func() int64) {
+	g.fn = fn
 }
 
 // AggGaugeFloat64 maintains a value as the sum of its children. The gauge will
@@ -224,10 +268,13 @@ func (g *GaugeFloat64) ToPrometheusMetric() *io_prometheus_client.Metric {
 	}
 }
 
-// Destroy is used to destroy the gauge associated with this child. The value of
-// the GaugeFloat64 will be decremented from its parent.
-func (g *GaugeFloat64) Destroy() {
-	g.Update(0)
+// Unlink unlinks this child from the parent, i.e. the parent will no longer
+// track this child (i.e. won't generate labels for it, etc). However, the child
+// will continue to be functional and reference the parent, meaning updates to
+// it will be reflected in the aggregate stored in the parent.
+//
+// See tenantrate.TestUseAfterRelease.
+func (g *GaugeFloat64) Unlink() {
 	g.parent.remove(g)
 }
 

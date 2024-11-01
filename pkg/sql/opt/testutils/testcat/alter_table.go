@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -16,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -25,9 +21,8 @@ import (
 // AlterTable is a partial implementation of the ALTER TABLE statement.
 //
 // Supported commands:
-//  - INJECT STATISTICS: imports table statistics from a JSON object.
-//  - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
-//
+//   - INJECT STATISTICS: imports table statistics from a JSON object.
+//   - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
 func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	tn := stmt.Table.ToTableName()
 	// Update the table name to include catalog and schema if not provided.
@@ -37,7 +32,7 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	for _, cmd := range stmt.Cmds {
 		switch t := cmd.(type) {
 		case *tree.AlterTableInjectStats:
-			injectTableStats(tab, t.Stats)
+			injectTableStats(tab, t.Stats, tc)
 
 		case *tree.AlterTableAddConstraint:
 			switch d := t.ConstraintDef.(type) {
@@ -55,17 +50,15 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 }
 
 // injectTableStats sets the table statistics as specified by a JSON object.
-func injectTableStats(tt *Table, statsExpr tree.Expr) {
+func injectTableStats(tt *Table, statsExpr tree.Expr, tc *Catalog) {
 	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	typedExpr, err := tree.TypeCheckAndRequire(
-		ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
-	)
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	typedExpr, err := tree.TypeCheckAndRequire(ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS")
 	if err != nil {
 		panic(err)
 	}
-	val, err := typedExpr.Eval(&evalCtx)
+	val, err := eval.Expr(ctx, &evalCtx, typedExpr)
 	if err != nil {
 		panic(err)
 	}
@@ -80,7 +73,7 @@ func injectTableStats(tt *Table, statsExpr tree.Expr) {
 	}
 	tt.Stats = make([]*TableStat, len(stats))
 	for i := range stats {
-		tt.Stats[i] = &TableStat{js: stats[i], tt: tt}
+		tt.Stats[i] = &TableStat{js: stats[i], tt: tt, evalCtx: &evalCtx, tc: tc}
 	}
 	// Call ColumnOrdinal on all possible columns to assert that
 	// the column names are valid.

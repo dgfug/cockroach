@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -35,9 +30,9 @@ type RangeIterator struct {
 	err   error
 }
 
-// NewRangeIterator creates a new RangeIterator.
-func NewRangeIterator(ds *DistSender) *RangeIterator {
-	return &RangeIterator{
+// MakeRangeIterator creates a new RangeIterator.
+func MakeRangeIterator(ds *DistSender) RangeIterator {
+	return RangeIterator{
 		ds: ds,
 	}
 }
@@ -52,6 +47,13 @@ const (
 	// Descending means Next() will advance towards keys that compare lower.
 	Descending
 )
+
+func (d ScanDirection) String() string {
+	if d == Ascending {
+		return "asc"
+	}
+	return "desc"
+}
 
 // Key returns the current key. The iterator must be valid.
 func (ri *RangeIterator) Key() roachpb.RKey {
@@ -96,7 +98,12 @@ func (ri *RangeIterator) ClosedTimestampPolicy() roachpb.RangeClosedTimestampPol
 	if !ri.Valid() {
 		panic(ri.Error())
 	}
-	return ri.token.ClosedTimestampPolicy()
+	// TODO(ajwerner): We default the closed timestamp policy here to
+	// LAG_BY_CLUSTER_SETTING, which is pessimistic. When sending batch requests,
+	// we default the policy to LEAD_FOR_GLOBAL_READS. The reasoning for this
+	// difference is not deeply principled. Consider unifying them.
+	const defaultPolicy = roachpb.LAG_BY_CLUSTER_SETTING
+	return ri.token.ClosedTimestampPolicy(defaultPolicy)
 }
 
 // Token returns the eviction token corresponding to the range
@@ -167,7 +174,8 @@ func (ri *RangeIterator) Next(ctx context.Context) {
 
 // Seek positions the iterator at the specified key.
 func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir ScanDirection) {
-	if log.HasSpanOrEvent(ctx) {
+	logEvents := log.HasSpan(ctx)
+	if logEvents {
 		rev := ""
 		if scanDir == Descending {
 			rev = " (rev)"
@@ -189,8 +197,12 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 	// deals with retryable range descriptor lookups.
 	var err error
 	for r := retry.StartWithCtx(ctx, ri.ds.rpcRetryOptions); r.Next(); {
+		// Note that we pass an empty eviction token here because ri.token
+		// corresponds to the previous range.
 		var rngInfo rangecache.EvictionToken
-		rngInfo, err = ri.ds.getRoutingInfo(ctx, ri.key, ri.token, ri.scanDir == Descending)
+		rngInfo, err = ri.ds.getRoutingInfo(
+			ctx, ri.key, rangecache.EvictionToken{}, ri.scanDir == Descending,
+		)
 
 		// getRoutingInfo may fail retryably if, for example, the first
 		// range isn't available via Gossip. Assume that all errors at
@@ -204,8 +216,8 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 			}
 			continue
 		}
-		if log.V(2) {
-			log.Infof(ctx, "key: %s, desc: %s", ri.key, rngInfo.Desc())
+		if logEvents {
+			log.Eventf(ctx, "key: %s, desc: %s", ri.key, rngInfo.Desc())
 		}
 
 		ri.token = rngInfo
@@ -213,7 +225,7 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 	}
 
 	// Check for an early exit from the retry loop.
-	if deducedErr := ri.ds.deduceRetryEarlyExitError(ctx); deducedErr != nil {
+	if deducedErr := ri.ds.deduceRetryEarlyExitError(ctx, err); deducedErr != nil {
 		ri.err = deducedErr
 	} else {
 		ri.err = errors.Wrapf(err, "RangeIterator failed to seek to %s", key)

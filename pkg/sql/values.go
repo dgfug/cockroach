@@ -1,21 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 type valuesNode struct {
@@ -29,7 +27,14 @@ type valuesNode struct {
 	// a vtable value generator. This changes distsql physical planning.
 	specifiedInQuery bool
 
+	// externallyOwnedContainer allows an external entity to control its
+	// lifetime so we don't call Close.  Used by copy to reuse the container.
+	externallyOwnedContainer bool
+
 	valuesRun
+
+	// Allow passing a coldata.Batch through a valuesNode.
+	coldataBatch coldata.Batch
 }
 
 func (p *planner) newContainerValuesNode(columns colinfo.ResultColumns, capacity int) *valuesNode {
@@ -37,7 +42,7 @@ func (p *planner) newContainerValuesNode(columns colinfo.ResultColumns, capacity
 		columns: columns,
 		valuesRun: valuesRun{
 			rows: rowcontainer.NewRowContainerWithCapacity(
-				p.EvalContext().Mon.MakeBoundAccount(),
+				p.Mon().MakeBoundAccount(),
 				colinfo.ColTypeInfoFromResCols(columns),
 				capacity,
 			),
@@ -52,6 +57,10 @@ type valuesRun struct {
 }
 
 func (n *valuesNode) startExec(params runParams) error {
+	if n.coldataBatch != nil {
+		return errors.AssertionFailedf("planning error: valuesNode started with coldata.Batch")
+	}
+
 	if n.rows != nil {
 		// n.rows was already created in newContainerValuesNode.
 		// Nothing to do here.
@@ -63,7 +72,7 @@ func (n *valuesNode) startExec(params runParams) error {
 	// from other planNodes), so its expressions need evaluating.
 	// This may run subqueries.
 	n.rows = rowcontainer.NewRowContainerWithCapacity(
-		params.extendedEvalCtx.Mon.MakeBoundAccount(),
+		params.p.Mon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(n.columns),
 		len(n.tuples),
 	)
@@ -72,7 +81,7 @@ func (n *valuesNode) startExec(params runParams) error {
 	for _, tupleRow := range n.tuples {
 		for i, typedExpr := range tupleRow {
 			var err error
-			row[i], err = typedExpr.Eval(params.EvalContext())
+			row[i], err = eval.Expr(params.ctx, params.EvalContext(), typedExpr)
 			if err != nil {
 				return err
 			}
@@ -98,7 +107,7 @@ func (n *valuesNode) Values() tree.Datums {
 }
 
 func (n *valuesNode) Close(ctx context.Context) {
-	if n.rows != nil {
+	if n.rows != nil && !n.externallyOwnedContainer {
 		n.rows.Close(ctx)
 		n.rows = nil
 	}

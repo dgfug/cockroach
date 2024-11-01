@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecwindow
 
@@ -20,15 +15,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -50,17 +48,18 @@ func TestWindowFramer(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	rng, _ := randutil.NewTestRand()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	// The spilling buffer used by the window framers always uses
+	// colcontainer.DiskQueueCacheModeClearAndReuseCache mode.
+	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
 	memAcc := testMemMonitor.MakeBoundAccount()
-	defer memAcc.Close(evalCtx.Ctx())
+	defer memAcc.Close(context.Background())
 
 	factory := coldataext.NewExtendedColumnFactory(evalCtx)
-	allocator := colmem.NewAllocator(evalCtx.Ctx(), &memAcc, factory)
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
+	allocator := colmem.NewAllocator(context.Background(), &memAcc, factory)
 
 	var memLimits = []int64{1, 1 << 10, 1 << 20}
 
@@ -78,17 +77,17 @@ func TestWindowFramer(t *testing.T) {
 		types.Float, types.Decimal, types.Interval, types.TimestampTZ, types.Date, types.TimeTZ,
 	}
 	const randExcludeProbability = 0.5
-	var randExclusions = []tree.WindowFrameExclusion{
-		tree.ExcludeCurrentRow, tree.ExcludeGroup, tree.ExcludeTies,
+	var randExclusions = []treewindow.WindowFrameExclusion{
+		treewindow.ExcludeCurrentRow, treewindow.ExcludeGroup, treewindow.ExcludeTies,
 	}
-	for _, mode := range []tree.WindowFrameMode{tree.ROWS, tree.GROUPS, tree.RANGE} {
+	for _, mode := range []treewindow.WindowFrameMode{treewindow.ROWS, treewindow.GROUPS, treewindow.RANGE} {
 		testCfg.mode = mode
 		t.Run(fmt.Sprintf("mode=%v", mode.Name()), func(t *testing.T) {
-			for _, bound := range []tree.WindowFrameBoundType{
-				tree.UnboundedPreceding, tree.OffsetPreceding, tree.CurrentRow,
-				tree.OffsetFollowing, tree.UnboundedFollowing,
+			for _, bound := range []treewindow.WindowFrameBoundType{
+				treewindow.UnboundedPreceding, treewindow.OffsetPreceding, treewindow.CurrentRow,
+				treewindow.OffsetFollowing, treewindow.UnboundedFollowing,
 			} {
-				for _, bounds := range [][2]tree.WindowFrameBoundType{
+				for _, bounds := range [][2]treewindow.WindowFrameBoundType{
 					{bound, getEndBound(rng, bound)},
 					{getStartBound(rng, bound), bound},
 				} {
@@ -107,7 +106,7 @@ func TestWindowFramer(t *testing.T) {
 								typ = randTypes[rng.Intn(len(randTypes))]
 							}
 							testCfg.typ = typ
-							exclusion := tree.NoExclusion
+							exclusion := treewindow.NoExclusion
 							if rng.Float64() < randExcludeProbability {
 								exclusion = randExclusions[rng.Intn(len(randExclusions))]
 							}
@@ -121,7 +120,7 @@ func TestWindowFramer(t *testing.T) {
 											testWindowFramer(t, testCfg)
 										})
 								}
-								if mode == tree.ROWS {
+								if mode == treewindow.ROWS {
 									// An ORDER BY clause is required for RANGE and GROUPS modes.
 									testCfg.ordered = false
 									t.Run(
@@ -141,7 +140,7 @@ func TestWindowFramer(t *testing.T) {
 
 type testConfig struct {
 	rng        *rand.Rand
-	evalCtx    *tree.EvalContext
+	evalCtx    *eval.Context
 	factory    coldata.ColumnFactory
 	allocator  *colmem.Allocator
 	queueCfg   colcontainer.DiskQueueCfg
@@ -149,10 +148,10 @@ type testConfig struct {
 	count      int
 	ordered    bool
 	asc        bool
-	mode       tree.WindowFrameMode
-	startBound tree.WindowFrameBoundType
-	endBound   tree.WindowFrameBoundType
-	exclusion  tree.WindowFrameExclusion
+	mode       treewindow.WindowFrameMode
+	startBound treewindow.WindowFrameBoundType
+	endBound   treewindow.WindowFrameBoundType
+	exclusion  treewindow.WindowFrameExclusion
 	memLimit   int64
 }
 
@@ -161,20 +160,20 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 
 	for i := 0; i < testCfg.count; i++ {
 		// Advance the columnar framer.
-		colWindowFramer.next(testCfg.evalCtx.Ctx())
+		colWindowFramer.next(context.Background())
 
 		// Advance the row-wise framer.
 		if testCfg.ordered {
-			vec, vecIdx, _ := partition.GetVecWithTuple(testCfg.evalCtx.Ctx(), peersColIdx, i)
+			vec, vecIdx, _ := partition.GetVecWithTuple(context.Background(), peersColIdx, i)
 			if i > 0 && vec.Bool()[vecIdx] {
 				rowWindowFramer.CurRowPeerGroupNum++
 				require.NoError(t, rowWindowFramer.PeerHelper.Update(rowWindowFramer))
 			}
 		}
 		rowWindowFramer.RowIdx = i
-		rowStartIdx, err := rowWindowFramer.FrameStartIdx(testCfg.evalCtx.Ctx(), testCfg.evalCtx)
+		rowStartIdx, err := rowWindowFramer.FrameStartIdx(context.Background(), testCfg.evalCtx)
 		require.NoError(t, err)
-		rowEndIdx, err := rowWindowFramer.FrameEndIdx(testCfg.evalCtx.Ctx(), testCfg.evalCtx)
+		rowEndIdx, err := rowWindowFramer.FrameEndIdx(context.Background(), testCfg.evalCtx)
 		require.NoError(t, err)
 
 		// Validate that the columnar window framer describes the same window
@@ -182,7 +181,7 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 		var colFrameIdx, firstIdx, lastIdx int
 		var foundRow bool
 		for j := rowStartIdx; j < rowEndIdx; j++ {
-			skipped, err := rowWindowFramer.IsRowSkipped(testCfg.evalCtx.Ctx(), j)
+			skipped, err := rowWindowFramer.IsRowSkipped(context.Background(), j)
 			require.NoError(t, err)
 			if skipped {
 				continue
@@ -207,20 +206,22 @@ func testWindowFramer(t *testing.T, testCfg *testConfig) {
 		require.Equal(t, lastIdx, colWindowFramer.frameLastIdx(), "LastIdx")
 	}
 
-	partition.Close(testCfg.evalCtx.Ctx())
+	partition.Close(context.Background())
 }
 
-func validForStart(bound tree.WindowFrameBoundType) bool {
-	return bound != tree.UnboundedFollowing
+func validForStart(bound treewindow.WindowFrameBoundType) bool {
+	return bound != treewindow.UnboundedFollowing
 }
 
-func validForEnd(bound tree.WindowFrameBoundType) bool {
-	return bound != tree.UnboundedPreceding
+func validForEnd(bound treewindow.WindowFrameBoundType) bool {
+	return bound != treewindow.UnboundedPreceding
 }
 
-func getStartBound(rng *rand.Rand, endBound tree.WindowFrameBoundType) tree.WindowFrameBoundType {
-	startBoundTypes := []tree.WindowFrameBoundType{
-		tree.UnboundedPreceding, tree.OffsetPreceding, tree.CurrentRow, tree.OffsetFollowing,
+func getStartBound(
+	rng *rand.Rand, endBound treewindow.WindowFrameBoundType,
+) treewindow.WindowFrameBoundType {
+	startBoundTypes := []treewindow.WindowFrameBoundType{
+		treewindow.UnboundedPreceding, treewindow.OffsetPreceding, treewindow.CurrentRow, treewindow.OffsetFollowing,
 	}
 	for {
 		startBound := startBoundTypes[rng.Intn(len(startBoundTypes))]
@@ -230,9 +231,11 @@ func getStartBound(rng *rand.Rand, endBound tree.WindowFrameBoundType) tree.Wind
 	}
 }
 
-func getEndBound(rng *rand.Rand, startBound tree.WindowFrameBoundType) tree.WindowFrameBoundType {
-	endBoundTypes := []tree.WindowFrameBoundType{
-		tree.OffsetPreceding, tree.CurrentRow, tree.OffsetFollowing, tree.UnboundedFollowing,
+func getEndBound(
+	rng *rand.Rand, startBound treewindow.WindowFrameBoundType,
+) treewindow.WindowFrameBoundType {
+	endBoundTypes := []treewindow.WindowFrameBoundType{
+		treewindow.OffsetPreceding, treewindow.CurrentRow, treewindow.OffsetFollowing, treewindow.UnboundedFollowing,
 	}
 	for {
 		endBound := endBoundTypes[rng.Intn(len(endBoundTypes))]
@@ -245,7 +248,7 @@ func getEndBound(rng *rand.Rand, startBound tree.WindowFrameBoundType) tree.Wind
 type datumRows struct {
 	rows tree.Datums
 	asc  bool
-	ctx  *tree.EvalContext
+	ctx  *eval.Context
 }
 
 func (r *datumRows) Len() int {
@@ -253,7 +256,10 @@ func (r *datumRows) Len() int {
 }
 
 func (r *datumRows) Less(i, j int) bool {
-	cmp := r.rows[i].Compare(r.ctx, r.rows[j])
+	cmp, err := r.rows[i].Compare(context.Background(), r.ctx, r.rows[j])
+	if err != nil {
+		colexecerror.InternalError(err)
+	}
 	if r.asc {
 		return cmp < 0
 	}
@@ -265,6 +271,7 @@ func (r *datumRows) Swap(i, j int) {
 }
 
 func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.SpillingBuffer) {
+	ctx := context.Background()
 	datums := &datumRows{
 		rows: make(tree.Datums, testCfg.count),
 		asc:  testCfg.asc,
@@ -286,7 +293,8 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 
 	partition := colexecutils.NewSpillingBuffer(
 		testCfg.allocator, testCfg.memLimit, testCfg.queueCfg,
-		colexecop.NewTestingSemaphore(2), []*types.T{testCfg.typ, types.Bool}, testDiskAcc,
+		colexecop.NewTestingSemaphore(2), []*types.T{testCfg.typ, types.Bool},
+		testDiskAcc, testMemAcc,
 	)
 	insertBatch := testCfg.allocator.NewMemBatchWithFixedCapacity(
 		[]*types.T{testCfg.typ, types.Bool},
@@ -295,10 +303,15 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 	var last tree.Datum
 	for i, val := range datums.rows {
 		insertBatch.ColVec(orderColIdx).Nulls().UnsetNulls()
-		insertBatch.ColVec(peersColIdx).Bool()[0] = false
-		if i == 0 || val.Compare(testCfg.evalCtx, last) != 0 {
-			insertBatch.ColVec(peersColIdx).Bool()[0] = true
+		peersVal := i == 0
+		if i > 0 {
+			cmp, err := val.Compare(ctx, testCfg.evalCtx, last)
+			if err != nil {
+				colexecerror.InternalError(err)
+			}
+			peersVal = cmp != 0
 		}
+		insertBatch.ColVec(peersColIdx).Bool()[0] = peersVal
 		last = val
 		vec := insertBatch.ColVec(orderColIdx)
 		if val == tree.DNull {
@@ -324,21 +337,20 @@ func makeSortedPartition(testCfg *testConfig) (tree.Datums, *colexecutils.Spilli
 			}
 		}
 		insertBatch.SetLength(1)
-		partition.AppendTuples(
-			testCfg.evalCtx.Ctx(), insertBatch, 0 /* startIdx */, insertBatch.Length())
+		partition.AppendTuples(ctx, insertBatch, 0 /* startIdx */, insertBatch.Length())
 	}
 	return datums.rows, partition
 }
 
 func initWindowFramers(
 	t *testing.T, testCfg *testConfig,
-) (windowFramer, *tree.WindowFrameRun, *colexecutils.SpillingBuffer) {
+) (windowFramer, *eval.WindowFrameRun, *colexecutils.SpillingBuffer) {
 	offsetType := types.Int
-	if testCfg.mode == tree.RANGE {
+	if testCfg.mode == treewindow.RANGE {
 		offsetType = GetOffsetTypeFromOrderColType(t, testCfg.typ)
 	}
-	startOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
-	endOffset := MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
+	startOffset := colexectestutils.MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
+	endOffset := colexectestutils.MakeRandWindowFrameRangeOffset(t, testCfg.rng, offsetType)
 
 	peersCol, orderCol := tree.NoColumnIdx, tree.NoColumnIdx
 	if testCfg.ordered {
@@ -347,16 +359,16 @@ func initWindowFramers(
 
 	datums, colBuffer := makeSortedPartition(testCfg)
 
-	datumEncoding := descpb.DatumEncoding_ASCENDING_KEY
+	datumEncoding := catenumpb.DatumEncoding_ASCENDING_KEY
 	if !testCfg.asc {
-		datumEncoding = descpb.DatumEncoding_DESCENDING_KEY
+		datumEncoding = catenumpb.DatumEncoding_DESCENDING_KEY
 	}
 	frame := &execinfrapb.WindowerSpec_Frame{
 		Mode: modeToExecinfrapb(testCfg.mode),
 		Bounds: execinfrapb.WindowerSpec_Frame_Bounds{
 			Start: execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.startBound),
-				TypedOffset: EncodeWindowFrameOffset(t, startOffset),
+				TypedOffset: colexectestutils.EncodeWindowFrameOffset(t, startOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,
@@ -364,7 +376,7 @@ func initWindowFramers(
 			},
 			End: &execinfrapb.WindowerSpec_Frame_Bound{
 				BoundType:   boundToExecinfrapb(testCfg.endBound),
-				TypedOffset: EncodeWindowFrameOffset(t, endOffset),
+				TypedOffset: colexectestutils.EncodeWindowFrameOffset(t, endOffset),
 				OffsetType: execinfrapb.DatumInfo{
 					Type:     testCfg.typ,
 					Encoding: datumEncoding,
@@ -373,7 +385,7 @@ func initWindowFramers(
 		},
 		Exclusion: exclusionToExecinfrapb(testCfg.exclusion),
 	}
-	if testCfg.mode != tree.RANGE {
+	if testCfg.mode != treewindow.RANGE {
 		frame.Bounds.Start.IntOffset = uint64(*(startOffset.(*tree.DInt)))
 		frame.Bounds.End.IntOffset = uint64(*(endOffset.(*tree.DInt)))
 	}
@@ -390,13 +402,13 @@ func initWindowFramers(
 	}
 	colWindowFramer := newWindowFramer(
 		testCfg.evalCtx, frame, ordering, []*types.T{testCfg.typ, types.Bool}, peersCol)
-	colWindowFramer.startPartition(testCfg.evalCtx.Ctx(), colBuffer.Length(), colBuffer)
+	colWindowFramer.startPartition(context.Background(), colBuffer.Length(), colBuffer)
 
 	rowDir := encoding.Ascending
 	if !testCfg.asc {
 		rowDir = encoding.Descending
 	}
-	rowWindowFramer := &tree.WindowFrameRun{
+	rowWindowFramer := &eval.WindowFrameRun{
 		Rows:         &indexedRows{partition: datums, orderColType: testCfg.typ},
 		ArgsIdxs:     []uint32{0},
 		FilterColIdx: tree.NoColumnIdx,
@@ -419,7 +431,7 @@ func initWindowFramers(
 		OrdColIdx:        orderCol,
 		OrdDirection:     rowDir,
 	}
-	rowWindowFramer.PlusOp, rowWindowFramer.MinusOp, _ = tree.WindowFrameRangeOps{}.LookupImpl(testCfg.typ, offsetType)
+	rowWindowFramer.PlusOp, rowWindowFramer.MinusOp, _ = eval.WindowFrameRangeOps{}.LookupImpl(testCfg.typ, offsetType)
 	require.NoError(t, rowWindowFramer.PeerHelper.Init(
 		rowWindowFramer,
 		&peerGroupChecker{partition: datums, ordered: testCfg.ordered}),
@@ -433,13 +445,13 @@ type indexedRows struct {
 	orderColType *types.T
 }
 
-var _ tree.IndexedRows = &indexedRows{}
+var _ eval.IndexedRows = &indexedRows{}
 
 func (ir indexedRows) Len() int {
 	return len(ir.partition)
 }
 
-func (ir indexedRows) GetRow(ctx context.Context, idx int) (tree.IndexedRow, error) {
+func (ir indexedRows) GetRow(ctx context.Context, idx int) (eval.IndexedRow, error) {
 	return indexedRow{row: tree.Datums{ir.partition[idx]}}, nil
 }
 
@@ -448,7 +460,7 @@ type indexedRow struct {
 	row tree.Datums
 }
 
-var _ tree.IndexedRow = &indexedRow{}
+var _ eval.IndexedRow = &indexedRow{}
 
 func (ir indexedRow) GetIdx() int {
 	return ir.idx
@@ -463,60 +475,63 @@ func (ir indexedRow) GetDatums(firstColIdx, lastColIdx int) (tree.Datums, error)
 }
 
 type peerGroupChecker struct {
-	evalCtx   tree.EvalContext
+	evalCtx   eval.Context
 	partition tree.Datums
 	ordered   bool
 }
 
-var _ tree.PeerGroupChecker = &peerGroupChecker{}
+var _ eval.PeerGroupChecker = &peerGroupChecker{}
 
 func (c *peerGroupChecker) InSameGroup(i, j int) (bool, error) {
 	if !c.ordered {
 		// All rows are in the same peer group.
 		return true, nil
 	}
-	return c.partition[i].Compare(&c.evalCtx, c.partition[j]) == 0, nil
+	cmp, err := c.partition[i].Compare(context.Background(), &c.evalCtx, c.partition[j])
+	return cmp == 0, err
 }
 
-func modeToExecinfrapb(mode tree.WindowFrameMode) execinfrapb.WindowerSpec_Frame_Mode {
+func modeToExecinfrapb(mode treewindow.WindowFrameMode) execinfrapb.WindowerSpec_Frame_Mode {
 	switch mode {
-	case tree.RANGE:
+	case treewindow.RANGE:
 		return execinfrapb.WindowerSpec_Frame_RANGE
-	case tree.ROWS:
+	case treewindow.ROWS:
 		return execinfrapb.WindowerSpec_Frame_ROWS
-	case tree.GROUPS:
+	case treewindow.GROUPS:
 		return execinfrapb.WindowerSpec_Frame_GROUPS
 	}
 	return 0
 }
 
-func boundToExecinfrapb(bound tree.WindowFrameBoundType) execinfrapb.WindowerSpec_Frame_BoundType {
+func boundToExecinfrapb(
+	bound treewindow.WindowFrameBoundType,
+) execinfrapb.WindowerSpec_Frame_BoundType {
 	switch bound {
-	case tree.UnboundedPreceding:
+	case treewindow.UnboundedPreceding:
 		return execinfrapb.WindowerSpec_Frame_UNBOUNDED_PRECEDING
-	case tree.OffsetPreceding:
+	case treewindow.OffsetPreceding:
 		return execinfrapb.WindowerSpec_Frame_OFFSET_PRECEDING
-	case tree.CurrentRow:
+	case treewindow.CurrentRow:
 		return execinfrapb.WindowerSpec_Frame_CURRENT_ROW
-	case tree.OffsetFollowing:
+	case treewindow.OffsetFollowing:
 		return execinfrapb.WindowerSpec_Frame_OFFSET_FOLLOWING
-	case tree.UnboundedFollowing:
+	case treewindow.UnboundedFollowing:
 		return execinfrapb.WindowerSpec_Frame_UNBOUNDED_FOLLOWING
 	}
 	return 0
 }
 
 func exclusionToExecinfrapb(
-	exclusion tree.WindowFrameExclusion,
+	exclusion treewindow.WindowFrameExclusion,
 ) execinfrapb.WindowerSpec_Frame_Exclusion {
 	switch exclusion {
-	case tree.NoExclusion:
+	case treewindow.NoExclusion:
 		return execinfrapb.WindowerSpec_Frame_NO_EXCLUSION
-	case tree.ExcludeCurrentRow:
+	case treewindow.ExcludeCurrentRow:
 		return execinfrapb.WindowerSpec_Frame_EXCLUDE_CURRENT_ROW
-	case tree.ExcludeGroup:
+	case treewindow.ExcludeGroup:
 		return execinfrapb.WindowerSpec_Frame_EXCLUDE_GROUP
-	case tree.ExcludeTies:
+	case treewindow.ExcludeTies:
 		return execinfrapb.WindowerSpec_Frame_EXCLUDE_TIES
 	}
 	return 0

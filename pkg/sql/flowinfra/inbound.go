@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -42,6 +37,7 @@ type InboundStreamHandler interface {
 // It is exported since it is the default for the flow infrastructure.
 type RowInboundStreamHandler struct {
 	execinfra.RowReceiver
+	Types []*types.T
 }
 
 var _ InboundStreamHandler = RowInboundStreamHandler{}
@@ -53,7 +49,7 @@ func (s RowInboundStreamHandler) Run(
 	firstMsg *execinfrapb.ProducerMessage,
 	f *FlowBase,
 ) error {
-	return processInboundStream(ctx, stream, firstMsg, s.RowReceiver, f)
+	return processInboundStream(ctx, stream, firstMsg, s.RowReceiver, f, s.Types)
 }
 
 // Timeout is part of the InboundStreamHandler interface.
@@ -75,9 +71,10 @@ func processInboundStream(
 	firstMsg *execinfrapb.ProducerMessage,
 	dst execinfra.RowReceiver,
 	f *FlowBase,
+	types []*types.T,
 ) error {
 
-	err := processInboundStreamHelper(ctx, stream, firstMsg, dst, f)
+	err := processInboundStreamHelper(ctx, stream, firstMsg, dst, f, types)
 
 	// err, if set, will also be propagated to the producer
 	// as the last record that the producer gets.
@@ -97,9 +94,11 @@ func processInboundStreamHelper(
 	firstMsg *execinfrapb.ProducerMessage,
 	dst execinfra.RowReceiver,
 	f *FlowBase,
+	types []*types.T,
 ) error {
 	draining := false
 	var sd StreamDecoder
+	sd.Init(types)
 
 	sendErrToConsumer := func(err error) {
 		if err != nil {
@@ -137,6 +136,7 @@ func processInboundStreamHelper(
 			if err != nil {
 				if err != io.EOF {
 					// Communication error.
+					log.VEventf(ctx, 2, "Inbox communication error: %v", err)
 					err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
 					sendErrToConsumer(err)
 					errChan <- err
@@ -148,6 +148,7 @@ func processInboundStreamHelper(
 				return
 			}
 
+			log.VEvent(ctx, 2, "Inbox received message")
 			if res := processProducerMessage(
 				ctx, f, stream, dst, &sd, &draining, msg,
 			); res.err != nil || res.consumerClosed {
@@ -212,7 +213,6 @@ func processProducerMessage(
 			return processMessageResult{err: err, consumerClosed: false}
 		}
 	}
-	var types []*types.T
 	for {
 		row, meta, err := sd.GetRow(nil /* rowBuf */)
 		if err != nil {
@@ -223,11 +223,10 @@ func processProducerMessage(
 			return processMessageResult{err: nil, consumerClosed: false}
 		}
 
+		// TODO(yuzefovich): consider removing this logging since the verbosity
+		// check is not exactly free.
 		if log.V(3) && row != nil {
-			if types == nil {
-				types = sd.Types()
-			}
-			log.Infof(ctx, "inbound stream pushing row %s", row.String(types))
+			log.Infof(ctx, "inbound stream pushing row %s", row.String(sd.types))
 		}
 		if *draining && meta == nil {
 			// Don't forward data rows when we're draining.
@@ -236,6 +235,8 @@ func processProducerMessage(
 		switch dst.Push(row, meta) {
 		case execinfra.NeedMoreRows:
 			continue
+		case execinfra.SwitchToAnotherPortal:
+			return processMessageResult{err: errors.AssertionFailedf("not allowed to switch to another portal")}
 		case execinfra.DrainRequested:
 			// The rest of rows are not needed by the consumer. We'll send a drain
 			// signal to the producer and expect it to quickly send trailing

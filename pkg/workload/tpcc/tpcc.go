@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpcc
 
@@ -14,51 +9,82 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"net/url"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
 )
 
-type tpcc struct {
-	flags     workload.Flags
-	connFlags *workload.ConnFlags
+var RandomSeed = workload.NewUint64RandomSeed()
 
-	seed             uint64
+const (
+	// A threshold that defines which duration is considered a long workload which is not meant for a benchmark result
+	longDurationWorkloadThreshold = 4 * 24 * time.Hour
+
+	// The reset time period in case we are running a long duration workload.
+	warehouseWytdResetPeriod = 24 * time.Hour
+
+	// Max rows that can be updated in a single txn, used while resetting the w_ytd values
+	maxRowsToUpdateTxn = 10_000
+)
+
+type tpcc struct {
+	flags        workload.Flags
+	connFlags    *workload.ConnFlags
+	workloadName string
+
 	warehouses       int
 	activeWarehouses int
 	nowString        []byte
 	numConns         int
+	idleConns        int
+	txnRetries       bool
 
-	idleConns int
+	// txnPreambleFile queries that will be executed before each operation.
+	txnPreambleFile       string
+	txnPreambleStatements statements.Statements
+	// txnPreambleTime metric for tracking duration for any queries that
+	// we execute.
+	txnPreambleTime *histogram.NamedHistogram
 
 	// Used in non-uniform random data generation. cLoad is the value of C at load
 	// time. cCustomerID is the value of C for the customer id generator. cItemID
 	// is the value of C for the item id generator. See 2.1.6.
 	cLoad, cCustomerID, cItemID int
 
-	mix                    string
-	waitFraction           float64
+	mix          string
+	waitFraction float64
+
+	// onTxnStartFns call back function to execute queries at the start of
+	// a txn.
+	onTxnStartFns []func(ctx context.Context, tx pgx.Tx) error
+
 	workers                int
+	activeWorkers          int
 	fks                    bool
 	separateColumnFamilies bool
 	// deprecatedFKIndexes adds in foreign key indexes that are no longer needed
 	// due to origin index restrictions being lifted.
 	deprecatedFkIndexes bool
-	dbOverride          string
 
 	txInfos []txInfo
 	// deck contains indexes into the txInfos slice.
@@ -66,7 +92,8 @@ type tpcc struct {
 
 	auditor *auditor
 
-	reg *histogram.Registry
+	reg        *histogram.Registry
+	txCounters txCounters
 
 	split   bool
 	scatter bool
@@ -86,19 +113,27 @@ type tpcc struct {
 	// testing purposes.
 	localWarehouses bool
 
-	usePostgres  bool
-	serializable bool
-	txOpts       pgx.TxOptions
-
 	expensiveChecks bool
 
 	replicateStaticColumns bool
+
+	queryTraceFile string
 
 	randomCIDsCache struct {
 		syncutil.Mutex
 		values [][]int
 	}
 	localsPool *sync.Pool
+
+	// Set to true if duration >= longDurationWorkloadThreshold.
+	// In that case, we reset w_ytd & d_ytd periodically and skip 3.3.2.1 and 3.3.2.8 consistency checks.
+	isLongDurationWorkload bool
+
+	// context group for any background reset table operation to avoid goroutine leaks during long duration workloads
+	resetTableGrp      ctxgroup.Group
+	resetTableCancelFn context.CancelFunc
+
+	asOfSystemTime string
 }
 
 type waitSetter struct {
@@ -140,6 +175,51 @@ func (w *waitSetter) String() string {
 	}
 }
 
+var _ pgx.QueryTracer = fileLoggerQueryTracer{}
+
+type fileLoggerQueryTracer struct {
+	file *os.File
+}
+
+func newFileLoggerQueryTracer(filePath string) (*fileLoggerQueryTracer, error) {
+	tracer := &fileLoggerQueryTracer{}
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, err
+	}
+	tracer.file = file
+	return tracer, nil
+}
+
+func (t *fileLoggerQueryTracer) Close() error {
+	return errors.CombineErrors(
+		errors.Wrap(t.file.Sync(), "failed to sync query trace file"),
+		errors.Wrap(t.file.Close(), "failed to close query trace file"),
+	)
+}
+
+func (t fileLoggerQueryTracer) Write(p []byte) (n int, err error) {
+	return t.file.Write(p)
+}
+
+func (t fileLoggerQueryTracer) TraceQueryStart(
+	ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData,
+) context.Context {
+	whitespacePattern := regexp.MustCompile(`\s+`)
+	fmt.Fprintf(t, "Query: %s\n", whitespacePattern.ReplaceAllString(strings.TrimSpace(data.SQL), " "))
+	return ctx
+}
+
+func (t fileLoggerQueryTracer) TraceQueryEnd(
+	ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData,
+) {
+	if data.Err == nil {
+		fmt.Fprintf(t, "CommandTag: %s\n", data.CommandTag.String())
+	} else {
+		fmt.Fprintf(t, "Error: %s\n", data.Err)
+	}
+}
+
 func init() {
 	workload.Register(tpccMeta)
 }
@@ -153,33 +233,42 @@ func FromWarehouses(warehouses int) workload.Generator {
 var tpccMeta = workload.Meta{
 	Name: `tpcc`,
 	Description: `TPC-C simulates a transaction processing workload` +
-		` using a rich schema of multiple tables`,
-	Version:      `2.2.0`,
-	PublicFacing: true,
+		` using a rich schema of multiple tables.`,
+	Version:    `2.2.0`,
+	RandomSeed: RandomSeed,
 	New: func() workload.Generator {
-		g := &tpcc{}
+		g := &tpcc{
+			workloadName: "tpcc",
+		}
 		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`db`:                 {RuntimeOnly: true},
-			`mix`:                {RuntimeOnly: true},
-			`partitions`:         {RuntimeOnly: true},
-			`client-partitions`:  {RuntimeOnly: true},
-			`partition-affinity`: {RuntimeOnly: true},
-			`partition-strategy`: {RuntimeOnly: true},
-			`zones`:              {RuntimeOnly: true},
-			`active-warehouses`:  {RuntimeOnly: true},
-			`scatter`:            {RuntimeOnly: true},
-			`serializable`:       {RuntimeOnly: true},
-			`split`:              {RuntimeOnly: true},
-			`wait`:               {RuntimeOnly: true},
-			`workers`:            {RuntimeOnly: true},
-			`conns`:              {RuntimeOnly: true},
-			`idle-conns`:         {RuntimeOnly: true},
-			`expensive-checks`:   {RuntimeOnly: true, CheckConsistencyOnly: true},
-			`local-warehouses`:   {RuntimeOnly: true},
+			`mix`:                      {RuntimeOnly: true},
+			`partitions`:               {RuntimeOnly: true},
+			`client-partitions`:        {RuntimeOnly: true},
+			`partition-affinity`:       {RuntimeOnly: true},
+			`partition-strategy`:       {RuntimeOnly: true},
+			`zones`:                    {RuntimeOnly: true},
+			`active-warehouses`:        {RuntimeOnly: true},
+			`active-workers`:           {RuntimeOnly: true},
+			`scatter`:                  {RuntimeOnly: true},
+			`split`:                    {RuntimeOnly: true},
+			`wait`:                     {RuntimeOnly: true},
+			`workers`:                  {RuntimeOnly: true},
+			`conns`:                    {RuntimeOnly: true},
+			`idle-conns`:               {RuntimeOnly: true},
+			`txn-retries`:              {RuntimeOnly: true},
+			`expensive-checks`:         {RuntimeOnly: true, CheckConsistencyOnly: true},
+			`local-warehouses`:         {RuntimeOnly: true},
+			`regions`:                  {RuntimeOnly: true},
+			`survival-goal`:            {RuntimeOnly: true},
+			`replicate-static-columns`: {RuntimeOnly: true},
+			`deprecated-fk-indexes`:    {RuntimeOnly: true},
+			`query-trace-file`:         {RuntimeOnly: true},
+			`fake-time`:                {RuntimeOnly: true},
+			`txn-preamble-file`:        {RuntimeOnly: true},
+			`aost`:                     {RuntimeOnly: true, CheckConsistencyOnly: true},
 		}
 
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.warehouses, `warehouses`, 1, `Number of warehouses for loading`)
 		g.flags.BoolVar(&g.fks, `fks`, true, `Add the foreign keys`)
 		g.flags.BoolVar(&g.deprecatedFkIndexes, `deprecated-fk-indexes`, false, `Add deprecated foreign keys (needed when running against v20.1 or below clusters)`)
@@ -189,16 +278,15 @@ var tpccMeta = workload.Meta{
 			`Weights for the transaction mix. The default matches the TPCC spec.`)
 		g.waitFraction = 1.0
 		g.flags.Var(&waitSetter{&g.waitFraction}, `wait`, `Wait mode (include think/keying sleeps): 1/true for tpcc-standard wait, 0/false for no waits, other factors also allowed`)
-		g.flags.StringVar(&g.dbOverride, `db`, ``,
-			`Override for the SQL database to use. If empty, defaults to the generator name`)
 		g.flags.IntVar(&g.workers, `workers`, 0, fmt.Sprintf(
-			`Number of concurrent workers. Defaults to --warehouses * %d`, numWorkersPerWarehouse,
+			`Number of concurrent workers. Defaults to --warehouses * %d`, NumWorkersPerWarehouse,
 		))
 		g.flags.IntVar(&g.numConns, `conns`, 0, fmt.Sprintf(
 			`Number of connections. Defaults to --warehouses * %d (except in nowait mode, where it defaults to --workers`,
 			numConnsPerWarehouse,
 		))
 		g.flags.IntVar(&g.idleConns, `idle-conns`, 0, `Number of idle connections. Defaults to 0`)
+		g.flags.BoolVar(&g.txnRetries, `txn-retries`, true, `Run transactions in a retry loop`)
 		g.flags.IntVar(&g.partitions, `partitions`, 1, `Partition tables`)
 		g.flags.IntVar(&g.clientPartitions, `client-partitions`, 0, `Make client behave as if the tables are partitioned, but does not actually partition underlying data. Requires --partition-affinity.`)
 		g.flags.IntSliceVar(&g.affinityPartitions, `partition-affinity`, nil, `Run load generator against specific partition (requires partitions). `+
@@ -209,15 +297,22 @@ var tpccMeta = workload.Meta{
 		g.flags.StringSliceVar(&g.multiRegionCfg.regions, "regions", []string{}, "Regions to use for multi-region partitioning. The first region is the PRIMARY REGION. Does not work with --zones.")
 		g.flags.Var(&g.multiRegionCfg.survivalGoal, "survival-goal", "Survival goal to use for multi-region setups. Allowed values: [zone, region].")
 		g.flags.IntVar(&g.activeWarehouses, `active-warehouses`, 0, `Run the load generator against a specific number of warehouses. Defaults to --warehouses'`)
+		g.flags.IntVar(&g.activeWorkers, `active-workers`, 0, `Number of workers that can execute at any given time. Defaults to --workers'`)
 		g.flags.BoolVar(&g.scatter, `scatter`, false, `Scatter ranges`)
-		g.flags.BoolVar(&g.serializable, `serializable`, false, `Force serializable mode`)
 		g.flags.BoolVar(&g.split, `split`, false, `Split tables`)
 		g.flags.BoolVar(&g.expensiveChecks, `expensive-checks`, false, `Run expensive checks`)
 		g.flags.BoolVar(&g.separateColumnFamilies, `families`, false, `Use separate column families for dynamic and static columns`)
 		g.flags.BoolVar(&g.replicateStaticColumns, `replicate-static-columns`, false, "Create duplicate indexes for all static columns in district, items and warehouse tables, such that each zone or rack has them locally.")
 		g.flags.BoolVar(&g.localWarehouses, `local-warehouses`, false, `Force transactions to use a local warehouse in all cases (in violation of the TPC-C specification)`)
-		g.connFlags = workload.NewConnFlags(&g.flags)
+		g.flags.StringVar(&g.queryTraceFile, `query-trace-file`, ``, `File to write the query traces to. Defaults to no output`)
+		// Support executing a query file before each transaction.
+		g.flags.StringVar(&g.txnPreambleFile, "txn-preamble-file", "", "queries that will be injected before each txn")
+		g.flags.StringVar(&g.asOfSystemTime, "aost", "",
+			"This is an optional parameter to specify AOST; used exclusively in conjunction with the TPC-C consistency "+
+				"check. Example values are (\"'-1m'\", \"'-1h'\")")
 
+		RandomSeed.AddFlag(&g.flags)
+		g.connFlags = workload.NewConnFlags(&g.flags)
 		// Hardcode this since it doesn't seem like anyone will want to change
 		// it and it's really noisy in the generated fixture paths.
 		g.nowString = []byte(`2006-01-02 15:04:05`)
@@ -255,6 +350,9 @@ func (*tpcc) Meta() workload.Meta { return tpccMeta }
 
 // Flags implements the Flagser interface.
 func (w *tpcc) Flags() workload.Flags { return w.flags }
+
+// ConnFlags implements the ConnFlagser interface.
+func (w *tpcc) ConnFlags() *workload.ConnFlags { return w.connFlags }
 
 // Hooks implements the Hookser interface.
 func (w *tpcc) Hooks() workload.Hooks {
@@ -319,7 +417,13 @@ func (w *tpcc) Hooks() workload.Hooks {
 			w.initNonUniformRandomConstants()
 
 			if w.workers == 0 {
-				w.workers = w.activeWarehouses * numWorkersPerWarehouse
+				w.workers = w.activeWarehouses * NumWorkersPerWarehouse
+			}
+
+			if w.activeWorkers > w.workers {
+				return errors.Errorf(`--active-workers needs to be less than or equal to workers (%d)`, w.workers)
+			} else if w.activeWorkers == 0 {
+				w.activeWorkers = w.workers
 			}
 
 			if w.numConns == 0 {
@@ -334,13 +438,13 @@ func (w *tpcc) Hooks() workload.Hooks {
 				}
 			}
 
-			if w.waitFraction > 0 && w.workers != w.activeWarehouses*numWorkersPerWarehouse {
-				return errors.Errorf(`--wait > 0 and --warehouses=%d requires --workers=%d`,
-					w.activeWarehouses, w.warehouses*numWorkersPerWarehouse)
+			if w.waitFraction > 0 && w.activeWorkers != w.activeWarehouses*NumWorkersPerWarehouse {
+				return errors.Errorf(`--wait > 0 and --warehouses=%d requires --active-workers=%d`,
+					w.activeWarehouses, w.warehouses*NumWorkersPerWarehouse)
 			}
 
-			if w.serializable {
-				w.txOpts = pgx.TxOptions{IsoLevel: pgx.Serializable}
+			if w.queryTraceFile != `` && w.workers != 1 {
+				return errors.Errorf(`--query-trace-file must be used with exactly one worker`)
 			}
 
 			w.auditor = newAuditor(w.activeWarehouses)
@@ -387,14 +491,14 @@ func (w *tpcc) Hooks() workload.Hooks {
 			var stmts []string
 			for i, region := range w.multiRegionCfg.regions {
 				var stmt string
+				// Region additions should be idempotent.
+				if _, ok := regions[region]; ok {
+					continue
+				}
 				// The first region is the PRIMARY region.
 				if i == 0 {
 					stmt = fmt.Sprintf(`alter database %s set primary region %q`, dbName, region)
 				} else {
-					// Region additions should be idempotent.
-					if _, ok := regions[region]; ok {
-						continue
-					}
 					stmt = fmt.Sprintf(`alter database %s add region %q`, dbName, region)
 				}
 				stmts = append(stmts, stmt)
@@ -419,7 +523,7 @@ func (w *tpcc) Hooks() workload.Hooks {
 
 			return nil
 		},
-		PostLoad: func(db *gosql.DB) error {
+		PostLoad: func(_ context.Context, db *gosql.DB) error {
 			if w.fks {
 				// We avoid validating foreign keys because we just generated
 				// the data set and don't want to scan over the entire thing
@@ -507,8 +611,17 @@ func (w *tpcc) Hooks() workload.Hooks {
 				if !w.expensiveChecks && check.Expensive {
 					continue
 				}
+				if check.LoadOnly {
+					// TODO(nvanbenschoten): support load-only checks.
+					continue
+				}
+
+				if w.isLongDurationWorkload && check.SkipForLongDuration {
+					continue
+				}
+
 				start := timeutil.Now()
-				err := check.Fn(db, "" /* asOfSystemTime */)
+				err := check.Fn(db, w.asOfSystemTime /* asOfSystemTime */)
 				log.Infof(ctx, `check %s took %s`, check.Name, timeutil.Since(start))
 				if err != nil {
 					return errors.Wrapf(err, `check failed: %s`, check.Name)
@@ -521,9 +634,10 @@ func (w *tpcc) Hooks() workload.Hooks {
 
 // Tables implements the Generator interface.
 func (w *tpcc) Tables() []workload.Table {
-	aCharsInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, aCharsAlphabet)
-	lettersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, lettersAlphabet)
-	numbersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, numbersAlphabet)
+	seed := RandomSeed.Seed()
+	aCharsInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, aCharsAlphabet)
+	lettersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, lettersAlphabet)
+	numbersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, numbersAlphabet)
 	if w.localsPool == nil {
 		w.localsPool = &sync.Pool{
 			New: func() interface{} {
@@ -734,29 +848,77 @@ func (w *tpcc) Ops(
 		}
 	}
 
-	counters := setupTPCCMetrics(reg.Registerer())
+	var resetTableCtx context.Context
+	resetTableCtx, w.resetTableCancelFn = context.WithCancel(ctx)
+	w.resetTableGrp = ctxgroup.WithContext(resetTableCtx)
 
-	sqlDatabase, err := workload.SanitizeUrls(w, w.dbOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
-	parsedURL, err := url.Parse(urls[0])
-	if err != nil {
-		return workload.QueryLoad{}, err
+	if duration, err := w.flags.GetDuration("duration"); err == nil {
+		if duration == 0 || duration >= longDurationWorkloadThreshold {
+			log.Warningf(ctx,
+				"Warning: this workload is being used with a long or indefinite duration."+
+					" This could cause it to deviate from the TPCC spec in subtle ways and is not meant for benchmarking. "+
+					"Consistency checks might be disabled",
+			)
+			w.isLongDurationWorkload = true
+		}
+	} else {
+		log.Warningf(ctx, "Couldn't get duration of the tpcc workload run for disabling consistency checks %v", err)
 	}
 
-	w.reg = reg
-	w.usePostgres = parsedURL.Port() == "5432"
+	// Need idempotency - Ops might be invoked multiple times with the same
+	// Registry.
+	if w.reg == nil {
+		w.reg = reg
+		w.txCounters = setupTPCCMetrics(w.workloadName, reg.Registerer())
+	}
 
 	// We can't use a single MultiConnPool because we want to implement partition
 	// affinity. Instead we have one MultiConnPool per server.
-	cfg := workload.MultiConnPoolCfg{
-		MaxTotalConnections: (w.numConns + len(urls) - 1) / len(urls), // round up
-		// Limit the number of connections per pool (otherwise preparing statements
-		// at startup can be slow).
-		MaxConnsPerPool: 50,
-	}
+	cfg := workload.NewMultiConnPoolCfgFromFlags(w.connFlags)
+	cfg.MaxTotalConnections = (w.numConns + len(urls) - 1) / len(urls) // round up
+
+	// Limit the number of connections per pool (otherwise preparing statements at
+	// startup can be slow).
+	cfg.MaxConnsPerPool = w.connFlags.Concurrency
 	fmt.Printf("Initializing %d connections...\n", w.numConns)
+
+	// If queries were specified before each operation, then lets
+	// execute those.
+	if w.txnPreambleFile != "" {
+		file, err := os.ReadFile(w.txnPreambleFile)
+		if err != nil {
+			return workload.QueryLoad{}, err
+		}
+		txnPreambleStatements, err := parser.Parse(string(file))
+		if err != nil {
+			return workload.QueryLoad{}, err
+		}
+		w.txnPreambleStatements = txnPreambleStatements
+
+		w.txnPreambleTime = reg.GetHandle().Get("txnPreamble")
+		w.onTxnStartFns = append(w.onTxnStartFns, func(ctx context.Context, tx pgx.Tx) error {
+			// Next execute any statements at the start of the txn.
+			startTime := timeutil.Now()
+			for _, stmt := range w.txnPreambleStatements {
+				if _, err := tx.Exec(ctx, stmt.AST.String()); err != nil {
+					return err
+				}
+			}
+			w.txnPreambleTime.Record(timeutil.Since(startTime))
+			return nil
+		})
+	}
+
+	// Set up the query tracer.
+	var tracer *fileLoggerQueryTracer
+	if w.queryTraceFile != `` {
+		var err error
+		tracer, err = newFileLoggerQueryTracer(w.queryTraceFile)
+		if err != nil {
+			return workload.QueryLoad{}, err
+		}
+		cfg.QueryTracer = tracer
+	}
 
 	dbs := make([]*workload.MultiConnPool, len(urls))
 	var g errgroup.Group
@@ -824,7 +986,7 @@ func (w *tpcc) Ops(
 		}
 	}
 	fmt.Printf("Initializing %d workers and preparing statements...\n", w.workers)
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	ql.WorkerFns = make([]func(context.Context) error, 0, w.workers)
 	var group errgroup.Group
 
@@ -839,6 +1001,9 @@ func (w *tpcc) Ops(
 		// If nothing is mine, then everything is mine.
 		return len(w.affinityPartitions) == 0
 	}
+
+	workersSem := quotapool.NewIntPool("workers", uint64(w.activeWorkers))
+
 	// Limit the amount of workers we initialize in parallel, to avoid running out
 	// of memory (#36897).
 	sem := make(chan struct{}, 100)
@@ -867,7 +1032,7 @@ func (w *tpcc) Ops(
 		idx := len(ql.WorkerFns) - 1
 		sem <- struct{}{}
 		group.Go(func() error {
-			worker, err := newWorker(ctx, w, db, reg.GetHandle(), counters, warehouse)
+			worker, err := newWorker(ctx, w, db, reg.GetHandle(), w.txCounters, warehouse, workersSem)
 			if err == nil {
 				ql.WorkerFns[idx] = worker.run
 			}
@@ -884,14 +1049,65 @@ func (w *tpcc) Ops(
 	}
 
 	// Close idle connections.
-	ql.Close = func(context context.Context) {
+	ql.Close = func(_ context.Context) error {
 		for _, conn := range conns {
 			if err := conn.Close(ctx); err != nil {
 				log.Warningf(ctx, "%v", err)
 			}
 		}
+		if tracer != nil {
+			if err := tracer.Close(); err != nil {
+				log.Warningf(ctx, "%v", err)
+			}
+		}
+
+		w.resetTableCancelFn()
+		if err := w.resetTableGrp.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			log.Warningf(ctx, "%v", err)
+		}
+		return nil
 	}
 	return ql, nil
+}
+
+// executeTx runs fn inside a transaction with retries, if enabled. On
+// non-retryable failures, the transaction is aborted and rolled back; on
+// success, the transaction is committed.
+func (w *tpcc) executeTx(
+	ctx context.Context, conn crdbpgx.Conn, fn func(pgx.Tx) error,
+) (onTxnStartDuration time.Duration, err error) {
+	txOpts := pgx.TxOptions{}
+	txnFuncWithStartFuncs := func(tx pgx.Tx) (err error) {
+		defer func() {
+			if err != nil && !w.txnRetries {
+				_ = tx.Rollback(ctx)
+			}
+		}()
+		if w.onTxnStartFns != nil {
+			startTime := timeutil.Now()
+			for _, onTxnStart := range w.onTxnStartFns {
+				if err = onTxnStart(ctx, tx); err != nil {
+					return err
+				}
+			}
+			onTxnStartDuration += timeutil.Since(startTime)
+		}
+		return fn(tx)
+	}
+
+	if w.txnRetries {
+		return onTxnStartDuration, crdbpgx.ExecuteTx(ctx, conn, txOpts, txnFuncWithStartFuncs)
+	}
+
+	tx, err := conn.BeginTx(ctx, txOpts)
+	if err != nil {
+		return onTxnStartDuration, err
+	}
+	err = txnFuncWithStartFuncs(tx)
+	if err != nil {
+		return onTxnStartDuration, err
+	}
+	return onTxnStartDuration, tx.Commit(ctx)
 }
 
 func (w *tpcc) partitionAndScatter(urls []string) error {

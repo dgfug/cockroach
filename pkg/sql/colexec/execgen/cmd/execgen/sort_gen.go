@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -15,7 +10,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 )
 
 type sortDirOverload struct {
@@ -63,9 +58,9 @@ func genSortOps(inputFileContents string, wr io.Writer) error {
 	return tmpl.Execute(wr, sortOverloads)
 }
 
-const quickSortTmpl = "pkg/sql/colexec/quicksort_tmpl.go"
+const pdqSortTmpl = "pkg/sql/colexec/pdqsort_tmpl.go"
 
-func genQuickSortOps(inputFileContents string, wr io.Writer) error {
+func genPDQSortOps(inputFileContents string, wr io.Writer) error {
 	r := strings.NewReplacer(
 		"_TYPE", "{{.VecMethod}}",
 		"_DIR", "{{$dir}}",
@@ -74,7 +69,7 @@ func genQuickSortOps(inputFileContents string, wr io.Writer) error {
 	s := r.Replace(inputFileContents)
 
 	// Now, generate the op, from the template.
-	tmpl, err := template.New("quicksort").Parse(s)
+	tmpl, err := template.New("pdqsort").Parse(s)
 	if err != nil {
 		return err
 	}
@@ -84,7 +79,7 @@ func genQuickSortOps(inputFileContents string, wr io.Writer) error {
 
 func init() {
 	registerGenerator(genSortOps, "sort.eg.go", sortOpsTmpl)
-	registerGenerator(genQuickSortOps, "quicksort.eg.go", quickSortTmpl)
+	registerGenerator(genPDQSortOps, "pdqsort.eg.go", pdqSortTmpl)
 	for _, nulls := range []bool{true, false} {
 		nullsOverload := &sortDirNullsOverload{
 			Nulls: nulls,
@@ -92,12 +87,12 @@ func init() {
 				{
 					Dir:             "execinfrapb.Ordering_Column_ASC",
 					DirString:       "Asc",
-					FamilyOverloads: sameTypeComparisonOpToOverloads[tree.LT],
+					FamilyOverloads: sameTypeComparisonOpToOverloads[treecmp.LT],
 				},
 				{
 					Dir:             "execinfrapb.Ordering_Column_DESC",
 					DirString:       "Desc",
-					FamilyOverloads: sameTypeComparisonOpToOverloads[tree.GT],
+					FamilyOverloads: sameTypeComparisonOpToOverloads[treecmp.GT],
 				},
 			},
 		}

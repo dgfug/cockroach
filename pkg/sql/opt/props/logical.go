@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
@@ -31,6 +26,10 @@ const (
 	// field is populated.
 	InterestingOrderings
 
+	// RestrictedInterestingOrderings is set when the
+	// Relational.Rule.RestrictedInterestingOrderings field is populated.
+	RestrictedInterestingOrderings
+
 	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
 	// is populated.
 	HasHoistableSubquery
@@ -52,9 +51,11 @@ type Shared struct {
 
 	// HasSubquery is true if the subtree rooted at this node contains a subquery.
 	// The subquery can be a Subquery, Exists, Any, or ArrayFlatten expression.
-	// Subqueries are the only place where a relational node can be nested within a
-	// scalar expression.
 	HasSubquery bool
+
+	// HasUDF is true if the subtree rooted at this node contains a UDF
+	// invocation.
+	HasUDF bool
 
 	// HasCorrelatedSubquery is true if the scalar expression tree contains a
 	// subquery having one or more outer columns. The subquery can be a Subquery,
@@ -169,9 +170,10 @@ type Relational struct {
 	// For more details, see the header comment for FuncDepSet.
 	FuncDeps FuncDepSet
 
-	// Stats is the set of statistics that apply to this relational expression.
-	// See statistics.go and memo/statistics_builder.go for more details.
-	Stats Statistics
+	// stats is the set of statistics that apply to this relational expression.
+	// See statistics.go and memo/statistics_builder.go for more details. It is
+	// unexported to avoid accidental copying.
+	stats Statistics
 
 	// Rule encapsulates the set of properties that are maintained to assist
 	// with specific sets of transformation rules. They are not intended to be
@@ -260,6 +262,11 @@ type Relational struct {
 		// been set.
 		InterestingOrderings OrderingSet
 
+		// RestrictedInterestingOrderings is similar to InterestingOrderings. It
+		// contains the "interesting" orderings that have been restricted to a
+		// given set of columns. See OrderingSet.RestrictToCols.
+		RestrictedInterestingOrderings []RestrictedInterestingOrdering
+
 		// UnfilteredCols is the set of all columns for which rows from their base
 		// table are guaranteed not to have been filtered. Rows may be duplicated,
 		// but no rows can be missing. Even columns which are not output columns are
@@ -272,6 +279,13 @@ type Relational struct {
 		// is only valid once the Rule.Available.UnfilteredCols bit has been set.
 		UnfilteredCols opt.ColSet
 	}
+}
+
+// RestrictedInterestingOrdering is an interesting ordering that has been
+// restricted to a set of columns. See OrderingSet.RestrictToCols.
+type RestrictedInterestingOrdering struct {
+	OrderingSet
+	Cols opt.ColSet
 }
 
 // Scalar properties are logical properties that are computed for scalar
@@ -340,26 +354,32 @@ type Scalar struct {
 	}
 }
 
-// IsAvailable returns true if the specified rule property has been populated
-// on this relational properties instance.
-func (r *Relational) IsAvailable(p AvailableRuleProps) bool {
-	return (r.Rule.Available & p) != 0
+// Statistics returns the set of statistics that apply to the relational
+// expression.
+func (r *Relational) Statistics() *Statistics {
+	return &r.stats
 }
 
-// SetAvailable sets the available bits for the given properties, in order to
-// mark them as populated on this relational properties instance.
-func (r *Relational) SetAvailable(p AvailableRuleProps) {
-	r.Rule.Available |= p
+// IsAvailable returns true if all of the specified rule properties have been
+// populated on this relational properties instance.
+func (r *Relational) IsAvailable(ps AvailableRuleProps) bool {
+	return (r.Rule.Available & ps) == ps
 }
 
-// IsAvailable returns true if the specified rule property has been populated
-// on this scalar properties instance.
-func (s *Scalar) IsAvailable(p AvailableRuleProps) bool {
-	return (s.Rule.Available & p) != 0
+// SetAvailable sets the available bits for all of the given properties, in
+// order to mark them as populated on this relational properties instance.
+func (r *Relational) SetAvailable(ps AvailableRuleProps) {
+	r.Rule.Available |= ps
 }
 
-// SetAvailable sets the available bits for the given properties, in order to
-// mark them as populated on this scalar properties instance.
-func (s *Scalar) SetAvailable(p AvailableRuleProps) {
-	s.Rule.Available |= p
+// IsAvailable returns true if all of the specified rule property have been
+// populated on this scalar properties instance.
+func (s *Scalar) IsAvailable(ps AvailableRuleProps) bool {
+	return (s.Rule.Available & ps) == ps
+}
+
+// SetAvailable sets the available bits for all of the given properties, in
+// order to mark them as populated on this scalar properties instance.
+func (s *Scalar) SetAvailable(ps AvailableRuleProps) {
+	s.Rule.Available |= ps
 }

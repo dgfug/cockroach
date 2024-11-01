@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -16,13 +11,14 @@ import (
 	"encoding/binary"
 	"math"
 	"math/rand"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -33,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -48,8 +45,8 @@ func beginTransaction(
 		return txn
 	}
 
-	var ba roachpb.BatchRequest
-	ba.Header = roachpb.Header{Txn: txn}
+	ba := &kvpb.BatchRequest{}
+	ba.Header = kvpb.Header{Txn: txn}
 	put := putArgs(key, []byte("value"))
 	ba.Add(&put)
 	assignSeqNumsForReqs(txn, &put)
@@ -79,7 +76,7 @@ func TestContendedIntentWithDependencyCycle(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	store, _ := createTestStore(t, testStoreOpts{createSystemRanges: true}, stopper)
+	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 
 	keyA := roachpb.Key("a")
 	keyB := roachpb.Key("b")
@@ -97,7 +94,7 @@ func TestContendedIntentWithDependencyCycle(t *testing.T) {
 	go func() {
 		put := putArgs(keyA, []byte("value"))
 		assignSeqNumsForReqs(txn1, &put)
-		if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: txn1}, &put); pErr != nil {
+		if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Txn: txn1}, &put); pErr != nil {
 			txnCh1 <- pErr.GoError()
 			return
 		}
@@ -125,7 +122,7 @@ func TestContendedIntentWithDependencyCycle(t *testing.T) {
 	go func() {
 		put := putArgs(keyB, []byte("value"))
 		assignSeqNumsForReqs(txn2, &put)
-		repl, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: txn2}, &put)
+		repl, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Txn: txn2}, &put)
 		if pErr != nil {
 			txnCh2 <- pErr.GoError()
 			return
@@ -159,13 +156,13 @@ func TestContendedIntentWithDependencyCycle(t *testing.T) {
 	go func() {
 		put := putArgs(keyB, []byte("value"))
 		assignSeqNumsForReqs(txn3, &put)
-		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: txn3}, &put)
+		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{Txn: txn3}, &put)
 		txnCh3 <- pErr.GoError()
 	}()
 
 	// The third transaction will always be aborted.
 	err := <-txnCh3
-	if !errors.HasType(err, (*roachpb.UnhandledRetryableError)(nil)) {
+	if !errors.HasType(err, (*kvpb.UnhandledRetryableError)(nil)) {
 		t.Fatalf("expected transaction aborted error; got %T", err)
 	}
 	if err := <-txnCh1; err != nil {
@@ -187,10 +184,12 @@ func TestContendedIntentWithDependencyCycle(t *testing.T) {
 func TestReliableIntentCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 66895, "Flaky due to non-deterministic txn cleanup")
+
+	skip.WithIssue(t, 66895)
 	skip.UnderShort(t) // takes 294s
 	skip.UnderRace(t, "timing-sensitive test")
-	skip.UnderStress(t, "memory-hungry test")
+	skip.UnderDeadlock(t, "timing-sensitive test")
+	//skip.UnderStress(t, "memory-hungry test")
 
 	prefix := roachpb.Key([]byte("key\x00"))
 
@@ -198,11 +197,11 @@ func TestReliableIntentCleanup(t *testing.T) {
 		// abortHeartbeats is used to abort txn heartbeats, returning
 		// TransactionAbortedError. Key is txn anchor key, value is a chan
 		// struct{} that will be closed when the next heartbeat aborts.
-		var abortHeartbeats sync.Map
+		var abortHeartbeats syncutil.Map[string, chan struct{}]
 
 		abortHeartbeat := func(t *testing.T, txnKey roachpb.Key) <-chan struct{} {
 			abortedC := make(chan struct{})
-			abortHeartbeats.Store(string(txnKey), abortedC)
+			abortHeartbeats.Store(string(txnKey), &abortedC)
 			t.Cleanup(func() {
 				abortHeartbeats.Delete(string(txnKey))
 			})
@@ -213,11 +212,11 @@ func TestReliableIntentCleanup(t *testing.T) {
 		// a txn anchor key, and the value is a chan chan<- struct{} that, when
 		// the Put is ready, will be used to send an unblock channel. The
 		// unblock channel can be closed to unblock the Put.
-		var blockPuts sync.Map
+		var blockPuts syncutil.Map[string, chan chan<- struct{}]
 
 		blockPut := func(t *testing.T, txnKey roachpb.Key) <-chan chan<- struct{} {
 			readyC := make(chan chan<- struct{})
-			blockPuts.Store(string(txnKey), readyC)
+			blockPuts.Store(string(txnKey), &readyC)
 			t.Cleanup(func() {
 				blockPuts.Delete(string(txnKey))
 			})
@@ -229,38 +228,38 @@ func TestReliableIntentCleanup(t *testing.T) {
 		// chan<- struct{} that, when the Put is ready, will be used to send an
 		// unblock channel. The unblock channel can be closed to unblock the
 		// Put.
-		var blockPutEvals sync.Map
+		var blockPutEvals syncutil.Map[string, chan chan<- struct{}]
 
 		blockPutEval := func(t *testing.T, txnKey roachpb.Key) <-chan chan<- struct{} {
 			readyC := make(chan chan<- struct{})
-			blockPutEvals.Store(string(txnKey), readyC)
+			blockPutEvals.Store(string(txnKey), &readyC)
 			t.Cleanup(func() {
 				blockPutEvals.Delete(string(txnKey))
 			})
 			return readyC
 		}
 
-		requestFilter := func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		requestFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 			// If we receive a heartbeat from a txn in abortHeartbeats,
 			// close the aborted channel and return an error response.
-			if _, ok := ba.GetArg(roachpb.HeartbeatTxn); ok && ba.Txn != nil {
+			if _, ok := ba.GetArg(kvpb.HeartbeatTxn); ok && ba.Txn != nil {
 				if abortedC, ok := abortHeartbeats.LoadAndDelete(string(ba.Txn.Key)); ok {
-					close(abortedC.(chan struct{}))
-					return roachpb.NewError(roachpb.NewTransactionAbortedError(
-						roachpb.ABORT_REASON_NEW_LEASE_PREVENTS_TXN))
+					close(*abortedC)
+					return kvpb.NewError(kvpb.NewTransactionAbortedError(
+						kvpb.ABORT_REASON_NEW_LEASE_PREVENTS_TXN))
 				}
 			}
 			return nil
 		}
 
-		evalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+		evalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 			// If we receive a Put request from a txn in blockPutEvals, signal
 			// the caller that the Put is ready to block by passing it an
 			// unblock channel, and wait for it to close.
-			if put, ok := args.Req.(*roachpb.PutRequest); ok && args.Hdr.Txn != nil {
+			if put, ok := args.Req.(*kvpb.PutRequest); ok && args.Hdr.Txn != nil {
 				if bytes.HasPrefix(put.Key, prefix) {
 					if ch, ok := blockPutEvals.LoadAndDelete(string(args.Hdr.Txn.Key)); ok {
-						readyC := ch.(chan chan<- struct{})
+						readyC := *ch
 						unblockC := make(chan struct{})
 						readyC <- unblockC
 						close(readyC)
@@ -271,14 +270,14 @@ func TestReliableIntentCleanup(t *testing.T) {
 			return nil
 		}
 
-		responseFilter := func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+		responseFilter := func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 			// If we receive a Put request from a txn in blockPuts, signal
 			// the caller that the Put is ready to block by passing it an
 			// unblock channel, and wait for it to close.
-			if arg, ok := ba.GetArg(roachpb.Put); ok && ba.Txn != nil {
-				if bytes.HasPrefix(arg.(*roachpb.PutRequest).Key, prefix) {
+			if arg, ok := ba.GetArg(kvpb.Put); ok && ba.Txn != nil {
+				if bytes.HasPrefix(arg.(*kvpb.PutRequest).Key, prefix) {
 					if ch, ok := blockPuts.LoadAndDelete(string(ba.Txn.Key)); ok {
-						readyC := ch.(chan chan<- struct{})
+						readyC := *ch
 						unblockC := make(chan struct{})
 						readyC <- unblockC
 						close(readyC)
@@ -307,7 +306,7 @@ func TestReliableIntentCleanup(t *testing.T) {
 				},
 			},
 		}
-		tc := serverutils.StartNewTestCluster(t, 3, clusterArgs)
+		tc := serverutils.StartCluster(t, 3, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 
 		srv := tc.Server(0)
@@ -356,7 +355,7 @@ func TestReliableIntentCleanup(t *testing.T) {
 				started            = timeutil.Now()
 			)
 			for {
-				result, err := storage.MVCCScan(ctx, store.Engine(), prefix, prefix.PrefixEnd(),
+				result, err := storage.MVCCScan(ctx, store.TODOEngine(), prefix, prefix.PrefixEnd(),
 					hlc.MaxTimestamp, storage.MVCCScanOptions{Inconsistent: true})
 				require.NoError(t, err)
 				intentCount := len(result.Intents)
@@ -389,7 +388,7 @@ func TestReliableIntentCleanup(t *testing.T) {
 			var txnEntry roachpb.Transaction
 			if !assert.Eventually(t, func() bool {
 				key := keys.TransactionKey(txnKey, txnID)
-				ok, err := storage.MVCCGetProto(ctx, store.Engine(), key, hlc.MaxTimestamp, &txnEntry,
+				ok, err := storage.MVCCGetProto(ctx, store.TODOEngine(), key, hlc.MaxTimestamp, &txnEntry,
 					storage.MVCCGetOptions{})
 				require.NoError(t, err)
 				return !ok
@@ -402,8 +401,8 @@ func TestReliableIntentCleanup(t *testing.T) {
 		removeKeys := func(t *testing.T) {
 			t.Helper()
 			batch := &kv.Batch{}
-			batch.AddRawRequest(&roachpb.ClearRangeRequest{
-				RequestHeader: roachpb.RequestHeader{
+			batch.AddRawRequest(&kvpb.ClearRangeRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    prefix,
 					EndKey: prefix.PrefixEnd(),
 				},
@@ -445,18 +444,18 @@ func TestReliableIntentCleanup(t *testing.T) {
 				// meanwhile, returning when heartbeat was aborted.
 				abortedC := abortHeartbeat(t, txnKey)
 				readyC := blockPut(t, txnKey)
-				require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "unblock", func(_ context.Context) {
+				go func() {
 					<-abortedC
 					unblockC := <-readyC
 					time.Sleep(100 * time.Millisecond)
 					close(unblockC)
-				}))
+				}()
 				close(abortErrC) // can't error
 
 			case "push":
 				// Push txn with a high-priority write once put is blocked.
 				readyC := blockPut(t, txnKey)
-				require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "push", func(ctx context.Context) {
+				go func() {
 					unblockC := <-readyC
 					defer close(unblockC)
 					defer close(abortErrC)
@@ -465,9 +464,13 @@ func TestReliableIntentCleanup(t *testing.T) {
 					pusherProto := roachpb.MakeTransaction(
 						"pusher",
 						nil, // baseKey
+						isolation.Serializable,
 						roachpb.MaxUserPriority,
 						now.ToTimestamp(),
 						srv.Clock().MaxOffset().Nanoseconds(),
+						int32(srv.SQLInstanceID()),
+						0,
+						false, // omitInRangefeeds
 					)
 					pusher := kv.NewTxnFromProto(ctx, db, srv.NodeID(), now, kv.RootTxn, &pusherProto)
 					if err := pusher.Put(ctx, txnKey, []byte("pushit")); err != nil {
@@ -478,8 +481,8 @@ func TestReliableIntentCleanup(t *testing.T) {
 						abortErrC <- err
 						return
 					}
-					time.Sleep(100 * time.Millisecond)
-				}))
+					time.Sleep(100 * time.Millisecond) // sleep before defers
+				}()
 
 			case "":
 				close(abortErrC)
@@ -492,12 +495,12 @@ func TestReliableIntentCleanup(t *testing.T) {
 			// evaluated in Raft.
 			if spec.finalize == "cancelAsync" {
 				readyC := blockPutEval(t, txnKey)
-				require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "cancel", func(_ context.Context) {
+				go func() {
 					unblockC := <-readyC
 					defer close(unblockC)
 					cancel()
-					time.Sleep(100 * time.Millisecond)
-				}))
+					time.Sleep(100 * time.Millisecond) // sleep before defers
+				}()
 			}
 
 			// Write numKeys KV pairs in batches of batchSize as a single txn.
@@ -559,25 +562,26 @@ func TestReliableIntentCleanup(t *testing.T) {
 			for attempt := 1; ; attempt++ {
 				txnKey := genKey(spec.singleRange)
 				txns[txn.ID()] = txnKey // before testTxnExecute, id may change on errors
-				retryErr := &roachpb.TransactionRetryWithProtoRefreshError{}
+				retryErr := &kvpb.TransactionRetryWithProtoRefreshError{}
 				err := testTxnExecute(t, ctx, spec, txn, txnKey)
 				if err == nil {
 					break
 				} else if spec.abort != "" {
 					require.Error(t, err)
-					if errors.As(err, retryErr) {
+					if errors.As(err, &retryErr) {
 						require.True(t, retryErr.PrevTxnAborted())
 					} else {
 						require.Fail(t, "expected TransactionRetryWithProtoRefreshError, got %v", err)
 					}
 					break
-				} else if !errors.As(err, retryErr) {
+				} else if !errors.As(err, &retryErr) {
 					require.NoError(t, err)
-				} else if attempt >= 3 {
+				} else if attempt >= 7 {
 					require.Fail(t, "too many txn retries", "attempt %v errored: %v", attempt, err)
 				} else {
 					t.Logf("retrying unexpected txn error: %v", err)
-					require.True(t, txn.IsRetryableErrMeantForTxn(*retryErr))
+					// Sanity check the retry error is meant for our transaction.
+					require.Equal(t, retryErr.PrevTxnID, txn.ID())
 				}
 			}
 
@@ -615,37 +619,42 @@ func TestReliableIntentCleanup(t *testing.T) {
 		}
 
 		// The actual tests are run here, using all combinations of parameters.
-		testutils.RunValues(t, "numKeys", []interface{}{1, 100, 100000}, func(t *testing.T, numKeys interface{}) {
+		testutils.RunValues(t, "numKeys", []int{1, 100, 100000}, func(t *testing.T, numKeys int) {
 			testutils.RunTrueAndFalse(t, "singleRange", func(t *testing.T, singleRange bool) {
 				testutils.RunTrueAndFalse(t, "txn", func(t *testing.T, txn bool) {
 					if !txn {
 						testNonTxn(t, testNonTxnSpec{
-							numKeys:     numKeys.(int),
+							numKeys:     numKeys,
 							singleRange: singleRange,
 						})
 						return
 					}
-					finalize := []interface{}{"commit", "rollback", "cancel", "cancelAsync"}
-					testutils.RunValues(t, "finalize", finalize, func(t *testing.T, finalize interface{}) {
+					finalize := []string{"commit", "rollback", "cancel", "cancelAsync"}
+					testutils.RunValues(t, "finalize", finalize, func(t *testing.T, finalize string) {
+						// TODO(erikgrinaker): cleanup does not always work reliably with
+						// context cancellation, so we skip these for now to deflake the test.
+						if finalize == "cancel" || finalize == "cancelAsync" {
+							skip.WithIssue(t, 105615)
+						}
 						if finalize == "cancelAsync" {
 							// cancelAsync can't run together with abort.
 							testTxn(t, testTxnSpec{
-								numKeys:     numKeys.(int),
+								numKeys:     numKeys,
 								singleRange: singleRange,
-								finalize:    finalize.(string),
+								finalize:    finalize,
 							})
 							return
 						}
-						abort := []interface{}{"no", "push", "heartbeat"}
-						testutils.RunValues(t, "abort", abort, func(t *testing.T, abort interface{}) {
-							if abort.(string) == "no" {
+						abort := []string{"no", "push", "heartbeat"}
+						testutils.RunValues(t, "abort", abort, func(t *testing.T, abort string) {
+							if abort == "no" {
 								abort = "" // "no" just makes the test output better
 							}
 							testTxn(t, testTxnSpec{
-								numKeys:     numKeys.(int),
+								numKeys:     numKeys,
 								singleRange: singleRange,
-								finalize:    finalize.(string),
-								abort:       abort.(string),
+								finalize:    finalize,
+								abort:       abort,
 							})
 						})
 					})

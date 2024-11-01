@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,12 +11,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -40,13 +37,14 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
 	r := sqlutils.MakeSQLRunner(sqlDB)
-	r.Exec(t, `
-		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
+	r.ExecMultiple(t,
+		`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;`,
+		`
 		CREATE DATABASE t;
 		USE t;
 	`)
 
-	datadriven.RunTest(t, "testdata/explain_tree", func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "explain_tree"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "exec":
 			r.Exec(t, d.Input)
@@ -58,13 +56,14 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			sd := NewInternalSessionData(ctx, execCfg.Settings, "test")
 			internalPlanner, cleanup := NewInternalPlanner(
 				"test",
 				kv.NewTxn(ctx, db, s.NodeID()),
-				security.RootUserName(),
+				username.NodeUserName(),
 				&MemoryMetrics{},
 				&execCfg,
-				sessiondatapb.SessionData{},
+				sd,
 			)
 			defer cleanup()
 			p := internalPlanner.(*planner)
@@ -74,14 +73,16 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 			ih.collectBundle = true
 			ih.savePlanForStats = true
 
-			p.stmt = makeStatement(stmt, ClusterWideID{})
+			p.stmt = makeStatement(stmt, clusterunique.ID{},
+				tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&execCfg.Settings.SV)))
 			if err := p.makeOptimizerPlan(ctx); err != nil {
 				t.Fatal(err)
 			}
-			p.curPlan.flags.Set(planFlagExecDone)
-			p.curPlan.close(ctx)
+			defer p.curPlan.close(ctx)
+			p.curPlan.savePlanInfo()
 			if d.Cmd == "plan-string" {
 				ob := ih.emitExplainAnalyzePlanToOutputBuilder(
+					ctx,
 					explain.Flags{Verbose: true, ShowTypes: true},
 					sessionphase.NewTimes(),
 					&execstats.QueryLevelStats{},

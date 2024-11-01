@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package goroutinedumper
 
@@ -34,12 +29,14 @@ const (
 
 var (
 	numGoroutinesThreshold = settings.RegisterIntSetting(
+		settings.ApplicationLevel,
 		"server.goroutine_dump.num_goroutines_threshold",
 		"a threshold beyond which if number of goroutines increases, "+
 			"then goroutine dump can be triggered",
 		1000,
 	)
 	totalDumpSizeLimit = settings.RegisterByteSizeSetting(
+		settings.ApplicationLevel,
 		"server.goroutine_dump.total_dump_size_limit",
 		"total size of goroutine dumps to be kept. "+
 			"Dumps are GC'ed in the order of creation time. The latest dump is "+
@@ -117,7 +114,7 @@ func NewGoroutineDumper(
 		return nil, errors.New("directory to store dumps could not be determined")
 	}
 
-	log.Infof(ctx, "writing goroutine dumps to %s", dir)
+	log.Infof(ctx, "writing goroutine dumps to %s", log.SafeManaged(dir))
 
 	gd := &GoroutineDumper{
 		heuristics: []heuristic{

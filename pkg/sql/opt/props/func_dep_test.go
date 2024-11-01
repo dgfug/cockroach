@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props_test
 
@@ -795,6 +790,17 @@ func TestFuncDeps_AddFrom(t *testing.T) {
 	abcde.AddStrictKey(c(2, 3), c(1, 2, 3, 4, 5))
 	verifyFD(t, abcde, "key(2,3); (1)-->(2-5), (2,3)-->(1,4,5)")
 	testColsAreStrictKey(t, abcde, c(1), true)
+
+	// Add a single-column strict dependency to a multi-column strict
+	// dependency.
+	m := &props.FuncDepSet{}
+	m.AddStrictKey(c(1, 2), c(1, 2))
+	verifyFD(t, m, "key(1,2)")
+	s := &props.FuncDepSet{}
+	s.AddStrictKey(c(1), c(1, 2))
+	verifyFD(t, s, "key(1); (1)-->(2)")
+	m.AddFrom(s)
+	verifyFD(t, m, "key(1); (1)-->(2)")
 }
 
 func TestFuncDeps_AddEquivFrom(t *testing.T) {
@@ -815,6 +821,16 @@ func TestFuncDeps_AddEquivFrom(t *testing.T) {
 	equiv.ProjectCols(opt.ColSet{})
 	equiv.AddEquivFrom(product)
 	verifyFD(t, &equiv, "(1)==(10), (10)==(1), (2)==(11), (11)==(2)")
+
+	// Add an equivalency to a multi-column strict dependency.
+	m := &props.FuncDepSet{}
+	m.AddStrictKey(c(1, 2), c(1, 2))
+	verifyFD(t, m, "key(1,2)")
+	s := &props.FuncDepSet{}
+	s.AddEquivalency(1, 2)
+	verifyFD(t, s, "(1)==(2), (2)==(1)")
+	m.AddEquivFrom(s)
+	verifyFD(t, m, "key(2); (1)==(2), (2)==(1)")
 }
 
 func TestFuncDeps_MakeProduct(t *testing.T) {
@@ -1263,8 +1279,9 @@ func TestFuncDeps_RemapFrom(t *testing.T) {
 }
 
 // Construct base table FD from figure 3.3, page 114:
-//   CREATE TABLE abcde (a INT PRIMARY KEY, b INT, c INT, d INT, e INT)
-//   CREATE UNIQUE INDEX ON abcde (b, c)
+//
+//	CREATE TABLE abcde (a INT PRIMARY KEY, b INT, c INT, d INT, e INT)
+//	CREATE UNIQUE INDEX ON abcde (b, c)
 func makeAbcdeFD(t *testing.T) *props.FuncDepSet {
 	// Set Key to all cols to start, and ensure it's overridden in AddStrictKey.
 	allCols := c(1, 2, 3, 4, 5)
@@ -1283,7 +1300,8 @@ func makeAbcdeFD(t *testing.T) *props.FuncDepSet {
 }
 
 // Construct base table FD from figure 3.3, page 114:
-//   CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
+//
+//	CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
 func makeMnpqFD(t *testing.T) *props.FuncDepSet {
 	allCols := c(10, 11, 12, 13)
 	mnpq := &props.FuncDepSet{}
@@ -1297,8 +1315,9 @@ func makeMnpqFD(t *testing.T) *props.FuncDepSet {
 }
 
 // Construct cartesian product FD from figure 3.6, page 122:
-//   CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
-//   SELECT * FROM abcde, mnpq
+//
+//	CREATE TABLE mnpq (m INT, n INT, p INT, q INT, PRIMARY KEY (m, n))
+//	SELECT * FROM abcde, mnpq
 func makeProductFD(t *testing.T) *props.FuncDepSet {
 	product := makeAbcdeFD(t)
 	product.MakeProduct(makeMnpqFD(t))
@@ -1312,7 +1331,8 @@ func makeProductFD(t *testing.T) *props.FuncDepSet {
 }
 
 // Construct inner join FD:
-//   SELECT * FROM abcde, mnpq WHERE a=m
+//
+//	SELECT * FROM abcde, mnpq WHERE a=m
 func makeJoinFD(t *testing.T) *props.FuncDepSet {
 	// Start with cartesian product FD and add equivalency to it.
 	join := makeProductFD(t)

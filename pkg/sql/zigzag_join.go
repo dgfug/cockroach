@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -52,7 +47,7 @@ type zigzagJoinSide struct {
 	scan *scanNode
 
 	// eqCols is an int slice containing the equated columns for this side
-	// of the zigzag join.
+	// of the zigzag join (as ordinals into scan.cols).
 	eqCols []int
 
 	// fixedVals contains fixed values for a prefix of this side's index columns.

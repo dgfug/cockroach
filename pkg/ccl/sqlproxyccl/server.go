@@ -1,67 +1,65 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlproxyccl
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/prometheus/common/expfmt"
 )
 
-// proxyConnHandler defines the signature of the function that handles each
-// individual new incoming connection.
-type proxyConnHandler func(ctx context.Context, conn *proxyConn) error
+var (
+	awaitNoConnectionsInterval = time.Minute
+)
 
 // Server is a TCP server that proxies SQL connections to a configurable
 // backend. It may also run an HTTP server to expose a health check and
 // prometheus metrics.
 type Server struct {
 	Stopper         *stop.Stopper
-	connHandler     proxyConnHandler
+	handler         *proxyHandler
 	mux             *http.ServeMux
 	metrics         *metrics
 	metricsRegistry *metric.Registry
 
-	promMu             syncutil.Mutex
 	prometheusExporter metric.PrometheusExporter
 }
 
 // NewServer constructs a new proxy server and provisions metrics and health
 // checks as well.
 func NewServer(ctx context.Context, stopper *stop.Stopper, options ProxyOptions) (*Server, error) {
+	registry := metric.NewRegistry()
+
 	proxyMetrics := makeProxyMetrics()
-	handler, err := newProxyHandler(ctx, stopper, &proxyMetrics, options)
+	registry.AddMetricStruct(&proxyMetrics)
+
+	handler, err := newProxyHandler(ctx, stopper, registry, &proxyMetrics, options)
 	if err != nil {
 		return nil, err
 	}
 
 	mux := http.NewServeMux()
 
-	registry := metric.NewRegistry()
-
-	registry.AddMetricStruct(&proxyMetrics)
-
 	s := &Server{
 		Stopper:            stopper,
-		connHandler:        handler.handle,
+		handler:            handler,
 		mux:                mux,
 		metrics:            &proxyMetrics,
 		metricsRegistry:    registry,
@@ -72,6 +70,7 @@ func NewServer(ctx context.Context, stopper *stop.Stopper, options ProxyOptions)
 	// endpoints.
 	mux.HandleFunc("/_status/vars/", s.handleVars)
 	mux.HandleFunc("/_status/healthz/", s.handleHealth)
+	mux.HandleFunc("/_status/cancel/", s.handleCancel)
 
 	// Taken from pprof's `init()` method. See:
 	// https://golang.org/src/net/http/pprof/pprof.go
@@ -105,15 +104,57 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVars(w http.ResponseWriter, r *http.Request) {
-	s.promMu.Lock()
-	defer s.promMu.Unlock()
-
-	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
-	s.prometheusExporter.ScrapeRegistry(s.metricsRegistry, true /* includeChildMetrics*/)
-	if err := s.prometheusExporter.PrintAsText(w); err != nil {
+	contentType := expfmt.Negotiate(r.Header)
+	w.Header().Set(httputil.ContentTypeHeader, string(contentType))
+	scrape := func(pm *metric.PrometheusExporter) {
+		pm.ScrapeRegistry(s.metricsRegistry, true /* includeChildMetrics*/)
+	}
+	if err := s.prometheusExporter.ScrapeAndPrintAsText(w, contentType, scrape); err != nil {
 		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// handleCancel processes a cancel request that has been forwarded from another
+// sqlproxy.
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	var retErr error
+	defer func() {
+		if retErr != nil {
+			// Lots of noise from this log indicates that somebody is spamming
+			// fake cancel requests.
+			log.Warningf(
+				r.Context(), "could not handle cancel request from client %s: %v",
+				r.RemoteAddr, retErr,
+			)
+		}
+		if f := s.handler.testingKnobs.httpCancelErrHandler; f != nil {
+			f(retErr)
+		}
+	}()
+	buf := make([]byte, proxyCancelRequestLen)
+	n, err := r.Body.Read(buf)
+	// Write the response as soon as we read the data, so we don't reveal if we
+	// are processing the request or not.
+	// Explicitly ignore any errors from writing the response as there's
+	// nothing to be done if the write fails.
+	_, _ = w.Write([]byte("OK"))
+	if err != nil && err != io.EOF {
+		retErr = err
+		return
+	}
+	if n != len(buf) {
+		retErr = errors.Errorf("unexpected number of bytes %d", n)
+		return
+	}
+	p := &proxyCancelRequest{}
+	if err := p.Decode(buf); err != nil {
+		retErr = err
+		return
+	}
+	// This request should never be forwarded, since if it is handled here, it
+	// was already forwarded to the correct node.
+	retErr = s.handler.handleCancelRequest(p, false /* allowForward */)
 }
 
 // ServeHTTP starts the proxy's HTTP server on the given listener.
@@ -121,18 +162,32 @@ func (s *Server) handleVars(w http.ResponseWriter, r *http.Request) {
 // a health check endpoint at /_status/healthz, and pprof debug
 // endpoints at /debug/pprof.
 func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
-	srv := http.Server{
-		Handler: s.mux,
+	if s.handler.RequireProxyProtocol {
+		ln = &proxyproto.Listener{
+			Listener: ln,
+			Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+				// There is a possibility where components doing healthchecking
+				// (e.g. Kubernetes) do not support the PROXY protocol directly.
+				// We use the `USE` policy here (which is also the default) to
+				// optionally allow the PROXY protocol to be supported. If a
+				// connection doesn't have the proxy headers, it'll just be
+				// treated as a regular one.
+				return proxyproto.USE, nil
+			},
+			ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
+		}
 	}
 
-	go func() {
+	srv := http.Server{Handler: s.mux}
+
+	err := s.Stopper.RunAsyncTask(ctx, "sqlproxy-http-cleanup", func(ctx context.Context) {
 		<-ctx.Done()
 
 		// Wait up to 15 seconds for the HTTP server to shut itself
 		// down. The HTTP service is an auxiliary service for health
 		// checking and metrics, which does not need a completely
 		// graceful shutdown.
-		_ = contextutil.RunWithTimeout(
+		_ = timeutil.RunWithTimeout(
 			context.Background(),
 			"http server shutdown",
 			15*time.Second,
@@ -140,11 +195,13 @@ func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
 				// Ignore any errors as this routine will only be called
 				// when the server is shutting down.
 				_ = srv.Shutdown(shutdownCtx)
-
 				return nil
 			},
 		)
-	}()
+	})
+	if err != nil {
+		return err
+	}
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -153,10 +210,45 @@ func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
 	return nil
 }
 
-// Serve serves a listener according to the Options given in NewServer().
+// Serve serves up to two listeners according to the Options given in
+// NewServer().
+//
+// If ln is not nil, a listener is served which does not require
+// proxy protocol headers, unless RequireProxyProtocol is true.
+//
+// If proxyProtocolLn is not nil, a listener is served which requires proxy
+// protocol headers.
+//
 // Incoming client connections are taken through the Postgres handshake and
 // relayed to the configured backend server.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+func (s *Server) ServeSQL(
+	ctx context.Context, ln net.Listener, proxyProtocolLn net.Listener,
+) error {
+	if ln != nil {
+		if s.handler.RequireProxyProtocol {
+			ln = s.requireProxyProtocolOnListener(ln)
+		}
+		log.Infof(ctx, "proxy server listening at %s", ln.Addr())
+		if err := s.Stopper.RunAsyncTask(ctx, "listener-serve", func(ctx context.Context) {
+			_ = s.serve(ctx, ln, s.handler.RequireProxyProtocol)
+		}); err != nil {
+			return err
+		}
+	}
+	if proxyProtocolLn != nil {
+		proxyProtocolLn = s.requireProxyProtocolOnListener(proxyProtocolLn)
+		log.Infof(ctx, "proxy with required proxy headers server listening at %s", proxyProtocolLn.Addr())
+		if err := s.Stopper.RunAsyncTask(ctx, "proxy-protocol-listener-serve", func(ctx context.Context) {
+			_ = s.serve(ctx, proxyProtocolLn, true /* requireProxyProtocol */)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// serve is called by ServeSQL to serve a single listener.
+func (s *Server) serve(ctx context.Context, ln net.Listener, requireProxyProtocol bool) error {
 	err := s.Stopper.RunAsyncTask(ctx, "listen-quiesce", func(ctx context.Context) {
 		<-s.Stopper.ShouldQuiesce()
 		if err := ln.Close(); err != nil && !grpcutil.IsClosedConnection(err) {
@@ -168,21 +260,19 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 
 	for {
-		origConn, err := ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		conn := &proxyConn{
-			Conn: origConn,
-		}
+		s.metrics.AcceptedConnCount.Inc(1)
 
 		err = s.Stopper.RunAsyncTask(ctx, "proxy-con-serve", func(ctx context.Context) {
 			defer func() { _ = conn.Close() }()
 			s.metrics.CurConnCount.Inc(1)
 			defer s.metrics.CurConnCount.Dec(1)
 			remoteAddr := conn.RemoteAddr()
-			ctxWithTag := logtags.AddTag(ctx, "client", remoteAddr)
-			if err := s.connHandler(ctxWithTag, conn); err != nil {
+			ctxWithTag := logtags.AddTag(ctx, "client", log.SafeOperational(remoteAddr))
+			if err := s.handler.handle(ctxWithTag, conn, requireProxyProtocol); err != nil {
 				log.Infof(ctxWithTag, "connection error: %v", err)
 			}
 		})
@@ -192,42 +282,43 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// proxyConn is a SQL connection into the proxy.
-type proxyConn struct {
-	net.Conn
-
-	mu struct {
-		syncutil.Mutex
-		closed   bool
-		closedCh chan struct{}
+func (s *Server) requireProxyProtocolOnListener(ln net.Listener) net.Listener {
+	return &proxyproto.Listener{
+		Listener: ln,
+		Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+			// REQUIRE enforces the connection to send a PROXY header.
+			// The connection will be rejected if one was not present.
+			return proxyproto.REQUIRE, nil
+		},
+		ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
 	}
 }
 
-// Done returns a channel that's closed when the connection is closed.
-func (c *proxyConn) done() <-chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mu.closedCh == nil {
-		c.mu.closedCh = make(chan struct{})
-		if c.mu.closed {
-			close(c.mu.closedCh)
+// AwaitNoConnections returns a channel that is closed once the server has no open connections.
+// This is meant to be used after the server has stopped accepting new connections and we are
+// waiting to shutdown the server without inturrupting existing connections
+//
+// If the context is cancelled the channel will never close because we have to end the async task
+// to allow the stopper to completely finish
+func (s *Server) AwaitNoConnections(ctx context.Context) <-chan struct{} {
+	c := make(chan struct{})
+
+	_ = s.Stopper.RunAsyncTask(ctx, "await-no-connections", func(context.Context) {
+		for {
+			connCount := s.metrics.CurConnCount.Value()
+			if connCount == 0 {
+				close(c)
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(awaitNoConnectionsInterval):
+				continue
+			}
 		}
-	}
-	return c.mu.closedCh
-}
 
-// Close closes the connection.
-// Any blocked Read or Write operations will be unblocked and return errors.
-// The connection's Done channel will be closed. This overrides net.Conn.Close.
-func (c *proxyConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mu.closed {
-		return nil
-	}
-	if c.mu.closedCh != nil {
-		close(c.mu.closedCh)
-	}
-	c.mu.closed = true
-	return c.Conn.Close()
+	})
+
+	return c
 }

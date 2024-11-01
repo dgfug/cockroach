@@ -1,22 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeofday
 
 import (
-	"fmt"
+	"bytes"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/strutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -52,12 +47,23 @@ func New(hour, min, sec, micro int) TimeOfDay {
 }
 
 func (t TimeOfDay) String() string {
+	return string(t.AppendFormat(nil))
+}
+
+// AppendFormat appends this TimeOfDay format to the specified buffer.
+func (t TimeOfDay) AppendFormat(buf []byte) []byte {
+	buf = strutil.AppendInt(buf, t.Hour(), 2)
+	buf = append(buf, ':')
+	buf = strutil.AppendInt(buf, t.Minute(), 2)
+	buf = append(buf, ':')
+	buf = strutil.AppendInt(buf, t.Second(), 2)
 	micros := t.Microsecond()
 	if micros > 0 {
-		s := fmt.Sprintf("%02d:%02d:%02d.%06d", t.Hour(), t.Minute(), t.Second(), micros)
-		return strings.TrimRight(s, "0")
+		buf = append(buf, '.')
+		buf = strutil.AppendInt(buf, micros, 6)
+		buf = bytes.TrimRight(buf, "0")
 	}
-	return fmt.Sprintf("%02d:%02d:%02d", t.Hour(), t.Minute(), t.Second())
+	return buf
 }
 
 // FromInt constructs a TimeOfDay from an int64, representing microseconds since

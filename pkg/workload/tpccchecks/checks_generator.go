@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpcc
 
@@ -35,9 +30,7 @@ foreground TPC-C workload`,
 		g := &tpccChecks{}
 		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`db`:          {RuntimeOnly: true},
-			`concurrency`: {RuntimeOnly: true},
-			`as-of`:       {RuntimeOnly: true},
+			`as-of`: {RuntimeOnly: true},
 		}
 		g.flags.IntVar(&g.concurrency, `concurrency`, 1,
 			`Number of concurrent workers. Defaults to 1.`,
@@ -48,6 +41,10 @@ foreground TPC-C workload`,
 				" AS OF SYSTEM TIME CLAUSE for all checks.")
 		checkNames := func() (checkNames []string) {
 			for _, c := range tpcc.AllChecks() {
+				if c.LoadOnly {
+					// TODO(nvanbenschoten): support load-only checks.
+					continue
+				}
 				checkNames = append(checkNames, c.Name)
 			}
 			return checkNames
@@ -66,9 +63,13 @@ foreground TPC-C workload`,
 	},
 }
 
+// Flags implements the Flagser interface.
 func (w *tpccChecks) Flags() workload.Flags {
 	return w.flags
 }
+
+// ConnFlags implements the ConnFlagser interface.
+func (w *tpccChecks) ConnFlags() *workload.ConnFlags { return w.connFlags }
 
 func init() {
 	workload.Register(tpccChecksMeta)
@@ -96,12 +97,9 @@ func (*tpccChecks) Meta() workload.Meta {
 func (w *tpccChecks) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.flags.Lookup("db").Value.String(), urls)
-	if err != nil {
-		return workload.QueryLoad{}, errors.Wrapf(err, "could not sanitize urls %v", urls)
-	}
 	dbs := make([]*gosql.DB, len(urls))
 	for i, url := range urls {
+		var err error
 		dbs[i], err = gosql.Open(`cockroach`, url)
 		if err != nil {
 			return workload.QueryLoad{}, errors.Wrapf(err, "failed to dial %s", url)
@@ -111,7 +109,7 @@ func (w *tpccChecks) Ops(
 		dbs[i].SetMaxOpenConns(3 * w.concurrency)
 		dbs[i].SetMaxIdleConns(3 * w.concurrency)
 	}
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	ql.WorkerFns = make([]func(context.Context) error, w.concurrency)
 	checks, err := filterChecks(tpcc.AllChecks(), w.checks)
 	if err != nil {

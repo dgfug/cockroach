@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package syncbench
 
@@ -22,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -105,11 +101,13 @@ func (w *worker) run(wg *sync.WaitGroup) {
 		atomic.AddUint64(&numOps, 1)
 		atomic.AddUint64(&numBytes, bytes)
 		elapsed := clampLatency(timeutil.Since(start), minLatency, maxLatency)
-		w.latency.Lock()
-		if err := w.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
-			log.Fatalf(ctx, "%v", err)
-		}
-		w.latency.Unlock()
+		func() {
+			w.latency.Lock()
+			defer w.latency.Unlock()
+			if err := w.latency.Current.RecordValue(elapsed.Nanoseconds()); err != nil {
+				log.Fatalf(ctx, "%v", err)
+			}
+		}()
 	}
 }
 
@@ -140,9 +138,9 @@ func Run(opts Options) error {
 
 	db, err := storage.Open(
 		context.Background(),
-		storage.Filesystem(opts.Dir),
-		storage.CacheSize(0),
-		storage.Settings(cluster.MakeTestingClusterSettings()))
+		fs.MustInitPhysicalTestingEnv(opts.Dir),
+		cluster.MakeTestingClusterSettings(),
+		storage.CacheSize(0))
 	if err != nil {
 		return err
 	}
@@ -185,10 +183,13 @@ func Run(opts Options) error {
 		case <-ticker.C:
 			var h *hdrhistogram.Histogram
 			for _, w := range workers {
-				w.latency.Lock()
-				m := w.latency.Merge()
-				w.latency.Rotate()
-				w.latency.Unlock()
+				var m *hdrhistogram.Histogram
+				func() {
+					w.latency.Lock()
+					defer w.latency.Unlock()
+					m = w.latency.Merge()
+					w.latency.Rotate()
+				}()
 				if h == nil {
 					h = m
 				} else {

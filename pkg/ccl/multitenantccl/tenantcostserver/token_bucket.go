@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostserver
 
@@ -12,8 +9,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -23,22 +22,22 @@ import (
 // runs on the host cluster to service requests coming from tenants (through the
 // kvtenant.Connector).
 func (s *instance) TokenBucketRequest(
-	ctx context.Context, tenantID roachpb.TenantID, in *roachpb.TokenBucketRequest,
-) *roachpb.TokenBucketResponse {
+	ctx context.Context, tenantID roachpb.TenantID, in *kvpb.TokenBucketRequest,
+) *kvpb.TokenBucketResponse {
 	if tenantID == roachpb.SystemTenantID {
-		return &roachpb.TokenBucketResponse{
+		return &kvpb.TokenBucketResponse{
 			Error: errors.EncodeError(ctx, errors.New("token bucket request for system tenant")),
 		}
 	}
 	instanceID := base.SQLInstanceID(in.InstanceID)
 	if instanceID < 1 {
-		return &roachpb.TokenBucketResponse{
+		return &kvpb.TokenBucketResponse{
 			Error: errors.EncodeError(ctx, errors.Errorf("invalid instance ID %d", instanceID)),
 		}
 	}
-	if in.RequestedRU < 0 {
-		return &roachpb.TokenBucketResponse{
-			Error: errors.EncodeError(ctx, errors.Errorf("negative requested RUs")),
+	if in.RequestedTokens < 0 {
+		return &kvpb.TokenBucketResponse{
+			Error: errors.EncodeError(ctx, errors.Errorf("negative requested tokens")),
 		}
 	}
 
@@ -50,13 +49,18 @@ func (s *instance) TokenBucketRequest(
 	metrics.mutex.Lock()
 	defer metrics.mutex.Unlock()
 
-	result := &roachpb.TokenBucketResponse{}
-	var consumption roachpb.TenantConsumption
-	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		*result = roachpb.TokenBucketResponse{}
+	// Check whether the consumption rates migration has run. If not, then do not
+	// attempt to read/write the new rates columns.
+	// TODO(andyk): Remove this after 24.3.
+	ratesAvailable := s.settings.Version.IsActive(ctx, clusterversion.V24_2_TenantRates)
 
-		h := makeSysTableHelper(ctx, s.executor, txn, tenantID)
-		tenant, instance, err := h.readTenantAndInstanceState(instanceID)
+	result := &kvpb.TokenBucketResponse{}
+	var consumption kvpb.TenantConsumption
+	if err := s.ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		*result = kvpb.TokenBucketResponse{}
+
+		h := makeSysTableHelper(ctx, tenantID, ratesAvailable)
+		tenant, instance, err := h.readTenantAndInstanceState(txn, instanceID)
 		if err != nil {
 			return err
 		}
@@ -69,11 +73,13 @@ func (s *instance) TokenBucketRequest(
 				return err
 			}
 		}
+
 		now := s.timeSource.Now()
+		last := tenant.LastUpdate.Time
 		tenant.update(now)
 
 		if !instance.Present {
-			if err := h.accomodateNewInstance(&tenant, &instance); err != nil {
+			if err := h.accommodateNewInstance(txn, &tenant, &instance); err != nil {
 				return err
 			}
 		}
@@ -86,7 +92,7 @@ func (s *instance) TokenBucketRequest(
 
 		if in.NextLiveInstanceID != 0 {
 			if err := s.handleNextLiveInstanceID(
-				&h, &tenant, &instance, base.SQLInstanceID(in.NextLiveInstanceID),
+				&h, txn, &tenant, &instance, base.SQLInstanceID(in.NextLiveInstanceID),
 			); err != nil {
 				return err
 			}
@@ -94,41 +100,50 @@ func (s *instance) TokenBucketRequest(
 
 		// Only update consumption if we are sure this is not a duplicate request
 		// that we already counted. Note that if this is a duplicate request, it
-		// will still use RUs from the bucket (RUCurrent); we rely on a higher level
-		// control loop that periodically reconfigures the token bucket to correct
-		// such errors.
+		// will still use tokens from the bucket (TokenCurrent); we rely on a higher
+		// level control loop that periodically reconfigures the token bucket to
+		// correct such errors.
 		if instance.Seq == 0 || instance.Seq < in.SeqNum {
-			tenant.Consumption.Add(&in.ConsumptionSinceLastRequest)
 			instance.Seq = in.SeqNum
+			tenant.Consumption.Add(&in.ConsumptionSinceLastRequest)
+
+			// Update consumption rates.
+			tenant.Rates.Update(now, last, &in.ConsumptionSinceLastRequest, in.ConsumptionPeriod)
 		}
 
-		// TODO(radu): update shares.
-		*result = tenant.Bucket.Request(in)
+		*result = tenant.Bucket.Request(ctx, in)
+		result.ConsumptionRates = *tenant.Rates.Current()
 
 		instance.LastUpdate.Time = now
-		if err := h.updateTenantAndInstanceState(tenant, instance); err != nil {
+		if err := h.updateTenantAndInstanceState(txn, &tenant, &instance); err != nil {
 			return err
 		}
 
-		if err := h.maybeCheckInvariants(); err != nil {
+		if err := h.maybeCheckInvariants(txn); err != nil {
 			panic(err)
 		}
 		consumption = tenant.Consumption
 		return nil
 	}); err != nil {
-		return &roachpb.TokenBucketResponse{
+		return &kvpb.TokenBucketResponse{
 			Error: errors.EncodeError(ctx, err),
 		}
 	}
 
 	// Report current consumption.
-	metrics.totalRU.Update(consumption.RU)
+	metrics.totalRU.UpdateIfHigher(consumption.RU)
+	metrics.totalKVRU.UpdateIfHigher(consumption.KVRU)
+	metrics.totalReadBatches.Update(int64(consumption.ReadBatches))
 	metrics.totalReadRequests.Update(int64(consumption.ReadRequests))
 	metrics.totalReadBytes.Update(int64(consumption.ReadBytes))
+	metrics.totalWriteBatches.Update(int64(consumption.WriteBatches))
 	metrics.totalWriteRequests.Update(int64(consumption.WriteRequests))
 	metrics.totalWriteBytes.Update(int64(consumption.WriteBytes))
 	metrics.totalSQLPodsCPUSeconds.Update(consumption.SQLPodsCPUSeconds)
 	metrics.totalPGWireEgressBytes.Update(int64(consumption.PGWireEgressBytes))
+	metrics.totalExternalIOEgressBytes.Update(int64(consumption.ExternalIOEgressBytes))
+	metrics.totalExternalIOIngressBytes.Update(int64(consumption.ExternalIOIngressBytes))
+	metrics.totalCrossRegionNetworkRU.UpdateIfHigher(consumption.CrossRegionNetworkRU)
 	return result
 }
 
@@ -137,6 +152,7 @@ func (s *instance) TokenBucketRequest(
 // (in the circular order).
 func (s *instance) handleNextLiveInstanceID(
 	h *sysTableHelper,
+	txn isql.Txn,
 	tenant *tenantState,
 	instance *instanceState,
 	nextLiveInstanceID base.SQLInstanceID,
@@ -172,7 +188,7 @@ func (s *instance) handleNextLiveInstanceID(
 			// Case 2: range [instance.NextInstance, nextLiveInstanceID) potentially
 			// needs cleanup.
 			instance.NextInstance, err = h.maybeCleanupStaleInstances(
-				cutoff, instance.NextInstance, nextLiveInstanceID,
+				txn, cutoff, instance.NextInstance, nextLiveInstanceID,
 			)
 			if err != nil {
 				return err
@@ -187,7 +203,7 @@ func (s *instance) handleNextLiveInstanceID(
 			// Case 2: range [tenant.FirstInstance, nextLiveInstanceID)
 			// potentially needs cleanup.
 			tenant.FirstInstance, err = h.maybeCleanupStaleInstances(
-				cutoff, tenant.FirstInstance, nextLiveInstanceID,
+				txn, cutoff, tenant.FirstInstance, nextLiveInstanceID,
 			)
 			if err != nil {
 				return err
@@ -197,7 +213,7 @@ func (s *instance) handleNextLiveInstanceID(
 			// Case 2: in our table, this is not the largest ID. The range
 			// [instance.NextInstance, ∞) potentially needs cleanup.
 			instance.NextInstance, err = h.maybeCleanupStaleInstances(
-				cutoff, instance.NextInstance, -1,
+				txn, cutoff, instance.NextInstance, -1,
 			)
 			if err != nil {
 				return err

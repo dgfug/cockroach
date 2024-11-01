@@ -160,6 +160,30 @@ SHOW JOBS SELECT a -- literals removed
 SHOW JOBS SELECT _ -- identifiers removed
 
 parse
+SHOW JOBS WITH EXECUTION DETAILS
+----
+SHOW JOBS WITH EXECUTION DETAILS
+SHOW JOBS WITH EXECUTION DETAILS -- fully parenthesized
+SHOW JOBS WITH EXECUTION DETAILS -- literals removed
+SHOW JOBS WITH EXECUTION DETAILS -- identifiers removed
+
+parse
+SHOW JOB a WITH EXECUTION DETAILS
+----
+SHOW JOBS VALUES (a) WITH EXECUTION DETAILS -- normalized!
+SHOW JOBS VALUES ((a)) WITH EXECUTION DETAILS -- fully parenthesized
+SHOW JOBS VALUES (a) WITH EXECUTION DETAILS -- literals removed
+SHOW JOBS VALUES (_) WITH EXECUTION DETAILS -- identifiers removed
+
+parse
+SHOW JOBS SELECT a WITH EXECUTION DETAILS
+----
+SHOW JOBS SELECT a WITH EXECUTION DETAILS
+SHOW JOBS SELECT (a) WITH EXECUTION DETAILS -- fully parenthesized
+SHOW JOBS SELECT a WITH EXECUTION DETAILS -- literals removed
+SHOW JOBS SELECT _ WITH EXECUTION DETAILS -- identifiers removed
+
+parse
 EXPLAIN SHOW JOBS SELECT a
 ----
 EXPLAIN SHOW JOBS SELECT a
@@ -278,17 +302,17 @@ parse
 RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3])
 ----
 RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3])
-RESUME JOBS FOR SCHEDULES SELECT ((unnest)((ARRAY[(1), (2), (3)]))) -- fully parenthesized
-RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[_, _, __more1__]) -- literals removed
-RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3]) -- identifiers removed
+RESUME JOBS FOR SCHEDULES SELECT (unnest((ARRAY[(1), (2), (3)]))) -- fully parenthesized
+RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[_, _, __more1_10__]) -- literals removed
+RESUME JOBS FOR SCHEDULES SELECT _(ARRAY[1, 2, 3]) -- identifiers removed
 
 parse
 EXPLAIN RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3])
 ----
 EXPLAIN RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3])
-EXPLAIN RESUME JOBS FOR SCHEDULES SELECT ((unnest)((ARRAY[(1), (2), (3)]))) -- fully parenthesized
-EXPLAIN RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[_, _, __more1__]) -- literals removed
-EXPLAIN RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[1, 2, 3]) -- identifiers removed
+EXPLAIN RESUME JOBS FOR SCHEDULES SELECT (unnest((ARRAY[(1), (2), (3)]))) -- fully parenthesized
+EXPLAIN RESUME JOBS FOR SCHEDULES SELECT unnest(ARRAY[_, _, __more1_10__]) -- literals removed
+EXPLAIN RESUME JOBS FOR SCHEDULES SELECT _(ARRAY[1, 2, 3]) -- identifiers removed
 
 parse
 RESUME JOB a

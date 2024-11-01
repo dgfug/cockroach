@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -14,11 +9,14 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -35,37 +33,33 @@ var CTASPlanResultTypes = []*types.T{
 
 type bulkRowWriter struct {
 	execinfra.ProcessorBase
-	flowCtx        *execinfra.FlowCtx
 	processorID    int32
 	batchIdxAtomic int64
 	tableDesc      catalog.TableDescriptor
 	spec           execinfrapb.BulkRowWriterSpec
 	input          execinfra.RowSource
-	output         execinfra.RowReceiver
-	summary        roachpb.BulkOpSummary
+	summary        kvpb.BulkOpSummary
 }
 
 var _ execinfra.Processor = &bulkRowWriter{}
 var _ execinfra.RowSource = &bulkRowWriter{}
 
 func newBulkRowWriterProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.BulkRowWriterSpec,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	c := &bulkRowWriter{
-		flowCtx:        flowCtx,
 		processorID:    processorID,
 		batchIdxAtomic: 0,
-		tableDesc:      spec.BuildTableDescriptor(),
+		tableDesc:      flowCtx.TableDescriptor(ctx, &spec.Table),
 		spec:           spec,
 		input:          input,
-		output:         output,
 	}
 	if err := c.Init(
-		c, &execinfrapb.PostProcessSpec{}, CTASPlanResultTypes, flowCtx, processorID, output,
+		ctx, c, &execinfrapb.PostProcessSpec{}, CTASPlanResultTypes, flowCtx, processorID,
 		nil /* memMonitor */, execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{input}},
 	); err != nil {
 		return nil, err
@@ -101,10 +95,10 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	kvCh := make(chan row.KVBatch, 10)
 	var g ctxgroup.Group
 
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	conv, err := row.NewDatumRowConverter(
-		ctx, &semaCtx, sp.tableDesc, nil /* targetColNames */, sp.EvalCtx, kvCh, nil,
-		/* seqChunkProvider */ sp.flowCtx.GetRowMetrics(),
+		ctx, &semaCtx, sp.tableDesc, nil /* targetColNames */, sp.FlowCtx.EvalCtx,
+		kvCh, nil /* seqChunkProvider */, sp.FlowCtx.GetRowMetrics(), sp.FlowCtx.Cfg.DB.KV(),
 	)
 	if err != nil {
 		return err
@@ -123,24 +117,36 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	return g.Wait()
 }
 
-func (sp *bulkRowWriter) wrapDupError(ctx context.Context, orig error) error {
-	var typed *kvserverbase.DuplicateKeyError
-	if !errors.As(orig, &typed) {
-		return orig
+func (sp *bulkRowWriter) maybeWrapAsPGError(ctx context.Context, orig error) error {
+	if typed := new(kvserverbase.DuplicateKeyError); errors.As(orig, &typed) {
+		v := &roachpb.Value{RawBytes: typed.Value}
+		return row.NewUniquenessConstraintViolationError(ctx, sp.tableDesc, typed.Key, v)
 	}
-	v := &roachpb.Value{RawBytes: typed.Value}
-	return row.NewUniquenessConstraintViolationError(ctx, sp.tableDesc, typed.Key, v)
+	if typed := new(kvpb.KeyCollisionError); errors.As(orig, &typed) {
+		v := &roachpb.Value{RawBytes: typed.Value}
+		return row.NewUniquenessConstraintViolationError(ctx, sp.tableDesc, typed.Key, v)
+	}
+	if typed := new(kvpb.InsufficientSpaceError); errors.As(orig, &typed) {
+		return pgerror.WithCandidateCode(typed, pgcode.DiskFull)
+	}
+	return orig
 }
 
 func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) error {
 	writeTS := sp.spec.Table.CreateAsOfTime
 	const bufferSize = 64 << 20
-	adder, err := sp.flowCtx.Cfg.BulkAdder(
-		ctx, sp.flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
+	adder, err := sp.FlowCtx.Cfg.BulkAdder(
+		ctx, sp.FlowCtx.Cfg.DB.KV(), writeTS, kvserverbase.BulkAdderOptions{
+			Name:          sp.tableDesc.GetName(),
 			MinBufferSize: bufferSize,
 			// We disallow shadowing here to ensure that we report errors when builds
-			// of unique indexes fail when there are duplicate values.
-			DisallowShadowing: true,
+			// of unique indexes fail when there are duplicate values. Note that while
+			// the timestamp passed does allow shadowing other writes by the same job,
+			// the check for allowed shadowing also requires the values match, so a
+			// conflicting unique index entry would still be rejected as its value
+			// would point to a different owning row.
+			DisallowShadowingBelow: writeTS,
+			WriteAtBatchTimestamp:  true,
 		},
 	)
 	if err != nil {
@@ -154,13 +160,13 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 		for kvBatch := range kvCh {
 			for _, kv := range kvBatch.KVs {
 				if err := adder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-					return sp.wrapDupError(ctx, err)
+					return sp.maybeWrapAsPGError(ctx, err)
 				}
 			}
 		}
 
 		if err := adder.Flush(ctx); err != nil {
-			return sp.wrapDupError(ctx, err)
+			return sp.maybeWrapAsPGError(ctx, err)
 		}
 		return nil
 	}
@@ -180,7 +186,7 @@ func (sp *bulkRowWriter) convertLoop(
 	defer close(kvCh)
 
 	done := false
-	alloc := &rowenc.DatumAlloc{}
+	alloc := &tree.DatumAlloc{}
 	typs := sp.input.OutputTypes()
 
 	for {

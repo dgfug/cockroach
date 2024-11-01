@@ -100,7 +100,7 @@ func (e *ProjectExpr) Private() interface{} {
 }
 
 func (e *ProjectExpr) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, e.Memo(), nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -138,7 +138,7 @@ func (e *ProjectExpr) RequiredPhysical() *physical.Required {
 }
 
 func (e *ProjectExpr) ProvidedPhysical() *physical.Provided {
-	return &e.grp.bestProps().provided
+	return e.grp.bestProps().provided
 }
 
 func (e *ProjectExpr) Cost() Cost {
@@ -220,7 +220,7 @@ func (e *ProjectionsExpr) Private() interface{} {
 }
 
 func (e *ProjectionsExpr) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -267,7 +267,7 @@ func (e *ProjectionsItem) Private() interface{} {
 }
 
 func (e *ProjectionsItem) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -318,7 +318,7 @@ func (e *SortExpr) Private() interface{} {
 }
 
 func (e *SortExpr) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, e.Memo(), nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -352,7 +352,7 @@ func (e *SortExpr) RequiredPhysical() *physical.Required {
 }
 
 func (e *SortExpr) ProvidedPhysical() *physical.Provided {
-	return &e.best.provided
+	return e.best.provided
 }
 
 func (e *SortExpr) Cost() Cost {
@@ -566,7 +566,7 @@ func (e *VariableExpr) Private() interface{} {
 }
 
 func (e *VariableExpr) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -613,7 +613,7 @@ func (e *MaxExpr) Private() interface{} {
 }
 
 func (e *MaxExpr) String() string {
-	f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)
+	f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }

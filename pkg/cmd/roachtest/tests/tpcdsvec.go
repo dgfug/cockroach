@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,11 +12,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/cmpconn"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpcds"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func registerTPCDSVec(r registry.Registry) {
@@ -55,14 +56,21 @@ func registerTPCDSVec(r registry.Registry) {
 	}
 
 	runTPCDSVec := func(ctx context.Context, t test.Test, c cluster.Cluster) {
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx)
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-		clusterConn := c.Conn(ctx, 1)
-		disableAutoStats(t, clusterConn)
+		clusterConn := c.Conn(ctx, t.L(), 1)
+		t.Status("disabling automatic collection of stats")
+		if _, err := clusterConn.Exec(
+			`SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false;`,
+		); err != nil {
+			t.Fatal(err)
+		}
 		t.Status("restoring TPCDS dataset for Scale Factor 1")
 		if _, err := clusterConn.Exec(
-			`RESTORE DATABASE tpcds FROM 'gs://cockroach-fixtures/workload/tpcds/scalefactor=1/backup?AUTH=implicit';`,
+			`
+RESTORE DATABASE tpcds FROM LATEST IN 'gs://cockroach-fixtures-us-east1/workload/tpcds/scalefactor=1/backup?AUTH=implicit'
+WITH unsafe_restore_incompatible_version;
+`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +80,8 @@ func registerTPCDSVec(r registry.Registry) {
 		}
 		scatterTables(t, clusterConn, tpcdsTables)
 		t.Status("waiting for full replication")
-		WaitFor3XReplication(t, clusterConn)
+		err := roachtestutil.WaitFor3XReplication(ctx, t.L(), clusterConn)
+		require.NoError(t, err)
 
 		// TODO(yuzefovich): it seems like if cmpconn.CompareConns hits a
 		// timeout, the query actually keeps on going and the connection
@@ -82,7 +91,7 @@ func registerTPCDSVec(r registry.Registry) {
 		// We additionally open fresh connections for each query.
 		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", timeout)
 		firstNode := c.Node(1)
-		urls, err := c.ExternalPGUrl(ctx, firstNode)
+		urls, err := c.ExternalPGUrl(ctx, t.L(), firstNode, roachprod.PGURLOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -173,9 +182,14 @@ func registerTPCDSVec(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "tpcdsvec",
-		Owner:   registry.OwnerSQLQueries,
-		Cluster: r.MakeClusterSpec(3),
+		Name:      "tpcdsvec",
+		Owner:     registry.OwnerSQLQueries,
+		Benchmark: true,
+		Cluster:   r.MakeClusterSpec(3),
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds: registry.Clouds(spec.GCE, spec.Local),
+		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCDSVec(ctx, t, c)
 		},

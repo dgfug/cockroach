@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 const fs                 = require('fs');
 const assert             = require('assert');
@@ -40,7 +35,7 @@ describe('error cases', () => {
   const cases = [{
     name: 'not enough params',
     query: { text: 'SELECT 3', values: ['foo'] },
-    msg: "expected 0 arguments, got 1",
+    msg: "bind message supplies 1 parameters, but requires 0",
     code: '08P01',
   }, {
     name: 'invalid utf8',

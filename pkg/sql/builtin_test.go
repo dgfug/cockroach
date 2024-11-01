@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,12 +37,12 @@ func TestFuncNull(t *testing.T) {
 		}
 	}
 
-	for _, name := range builtins.AllBuiltinNames {
+	for _, name := range builtins.AllBuiltinNames() {
 		switch strings.ToLower(name) {
 		case "crdb_internal.force_panic", "crdb_internal.force_log_fatal", "pg_sleep":
 			continue
 		}
-		_, variations := builtins.GetBuiltinProperties(name)
+		_, variations := builtinsregistry.GetBuiltinProperties(name)
 		for _, builtin := range variations {
 			// Untyped NULL.
 			{

@@ -1,19 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import assign from "lodash/assign";
+import isEmpty from "lodash/isEmpty";
 import * as React from "react";
-import Select from "react-select";
+import Select, { Option } from "react-select";
 
 import * as protos from "src/js/protos";
-import { AxisUnits } from "src/views/shared/components/metricQuery";
+import { isSystemTenant } from "src/redux/tenants";
 import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
 
 import { MetricOption } from "./metricOption";
@@ -53,8 +50,10 @@ export class CustomMetricState {
   downsampler = TimeSeriesQueryAggregator.AVG;
   aggregator = TimeSeriesQueryAggregator.SUM;
   derivative = TimeSeriesQueryDerivative.NONE;
-  perNode = false;
-  source = "";
+  perSource = false;
+  perTenant = false;
+  nodeSource = "";
+  tenantSource = "";
 }
 
 export class CustomChartState {
@@ -69,6 +68,8 @@ export class CustomChartState {
 interface CustomMetricRowProps {
   metricOptions: DropdownOption[];
   nodeOptions: DropdownOption[];
+  tenantOptions: DropdownOption[];
+  canViewTenantOptions: boolean;
   index: number;
   rowState: CustomMetricState;
   onChange: (index: number, newState: CustomMetricState) => void;
@@ -79,43 +80,55 @@ export class CustomMetricRow extends React.Component<CustomMetricRowProps> {
   changeState(newState: Partial<CustomMetricState>) {
     this.props.onChange(
       this.props.index,
-      _.assign(this.props.rowState, newState),
+      assign(this.props.rowState, newState),
     );
   }
 
-  changeMetric = (selectedOption: DropdownOption) => {
+  changeMetric = (selectedOption: Option<string>) => {
     this.changeState({
       metric: selectedOption.value,
     });
   };
 
-  changeDownsampler = (selectedOption: DropdownOption) => {
+  changeDownsampler = (selectedOption: Option<string>) => {
     this.changeState({
       downsampler: +selectedOption.value,
     });
   };
 
-  changeAggregator = (selectedOption: DropdownOption) => {
+  changeAggregator = (selectedOption: Option<string>) => {
     this.changeState({
       aggregator: +selectedOption.value,
     });
   };
 
-  changeDerivative = (selectedOption: DropdownOption) => {
+  changeDerivative = (selectedOption: Option<string>) => {
     this.changeState({
       derivative: +selectedOption.value,
     });
   };
 
-  changeSource = (selectedOption: DropdownOption) => {
+  changeNodeSource = (selectedOption: Option<string>) => {
     this.changeState({
-      source: selectedOption.value,
+      nodeSource: selectedOption.value,
     });
   };
 
-  changePerNode = (selection: React.FormEvent<HTMLInputElement>) => {
+  changeTenant = (selectedOption: Option<string>) => {
     this.changeState({
-      perNode: selection.currentTarget.checked,
+      tenantSource: selectedOption.value,
+    });
+  };
+
+  changePerSource = (selection: React.FormEvent<HTMLInputElement>) => {
+    this.changeState({
+      perSource: selection.currentTarget.checked,
+    });
+  };
+
+  changePerTenant = (selection: React.FormEvent<HTMLInputElement>) => {
+    this.changeState({
+      perTenant: selection.currentTarget.checked,
     });
   };
 
@@ -127,13 +140,17 @@ export class CustomMetricRow extends React.Component<CustomMetricRowProps> {
     const {
       metricOptions,
       nodeOptions,
+      tenantOptions,
+      canViewTenantOptions,
       rowState: {
         metric,
         downsampler,
         aggregator,
         derivative,
-        source,
-        perNode,
+        nodeSource,
+        perSource,
+        tenantSource,
+        perTenant,
       },
     } = this.props;
 
@@ -196,19 +213,42 @@ export class CustomMetricRow extends React.Component<CustomMetricRowProps> {
               className="metric-table-dropdown__select"
               clearable={false}
               searchable={false}
-              value={source}
+              value={nodeSource}
               options={nodeOptions}
-              onChange={this.changeSource}
+              onChange={this.changeNodeSource}
             />
           </div>
         </td>
         <td className="metric-table__cell">
           <input
             type="checkbox"
-            checked={perNode}
-            onChange={this.changePerNode}
+            checked={perSource}
+            onChange={this.changePerSource}
           />
         </td>
+        {canViewTenantOptions && (
+          <td>
+            <div className="metric-table-dropdown">
+              <Select
+                className="metric-table-dropdown__select"
+                clearable={false}
+                searchable={false}
+                value={tenantSource}
+                options={tenantOptions}
+                onChange={this.changeTenant}
+              />
+            </div>
+          </td>
+        )}
+        {canViewTenantOptions && (
+          <td className="metric-table__cell">
+            <input
+              type="checkbox"
+              checked={perTenant}
+              onChange={this.changePerTenant}
+            />
+          </td>
+        )}
         <td className="metric-table__cell">
           <button
             className="edit-button metric-edit-button"
@@ -225,6 +265,8 @@ export class CustomMetricRow extends React.Component<CustomMetricRowProps> {
 interface CustomChartTableProps {
   metricOptions: DropdownOption[];
   nodeOptions: DropdownOption[];
+  tenantOptions: DropdownOption[];
+  currentTenant: string | null;
   index: number;
   chartState: CustomChartState;
   onChange: (index: number, newState: CustomChartState) => void;
@@ -276,12 +318,15 @@ export class CustomChartTable extends React.Component<CustomChartTableProps> {
   };
 
   render() {
+    const { tenantOptions, currentTenant } = this.props;
     const metrics = this.currentMetrics();
+    const canViewTenantOptions =
+      isSystemTenant(currentTenant) && tenantOptions.length > 1;
     let table: JSX.Element = (
       <h3>Click "Add Metric" to add a metric to the custom chart.</h3>
     );
 
-    if (!_.isEmpty(metrics)) {
+    if (!isEmpty(metrics)) {
       table = (
         <table className="metric-table">
           <thead>
@@ -291,7 +336,13 @@ export class CustomChartTable extends React.Component<CustomChartTableProps> {
               <td className="metric-table__header">Aggregator</td>
               <td className="metric-table__header">Rate</td>
               <td className="metric-table__header">Source</td>
-              <td className="metric-table__header">Per Node</td>
+              <td className="metric-table__header">Per Node/Store</td>
+              {canViewTenantOptions && (
+                <td className="metric-table__header">Virtual Cluster</td>
+              )}
+              {canViewTenantOptions && (
+                <td className="metric-table__header">Per Virtual Cluster</td>
+              )}
               <td className="metric-table__header"></td>
             </tr>
           </thead>
@@ -301,6 +352,8 @@ export class CustomChartTable extends React.Component<CustomChartTableProps> {
                 key={i}
                 metricOptions={this.props.metricOptions}
                 nodeOptions={this.props.nodeOptions}
+                tenantOptions={tenantOptions}
+                canViewTenantOptions={canViewTenantOptions}
                 index={i}
                 rowState={row}
                 onChange={this.updateMetricRow}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -16,6 +11,37 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 )
+
+// DeriveRestrictedInterestingOrderings calculates and returns the entry of the
+// Relational.Rule.RestrictedInterestingOrderings property of a relational
+// operator that corresponds to the given columns.
+func DeriveRestrictedInterestingOrderings(e memo.RelExpr, cols opt.ColSet) props.OrderingSet {
+	l := e.Relational()
+	fds := &l.FuncDeps
+	// We follow the convention of checking if the property is available, even
+	// though it is not necessary because the property is a slice. The overhead
+	// of the check is basically zero.
+	if l.IsAvailable(props.RestrictedInterestingOrderings) {
+		for i := range l.Rule.RestrictedInterestingOrderings {
+			ord := &l.Rule.RestrictedInterestingOrderings[i]
+			if cols.Equals(ord.Cols) {
+				return ord.OrderingSet
+			}
+		}
+	}
+	l.SetAvailable(props.RestrictedInterestingOrderings)
+
+	// Derive the interesting orderings and restrict them to the given columns.
+	orders := DeriveInterestingOrderings(e).Copy()
+	orders.RestrictToCols(cols, fds)
+
+	l.Rule.RestrictedInterestingOrderings = append(l.Rule.RestrictedInterestingOrderings,
+		props.RestrictedInterestingOrdering{
+			OrderingSet: orders,
+			Cols:        cols,
+		})
+	return orders
+}
 
 // DeriveInterestingOrderings calculates and returns the
 // Relational.Rule.InterestingOrderings property of a relational operator.
@@ -179,6 +205,8 @@ func interestingOrderingsForJoin(rel memo.RelExpr) props.OrderingSet {
 	}
 	// For a join, we could conceivably preserve the order of one side (even with
 	// hash-join, depending on which side we store).
+	// TODO(drewk): add logic for orderings on columns from both sides, since both
+	//  lookup and merge joins can provide them.
 	ordLeft := DeriveInterestingOrderings(rel.Child(0).(memo.RelExpr))
 	ordRight := DeriveInterestingOrderings(rel.Child(1).(memo.RelExpr))
 	ord := make(props.OrderingSet, 0, len(ordLeft)+len(ordRight))
@@ -192,9 +220,16 @@ func interestingOrderingsForSetOp(rel memo.RelExpr) props.OrderingSet {
 		// LocalityOptimizedSearchOp does not support passing through orderings.
 		return nil
 	}
-	ordLeft := DeriveInterestingOrderings(rel.Child(0).(memo.RelExpr))
-	ordRight := DeriveInterestingOrderings(rel.Child(1).(memo.RelExpr))
+	leftChild := rel.Child(0).(memo.RelExpr)
+	rightChild := rel.Child(1).(memo.RelExpr)
+	ordLeft := DeriveInterestingOrderings(leftChild)
+	ordRight := DeriveInterestingOrderings(rightChild)
 	private := rel.Private().(*memo.SetPrivate)
+
+	// We can only keep orderings on output columns.
+	ordLeft.RestrictToCols(private.LeftCols.ToSet(), &leftChild.Relational().FuncDeps)
+	ordRight.RestrictToCols(private.RightCols.ToSet(), &rightChild.Relational().FuncDeps)
+
 	ordLeft = ordLeft.RemapColumns(private.LeftCols, private.OutCols)
 	ordRight = ordRight.RemapColumns(private.RightCols, private.OutCols)
 

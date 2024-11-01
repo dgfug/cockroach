@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -32,27 +27,10 @@ func (t *TableName) Format(ctx *FmtCtx) {
 		ctx.tableNameFormatter(ctx, t)
 		return
 	}
-	t.ObjectNamePrefix.Format(ctx)
-	if t.ExplicitSchema || ctx.alwaysFormatTablePrefix() {
-		ctx.WriteByte('.')
-	}
-	ctx.FormatNode(&t.ObjectName)
+	t.objName.Format(ctx)
 }
-func (t *TableName) String() string { return AsString(t) }
 
 func (t *TableName) objectName() {}
-
-// FQString renders the table name in full, not omitting the prefix
-// schema and catalog names. Suitable for logging, etc.
-func (t *TableName) FQString() string {
-	ctx := NewFmtCtx(FmtSimple)
-	ctx.FormatNode(&t.CatalogName)
-	ctx.WriteByte('.')
-	ctx.FormatNode(&t.SchemaName)
-	ctx.WriteByte('.')
-	ctx.FormatNode(&t.ObjectName)
-	return ctx.CloseAndGetString()
-}
 
 // Table retrieves the unqualified table name.
 func (t *TableName) Table() string {
@@ -77,31 +55,22 @@ func NewTableNameWithSchema(db, sc, tbl Name) *TableName {
 
 // MakeTableNameWithSchema creates a new fully qualified table name.
 func MakeTableNameWithSchema(db, schema, tbl Name) TableName {
-	return TableName{objName{
-		ObjectName: tbl,
-		ObjectNamePrefix: ObjectNamePrefix{
-			CatalogName:     db,
-			SchemaName:      schema,
-			ExplicitSchema:  true,
-			ExplicitCatalog: true,
-		},
-	}}
+	return TableName{
+		objName: makeQualifiedObjName(db, schema, tbl),
+	}
 }
 
 // MakeTableNameFromPrefix creates a table name from an unqualified name
 // and a resolved prefix.
 func MakeTableNameFromPrefix(prefix ObjectNamePrefix, object Name) TableName {
-	return TableName{objName{
-		ObjectName:       object,
-		ObjectNamePrefix: prefix,
-	}}
+	return TableName{
+		objName: makeObjNameWithPrefix(prefix, object),
+	}
 }
 
 // MakeUnqualifiedTableName creates a new base table name.
 func MakeUnqualifiedTableName(tbl Name) TableName {
-	return TableName{objName{
-		ObjectName: tbl,
-	}}
+	return MakeTableNameFromPrefix(ObjectNamePrefix{}, tbl)
 }
 
 // NewUnqualifiedTableName creates a new base table name.
@@ -111,10 +80,10 @@ func NewUnqualifiedTableName(tbl Name) *TableName {
 }
 
 func makeTableNameFromUnresolvedName(n *UnresolvedName) TableName {
-	return TableName{objName{
-		ObjectName:       Name(n.Parts[0]),
-		ObjectNamePrefix: makeObjectNamePrefixFromUnresolvedName(n),
-	}}
+	return MakeTableNameFromPrefix(
+		makeObjectNamePrefixFromUnresolvedName(n),
+		Name(n.Parts[0]),
+	)
 }
 
 func makeObjectNamePrefixFromUnresolvedName(n *UnresolvedName) ObjectNamePrefix {
@@ -143,18 +112,18 @@ func (ts *TableNames) String() string { return AsString(ts) }
 
 // TableIndexName refers to a table index. There are a few cases:
 //
-//  - if both the table name and the index name are set, refers to a specific
-//    index in a specific table.
+//   - if both the table name and the index name are set, refers to a specific
+//     index in a specific table.
 //
-//  - if the table name is set and index name is empty, refers to the primary
-//    index of that table.
+//   - if the table name is set and index name is empty, refers to the primary
+//     index of that table.
 //
-//  - if the table name is empty and the index name is set, refers to an index
-//    of that name among all tables within a catalog/schema; if there is a
-//    duplicate name, that will result in an error. Note that it is possible to
-//    specify the schema or catalog without specifying a table name; in this
-//    case, Table.ObjectNamePrefix has the fields set but Table.ObjectName is
-//    empty.
+//   - if the table name is empty and the index name is set, refers to an index
+//     of that name among all tables within a catalog/schema; if there is a
+//     duplicate name, that will result in an error. Note that it is possible to
+//     specify the schema or catalog without specifying a table name; in this
+//     case, Table.ObjectNamePrefix has the fields set but Table.ObjectName is
+//     empty.
 type TableIndexName struct {
 	Table TableName
 	Index UnrestrictedName

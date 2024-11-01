@@ -1,19 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { Fragment } from "react";
-import _ from "lodash";
-import classNames from "classnames/bind";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { Fraction } from "../statementDetails";
 import { Tooltip } from "@cockroachlabs/ui-components";
+import classNames from "classnames/bind";
+import sortBy from "lodash/sortBy";
+import values from "lodash/values";
+import React, { Fragment } from "react";
+
 import {
   getAttributeTooltip,
   getOperatorTooltip,
@@ -44,16 +40,25 @@ export interface FlatPlanNode {
 }
 
 function warnForAttribute(attr: IAttr): boolean {
-  // TODO(yuzefovich): 'spans ALL' is pre-20.1 attribute (and it might show up
-  // during an upgrade), so we should remove the check for it after 20.2
-  // release.
-  if (
-    attr.key === "spans" &&
-    (attr.value === "FULL SCAN" || attr.value === "ALL")
-  ) {
-    return true;
+  return attr.key === "spans" && attr.value === "FULL SCAN";
+}
+
+// planNodeAttrsToString converts an array of FlatPlanNodeAttribute[] into a string.
+export function planNodeAttrsToString(attrs: FlatPlanNodeAttribute[]): string {
+  return attrs.map(attr => `${attr.key} ${attr.values.join(" ")}`).join(" ");
+}
+
+// planNodeToString recursively converts a FlatPlanNode into a string.
+export function planNodeToString(plan: FlatPlanNode): string {
+  const str = `${plan.name} ${planNodeAttrsToString(plan.attrs)}`;
+
+  if (plan.children.length > 0) {
+    return `${str} ${plan.children
+      .map(child => planNodeToString(child))
+      .join(" ")}`;
   }
-  return false;
+
+  return str;
 }
 
 // flattenAttributes takes a list of attrs (IAttr[]) and collapses
@@ -101,24 +106,13 @@ export function flattenAttributes(
       }
     }
   });
-  const flattenedAttrs = _.values(flattenedAttrsMap);
-  return _.sortBy(flattenedAttrs, attr =>
+  const flattenedAttrs = values(flattenedAttrsMap);
+  return sortBy(flattenedAttrs, attr =>
     attr.key === "table" ? "table" : "z" + attr.key,
   );
 }
 
 /* ************************* HELPER FUNCTIONS ************************* */
-
-function fractionToString(fraction: Fraction): string {
-  // The fraction denominator is the number of times the statement
-  // has been executed.
-
-  if (Number.isNaN(fraction.numerator)) {
-    return "unknown";
-  }
-
-  return (fraction.numerator > 0).toString();
-}
 
 // flattenTreeAttributes takes a tree representation of a logical
 // plan (IExplainTreePlanNode) and flattens the attributes in each node.
@@ -152,12 +146,7 @@ export function standardizeKey(str: string): string {
     .split(/[ -]+/)
     .filter(str => str !== "(anti)")
     .map((str, i) =>
-      i === 0
-        ? str
-        : str
-            .charAt(0)
-            .toUpperCase()
-            .concat(str.substring(1)),
+      i === 0 ? str : str.charAt(0).toUpperCase().concat(str.substring(1)),
     )
     .join("");
 }
@@ -256,8 +245,8 @@ function PlanNode({ node }: PlanNodeProps): React.ReactElement {
 }
 
 export type GlobalPropertiesType = {
-  distribution: Fraction;
-  vectorized: Fraction;
+  distribution: boolean;
+  vectorized: boolean;
 };
 
 interface PlanViewProps {
@@ -276,12 +265,12 @@ export function PlanView({
   const globalAttrs: FlatPlanNodeAttribute[] = [
     {
       key: "distribution",
-      values: [fractionToString(globalProperties.distribution)],
+      values: [globalProperties.distribution.toString()],
       warn: false, // distribution is never warned
     },
     {
       key: "vectorized",
-      values: [fractionToString(globalProperties.vectorized)],
+      values: [globalProperties.vectorized.toString()],
       warn: false, // vectorized is never warned
     },
   ];

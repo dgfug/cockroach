@@ -204,15 +204,15 @@ TABLE inv
  ├── g geometry
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
- ├── j_inverted_key jsonb not null [inverted]
- ├── g_inverted_key geometry not null [inverted]
+ ├── j_inverted_key encodedkey not null [inverted]
+ ├── g_inverted_key encodedkey not null [inverted]
  ├── PRIMARY INDEX inv_pkey
  │    └── k int not null
  ├── INVERTED INDEX inv_j_idx
- │    ├── j_inverted_key jsonb not null [inverted]
+ │    ├── j_inverted_key encodedkey not null [inverted]
  │    └── k int not null
  └── INVERTED INDEX inv_g_idx
-      ├── g_inverted_key geometry not null [inverted]
+      ├── g_inverted_key encodedkey not null [inverted]
       └── k int not null
 
 # Table with inverted indexes and implicit primary index.
@@ -236,15 +236,15 @@ TABLE inv2
  ├── rowid int not null default (unique_rowid()) [hidden]
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
- ├── j_inverted_key jsonb not null [inverted]
- ├── g_inverted_key geometry not null [inverted]
+ ├── j_inverted_key encodedkey not null [inverted]
+ ├── g_inverted_key encodedkey not null [inverted]
  ├── PRIMARY INDEX inv2_pkey
  │    └── rowid int not null default (unique_rowid()) [hidden]
  ├── INVERTED INDEX inv2_j_idx
- │    ├── j_inverted_key jsonb not null [inverted]
+ │    ├── j_inverted_key encodedkey not null [inverted]
  │    └── rowid int not null default (unique_rowid()) [hidden]
  └── INVERTED INDEX inv2_g_idx
-      ├── g_inverted_key geometry not null [inverted]
+      ├── g_inverted_key encodedkey not null [inverted]
       └── rowid int not null default (unique_rowid()) [hidden]
 
 # Table with unique constraints.
@@ -365,3 +365,120 @@ TABLE generated_as_identity_seq_opt
  ├── tableoid oid [hidden] [system]
  └── PRIMARY INDEX generated_as_identity_seq_opt_pkey
       └── rowid int not null default (unique_rowid()) [hidden]
+
+# Virtual column in primary key is treated as a stored column in the optimizer.
+exec-ddl
+CREATE TABLE virtpk (
+    a INT,
+    v INT AS (a + 10) VIRTUAL,
+    PRIMARY KEY (v, a)
+)
+----
+
+exec-ddl
+SHOW CREATE virtpk
+----
+TABLE virtpk
+ ├── a int not null
+ ├── v int not null as (a + 10) stored
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ └── PRIMARY INDEX virtpk_pkey
+      ├── v int not null as (a + 10) stored
+      └── a int not null
+
+# Tables are implicit record types.
+exec-ddl
+CREATE TABLE typ1 (
+  a INT PRIMARY KEY,
+  b STRING
+)
+----
+
+exec-ddl
+CREATE TABLE typ2 (
+  a INT PRIMARY KEY
+)
+----
+
+exec-ddl
+CREATE TABLE tab_with_types (
+  k INT PRIMARY KEY,
+  t1 typ1,
+  t2 typ2
+)
+----
+
+exec-ddl
+SHOW CREATE tab_with_types
+----
+TABLE tab_with_types
+ ├── k int not null
+ ├── t1 tuple{int AS a, string AS b}
+ ├── t2 tuple{int AS a}
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ └── PRIMARY INDEX tab_with_types_pkey
+      └── k int not null
+
+# Regression test for #76994. Only unique constraints with the same columns and
+# predicates should be deduplicated.
+exec-ddl
+CREATE TABLE t76994 (
+  k INT PRIMARY KEY,
+  a INT,
+  b INT,
+  UNIQUE WITHOUT INDEX (a) WHERE b < 0,
+  UNIQUE WITHOUT INDEX (a) WHERE b < 0,
+  UNIQUE WITHOUT INDEX (a) WHERE b > 0
+)
+----
+
+exec-ddl
+SHOW CREATE t76994
+----
+TABLE t76994
+ ├── k int not null
+ ├── a int
+ ├── b int
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ ├── PRIMARY INDEX t76994_pkey
+ │    └── k int not null
+ ├── UNIQUE WITHOUT INDEX (a)
+ │    └── WHERE b < 0
+ └── UNIQUE WITHOUT INDEX (a)
+      └── WHERE b > 0
+
+# Table implicit types should not include hidden columns.
+exec-ddl
+CREATE TABLE hidden_columns (
+  a INT,
+  b INT NOT VISIBLE,
+  c INT
+)
+----
+
+build
+SELECT ROW(1, 2)::hidden_columns;
+----
+project
+ ├── columns: row:1(tuple{int AS a, int AS c}!null)
+ ├── cardinality: [1 - 1]
+ ├── immutable
+ ├── stats: [rows=1]
+ ├── cost: 0.05
+ ├── key: ()
+ ├── fd: ()-->(1)
+ ├── prune: (1)
+ ├── values
+ │    ├── cardinality: [1 - 1]
+ │    ├── stats: [rows=1]
+ │    ├── cost: 0.02
+ │    ├── key: ()
+ │    └── tuple [type=tuple]
+ └── projections
+      └── cast: RECORD [as=row:1, type=tuple{int AS a, int AS c}, immutable]
+           └── tuple [type=tuple{int, int}]
+                ├── const: 1 [type=int]
+                └── const: 2 [type=int]

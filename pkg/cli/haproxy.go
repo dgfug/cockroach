@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -15,7 +10,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"sort"
@@ -28,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -75,11 +70,11 @@ func nodeStatusesToNodeInfos(nodes *serverpb.NodesResponse) []haProxyNodeInfo {
 
 	httpAddr := ""
 	httpPort := base.DefaultHTTPPort
-	fs.Var(addrSetter{&httpAddr, &httpPort}, cliflags.ListenHTTPAddr.Name, "" /* usage */)
+	fs.Var(addr.NewAddrSetter(&httpAddr, &httpPort), cliflags.ListenHTTPAddr.Name, "" /* usage */)
 	fs.Var(aliasStrVar{&httpPort}, cliflags.ListenHTTPPort.Name, "" /* usage */)
 
 	// Discard parsing output.
-	fs.SetOutput(ioutil.Discard)
+	fs.SetOutput(io.Discard)
 
 	nodeInfos := make([]haProxyNodeInfo, 0, len(nodes.Nodes))
 
@@ -221,12 +216,11 @@ func runGenHAProxyCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	c, finish, err := getStatusClient(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
 	defer finish()
-	c := serverpb.NewStatusClient(conn)
 
 	nodeStatuses, err := c.Nodes(ctx, &serverpb.NodesRequest{})
 	if err != nil {

@@ -1,17 +1,11 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
-	"bytes"
 	"context"
 	"time"
 
@@ -19,7 +13,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/redact"
 )
 
 // Server implements PerReplicaServer.
@@ -53,30 +46,18 @@ func (is Server) execStoreCommand(
 func (is Server) CollectChecksum(
 	ctx context.Context, req *CollectChecksumRequest,
 ) (*CollectChecksumResponse, error) {
-	resp := &CollectChecksumResponse{}
+	var resp *CollectChecksumResponse
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
+			ctx, cancel := s.stopper.WithCancelOnQuiesce(ctx)
+			defer cancel()
 			r, err := s.GetReplica(req.RangeID)
 			if err != nil {
 				return err
 			}
-			c, err := r.getChecksum(ctx, req.ChecksumID)
+			ccr, err := r.getChecksum(ctx, req.ChecksumID)
 			if err != nil {
 				return err
-			}
-			ccr := c.CollectChecksumResponse
-			if !bytes.Equal(req.Checksum, ccr.Checksum) {
-				// If this check is false, then this request is the replica carrying out
-				// the consistency check. The message is spurious, but we want to leave the
-				// snapshot (if present) intact.
-				if len(req.Checksum) > 0 {
-					log.Errorf(ctx, "consistency check failed on range r%d: expected checksum %x, got %x",
-						req.RangeID, redact.Safe(req.Checksum), redact.Safe(ccr.Checksum))
-					// Leave resp.Snapshot alone so that the caller will receive what's
-					// in it (if anything).
-				}
-			} else {
-				ccr.Snapshot = nil
 			}
 			resp = &ccr
 			return nil
@@ -88,6 +69,8 @@ func (is Server) CollectChecksum(
 //
 // It is the caller's responsibility to cancel or set a timeout on the context.
 // If the context is never canceled, WaitForApplication will retry forever.
+//
+// TODO(erikgrinaker): consider using Replica.WaitForLeaseAppliedIndex().
 func (is Server) WaitForApplication(
 	ctx context.Context, req *WaitForApplicationRequest,
 ) (*WaitForApplicationResponse, error) {
@@ -104,7 +87,7 @@ func (is Server) WaitForApplication(
 				return err
 			}
 			repl.mu.RLock()
-			leaseAppliedIndex := repl.mu.state.LeaseAppliedIndex
+			leaseAppliedIndex := repl.shMu.state.LeaseAppliedIndex
 			repl.mu.RUnlock()
 			if leaseAppliedIndex >= req.LeaseIndex {
 				// For performance reasons, we don't sync to disk when
@@ -118,7 +101,7 @@ func (is Server) WaitForApplication(
 				// everything up to this point to disk.
 				//
 				// https://github.com/cockroachdb/cockroach/issues/33120
-				return storage.WriteSyncNoop(ctx, s.engine)
+				return storage.WriteSyncNoop(s.TODOEngine())
 			}
 		}
 		if ctx.Err() == nil {
@@ -162,7 +145,66 @@ func (is Server) CompactEngineSpan(
 	resp := &CompactEngineSpanResponse{}
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
-			return s.Engine().CompactRange(req.Span.Key, req.Span.EndKey, true /* forceBottommost */)
+			return s.TODOEngine().CompactRange(req.Span.Key, req.Span.EndKey)
+		})
+	return resp, err
+}
+
+// GetTableMetrics implements PerStoreServer. It retrieves metrics
+// SSTables for a given node and store id.
+func (is Server) GetTableMetrics(
+	ctx context.Context, req *GetTableMetricsRequest,
+) (*GetTableMetricsResponse, error) {
+	resp := &GetTableMetricsResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			metricsInfo, err := s.TODOEngine().GetTableMetrics(req.Span.Key, req.Span.EndKey)
+
+			if err != nil {
+				return err
+			}
+
+			resp.TableMetrics = metricsInfo
+			return nil
+		})
+	return resp, err
+}
+
+func (is Server) ScanStorageInternalKeys(
+	ctx context.Context, req *ScanStorageInternalKeysRequest,
+) (*ScanStorageInternalKeysResponse, error) {
+	resp := &ScanStorageInternalKeysResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			metrics, err := s.TODOEngine().ScanStorageInternalKeys(req.Span.Key, req.Span.EndKey, req.MegabytesPerSecond)
+
+			if err != nil {
+				return err
+			}
+
+			resp.AdvancedPebbleMetrics = metrics
+			return nil
+		})
+	return resp, err
+}
+
+// SetCompactionConcurrency implements PerStoreServer. It changes the compaction
+// concurrency of a store. While SetCompactionConcurrency is safe for concurrent
+// use, it adds uncertainty about the compaction concurrency actually set on
+// the store. It also adds uncertainty about the compaction concurrency set on
+// the store once the request is cancelled.
+func (is Server) SetCompactionConcurrency(
+	ctx context.Context, req *CompactionConcurrencyRequest,
+) (*CompactionConcurrencyResponse, error) {
+	resp := &CompactionConcurrencyResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			prevConcurrency := s.TODOEngine().SetCompactionConcurrency(req.CompactionConcurrency)
+
+			// Wait for cancellation, and once cancelled, reset the compaction concurrency.
+			<-ctx.Done()
+			s.TODOEngine().SetCompactionConcurrency(prevConcurrency)
+			return nil
 		})
 	return resp, err
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -15,12 +10,11 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
@@ -71,61 +65,33 @@ func (s destroyStatus) Removed() bool {
 // don't know the current replica ID.
 const mergedTombstoneReplicaID roachpb.ReplicaID = math.MaxInt32
 
-func (r *Replica) preDestroyRaftMuLocked(
-	ctx context.Context,
-	reader storage.Reader,
-	writer storage.Writer,
-	nextReplicaID roachpb.ReplicaID,
-	clearRangeIDLocalOnly bool,
-	mustUseClearRange bool,
-) error {
-	r.mu.RLock()
-	desc := r.descRLocked()
-	removed := r.mu.destroyStatus.Removed()
-	r.mu.RUnlock()
-
-	// The replica must be marked as destroyed before its data is removed. If
-	// not, we risk new commands being accepted and observing the missing data.
-	if !removed {
-		log.Fatalf(ctx, "replica not marked as destroyed before call to preDestroyRaftMuLocked: %v", r)
-	}
-
-	err := clearRangeData(desc, reader, writer, clearRangeIDLocalOnly, mustUseClearRange)
-	if err != nil {
-		return err
-	}
-
-	// Save a tombstone to ensure that replica IDs never get reused.
-	//
-	// NB: Legacy tombstones (which are in the replicated key space) are wiped
-	// in clearRangeData, but that's OK since we're writing a new one in the same
-	// batch (and in particular, sequenced *after* the wipe).
-	return r.setTombstoneKey(ctx, writer, nextReplicaID)
-}
-
 func (r *Replica) postDestroyRaftMuLocked(ctx context.Context, ms enginepb.MVCCStats) error {
-	// NB: we need the nil check below because it's possible that we're GC'ing a
-	// Replica without a replicaID, in which case it does not have a sideloaded
-	// storage.
-	//
 	// TODO(tschottdorf): at node startup, we should remove all on-disk
 	// directories belonging to replicas which aren't present. A crash before a
 	// call to postDestroyRaftMuLocked will currently leave the files around
 	// forever.
-	if r.raftMu.sideloaded != nil {
-		return r.raftMu.sideloaded.Clear(ctx)
+	//
+	// TODO(tbg): coming back in 2021, the above should be outdated. The ReplicaID
+	// is set on creation and never changes over the lifetime of a Replica. Also,
+	// the replica is always contained in its descriptor. So this code below should
+	// be removable.
+	//
+	// TODO(pavelkalinnikov): coming back in 2023, the above may still happen if:
+	// (1) state machine syncs, (2) OS crashes before (3) sideloaded was able to
+	// sync the files removal. The files should be cleaned up on restart.
+	if err := r.raftMu.sideloaded.Clear(ctx); err != nil {
+		return err
 	}
 
 	// Release the reference to this tenant in metrics, we know the tenant ID is
 	// valid if the replica is initialized.
-	if tenantID, ok := r.TenantID(); ok {
-		r.store.metrics.releaseTenant(ctx, tenantID)
+	if r.tenantMetricsRef != nil {
+		r.store.metrics.releaseTenant(ctx, r.tenantMetricsRef)
 	}
 
 	// Unhook the tenant rate limiter if we have one.
 	if r.tenantLimiter != nil {
 		r.store.tenantRateLimiters.Release(r.tenantLimiter)
-		r.tenantLimiter = nil
 	}
 
 	return nil
@@ -138,17 +104,23 @@ func (r *Replica) destroyRaftMuLocked(ctx context.Context, nextReplicaID roachpb
 	startTime := timeutil.Now()
 
 	ms := r.GetMVCCStats()
-	batch := r.Engine().NewUnindexedBatch(true /* writeOnly */)
+	batch := r.store.TODOEngine().NewWriteBatch()
 	defer batch.Close()
-	clearRangeIDLocalOnly := !r.IsInitialized()
-	if err := r.preDestroyRaftMuLocked(
-		ctx,
-		r.Engine(),
-		batch,
-		nextReplicaID,
-		clearRangeIDLocalOnly,
-		false, /* mustUseClearRange */
-	); err != nil {
+	desc := r.Desc()
+	inited := desc.IsInitialized()
+
+	opts := kvstorage.ClearRangeDataOptions{
+		ClearReplicatedBySpan: desc.RSpan(), // zero if !inited
+		// TODO(tbg): if it's uninitialized, we might as well clear
+		// the replicated state because there isn't any. This seems
+		// like it would be simpler, but needs a code audit to ensure
+		// callers don't call this in in-between states where the above
+		// assumption doesn't hold.
+		ClearReplicatedByRangeID:   inited,
+		ClearUnreplicatedByRangeID: true,
+	}
+	// TODO(sep-raft-log): need both engines separately here.
+	if err := kvstorage.DestroyReplica(ctx, r.RangeID, r.store.TODOEngine(), batch, nextReplicaID, opts); err != nil {
 		return err
 	}
 	preTime := timeutil.Now()
@@ -183,9 +155,10 @@ func (r *Replica) destroyRaftMuLocked(ctx context.Context, nextReplicaID roachpb
 
 // disconnectReplicationRaftMuLocked is called when a Replica is being removed.
 // It cancels all outstanding proposals, closes the proposalQuota if there
-// is one, and removes the in-memory raft state.
+// is one, releases all held flow tokens, and removes the in-memory raft state.
 func (r *Replica) disconnectReplicationRaftMuLocked(ctx context.Context) {
 	r.raftMu.AssertHeld()
+	r.flowControlV2.OnDestroyRaftMuLocked(ctx)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// NB: In the very rare scenario that we're being removed but currently
@@ -195,53 +168,18 @@ func (r *Replica) disconnectReplicationRaftMuLocked(ctx context.Context) {
 	if pq := r.mu.proposalQuota; pq != nil {
 		pq.Close("destroyed")
 	}
+	r.mu.replicaFlowControlIntegration.onDestroyed(ctx)
 	r.mu.proposalBuf.FlushLockedWithoutProposing(ctx)
 	for _, p := range r.mu.proposals {
 		r.cleanupFailedProposalLocked(p)
 		// NB: each proposal needs its own version of the error (i.e. don't try to
 		// share the error across proposals).
-		p.finishApplication(ctx, proposalResult{
-			Err: roachpb.NewError(
-				roachpb.NewAmbiguousResultError(
-					apply.ErrRemoved.Error())),
-		})
+		p.finishApplication(ctx, makeProposalResultErr(kvpb.NewAmbiguousResultError(apply.ErrRemoved)))
+	}
+
+	if !r.mu.destroyStatus.Removed() {
+		log.Fatalf(ctx, "removing raft group before destroying replica %s", r)
 	}
 	r.mu.internalRaftGroup = nil
-}
-
-// setTombstoneKey writes a tombstone to disk to ensure that replica IDs never
-// get reused. It determines what the minimum next replica ID can be using
-// the provided nextReplicaID and the Replica's own ID.
-//
-// We have to be careful to set the right key, since a replica can be using an
-// ID that it hasn't yet received a RangeDescriptor for if it receives raft
-// requests for that replica ID (as seen in #14231).
-func (r *Replica) setTombstoneKey(
-	ctx context.Context, writer storage.Writer, externalNextReplicaID roachpb.ReplicaID,
-) error {
-	r.mu.Lock()
-	nextReplicaID := r.mu.state.Desc.NextReplicaID
-	if nextReplicaID < externalNextReplicaID {
-		nextReplicaID = externalNextReplicaID
-	}
-	if nextReplicaID > r.mu.tombstoneMinReplicaID {
-		r.mu.tombstoneMinReplicaID = nextReplicaID
-	}
-	r.mu.Unlock()
-	return writeTombstoneKey(ctx, writer, r.RangeID, nextReplicaID)
-}
-
-func writeTombstoneKey(
-	ctx context.Context,
-	writer storage.Writer,
-	rangeID roachpb.RangeID,
-	nextReplicaID roachpb.ReplicaID,
-) error {
-	tombstoneKey := keys.RangeTombstoneKey(rangeID)
-	tombstone := &roachpb.RangeTombstone{
-		NextReplicaID: nextReplicaID,
-	}
-	// "Blind" because ms == nil and timestamp.IsEmpty().
-	return storage.MVCCBlindPutProto(ctx, writer, nil, tombstoneKey,
-		hlc.Timestamp{}, tombstone, nil)
+	r.mu.raftTracer.Close()
 }

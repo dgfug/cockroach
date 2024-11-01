@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -86,6 +81,28 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 	return s.batch
 }
 
+type rawBatchOp struct {
+	colexecop.ZeroInputNode
+	batch coldata.Batch
+}
+
+var _ colexecop.Operator = &rawBatchOp{}
+
+func (s *rawBatchOp) Init(ctx context.Context) {
+}
+
+func (s *rawBatchOp) Next() coldata.Batch {
+	b := s.batch
+	s.batch = coldata.ZeroBatch
+	return b
+}
+
+// NewRawColDataBatchOp allocates a rawBatchOp. This is used by COPY to perform
+// vectorized inserts.
+func NewRawColDataBatchOp(b coldata.Batch) colexecop.Operator {
+	return &rawBatchOp{batch: b}
+}
+
 // vectorTypeEnforcer is a utility Operator that on every call to Next
 // enforces that non-zero length batch from the input has a vector of the
 // desired type in the desired position. If the width of the batch is less than
@@ -99,24 +116,22 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 //
 // The intended diagram is as follows:
 //
-//       original input                (with schema [t1, ..., tN])
-//       --------------
-//             |
-//             ↓
-//     vectorTypeEnforcer              (will enforce that tN+1 = outputType)
-//     ------------------
-//             |
-//             ↓
-//   "projecting" operator             (projects its output of type outputType
-//   ---------------------              in column at position of N+1)
-//
+//	    original input                (with schema [t1, ..., tN])
+//	    --------------
+//	          |
+//	          ↓
+//	  vectorTypeEnforcer              (will enforce that tN+1 = outputType)
+//	  ------------------
+//	          |
+//	          ↓
+//	"projecting" operator             (projects its output of type outputType
+//	---------------------              in column at position of N+1)
 type vectorTypeEnforcer struct {
-	colexecop.OneInputInitCloserHelper
 	colexecop.NonExplainable
-
 	allocator *colmem.Allocator
 	typ       *types.T
-	idx       int
+	colexecop.OneInputInitCloserHelper
+	idx int
 }
 
 var _ colexecop.ResettableOperator = &vectorTypeEnforcer{}

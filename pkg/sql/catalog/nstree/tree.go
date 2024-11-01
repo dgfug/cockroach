@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package nstree provides a data structure for storing and retrieving
 // descriptors namespace entry-like data.
@@ -51,7 +46,7 @@ func get(t *btree.BTree, k item) interface{} {
 	return nil
 }
 
-func delete(t *btree.BTree, k item) interface{} {
+func remove(t *btree.BTree, k item) interface{} {
 	defer k.put()
 	if deleted, ok := t.Delete(k).(item); ok {
 		defer deleted.put()
@@ -71,8 +66,15 @@ func ascend(t *btree.BTree, f func(k interface{}) error) (err error) {
 		err = f(i.(item).value())
 		return err == nil
 	})
-	if iterutil.Done(err) {
-		err = nil
-	}
-	return err
+	return iterutil.Map(err)
+}
+
+func ascendRange(
+	t *btree.BTree, greaterOrEqual, lessThan btree.Item, f func(k interface{}) error,
+) (err error) {
+	t.AscendRange(greaterOrEqual, lessThan, func(i btree.Item) bool {
+		err = f(i.(item).value())
+		return err == nil
+	})
+	return iterutil.Map(err)
 }

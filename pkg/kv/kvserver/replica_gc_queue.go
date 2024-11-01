@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -15,13 +10,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
 )
 
 const (
@@ -57,7 +55,7 @@ const (
 var (
 	metaReplicaGCQueueRemoveReplicaCount = metric.Metadata{
 		Name:        "queue.replicagc.removereplica",
-		Help:        "Number of replica removals attempted by the replica gc queue",
+		Help:        "Number of replica removals attempted by the replica GC queue",
 		Measurement: "Replica Removals",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -83,6 +81,8 @@ type replicaGCQueue struct {
 	db      *kv.DB
 }
 
+var _ queueImpl = &replicaGCQueue{}
+
 // newReplicaGCQueue returns a new instance of replicaGCQueue.
 func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 	rgcq := &replicaGCQueue{
@@ -95,14 +95,15 @@ func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 		queueConfig{
 			maxSize:                  defaultQueueMaxSize,
 			needsLease:               false,
-			needsRaftInitialized:     true,
-			needsSystemConfig:        false,
+			needsSpanConfigs:         false,
 			acceptsUnsplitRanges:     true,
 			processDestroyedReplicas: true,
 			successes:                store.metrics.ReplicaGCQueueSuccesses,
 			failures:                 store.metrics.ReplicaGCQueueFailures,
+			storeFailures:            store.metrics.StoreFailures,
 			pending:                  store.metrics.ReplicaGCQueuePending,
 			processingNanos:          store.metrics.ReplicaGCQueueProcessingNanos,
+			disabledConfig:           kvserverbase.ReplicaGCQueueEnabled,
 		},
 	)
 	return rgcq
@@ -143,7 +144,7 @@ func replicaIsSuspect(repl *Replica) bool {
 	if !ok {
 		return true
 	}
-	if t := replDesc.GetType(); t != roachpb.VOTER_FULL && t != roachpb.NON_VOTER {
+	if t := replDesc.Type; t != roachpb.VOTER_FULL && t != roachpb.NON_VOTER {
 		return true
 	}
 
@@ -157,8 +158,8 @@ func replicaIsSuspect(repl *Replica) bool {
 	// because it has probably already been removed from its raft group but
 	// doesn't know it. Without this, node decommissioning can stall on such
 	// dormant ranges.
-	raftStatus := repl.RaftStatus()
-	if raftStatus == nil {
+	raftStatus := repl.RaftBasicStatus()
+	if raftStatus.Empty() {
 		liveness, ok := repl.store.cfg.NodeLiveness.Self()
 		return ok && !liveness.Membership.Active()
 	}
@@ -167,7 +168,7 @@ func replicaIsSuspect(repl *Replica) bool {
 	switch raftStatus.SoftState.RaftState {
 	// If a replica is a candidate, then by definition it has lost contact with
 	// its leader and possibly the rest of the Raft group, so consider it suspect.
-	case raft.StateCandidate, raft.StatePreCandidate:
+	case raftpb.StateCandidate, raftpb.StatePreCandidate:
 		return true
 
 	// If the replica is a follower, check that the leader is in our range
@@ -176,7 +177,7 @@ func replicaIsSuspect(repl *Replica) bool {
 	// a quiesced follower which was partitioned away from the Raft group during
 	// its own removal from the range -- this case is vulnerable to race
 	// conditions, but if it fails it will be GCed within 12 hours anyway.
-	case raft.StateFollower:
+	case raftpb.StateFollower:
 		leadDesc, ok := repl.Desc().GetReplicaDescriptorByID(roachpb.ReplicaID(raftStatus.Lead))
 		if !ok || !livenessMap[leadDesc.NodeID].IsLive {
 			return true
@@ -185,7 +186,7 @@ func replicaIsSuspect(repl *Replica) bool {
 	// If the replica is a leader, check that it has a quorum. This handles e.g.
 	// a stuck leader with a lost quorum being replaced via Node.ResetQuorum,
 	// which must cause the stale leader to relinquish its lease and GC itself.
-	case raft.StateLeader:
+	case raftpb.StateLeader:
 		if !repl.Desc().Replicas().CanMakeProgress(func(d roachpb.ReplicaDescriptor) bool {
 			return livenessMap[d.NodeID].IsLive
 		}) {
@@ -231,7 +232,7 @@ func (rgcq *replicaGCQueue) process(
 	// considering one of the metadata ranges: we must not do an inconsistent
 	// lookup in our own copy of the range.
 	rs, _, err := kv.RangeLookup(ctx, rgcq.db.NonTransactionalSender(), desc.StartKey.AsRawKey(),
-		roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+		kvpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 	if err != nil {
 		return false, err
 	}
@@ -269,7 +270,7 @@ func (rgcq *replicaGCQueue) process(
 		// the use of a snapshot when catching up to the new replica ID.
 		// We don't normally expect to have a *higher* local replica ID
 		// than the one in the meta descriptor, but it's possible after
-		// recovering with unsafe-remove-dead-replicas.
+		// recovering with "debug recover".
 		return false, nil
 	} else if sameRange {
 		// We are no longer a member of this range, but the range still exists.
@@ -318,6 +319,9 @@ func (rgcq *replicaGCQueue) process(
 		if err := repl.store.RemoveReplica(ctx, repl, nextReplicaID, RemoveOptions{
 			DestroyData: true,
 		}); err != nil {
+			// Should never get an error from RemoveReplica.
+			const format = "error during replicaGC: %v"
+			logcrash.ReportOrPanic(ctx, &repl.store.ClusterSettings().SV, format, err)
 			return false, err
 		}
 	} else {
@@ -336,7 +340,7 @@ func (rgcq *replicaGCQueue) process(
 		if leftRepl != nil {
 			leftDesc := leftRepl.Desc()
 			rs, _, err := kv.RangeLookup(ctx, rgcq.db.NonTransactionalSender(), leftDesc.StartKey.AsRawKey(),
-				roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+				kvpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 			if err != nil {
 				return false, err
 			}
@@ -365,11 +369,20 @@ func (rgcq *replicaGCQueue) process(
 	return true, nil
 }
 
+func (*replicaGCQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (*replicaGCQueue) timer(_ time.Duration) time.Duration {
 	return replicaGCQueueTimerDuration
 }
 
 // purgatoryChan returns nil.
 func (*replicaGCQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*replicaGCQueue) updateChan() <-chan time.Time {
 	return nil
 }

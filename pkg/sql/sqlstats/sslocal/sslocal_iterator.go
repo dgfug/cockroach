@@ -1,17 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sslocal
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 )
@@ -20,21 +15,21 @@ type baseIterator struct {
 	sqlStats *SQLStats
 	idx      int
 	appNames []string
-	options  *sqlstats.IteratorOptions
+	options  sqlstats.IteratorOptions
 }
 
 // StmtStatsIterator is an iterator that can be used to iterate over the
 // statement statistics stored in SQLStats.
 type StmtStatsIterator struct {
 	baseIterator
-	curIter *ssmemstorage.StmtStatsIterator
+	curIter ssmemstorage.StmtStatsIterator
 }
 
 // NewStmtStatsIterator returns a new instance of the StmtStatsIterator.
-func NewStmtStatsIterator(s *SQLStats, options *sqlstats.IteratorOptions) *StmtStatsIterator {
+func NewStmtStatsIterator(s *SQLStats, options sqlstats.IteratorOptions) StmtStatsIterator {
 	appNames := s.getAppNames(options.SortedAppNames)
 
-	return &StmtStatsIterator{
+	return StmtStatsIterator{
 		baseIterator: baseIterator{
 			sqlStats: s,
 			idx:      -1,
@@ -53,7 +48,7 @@ func NewStmtStatsIterator(s *SQLStats, options *sqlstats.IteratorOptions) *StmtS
 func (s *StmtStatsIterator) Next() bool {
 	// If we haven't called Next() for the first time or our current child
 	// iterator has finished iterator, then we increment s.idx.
-	if s.curIter == nil || !s.curIter.Next() {
+	if !s.curIter.Initialized() || !s.curIter.Next() {
 		s.idx++
 		if s.idx >= len(s.appNames) {
 			return false
@@ -68,9 +63,9 @@ func (s *StmtStatsIterator) Next() bool {
 	return true
 }
 
-// Cur returns the roachpb.CollectedStatementStatistics at the current internal
+// Cur returns the appstatspb.CollectedStatementStatistics at the current internal
 // counter.
-func (s *StmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
+func (s *StmtStatsIterator) Cur() *appstatspb.CollectedStatementStatistics {
 	return s.curIter.Cur()
 }
 
@@ -78,14 +73,14 @@ func (s *StmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
 // statement statistics stored in SQLStats.
 type TxnStatsIterator struct {
 	baseIterator
-	curIter *ssmemstorage.TxnStatsIterator
+	curIter ssmemstorage.TxnStatsIterator
 }
 
 // NewTxnStatsIterator returns a new instance of the TxnStatsIterator.
-func NewTxnStatsIterator(s *SQLStats, options *sqlstats.IteratorOptions) *TxnStatsIterator {
+func NewTxnStatsIterator(s *SQLStats, options sqlstats.IteratorOptions) TxnStatsIterator {
 	appNames := s.getAppNames(options.SortedAppNames)
 
-	return &TxnStatsIterator{
+	return TxnStatsIterator{
 		baseIterator: baseIterator{
 			sqlStats: s,
 			idx:      -1,
@@ -104,7 +99,7 @@ func NewTxnStatsIterator(s *SQLStats, options *sqlstats.IteratorOptions) *TxnSta
 func (t *TxnStatsIterator) Next() bool {
 	// If we haven't called Next() for the first time or our current child
 	// iterator has finished iterator, then we increment s.idx.
-	if t.curIter == nil || !t.curIter.Next() {
+	if !t.curIter.Initialized() || !t.curIter.Next() {
 		t.idx++
 		if t.idx >= len(t.appNames) {
 			return false
@@ -119,8 +114,8 @@ func (t *TxnStatsIterator) Next() bool {
 	return true
 }
 
-// Cur returns the roachpb.CollectedTransactionStatistics at the current internal
+// Cur returns the appstatspb.CollectedTransactionStatistics at the current internal
 // counter.
-func (t *TxnStatsIterator) Cur() *roachpb.CollectedTransactionStatistics {
+func (t *TxnStatsIterator) Cur() *appstatspb.CollectedTransactionStatistics {
 	return t.curIter.Cur()
 }

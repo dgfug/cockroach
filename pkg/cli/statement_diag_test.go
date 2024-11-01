@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,13 +26,15 @@ func Example_statement_diag() {
 		        (20, 'SELECT _ FROM _ WHERE _ > _', 'SELECT a FROM t WHERE b > 1', '2010-01-02 03:04:06', ARRAY[1001,1002,1003]),
 		        (30, 'SELECT _ FROM _ WHERE _ > _', 'SELECT a FROM t WHERE b > 1', '2010-01-02 03:04:07', ARRAY[1001])`,
 
-		`INSERT INTO system.statement_diagnostics_requests(id, completed, statement_fingerprint, statement_diagnostics_id, requested_at)
-		 VALUES (1, TRUE, 'SELECT _ FROM _', 10, '2010-01-02 03:04:00'),
-		        (2, TRUE, 'SELECT _ FROM _ WHERE _ > _', 20, '2010-01-02 03:04:02'),
-		        (3, TRUE, 'SELECT _ FROM _ WHERE _ > _', 30, '2010-01-02 03:04:05'),
-						(4, FALSE, 'SELECT _ + _', NULL, '2010-01-02 03:04:10'),
-						(5, FALSE, 'SELECT _ - _', NULL, '2010-01-02 03:04:11'),
-						(6, FALSE, 'SELECT _ / _', NULL, '2010-01-02 03:04:12')`,
+		`INSERT INTO system.statement_diagnostics_requests(
+                     id, completed, statement_fingerprint, plan_gist, anti_plan_gist, statement_diagnostics_id,
+                     requested_at, sampling_probability, min_execution_latency, expires_at)
+		 VALUES (1, TRUE, 'SELECT _ FROM _', '', NULL, 10, '2010-01-02 03:04:00', NULL, NULL, NULL),
+		        (2, TRUE, 'SELECT _ FROM _ WHERE _ > _', '', NULL, 20, '2010-01-02 03:04:02', 0.5, NULL, NULL),
+		        (3, TRUE, 'SELECT _ FROM _ WHERE _ > _', '', NULL, 30, '2010-01-02 03:04:05', 1.0, NULL, NULL),
+		        (4, FALSE, 'SELECT _ + _', '', NULL, NULL, '2010-01-02 03:04:10', 0.8, '1d 2h 3m 4s 5ms 6us', NULL),
+		        (5, FALSE, 'SELECT _ - _', 'foo', false, NULL, '2010-01-02 03:04:11', 1.0, NULL, '2030-01-02 03:04:12'),
+		        (6, FALSE, 'SELECT _ / _', 'bar', true, NULL, '2010-01-02 03:04:12', NULL, '0s', NULL)`,
 	}
 
 	for _, cmd := range commands {
@@ -49,7 +45,7 @@ func Example_statement_diag() {
 	}
 	c.RunWithArgs([]string{"statement-diag", "list"})
 	c.RunWithArgs([]string{"statement-diag", "download", "13"})
-	tmpfile, err := ioutil.TempFile("", "bundle-*.zip")
+	tmpfile, err := os.CreateTemp("", "bundle-*.zip")
 	if err != nil {
 		log.Fatalf(context.Background(), "Couldn't execute sql: %s", err)
 	}
@@ -62,7 +58,7 @@ func Example_statement_diag() {
 	if err != nil {
 		log.Fatalf(context.Background(), "Error downloading bundle: %s", err)
 	}
-	data, err := ioutil.ReadFile(bundleFile)
+	data, err := os.ReadFile(bundleFile)
 	if err != nil {
 		log.Fatalf(context.Background(), "Error reading bundle: %s", err)
 	}
@@ -95,10 +91,10 @@ func Example_statement_diag() {
 	//   10  2010-01-02 03:04:05 UTC  SELECT _ FROM _
 	//
 	// Outstanding activation requests:
-	//   ID  Activation time          Statement
-	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _
-	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _
-	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _
+	//   ID  Activation time          Statement     Plan gist  Anti plan gist  Sampling probability  Min execution latency  Expires at                     Redacted
+	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _  bar        true            1.0000                N/A                    never                          false
+	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _  foo        false           1.0000                N/A                    2030-01-02 03:04:12 +0000 UTC  false
+	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _             false           0.8000                26h3m4.005s            never                          false
 	// statement-diag download 13
 	// ERROR: failed to download statement diagnostics bundle 13 to 'stmt-bundle-13.zip': no statement diagnostics bundle with ID 13
 	// statement-diag download 20 tempfile.zip
@@ -121,18 +117,18 @@ func Example_statement_diag() {
 	//   20  2010-01-02 03:04:06 UTC  SELECT _ FROM _ WHERE _ > _
 	//
 	// Outstanding activation requests:
-	//   ID  Activation time          Statement
-	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _
-	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _
-	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _
+	//   ID  Activation time          Statement     Plan gist  Anti plan gist  Sampling probability  Min execution latency  Expires at                     Redacted
+	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _  bar        true            1.0000                N/A                    never                          false
+	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _  foo        false           1.0000                N/A                    2030-01-02 03:04:12 +0000 UTC  false
+	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _             false           0.8000                26h3m4.005s            never                          false
 	// statement-diag delete --all
 	// statement-diag list
 	// No statement diagnostics bundles available.
 	// Outstanding activation requests:
-	//   ID  Activation time          Statement
-	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _
-	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _
-	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _
+	//   ID  Activation time          Statement     Plan gist  Anti plan gist  Sampling probability  Min execution latency  Expires at                     Redacted
+	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _  bar        true            1.0000                N/A                    never                          false
+	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _  foo        false           1.0000                N/A                    2030-01-02 03:04:12 +0000 UTC  false
+	//   4   2010-01-02 03:04:10 UTC  SELECT _ + _             false           0.8000                26h3m4.005s            never                          false
 	// statement-diag cancel xx
 	// ERROR: invalid ID
 	// statement-diag cancel 5 6
@@ -143,9 +139,9 @@ func Example_statement_diag() {
 	// statement-diag list
 	// No statement diagnostics bundles available.
 	// Outstanding activation requests:
-	//   ID  Activation time          Statement
-	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _
-	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _
+	//   ID  Activation time          Statement     Plan gist  Anti plan gist  Sampling probability  Min execution latency  Expires at                     Redacted
+	//   6   2010-01-02 03:04:12 UTC  SELECT _ / _  bar        true            1.0000                N/A                    never                          false
+	//   5   2010-01-02 03:04:11 UTC  SELECT _ - _  foo        false           1.0000                N/A                    2030-01-02 03:04:12 +0000 UTC  false
 	// statement-diag cancel 123
 	// ERROR: no outstanding activation request with ID 123
 	// statement-diag cancel --all

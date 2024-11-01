@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package closedts
 
@@ -55,8 +50,7 @@ func TestTargetForPolicy(t *testing.T) {
 			expClosedTSTarget: now.
 				Add((maxClockOffset +
 					millis(275) /* sideTransportPropTime */ +
-					millis(25) /* bufferTime */).Nanoseconds(), 0).
-				WithSynthetic(true),
+					millis(25) /* bufferTime */).Nanoseconds(), 0),
 		},
 		{
 			sideTransportCloseInterval: millis(50),
@@ -64,14 +58,13 @@ func TestTargetForPolicy(t *testing.T) {
 			expClosedTSTarget: now.
 				Add((maxClockOffset +
 					millis(245) /* raftTransportPropTime */ +
-					millis(25) /* bufferTime */).Nanoseconds(), 0).
-				WithSynthetic(true),
+					millis(25) /* bufferTime */).Nanoseconds(), 0),
 		},
 		{
 			leadTargetOverride:         millis(1234),
 			sideTransportCloseInterval: millis(200),
 			rangePolicy:                roachpb.LEAD_FOR_GLOBAL_READS,
-			expClosedTSTarget:          now.Add(millis(1234).Nanoseconds(), 0).WithSynthetic(true),
+			expClosedTSTarget:          now.Add(millis(1234).Nanoseconds(), 0),
 		},
 	} {
 		t.Run("", func(t *testing.T) {

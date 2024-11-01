@@ -14,11 +14,13 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/util/protoutil",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/util/buildutil",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//jsonpb",
         "@com_github_gogo_protobuf//proto",
         "@com_github_grpc_ecosystem_grpc_gateway//runtime:go_default_library",
+        "@org_golang_google_protobuf//proto",
     ],
 )
 
@@ -30,8 +32,11 @@ go_test(
         ":protoutil",
         "//pkg/config/zonepb",
         "//pkg/gossip",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/protectedts/ptpb",
+        "//pkg/roachpb",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/storage/enginepb",
         "@com_github_gogo_protobuf//proto",

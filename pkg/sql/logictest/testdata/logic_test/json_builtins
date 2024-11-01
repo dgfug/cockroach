@@ -335,7 +335,7 @@ SELECT json_agg((3808362714,))
 
 ## json_array_elements and jsonb_array_elements
 
-query T colnames
+query T colnames,nosort
 SELECT json_array_elements('[1, 2, 3]'::JSON)
 ----
 json_array_elements
@@ -343,7 +343,7 @@ json_array_elements
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM json_array_elements('[1, 2, 3]'::JSON)
 ----
 value
@@ -351,7 +351,7 @@ value
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT jsonb_array_elements('[1, 2, 3]'::JSON)
 ----
 jsonb_array_elements
@@ -359,7 +359,7 @@ jsonb_array_elements
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM jsonb_array_elements('[1, 2, 3]'::JSON)
 ----
 value
@@ -367,7 +367,7 @@ value
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT json_array_elements('[1, true, null, "text", -1.234, {"2": 3, "4": "5"}, [1, 2, 3]]'::JSON)
 ----
 json_array_elements
@@ -379,7 +379,7 @@ null
 {"2": 3, "4": "5"}
 [1, 2, 3]
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM json_array_elements('[1, true, null, "text", -1.234, {"2": 3, "4": "5"}, [1, 2, 3]]'::JSON)
 ----
 value
@@ -405,7 +405,7 @@ SELECT jsonb_array_elements('{"1": 2}'::JSON)
 
 ## json_array_elements_text and jsonb_array_elements_text
 
-query T colnames
+query T colnames,nosort
 SELECT json_array_elements_text('[1, 2, 3]'::JSON)
 ----
 json_array_elements_text
@@ -413,7 +413,7 @@ json_array_elements_text
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM json_array_elements_text('[1, 2, 3]'::JSON)
 ----
 value
@@ -421,7 +421,7 @@ value
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT json_array_elements_text('[1, 2, 3]'::JSON)
 ----
 json_array_elements_text
@@ -429,7 +429,7 @@ json_array_elements_text
 2
 3
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM json_array_elements_text('[1, 2, 3]'::JSON)
 ----
 value
@@ -437,7 +437,7 @@ value
 2
 3
 
-query T
+query T nosort
 SELECT json_array_elements_text('[1, true, null, "text", -1.234, {"2": 3, "4": "5"}, [1, 2, 3]]'::JSON)
 ----
 1
@@ -461,13 +461,13 @@ SELECT jsonb_array_elements_text('{"1": 2}'::JSON)
 
 ## json_object_keys and jsonb_object_keys
 
-query T
+query T nosort
 SELECT json_object_keys('{"1": 2, "3": 4}'::JSON)
 ----
 1
 3
 
-query T
+query T nosort
 SELECT jsonb_object_keys('{"1": 2, "3": 4}'::JSON)
 ----
 1
@@ -483,7 +483,7 @@ SELECT json_object_keys('{"\"1\"": 2}'::JSON)
 "1"
 
 # Keys are sorted.
-query T colnames
+query T colnames,nosort
 SELECT json_object_keys('{"a": 1, "1": 2, "3": {"4": 5, "6": 7}}'::JSON)
 ----
 json_object_keys
@@ -491,7 +491,7 @@ json_object_keys
 3
 a
 
-query T colnames
+query T colnames,nosort
 SELECT * FROM json_object_keys('{"a": 1, "1": 2, "3": {"4": 5, "6": 7}}'::JSON)
 ----
 json_object_keys
@@ -520,7 +520,7 @@ SELECT json_build_object('a', 2, 'b', 4)
 query T
 SELECT jsonb_build_object(true,'val',1, 0, 1.3, 2, date '2019-02-03' - date '2019-01-01', 4, '2001-01-01 11:00+3'::timestamptz, '11:00+3'::timetz)
 ----
-{"1": 0, "1.3": 2, "2001-01-01 08:00:00+00:00": "11:00:00+03:00:00", "33": 4, "true": "val"}
+{"1": 0, "1.3": 2, "2001-01-01 08:00:00+00": "11:00:00+03", "33": 4, "true": "val"}
 
 query T
 SELECT json_build_object('a',1,'b',1.2,'c',true,'d',null,'e','{"x": 3, "y": [1,2,3]}'::JSON)
@@ -550,7 +550,7 @@ SELECT json_build_object('\a', 1)
 ----
 {"\\a": 1}
 
-query T
+query T nosort
 SELECT json_build_object(json_object_keys('{"x":3, "y":4}'::JSON), 2)
 ----
 {"x": 2}
@@ -562,22 +562,41 @@ SELECT json_build_object('a', '0100110'::varbit)
 ----
 {"a": "0100110"}
 
+# Regression for an internal error when using an enum and void in the key.
+statement ok
+CREATE TYPE e AS ENUM ('e');
+
+query T
+SELECT json_build_object('e'::e, 1)
+----
+{"e": 1}
+
+query T
+SELECT json_build_object(''::void, 1)
+----
+{"": 1}
+
 # even number of arguments
-query error pq: json_build_object\(\): argument list must have even number of elements
+statement error pgcode 22023 json_build_object\(\): argument list must have even number of elements
 SELECT json_build_object(1,2,3)
 
 # keys must be scalar and not null
-query error pq: json_build_object\(\): argument 1 cannot be null
+statement error pgcode 22004 json_build_object\(\): null value not allowed for object key
 SELECT json_build_object(null,2)
 
-query error pq: json_build_object\(\): key value must be scalar, not array, tuple, or json
+statement error pgcode 22023 json_build_object\(\): key value must be scalar, not array, composite, or json
 SELECT json_build_object((1,2),3)
 
-query error pq: json_build_object\(\): key value must be scalar, not array, tuple, or json
+statement error pgcode 22023 json_build_object\(\): key value must be scalar, not array, composite, or json
 SELECT json_build_object('{"a":1,"b":2}'::JSON, 3)
 
-query error pq: json_build_object\(\): key value must be scalar, not array, tuple, or json
+statement error pgcode 22023 json_build_object\(\): key value must be scalar, not array, composite, or json
 SELECT json_build_object('{1,2,3}'::int[], 3)
+
+query T
+SELECT json_build_object('a'::tsvector, 1, 'b'::tsquery, 2)
+----
+{"'a'": 1, "'b'": 2}
 
 query T
 SELECT json_extract_path('{"a": 1}', 'a')
@@ -715,13 +734,13 @@ SELECT jsonb_build_array('+Inf'::FLOAT8, 'NaN'::FLOAT8)::STRING::JSONB
 ----
 ["Infinity", "NaN"]
 
-query error pq: json_object\(\): array must have even number of elements
+statement error pgcode 2202E json_object\(\): array must have even number of elements
 SELECT json_object('{a,b,c}'::TEXT[])
 
-query error pq: json_object\(\): null value not allowed for object key
+statement error pgcode 22004 json_object\(\): null value not allowed for object key
 SELECT json_object('{NULL, a}'::TEXT[])
 
-query error pq: json_object\(\): null value not allowed for object key
+statement error pgcode 22004 json_object\(\): null value not allowed for object key
 SELECT json_object('{a,b,NULL,"d e f"}'::TEXT[],'{1,2,3,"a b c"}'::TEXT[])
 
 query error pq: json_object\(\): mismatched array dimensions
@@ -768,13 +787,13 @@ SELECT json_object('{a,b,c,"d e f"}'::TEXT[],'{1,2,3,"a b c"}'::TEXT[])
 ----
 {"a": "1", "b": "2", "c": "3", "d e f": "a b c"}
 
-query error pq: jsonb_object\(\): array must have even number of elements
+statement error pgcode 2202E jsonb_object\(\): array must have even number of elements
 SELECT jsonb_object('{a,b,c}'::TEXT[])
 
-query error pq: jsonb_object\(\): null value not allowed for object key
+statement error pgcode 22004 jsonb_object\(\): null value not allowed for object key
 SELECT jsonb_object('{NULL, a}'::TEXT[])
 
-query error pq: jsonb_object\(\): null value not allowed for object key
+statement error pgcode 22004 jsonb_object\(\): null value not allowed for object key
 SELECT jsonb_object('{a,b,NULL,"d e f"}'::TEXT[],'{1,2,3,"a b c"}'::TEXT[])
 
 query error pq: jsonb_object\(\): mismatched array dimensions
@@ -831,7 +850,7 @@ query TT
 SELECT * FROM json_each('{}') q
 ----
 
-query T colnames
+query T colnames,nosort
 SELECT json_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
 ----
 json_each
@@ -841,7 +860,7 @@ json_each
 (f5,99)
 (f6,"""stringy""")
 
-query TT colnames
+query TT colnames,nosort
 SELECT * FROM json_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
@@ -861,7 +880,7 @@ query TT
 SELECT * FROM jsonb_each('{}') q
 ----
 
-query T colnames
+query T colnames,nosort
 SELECT jsonb_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
 ----
 jsonb_each
@@ -871,7 +890,7 @@ jsonb_each
 (f5,99)
 (f6,"""stringy""")
 
-query TT colnames
+query TT colnames,nosort
 SELECT * FROM jsonb_each('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
@@ -891,7 +910,7 @@ query TT
 SELECT * FROM jsonb_each_text('{}') q
 ----
 
-query T colnames
+query T colnames,nosort
 SELECT jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
 ----
 jsonb_each_text
@@ -901,7 +920,7 @@ jsonb_each_text
 (f5,99)
 (f6,stringy)
 
-query T colnames
+query T colnames,nosort
 SELECT jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 q
@@ -911,7 +930,7 @@ q
 (f5,99)
 (f6,stringy)
 
-query TT colnames
+query TT colnames,nosort
 SELECT * FROM jsonb_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
@@ -935,7 +954,7 @@ query TT
 SELECT * FROM json_each_text('{}') q
 ----
 
-query T colnames
+query T colnames,nosort
 SELECT json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}')
 ----
 json_each_text
@@ -945,7 +964,7 @@ json_each_text
 (f5,99)
 (f6,stringy)
 
-query T colnames
+query T colnames,nosort
 SELECT json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 q
@@ -955,7 +974,7 @@ q
 (f5,99)
 (f6,stringy)
 
-query TT colnames
+query TT colnames,nosort
 SELECT * FROM json_each_text('{"f1":[1,2,3],"f2":{"f3":1},"f4":null,"f5":99,"f6":"stringy"}') q
 ----
 key  value
@@ -1262,6 +1281,9 @@ SELECT (json_populate_record(((1.01, 2, 3) AS d, c, a), '{"a": 3, "c": 10, "d": 
 d
 11.001
 
+statement error argument of json_populate_record must be an object
+SELECT * FROM json_populate_record(((1, 2) AS a, b), '"a"')
+
 statement ok
 CREATE TABLE testtab (
 	i	int,
@@ -1316,14 +1338,14 @@ SELECT * FROM json_populate_record(((3,) AS a), NULL)
 ----
 3
 
-query FIII colnames
+query FIII colnames,nosort
 SELECT *, c FROM json_populate_recordset(((1.01, 2, 3) AS d, c, a), '[{"a": 3, "c": 10, "d": 11.001}, {}]')
 ----
 d       c   a  c
 11.001  10  3  10
 1.01    2   3  2
 
-query FITI colnames
+query FITI colnames,nosort
 SELECT *, c FROM json_populate_recordset(((NULL::NUMERIC, 2::INT, 3::TEXT) AS d, c, a), '[{"a": 3, "c": 10, "d": 11.001}, {}]')
 ----
 d       c   a  c
@@ -1356,8 +1378,131 @@ SELECT * FROM json_populate_recordset(((NULL::NUMERIC, 2::INT, 3::TEXT) AS d, c,
 query error argument of json_populate_recordset must be an array of objects
 SELECT * FROM json_populate_recordset(((NULL::NUMERIC, 2::INT, 3::TEXT) AS d, c, a), '[{"foo":"bar"}, 3]')
 
-query ITTTTT
+query ITTTTT nosort
 SELECT * FROM json_populate_recordset(NULL::testtab, '[{"i": 3, "ia": [1,2,3], "t": "foo", "ta": ["a", "b"], "ts": "2017-01-01 00:00", "j": {"a": "b", "c": 3, "d": [1,false,true,null,{"1":"2"}]}}, {}]'::JSON)
 ----
 3     {1,2,3}  foo   {a,b}  2017-01-01 00:00:00 +0000 +0000  {"a": "b", "c": 3, "d": [1, false, true, null, {"1": "2"}]}
 NULL  NULL     NULL  NULL   NULL                             NULL
+
+query error invalid non-object argument to json_to_record
+SELECT * FROM json_to_record('3') AS t(a INT)
+
+query error invalid non-object argument to json_to_record
+SELECT * FROM json_to_record('"a"') AS t(a TEXT)
+
+query error invalid non-object argument to json_to_record
+SELECT * FROM json_to_record('null') AS t(a INT)
+
+query error invalid non-object argument to json_to_record
+SELECT * FROM json_to_record('true') AS t(a INT)
+
+query error invalid non-object argument to json_to_record
+SELECT * FROM json_to_record('[1,2]') AS t(a INT)
+
+query error column definition list is required for functions returning \"record\"
+SELECT * FROM json_to_record('{"a": "b"}') AS t(a)
+
+query error column definition list is required for functions returning \"record\"
+SELECT * FROM json_to_record('{"a": "b"}')
+
+# Test that non-record generators don't permit col definition lists (with types).
+query error a column definition list is only allowed for functions returning \"record\"
+SELECT * FROM generate_series(1,10) g(g int)
+
+statement ok
+CREATE TABLE j (j) AS SELECT '{
+  "str": "a",
+  "int": 1,
+  "bool": true,
+  "nul": null,
+  "dec": 2.45,
+  "arrint": [1,2],
+  "arrmixed": [1,2,true],
+  "arrstr": ["a", "b"],
+  "arrbool": [true, false],
+  "obj": {"i": 3, "t": "blah", "z": true}
+  }'::JSONB
+
+statement ok
+INSERT INTO j VALUES('{"str": "zzz"}')
+
+query TIBTFTTTTT
+SELECT t.* FROM j, json_to_record(j.j) AS t(
+  str TEXT,
+  int INT,
+  bool BOOL,
+  nul TEXT,
+  dec DECIMAL,
+  arrint INT[],
+  arrmixed TEXT,
+  arrstr TEXT[],
+  arrbool BOOL[],
+  obj TEXT
+) ORDER BY rowid
+----
+a    1     true  NULL  2.45  {1,2}  [1, 2, true]  {a,b}  {t,f}  {"i": 3, "t": "blah", "z": true}
+zzz  NULL  NULL  NULL  NULL  NULL   NULL          NULL   NULL   NULL
+
+# Test that mismatched types return an error
+query error could not parse \"true\" as type int
+SELECT t.bool FROM j, json_to_record(j.j) AS t(bool INT)
+
+# But types can be coerced.
+query TT rowsort
+SELECT t.* FROM j, json_to_record(j.j) AS t(int TEXT, bool TEXT)
+----
+1     true
+NULL  NULL
+
+# Mixed type arrays
+query error could not parse \"2\" as type bool
+SELECT t.arrmixed FROM j, json_to_record(j.j) AS t(arrmixed BOOL[])
+
+# Record with custom type
+query T rowsort
+SELECT t.obj FROM j, json_to_record(j.j) AS t(obj testtab)
+----
+(3,,blah,,,)
+NULL
+
+# Test json_to_recordset
+query TIBTFTTTTT
+SELECT t.* FROM j, json_to_recordset(j.j || '[]' || j.j) AS t(
+  str TEXT,
+  int INT,
+  bool BOOL,
+  nul TEXT,
+  dec DECIMAL,
+  arrint INT[],
+  arrmixed TEXT,
+  arrstr TEXT[],
+  arrbool BOOL[],
+  obj TEXT
+) ORDER BY rowid
+----
+a    1     true  NULL  2.45  {1,2}  [1, 2, true]  {a,b}  {t,f}  {"i": 3, "t": "blah", "z": true}
+a    1     true  NULL  2.45  {1,2}  [1, 2, true]  {a,b}  {t,f}  {"i": 3, "t": "blah", "z": true}
+zzz  NULL  NULL  NULL  NULL  NULL   NULL          NULL   NULL   NULL
+zzz  NULL  NULL  NULL  NULL  NULL   NULL          NULL   NULL   NULL
+
+query TT rowsort
+SELECT * FROM jsonb_to_recordset('[{"foo": "bar"}, {"foo": "bar2"}]') AS t(foo TEXT),
+              jsonb_to_recordset('[{"foo": "blah"}, {"foo": "blah2"}]') AS u(foo TEXT)
+----
+bar   blah
+bar   blah2
+bar2  blah
+bar2  blah2
+
+# Regression test for incorrectly using jsonString.String() for asserting that
+# keys are ordered in the jsonObject (#121326).
+query T rowsort
+WITH cte(col) AS (
+  VALUES
+    ('false'::JSONB),
+    (jsonb_object(ARRAY['0', '', e'\x14', '']::TEXT[]))
+  )
+SELECT jsonb_object_agg('k', 'v') OVER (PARTITION BY cte.col) FROM cte;
+----
+{"k": "v"}
+{"k": "v"}

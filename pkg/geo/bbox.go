@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geo
 
@@ -17,9 +12,11 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	"github.com/golang/geo/s2"
-	"github.com/twpayne/go-geom"
+	geom "github.com/twpayne/go-geom"
 )
 
 // CartesianBoundingBox is the cartesian BoundingBox representation,
@@ -36,15 +33,21 @@ func NewCartesianBoundingBox() *CartesianBoundingBox {
 
 // Repr is the string representation of the CartesianBoundingBox.
 func (b *CartesianBoundingBox) Repr() string {
-	// fmt.Sprintf with %f does not truncate leading zeroes, so use
-	// FormatFloat instead.
-	return fmt.Sprintf(
-		"BOX(%s %s,%s %s)",
-		strconv.FormatFloat(b.LoX, 'f', -1, 64),
-		strconv.FormatFloat(b.LoY, 'f', -1, 64),
-		strconv.FormatFloat(b.HiX, 'f', -1, 64),
-		strconv.FormatFloat(b.HiY, 'f', -1, 64),
-	)
+	return string(b.AppendFormat(nil))
+}
+
+// AppendFormat appends string representation of the CartesianBoundingBox
+// to the buffer, and returns modified buffer.
+func (b *CartesianBoundingBox) AppendFormat(buf []byte) []byte {
+	buf = append(buf, "BOX("...)
+	buf = strconv.AppendFloat(buf, b.LoX, 'f', -1, 64)
+	buf = append(buf, ' ')
+	buf = strconv.AppendFloat(buf, b.LoY, 'f', -1, 64)
+	buf = append(buf, ',')
+	buf = strconv.AppendFloat(buf, b.HiX, 'f', -1, 64)
+	buf = append(buf, ' ')
+	buf = strconv.AppendFloat(buf, b.HiY, 'f', -1, 64)
+	return append(buf, ')')
 }
 
 // ParseCartesianBoundingBox parses a box2d string into a bounding box.
@@ -56,35 +59,37 @@ func ParseCartesianBoundingBox(s string) (CartesianBoundingBox, error) {
 		return b, errors.Wrapf(err, "error parsing box2d")
 	}
 	if numScanned != 5 || strings.ToLower(prefix) != "box" {
-		return b, errors.Newf("expected format 'box(min_x min_y,max_x max_y)'")
+		return b, pgerror.Newf(pgcode.InvalidParameterValue, "expected format 'box(min_x min_y,max_x max_y)'")
 	}
 	return b, nil
 }
 
 // Compare returns the comparison between two bounding boxes.
 // Compare lower dimensions before higher ones, i.e. X, then Y.
+// In SQL, NaN is treated as less than all other float values. In Go, any
+// comparison with NaN returns false.
 func (b *CartesianBoundingBox) Compare(o *CartesianBoundingBox) int {
-	if b.LoX < o.LoX {
+	if b.LoX < o.LoX || (math.IsNaN(b.LoX) && !math.IsNaN(o.LoX)) {
 		return -1
-	} else if b.LoX > o.LoX {
+	} else if b.LoX > o.LoX || (!math.IsNaN(b.LoX) && math.IsNaN(o.LoX)) {
 		return 1
 	}
 
-	if b.HiX < o.HiX {
+	if b.HiX < o.HiX || (math.IsNaN(b.HiX) && !math.IsNaN(o.HiX)) {
 		return -1
-	} else if b.HiX > o.HiX {
+	} else if b.HiX > o.HiX || (!math.IsNaN(b.HiX) && math.IsNaN(o.HiX)) {
 		return 1
 	}
 
-	if b.LoY < o.LoY {
+	if b.LoY < o.LoY || (math.IsNaN(b.LoY) && !math.IsNaN(o.LoY)) {
 		return -1
-	} else if b.LoY > o.LoY {
+	} else if b.LoY > o.LoY || (!math.IsNaN(b.LoY) && math.IsNaN(o.LoY)) {
 		return 1
 	}
 
-	if b.HiY < o.HiY {
+	if b.HiY < o.HiY || (math.IsNaN(b.HiY) && !math.IsNaN(o.HiY)) {
 		return -1
-	} else if b.HiY > o.HiY {
+	} else if b.HiY > o.HiY || (!math.IsNaN(b.HiY) && math.IsNaN(o.HiY)) {
 		return 1
 	}
 
@@ -232,7 +237,7 @@ func boundingBoxFromGeomT(g geom.T, soType geopb.SpatialObjectType) (*geopb.Boun
 			HiY: rect.Lat.Hi,
 		}, nil
 	}
-	return nil, errors.Newf("unknown spatial type: %s", soType)
+	return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unknown spatial type: %s", soType)
 }
 
 // BoundingBoxFromGeomTGeometryType returns an appropriate bounding box for a Geometry type.
@@ -273,18 +278,26 @@ func boundingBoxFromGeomTGeographyType(g geom.T) (s2.Rect, error) {
 	rect := s2.EmptyRect()
 	switch g := g.(type) {
 	case *geom.Point:
-		return geogPointsBBox(g), nil
+		return geogPointsBBox(g)
 	case *geom.MultiPoint:
-		return geogPointsBBox(g), nil
+		return geogPointsBBox(g)
 	case *geom.LineString:
-		return geogLineBBox(g), nil
+		return geogLineBBox(g)
 	case *geom.MultiLineString:
 		for i := 0; i < g.NumLineStrings(); i++ {
-			rect = rect.Union(geogLineBBox(g.LineString(i)))
+			r, err := geogLineBBox(g.LineString(i))
+			if err != nil {
+				return s2.EmptyRect(), err
+			}
+			rect = rect.Union(r)
 		}
 	case *geom.Polygon:
 		for i := 0; i < g.NumLinearRings(); i++ {
-			rect = rect.Union(geogLineBBox(g.LinearRing(i)))
+			r, err := geogLineBBox(g.LinearRing(i))
+			if err != nil {
+				return s2.EmptyRect(), err
+			}
+			rect = rect.Union(r)
 		}
 	case *geom.MultiPolygon:
 		for i := 0; i < g.NumPolygons(); i++ {
@@ -310,22 +323,30 @@ func boundingBoxFromGeomTGeographyType(g geom.T) (s2.Rect, error) {
 
 // geogPointsBBox constructs a bounding box, represented as a s2.Rect, for the set
 // of points contained in g.
-func geogPointsBBox(g geom.T) s2.Rect {
+func geogPointsBBox(g geom.T) (s2.Rect, error) {
 	rect := s2.EmptyRect()
 	flatCoords := g.FlatCoords()
 	for i := 0; i < len(flatCoords); i += g.Stride() {
-		rect = rect.AddPoint(s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i]))
+		point := s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i])
+		if !point.IsValid() {
+			return s2.EmptyRect(), OutOfRangeError()
+		}
+		rect = rect.AddPoint(point)
 	}
-	return rect
+	return rect, nil
 }
 
 // geogLineBBox constructs a bounding box, represented as a s2.Rect, for the line
 // or ring/loop represented by g.
-func geogLineBBox(g geom.T) s2.Rect {
+func geogLineBBox(g geom.T) (s2.Rect, error) {
 	bounder := s2.NewRectBounder()
 	flatCoords := g.FlatCoords()
 	for i := 0; i < len(flatCoords); i += g.Stride() {
-		bounder.AddPoint(s2.PointFromLatLng(s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i])))
+		point := s2.LatLngFromDegrees(flatCoords[i+1], flatCoords[i])
+		if !point.IsValid() {
+			return s2.EmptyRect(), OutOfRangeError()
+		}
+		bounder.AddPoint(s2.PointFromLatLng(point))
 	}
-	return bounder.RectBound()
+	return bounder.RectBound(), nil
 }

@@ -27,20 +27,20 @@ statement ok
 ALTER TABLE r EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 2), (ARRAY[2], 3), (ARRAY[3], 1)
 
 query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE l] ORDER BY lease_holder
+SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE l WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-NULL       /2       {1}       1
-/2         /3       {2}       2
-/3         NULL     {3}       3
+start_key           end_key                 replicas  lease_holder
+<before:/Table/67>  …/1/2                   {1}       1
+…/1/2               …/1/3                   {2}       2
+…/1/3               <after:/Table/107/1/2>  {3}       3
 
 query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE r] ORDER BY lease_holder
+SELECT start_key, end_key, replicas, lease_holder from [SHOW EXPERIMENTAL_RANGES FROM TABLE r WITH DETAILS] ORDER BY lease_holder
 ----
-start_key  end_key  replicas  lease_holder
-/2         /3       {1}       1
-/3         NULL     {2}       2
-NULL       /2       {3}       3
+start_key                end_key       replicas  lease_holder
+…/1/2                    …/1/3         {1}       1
+…/1/3                    <after:/Max>  {2}       2
+<before:/Table/106/1/3>  …/1/2         {3}       3
 
 query T
 EXPLAIN (DISTSQL) SELECT * FROM l LEFT OUTER JOIN r USING(a) WHERE a = 2
@@ -63,7 +63,7 @@ vectorized: true
       table: r@r_pkey
       spans: [/2 - /2]
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEk9GPk0AQxt_9Kybz1OoaWIovJJdglFMuPTiBiyaGh70ytiQci7tLYtP0fzeASQV7tY1R39jd-X0z3zdhh_prhR4Gn-6Wr8MIZm_DNEs_LOeQBsvgTQbP4TqJb6GCZXCdwU0cRqDgPg2jdzATc_j4PkgCEHAFDjKsZUGReCSN3mfkyNDBnGGj5Iq0lqq73vVFYfENPZthWTet6a5zhiupCL0dmtJUhB5m4qGihERByuq0CjKirHpp5TeqfBRqiwzTRtTaA8uxbMz3DGVrfmgepB62sBF6MxbxOeb7nKE2Yk3oOXv2xGwHnbaWqiBFxUgp78jflRwxeEtqTTeyrElZi_Fs2bYhb4g8vs-CpA8eGVb0xcx8_mJ-pcr1ZvhEhnFrPPA58x3mu5MUDg4Xf-DwyPiRfCkby51GcbS1O2rNz1-8Pc6l-guL50_O9i8W7_zXxR8ZLiHdyFrTWXu1O3tUrGmIS8tWrehOyVXfZjjGPdcnW5A2w6s7HMK6f-r_vfNhfhrmU9j-GXZGMJ_Czkn41Qi2p_DiAs-_dD4N89Owe5HnfP_sewAAAP__ZsHuOw==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEk19v0zAUxd_5FNZ9WsFV4zR7sTQpaM0gU_-MJhNIKJrc5raNlsbBdjSqqt8dJRm0iVooTIAfovjfz-ceH29Bf0mBg_fpbvjWH5OLgR-EwYdhhwTe0LsOyWtyM52MSEqG3k1Ibif-mChyH_jjd-RCdMjH997UI4JcERsoZDLGsVijBv4ZGFCwIaKQKzlHraUqh7fVIj_-CtyikGR5YcrhiMJcKgS-BZOYFIFDKGYpTlHEqHolK0YjkrRCK1c95I-4AQrXMi3WmeZEUDIDCkEuyl7P7lkQ7SjIwjwfsSfPNmQl9KrJdBlEu4iCNmKJwO0D3f4AONvRE9L33CKTKkaFcYMclTt_teRI_SNUS7yVSYaq129qDTc58vpGJvehN63uBSikuDAXLnvTuVLJclX_AoVJYThxGXVt6jotV_YV91sV919Q8ZFyxrIr857TtuaoFKclxWlIYefnxmr6lrrp384Na0m3Tkr_F7mx_0Nu7JO5OSJ2ijqXmcazYmG1Tuqysn6Ml1j7qWWh5nin5LxaW3cnFaiyPkZt6lmn7vhZNWWXJygU6x8P_XwSO03qt0msTbIOSXaDxA5Jl22S_VPSZYNkHZKsNqn_Gz6xF5DYaZLdJjl_6pNT5mGRyqeHJAYO1nPrHvl8b1BuEEtdhjJYyacKW74TDXwhUo0URuIRB2hQrZMs0SaZAzeqwN3u1bcAAAD__wr9Uho=
 
 # Test that we can handle merge joins with equality columns of integers with
 # different widths.

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -35,26 +31,25 @@ var _ execinfra.RowSource = &ordinalityProcessor{}
 const ordinalityProcName = "ordinality"
 
 func newOrdinalityProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.OrdinalitySpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.RowSourcedProcessor, error) {
-	ctx := flowCtx.EvalCtx.Ctx()
 	o := &ordinalityProcessor{input: input, curCnt: 1}
 
 	colTypes := make([]*types.T, len(input.OutputTypes())+1)
 	copy(colTypes, input.OutputTypes())
 	colTypes[len(colTypes)-1] = types.Int
 	if err := o.Init(
+		ctx,
 		o,
 		post,
 		colTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{o.input},
@@ -63,7 +58,7 @@ func newOrdinalityProcessor(
 		return nil, err
 	}
 
-	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		o.input = newInputStatCollector(o.input)
 		o.ExecStatsForTrace = o.execStatsForTrace
 	}

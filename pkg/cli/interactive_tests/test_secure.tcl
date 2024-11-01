@@ -31,12 +31,6 @@ proc start_secure_server {argv certs_dir extra} {
     report "END START SECURE SERVER"
 }
 
-proc stop_secure_server {argv certs_dir} {
-    report "BEGIN STOP SECURE SERVER"
-    system "$argv quit --certs-dir=$certs_dir"
-    report "END STOP SECURE SERVER"
-}
-
 start_secure_server $argv $certs_dir ""
 
 start_test "Check that the env vars are properly reported in the log file."
@@ -64,7 +58,7 @@ eexpect $prompt
 end_test
 
 start_test "Passwords are not requested when a certificate for the user exists"
-send "$argv sql --user=testuser --certs-dir=$certs_dir\r"
+send "$argv sql --no-line-editor --user=testuser --certs-dir=$certs_dir\r"
 eexpect "testuser@"
 send "\\q\r"
 eexpect $prompt
@@ -72,7 +66,7 @@ end_test
 
 start_test "Check that CREATE USER WITH PASSWORD can be used from transactions."
 # Create a user from a transaction.
-send "$argv sql --certs-dir=$certs_dir\r"
+send "$argv sql --no-line-editor --certs-dir=$certs_dir\r"
 eexpect "root@"
 send "BEGIN TRANSACTION;\r"
 eexpect "root@"
@@ -83,26 +77,25 @@ eexpect "root@"
 send "\\q\r"
 # Log in with the correct password.
 eexpect $prompt
-send "$argv sql --certs-dir=$certs_dir --user=eisen\r"
+send "$argv sql --no-line-editor --certs-dir=$certs_dir --user=eisen\r"
 eexpect "Enter password:"
 send "hunter2\r"
 eexpect "eisen@"
 send "\\q\r"
 # Try to log in with an incorrect password.
 eexpect $prompt
-send "$argv sql --certs-dir=$certs_dir --user=eisen\r"
+send "$argv sql --no-line-editor --certs-dir=$certs_dir --user=eisen\r"
 eexpect "Enter password:"
 send "*****\r"
 eexpect "ERROR: password authentication failed for user eisen"
 eexpect "Failed running \"sql\""
 # Check that history is scrubbed.
-send "$argv sql --certs-dir=$certs_dir\r"
+send "$argv sql --no-line-editor --certs-dir=$certs_dir\r"
 eexpect "root@"
-interrupt
 end_test
 
-# Terminate the shell with Ctrl+C.
-interrupt
+# Terminate the shell with Ctrl+D.
+send_eof
 eexpect $prompt
 
 start_test "Check that an auth cookie cannot be created for a user that does not exist."
@@ -115,16 +108,16 @@ set mywd [pwd]
 
 start_test "Check that socket-based login works."
 
-send "$argv sql --url 'postgres://eisen@?host=$mywd&port=26257'\r"
+send "$argv sql --no-line-editor --url 'postgres://eisen@?host=$mywd&port=26257'\r"
 eexpect "Enter password:"
 send "hunter2\r"
 eexpect "eisen@"
-interrupt
+send_eof
 eexpect $prompt
 
-send "$argv sql --url 'postgres://eisen:hunter2@?host=$mywd&port=26257'\r"
+send "$argv sql --no-line-editor --url 'postgres://eisen:hunter2@?host=$mywd&port=26257'\r"
 eexpect "eisen@"
-interrupt
+send_eof
 eexpect $prompt
 
 end_test
@@ -163,8 +156,8 @@ end_test
 set pyfile [file join [file dirname $argv0] test_auth_cookie.py]
 
 start_test "Check that the auth cookie works."
-send "$python $pyfile cookie.txt 'https://localhost:8080/_admin/v1/settings'\r"
-eexpect "cluster.organization"
+send "$python $pyfile cookie.txt 'https://localhost:8080/_admin/v1/users'\r"
+eexpect "users"
 eexpect $prompt
 end_test
 
@@ -206,7 +199,7 @@ end_test
 
 
 # Now test the cookies with non-TLS http.
-stop_secure_server $argv $certs_dir
+stop_server $argv
 
 start_secure_server $argv $certs_dir --unencrypted-localhost-http
 
@@ -219,4 +212,4 @@ end_test
 send "exit 0\r"
 eexpect eof
 
-stop_secure_server $argv $certs_dir
+stop_server $argv

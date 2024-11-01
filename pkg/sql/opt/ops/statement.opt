@@ -35,13 +35,11 @@ define CreateView {
 
 [Private]
 define CreateViewPrivate {
+    # Syntax is the CREATE VIEW AST node.
+    Syntax TreeCreateView
+
     # Schema is the ID of the catalog schema into which the new table goes.
     Schema SchemaID
-    ViewName TableName
-    Persistence Persistence
-    IfNotExists bool
-    Replace bool
-    Materialized bool
 
     # ViewQuery contains the query for the view; data sources are always fully
     # qualified.
@@ -52,10 +50,59 @@ define CreateViewPrivate {
     Columns Presentation
 
     # Deps contains the data source dependencies of the view.
-    Deps ViewDeps
+    Deps SchemaDeps
 
     # TypeDeps contains the type dependencies of the view.
-    TypeDeps ViewTypeDeps
+    TypeDeps SchemaTypeDeps
+
+    # WithData indicates if the materialized view is populated
+    # with data upon creation.
+    WithData bool
+}
+
+# CreateFunction represents a CREATE FUNCTION statement.
+[Relational, DDL, Mutation]
+define CreateFunction {
+    _ CreateFunctionPrivate
+}
+
+[Private]
+define CreateFunctionPrivate {
+    # Schema is the ID of the catalog schema into which the new function goes.
+    Schema SchemaID
+
+    # Syntax is the CREATE FUNCTION AST node.
+    Syntax CreateRoutine
+
+    # Deps contains the data source dependencies of the function.
+    Deps SchemaDeps
+
+    # TypeDeps contains the type dependencies of the function.
+    TypeDeps SchemaTypeDeps
+
+    # FuncDeps contains the function dependencies of the function.
+    FuncDeps SchemaFunctionDeps
+}
+
+# CreateTrigger represents a CREATE TRIGGER statement.
+[Relational, DDL, Mutation]
+define CreateTrigger {
+    _ CreateTriggerPrivate
+}
+
+[Private]
+define CreateTriggerPrivate {
+    # Syntax is the CREATE TRIGGER AST node.
+    Syntax CreateTrigger
+
+    # Deps contains the data source dependencies of the trigger.
+    Deps SchemaDeps
+
+    # TypeDeps contains the type dependencies of the trigger.
+    TypeDeps SchemaTypeDeps
+
+    # FuncDeps contains the function dependencies of the trigger.
+    FuncDeps SchemaFunctionDeps
 }
 
 # Explain returns information about the execution plan of the "input"
@@ -191,8 +238,7 @@ define AlterTableRelocate {
 
 [Private]
 define AlterTableRelocatePrivate {
-    RelocateLease bool
-    RelocateNonVoters bool
+    SubjectReplicas RelocateSubject
     _ AlterTableSplitPrivate
 }
 
@@ -281,6 +327,21 @@ define ExportPrivate {
     Columns ColList
 }
 
+# ShowCompletions represents a SHOW COMPLETIONS statement.
+[Relational]
+define ShowCompletions {
+    _ ShowCompletionsPrivate
+}
+
+[Private]
+define ShowCompletionsPrivate {
+    # Command is the tree.ShowCompletions AST node.
+    Command ShowCompletions
+
+    # Columns stores the column IDs for the statement result columns.
+    Columns ColList
+}
+
 # CreateStatistics represents a CREATE STATISTICS or ANALYZE statement.
 [Relational]
 define CreateStatistics {
@@ -291,4 +352,43 @@ define CreateStatistics {
 define CreateStatisticsPrivate {
     # Syntax is the tree.CreateStats AST node.
     Syntax CreateStats
+}
+
+# AlterRangeRelocate represents an `ALTER RANGE .. RELOCATE ..` statement.
+[Relational, Mutation]
+define AlterRangeRelocate {
+    # The input expression provides range IDs as integers.
+    Input RelExpr
+
+    # ToStoreID is the destination store ID.
+    ToStoreID ScalarExpr
+
+    # FromStoreID is the origin store ID, set to NULL when transfering the leaseholder (subject LEASE).
+    FromStoreID ScalarExpr
+    _ AlterRangeRelocatePrivate
+}
+
+[Private]
+define AlterRangeRelocatePrivate {
+    # The subject indicates which replicas will be relocated.
+    SubjectReplicas RelocateSubject
+
+    # Columns stores the column IDs for the statement result columns.
+    Columns ColList
+
+    # Props stores the required physical properties for the input expression.
+    Props PhysProps
+}
+
+[Relational]
+define Call {
+    # Proc is the procedure being invoked. It is a UDFCallExpr.
+    Proc ScalarExpr
+    _ CallPrivate
+}
+
+[Private]
+define CallPrivate {
+    # Columns stores the column IDs for the statement result columns.
+    Columns ColList
 }

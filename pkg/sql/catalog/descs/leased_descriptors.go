@@ -1,30 +1,26 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
-type leaseManager interface {
+type LeaseManager interface {
 	AcquireByName(
 		ctx context.Context,
 		timestamp hlc.Timestamp,
@@ -36,6 +32,10 @@ type leaseManager interface {
 	Acquire(
 		ctx context.Context, timestamp hlc.Timestamp, id descpb.ID,
 	) (lease.LeasedDescriptor, error)
+
+	IncGaugeAfterLeaseDuration(
+		gaugeType lease.AfterLeaseDurationGauge,
+	) (decrAfterWait func())
 }
 
 type deadlineHolder interface {
@@ -62,7 +62,7 @@ func (m maxTimestampBoundDeadlineHolder) UpdateDeadline(
 	return nil
 }
 
-func makeLeasedDescriptors(lm leaseManager) leasedDescriptors {
+func makeLeasedDescriptors(lm LeaseManager) leasedDescriptors {
 	return leasedDescriptors{
 		lm: lm,
 	}
@@ -71,8 +71,95 @@ func makeLeasedDescriptors(lm leaseManager) leasedDescriptors {
 // leasedDescriptors holds references to all the descriptors leased in the
 // transaction, and supports access by name and by ID.
 type leasedDescriptors struct {
-	lm    leaseManager
-	cache nstree.Map
+	lm    LeaseManager
+	cache nstree.NameMap
+}
+
+// mismatchedExternalDataRowTimestamp is generated when the external row data timestamps
+// within a descriptor do not match.
+type mismatchedExternalDataRowTimestamp struct {
+	newDescName      string
+	newDescID        descpb.ID
+	newDescTS        hlc.Timestamp
+	existingDescName string
+	existingDescID   descpb.ID
+	existingDescTS   hlc.Timestamp
+}
+
+func newMismatchedExternalDataRowTimestampError(
+	newDesc catalog.TableDescriptor, existingDesc catalog.TableDescriptor,
+) *mismatchedExternalDataRowTimestamp {
+	return &mismatchedExternalDataRowTimestamp{
+		newDescName:      newDesc.GetName(),
+		newDescID:        newDesc.GetID(),
+		newDescTS:        newDesc.ExternalRowData().AsOf,
+		existingDescName: existingDesc.GetName(),
+		existingDescID:   existingDesc.GetID(),
+		existingDescTS:   existingDesc.ExternalRowData().AsOf,
+	}
+}
+
+func (e *mismatchedExternalDataRowTimestamp) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("PCR reader timestamp has moved forward, "+
+		"existing descriptor %s(%d) and timestamp: %s "+
+		"new descritpor %s(%d) and timestamp: %s",
+		e.newDescName,
+		e.newDescID,
+		e.newDescTS,
+		e.existingDescName,
+		e.existingDescID,
+		e.existingDescTS)
+	return nil
+}
+
+func (e *mismatchedExternalDataRowTimestamp) Error() string {
+	return fmt.Sprint(errors.Formattable(e))
+}
+
+var _ errors.SafeFormatter = (*mismatchedExternalDataRowTimestamp)(nil)
+
+// maybeAssertExternalRowDataTS asserts if the descriptor references external
+// row data, then the timestamp across the entire collection *must* match.
+func (ld *leasedDescriptors) maybeAssertExternalRowDataTS(desc catalog.Descriptor) error {
+	tableDesc, ok := desc.(catalog.TableDescriptor)
+	if !ok {
+		return nil
+	}
+	if tableDesc.ExternalRowData() == nil {
+		return nil
+	}
+	currentTS := tableDesc.ExternalRowData().AsOf
+	return ld.cache.IterateByID(func(entry catalog.NameEntry) error {
+		// Skip databases / schemas.
+		if entry.GetParentID() == descpb.InvalidID ||
+			entry.GetParentSchemaID() == descpb.InvalidID ||
+			entry.GetID() == tableDesc.GetID() {
+			return nil
+		}
+		// Next get the underlying descriptor.
+		otherDesc := entry.(lease.LeasedDescriptor).Underlying()
+		if otherTableDesc, ok := otherDesc.(catalog.TableDescriptor); ok {
+			// Skip conventional descriptors.
+			if otherTableDesc.ExternalRowData() == nil {
+				return nil
+			}
+			// Confirm the timestamps match the most recent descriptor.
+			if !otherTableDesc.ExternalRowData().AsOf.Equal(currentTS) {
+				// Normally the PCR catalog reader will run with AOST timestamps,
+				// if during the setup of the connection executor we were able to
+				// lease the system database descriptor and confirm that it is for
+				// a PCR reader catalog. If we were not able to lease the system database
+				// descriptor, then its possible no AOST timestamp is set. Otherwise,
+				// this error should *never* happen.
+				return newMismatchedExternalDataRowTimestampError(
+					tableDesc,
+					otherTableDesc)
+			}
+			// Otherwise, we expect all other timestamps to match as well.
+			return iterutil.StopIteration()
+		}
+		return nil
+	})
 }
 
 // getLeasedDescriptorByName return a leased descriptor valid for the
@@ -95,15 +182,8 @@ func (ld *leasedDescriptors) getByName(
 			log.Eventf(ctx, "found descriptor in collection for (%d, %d, '%s'): %d",
 				parentID, parentSchemaID, name, cached.GetID())
 		}
-		return cached.(lease.LeasedDescriptor).Underlying(), false, nil
-	}
-
-	for _, d := range systemschema.UnleasableSystemDescriptors {
-		if parentID == d.GetParentID() &&
-			parentSchemaID == d.GetParentSchemaID() &&
-			name == d.GetName() {
-			return nil, true, nil
-		}
+		desc = cached.(lease.LeasedDescriptor).Underlying()
+		return desc, false, nil
 	}
 
 	readTimestamp := txn.ReadTimestamp()
@@ -114,27 +194,30 @@ func (ld *leasedDescriptors) getByName(
 
 // getByID return a leased descriptor valid for the transaction,
 // acquiring one if necessary.
-// We set a deadline on the transaction based on the lease expiration, which is
-// the usual case, unless setTxnDeadline is false.
 func (ld *leasedDescriptors) getByID(
-	ctx context.Context, txn deadlineHolder, id descpb.ID, setTxnDeadline bool,
+	ctx context.Context, txn deadlineHolder, id descpb.ID,
 ) (_ catalog.Descriptor, shouldReadFromStore bool, _ error) {
 	// First, look to see if we already have the table in the shared cache.
-	if cached := ld.cache.GetByID(id); cached != nil {
-		if log.V(2) {
-			log.Eventf(ctx, "found descriptor in collection for (%d, %d, '%s'): %d",
-				cached.GetParentID(), cached.GetParentSchemaID(), cached.GetName(), id)
-		}
-		return cached.(lease.LeasedDescriptor).Underlying(), false, nil
-	}
-
-	if _, isUnleasable := systemschema.UnleasableSystemDescriptors[id]; isUnleasable {
-		return nil, true, nil
+	if cached := ld.getCachedByID(ctx, id); cached != nil {
+		return cached, false, nil
 	}
 
 	readTimestamp := txn.ReadTimestamp()
 	desc, err := ld.lm.Acquire(ctx, readTimestamp, id)
+	const setTxnDeadline = false
 	return ld.getResult(ctx, txn, setTxnDeadline, desc, err)
+}
+
+func (ld *leasedDescriptors) getCachedByID(ctx context.Context, id descpb.ID) catalog.Descriptor {
+	cached := ld.cache.GetByID(id)
+	if cached == nil {
+		return nil
+	}
+	if log.V(2) {
+		log.Eventf(ctx, "found descriptor in collection for (%d, %d, '%s'): %d",
+			cached.GetParentID(), cached.GetParentSchemaID(), cached.GetName(), id)
+	}
+	return cached.(lease.LeasedDescriptor).Underlying()
 }
 
 // getResult is a helper to deal with the result that comes back from Acquire
@@ -164,13 +247,13 @@ func (ld *leasedDescriptors) getResult(
 		return nil, false, err
 	}
 
-	expiration := ldesc.Expiration()
+	expiration := ldesc.Expiration(ctx)
 	readTimestamp := txn.ReadTimestamp()
 	if expiration.LessEq(txn.ReadTimestamp()) {
 		log.Fatalf(ctx, "bad descriptor for T=%s, expiration=%s", readTimestamp, expiration)
 	}
 
-	ld.cache.Upsert(ldesc)
+	ld.cache.Upsert(ldesc, ldesc.Underlying().SkipNamespace())
 	if log.V(2) {
 		log.Eventf(ctx, "added descriptor '%s' to collection: %+v", ldesc.GetName(), ldesc.Underlying())
 	}
@@ -184,7 +267,12 @@ func (ld *leasedDescriptors) getResult(
 			return nil, false, err
 		}
 	}
-	return ldesc.Underlying(), false, nil
+
+	desc := ldesc.Underlying()
+	if err = ld.maybeAssertExternalRowDataTS(desc); err != nil {
+		return nil, false, err
+	}
+	return desc, false, nil
 }
 
 func (ld *leasedDescriptors) maybeUpdateDeadline(
@@ -194,34 +282,64 @@ func (ld *leasedDescriptors) maybeUpdateDeadline(
 	// and session expiration. The sqlliveness.Session will only be set in the
 	// multi-tenant environment for controlling transactions associated with ephemeral
 	// SQL pods.
+	//
+	// TODO(andrei,ajwerner): Using the session expiration here makes no sense at
+	// the moment. This was done with the mistaken impression that it'll do
+	// something for transactions that use the unique_rowid() function, but it
+	// doesn't (since that function cares about wall time, not the transaction's
+	// commit timestamp). We've left this code in place, though, because we intend
+	// to tie descriptor leases to sessions, at which point using the session
+	// expiration as the deadline will serve a purpose.
 	var deadline hlc.Timestamp
 	if session != nil {
-		if expiration, txnTS := session.Expiration(), txn.ReadTimestamp(); txnTS.Less(expiration) {
-			deadline = expiration
-		} else {
-			// If the session has expired relative to this transaction, propagate
-			// a clear error that that's what is going on.
-			return errors.Errorf(
-				"liveness session expired %s before transaction",
-				txnTS.GoTime().Sub(expiration.GoTime()),
-			)
-		}
+		deadline = session.Expiration()
 	}
-	if leaseDeadline, ok := ld.getDeadline(); ok && (deadline.IsEmpty() || leaseDeadline.Less(deadline)) {
+	if leaseDeadline, ok := ld.getDeadline(ctx); ok && (deadline.IsEmpty() || leaseDeadline.Less(deadline)) {
 		// Set the deadline to the lease deadline if session expiration is empty
 		// or lease deadline is less than the session expiration.
 		deadline = leaseDeadline
 	}
 	// If the deadline has been set, update the transaction deadline.
 	if !deadline.IsEmpty() {
+		// If the deadline certainly cannot be met, return an error which will
+		// be retried explicitly.
+		if txnTs := txn.ReadTimestamp(); deadline.LessEq(txnTs) {
+			return &deadlineExpiredError{
+				txnTS:      txnTs,
+				expiration: deadline,
+			}
+		}
 		return txn.UpdateDeadline(ctx, deadline)
 	}
 	return nil
 }
 
-func (ld *leasedDescriptors) getDeadline() (deadline hlc.Timestamp, haveDeadline bool) {
+// deadlineExpiredError is returned when the deadline from either a descriptor
+// lease or a sqlliveness session is before the current transaction timestamp.
+// The error is a user-visible retry.
+type deadlineExpiredError struct {
+	txnTS, expiration hlc.Timestamp
+}
+
+func (e *deadlineExpiredError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("liveness session expired %v before transaction",
+		e.txnTS.GoTime().Sub(e.expiration.GoTime()))
+	return nil
+}
+
+func (e *deadlineExpiredError) ClientVisibleRetryError() {}
+
+func (e *deadlineExpiredError) Error() string {
+	return fmt.Sprint(errors.Formattable(e))
+}
+
+var _ errors.SafeFormatter = (*deadlineExpiredError)(nil)
+
+func (ld *leasedDescriptors) getDeadline(
+	ctx context.Context,
+) (deadline hlc.Timestamp, haveDeadline bool) {
 	_ = ld.cache.IterateByID(func(descriptor catalog.NameEntry) error {
-		expiration := descriptor.(lease.LeasedDescriptor).Expiration()
+		expiration := descriptor.(lease.LeasedDescriptor).Expiration(ctx)
 		if !haveDeadline || expiration.Less(deadline) {
 			deadline, haveDeadline = expiration, true
 		}

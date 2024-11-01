@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metric
 
@@ -50,17 +45,6 @@ func TestRuleRegistry(t *testing.T) {
 	require.Nil(t, err)
 	registry := NewRuleRegistry()
 	registry.AddRule(rule)
-	require.NotNil(t, registry.getRuleForTest(testRule))
-	require.Nil(t, registry.getRuleForTest("invalid"))
-}
-
-func (r *RuleRegistry) getRuleForTest(ruleName string) Rule {
-	r.Lock()
-	defer r.Unlock()
-	for _, rule := range r.rules {
-		if rule.Name() == ruleName {
-			return rule
-		}
-	}
-	return nil
+	require.NotNil(t, registry.GetRuleForTest(testRule))
+	require.Nil(t, registry.GetRuleForTest("invalid"))
 }

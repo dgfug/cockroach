@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package dumpstore
 
@@ -144,13 +139,7 @@ func TestRemoveOldAndTooBig(t *testing.T) {
 
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			path, err := ioutil.TempDir("", "remove")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = os.RemoveAll(path) }()
-
-			files := populate(t, path, tc.startFiles, tc.sizes)
+			files := populate(t, t.TempDir(), tc.startFiles, tc.sizes)
 
 			cleaned := []string{}
 			cleanupFn := func(s string) error {

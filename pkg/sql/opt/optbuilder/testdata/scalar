@@ -879,9 +879,8 @@ concat [type=int[]]
  ├── array: [type=int[]]
  │    ├── const: 1 [type=int]
  │    └── const: 2 [type=int]
- └── cast: INT8 [type=int]
-      └── cast: INT2 [type=int2]
-           └── null [type=unknown]
+ └── cast: INT2 [type=int2]
+      └── null [type=unknown]
 
 build-scalar
 NULL::bigint || ARRAY[1, 2]
@@ -1280,7 +1279,21 @@ project
 build
 SELECT ARRAY(SELECT y FROM u ORDER BY x) FROM v
 ----
-error (0A000): unimplemented: can't execute a correlated ARRAY(...) over int[]
+project
+ ├── columns: array:10
+ ├── scan v
+ │    └── columns: v.y:1 v.rowid:2!null v.crdb_internal_mvcc_timestamp:3 v.tableoid:4
+ └── projections
+      └── array-flatten col=9 [as=array:10]
+           └── sort
+                ├── columns: y:9  [hidden: x:5]
+                ├── ordering: +5
+                └── project
+                     ├── columns: y:9 x:5
+                     ├── scan u
+                     │    └── columns: x:5 u.rowid:6!null u.crdb_internal_mvcc_timestamp:7 u.tableoid:8
+                     └── projections
+                          └── v.y:1 [as=y:9]
 
 build-scalar
 ISERROR(1/0)
@@ -1344,10 +1357,9 @@ case [type=oid]
  ├── when [type=oid]
  │    ├── true [type=bool]
  │    └── const: 1234 [type=oid]
- └── coalesce [type=oid]
-      ├── cast: OID [type=oid]
-      │    └── null [type=unknown]
-      └── cast: OID [type=oid]
+ └── cast: OID [type=oid]
+      └── coalesce [type=unknown]
+           ├── null [type=unknown]
            └── null [type=unknown]
 
 # Make sure NULL arguments for AND/OR/NOT are typed as boolean.
@@ -1471,7 +1483,7 @@ error: unsupported comparison operator: <geometry[]> && <geometry>
 # Regression test for #57959. Ensure that the CASE statement is typed as
 # string[].
 build-scalar vars=(a varbit)
-(CASE WHEN (a) IN (a) THEN ARRAY[NULL] ELSE ARRAY[] END) IS NULL
+(CASE WHEN (a) IN (a) THEN ARRAY[] ELSE ARRAY[NULL] END) IS NULL
 ----
 is [type=bool]
  ├── case [type=string[]]
@@ -1482,6 +1494,201 @@ is [type=bool]
  │    │    │    └── tuple [type=tuple{varbit}]
  │    │    │         └── variable: a:1 [type=varbit]
  │    │    └── array: [type=string[]]
- │    │         └── null [type=unknown]
  │    └── array: [type=string[]]
+ │         └── null [type=unknown]
  └── null [type=unknown]
+
+build-scalar vars=(a varbit)
+(CASE WHEN (a) IN (a) THEN ARRAY[NULL] ELSE ARRAY[] END) IS NULL
+----
+error: incompatible value type: cannot determine type of empty array. Consider casting to the desired type, for example ARRAY[]::int[]
+
+# Regression test for #75365. Do not create invalid casts when building CASE
+# expressions. We build a Select expressions here instead of a scalar so that
+# logical properties are generated, which is required to reproduce the bug.
+build
+SELECT CASE WHEN false THEN ARRAY[]::RECORD[] ELSE ARRAY[('', 0)] END
+----
+project
+ ├── columns: array:1!null
+ ├── values
+ │    └── ()
+ └── projections
+      └── CASE WHEN false THEN ARRAY[] ELSE ARRAY[('', 0)]::RECORD[] END [as=array:1]
+
+build
+SELECT CASE WHEN false THEN ARRAY[('', 0)] WHEN true THEN ARRAY[('', 0)] ELSE ARRAY[]::RECORD[] END
+----
+project
+ ├── columns: array:1!null
+ ├── values
+ │    └── ()
+ └── projections
+      └── CASE WHEN false THEN ARRAY[('', 0)]::RECORD[] WHEN true THEN ARRAY[('', 0)]::RECORD[] ELSE ARRAY[] END [as=array:1]
+
+build
+SELECT CASE WHEN false THEN ARRAY[('', 0)] ELSE ARRAY[]::RECORD[] END
+----
+project
+ ├── columns: array:1!null
+ ├── values
+ │    └── ()
+ └── projections
+      └── CASE WHEN false THEN ARRAY[('', 0)]::RECORD[] ELSE ARRAY[] END [as=array:1]
+
+build
+SELECT CASE WHEN false THEN ARRAY[('', 0)] WHEN true THEN ARRAY[]::RECORD[] ELSE ARRAY[('', 0)] END
+----
+project
+ ├── columns: array:1!null
+ ├── values
+ │    └── ()
+ └── projections
+      └── CASE WHEN false THEN ARRAY[('', 0)]::RECORD[] WHEN true THEN ARRAY[] ELSE ARRAY[('', 0)]::RECORD[] END [as=array:1]
+
+# Regression test for #76807. Do not create invalid casts when building COALESCE
+# and IF expressions.
+build
+SELECT COALESCE(t.v, ARRAY[]:::RECORD[])
+FROM (VALUES (ARRAY[(1, 'foo')])) AS t(v)
+----
+project
+ ├── columns: coalesce:2
+ ├── values
+ │    ├── columns: column1:1
+ │    └── (ARRAY[(1, 'foo')],)
+ └── projections
+      └── COALESCE(column1:1::RECORD[], ARRAY[]) [as=coalesce:2]
+
+build
+SELECT COALESCE(ARRAY[]:::RECORD[], t.v)
+FROM (VALUES (ARRAY[(1, 'foo')])) AS t(v)
+----
+project
+ ├── columns: coalesce:2
+ ├── values
+ │    ├── columns: column1:1
+ │    └── (ARRAY[(1, 'foo')],)
+ └── projections
+      └── COALESCE(ARRAY[], column1:1::RECORD[]) [as=coalesce:2]
+
+build
+SELECT IF(true, t.v, ARRAY[]:::RECORD[])
+FROM (VALUES (ARRAY[(1, 'foo')])) AS t(v)
+----
+project
+ ├── columns: if:2
+ ├── values
+ │    ├── columns: column1:1
+ │    └── (ARRAY[(1, 'foo')],)
+ └── projections
+      └── CASE WHEN true THEN column1:1::RECORD[] ELSE ARRAY[] END [as=if:2]
+
+build
+SELECT IF(true, ARRAY[]:::RECORD[], t.v)
+FROM (VALUES (ARRAY[(1, 'foo')])) AS t(v)
+----
+project
+ ├── columns: if:2
+ ├── values
+ │    ├── columns: column1:1
+ │    └── (ARRAY[(1, 'foo')],)
+ └── projections
+      └── CASE WHEN true THEN ARRAY[] ELSE column1:1::RECORD[] END [as=if:2]
+
+# Regression test for #102110. Ensure that CASE is typed correctly when
+# different types are used in different branches.
+exec-ddl
+CREATE TABLE t102110_1 (t TEXT);
+----
+
+exec-ddl
+CREATE TABLE t102110_2 (c CHAR);
+----
+
+build
+SELECT t102110_1.t FROM t102110_1, t102110_2
+WHERE t102110_1.t NOT BETWEEN t102110_1.t AND
+  (CASE WHEN NULL THEN t102110_2.c ELSE t102110_1.t END);
+----
+project
+ ├── columns: t:1
+ └── select
+      ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      ├── inner-join (cross)
+      │    ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    ├── scan t102110_1
+      │    │    └── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4
+      │    ├── scan t102110_2
+      │    │    └── columns: c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    └── filters (true)
+      └── filters
+           └── NOT ((t:1 >= t:1) AND (t:1 <= CASE WHEN NULL THEN c:5::STRING ELSE t:1 END))
+
+build
+SELECT t102110_1.t FROM t102110_1, t102110_2
+WHERE t102110_1.t NOT BETWEEN t102110_1.t AND
+  (CASE WHEN NULL THEN t102110_1.t ELSE t102110_2.c END);
+----
+project
+ ├── columns: t:1
+ └── select
+      ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      ├── inner-join (cross)
+      │    ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    ├── scan t102110_1
+      │    │    └── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4
+      │    ├── scan t102110_2
+      │    │    └── columns: c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    └── filters (true)
+      └── filters
+           └── NOT ((t:1 >= t:1) AND (t:1 <= CASE WHEN NULL THEN t:1::BPCHAR ELSE c:5::BPCHAR END))
+
+# IF is typed differently (Postgres does not support IF).
+build
+SELECT t102110_1.t FROM t102110_1, t102110_2
+WHERE t102110_1.t NOT BETWEEN t102110_1.t AND
+  IF(NULL, t102110_2.c, t102110_1.t);
+----
+project
+ ├── columns: t:1
+ └── select
+      ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      ├── inner-join (cross)
+      │    ├── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4 c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    ├── scan t102110_1
+      │    │    └── columns: t:1 t102110_1.rowid:2!null t102110_1.crdb_internal_mvcc_timestamp:3 t102110_1.tableoid:4
+      │    ├── scan t102110_2
+      │    │    └── columns: c:5 t102110_2.rowid:6!null t102110_2.crdb_internal_mvcc_timestamp:7 t102110_2.tableoid:8
+      │    └── filters (true)
+      └── filters
+           └── NOT ((t:1 >= t:1) AND (t:1 <= CASE NULL WHEN true THEN c:5 ELSE t:1::BPCHAR END))
+
+exec-ddl
+CREATE TABLE t108360_1 (t TEXT)
+----
+
+exec-ddl
+CREATE TABLE t108360_2 (c CHAR)
+----
+
+build
+SELECT (CASE WHEN t108360_1.t > t108360_2.c THEN t108360_1.t ELSE t108360_2.c END)
+FROM t108360_1, t108360_2
+WHERE t108360_1.t = (CASE WHEN t108360_1.t > t108360_2.c THEN t108360_1.t ELSE t108360_2.c END);
+----
+project
+ ├── columns: c:9
+ ├── select
+ │    ├── columns: t:1!null t108360_1.rowid:2!null t108360_1.crdb_internal_mvcc_timestamp:3 t108360_1.tableoid:4 t108360_2.c:5 t108360_2.rowid:6!null t108360_2.crdb_internal_mvcc_timestamp:7 t108360_2.tableoid:8
+ │    ├── inner-join (cross)
+ │    │    ├── columns: t:1 t108360_1.rowid:2!null t108360_1.crdb_internal_mvcc_timestamp:3 t108360_1.tableoid:4 t108360_2.c:5 t108360_2.rowid:6!null t108360_2.crdb_internal_mvcc_timestamp:7 t108360_2.tableoid:8
+ │    │    ├── scan t108360_1
+ │    │    │    └── columns: t:1 t108360_1.rowid:2!null t108360_1.crdb_internal_mvcc_timestamp:3 t108360_1.tableoid:4
+ │    │    ├── scan t108360_2
+ │    │    │    └── columns: t108360_2.c:5 t108360_2.rowid:6!null t108360_2.crdb_internal_mvcc_timestamp:7 t108360_2.tableoid:8
+ │    │    └── filters (true)
+ │    └── filters
+ │         └── t:1 = CASE WHEN t:1 > t108360_2.c:5 THEN t:1::BPCHAR ELSE t108360_2.c:5::BPCHAR END
+ └── projections
+      └── CASE WHEN t:1 > t108360_2.c:5 THEN t:1::BPCHAR ELSE t108360_2.c:5::BPCHAR END [as=c:9]

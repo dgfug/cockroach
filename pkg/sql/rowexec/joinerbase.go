@@ -1,23 +1,19 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,16 +21,19 @@ import (
 type joinerBase struct {
 	execinfra.ProcessorBase
 
-	joinType    descpb.JoinType
-	onCond      execinfrapb.ExprHelper
-	emptyLeft   rowenc.EncDatumRow
-	emptyRight  rowenc.EncDatumRow
+	joinType descpb.JoinType
+	onCond   execinfrapb.ExprHelper
+	// combinedRow has enough space for both the left and right input rows even
+	// if only columns from one side of the join are included in the output.
+	// This allows storing values for columns referenced in the ON condition,
+	// which can originate from either side of the join. combinedRow also
+	// includes space for the value of the continuation column, if necessary.
 	combinedRow rowenc.EncDatumRow
-
-	// EqCols contains the indices of the columns that are constrained to be
-	// equal. Specifically column EqCols[0][i] on the left side must match the
-	// column EqCols[1][i] on the right side.
-	eqCols [2][]uint32
+	// outputSize is the number of columns in the output row, not including the
+	// continuation column. It is only equal to the length of combinedRow when
+	// both the left and right columns are included in the output, and when
+	// there is no continuation column.
+	outputSize int
 }
 
 // Init initializes the joinerBase.
@@ -42,6 +41,7 @@ type joinerBase struct {
 // opts is passed along to the underlying ProcessorBase. The zero value is used
 // if the processor using the joinerBase is not implementing RowSource.
 func (jb *joinerBase) init(
+	ctx context.Context,
 	self execinfra.RowSource,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
@@ -49,56 +49,52 @@ func (jb *joinerBase) init(
 	rightTypes []*types.T,
 	jType descpb.JoinType,
 	onExpr execinfrapb.Expression,
-	leftEqColumns []uint32,
-	rightEqColumns []uint32,
 	outputContinuationColumn bool,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 	opts execinfra.ProcStateOpts,
-) error {
+) (*eval.Context, error) {
 	jb.joinType = jType
 
 	if jb.joinType.IsSetOpJoin() {
 		if !onExpr.Empty() {
-			return errors.Errorf("expected empty onExpr, got %v", onExpr)
+			return nil, errors.Errorf("expected empty onExpr, got %v", onExpr)
 		}
 	}
 
-	jb.emptyLeft = make(rowenc.EncDatumRow, len(leftTypes))
-	for i := range jb.emptyLeft {
-		jb.emptyLeft[i] = rowenc.DatumToEncDatum(leftTypes[i], tree.DNull)
-	}
-	jb.emptyRight = make(rowenc.EncDatumRow, len(rightTypes))
-	for i := range jb.emptyRight {
-		jb.emptyRight[i] = rowenc.DatumToEncDatum(rightTypes[i], tree.DNull)
-	}
-
-	jb.eqCols[leftSide] = leftEqColumns
-	jb.eqCols[rightSide] = rightEqColumns
-
-	rowSize := len(leftTypes) + len(rightTypes)
+	// Allocate enough space to fit the left row, right row, and continuation
+	// column.
+	combinedRowSize := len(leftTypes) + len(rightTypes)
 	if outputContinuationColumn {
 		// NB: Can only be true for inner joins and left outer joins.
-		rowSize++
+		combinedRowSize++
 	}
-	jb.combinedRow = make(rowenc.EncDatumRow, rowSize)
+	jb.combinedRow = make(rowenc.EncDatumRow, combinedRowSize)
 
 	onCondTypes := make([]*types.T, 0, len(leftTypes)+len(rightTypes))
 	onCondTypes = append(onCondTypes, leftTypes...)
 	onCondTypes = append(onCondTypes, rightTypes...)
 
-	outputTypes := jType.MakeOutputTypes(leftTypes, rightTypes)
+	var outputTypes []*types.T
 	if outputContinuationColumn {
-		outputTypes = append(outputTypes, types.Bool)
+		outputTypes = jType.MakeOutputTypesWithContinuationColumn(leftTypes, rightTypes)
+		jb.outputSize = len(outputTypes) - 1
+	} else {
+		outputTypes = jType.MakeOutputTypes(leftTypes, rightTypes)
+		jb.outputSize = len(outputTypes)
 	}
 
-	if err := jb.ProcessorBase.Init(
-		self, post, outputTypes, flowCtx, processorID, output, nil /* memMonitor */, opts,
-	); err != nil {
-		return err
+	evalCtx := flowCtx.EvalCtx
+	if !onExpr.Empty() {
+		// Only make a copy if we need to evaluate ON expression.
+		evalCtx = flowCtx.NewEvalCtx()
 	}
-	semaCtx := flowCtx.TypeResolverFactory.NewSemaContext(flowCtx.EvalCtx.Txn)
-	return jb.onCond.Init(onExpr, onCondTypes, semaCtx, jb.EvalCtx)
+	if err := jb.ProcessorBase.InitWithEvalCtx(
+		ctx, self, post, outputTypes, flowCtx, evalCtx, processorID, nil /* memMonitor */, opts,
+	); err != nil {
+		return nil, err
+	}
+	semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
+	return evalCtx, jb.onCond.Init(ctx, onExpr, onCondTypes, semaCtx, evalCtx)
 }
 
 // joinSide is the utility type to distinguish between two sides of the join.
@@ -118,19 +114,73 @@ func (j joinSide) String() string {
 	return "right"
 }
 
+// emptyRow is used for rendering unmatched rows in outer and anti-joins.
+var emptyRow = [16]rowenc.EncDatum{
+	rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(),
+	rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(),
+	rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(),
+	rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(), rowenc.NullEncDatum(),
+}
+
+// copyEmptyRow copies NULL values into dst.
+func copyEmptyRow(dst []rowenc.EncDatum) {
+	for len(dst) > 0 {
+		n := copy(dst, emptyRow[:])
+		dst = dst[n:]
+	}
+}
+
 // renderUnmatchedRow creates a result row given an unmatched row on either
 // side. Only used for outer and anti joins. Note that if the join is outputting
 // a continuation column, the returned slice does not include the continuation
 // column, but has the capacity for it.
 func (jb *joinerBase) renderUnmatchedRow(row rowenc.EncDatumRow, side joinSide) rowenc.EncDatumRow {
-	lrow, rrow := jb.emptyLeft, jb.emptyRight
-	if side == leftSide {
-		lrow = row
-	} else {
-		rrow = row
+	// Return row if the empty side of the join should not be rendered.
+	if (side == leftSide && !jb.joinType.ShouldIncludeRightColsInOutput()) ||
+		(side == rightSide && !jb.joinType.ShouldIncludeLeftColsInOutput()) {
+		return row
 	}
 
-	return jb.renderForOutput(lrow, rrow)
+	// Return an empty row if the non-empty side of the join should not be
+	// rendered.
+	if (side == leftSide && !jb.joinType.ShouldIncludeLeftColsInOutput()) ||
+		(side == rightSide && !jb.joinType.ShouldIncludeRightColsInOutput()) {
+		copyEmptyRow(jb.combinedRow[:jb.outputSize])
+		return jb.combinedRow[:jb.outputSize]
+	}
+
+	// Otherwise, combine row and NULLs in combined row. First, determine which
+	// side of the row should be filled with NULLs.
+	var nonEmpty rowenc.EncDatumRow
+	var empty rowenc.EncDatumRow
+	if side == leftSide {
+		nonEmpty = jb.combinedRow[:len(row)]
+		empty = jb.combinedRow[len(row):jb.outputSize]
+	} else {
+		split := jb.outputSize - len(row)
+		empty = jb.combinedRow[:split]
+		nonEmpty = jb.combinedRow[split:jb.outputSize]
+	}
+
+	// Copy the non-empty side of the row.
+	if len(nonEmpty) == 1 {
+		// If the slice is of length 1, it is faster to use direct assignment
+		// instead of copy.
+		nonEmpty[0] = row[0]
+	} else {
+		copy(nonEmpty, row)
+	}
+
+	// Copy the empty side of the row.
+	if len(empty) == 1 {
+		// If the slice is of length 1, it is faster to use direct assignment
+		// instead of copyEmptyRow.
+		empty[0] = rowenc.NullEncDatum()
+	} else {
+		copyEmptyRow(empty)
+	}
+
+	return jb.combinedRow[:jb.outputSize]
 }
 
 // shouldEmitUnmatchedRow determines if we should emit an unmatched row (with
@@ -166,7 +216,7 @@ func shouldEmitUnmatchedRow(side joinSide, joinType descpb.JoinType) bool {
 func (jb *joinerBase) render(lrow, rrow rowenc.EncDatumRow) (rowenc.EncDatumRow, error) {
 	outputRow := jb.renderForOutput(lrow, rrow)
 
-	if jb.onCond.Expr != nil {
+	if jb.onCond.Expr() != nil {
 		// We need to evaluate the ON condition which can refer to the columns
 		// from both sides of the join regardless of the join type, so we need
 		// to have the combined row.
@@ -178,7 +228,7 @@ func (jb *joinerBase) render(lrow, rrow rowenc.EncDatumRow) (rowenc.EncDatumRow,
 		} else {
 			combinedRow = jb.combine(lrow, rrow)
 		}
-		res, err := jb.onCond.EvalFilter(combinedRow)
+		res, err := jb.onCond.EvalFilter(jb.Ctx(), combinedRow)
 		if !res || err != nil {
 			return nil, err
 		}
@@ -215,15 +265,4 @@ func (jb *joinerBase) renderForOutput(lrow, rrow rowenc.EncDatumRow) rowenc.EncD
 		return lrow
 	}
 	return jb.combine(lrow, rrow)
-}
-
-// addColumnsNeededByOnExpr updates neededCols to include all IndexedVars from
-// onCond that are used and that have ordinals in [startIdx, endIdx) range.
-// Notably, every added needed column ordinal is shifted down by startIdx.
-func (jb *joinerBase) addColumnsNeededByOnExpr(neededCols *util.FastIntSet, startIdx, endIdx int) {
-	for _, v := range jb.onCond.Vars.GetIndexedVars() {
-		if v.Used && v.Idx >= startIdx && v.Idx < endIdx {
-			neededCols.Add(v.Idx - startIdx)
-		}
-	}
 }

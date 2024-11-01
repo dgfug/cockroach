@@ -1,35 +1,30 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-// "make test" would normally test this file, but it should only be tested
-// within docker compose.
-
-//go:build compose
-// +build compose
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package compare
 
 import (
 	"context"
 	"flag"
-	"io/ioutil"
+	"fmt"
+	"os"
+	"path"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/cmpconn"
+	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/jackc/pgx/v4"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -38,23 +33,34 @@ var (
 )
 
 func TestCompare(t *testing.T) {
+	if os.Getenv("COCKROACH_RUN_COMPOSE_COMPARE") == "" {
+		skip.IgnoreLint(t, "COCKROACH_RUN_COMPOSE_COMPARE not set")
+	}
+	// N.B. randomized SQL workload performed by this test may require CCL
+	var license = envutil.EnvOrDefaultString("COCKROACH_DEV_LICENSE", "")
+	require.NotEmptyf(t, license, "COCKROACH_DEV_LICENSE must be set")
+
+	// Initialize GEOS libraries so that the test can use geospatial types.
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, path.Join(workingDir, "lib"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	uris := map[string]struct {
 		addr string
 		init []string
 	}{
-		"postgres": {
-			addr: "postgresql://postgres@postgres:5432/postgres",
-			init: []string{
-				"drop schema if exists public cascade",
-				"create schema public",
-				"CREATE EXTENSION IF NOT EXISTS postgis",
-				"CREATE EXTENSION IF NOT EXISTS postgis_topology",
-				"CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;",
-			},
-		},
 		"cockroach1": {
 			addr: "postgresql://root@cockroach1:26257/postgres?sslmode=disable",
 			init: []string{
+				"SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing'",
+				"SET extra_float_digits = 0",   // For Postgres Compat when casting floats to strings.
+				"SET null_ordered_last = true", // For Postgres Compat, see https://www.cockroachlabs.com/docs/stable/order-by#parameters
+				fmt.Sprintf("SET CLUSTER SETTING enterprise.license = '%s'", license),
 				"drop database if exists postgres",
 				"create database postgres",
 			},
@@ -62,28 +68,16 @@ func TestCompare(t *testing.T) {
 		"cockroach2": {
 			addr: "postgresql://root@cockroach2:26257/postgres?sslmode=disable",
 			init: []string{
+				"SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing'",
+				"SET extra_float_digits = 0",   // For Postgres Compat when casting floats to strings.
+				"SET null_ordered_last = true", // For Postgres Compat https://www.cockroachlabs.com/docs/stable/order-by#parameters
+				fmt.Sprintf("SET CLUSTER SETTING enterprise.license = '%s'", license),
 				"drop database if exists postgres",
 				"create database postgres",
 			},
 		},
 	}
 	configs := map[string]testConfig{
-		"postgres": {
-			setup:           sqlsmith.Setups[sqlsmith.RandTableSetupName],
-			setupMutators:   []randgen.Mutator{randgen.PostgresCreateTableMutator},
-			opts:            []sqlsmith.SmitherOption{sqlsmith.PostgresMode()},
-			ignoreSQLErrors: true,
-			conns: []testConn{
-				{
-					name:     "cockroach1",
-					mutators: []randgen.Mutator{},
-				},
-				{
-					name:     "postgres",
-					mutators: []randgen.Mutator{randgen.PostgresMutator},
-				},
-			},
-		},
 		"mutators": {
 			setup:           sqlsmith.Setups[sqlsmith.RandTableSetupName],
 			opts:            []sqlsmith.SmitherOption{sqlsmith.CompareMode()},
@@ -96,10 +90,8 @@ func TestCompare(t *testing.T) {
 				{
 					name: "cockroach2",
 					mutators: []randgen.Mutator{
-						randgen.StatisticsMutator,
 						randgen.ForeignKeyMutator,
 						randgen.ColumnFamilyMutator,
-						randgen.StatisticsMutator,
 						randgen.IndexStoringMutator,
 						randgen.PartialIndexMutator,
 					},
@@ -126,7 +118,9 @@ func TestCompare(t *testing.T) {
 			t.Logf("starting test: %s", confName)
 			rng, _ := randutil.NewTestRand()
 			setup := config.setup(rng)
-			setup, _ = randgen.ApplyString(rng, setup, config.setupMutators...)
+			for i := range setup {
+				setup[i], _ = randgen.ApplyString(rng, setup[i], config.setupMutators...)
+			}
 
 			conns := map[string]cmpconn.Conn{}
 			for _, testCn := range config.conns {
@@ -139,16 +133,22 @@ func TestCompare(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer conn.Close()
+
+				defer func(conn cmpconn.Conn) {
+					conn.Close(ctx)
+				}(conn)
+
 				for _, init := range uri.init {
 					if err := conn.Exec(ctx, init); err != nil {
 						t.Fatalf("%s: %v", testCn.name, err)
 					}
 				}
-				connSetup, _ := randgen.ApplyString(rng, setup, testCn.mutators...)
-				if err := conn.Exec(ctx, connSetup); err != nil {
-					t.Log(connSetup)
-					t.Fatalf("%s: %v", testCn.name, err)
+				for i := range setup {
+					stmt, _ := randgen.ApplyString(rng, setup[i], testCn.mutators...)
+					if err := conn.Exec(ctx, stmt); err != nil {
+						t.Log(stmt)
+						t.Fatalf("%s: %v", testCn.name, err)
+					}
 				}
 				conns[testCn.name] = conn
 			}
@@ -174,7 +174,7 @@ func TestCompare(t *testing.T) {
 					ctx, time.Second*30, conns, "" /* prep */, query, config.ignoreSQLErrors,
 				); err != nil {
 					path := filepath.Join(*flagArtifacts, confName+".log")
-					if err := ioutil.WriteFile(path, []byte(err.Error()), 0666); err != nil {
+					if err := os.WriteFile(path, []byte(err.Error()), 0666); err != nil {
 						t.Log(err)
 					}
 					t.Fatal(err)
@@ -182,10 +182,10 @@ func TestCompare(t *testing.T) {
 					ignoredErrCount++
 				}
 				totalQueryCount++
-				// Make sure we can still ping on a connection. If we can't we may have
+				// Make sure we can still ping on a connection. If we can't, we may have
 				// crashed something.
 				for name, conn := range conns {
-					if err := conn.Ping(); err != nil {
+					if err := conn.Ping(ctx); err != nil {
 						t.Log(query)
 						t.Fatalf("%s: ping: %v", name, err)
 					}

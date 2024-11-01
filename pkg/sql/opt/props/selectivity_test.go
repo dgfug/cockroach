@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
@@ -72,6 +67,13 @@ func TestSelectivity(t *testing.T) {
 	test(MinSelectivity(ZeroSelectivity, OneSelectivity), ZeroSelectivity)
 	test(MinSelectivity(ZeroSelectivity, s(epsilon)), ZeroSelectivity)
 	test(MinSelectivity(s(0), s(epsilon)), s(epsilon))
+
+	// MaxSelectivity variations.
+	test(MaxSelectivity(s(0.4), s(0.5)), s(0.5))
+	test(MaxSelectivity(s(0.5), s(0.4)), s(0.5))
+	test(MaxSelectivity(ZeroSelectivity, OneSelectivity), OneSelectivity)
+	test(MaxSelectivity(ZeroSelectivity, s(epsilon)), s(epsilon))
+	test(MaxSelectivity(s(0), s(epsilon)), s(epsilon))
 
 	// selectivityInRange variations.
 	testFloat(selectivityInRange(epsilon), epsilon)

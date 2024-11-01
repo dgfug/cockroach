@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire_test
 
@@ -15,7 +10,7 @@ import (
 	gosql "database/sql"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -29,11 +24,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -46,7 +42,9 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/stdstrings"
 	"github.com/cockroachdb/redact"
+	pgx "github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 // TestAuthenticationAndHBARules exercises the authentication code
@@ -55,69 +53,84 @@ import (
 // It supports the following DSL:
 //
 // config [secure] [insecure]
-//       Only run the test file if the server is in the specified
-//       security mode. (The default is `config secure insecure` i.e.
-//       the test file is applicable to both.)
+//
+//	Only run the test file if the server is in the specified
+//	security mode. (The default is `config secure insecure` i.e.
+//	the test file is applicable to both.)
 //
 // accept_sql_without_tls
-//       Enable TCP connections without TLS in secure mode.
+//
+//	Enable TCP connections without TLS in secure mode.
 //
 // set_hba
 // <hba config>
-//       Load the provided HBA configuration via the cluster setting
-//       server.host_based_authentication.configuration.
-//       The expected output is the configuration after parsing
-//       and reloading in the server.
+//
+//	Load the provided HBA configuration via the cluster setting
+//	server.host_based_authentication.configuration.
+//	The expected output is the configuration after parsing
+//	and reloading in the server.
+//
+// set_identity_map
+// <identity map>
+//
+//	Load the provided identity map via the cluster setting
+//	server.identity_map.configuration.
+//	The expected output is the configuration after parsing
+//	and reloading in the server.
 //
 // sql
 // <sql input>
-//       Execute the specified SQL statement using the default root
-//       connection provided by StartServer().
+//
+//	Execute the specified SQL statement using the default root
+//	connection provided by StartServer().
 //
 // authlog N
 // <regexp>
-//       Expect <regexp> at the end of the auth log then report the
-//       N entries before that.
+//
+//	Expect <regexp> at the end of the auth log then report the
+//	N entries before that.
 //
 // connect [key=value ...]
-//       Attempt a SQL connection using the provided connection
-//       parameters using the pg "DSN notation": k/v pairs separated
-//       by spaces.
-//       The following standard pg keys are recognized:
-//            user - the username
-//            password - the password
-//            host - the server name/address
-//            port - the server port
-//            sslmode, sslrootcert, sslcert, sslkey - SSL parameters.
 //
-//       The order of k/v pairs matters: if the same key is specified
-//       multiple times, the first occurrence takes priority.
+//	Attempt a SQL connection using the provided connection
+//	parameters using the pg "DSN notation": k/v pairs separated
+//	by spaces.
+//	The following standard pg keys are recognized:
+//	     user - the username
+//	     password - the password
+//	     host - the server name/address
+//	     port - the server port
+//	     force_certs - force the use of baked-in certificates
+//	     sslmode, sslrootcert, sslcert, sslkey - SSL parameters.
 //
-//       Additionally, the test runner will always _append_ a default
-//       value for user (root), host/port/sslrootcert from the
-//       initialized test server. This default configuration is placed
-//       at the end so that each test can override the values.
+//	The order of k/v pairs matters: if the same key is specified
+//	multiple times, the first occurrence takes priority.
 //
-//       The test runner also adds a default value for sslcert and
-//       sslkey based on the value of "user" — either when provided by
-//       the test, or root by default.
+//	Additionally, the test runner will always _append_ a default
+//	value for user (root), host/port/sslrootcert from the
+//	initialized test server. This default configuration is placed
+//	at the end so that each test can override the values.
 //
-//       When the user is either "root" or "testuser" (those are the
-//       users for which the test server generates certificates),
-//       sslmode also gets a default of "verify-full". For other
-//       users, sslmode is initialized by default to "verify-ca".
+//	The test runner also adds a default value for sslcert and
+//	sslkey based on the value of "user" — either when provided by
+//	the test, or root by default.
+//
+//	When the user is either "root" or "testuser" (those are the
+//	users for which the test server generates certificates),
+//	sslmode also gets a default of "verify-full". For other
+//	users, sslmode is initialized by default to "verify-ca".
 //
 // For the directives "sql" and "connect", the expected output can be
 // either "ok" (no error) or "ERROR:" followed by the expected error
 // string.
 // The auth and connection log entries, if any, are also produced
 // alongside the "ok" or "ERROR" message.
-//
 func TestAuthenticationAndHBARules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	skip.UnderRace(t, "takes >1min under race")
 
 	testutils.RunTrueAndFalse(t, "insecure", func(t *testing.T, insecure bool) {
+		defer leaktest.AfterTest(t)()
 		hbaRunTest(t, insecure)
 	})
 }
@@ -129,6 +142,7 @@ func makeSocketFile(t *testing.T) (socketDir, socketFile string, cleanupFn func(
 		// Unix sockets not supported on windows.
 		return "", "", func() {}
 	}
+	socketName := ".s.PGSQL." + socketConnVirtualPort
 	// We need a temp directory in which we'll create the unix socket.
 	//
 	// On BSD, binding to a socket is limited to a path length of 104 characters
@@ -136,13 +150,19 @@ func makeSocketFile(t *testing.T) (socketDir, socketFile string, cleanupFn func(
 	//
 	// macOS has a tendency to produce very long temporary directory names, so
 	// we are careful to keep all the constants involved short.
-	tempDir, err := ioutil.TempDir("", "TestAuth")
-	if err != nil {
-		t.Fatal(err)
+	baseTmpDir := os.TempDir()
+	if len(baseTmpDir) >= 104-1-len(socketName)-1-len("TestAuth")-10 {
+		t.Logf("temp dir name too long: %s", baseTmpDir)
+		t.Logf("using /tmp instead.")
+		// Note: /tmp might fail in some systems, that's why we still prefer
+		// os.TempDir() if available.
+		baseTmpDir = "/tmp"
 	}
+	tempDir, err := os.MkdirTemp(baseTmpDir, "TestAuth")
+	require.NoError(t, err)
 	// ".s.PGSQL.NNNN" is the standard unix socket name supported by pg clients.
 	return tempDir,
-		filepath.Join(tempDir, ".s.PGSQL."+socketConnVirtualPort),
+		filepath.Join(tempDir, socketName),
 		func() { _ = os.RemoveAll(tempDir) }
 }
 
@@ -152,7 +172,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 		httpScheme = "https://"
 	}
 
-	datadriven.Walk(t, "testdata/auth", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "auth"), func(t *testing.T, path string) {
 		defer leaktest.AfterTest(t)()
 
 		maybeSocketDir, maybeSocketFile, cleanup := makeSocketFile(t)
@@ -174,38 +194,57 @@ func hbaRunTest(t *testing.T, insecure bool) {
 					CommonSinkConfig: logconfig.CommonSinkConfig{Auditable: &bt},
 				},
 				Channels: logconfig.SelectChannels(channel.SESSIONS),
-			}}
+			},
+			"dev": {
+				FileDefaults: logconfig.FileDefaults{
+					CommonSinkConfig: logconfig.CommonSinkConfig{Auditable: &bt},
+				},
+				Channels: logconfig.SelectChannels(channel.DEV),
+			},
+		}
 		dir := sc.GetDirectory()
 		if err := cfg.Validate(&dir); err != nil {
 			t.Fatal(err)
 		}
-		cleanup, err := log.ApplyConfig(cfg)
+		cleanup, err := log.ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cleanup()
 
 		s, conn, _ := serverutils.StartServer(t,
-			base.TestServerArgs{Insecure: insecure, SocketFile: maybeSocketFile})
+			base.TestServerArgs{
+				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107310),
+				Insecure:          insecure,
+				SocketFile:        maybeSocketFile,
+			})
 		defer s.Stopper().Stop(context.Background())
 
 		// Enable conn/auth logging.
 		// We can't use the cluster settings to do this, because
 		// cluster settings propagate asynchronously.
-		testServer := s.(*server.TestServer)
-		pgServer := s.(*server.TestServer).PGServer()
+		testServer := s.ApplicationLayer()
+		pgServer := testServer.PGServer().(*pgwire.Server)
 		pgServer.TestingEnableConnLogging()
 		pgServer.TestingEnableAuthLogging()
+		testServer.PGPreServer().(*pgwire.PreServeConnHandler).TestingAcceptSystemIdentityOption(true)
 
-		httpClient, err := s.GetAdminAuthenticatedHTTPClient()
+		httpClient, err := s.GetAdminHTTPClient()
 		if err != nil {
 			t.Fatal(err)
 		}
 		httpHBAUrl := httpScheme + s.HTTPAddr() + "/debug/hba_conf"
 
-		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`CREATE USER %s`, security.TestUser)); err != nil {
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`CREATE USER %s`, username.TestUser)); err != nil {
 			t.Fatal(err)
 		}
+
+		// This counter ensures that new log messages have become available
+		// between calls to the authlog command. It avoids the case where
+		// the last line from the previous authlog block also happens to
+		// match the regex for the current authlog block, leading to a
+		// desynchronization between the test script and the logfiles.
+		lastAuthLogCounter := uint64(0)
 
 		datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
 			resultString, err := func() (string, error) {
@@ -227,7 +266,10 @@ func hbaRunTest(t *testing.T, insecure bool) {
 					}
 
 				case "accept_sql_without_tls":
-					testServer.Cfg.AcceptSQLWithoutTLS = true
+					testServer.SetAcceptSQLWithoutTLS(true)
+
+				case "reject_sql_without_tls":
+					testServer.SetAcceptSQLWithoutTLS(false)
 
 				case "set_hba":
 					_, err := conn.ExecContext(context.Background(),
@@ -248,7 +290,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 						}
 					}
 					testutils.SucceedsSoon(t, func() error {
-						curConf := pgServer.GetAuthenticationConfiguration()
+						curConf, _ := pgServer.GetAuthenticationConfiguration()
 						if expConf.String() != curConf.String() {
 							return errors.Newf(
 								"HBA config not yet loaded\ngot:\n%s\nexpected:\n%s",
@@ -264,7 +306,48 @@ func hbaRunTest(t *testing.T, insecure bool) {
 						return "", err
 					}
 					defer resp.Body.Close()
-					body, err := ioutil.ReadAll(resp.Body)
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						return "", err
+					}
+					return string(body), nil
+
+				case "set_identity_map":
+					_, err := conn.ExecContext(context.Background(),
+						`SET CLUSTER SETTING server.identity_map.configuration = $1`, td.Input)
+					if err != nil {
+						return "", err
+					}
+
+					// Wait until the configuration has propagated back to the
+					// test client. We need to wait because the cluster setting
+					// change propagates asynchronously.
+					expConf := identmap.Empty()
+					if td.Input != "" {
+						expConf, err = identmap.From(strings.NewReader(td.Input))
+						if err != nil {
+							// The SET above succeeded so we don't expect a problem here.
+							t.Fatal(err)
+						}
+					}
+					testutils.SucceedsSoon(t, func() error {
+						_, curConf := pgServer.GetAuthenticationConfiguration()
+						if expConf.String() != curConf.String() {
+							return errors.Newf(
+								"identity map not yet loaded\ngot:\n%s\nexpected:\n%s",
+								curConf, expConf)
+						}
+						return nil
+					})
+
+					// Verify the HBA configuration was processed properly by
+					// reporting the resulting cached configuration.
+					resp, err := httpClient.Get(httpHBAUrl)
+					if err != nil {
+						return "", err
+					}
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
 					if err != nil {
 						return "", err
 					}
@@ -329,6 +412,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 								// Erase non-deterministic fields.
 								info["Timestamp"] = "XXX"
 								info["RemoteAddress"] = "XXX"
+								info["SessionID"] = "XXX"
 								if _, ok := info["Duration"]; ok {
 									info["Duration"] = "NNN"
 								}
@@ -342,6 +426,10 @@ func hbaRunTest(t *testing.T, insecure bool) {
 							if !re.MatchString(lastLogMsg) {
 								return errors.Newf("last entry does not match: %q", lastLogMsg)
 							}
+							if lastAuthLogCounter == entries[0].Counter {
+								return errors.Newf("log counter has not advanced beyond: %d", lastAuthLogCounter)
+							}
+							lastAuthLogCounter = entries[0].Counter
 						}
 						return nil
 					}); err != nil {
@@ -355,23 +443,70 @@ func hbaRunTest(t *testing.T, insecure bool) {
 						return td.Expected, nil
 					}
 
+					// We use rmArg to prevent test-only connection parameters to
+					// leak to the session var option parser.
+					rmArg := func(key string) {
+						for i, a := range td.CmdArgs {
+							if a.Key == key {
+								td.CmdArgs = append(td.CmdArgs[:i], td.CmdArgs[i+1:]...)
+								return
+							}
+						}
+					}
+
 					// Prepare a connection string using the server's default.
 					// What is the user requested by the test?
-					user := security.RootUser
+					user := username.RootUser
 					if td.HasArg("user") {
 						td.ScanArgs(t, "user", &user)
+					}
+
+					// Allow connections for non-root, non-testuser to force the
+					// use of client certificates.
+					forceCerts := false
+					if td.HasArg("force_certs") {
+						rmArg("force_certs")
+						forceCerts = true
+					}
+
+					// Whether to display the system identity as well (to test remappings).
+					showSystemIdentity := false
+					if td.HasArg("show_system_identity") {
+						rmArg("show_system_identity")
+						showSystemIdentity = true
+					}
+
+					// Whether to display the authentication_method as well.
+					showAuthMethod := false
+					if td.HasArg("show_authentication_method") {
+						rmArg("show_authentication_method")
+						showAuthMethod = true
+					}
+
+					certName := ""
+					if td.HasArg("cert_name") {
+						td.ScanArgs(t, "cert_name", &certName)
+						rmArg("cert_name")
+					}
+
+					systemIdentity := user
+					explicitSystemIdentity := td.HasArg("system_identity")
+					if explicitSystemIdentity {
+						td.ScanArgs(t, "system_identity", &systemIdentity)
+						rmArg("system_identity")
 					}
 
 					// We want the certs to be present in the filesystem for this test.
 					// However, certs are only generated for users "root" and "testuser" specifically.
 					sqlURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(
-						t, s.ServingSQLAddr(), t.Name(), url.User(user),
-						user == security.RootUser || user == security.TestUser /* withClientCerts */)
+						t, s.AdvSQLAddr(), t.Name(), url.User(systemIdentity),
+						forceCerts || systemIdentity == username.RootUser ||
+							systemIdentity == username.TestUser, certName)
 					defer cleanupFn()
 
 					var host, port string
 					if td.Cmd == "connect" {
-						host, port, err = net.SplitHostPort(s.ServingSQLAddr())
+						host, port, err = net.SplitHostPort(s.AdvSQLAddr())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -403,6 +538,12 @@ func hbaRunTest(t *testing.T, insecure bool) {
 						args = append(args,
 							datadriven.CmdArg{Key: key, Vals: []string{options.Get(key)}})
 					}
+
+					if explicitSystemIdentity {
+						args = append(args,
+							datadriven.CmdArg{Key: "options", Vals: []string{"-csystem_identity=" + systemIdentity}})
+					}
+
 					// Now turn the cmdargs into a dsn.
 					var dsnBuf strings.Builder
 					sp := ""
@@ -434,11 +575,37 @@ func hbaRunTest(t *testing.T, insecure bool) {
 						return "", err
 					}
 					row := dbSQL.QueryRow("SELECT current_catalog")
-					var dbName string
-					if err := row.Scan(&dbName); err != nil {
+					var result string
+					if err := row.Scan(&result); err != nil {
 						return "", err
 					}
-					return "ok " + dbName, nil
+					if showSystemIdentity {
+						row := dbSQL.QueryRow(`SHOW system_identity`)
+						var name string
+						if err := row.Scan(&name); err != nil {
+							t.Fatal(err)
+						}
+						result += " " + name
+					}
+					if showAuthMethod {
+						var method, methodFromShowSessions string
+						row := dbSQL.QueryRow(`SHOW authentication_method`)
+						if err := row.Scan(&method); err != nil {
+							t.Fatal(err)
+						}
+						// Verify that the session variable agrees with the information
+						// in SHOW SESSIONS.
+						row = dbSQL.QueryRow(`SELECT authentication_method FROM [SHOW SESSIONS] WHERE session_id = current_setting('session_id');`)
+						if err := row.Scan(&methodFromShowSessions); err != nil {
+							t.Fatal(err)
+						}
+						if method != methodFromShowSessions {
+							t.Fatalf("SHOW SESSIONS disagrees with SHOW: %s vs %s", method, methodFromShowSessions)
+						}
+						result += " " + method
+					}
+
+					return "ok " + result, nil
 
 				default:
 					td.Fatalf(t, "unknown command: %s", td.Cmd)
@@ -466,6 +633,13 @@ func fmtErr(err error) string {
 			}
 			if pqErr.Hint != "" {
 				hint := strings.Replace(pqErr.Hint, stdstrings.IssueReferral, "<STANDARD REFERRAL>", 1)
+				if strings.Contains(hint, "Supported methods:") {
+					// Depending on whether the test is running on linux or not
+					// (or, more specifically, whether gss build tag is set),
+					// "gss" method might not be included, so we remove it here
+					// and not include into the expected output.
+					hint = strings.Replace(hint, "gss, ", "", 1)
+				}
 				errStr += "\nHINT: " + hint
 			}
 			if pqErr.Detail != "" {
@@ -487,26 +661,26 @@ func TestClientAddrOverride(t *testing.T) {
 	defer sc.Close(t)
 
 	// Start a server.
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
 
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(security.TestUser),
-	)
+	s := srv.ApplicationLayer()
+
+	pgURL, cleanupFunc := s.PGUrl(t, serverutils.CertsDirPrefix("testClientAddrOverride"), serverutils.User(username.TestUser))
 	defer cleanupFunc()
 
 	// Ensure the test user exists.
-	if _, err := db.Exec(fmt.Sprintf(`CREATE USER %s`, security.TestUser)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`CREATE USER %s`, username.TestUser)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Enable conn/auth logging.
 	// We can't use the cluster settings to do this, because
 	// cluster settings for booleans propagate asynchronously.
-	testServer := s.(*server.TestServer)
-	pgServer := testServer.PGServer()
+	pgServer := s.PGServer().(*pgwire.Server)
 	pgServer.TestingEnableAuthLogging()
+	pgPreServer := s.PGPreServer().(*pgwire.PreServeConnHandler)
 
 	testCases := []struct {
 		specialAddr string
@@ -527,7 +701,7 @@ func TestClientAddrOverride(t *testing.T) {
 				addr = addr[1 : len(addr)-1]
 				mask = "128"
 			}
-			hbaConf := "host all " + security.TestUser + " " + addr + "/" + mask + " reject\n" +
+			hbaConf := "host all " + username.TestUser + " " + addr + "/" + mask + " reject\n" +
 				"host all all all cert-password\n"
 			if _, err := db.Exec(
 				`SET CLUSTER SETTING server.host_based_authentication.configuration = $1`,
@@ -545,7 +719,7 @@ func TestClientAddrOverride(t *testing.T) {
 				t.Fatal(err)
 			}
 			testutils.SucceedsSoon(t, func() error {
-				curConf := pgServer.GetAuthenticationConfiguration()
+				curConf, _ := pgServer.GetAuthenticationConfiguration()
 				if expConf.String() != curConf.String() {
 					return errors.Newf(
 						"HBA config not yet loaded\ngot:\n%s\nexpected:\n%s",
@@ -562,7 +736,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-reject-override", func(t *testing.T) {
 				// Connect a first time, with trust override disabled. In that case,
 				// the server will complain that the remote override is not supported.
-				_ = pgServer.TestingSetTrustClientProvidedRemoteAddr(false)
+				_ = pgPreServer.TestingSetTrustClientProvidedRemoteAddr(false)
 
 				testDB, err := gosql.Open("postgres", pgURL.String())
 				if err != nil {
@@ -583,7 +757,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-hba-uses-override", func(t *testing.T) {
 				// Now recognize the override. Now we're expecting the connection
 				// to hit the HBA rule and fail with an authentication error.
-				_ = pgServer.TestingSetTrustClientProvidedRemoteAddr(true)
+				_ = pgPreServer.TestingSetTrustClientProvidedRemoteAddr(true)
 
 				testDB, err := gosql.Open("postgres", pgURL.String())
 				if err != nil {
@@ -598,7 +772,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-log-uses-override", func(t *testing.T) {
 				// Wait for the disconnection event in logs.
 				testutils.SucceedsSoon(t, func() error {
-					log.Flush()
+					log.FlushFiles()
 					entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, sessionTerminatedRe,
 						log.WithMarkedSensitiveData)
 					if err != nil {
@@ -611,7 +785,7 @@ func TestClientAddrOverride(t *testing.T) {
 				})
 
 				// Now we want to check that the logging tags are also updated.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, authLogFileRe,
 					log.WithMarkedSensitiveData)
 				if err != nil {
@@ -625,7 +799,7 @@ func TestClientAddrOverride(t *testing.T) {
 					t.Log(e.Tags)
 					if strings.Contains(e.Tags, "client=") {
 						seenClient = true
-						if !strings.Contains(e.Tags, "client="+string(redact.StartMarker())+tc.specialAddr+":"+tc.specialPort+string(redact.EndMarker())) {
+						if !strings.Contains(e.Tags, "client="+tc.specialAddr+":"+tc.specialPort) {
 							t.Fatalf("expected override addr in log tags, got %+v", e)
 						}
 					}
@@ -636,6 +810,67 @@ func TestClientAddrOverride(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestSSLSessionVar checks that the read-only SSL session variable correctly
+// reflects the state of the connection.
+func TestSSLSessionVar(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	ctx := context.Background()
+	// Start a server.
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
+	// Ensure the test user exists.
+	if _, err := db.Exec(fmt.Sprintf(`CREATE USER %s WITH PASSWORD 'abc'`, username.TestUser)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set the system layer to accept SQL without TLS in the event of a shared
+	// process virtual cluster.
+	srv.SystemLayer().SetAcceptSQLWithoutTLS(true)
+
+	// TODO(herko): What effect should this have on a shared process virtual
+	// cluster? See: https://github.com/cockroachdb/cockroach/issues/112961
+	s.SetAcceptSQLWithoutTLS(true)
+
+	pgURLWithCerts, cleanupFuncCerts := s.PGUrl(t,
+		serverutils.CertsDirPrefix("TestSSLSessionVarCerts"),
+		serverutils.User(username.TestUser),
+		serverutils.ClientCerts(true),
+	)
+	defer cleanupFuncCerts()
+
+	pgURLWithoutCerts, cleanupFuncWithoutCerts := s.PGUrl(t,
+		serverutils.CertsDirPrefix("TestSSLSessionVarNoCerts"),
+		serverutils.UserPassword(username.TestUser, "abc"),
+		serverutils.ClientCerts(false),
+	)
+	defer cleanupFuncWithoutCerts()
+
+	q := pgURLWithoutCerts.Query()
+	q.Set("sslmode", "disable")
+	pgURLWithoutCerts.RawQuery = q.Encode()
+
+	// Connect with certs.
+	connWithCerts, err := pgx.Connect(ctx, pgURLWithCerts.String())
+	require.NoError(t, err)
+	var result string
+	err = connWithCerts.QueryRow(ctx, "SHOW ssl").Scan(&result)
+	require.NoError(t, err)
+	require.Equal(t, "on", result)
+
+	// Connect without certs.
+	connWithoutCerts, err := pgx.Connect(ctx, pgURLWithoutCerts.String())
+	require.NoError(t, err)
+	err = connWithoutCerts.QueryRow(ctx, "SHOW ssl").Scan(&result)
+	require.NoError(t, err)
+	require.Equal(t, "off", result)
 }
 
 var sessionTerminatedRe = regexp.MustCompile("client_session_end")

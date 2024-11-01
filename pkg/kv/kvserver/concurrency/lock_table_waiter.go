@@ -1,29 +1,26 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package concurrency
 
 import (
-	"bytes"
 	"context"
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -31,81 +28,64 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"go.opentelemetry.io/otel/attribute"
 )
 
-// LockTableLivenessPushDelay sets the delay before pushing in order to detect
-// coordinator failures of conflicting transactions.
-var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
-	"kv.lock_table.coordinator_liveness_push_delay",
-	"the delay before pushing in order to detect coordinator failures of conflicting transactions",
-	// This is set to a short duration to ensure that we quickly detect failed
-	// transaction coordinators that have abandoned one or many locks. We don't
-	// want to wait out a long timeout on each of these locks to detect that
-	// they are abandoned. However, we also don't want to push immediately in
-	// cases where the lock is going to be resolved shortly.
-	//
-	// We could increase this default to somewhere on the order of the
-	// transaction heartbeat timeout (5s) if we had a better way to avoid paying
-	// the cost on each of a transaction's abandoned locks and instead only pay
-	// it once per abandoned transaction per range or per node. This could come
-	// in a few different forms, including:
-	// - a per-store cache of recently detected abandoned transaction IDs
-	// - a per-range reverse index from transaction ID to locked keys
-	//
-	// EDIT: The finalizedTxnCache gets us part of the way here. It allows us to
-	// pay the liveness push delay cost once per abandoned transaction per range
-	// instead of once per each of an abandoned transaction's locks. This helped
-	// us to feel comfortable increasing the default delay from the original
-	// 10ms to the current 50ms. Still, to feel comfortable increasing this
-	// further, we'd want to improve this cache (e.g. lifting it to the store
-	// level) to reduce the cost to once per abandoned transaction per store.
-	//
-	// TODO(nvanbenschoten): continue increasing this default value.
-	50*time.Millisecond,
-)
-
-// LockTableDeadlockDetectionPushDelay sets the delay before pushing in order to
-// detect dependency cycles between transactions.
-var LockTableDeadlockDetectionPushDelay = settings.RegisterDurationSetting(
+// LockTableDeadlockOrLivenessDetectionPushDelay sets the delay before pushing
+// in order to detect dependency cycles between transactions or coordinator
+// failure of conflicting transactions.
+var LockTableDeadlockOrLivenessDetectionPushDelay = settings.RegisterDurationSetting(
+	settings.SystemOnly,
 	"kv.lock_table.deadlock_detection_push_delay",
 	"the delay before pushing in order to detect dependency cycles between transactions",
-	// This is set to a medium duration to ensure that deadlock caused by
-	// dependency cycles between transactions are eventually detected, but that
-	// the deadlock detection does not impose any overhead in the vastly common
-	// case where there are no dependency cycles. We optimistically assume that
-	// deadlocks are not common in production applications and wait locally on
-	// locks for a while before checking for a deadlock. Increasing this value
-	// reduces the amount of time wasted in needless deadlock checks, but slows
-	// down reporting of real deadlock scenarios.
+	// Transactions that come across contending locks must push the lock holder
+	// to detect whether they're abandoned or are part of a dependency cycle that
+	// would cause a deadlock. We optimistically assume failed transaction
+	// coordinators and deadlocks are not common in production applications, and
+	// wait locally on locks for a while before checking for a deadlock. This
+	// reduces needless pushing in cases where there is no deadlock or coordinator
+	// failure to speak of.
 	//
-	// The value is analogous to Postgres' deadlock_timeout setting, which has a
-	// default value of 1s:
+	// Assuming we care about detecting failed coordinators more than deadlocks
+	// (which are a true rarity and a case we don't want to optimize for),
+	// increasing the value of this setting would come down to optimizing the cost
+	// we pay per-abandoned transaction. Currently, with the txnStatusCache,
+	// we pay a cost per abandoned transaction per range. The txnStatusCache is
+	// also quite small. Some improvements here could be:
+	// - A per-store cache instead of a per-range cache.
+	// - Increasing the number of finalized transactions we keep track of, even if
+	// this is per-request instead of per-range.
+	//
+	// The deadlock portion of this setting is analogous to Postgres'
+	// deadlock_timeout setting, which has a default value of 1s:
 	//  https://www.postgresql.org/docs/current/runtime-config-locks.html#GUC-DEADLOCK-TIMEOUT.
 	//
-	// We could increase this default to somewhere around 250ms - 1000ms if we
-	// confirmed that we do not observe deadlocks in any of the workloads that
-	// we care about. When doing so, we should be conscious that even once
+	// When increasing this value, we should be conscious that even once
 	// distributed deadlock detection begins, there is some latency proportional
 	// to the length of the dependency cycle before the deadlock is detected.
 	//
+	//
 	// TODO(nvanbenschoten): increasing this default value.
 	100*time.Millisecond,
+	settings.WithName("kv.lock_table.deadlock_detection_or_liveness_push_delay"),
+	// Old setting name when liveness and deadlock push delays could be set
+	// independently.
+	settings.WithRetiredName("kv.lock_table.coordinator_liveness_push_delay"),
 )
 
 // lockTableWaiterImpl is an implementation of lockTableWaiter.
 type lockTableWaiterImpl struct {
-	st      *cluster.Settings
-	clock   *hlc.Clock
-	stopper *stop.Stopper
-	ir      IntentResolver
-	lt      lockTable
+	nodeDesc *roachpb.NodeDescriptor
+	st       *cluster.Settings
+	clock    *hlc.Clock
+	stopper  *stop.Stopper
+	ir       IntentResolver
+	lt       lockTable
 
-	// When set, WriteIntentError are propagated instead of pushing
+	// When set, WriteIntentErrors are propagated instead of pushing
 	// conflicting transactions.
 	disableTxnPushing bool
-	// When set, called just before each ContentionEvent is emitted.
-	// Is allowed to mutate the event.
-	onContentionEvent func(ev *roachpb.ContentionEvent)
 	// When set, called just before each push timer event is processed.
 	onPushTimer func()
 }
@@ -119,8 +99,8 @@ type IntentResolver interface {
 	// block until the pushee transaction is finalized or eventually can be
 	// pushed successfully.
 	PushTransaction(
-		context.Context, *enginepb.TxnMeta, roachpb.Header, roachpb.PushTxnType,
-	) (*roachpb.Transaction, *Error)
+		context.Context, *enginepb.TxnMeta, kvpb.Header, kvpb.PushTxnType,
+	) (*roachpb.Transaction, bool, *Error)
 
 	// ResolveIntent synchronously resolves the provided intent.
 	ResolveIntent(context.Context, roachpb.LockUpdate, intentresolver.ResolveOptions) *Error
@@ -132,22 +112,21 @@ type IntentResolver interface {
 // WaitOn implements the lockTableWaiter interface.
 func (w *lockTableWaiterImpl) WaitOn(
 	ctx context.Context, req Request, guard lockTableGuard,
-) (err *Error) {
+) *Error {
 	newStateC := guard.NewStateChan()
 	ctxDoneC := ctx.Done()
 	shouldQuiesceC := w.stopper.ShouldQuiesce()
 	// Used to delay liveness and deadlock detection pushes.
-	var timer *timeutil.Timer
+	var timer timeutil.Timer
+	defer timer.Stop()
 	var timerC <-chan time.Time
 	var timerWaitingState waitingState
 	// Used to enforce lock timeouts.
 	var lockDeadline time.Time
 
-	h := contentionEventHelper{
-		sp:      tracing.SpanFromContext(ctx),
-		onEvent: w.onContentionEvent,
-	}
-	defer h.emit()
+	tracer := newContentionEventTracer(tracing.SpanFromContext(ctx), w.clock)
+	// Make sure the contention time info is finalized when exiting the function.
+	defer tracer.notify(ctx, waitingState{kind: doneWaiting})
 
 	for {
 		select {
@@ -158,63 +137,31 @@ func (w *lockTableWaiterImpl) WaitOn(
 		// about another contending transaction on newStateC.
 		case <-newStateC:
 			timerC = nil
-			state := guard.CurState()
-			log.Eventf(ctx, "lock wait-queue event: %s", state)
-			h.emitAndInit(state)
+			state, err := guard.CurState()
+			if err != nil {
+				return kvpb.NewError(err)
+			}
+			log.VEventf(ctx, 3, "lock wait-queue event: %s", state)
+			tracer.notify(ctx, state)
 			switch state.kind {
-			case waitFor, waitForDistinguished:
-				if req.WaitPolicy == lock.WaitPolicy_Error {
-					// If the waiter has an Error wait policy, resolve the conflict
-					// immediately without waiting. If the conflict is a lock then
-					// push the lock holder's transaction using a PUSH_TOUCH to
-					// determine whether the lock is abandoned or whether its holder
-					// is still active. If the conflict is a reservation holder,
-					// raise an error immediately, we know the reservation holder is
-					// active.
-					if state.held {
-						err = w.pushLockTxn(ctx, req, state)
-					} else {
-						err = newWriteIntentErr(req, state, reasonWaitPolicy)
-					}
-					if err != nil {
-						return err
-					}
-					continue
-				}
-
+			case waitFor:
 				// waitFor indicates that the request is waiting on another
 				// transaction. This transaction may be the lock holder of a
 				// conflicting lock or the head of a lock-wait queue that the
 				// request is a part of.
-				//
-				// waitForDistinguished is like waitFor, except it instructs the
-				// waiter to quickly push the conflicting transaction after a short
-				// liveness push delay instead of waiting out the full deadlock
-				// detection push delay. The lockTable guarantees that there is
-				// always at least one request in the waitForDistinguished state for
-				// each lock that has any waiters.
-				//
-				// The purpose of the waitForDistinguished state is to avoid waiting
-				// out the longer deadlock detection delay before recognizing and
-				// recovering from the failure of a transaction coordinator for
-				// *each* of that transaction's previously written intents.
-				livenessPush := state.kind == waitForDistinguished
-				deadlockPush := true
+				waitPolicyPush := req.WaitPolicy == lock.WaitPolicy_Error
 
-				// If the conflict is a reservation holder and not a held lock then
-				// there's no need to perform a liveness push - the request must be
-				// alive or its context would have been canceled and it would have
-				// exited its lock wait-queues.
-				if !state.held {
-					livenessPush = false
-				}
+				deadlockOrLivenessPush := true
 
-				// For non-transactional requests, there's no need to perform
-				// deadlock detection because a non-transactional request can
-				// not be part of a dependency cycle. Non-transactional requests
-				// cannot hold locks or reservations.
-				if req.Txn == nil {
-					deadlockPush = false
+				// Non-transactional requests do not need to perform a deadlock push as
+				// they can't hold locks that outlive the request's duration. As such,
+				// they can't be part of deadlock cycles.
+				//
+				// Now, if the lock isn't held, we don't need to check for liveness -
+				// the request must be default alive, or its context would have been
+				// cancelled, and it would have exited the lock's wait-queues.
+				if !state.held && req.Txn == nil {
+					deadlockOrLivenessPush = false
 				}
 
 				// For requests that have a lock timeout, push after the timeout to
@@ -222,23 +169,38 @@ func (w *lockTableWaiterImpl) WaitOn(
 				// still active.
 				timeoutPush := req.LockTimeout != 0
 
-				// If the request doesn't want to perform a delayed push for any
-				// reason, continue waiting without a timer.
-				if !livenessPush && !deadlockPush && !timeoutPush {
+				// If the pushee has the minimum priority or if the pusher has the
+				// maximum priority, push immediately to proceed without queueing.
+				// The push should succeed without entering the txn wait-queue.
+				priorityPush := canPushWithPriority(req, state)
+
+				// If the request doesn't want to perform a delayed push for any reason,
+				// continue waiting without a timer.
+				if !(deadlockOrLivenessPush || timeoutPush || priorityPush || waitPolicyPush) {
+					log.VEventf(ctx, 3, "not pushing")
 					continue
 				}
 
-				// The request should push to detect abandoned locks due to
-				// failed transaction coordinators, detect deadlocks between
-				// transactions, or both, but only after delay. This delay
-				// avoids unnecessary push traffic when the conflicting
-				// transaction is continuing to make forward progress.
+				// Most[2] requests perform a delayed[1] push for liveness and/or
+				// deadlock detection. A request's priority, wait policy, and lock
+				// timeout may shorten this delay.
+				//
+				// [1] The request should push to detect abandoned locks due to failed
+				// transaction coordinators, detect deadlocks between transactions, or
+				// both, but only after delay. This delay avoids unnecessary push
+				// traffic when the conflicting transaction is continuing to make
+				// forward progress.
+				//
+				// [2] The only exception being non-transactional requests (that can't
+				// be part of deadlock cycles) that are waiting on a known to be live
+				// transaction (one that's acquired a claim but not the lock).
 				delay := time.Duration(math.MaxInt64)
-				if livenessPush {
-					delay = minDuration(delay, LockTableLivenessPushDelay.Get(&w.st.SV))
-				}
-				if deadlockPush {
-					delay = minDuration(delay, LockTableDeadlockDetectionPushDelay.Get(&w.st.SV))
+				if deadlockOrLivenessPush {
+					if req.DeadlockTimeout == 0 {
+						delay = LockTableDeadlockOrLivenessDetectionPushDelay.Get(&w.st.SV)
+					} else {
+						delay = req.DeadlockTimeout
+					}
 				}
 				if timeoutPush {
 					// Only reset the lock timeout deadline if this is the first time
@@ -252,19 +214,18 @@ func (w *lockTableWaiterImpl) WaitOn(
 					delay = minDuration(delay, w.timeUntilDeadline(lockDeadline))
 				}
 
-				// However, if the pushee has the minimum priority or if the
-				// pusher has the maximum priority, push immediately.
-				// TODO(nvanbenschoten): flesh these interactions out more and
-				// add some testing.
-				if hasMinPriority(state.txn) || hasMaxPriority(req.Txn) {
+				// If the waiter has priority or an Error wait policy, resolve the
+				// conflict immediately without waiting.
+				if priorityPush || waitPolicyPush {
 					delay = 0
 				}
 
+				log.VEventf(ctx, 3, "pushing after %s for: "+
+					"deadlock/liveness detection = %t, timeout enforcement = %t, "+
+					"priority enforcement = %t, wait policy error = %t",
+					delay, deadlockOrLivenessPush, timeoutPush, priorityPush, waitPolicyPush)
+
 				if delay > 0 {
-					if timer == nil {
-						timer = timeutil.NewTimer()
-						defer timer.Stop()
-					}
 					timer.Reset(delay)
 					timerC = timer.C
 				} else {
@@ -302,10 +263,10 @@ func (w *lockTableWaiterImpl) WaitOn(
 				return w.pushLockTxn(ctx, req, state)
 
 			case waitSelf:
-				// Another request from the same transaction is the reservation
-				// holder of this lock wait-queue. This can only happen when the
-				// request's transaction is sending multiple requests concurrently.
-				// Proceed with waiting without pushing anyone.
+				// Another request from the same transaction has claimed the lock (but
+				// not yet acquired it). This can only happen when the request's
+				// transaction is sending multiple requests concurrently. Proceed with
+				// waiting without pushing anyone.
 
 			case waitQueueMaxLengthExceeded:
 				// The request attempted to wait in a lock wait-queue whose length was
@@ -331,47 +292,25 @@ func (w *lockTableWaiterImpl) WaitOn(
 				// the comment in lockTableImpl.tryActiveWait for the proper way to
 				// remove this and other evaluation races.
 				toResolve := guard.ResolveBeforeScanning()
-				return w.ResolveDeferredIntents(ctx, toResolve)
+				return w.ResolveDeferredIntents(ctx, req.AdmissionHeader, toResolve)
 
 			default:
 				panic("unexpected waiting state")
 			}
 
 		case <-timerC:
-			// If the request was in the waitFor or waitForDistinguished states
-			// and did not observe any update to its state for the entire delay,
-			// it should push. It may be the case that the transaction is part
-			// of a dependency cycle or that the lock holder's coordinator node
-			// has crashed.
+			// If the request was in the waitFor state and did not observe any update
+			// to its state for the entire delay, it should push. It may be the case
+			// that the transaction is part of a dependency cycle or that the lock
+			// holder's coordinator node has crashed.
+			timer.Read = true
 			timerC = nil
-			if timer != nil {
-				timer.Read = true
-			}
 			if w.onPushTimer != nil {
 				w.onPushTimer()
 			}
 
 			// push with the option to wait on the conflict if active.
 			pushWait := func(ctx context.Context) *Error {
-				// If the request is conflicting with a held lock then it pushes its
-				// holder synchronously - there is no way it will be able to proceed
-				// until the lock's transaction undergoes a state transition (either
-				// completing or being pushed) and then updates the lock's state
-				// through intent resolution. The request has a dependency on the
-				// entire conflicting transaction.
-				//
-				// However, if the request is conflicting with another request (a
-				// reservation holder) then it pushes the reservation holder
-				// asynchronously while continuing to listen to state transition in
-				// the lockTable. This allows the request to cancel its push if the
-				// conflicting reservation exits the lock wait-queue without leaving
-				// behind a lock. In this case, the request has a dependency on the
-				// conflicting request but not necessarily the entire conflicting
-				// transaction.
-				if timerWaitingState.held {
-					return w.pushLockTxn(ctx, req, timerWaitingState)
-				}
-
 				// It would be more natural to launch an async task for the push and
 				// continue listening on this goroutine for lockTable state transitions,
 				// but doing so is harder to test against. Instead, we launch an async
@@ -381,35 +320,80 @@ func (w *lockTableWaiterImpl) WaitOn(
 				pushCtx, pushCancel := context.WithCancel(ctx)
 				defer pushCancel()
 				go watchForNotifications(pushCtx, pushCancel, newStateC)
-				err := w.pushRequestTxn(pushCtx, req, timerWaitingState)
-				if errors.Is(pushCtx.Err(), context.Canceled) {
-					// Ignore the context canceled error. If this was for the
-					// parent context then we'll notice on the next select.
+
+				var err *Error
+				if timerWaitingState.held {
+					// Note that even though the request has a dependency on the
+					// transaction that holds the lock, this dependency can be broken
+					// without the holder's transaction getting finalized[1] such that the
+					// pusher can proceed before the synchronous push below returns. The
+					// pusher must detect such cases (watchForNotifications) and cancel
+					// its push in such cases.
 					//
-					// NOTE: we look at pushCtx.Err() and not err to avoid the
-					// potential for bugs if context cancellation is not
-					// propagated correctly on some error paths.
-					err = nil
+					// [1] This can happen for a few reasons:
+					// 1. The pusher may not conflict with the lock holder itself, but one
+					// of the waiting requests instead. If the waiting request drops out
+					// of the lock's wait queue the pusher should be allowed to proceed.
+					// Concretely, a construction like follows:
+					//   - holder: shared
+					//     - wait-queue: exclusive, shared
+					// In this case, the waiting shared lock request will push the
+					// holder[*] However, if the waiting exclusive locking request drops
+					// out of the wait queue, the shared locking request no longer needs
+					// to wait/push the holder.
+					// 2. The lock may be rolled back because of savepoints even if the
+					// transaction isn't finalized/pushed successfully.
+					// 3. The lock may no longer be tracked by the lock table even though
+					// the holder's transaction is still pending. This can happen if it's
+					// an intent that's pushed to a higher timestamp by a different
+					// request. In such cases, the lock table will simply forget the lock
+					// when the intent is resolved. Note that in such cases, the pusher
+					// may still conflict with the intent and rediscover it -- that's
+					// okay.
+					//
+					// [*] The shared locking request will push the lock holder (strength
+					// shared) instead of the exclusive lock requesting (the one it
+					// actually conflicts with) because it transitively depends on the
+					// shared locking request. In doing so, it is essentially collapsing
+					// edges in the local portion of its dependency graph for deadlock
+					// detection, as doing so is cheaper that finding out the same
+					// information using (QueryTxnRequest) RPCs.
+					err = w.pushLockTxn(pushCtx, req, timerWaitingState)
+				} else {
+					// The request conflicts with another request that's claimed an unheld
+					// lock. The conflicting request may exit the lock table without
+					// actually acquiring the lock. If that happens, we may be able to
+					// proceed without needing to wait for the push to successfully
+					// complete. Such cases will be detected by listening for lock state
+					// transitions (watchForNotifications).
+					err = w.pushRequestTxn(pushCtx, req, timerWaitingState)
+				}
+				// Ignore the context canceled error. If this was for the parent context
+				// then we'll notice on the next select.
+				//
+				// NOTE: we look at pushCtx.Err() and not err to avoid the potential for
+				// bugs if context cancellation is not propagated correctly on some
+				// error paths.
+				if errors.Is(pushCtx.Err(), context.Canceled) {
+					return nil
 				}
 				return err
 			}
 
 			// push without the option to wait on the conflict if active.
 			pushNoWait := func(ctx context.Context) *Error {
-				// Resolve the conflict without waiting. If the conflict is a lock
-				// then push the lock holder's transaction using a PUSH_TOUCH to
-				// determine whether the lock is abandoned or whether its holder is
-				// still active. If the conflict is a reservation holder, raise an
-				// error immediately, we know the reservation holder is active.
-				if timerWaitingState.held {
-					return w.pushLockTxnAfterTimeout(ctx, req, timerWaitingState)
-				}
-				return newWriteIntentErr(req, timerWaitingState, reasonLockTimeout)
+				// Resolve the conflict without waiting by pushing the lock holder's
+				// transaction.
+				return w.pushLockTxnAfterTimeout(ctx, req, timerWaitingState)
 			}
 
 			// We push with or without the option to wait on the conflict,
-			// depending on the state of the lock timeout, if one exists.
-			if !lockDeadline.IsZero() {
+			// depending on the state of the lock timeout, if one exists,
+			// and depending on the wait policy.
+			var err *Error
+			if req.WaitPolicy == lock.WaitPolicy_Error {
+				err = w.pushLockTxn(ctx, req, timerWaitingState)
+			} else if !lockDeadline.IsZero() {
 				untilDeadline := w.timeUntilDeadline(lockDeadline)
 				if untilDeadline == 0 {
 					// Deadline already exceeded.
@@ -427,10 +411,10 @@ func (w *lockTableWaiterImpl) WaitOn(
 			}
 
 		case <-ctxDoneC:
-			return roachpb.NewError(ctx.Err())
+			return kvpb.NewError(ctx.Err())
 
 		case <-shouldQuiesceC:
-			return roachpb.NewError(&roachpb.NodeUnavailableError{})
+			return kvpb.NewError(&kvpb.NodeUnavailableError{})
 		}
 	}
 }
@@ -459,54 +443,47 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 
 	// Construct the request header and determine which form of push to use.
 	h := w.pushHeader(req)
-	var pushType roachpb.PushTxnType
-	switch req.WaitPolicy {
-	case lock.WaitPolicy_Block:
-		// This wait policy signifies that the request wants to wait until the
-		// conflicting lock is released. For read-write conflicts, try to push
-		// the lock holder's timestamp forward so the read request can read
-		// under the lock. For write-write conflicts, try to abort the lock
-		// holder entirely so the write request can revoke and replace the lock
-		// with its own lock.
-		switch ws.guardAccess {
-		case spanset.SpanReadOnly:
-			pushType = roachpb.PUSH_TIMESTAMP
-			log.VEventf(ctx, 2, "pushing timestamp of txn %s above %s", ws.txn.ID.Short(), h.Timestamp)
-
-		case spanset.SpanReadWrite:
-			pushType = roachpb.PUSH_ABORT
-			log.VEventf(ctx, 2, "pushing txn %s to abort", ws.txn.ID.Short())
+	var pushType kvpb.PushTxnType
+	var beforePushObs roachpb.ObservedTimestamp
+	if ws.guardStrength == lock.None {
+		pushType = kvpb.PUSH_TIMESTAMP
+		beforePushObs = roachpb.ObservedTimestamp{
+			NodeID:    w.nodeDesc.NodeID,
+			Timestamp: w.clock.NowAsClockTimestamp(),
 		}
-
-	case lock.WaitPolicy_Error:
-		// This wait policy signifies that the request wants to raise an error
-		// upon encountering a conflicting lock. We still need to push the lock
-		// holder to ensure that it is active and that this isn't an abandoned
-		// lock, but we push using a PUSH_TOUCH to immediately return an error
-		// if the lock hold is still active.
-		pushType = roachpb.PUSH_TOUCH
-		log.VEventf(ctx, 2, "pushing txn %s to check if abandoned", ws.txn.ID.Short())
-
-	default:
-		log.Fatalf(ctx, "unexpected WaitPolicy: %v", req.WaitPolicy)
+		// TODO(nvanbenschoten): because information about the local_timestamp
+		// leading the MVCC timestamp of an intent is lost, we also need to push
+		// the intent up to the top of the transaction's local uncertainty limit
+		// on this node. This logic currently lives in pushHeader, but we could
+		// simplify it and move it out here.
+		//
+		// We could also explore adding a preserve_local_timestamp flag to
+		// MVCCValue that would explicitly store the local timestamp even in
+		// cases where it would normally be omitted. This could be set during
+		// intent resolution when a push observation is provided. Or we could
+		// not persist this, but still preserve the local timestamp when the
+		// adjusting the intent, accepting that the intent would then no longer
+		// round-trip and would lose the local timestamp if rewritten later.
+		log.VEventf(ctx, 2, "pushing timestamp of txn %s above %s", ws.txn.Short(), h.Timestamp)
+	} else {
+		pushType = kvpb.PUSH_ABORT
+		log.VEventf(ctx, 2, "pushing txn %s to abort", ws.txn.Short())
 	}
 
-	pusheeTxn, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
+	pusheeTxn, _, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
 	if err != nil {
 		// If pushing with an Error WaitPolicy and the push fails, then the lock
 		// holder is still active. Transform the error into a WriteIntentError.
-		if _, ok := err.GetDetail().(*roachpb.TransactionPushError); ok && req.WaitPolicy == lock.WaitPolicy_Error {
+		if _, ok := err.GetDetail().(*kvpb.TransactionPushError); ok && req.WaitPolicy == lock.WaitPolicy_Error {
 			err = newWriteIntentErr(req, ws, reasonWaitPolicy)
 		}
 		return err
 	}
 
-	// If the transaction is finalized, add it to the finalizedTxnCache. This
-	// avoids needing to push it again if we find another one of its locks and
-	// allows for batching of intent resolution.
-	if pusheeTxn.Status.IsFinalized() {
-		w.lt.TransactionIsFinalized(pusheeTxn)
-	}
+	// If the transaction was pushed, add it to the txnStatusCache. This avoids
+	// needing to push it again if we find another one of its locks and allows for
+	// batching of intent resolution.
+	w.lt.PushedTransactionUpdated(pusheeTxn)
 
 	// If the push succeeded then the lock holder transaction must have
 	// experienced a state transition such that it no longer conflicts with
@@ -534,13 +511,100 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 	// We always poison due to limitations of the API: not poisoning equals
 	// clearing the AbortSpan, and if our pushee transaction first got pushed
 	// for timestamp (by us), then (by someone else) aborted and poisoned, and
-	// then we run the below code, we're clearing the AbortSpan illegaly.
+	// then we run the below code, we're clearing the AbortSpan illegally.
 	// Furthermore, even if our pushType is not PUSH_ABORT, we may have ended up
 	// with the responsibility to abort the intents (for example if we find the
 	// transaction aborted). To do better here, we need per-intent information
 	// on whether we need to poison.
 	resolve := roachpb.MakeLockUpdate(pusheeTxn, roachpb.Span{Key: ws.key})
-	opts := intentresolver.ResolveOptions{Poison: true}
+	if pusheeTxn.Status == roachpb.PENDING {
+		// The pushee was still PENDING at the time that the push observed its
+		// transaction record. It is safe to use the clock observation we gathered
+		// before initiating the push during intent resolution, as we know that this
+		// observation must have been made before the pushee committed (implicitly
+		// or explicitly) and acknowledged its client, assuming it does commit at
+		// some point.
+		//
+		// This observation can be used to forward the local timestamp of the intent
+		// when intent resolution forwards its version timestamp. This is important,
+		// as it prevents the pusher, who has an even earlier observed timestamp
+		// from this node, from considering this intent to be uncertain after the
+		// resolution succeeds and the pusher returns to read.
+		//
+		// For example, consider a reader with a read timestamp of 10, a global
+		// uncertainty limit of 25, and a local uncertainty limit (thanks to an
+		// observed timestamp) of 15. The reader conflicts with an intent that has a
+		// version timestamp and local timestamp of 8. The reader observes the local
+		// clock at 16 before pushing and then succeeds in pushing the intent's
+		// holder txn to timestamp 11 (read_timestamp + 1). If the reader were to
+		// resolve the intent to timestamp 11 but leave its local timestamp at 8
+		// then the reader would consider the value "uncertain" upon re-evaluation.
+		// However, if the reader also updates the value's local timestamp to 16
+		// during intent resolution then it will not consider the value to be
+		// "uncertain".
+		//
+		// Unfortunately, this does not quite work as written, as the MVCC key
+		// encoding logic normalizes (as an optimization) keys with
+		//  local timestamp >= mvcc timestamp
+		// to
+		//  local timestamp == mvcc timestamp
+		// To work around this, the pusher must also push the mvcc timestamp of the
+		// intent above its own local uncertainty limit. In the example above, this
+		// would mean pushing the intent's holder txn to timestamp 16 as well. The
+		// logic that handles this is in pushHeader.
+		//
+		// Note that it would be incorrect to update the intent's local timestamp if
+		// the pushee was found to be committed (implicitly or explicitly), as the
+		// pushee may have already acknowledged its client by the time the clock
+		// observation was taken and the value should be considered uncertain. Doing
+		// so could allow the pusher to serve a stale read.
+		//
+		// For example, if we used the observation after the push found a committed
+		// pushee, we would be susceptible to a stale read that looks like:
+		// 1. txn1 writes intent on key k @ ts 10, on node N
+		// 2. txn1 commits @ ts 15, acks client
+		// 3. txn1's async intent resolution of key k stalls
+		// 4. txn2 begins after txn1 with read timestamp @ 11
+		// 5. txn2 collects observed timestamp @ 12 from node N
+		// 6. txn2 encounters intent on key k, observes clock @ ts 13, pushes, finds
+		//    committed record, resolves intent with observation. Committed version
+		//    now has mvcc timestamp @ 15 and local timestamp @ 13
+		// 7. txn2 reads @ 11 with local uncertainty limit @ 12, fails to observe
+		//    key k's new version. Stale read!
+		//
+		// More subtly, it would also be incorrect to update the intent's local
+		// timestamp using an observation captured _after_ the push completed, even
+		// if it had found a PENDING record. This is because this ordering makes no
+		// guarantee that the clock observation is captured before the pushee
+		// commits and acknowledges its client. This could not lead to the pusher
+		// serving a stale read, but it could lead to other transactions serving
+		// stale reads.
+		//
+		// For example, if we captured the observation after the push completed, we
+		// would be susceptible to a stale read that looks like:
+		// 1. txn1 writes intent on key k @ ts 10, on node N
+		// 2. txn2 (concurrent with txn1, so no risk of stale read itself) encounters
+		//    intent on key k, pushes, finds pending record and pushes to timestamp 14
+		// 3. txn1 commits @ ts 15, acks client
+		// 4. txn1's async intent resolution of key k stalls
+		// 5. txn3 begins after txn1 with read timestamp @ 11
+		// 6. txn3 collects observed timestamp @ 12 from node N
+		// 7. txn2 observes clock @ 13 _after_ push, resolves intent (still pending)
+		//    with observation. Intent now has mvcc timestamp @ 14 and local
+		//    timestamp @ 13
+		// 8. txn3 reads @ 11 with local uncertainty limit @ 12, fails to observe
+		//    key k's intent so it does not resolve it to committed. Stale read!
+		//
+		// There is some inherent raciness here, because the lease may move between
+		// when we push and when the reader later read. In such cases, the reader's
+		// local uncertainty limit may exceed the intent's local timestamp during
+		// the subsequent read and it may need to push again. However, we expect to
+		// eventually succeed in reading, either after lease movement subsides or
+		// after the reader's read timestamp surpasses its global uncertainty limit.
+		resolve.ClockWhilePending = beforePushObs
+	}
+	logResolveIntent(ctx, resolve)
+	opts := intentresolver.ResolveOptions{Poison: true, AdmissionHeader: req.AdmissionHeader}
 	return w.ir.ResolveIntent(ctx, resolve, opts)
 }
 
@@ -554,7 +618,7 @@ func (w *lockTableWaiterImpl) pushLockTxnAfterTimeout(
 ) *Error {
 	req.WaitPolicy = lock.WaitPolicy_Error
 	err := w.pushLockTxn(ctx, req, ws)
-	if _, ok := err.GetDetail().(*roachpb.WriteIntentError); ok {
+	if _, ok := err.GetDetail().(*kvpb.WriteIntentError); ok {
 		err = newWriteIntentErr(req, ws, reasonLockTimeout)
 	}
 	return err
@@ -585,17 +649,17 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 	// aborted due to a deadlock or b) the request exits the lock wait-queue and
 	// the caller of this function cancels the push.
 	h := w.pushHeader(req)
-	pushType := roachpb.PUSH_ABORT
-	log.VEventf(ctx, 3, "pushing txn %s to detect request deadlock", ws.txn.ID.Short())
+	pushType := kvpb.PUSH_ABORT
+	log.VEventf(ctx, 3, "pushing txn %s to detect request deadlock", ws.txn.Short())
 
-	_, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
+	_, _, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
 	if err != nil {
 		return err
 	}
 
 	// Even if the push succeeded and aborted the other transaction to break a
 	// deadlock, there's nothing for the pusher to clean up. The conflicting
-	// request will quickly exit the lock wait-queue and release its reservation
+	// request will quickly exit the lock wait-queue and release its claim
 	// once it notices that it is aborted and the pusher will be free to proceed
 	// because it was not waiting on any locks. If the pusher's request does end
 	// up hitting a lock which the pushee fails to clean up, it will perform the
@@ -632,25 +696,25 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 	// Example:
 	//
 	//  req(1, txn1), req(1, txn2) are both waiting on a lock held by txn3, and
-	//  they respectively hold a reservation on key "a" and key "b". req(2, txn2)
-	//  queues up behind the reservation on key "a" and req(2, txn1) queues up
-	//  behind the reservation on key "b". Now the dependency cycle between txn1
-	//  and txn2 only involves requests, but some of the requests here also
-	//  depend on a lock. So when both txn1, txn2 are aborted, the req(1, txn1),
-	//  req(1, txn2) are guaranteed to eventually notice through self-directed
-	//  QueryTxn requests and will exit the lockTable, allowing req(2, txn1) and
-	//  req(2, txn2) to get the reservation and now they no longer depend on each
-	//  other.
-	//
+	//  they respectively hold a claim (but not the lock itself) on key "a" and
+	//  key "b". req(2, txn2) queues up behind the claim on key "a" and req(2,
+	//  txn1) queues up behind the claim on key "b". Now the dependency cycle
+	//  between txn1 and txn2 only involves requests, but some of the requests
+	//  here also depend on a lock. So when both txn1, txn2 are aborted, the
+	//  req(1, txn1), req(1, txn2) are guaranteed to eventually notice through
+	//  self-directed QueryTxn requests and will exit the lockTable, allowing
+	//  req(2, txn1) and req(2, txn2) to claim the lock and now they no longer
+	//  depend on each other.
 	return nil
 }
 
 // pushHeader returns a BatchRequest header to be used for pushing other
 // transactions on behalf of the provided request.
-func (w *lockTableWaiterImpl) pushHeader(req Request) roachpb.Header {
-	h := roachpb.Header{
+func (w *lockTableWaiterImpl) pushHeader(req Request) kvpb.Header {
+	h := kvpb.Header{
 		Timestamp:    req.Timestamp,
-		UserPriority: req.Priority,
+		UserPriority: req.NonTxnPriority,
+		WaitPolicy:   req.WaitPolicy,
 	}
 	if req.Txn != nil {
 		// We are going to hand the header (and thus the transaction proto) to
@@ -664,42 +728,26 @@ func (w *lockTableWaiterImpl) pushHeader(req Request) roachpb.Header {
 		// transaction's uncertainty interval. This allows us to not have to
 		// restart for uncertainty if the push succeeds and we come back and
 		// read.
+		uncertaintyLimit := req.Txn.GlobalUncertaintyLimit
+		// However, because we intend to read on the same node, we can limit
+		// this to a clock reading from the local clock, relying on the fact
+		// that an observed timestamp from this node will limit our local
+		// uncertainty limit when we return to read.
 		//
-		// NOTE: GlobalUncertaintyLimit is effectively synthetic because it does
-		// not come from an HLC clock, but it does not currently get marked as
-		// so. See the comment in roachpb.MakeTransaction. This synthetic flag
-		// is then removed if we call Backward(clock.Now()) below.
-		uncertaintyLimit := req.Txn.GlobalUncertaintyLimit.WithSynthetic(true)
-		if !h.Timestamp.Synthetic {
-			// Because we intend to read on the same node, we can limit this to a
-			// clock reading from the local clock, relying on the fact that an
-			// observed timestamp from this node will limit our local uncertainty
-			// limit when we return to read.
-			//
-			// We intentionally do not use an observed timestamp directly to limit
-			// the push timestamp, because observed timestamps are not applicable in
-			// some cases (e.g. across lease changes). So to avoid an infinite loop
-			// where we continue to push to an unusable observed timestamp and
-			// continue to find the pushee in our uncertainty interval, we instead
-			// use the present time to limit the push timestamp, which is less
-			// optimal but is guaranteed to progress.
-			//
-			// There is some inherent raciness here, because the lease may move
-			// between when we push and when we later read. In such cases, we may
-			// need to push again, but expect to eventually succeed in reading,
-			// either after lease movement subsides or after the reader's read
-			// timestamp surpasses its global uncertainty limit.
-			//
-			// However, this argument only holds if we expect to be able to use a
-			// local uncertainty limit when we return to read the pushed intent.
-			// Notably, local uncertainty limits can not be used to ignore intents
-			// with synthetic timestamps that would otherwise be in a reader's
-			// uncertainty interval. This is because observed timestamps do not
-			// apply to intents/values with synthetic timestamps. So if we know
-			// that we will be pushing an intent to a synthetic timestamp, we
-			// don't limit the value to a clock reading from the local clock.
-			uncertaintyLimit.Backward(w.clock.Now())
-		}
+		// We intentionally do not use an observed timestamp directly to limit
+		// the push timestamp, because observed timestamps are not applicable in
+		// some cases (e.g. across lease changes). So to avoid an infinite loop
+		// where we continue to push to an unusable observed timestamp and
+		// continue to find the pushee in our uncertainty interval, we instead
+		// use the present time to limit the push timestamp, which is less
+		// optimal but is guaranteed to progress.
+		//
+		// There is some inherent raciness here, because the lease may move
+		// between when we push and when we later read. In such cases, we may
+		// need to push again, but expect to eventually succeed in reading,
+		// either after lease movement subsides or after the reader's read
+		// timestamp surpasses its global uncertainty limit.
+		uncertaintyLimit.Backward(w.clock.Now())
 		h.Timestamp.Forward(uncertaintyLimit)
 	}
 	return h
@@ -722,13 +770,19 @@ func (w *lockTableWaiterImpl) timeUntilDeadline(deadline time.Time) time.Duratio
 
 // ResolveDeferredIntents implements the lockTableWaiter interface.
 func (w *lockTableWaiterImpl) ResolveDeferredIntents(
-	ctx context.Context, deferredResolution []roachpb.LockUpdate,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	deferredResolution []roachpb.LockUpdate,
 ) *Error {
 	if len(deferredResolution) == 0 {
 		return nil
 	}
+	log.VEventf(ctx, 2, "resolving a batch of %d intent(s)", len(deferredResolution))
+	for _, intent := range deferredResolution {
+		logResolveIntent(ctx, intent)
+	}
 	// See pushLockTxn for an explanation of these options.
-	opts := intentresolver.ResolveOptions{Poison: true}
+	opts := intentresolver.ResolveOptions{Poison: true, AdmissionHeader: admissionHeader}
 	return w.ir.ResolveIntents(ctx, deferredResolution, opts)
 }
 
@@ -745,9 +799,9 @@ func (w *lockTableWaiterImpl) ResolveDeferredIntents(
 // The push may have timed out before this point due to a slow network, slow
 // CPU, or for some other reason. But just like with WaitPolicy_Error, we don't
 // want to throw a WriteIntentError on abandoned locks. So on timeout, we issue
-// a PUSH_TOUCH request (like we do for WaitPolicy_Error) that is not subject to
-// the lock_timeout to check with certainty whether the conflict is active or
-// not, but without blocking if it happens to be active.
+// a new request with WaitPolicy_Error that is not subject to the lock_timeout
+// to check with certainty whether the conflict is active or not, but without
+// blocking if it happens to be active.
 func doWithTimeoutAndFallback(
 	ctx context.Context,
 	timeout time.Duration,
@@ -785,6 +839,40 @@ func watchForNotifications(ctx context.Context, cancel func(), newStateC chan st
 	}
 }
 
+// txnStatusCache is a small LRU cache that tracks the status of transactions
+// have been successfully pushed. The caches are partitioned into finalized and
+// pending transactions. Users are responsible for accessing the partition that
+// interests them.
+//
+// The zero value of this struct is ready for use.
+type txnStatusCache struct {
+	// finalizedTxns is a small LRU cache that tracks transactions that were
+	// pushed and found to be finalized (COMMITTED or ABORTED). It is used as an
+	// optimization to avoid repeatedly pushing the transaction record when
+	// cleaning up the intents of an abandoned transaction.
+	finalizedTxns txnCache
+
+	// pendingTxns is a small LRU cache that tracks transactions whose minimum
+	// commit timestamp was pushed but whose final status is not yet known. It is
+	// used an an optimization to avoid repeatedly pushing the transaction record
+	// when transaction priorities allow a pusher to move many intents of a
+	// lower-priority transaction.
+	pendingTxns txnCache
+}
+
+func (c *txnStatusCache) add(txn *roachpb.Transaction) {
+	if txn.Status.IsFinalized() {
+		c.finalizedTxns.add(txn)
+	} else {
+		c.pendingTxns.add(txn)
+	}
+}
+
+func (c *txnStatusCache) clear() {
+	c.finalizedTxns.clear()
+	c.pendingTxns.clear()
+}
+
 // txnCache is a small LRU cache that holds Transaction objects.
 //
 // The zero value of this struct is ready for use.
@@ -808,6 +896,11 @@ func (c *txnCache) add(txn *roachpb.Transaction) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if idx := c.getIdxLocked(txn.ID); idx >= 0 {
+		if curTxn := c.txns[idx]; txn.WriteTimestamp.Less(curTxn.WriteTimestamp) {
+			// If the new txn has a lower write timestamp than the cached txn,
+			// just move the cached txn to the front of the LRU cache.
+			txn = curTxn
+		}
 		c.moveFrontLocked(txn, idx)
 	} else {
 		c.insertFrontLocked(txn)
@@ -841,87 +934,275 @@ func (c *txnCache) insertFrontLocked(txn *roachpb.Transaction) {
 	c.txns[0] = txn
 }
 
-// contentionEventHelper tracks and emits ContentionEvents.
-type contentionEventHelper struct {
-	sp      *tracing.Span
-	onEvent func(event *roachpb.ContentionEvent) // may be nil
+// tagContentionTracer is the tracing span tag that the *contentionEventTracer
+// lives under.
+const tagContentionTracer = "locks"
 
-	// Internal.
-	ev     *roachpb.ContentionEvent
-	tBegin time.Time
+// tagWaitKey is the tracing span tag indicating the key of the lock the request
+// is currently waiting on.
+const tagWaitKey = "wait_key"
+
+// tagWaitStart is the tracing span tag indicating when the request started
+// waiting on the lock (a unique key,txn pair) it's currently waiting on.
+const tagWaitStart = "wait_start"
+
+// tagLockHolderTxn is the tracing span tag indicating the ID of the txn holding
+// the lock (or has claimed the lock) that the request is currently waiting
+// on.
+const tagLockHolderTxn = "holder_txn"
+
+// tagNumLocks is the tracing span tag indicating the number of locks that the
+// request has previously waited on. If the request is currently waiting on
+// a lock, that lock is included.
+const tagNumLocks = "num"
+
+// tagWaited is the tracing span tag indicating the total time that the span has
+// waited on locks. If the span is currently waiting on a lock, the time it has
+// already waited on that lock is included.
+const tagWaited = "wait"
+
+// contentionEventTracer adds lock contention information to the trace, in the
+// form of events and tags. The contentionEventTracer is associated with a
+// tracing span.
+type contentionEventTracer struct {
+	sp      *tracing.Span
+	onEvent func(event *kvpb.ContentionEvent) // may be nil
+	tag     contentionTag
 }
 
-// emit emits the open contention event, if any.
-func (h *contentionEventHelper) emit() {
-	if h.ev == nil {
+// contentionTag represents a lazy tracing span tag containing lock contention
+// information. The contentionTag is fed info from the parent
+// contentionEventTracer.
+type contentionTag struct {
+	clock *hlc.Clock
+	mu    struct {
+		syncutil.Mutex
+
+		// lockWait accumulates time waited for locks before the current waiting
+		// period (the current waiting period starts at waitStart).
+		lockWait time.Duration
+
+		// waiting is set if the contentionEventTracer has been notified of a lock
+		// that the underlying request is waiting on. The contentionEventTracer
+		// starts with waiting=false, and transitions to waiting=true on the first
+		// notify() call. It transitions back to waiting=false on terminal events,
+		// and can then continue transitioning back and forth (in case the request
+		// is sequenced again and encounters more locks).
+		waiting bool
+
+		// waitStart represents the timestamp when the request started waiting on
+		// a lock, as defined by a unique (key,txn) pair, in the current iteration
+		// of the contentionEventTracer. The wait time in previous iterations is
+		// accumulated in lockWait. When not waiting anymore or when waiting on a
+		// new (key,txn), timeutil.Since(waitStart) is added to lockWait.
+		waitStart time.Time
+
+		// curStateKey and curStateTxn are the current waitingState's key and txn,
+		// if any. They are overwritten every time the lock table notify()s the
+		// contentionEventTracer of a new state. They are not set if waiting is
+		// false.
+		curStateKey roachpb.Key
+		curStateTxn *enginepb.TxnMeta
+
+		// numLocks counts the number of locks this contentionEventTracer has seen so
+		// far, including the one we're currently waiting on (if any).
+		numLocks int
+	}
+}
+
+// newContentionEventTracer creates a contentionEventTracer and associates it
+// with the provided tracing span. The contentionEventTracer will emit events to
+// the respective span and will also act as a lazy tag on the span.
+//
+// sp can be nil, in which case the tracer will not do anything.
+//
+// It is legal to create a tracer on a span that has previously had another
+// tracer. In that case, the new tracer will absorb the counters from the
+// previous one, and replace it as a span tag. However, it is illegal to create
+// a contentionEventTracer on a span that already has an "active"
+// contentionEventTracer; two tracers sharing a span concurrently doesn't work,
+// as they'd clobber each other. The expectation is that, if this span had a
+// tracer on it, that tracer should have been properly shutdown.
+func newContentionEventTracer(sp *tracing.Span, clock *hlc.Clock) *contentionEventTracer {
+	t := &contentionEventTracer{}
+	t.tag.clock = clock
+
+	// If the span had previously had contention info, we'll absorb the info into
+	// the new tracer/tag.
+	oldTag, ok := sp.GetLazyTag(tagContentionTracer)
+	if ok {
+		oldContentionTag := oldTag.(*contentionTag)
+		oldContentionTag.mu.Lock()
+		waiting := oldContentionTag.mu.waiting
+		if waiting {
+			oldContentionTag.mu.Unlock()
+			panic("span already contains contention tag in the waiting state")
+		}
+		t.tag.mu.numLocks = oldContentionTag.mu.numLocks
+		t.tag.mu.lockWait = oldContentionTag.mu.lockWait
+		oldContentionTag.mu.Unlock()
+	}
+
+	sp.SetLazyTag(tagContentionTracer, &t.tag)
+	t.sp = sp
+	return t
+}
+
+// SetOnContentionEvent registers a callback to be called before each event is
+// emitted. The callback may modify the event.
+func (h *contentionEventTracer) SetOnContentionEvent(f func(ev *kvpb.ContentionEvent)) {
+	h.onEvent = f
+}
+
+var _ tracing.LazyTag = &contentionTag{}
+
+// notify processes an event from the lock table.
+// compares the waitingState's active txn (if any) against the current
+// ContentionEvent (if any). If they match, we are continuing to handle the
+// same event and no action is taken. If they differ, the open event (if any) is
+// finalized and added to the Span, and a new event initialized from the inputs.
+func (h *contentionEventTracer) notify(ctx context.Context, s waitingState) {
+	if h.sp == nil {
+		// No span to manipulate - don't do any work.
 		return
 	}
-	h.ev.Duration = timeutil.Since(h.tBegin)
+
+	event := h.tag.notify(ctx, s)
+	if event != nil {
+		h.emit(event)
+	}
+}
+
+// emit records a ContentionEvent to the tracing span corresponding to the
+// current wait state (if any).
+func (h *contentionEventTracer) emit(event *kvpb.ContentionEvent) {
+	if event == nil {
+		return
+	}
 	if h.onEvent != nil {
 		// NB: this is intentionally above the call to RecordStructured so that
 		// this interceptor gets to mutate the event (used for test determinism).
-		h.onEvent(h.ev)
+		h.onEvent(event)
 	}
-	h.sp.RecordStructured(h.ev)
-	h.ev = nil
+	h.sp.RecordStructured(event)
 }
 
-// emitAndInit compares the waitingState's active txn (if any) against the current
-// ContentionEvent (if any). If the they match, we are continuing to handle the
-// same event and no action is taken. If they differ, the open event (if any) is
-// finalized and added to the Span, and a new event initialized from the inputs.
-func (h *contentionEventHelper) emitAndInit(s waitingState) {
-	if h.sp == nil {
-		// No span to attach payloads to - don't do any work.
-		//
-		// TODO(tbg): we could special case the noop span here too, but the plan is for
-		// nobody to use noop spans any more (trace.mode=background).
-		return
+func (tag *contentionTag) generateEventLocked() *kvpb.ContentionEvent {
+	if !tag.mu.waiting {
+		return nil
 	}
 
-	// If true, we want to emit the current event and possibly start a new one.
-	// Otherwise,
+	return &kvpb.ContentionEvent{
+		Key:      tag.mu.curStateKey,
+		TxnMeta:  *tag.mu.curStateTxn,
+		Duration: tag.clock.PhysicalTime().Sub(tag.mu.waitStart),
+	}
+}
+
+// See contentionEventTracer.notify.
+func (tag *contentionTag) notify(ctx context.Context, s waitingState) *kvpb.ContentionEvent {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+
+	// Depending on the kind of notification, we check whether we're now waiting
+	// on a different key than we were previously. If we're now waiting on a
+	// different key, we'll return an event corresponding to the previous key.
 	switch s.kind {
-	case waitFor, waitForDistinguished, waitSelf:
+	case waitFor, waitSelf, waitElsewhere:
 		// If we're tracking an event and see a different txn/key, the event is
 		// done and we initialize the new event tracking the new txn/key.
 		//
-		// NB: we're guaranteed to have `s.{txn,key}` populated here.
-		if h.ev != nil &&
-			(!h.ev.TxnMeta.ID.Equal(s.txn.ID) || !bytes.Equal(h.ev.Key, s.key)) {
-			h.emit() // h.ev is now nil
-		}
-
-		if h.ev == nil {
-			h.ev = &roachpb.ContentionEvent{
-				Key:     s.key,
-				TxnMeta: *s.txn,
+		// NB: we're guaranteed to have `curState{Txn,Key}` populated here.
+		if tag.mu.waiting {
+			curLockTxn, curLockKey := tag.mu.curStateTxn.ID, tag.mu.curStateKey
+			differentLock := !curLockTxn.Equal(s.txn.ID) || !curLockKey.Equal(s.key)
+			if !differentLock {
+				return nil
 			}
-			h.tBegin = timeutil.Now()
 		}
-	case waitElsewhere, waitQueueMaxLengthExceeded, doneWaiting:
-		// If we have an event, emit it now and that's it - the case we're in
-		// does not give us a new transaction/key.
-		if h.ev != nil {
-			h.emit()
+		res := tag.generateEventLocked()
+		tag.mu.waiting = true
+		tag.mu.curStateKey = s.key
+		tag.mu.curStateTxn = s.txn
+		// Accumulate the wait time.
+		now := tag.clock.PhysicalTime()
+		if !tag.mu.waitStart.IsZero() {
+			tag.mu.lockWait += now.Sub(tag.mu.waitStart)
 		}
+		tag.mu.waitStart = now
+		tag.mu.numLocks++
+		return res
+	case doneWaiting, waitQueueMaxLengthExceeded:
+		// There will be no more state updates; we're done waiting.
+		res := tag.generateEventLocked()
+		tag.mu.waiting = false
+		tag.mu.curStateKey = nil
+		tag.mu.curStateTxn = nil
+		// Accumulate the wait time.
+		now := tag.clock.PhysicalTime()
+		tag.mu.lockWait += now.Sub(tag.mu.waitStart)
+		tag.mu.waitStart = time.Time{}
+		return res
 	default:
-		panic("unhandled waitingState.kind")
+		kind := s.kind // escapes to the heap
+		log.Fatalf(ctx, "unhandled waitingState.kind: %v", kind)
 	}
+	panic("unreachable")
+}
+
+// Render implements the tracing.LazyTag interface.
+func (tag *contentionTag) Render() []attribute.KeyValue {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	tags := make([]attribute.KeyValue, 0, 4)
+	if tag.mu.numLocks > 0 {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagNumLocks,
+			Value: attribute.IntValue(tag.mu.numLocks),
+		})
+	}
+	// Compute how long the request has waited on locks by adding the prior wait
+	// time (if any) and the current wait time (if we're currently waiting).
+	lockWait := tag.mu.lockWait
+	if !tag.mu.waitStart.IsZero() {
+		lockWait += tag.clock.PhysicalTime().Sub(tag.mu.waitStart)
+	}
+	if lockWait != 0 {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaited,
+			Value: attribute.StringValue(string(humanizeutil.Duration(lockWait))),
+		})
+	}
+
+	if tag.mu.waiting {
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaitKey,
+			Value: attribute.StringValue(tag.mu.curStateKey.String()),
+		})
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagLockHolderTxn,
+			Value: attribute.StringValue(tag.mu.curStateTxn.ID.String()),
+		})
+		tags = append(tags, attribute.KeyValue{
+			Key:   tagWaitStart,
+			Value: attribute.StringValue(tag.mu.waitStart.Format("15:04:05.123")),
+		})
+	}
+	return tags
 }
 
 const (
-	reasonWaitPolicy                 = roachpb.WriteIntentError_REASON_WAIT_POLICY
-	reasonLockTimeout                = roachpb.WriteIntentError_REASON_LOCK_TIMEOUT
-	reasonWaitQueueMaxLengthExceeded = roachpb.WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED
+	reasonWaitPolicy                 = kvpb.WriteIntentError_REASON_WAIT_POLICY
+	reasonLockTimeout                = kvpb.WriteIntentError_REASON_LOCK_TIMEOUT
+	reasonWaitQueueMaxLengthExceeded = kvpb.WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED
 )
 
-func newWriteIntentErr(
-	req Request, ws waitingState, reason roachpb.WriteIntentError_Reason,
-) *Error {
-	err := roachpb.NewError(&roachpb.WriteIntentError{
-		Intents: []roachpb.Intent{roachpb.MakeIntent(ws.txn, ws.key)},
-		Reason:  reason,
+func newWriteIntentErr(req Request, ws waitingState, reason kvpb.WriteIntentError_Reason) *Error {
+	// TODO(nvanbenschoten): we should use the correct Lock strength of the lock
+	// holder, once we have it.
+	err := kvpb.NewError(&kvpb.WriteIntentError{
+		Locks:  []roachpb.Lock{roachpb.MakeIntent(ws.txn, ws.key).AsLock()},
+		Reason: reason,
 	})
 	// TODO(nvanbenschoten): setting an error index can assist the KV client in
 	// understanding which request hit an error. This is not necessary, but can
@@ -937,12 +1218,45 @@ func newWriteIntentErr(
 	return err
 }
 
-func hasMinPriority(txn *enginepb.TxnMeta) bool {
-	return txn != nil && txn.Priority == enginepb.MinTxnPriority
+func canPushWithPriority(req Request, s waitingState) bool {
+	if s.txn == nil {
+		// Can't push a non-transactional request.
+		return false
+	}
+	var pushType kvpb.PushTxnType
+	if s.guardStrength == lock.None {
+		pushType = kvpb.PUSH_TIMESTAMP
+	} else {
+		pushType = kvpb.PUSH_ABORT
+	}
+	var pusherIso, pusheeIso isolation.Level
+	var pusherPri, pusheePri enginepb.TxnPriority
+	if req.Txn != nil {
+		pusherIso = req.Txn.IsoLevel
+		pusherPri = req.Txn.Priority
+	} else {
+		pusherIso = isolation.Serializable
+		pusherPri = roachpb.MakePriority(req.NonTxnPriority)
+	}
+	pusheeIso = s.txn.IsoLevel
+	pusheePri = s.txn.Priority
+	// We assume that the pushee is in the PENDING state when deciding whether
+	// to push. A push may determine that the pushee is STAGING or has already
+	// been finalized.
+	pusheeStatus := roachpb.PENDING
+	return txnwait.CanPushWithPriority(pushType, pusherIso, pusheeIso, pusherPri, pusheePri, pusheeStatus)
 }
 
-func hasMaxPriority(txn *roachpb.Transaction) bool {
-	return txn != nil && txn.Priority == enginepb.MaxTxnPriority
+func logResolveIntent(ctx context.Context, intent roachpb.LockUpdate) {
+	if !log.ExpensiveLogEnabled(ctx, 2) {
+		return
+	}
+	var obsStr redact.RedactableString
+	if obs := intent.ClockWhilePending; obs != (roachpb.ObservedTimestamp{}) {
+		obsStr = redact.Sprintf(" and clock observation {%d %v}", obs.NodeID, obs.Timestamp)
+	}
+	log.VEventf(ctx, 2, "resolving intent %s for txn %s with %s status%s",
+		intent.Key, intent.Txn.Short(), intent.Status, obsStr)
 }
 
 func minDuration(a, b time.Duration) time.Duration {

@@ -1,10 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package engineccl
 
@@ -13,7 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
@@ -26,6 +23,8 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
 	"github.com/gogo/protobuf/proto"
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 )
 
 const (
@@ -58,9 +57,14 @@ const (
 // PebbleKeyManager manages encryption keys. There are two implementations. See encrypted_fs.go for
 // high-level context.
 type PebbleKeyManager interface {
-	// ActiveKey returns the currently active key. If plaintext should be used it can return nil or
-	// a key with encryption_type = Plaintext.
-	ActiveKey(ctx context.Context) (*enginepbccl.SecretKey, error)
+	// ActiveKeyForWriter returns the currently active key for a writer. If
+	// plaintext should be used it can return nil or a key with encryption_type
+	// = Plaintext.
+	ActiveKeyForWriter(ctx context.Context) (*enginepbccl.SecretKey, error)
+
+	// ActiveKeyInfoForStats returns the currently active key info for stats. It
+	// returns nil for the same case(s) as documented in ActiveKeyForWriter.
+	ActiveKeyInfoForStats() *enginepbccl.KeyInfo
 
 	// GetKey gets the key for the given id. Returns an error if the key was not found.
 	GetKey(id string) (*enginepbccl.SecretKey, error)
@@ -87,11 +91,11 @@ type StoreKeyManager struct {
 // Load must be called before calling other functions.
 func (m *StoreKeyManager) Load(ctx context.Context) error {
 	var err error
-	m.activeKey, err = loadKeyFromFile(m.fs, m.activeKeyFilename)
+	m.activeKey, err = LoadKeyFromFile(m.fs, m.activeKeyFilename)
 	if err != nil {
 		return err
 	}
-	m.oldKey, err = loadKeyFromFile(m.fs, m.oldKeyFilename)
+	m.oldKey, err = LoadKeyFromFile(m.fs, m.oldKeyFilename)
 	if err != nil {
 		return err
 	}
@@ -100,9 +104,17 @@ func (m *StoreKeyManager) Load(ctx context.Context) error {
 	return nil
 }
 
-// ActiveKey implements PebbleKeyManager.ActiveKey.
-func (m *StoreKeyManager) ActiveKey(ctx context.Context) (*enginepbccl.SecretKey, error) {
+// ActiveKeyForWriter implements PebbleKeyManager.
+func (m *StoreKeyManager) ActiveKeyForWriter(ctx context.Context) (*enginepbccl.SecretKey, error) {
 	return m.activeKey, nil
+}
+
+// ActiveKeyInfoForStats implements PebbleKeyManager.
+func (m *StoreKeyManager) ActiveKeyInfoForStats() *enginepbccl.KeyInfo {
+	if m.activeKey != nil {
+		return m.activeKey.Info
+	}
+	return nil
 }
 
 // GetKey implements PebbleKeyManager.GetKey.
@@ -116,7 +128,8 @@ func (m *StoreKeyManager) GetKey(id string) (*enginepbccl.SecretKey, error) {
 	return nil, fmt.Errorf("store key ID %s was not found", id)
 }
 
-func loadKeyFromFile(fs vfs.FS, filename string) (*enginepbccl.SecretKey, error) {
+// LoadKeyFromFile reads a secret key from the given file.
+func LoadKeyFromFile(fs vfs.FS, filename string) (*enginepbccl.SecretKey, error) {
 	now := kmTimeNow().Unix()
 	key := &enginepbccl.SecretKey{}
 	key.Info = &enginepbccl.KeyInfo{}
@@ -133,25 +146,58 @@ func loadKeyFromFile(fs vfs.FS, filename string) (*enginepbccl.SecretKey, error)
 		return nil, err
 	}
 	defer f.Close()
-	b, err := ioutil.ReadAll(f)
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
-	// keyIDLength bytes for the ID, followed by the key.
-	keyLength := len(b) - keyIDLength
-	switch keyLength {
-	case 16:
-		key.Info.EncryptionType = enginepbccl.EncryptionType_AES128_CTR
-	case 24:
-		key.Info.EncryptionType = enginepbccl.EncryptionType_AES192_CTR
-	case 32:
-		key.Info.EncryptionType = enginepbccl.EncryptionType_AES256_CTR
-	default:
-		return nil, fmt.Errorf("store key of unsupported length: %d", keyLength)
+
+	// We support two file formats:
+	// - Old-style keys are just raw random data with no delimiters; the only
+	//   format validity requirement is that the file has the right length.
+	// - New-style keys are in JWK format (we support both JWK (single-key)
+	//   and JWKS (set of keys)) formats, although we currently require
+	//   that JWKS sets contain exactly one key).
+	// Since random generation of 48+ bytes will not produce a valid json object,
+	// if the file parses as JWK, assume that was the intended format.
+	if keySet, jwkErr := jwk.Parse(b); jwkErr == nil {
+		jwKey, ok := keySet.Key(0)
+		if !ok {
+			return nil, fmt.Errorf("JWKS file contains no keys")
+		}
+		if keySet.Len() != 1 {
+			return nil, fmt.Errorf("expected exactly 1 key in JWKS file, found %d", keySet.Len())
+		}
+		if jwKey.KeyType() != jwa.OctetSeq {
+			return nil, fmt.Errorf("expected kty=oct, found %s", jwKey.KeyType())
+		}
+		key.Info.EncryptionType, err = enginepbccl.EncryptionTypeFromJWKAlgorithm(jwKey.Algorithm().String())
+		if err != nil {
+			return nil, err
+		}
+		key.Info.KeyId = jwKey.KeyID()
+		symKey, ok := jwKey.(jwk.SymmetricKey)
+		if !ok {
+			return nil, fmt.Errorf("error converting jwk.Key to SymmetricKey")
+		}
+		key.Key = symKey.Octets()
+	} else {
+		// keyIDLength bytes for the ID, followed by the key.
+		keyLength := len(b) - keyIDLength
+		switch keyLength {
+		case 16:
+			key.Info.EncryptionType = enginepbccl.EncryptionType_AES128_CTR
+		case 24:
+			key.Info.EncryptionType = enginepbccl.EncryptionType_AES192_CTR
+		case 32:
+			key.Info.EncryptionType = enginepbccl.EncryptionType_AES256_CTR
+		default:
+			return nil, errors.Wrapf(jwkErr, "could not parse store key. "+
+				"Key length %d is not valid for old-style key. Parse error for new-style key", keyLength)
+		}
+		key.Key = b[keyIDLength:]
+		// Hex encoding to make it human readable.
+		key.Info.KeyId = hex.EncodeToString(b[:keyIDLength])
 	}
-	key.Key = b[keyIDLength:]
-	// Hex encoding to make it human readable.
-	key.Info.KeyId = hex.EncodeToString(b[:keyIDLength])
 	key.Info.CreationTime = now
 	key.Info.Source = filename
 
@@ -169,21 +215,28 @@ type DataKeyManager struct {
 
 	// Implementation.
 
-	mu struct {
+	writeMu struct {
 		syncutil.Mutex
-		// Non-nil after Load()
-		keyRegistry *enginepbccl.DataKeysRegistry
-		// rotationEnabled => non-nil
-		activeKey *enginepbccl.SecretKey
+		mu struct {
+			// Setters must hold both writeMu and writeMu.mu.
+			// Getters: Can hold either writeMu or writeMu.mu.
+			//
+			// writeMu > writeMu.mu, since setters hold the former when acquiring
+			// the latter. Setters should never hold the latter while doing IO. This
+			// would block getters, that are using mu, if the IO got stuck, say due
+			// to a disk stall -- we want getters (which may be doing read IO) to
+			// not get stuck due to setters being stuck, since the read IO may
+			// succeed due to the (page) cache.
+			syncutil.RWMutex
+			// Non-nil after Load(). The StoreKeys and DataKeys maps contain non-nil
+			// values.
+			keyRegistry *enginepbccl.DataKeysRegistry
+			// rotationEnabled => non-nil.
+			activeKey *enginepbccl.SecretKey
+		}
 		// Transitions to true when SetActiveStoreKeyInfo() is called for the
 		// first time.
 		rotationEnabled bool
-		// useMarker indicates whether or not the data key registry
-		// should write new files and use an atomic marker to mark the
-		// active file. This is set to true once the 21.2 version is
-		// finalized.
-		// TODO(jackson): Remove after v21.2.
-		useMarker bool
 		// marker is an atomic file marker used to denote which of the
 		// data keys registry files is the current one. When we rotate
 		// files, the marker is atomically moved to the new file. It's
@@ -203,9 +256,9 @@ func makeRegistryProto() *enginepbccl.DataKeysRegistry {
 
 // Close releases all of the manager's held resources.
 func (m *DataKeyManager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.mu.marker.Close()
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	return m.writeMu.marker.Close()
 }
 
 // Load must be called before calling other methods.
@@ -214,111 +267,99 @@ func (m *DataKeyManager) Load(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	useMarker := filename != ""
 
-	// If the marker doesn't exist, filename is the empty string.  In
-	// this case, we fall back to looking for the file at the fixed
-	// `DATA_KEYS_REGISTRY` path.
-	if filename == "" {
-		filename = keyRegistryFilename
-		_, err = m.fs.Stat(m.fs.PathJoin(m.dbDir, filename))
-		if err != nil && !oserror.IsNotExist(err) {
-			return err
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.mu.marker = marker
-	m.mu.useMarker = useMarker
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	m.writeMu.marker = marker
+	func() {
+		m.writeMu.mu.Lock()
+		defer m.writeMu.mu.Unlock()
+		m.writeMu.mu.keyRegistry = makeRegistryProto()
+	}()
 	if oserror.IsNotExist(err) {
 		// First run.
-		m.mu.keyRegistry = makeRegistryProto()
 		return nil
 	}
 
 	// Load the existing state from the file named by `filename`.
-	m.mu.filename = filename
-	f, err := m.fs.Open(m.fs.PathJoin(m.dbDir, filename))
-	if err != nil {
-		return err
+	m.writeMu.filename = filename
+	if filename != "" {
+		f, err := m.fs.Open(m.fs.PathJoin(m.dbDir, filename))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		b, err := io.ReadAll(f)
+		if err != nil {
+			return err
+		}
+		func() {
+			m.writeMu.mu.Lock()
+			defer m.writeMu.mu.Unlock()
+			err = protoutil.Unmarshal(b, m.writeMu.mu.keyRegistry)
+		}()
+		if err != nil {
+			return err
+		}
+		if err = validateRegistry(m.writeMu.mu.keyRegistry); err != nil {
+			return err
+		}
 	}
-	defer f.Close()
-	b, err := ioutil.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	m.mu.keyRegistry = makeRegistryProto()
-	if err = protoutil.Unmarshal(b, m.mu.keyRegistry); err != nil {
-		return err
-	}
-	if err = validateRegistry(m.mu.keyRegistry); err != nil {
-		return err
-	}
-	if m.mu.keyRegistry.ActiveDataKeyId != "" {
-		key, found := m.mu.keyRegistry.DataKeys[m.mu.keyRegistry.ActiveDataKeyId]
+	// Else there is no DataKeysRegistry file yet.
+
+	if m.writeMu.mu.keyRegistry.ActiveDataKeyId != "" {
+		key, found := m.writeMu.mu.keyRegistry.DataKeys[m.writeMu.mu.keyRegistry.ActiveDataKeyId]
 		if !found {
 			// This should have resulted in an error in validateRegistry()
 			panic("unexpected inconsistent DataKeysRegistry")
 		}
-		m.mu.activeKey = key
-		log.Infof(ctx, "loaded active data key: %s", m.mu.activeKey.Info.String())
+		func() {
+			m.writeMu.mu.Lock()
+			defer m.writeMu.mu.Unlock()
+			m.writeMu.mu.activeKey = key
+		}()
+		log.Infof(ctx, "loaded active data key: %s", m.writeMu.mu.activeKey.Info.String())
 	} else {
 		log.Infof(ctx, "no active data key yet")
 	}
 	return nil
 }
 
-// UseMarker informs the data key manager that it should begin using the
-// marker file to denote which file is active.
-//
-// TODO(jackson): Remove this in 22.1. In 22.1 we can unconditionally
-// use the marker file.
-func (m *DataKeyManager) UseMarker() error {
-	if m.readOnly {
-		return nil
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.mu.useMarker = true
-
-	// If there is no filename, the data keys registry has never been
-	// written. There's no file to mark yet. The first rotation will set
-	// the marker.
-	if m.mu.filename == "" {
-		return nil
-	}
-	// NB: This may move the marker to mark the file with the previous
-	// static filename "COCKROACHDB_DATA_KEYS".
-	return m.mu.marker.Move(m.mu.filename)
-}
-
-// ActiveKey implements PebbleKeyManager.ActiveKey.
+// ActiveKeyForWriter implements PebbleKeyManager.
 //
 // TODO(sbhola): do rotation via a background activity instead of in this function so that we don't
 // slow down creation of files.
-func (m *DataKeyManager) ActiveKey(ctx context.Context) (*enginepbccl.SecretKey, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.mu.rotationEnabled {
+func (m *DataKeyManager) ActiveKeyForWriter(ctx context.Context) (*enginepbccl.SecretKey, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if m.writeMu.rotationEnabled {
 		now := kmTimeNow().Unix()
-		if now-m.mu.activeKey.Info.CreationTime > m.rotationPeriod {
+		if now-m.writeMu.mu.activeKey.Info.CreationTime > m.rotationPeriod {
 			keyRegistry := makeRegistryProto()
-			proto.Merge(keyRegistry, m.mu.keyRegistry)
+			proto.Merge(keyRegistry, m.writeMu.mu.keyRegistry)
 			if err := m.rotateDataKeyAndWrite(ctx, keyRegistry); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return m.mu.activeKey, nil
+	return m.writeMu.mu.activeKey, nil
+}
+
+// ActiveKeyInfoForStats implements PebbleKeyManager.
+func (m *DataKeyManager) ActiveKeyInfoForStats() *enginepbccl.KeyInfo {
+	m.writeMu.mu.RLock()
+	defer m.writeMu.mu.RUnlock()
+	if m.writeMu.mu.activeKey != nil {
+		return m.writeMu.mu.activeKey.Info
+	}
+	return nil
 }
 
 // GetKey implements PebbleKeyManager.GetKey.
 func (m *DataKeyManager) GetKey(id string) (*enginepbccl.SecretKey, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key, found := m.mu.keyRegistry.DataKeys[id]
+	m.writeMu.mu.RLock()
+	defer m.writeMu.mu.RUnlock()
+	key, found := m.writeMu.mu.keyRegistry.DataKeys[id]
 	if !found {
 		return nil, fmt.Errorf("key %s is not found", id)
 	}
@@ -339,17 +380,20 @@ func (m *DataKeyManager) SetActiveStoreKeyInfo(
 	if m.readOnly {
 		return errors.New("read only")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	prevActiveStoreKey, found := m.mu.keyRegistry.StoreKeys[m.mu.keyRegistry.ActiveStoreKeyId]
-	if found && prevActiveStoreKey.KeyId == storeKeyInfo.KeyId && m.mu.activeKey != nil {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	// Enable data key rotation regardless of what case we go into.
+	m.writeMu.rotationEnabled = true
+	prevActiveStoreKey, found :=
+		m.writeMu.mu.keyRegistry.StoreKeys[m.writeMu.mu.keyRegistry.ActiveStoreKeyId]
+	if found && prevActiveStoreKey.KeyId == storeKeyInfo.KeyId && m.writeMu.mu.activeKey != nil {
 		// The active store key has not changed and we already have an active data key,
 		// so no need to do anything.
 		return nil
 	}
 	// For keys other than plaintext, make sure the user is not reusing inactive keys.
 	if storeKeyInfo.EncryptionType != enginepbccl.EncryptionType_Plaintext {
-		if _, found := m.mu.keyRegistry.StoreKeys[storeKeyInfo.KeyId]; found {
+		if _, found := m.writeMu.mu.keyRegistry.StoreKeys[storeKeyInfo.KeyId]; found {
 			return fmt.Errorf("new active store key ID %s already exists as an inactive key -- this"+
 				"is really dangerous", storeKeyInfo.KeyId)
 		}
@@ -357,7 +401,7 @@ func (m *DataKeyManager) SetActiveStoreKeyInfo(
 
 	// The keyRegistry proto that will replace the current one.
 	keyRegistry := makeRegistryProto()
-	proto.Merge(keyRegistry, m.mu.keyRegistry)
+	proto.Merge(keyRegistry, m.writeMu.mu.keyRegistry)
 	keyRegistry.StoreKeys[storeKeyInfo.KeyId] = storeKeyInfo
 	keyRegistry.ActiveStoreKeyId = storeKeyInfo.KeyId
 	if storeKeyInfo.EncryptionType == enginepbccl.EncryptionType_Plaintext {
@@ -369,27 +413,33 @@ func (m *DataKeyManager) SetActiveStoreKeyInfo(
 	if err := m.rotateDataKeyAndWrite(ctx, keyRegistry); err != nil {
 		return err
 	}
-	m.mu.rotationEnabled = true
+	m.writeMu.rotationEnabled = true
 	return nil
 }
 
+// For stats.
 func (m *DataKeyManager) getScrubbedRegistry() *enginepbccl.DataKeysRegistry {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.writeMu.mu.RLock()
+	defer m.writeMu.mu.RUnlock()
 	r := makeRegistryProto()
-	proto.Merge(r, m.mu.keyRegistry)
+	proto.Merge(r, m.writeMu.mu.keyRegistry)
 	for _, v := range r.DataKeys {
 		v.Key = nil
 	}
 	return r
 }
 
+// validateRegistry must not modify keyRegistry.
 func validateRegistry(keyRegistry *enginepbccl.DataKeysRegistry) error {
-	if keyRegistry.ActiveStoreKeyId != "" && keyRegistry.StoreKeys[keyRegistry.ActiveStoreKeyId] == nil {
-		return fmt.Errorf("active store key %s not found", keyRegistry.ActiveStoreKeyId)
+	if keyRegistry.ActiveStoreKeyId != "" {
+		if k, ok := keyRegistry.StoreKeys[keyRegistry.ActiveStoreKeyId]; !ok || k == nil {
+			return fmt.Errorf("active store key %s not found", keyRegistry.ActiveStoreKeyId)
+		}
 	}
-	if keyRegistry.ActiveDataKeyId != "" && keyRegistry.DataKeys[keyRegistry.ActiveDataKeyId] == nil {
-		return fmt.Errorf("active data key %s not found", keyRegistry.ActiveDataKeyId)
+	if keyRegistry.ActiveDataKeyId != "" {
+		if k, ok := keyRegistry.DataKeys[keyRegistry.ActiveDataKeyId]; !ok || k == nil {
+			return fmt.Errorf("active data key %s not found", keyRegistry.ActiveDataKeyId)
+		}
 	}
 	return nil
 }
@@ -415,11 +465,11 @@ func generateAndSetNewDataKey(
 	} else {
 		var keyLength int
 		switch activeStoreKey.EncryptionType {
-		case enginepbccl.EncryptionType_AES128_CTR:
+		case enginepbccl.EncryptionType_AES128_CTR, enginepbccl.EncryptionType_AES_128_CTR_V2:
 			keyLength = 16
-		case enginepbccl.EncryptionType_AES192_CTR:
+		case enginepbccl.EncryptionType_AES192_CTR, enginepbccl.EncryptionType_AES_192_CTR_V2:
 			keyLength = 24
-		case enginepbccl.EncryptionType_AES256_CTR:
+		case enginepbccl.EncryptionType_AES256_CTR, enginepbccl.EncryptionType_AES_256_CTR_V2:
 			keyLength = 32
 		default:
 			return nil, fmt.Errorf("unknown encryption type %d for key ID %s",
@@ -449,7 +499,7 @@ func generateAndSetNewDataKey(
 	return key, nil
 }
 
-// REQUIRES: m.mu is held.
+// REQUIRES: m.writeMu is held.
 func (m *DataKeyManager) rotateDataKeyAndWrite(
 	ctx context.Context, keyRegistry *enginepbccl.DataKeysRegistry,
 ) (err error) {
@@ -457,7 +507,8 @@ func (m *DataKeyManager) rotateDataKeyAndWrite(
 		if err != nil {
 			log.Infof(ctx, "error while attempting to rotate data key: %s", err)
 		} else {
-			log.Infof(ctx, "rotated to new active data key: %s", proto.CompactTextString(m.mu.activeKey.Info))
+			log.Infof(ctx, "rotated to new active data key: %s",
+				proto.CompactTextString(m.writeMu.mu.activeKey.Info))
 		}
 	}()
 
@@ -473,31 +524,12 @@ func (m *DataKeyManager) rotateDataKeyAndWrite(
 		return err
 	}
 
-	if !m.mu.useMarker {
-		// If the v21.2 version hasn't been finalized yet, write the
-		// registry to the static filename `COCKROACHDB_DATA_KEYS`. If
-		// there's a crash mid-Rename, it's possible that we'll be left
-		// with a corrupt data key registry.
-		// TODO(jackson): Remove this for 22.1.
-		path := m.fs.PathJoin(m.dbDir, keyRegistryFilename)
-		if err = fs.SafeWriteToFile(m.fs, m.dbDir, path, bytes); err != nil {
-			return
-		}
-		m.mu.filename = keyRegistryFilename
-		m.mu.keyRegistry = keyRegistry
-		m.mu.activeKey = newKey
-		return err
-	}
-
-	// The v21.2 version has been finalized. Write a new file
-	// containing the updated state, and move the atomic marker to
-	// point to the new file.
-
 	// Write the current registry state to a new file and sync it.
 	// The new file's filename incorporates the marker's iteration
 	// number to ensure we're not overwriting the existing registry.
-	filename := fmt.Sprintf("%s_%06d_%s", keyRegistryFilename, m.mu.marker.NextIter(), registryFormatMonolith)
-	f, err := m.fs.Create(m.fs.PathJoin(m.dbDir, filename))
+	filename := fmt.Sprintf(
+		"%s_%06d_%s", keyRegistryFilename, m.writeMu.marker.NextIter(), registryFormatMonolith)
+	f, err := m.fs.Create(m.fs.PathJoin(m.dbDir, filename), fs.EncryptionRegistryWriteCategory)
 	if err != nil {
 		return err
 	}
@@ -512,14 +544,18 @@ func (m *DataKeyManager) rotateDataKeyAndWrite(
 	// the new file is active. This call to marker.Move will also sync
 	// the directory on behalf of both the marker and the registry
 	// itself.
-	if err := m.mu.marker.Move(filename); err != nil {
+	if err := m.writeMu.marker.Move(filename); err != nil {
 		return err
 	}
 
-	prevFilename := m.mu.filename
-	m.mu.filename = filename
-	m.mu.keyRegistry = keyRegistry
-	m.mu.activeKey = newKey
+	prevFilename := m.writeMu.filename
+	m.writeMu.filename = filename
+	func() {
+		m.writeMu.mu.Lock()
+		defer m.writeMu.mu.Unlock()
+		m.writeMu.mu.keyRegistry = keyRegistry
+		m.writeMu.mu.activeKey = newKey
+	}()
 
 	// Remove the previous data registry file.
 	if prevFilename != "" {

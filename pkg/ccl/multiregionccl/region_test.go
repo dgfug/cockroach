@@ -1,24 +1,25 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package multiregionccl_test
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -27,16 +28,86 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// startTestCluster starts a 3 node cluster.
+//
+// Note, if a testfeed depends on particular testing knobs, those may
+// need to be applied to each of the servers in the test cluster
+// returned from this function.
+func TestMultiRegionDatabaseStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t, "times out under race")
+
+	ctx := context.Background()
+	knobs := base.TestingKnobs{}
+
+	tc, db, cleanup := multiregionccltestutils.TestingCreateMultiRegionClusterWithRegionList(
+		t,
+		[]string{"us-east", "us-west"},
+		3, /* serversPerRegion */
+		knobs,
+		multiregionccltestutils.WithUseDatabase("d"),
+	)
+
+	defer cleanup()
+
+	_, err := db.ExecContext(ctx,
+		`CREATE DATABASE test PRIMARY REGION "us-west";
+    USE test;
+    CREATE TABLE a(id uuid primary key);`)
+	require.NoError(t, err)
+
+	s := tc.Server(0)
+
+	testutils.SucceedsWithin(t, func() error {
+		// Get the list of nodes from ranges table
+		row := db.QueryRowContext(ctx,
+			`USE test;
+    WITH x AS (SHOW RANGES FROM TABLE a) SELECT replicas FROM x;`)
+		var nodesStr string
+		err = row.Scan(&nodesStr)
+		if err != nil {
+			return err
+		}
+
+		// string comes back "{1,2,3}".
+		nodesStr = strings.TrimLeft(nodesStr, "{")
+		nodesStr = strings.TrimRight(nodesStr, "}")
+		nodes := strings.Split(nodesStr, ",")
+
+		var resp serverpb.DatabaseDetailsResponse
+		require.NoError(t, serverutils.GetJSONProto(s, "/_admin/v1/databases/test?include_stats=true", &resp))
+
+		if resp.Stats.RangeCount != int64(1) {
+			return errors.Newf("expected range-count=1, got %d", resp.Stats.RangeCount)
+		}
+
+		if len(resp.Stats.NodeIDs) != len(nodes) {
+			return errors.Newf("expected node-ids=%s, got %s", nodes, resp.Stats.NodeIDs)
+		}
+
+		for i, n := range resp.Stats.NodeIDs {
+			if nodes[i] != fmt.Sprint(n) {
+				return errors.Newf("The nodes returned from endpoint do not match nodes listed in the show range from table. expected: %s; actual: %s", nodes, resp.Stats.NodeIDs)
+			}
+		}
+
+		return nil
+	}, 45*time.Second)
+}
+
 // TestConcurrentAddDropRegions tests all combinations of add/drop as if they
 // were executed by two concurrent sessions. The general sketch of the test is
 // as follows:
-// - First operation is executed and blocks before the enum members are promoted.
-// - The second operation starts once the first operation has reached the type
-//   schema changer. It continues to completion. It may succeed/fail depending
-//   on the specific test setup.
-// - The first operation is resumed and allowed to complete. We expect it to
-//   succeed.
-// - Verify database regions are as expected.
+//   - First operation is executed and blocks before the enum members are promoted.
+//   - The second operation starts once the first operation has reached the type
+//     schema changer. It continues to completion. It may succeed/fail depending
+//     on the specific test setup.
+//   - The first operation is resumed and allowed to complete. We expect it to
+//     succeed.
+//   - Verify database regions are as expected.
+//
 // Operations act on a multi-region database that contains a REGIONAL BY ROW
 // table, so as to exercise the repartitioning semantics.
 func TestConcurrentAddDropRegions(t *testing.T) {
@@ -149,12 +220,12 @@ CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3"
 CREATE TABLE db.rbr () LOCALITY REGIONAL BY ROW`)
 			require.NoError(t, err)
 
-			go func() {
-				if _, err := sqlDB.Exec(tc.firstOp); err != nil {
+			go func(firstOp string) {
+				if _, err := sqlDB.Exec(firstOp); err != nil {
 					t.Error(err)
 				}
 				close(firstOpFinished)
-			}()
+			}(tc.firstOp)
 
 			// Wait for the first operation to reach the type schema changer.
 			<-firstOpStarted
@@ -288,12 +359,12 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 `)
 				require.NoError(t, err)
 
-				go func() {
+				go func(cmd string, shouldSucceed bool) {
 					defer func() {
 						close(typeChangeFinished)
 					}()
-					_, err := sqlDB.Exec(regionAlterCmd.cmd)
-					if regionAlterCmd.shouldSucceed {
+					_, err := sqlDB.Exec(cmd)
+					if shouldSucceed {
 						if err != nil {
 							t.Errorf("expected success, got %v", err)
 						}
@@ -302,7 +373,7 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 							t.Errorf("expected error boom, found %v", err)
 						}
 					}
-				}()
+				}(regionAlterCmd.cmd, regionAlterCmd.shouldSucceed)
 
 				<-typeChangeStarted
 
@@ -350,7 +421,7 @@ func TestSettingPlacementAmidstAddDrop(t *testing.T) {
 ALTER TABLE db.public.global CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 5,
 	num_voters = 3,
@@ -366,7 +437,7 @@ ALTER TABLE db.public.global CONFIGURE ZONE USING
 ALTER TABLE db.public.global CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -401,18 +472,18 @@ ALTER TABLE db.public.global CONFIGURE ZONE USING
 
 			_, err := sqlDB.Exec(`
 CREATE DATABASE db PRIMARY REGION "us-east1" REGIONS "us-east2";
-CREATE TABLE db.global () LOCALITY GLOBAL;
-SET CLUSTER SETTING sql.defaults.multiregion_placement_policy.enabled = true;`)
+CREATE TABLE db.global () LOCALITY GLOBAL;`)
 			require.NoError(t, err)
-
-			go func() {
+			_, err = sqlDB.Exec(`SET CLUSTER SETTING sql.defaults.multiregion_placement_policy.enabled = true;`)
+			require.NoError(t, err)
+			go func(regionOp string) {
 				defer func() {
 					close(regionOpFinished)
 				}()
 
-				_, err := sqlDB.Exec(tc.regionOp)
+				_, err := sqlDB.Exec(regionOp)
 				require.NoError(t, err)
-			}()
+			}(tc.regionOp)
 
 			<-regionOpStarted
 			_, err = sqlDB.Exec(tc.placementOp)
@@ -773,7 +844,67 @@ CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2" PLACEMENT R
 	}
 }
 
-// TestRegionAddDropEnclosingBackupOps tests adding/dropping regions
+func TestDropRegionFailWithConcurrentBackupOps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testRegionAddDropWithConcurrentBackupOps(t, struct {
+		cmd                string
+		shouldSucceed      bool
+		expectedPartitions []string
+	}{
+		cmd:                `ALTER DATABASE db DROP REGION "us-east3"`,
+		shouldSucceed:      false,
+		expectedPartitions: []string{"us-east1", "us-east2", "us-east3"},
+	})
+}
+
+func TestDropRegionSucceedWithConcurrentBackupOps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testRegionAddDropWithConcurrentBackupOps(t, struct {
+		cmd                string
+		shouldSucceed      bool
+		expectedPartitions []string
+	}{
+		cmd:                `ALTER DATABASE db DROP REGION "us-east3"`,
+		shouldSucceed:      true,
+		expectedPartitions: []string{"us-east1", "us-east2"},
+	})
+}
+
+func TestAddRegionFailWithConcurrentBackupOps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testRegionAddDropWithConcurrentBackupOps(t, struct {
+		cmd                string
+		shouldSucceed      bool
+		expectedPartitions []string
+	}{
+		cmd:                `ALTER DATABASE db ADD REGION "us-east4"`,
+		shouldSucceed:      false,
+		expectedPartitions: []string{"us-east1", "us-east2", "us-east3"},
+	})
+}
+
+func TestAddRegionSucceedWithConcurrentBackupOps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testRegionAddDropWithConcurrentBackupOps(t, struct {
+		cmd                string
+		shouldSucceed      bool
+		expectedPartitions []string
+	}{
+		cmd:                `ALTER DATABASE db ADD REGION "us-east4"`,
+		shouldSucceed:      true,
+		expectedPartitions: []string{"us-east1", "us-east2", "us-east3", "us-east4"},
+	})
+}
+
+// testRegionAddDropWithConcurrentBackupOps tests adding/dropping regions
 // (which may or may not succeed) with a concurrent backup operation
 // The sketch of the test is as follows:
 // - Client 1 performs an ALTER ADD / DROP REGION. Let the user txn commit.
@@ -784,44 +915,15 @@ CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2" PLACEMENT R
 // - Restore the database, block in the schema changer.
 // - Fail or succeed the schema change job.
 // - Validate that the database and its tables look as expected.
-func TestRegionAddDropWithConcurrentBackupOps(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 68341, "flaky test")
-	defer log.Scope(t).Close(t)
-
-	skip.UnderRace(t, "times out under race")
-
-	regionAlterCmds := []struct {
-		name               string
+func testRegionAddDropWithConcurrentBackupOps(
+	t *testing.T,
+	regionAlterCmd struct {
 		cmd                string
 		shouldSucceed      bool
 		expectedPartitions []string
-	}{
-		{
-			name:               "drop-region-fail",
-			cmd:                `ALTER DATABASE db DROP REGION "us-east3"`,
-			shouldSucceed:      false,
-			expectedPartitions: []string{"us-east1", "us-east2", "us-east3"},
-		},
-		{
-			name:               "drop-region-succeed",
-			cmd:                `ALTER DATABASE db DROP REGION "us-east3"`,
-			shouldSucceed:      true,
-			expectedPartitions: []string{"us-east1", "us-east2"},
-		},
-		{
-			name:               "add-region-fail",
-			cmd:                `ALTER DATABASE db ADD REGION "us-east4"`,
-			shouldSucceed:      false,
-			expectedPartitions: []string{"us-east1", "us-east2", "us-east3"},
-		},
-		{
-			name:               "add-region-succeed",
-			cmd:                `ALTER DATABASE db ADD REGION "us-east4"`,
-			shouldSucceed:      true,
-			expectedPartitions: []string{"us-east1", "us-east2", "us-east3", "us-east4"},
-		},
-	}
+	},
+) {
+	skip.UnderRace(t, "times out under race")
 
 	testCases := []struct {
 		name      string
@@ -830,162 +932,162 @@ func TestRegionAddDropWithConcurrentBackupOps(t *testing.T) {
 	}{
 		{
 			name:      "backup-database",
-			backupOp:  `BACKUP DATABASE db TO 'nodelocal://0/db_backup'`,
-			restoreOp: `RESTORE DATABASE db FROM 'nodelocal://0/db_backup'`,
+			backupOp:  `BACKUP DATABASE db INTO 'nodelocal://1/db_backup'`,
+			restoreOp: `RESTORE DATABASE db FROM LATEST IN 'nodelocal://1/db_backup'`,
 		},
 	}
 
 	for _, tc := range testCases {
-		for _, regionAlterCmd := range regionAlterCmds {
-			t.Run(regionAlterCmd.name+"-"+tc.name, func(t *testing.T) {
-				var mu syncutil.Mutex
-				typeChangeStarted := make(chan struct{})
-				typeChangeFinished := make(chan struct{})
-				backupOpFinished := make(chan struct{})
-				waitInTypeSchemaChangerDuringBackup := true
+		t.Run(tc.name, func(t *testing.T) {
+			var mu syncutil.Mutex
+			typeChangeStarted := make(chan struct{})
+			typeChangeFinished := make(chan struct{})
+			backupOpFinished := make(chan struct{})
+			waitInTypeSchemaChangerDuringBackup := true
 
-				backupKnobs := base.TestingKnobs{
-					SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
-						RunBeforeEnumMemberPromotion: func(ctx context.Context) error {
-							mu.Lock()
-							defer mu.Unlock()
-							if waitInTypeSchemaChangerDuringBackup {
-								waitInTypeSchemaChangerDuringBackup = false
-								close(typeChangeStarted)
-								<-backupOpFinished
-							}
-							// Always return success here. The goal of this test isn't to
-							// fail during the backup, but to do so during the restore.
-							return nil
-						},
+			backupKnobs := base.TestingKnobs{
+				SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
+					RunBeforeEnumMemberPromotion: func(ctx context.Context) error {
+						mu.Lock()
+						defer mu.Unlock()
+						if waitInTypeSchemaChangerDuringBackup {
+							waitInTypeSchemaChangerDuringBackup = false
+							close(typeChangeStarted)
+							<-backupOpFinished
+						}
+						// Always return success here. The goal of this test isn't to
+						// fail during the backup, but to do so during the restore.
+						return nil
 					},
-					// Decrease the adopt loop interval so that retries happen quickly.
-					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-				}
+				},
+				// Decrease the adopt loop interval so that retries happen quickly.
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			}
 
-				tempExternalIODir, tempDirCleanup := testutils.TempDir(t)
-				defer tempDirCleanup()
+			tempExternalIODir, tempDirCleanup := testutils.TempDir(t)
+			defer tempDirCleanup()
 
-				_, sqlDBBackup, cleanupBackup := multiregionccltestutils.TestingCreateMultiRegionCluster(
-					t,
-					4, /* numServers */
-					backupKnobs,
-					multiregionccltestutils.WithBaseDirectory(tempExternalIODir),
-				)
-				defer cleanupBackup()
+			_, sqlDBBackup, cleanupBackup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+				t,
+				4, /* numServers */
+				backupKnobs,
+				multiregionccltestutils.WithBaseDirectory(tempExternalIODir),
+			)
+			defer cleanupBackup()
 
-				_, err := sqlDBBackup.Exec(`
+			_, err := sqlDBBackup.Exec(`
 DROP DATABASE IF EXISTS db;
 CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3";
 USE db;
 CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 INSERT INTO db.rbr VALUES (1,1),(2,2),(3,3);
 `)
-				require.NoError(t, err)
+			require.NoError(t, err)
 
-				go func() {
-					defer func() {
-						close(typeChangeFinished)
-					}()
-					_, err := sqlDBBackup.Exec(regionAlterCmd.cmd)
-					if err != nil {
-						t.Errorf("expected success, got %v when executing %s", err, regionAlterCmd.cmd)
-					}
+			go func(cmd string) {
+				defer func() {
+					close(typeChangeFinished)
 				}()
-
-				<-typeChangeStarted
-
-				_, err = sqlDBBackup.Exec(tc.backupOp)
-				close(backupOpFinished)
-				require.NoError(t, err)
-
-				<-typeChangeFinished
-
-				restoreKnobs := base.TestingKnobs{
-					SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
-						RunBeforeEnumMemberPromotion: func(context.Context) error {
-							mu.Lock()
-							defer mu.Unlock()
-							if !regionAlterCmd.shouldSucceed {
-								// Trigger a roll-back.
-								return errors.New("nope")
-							}
-							// Trod on.
-							return nil
-						},
-					},
-					// Decrease the adopt loop interval so that retries happen quickly.
-					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				_, err := sqlDBBackup.Exec(cmd)
+				if err != nil {
+					t.Errorf("expected success, got %v when executing %s", err, cmd)
 				}
+			}(regionAlterCmd.cmd)
 
-				// Start a new cluster (with new testing knobs) for restore.
-				_, sqlDBRestore, cleanupRestore := multiregionccltestutils.TestingCreateMultiRegionCluster(
-					t,
-					4, /* numServers */
-					restoreKnobs,
-					multiregionccltestutils.WithBaseDirectory(tempExternalIODir),
-				)
-				defer cleanupRestore()
+			<-typeChangeStarted
 
-				_, err = sqlDBRestore.Exec(tc.restoreOp)
-				require.NoError(t, err)
+			_, err = sqlDBBackup.Exec(tc.backupOp)
+			close(backupOpFinished)
+			require.NoError(t, err)
 
-				// First ensure that the data was restored correctly.
-				numRows := sqlDBRestore.QueryRow(`SELECT count(*) from db.rbr`)
-				require.NoError(t, numRows.Err())
-				var count int
-				err = numRows.Scan(&count)
-				require.NoError(t, err)
-				if count != 3 {
-					t.Logf("unexpected number of rows after restore: expected 3, found %d", count)
-				}
+			<-typeChangeFinished
 
-				// Now validate that the background job has completed and the
-				// regions are in the expected state.
-				testutils.SucceedsSoon(t, func() error {
-					dbRegions := make([]string, 0, len(regionAlterCmd.expectedPartitions))
-					rowsRegions, err := sqlDBRestore.Query("SELECT region FROM [SHOW REGIONS FROM DATABASE db]")
-					require.NoError(t, err)
-					defer rowsRegions.Close()
-					for {
-						done := rowsRegions.Next()
-						if !done {
-							require.NoError(t, rowsRegions.Err())
-							break
+			restoreKnobs := base.TestingKnobs{
+				SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
+					RunBeforeEnumMemberPromotion: func(context.Context) error {
+						mu.Lock()
+						defer mu.Unlock()
+						if !regionAlterCmd.shouldSucceed {
+							// Trigger a roll-back.
+							return jobs.MarkAsPermanentJobError(errors.New("nope"))
 						}
-						var region string
-						err := rowsRegions.Scan(&region)
-						require.NoError(t, err)
-						dbRegions = append(dbRegions, region)
+						// Trod on.
+						return nil
+					},
+				},
+				// Decrease the adopt loop interval so that retries happen quickly.
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			}
+
+			// Start a new cluster (with new testing knobs) for restore.
+			_, sqlDBRestore, cleanupRestore := multiregionccltestutils.TestingCreateMultiRegionCluster(
+				t,
+				4, /* numServers */
+				restoreKnobs,
+				multiregionccltestutils.WithBaseDirectory(tempExternalIODir),
+			)
+			defer cleanupRestore()
+
+			_, err = sqlDBRestore.Exec(tc.restoreOp)
+			require.NoError(t, err)
+
+			// First ensure that the data was restored correctly.
+			numRows := sqlDBRestore.QueryRow(`SELECT count(*) from db.rbr`)
+			require.NoError(t, numRows.Err())
+			var count int
+			err = numRows.Scan(&count)
+			require.NoError(t, err)
+			if count != 3 {
+				t.Logf("unexpected number of rows after restore: expected 3, found %d", count)
+			}
+
+			// Now validate that the background job has completed and the
+			// regions are in the expected state.
+			testutils.SucceedsSoon(t, func() error {
+				dbRegions := make([]string, 0, len(regionAlterCmd.expectedPartitions))
+				rowsRegions, err := sqlDBRestore.Query("SELECT region FROM [SHOW REGIONS FROM DATABASE db]")
+				require.NoError(t, err)
+				defer func() {
+					require.NoError(t, rowsRegions.Close())
+				}()
+				for {
+					done := rowsRegions.Next()
+					if !done {
+						require.NoError(t, rowsRegions.Err())
+						break
 					}
-					if len(dbRegions) != len(regionAlterCmd.expectedPartitions) {
-						return errors.Newf("unexpected number of regions, expected: %v found %v",
+					var region string
+					err := rowsRegions.Scan(&region)
+					require.NoError(t, err)
+					dbRegions = append(dbRegions, region)
+				}
+				if len(dbRegions) != len(regionAlterCmd.expectedPartitions) {
+					return errors.Newf("unexpected number of regions, expected: %v found %v",
+						regionAlterCmd.expectedPartitions,
+						dbRegions,
+					)
+				}
+				for i, expectedRegion := range regionAlterCmd.expectedPartitions {
+					if expectedRegion != dbRegions[i] {
+						return errors.Newf("unexpected regions, expected: %v found %v",
 							regionAlterCmd.expectedPartitions,
 							dbRegions,
 						)
 					}
-					for i, expectedRegion := range regionAlterCmd.expectedPartitions {
-						if expectedRegion != dbRegions[i] {
-							return errors.Newf("unexpected regions, expected: %v found %v",
-								regionAlterCmd.expectedPartitions,
-								dbRegions,
-							)
-						}
-					}
-					return nil
-				})
-
-				// Finally, confirm that all of the tables were repartitioned
-				// correctly by the above ADD/DROP region job.
-				testutils.SucceedsSoon(t, func() error {
-					return multiregionccltestutils.TestingEnsureCorrectPartitioning(
-						sqlDBRestore,
-						"db",
-						"rbr",
-						[]string{"rbr@rbr_pkey"},
-					)
-				})
+				}
+				return nil
 			})
-		}
+
+			// Finally, confirm that all of the tables were repartitioned
+			// correctly by the above ADD/DROP region job.
+			testutils.SucceedsSoon(t, func() error {
+				return multiregionccltestutils.TestingEnsureCorrectPartitioning(
+					sqlDBRestore,
+					"db",
+					"rbr",
+					[]string{"rbr@rbr_pkey"},
+				)
+			})
+		})
 	}
 }

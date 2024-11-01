@@ -1,19 +1,15 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 package cli
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,11 +17,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -82,7 +81,7 @@ func Example_userfile_upload() {
 }
 
 func createTestDirWithNontrivialSubtree() (string, func() error, error) {
-	tmpDir, err := ioutil.TempDir("", testUserfileUploadTempDirPrefix)
+	tmpDir, err := os.MkdirTemp("", testUserfileUploadTempDirPrefix)
 	if err != nil {
 		return "", nil, err
 	}
@@ -115,7 +114,7 @@ func createTestDirWithNontrivialSubtree() (string, func() error, error) {
 	}
 	for i, relPath := range filesRelativePaths {
 		contents := fmt.Sprintf("content %d", i+1)
-		if err := ioutil.WriteFile(filepath.Join(testDir, relPath), []byte(contents), 0666); err != nil {
+		if err := os.WriteFile(filepath.Join(testDir, relPath), []byte(contents), 0666); err != nil {
 			return "", cleanup, err
 		}
 	}
@@ -355,20 +354,44 @@ func Example_userfile_upload_recursive() {
 
 func checkUserFileContent(
 	ctx context.Context,
-	t *testing.T,
-	execcCfg interface{},
-	user security.SQLUsername,
+	t testing.TB,
+	execCfg interface{},
+	user username.SQLUsername,
 	userfileURI string,
 	expectedContent []byte,
 ) {
-	store, err := execcCfg.(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
+	store, err := execCfg.(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
 		userfileURI, user)
 	require.NoError(t, err)
-	reader, err := store.ReadFile(ctx, "")
+	reader, _, err := store.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 	require.NoError(t, err)
-	got, err := ioutil.ReadAll(reader)
+	got, err := ioctx.ReadAll(ctx, reader)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(got, expectedContent))
+}
+
+func BenchmarkUserfileUpload(b *testing.B) {
+	c := NewCLITest(TestCLIParams{T: b})
+	defer c.Cleanup()
+
+	dir, cleanFn := testutils.TempDir(b)
+	defer cleanFn()
+
+	dataSize := 64 << 20
+	rnd, _ := randutil.NewTestRand()
+	content := randutil.RandBytes(rnd, dataSize)
+
+	filePath := filepath.Join(dir, "testfile")
+	err := os.WriteFile(filePath, content, 0666)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	b.SetBytes(int64(dataSize))
+	for n := 0; n < b.N; n++ {
+		_, err = c.RunWithCapture(fmt.Sprintf("userfile upload %s %s", filePath, fmt.Sprintf("%s-%d", filePath, n)))
+		require.NoError(b, err)
+	}
 }
 
 func TestUserFileUploadRecursive(t *testing.T) {
@@ -437,14 +460,14 @@ func TestUserFileUploadRecursive(t *testing.T) {
 						// specified.
 						if tc.name == "destination-not-full-URI" {
 							destinationFileURI = constructUserfileDestinationURI("",
-								filepath.Join(dstDir, relPath), security.RootUserName())
+								filepath.Join(dstDir, relPath), username.RootUserName())
 						}
 
-						fileContent, err := ioutil.ReadFile(path)
+						fileContent, err := os.ReadFile(path)
 						if err != nil {
 							return err
 						}
-						checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+						checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(),
 							destinationFileURI, fileContent)
 						return nil
 					})
@@ -492,7 +515,7 @@ func TestUserFileUpload(t *testing.T) {
 	} {
 		// Write local file.
 		filePath := filepath.Join(dir, fmt.Sprintf("file%d.csv", i))
-		err := ioutil.WriteFile(filePath, tc.fileContent, 0666)
+		err := os.WriteFile(filePath, tc.fileContent, 0666)
 		require.NoError(t, err)
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("destination-not-full-URI", func(t *testing.T) {
@@ -502,8 +525,8 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
-					constructUserfileDestinationURI("", destination, security.RootUserName()),
+				checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(),
+					constructUserfileDestinationURI("", destination, username.RootUserName()),
 					tc.fileContent)
 			})
 
@@ -513,7 +536,7 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+				checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(),
 					destination, tc.fileContent)
 			})
 
@@ -525,7 +548,7 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+				checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(),
 					destination, tc.fileContent)
 			})
 
@@ -550,6 +573,42 @@ func TestUserFileUpload(t *testing.T) {
 			})
 		})
 	}
+}
+
+// Regression test for https://github.com/cockroachdb/cockroach/issues/102494.
+// Uploading the same file with telemetry logs enabled used to crash the node.
+func TestUserFileUploadExistingFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := NewCLITest(TestCLIParams{T: t})
+	defer c.Cleanup()
+	c.omitArgs = true
+
+	_, err := c.RunWithCaptureArgs([]string{"sql", "-e", "SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true"})
+	require.NoError(t, err)
+
+	dir, cleanFn := testutils.TempDir(t)
+	defer cleanFn()
+	ctx := context.Background()
+	contents := make([]byte, chunkSize)
+
+	// Write local file.
+	filePath := filepath.Join(dir, "file.csv")
+	err = os.WriteFile(filePath, contents, 0666)
+	require.NoError(t, err)
+
+	destination := "userfile://defaultdb.public.foo/test/file.csv"
+	out, err := c.RunWithCapture(fmt.Sprintf("userfile upload %s %s", filePath, destination))
+	require.NoError(t, err)
+	require.Contains(t, out, "successfully uploaded to userfile://defaultdb.public.foo/test/file.csv")
+
+	checkUserFileContent(
+		ctx, t, c.Server.ExecutorConfig(), username.RootUserName(), destination, contents,
+	)
+
+	out, err = c.RunWithCapture(fmt.Sprintf("userfile upload %s %s", filePath, destination))
+	require.NoError(t, err)
+	require.Contains(t, out, "destination file already exists for /test/file.csv")
 }
 
 func checkListedFiles(t *testing.T, c TestCLI, uri string, args string, expectedFiles []string) {
@@ -603,12 +662,12 @@ func TestUserfile(t *testing.T) {
 	sort.Strings(fileNames)
 
 	localFilePath := filepath.Join(dir, "test.csv")
-	err := ioutil.WriteFile(localFilePath, []byte("a"), 0666)
+	err := os.WriteFile(localFilePath, []byte("a"), 0666)
 	require.NoError(t, err)
 
 	defaultUserfileURLSchemeAndHost := url.URL{
 		Scheme: defaultUserfileScheme,
-		Host:   defaultQualifiedNamePrefix + security.RootUser,
+		Host:   defaultQualifiedNamePrefix + username.RootUser,
 	}
 
 	for tcNum, tc := range []struct {
@@ -780,14 +839,14 @@ func TestUsernameUserfileInteraction(t *testing.T) {
 
 	localFilePath := filepath.Join(dir, "test.csv")
 	fileContent := []byte("a")
-	err := ioutil.WriteFile(localFilePath, []byte("a"), 0666)
+	err := os.WriteFile(localFilePath, []byte("a"), 0666)
 	require.NoError(t, err)
 
-	rootURL, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(),
-		url.User(security.RootUser))
+	rootURL, cleanup := sqlutils.PGUrl(t, c.Server.AdvSQLAddr(), t.Name(),
+		url.User(username.RootUser))
 	defer cleanup()
 
-	conn := sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard, rootURL.String())
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, rootURL.String())
 	defer func() {
 		if err := conn.Close(); err != nil {
 			t.Fatal(err)
@@ -815,25 +874,26 @@ func TestUsernameUserfileInteraction(t *testing.T) {
 			},
 		} {
 			createUserQuery := fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD 'a'`, tc.username)
-			err = conn.Exec(createUserQuery, nil)
+			err = conn.Exec(ctx, createUserQuery)
 			require.NoError(t, err)
 
 			privsUserQuery := fmt.Sprintf(`GRANT CREATE ON DATABASE defaultdb TO "%s"`, tc.username)
-			err = conn.Exec(privsUserQuery, nil)
+			err = conn.Exec(ctx, privsUserQuery)
 			require.NoError(t, err)
 
-			userURL, cleanup2 := sqlutils.PGUrlWithOptionalClientCerts(t, c.ServingSQLAddr(), t.Name(),
-				url.UserPassword(tc.username, "a"), false)
+			userURL, cleanup2 := sqlutils.PGUrlWithOptionalClientCerts(t,
+				c.Server.AdvSQLAddr(), t.Name(),
+				url.UserPassword(tc.username, "a"), false, "")
 			defer cleanup2()
 
 			_, err := c.RunWithCapture(fmt.Sprintf("userfile upload %s %s --url=%s",
 				localFilePath, tc.name, userURL.String()))
 			require.NoError(t, err)
 
-			user, err := security.MakeSQLUsernameFromUserInput(tc.username, security.UsernameCreation)
+			user, err := username.MakeSQLUsernameFromUserInput(tc.username, username.PurposeCreation)
 			require.NoError(t, err)
 			uri := constructUserfileDestinationURI("", tc.name, user)
-			checkUserFileContent(ctx, t, c.ExecutorConfig(), user, uri, fileContent)
+			checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), user, uri, fileContent)
 
 			checkListedFiles(t, c, "", fmt.Sprintf("--url=%s", userURL.String()), []string{tc.name})
 

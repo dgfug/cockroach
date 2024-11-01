@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lang
 
@@ -16,23 +11,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
-
-// The Optgen language compiler uses itself to generate its AST expressions.
-// This is a form of compiler bootstrapping:
-//   https://en.wikipedia.org/wiki/Bootstrapping_(compilers)
-//
-// In order to regenerate expr.og.go or operator.og.go, perform these steps
-// from the optgen directory (and make sure that $GOROOT/bin is in your path):
-//
-//   cd cmd/langgen
-//   go build && go install
-//   cd ../../lang
-//   go generate
-
-//go:generate langgen -out expr.og.go exprs lang.opt
-//go:generate langgen -out operator.og.go ops lang.opt
-//go:generate stringer -type=Operator operator.og.go
 
 // VisitFunc is called by the Visit method of an expression for each child of
 // that expression. The function can return the expression as-is, with no
@@ -196,9 +178,9 @@ func (e RuleSetExpr) Sort(less func(left, right *RuleExpr) bool) {
 // construct several different operators; which it constructs is not known until
 // runtime. For example:
 //
-//   (Select $input:(Left | InnerJoin $left:* $right:* $on))
-//   =>
-//   ((OpName $input) $left $right $on)
+//	(Select $input:(Left | InnerJoin $left:* $right:* $on))
+//	=>
+//	((OpName $input) $left $right $on)
 //
 // The replace pattern uses a constructor function that dynamically constructs
 // either a Left or InnerJoin operator.
@@ -276,7 +258,7 @@ func formatExpr(e Expr, buf *bytes.Buffer, level int) {
 		return
 	}
 
-	opName := strings.Title(e.Op().String())
+	opName := cases.Title(language.English, cases.NoLower).String(e.Op().String())
 	opName = opName[:len(opName)-2]
 	src := e.Source()
 

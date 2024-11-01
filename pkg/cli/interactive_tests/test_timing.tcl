@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 # This test ensures timing displayed in the CLI works as expected.
 
-spawn $argv demo movr
+spawn $argv demo movr --no-line-editor --log-dir=logs
 eexpect root@
 
 start_test "Test that server execution time and network latency are printed by default."
@@ -35,9 +35,6 @@ end_test
 
 start_test "Check that server times also work if IntervalStyle is different"
 # regression test for issue #67618.
-send "set intervalstyle_enabled = 'on';\r"
-eexpect "SET"
-eexpect root@
 send "set IntervalStyle = 'iso_8601';\r"
 eexpect "SET"
 eexpect root@

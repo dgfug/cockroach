@@ -1,31 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import * as protobuf from "protobufjs/minimal";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
-import * as protos from "src/js/protos";
 import * as eventTypes from "src/util/eventTypes";
-
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 /**
  * getEventDescription returns a short summary of an event.
  */
-export function getEventDescription(e: Event$Properties): string {
-  const info: EventInfo = protobuf.util.isset(e, "info")
-    ? JSON.parse(e.info)
-    : {};
+export function getEventDescription(e: clusterUiApi.EventColumns): string {
+  const info: EventInfo = e.info ? JSON.parse(e.info) : {};
+  const withID = info.MutationID ? ` with ID ${info.MutationID}` : "";
   let privs = "";
   let comment = "";
 
-  switch (e.event_type) {
+  switch (e.eventType) {
     case eventTypes.CREATE_DATABASE:
       return `Database Created: User ${info.User} created database ${info.DatabaseName}`;
     case eventTypes.DROP_DATABASE: {
@@ -75,13 +66,13 @@ export function getEventDescription(e: Event$Properties): string {
     case eventTypes.TRUNCATE_TABLE:
       return `Table Truncated: User ${info.User} truncated table ${info.TableName}`;
     case eventTypes.ALTER_TABLE:
-      return `Schema Change: User ${info.User} began a schema change to alter table ${info.TableName} with ID ${info.MutationID}`;
+      return `Schema Change: User ${info.User} began a schema change to alter table ${info.TableName}${withID}`;
     case eventTypes.CREATE_INDEX:
-      return `Schema Change: User ${info.User} began a schema change to create an index ${info.IndexName} on table ${info.TableName} with ID ${info.MutationID}`;
+      return `Schema Change: User ${info.User} began a schema change to create an index ${info.IndexName} on table ${info.TableName}${withID}`;
     case eventTypes.DROP_INDEX:
-      return `Schema Change: User ${info.User} began a schema change to drop index ${info.IndexName} on table ${info.TableName} with ID ${info.MutationID}`;
+      return `Schema Change: User ${info.User} began a schema change to drop index ${info.IndexName} on table ${info.TableName}${withID}`;
     case eventTypes.ALTER_INDEX:
-      return `Schema Change: User ${info.User} began a schema change to alter index ${info.IndexName} on table ${info.TableName} with ID ${info.MutationID}`;
+      return `Schema Change: User ${info.User} began a schema change to alter index ${info.IndexName} on table ${info.TableName}${withID}`;
     case eventTypes.CREATE_VIEW:
       return `View Created: User ${info.User} created view ${info.ViewName}`;
     case eventTypes.DROP_VIEW:
@@ -103,11 +94,11 @@ export function getEventDescription(e: Event$Properties): string {
     case eventTypes.DROP_SEQUENCE:
       return `Sequence Dropped: User ${info.User} dropped sequence ${info.SequenceName}`;
     case eventTypes.REVERSE_SCHEMA_CHANGE:
-      return `Schema Change Reversed: Schema change on descriptor ${info.DescriptorID} with ID ${info.MutationID} was reversed.`;
+      return `Schema Change Reversed: Schema change on descriptor ${info.DescriptorID}${withID} was reversed.`;
     case eventTypes.FINISH_SCHEMA_CHANGE:
-      return `Schema Change Completed: Schema change on descriptor ${info.DescriptorID} with ID ${info.MutationID} was completed.`;
+      return `Schema Change Completed: Schema change on descriptor ${info.DescriptorID}${withID} was completed.`;
     case eventTypes.FINISH_SCHEMA_CHANGE_ROLLBACK:
-      return `Schema Change Rollback Completed: Rollback of schema change on descriptor ${info.DescriptorID} with ID ${info.MutationID} was completed.`;
+      return `Schema Change Rollback Completed: Rollback of schema change on descriptor ${info.DescriptorID}${withID} was completed.`;
     case eventTypes.NODE_JOIN:
       return `Node Joined: Node ${info.NodeID} joined the cluster`;
     case eventTypes.NODE_DECOMMISSIONING:
@@ -124,7 +115,12 @@ export function getEventDescription(e: Event$Properties): string {
       }
       return `Cluster Setting Changed: User ${info.User} changed ${info.SettingName}`;
     case eventTypes.SET_ZONE_CONFIG:
-      return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target} to ${info.Config}`;
+      if (info.Options && info.Options.length > 0) {
+        return `Zone Config Changed: User ${
+          info.User
+        } set the zone config for ${info.Target} to ${info.Options.join(", ")}`;
+      }
+      return `Zone Config Changed: User ${info.User} set the zone config for ${info.Target}`;
     case eventTypes.REMOVE_ZONE_CONFIG:
       return `Zone Config Removed: User ${info.User} removed the zone config for ${info.Target}`;
     case eventTypes.CREATE_STATISTICS:
@@ -178,7 +174,17 @@ export function getEventDescription(e: Event$Properties): string {
     case eventTypes.DROP_ROLE:
       return `Role Dropped: User ${info.User} dropped role ${info.RoleName}`;
     case eventTypes.ALTER_ROLE:
-      return `Role Altered: User ${info.User} altered role ${info.RoleName} with options ${info.Options}`;
+      if (info.Options && info.Options.length > 0) {
+        return `Role Altered: User ${info.User} altered role ${info.RoleName} with options ${info.Options}`;
+      } else if (
+        info.SetInfo &&
+        info.SetInfo.length === 1 &&
+        info.SetInfo[0] === "DEFAULTSETTINGS"
+      ) {
+        return `Role Altered: User ${info.User} altered default settings for role ${info.RoleName}`;
+      } else {
+        return `Role Altered: User ${info.User} altered role ${info.RoleName}`;
+      }
     case eventTypes.IMPORT:
       return `Import Job: User ${info.User} has a job ${info.JobID} running with status ${info.Status}`;
     case eventTypes.RESTORE:
@@ -198,14 +204,14 @@ export function getEventDescription(e: Event$Properties): string {
     eventTypes.UNSAFE_UPSERT_DESCRIPTOR,
     eventTypes.UNSAFE_DELETE_DESCRIPTOR):
       return `Unsafe: User ${info.User} executed crdb_internal.${
-        e.event_type
+        e.eventType
       }, Info: ${JSON.stringify(info, null, 2)}`;
+    case eventTypes.DISK_SLOWNESS_DETECTED:
+      return `Disk Slowness Detected: Node ${info.NodeID} Store ${info.StoreID} is experiencing a slow disk`;
+    case eventTypes.DISK_SLOWNESS_CLEARED:
+      return `Disk Slowness Cleared: Node ${info.NodeID} Store ${info.StoreID} is no longer experiencing a slow disk`;
     default:
-      return `Event: ${e.event_type}, content: ${JSON.stringify(
-        info,
-        null,
-        2,
-      )}`;
+      return `Event: ${e.eventType}, content: ${JSON.stringify(info, null, 2)}`;
   }
 }
 
@@ -213,7 +219,6 @@ export function getEventDescription(e: Event$Properties): string {
 // and the `info` field of the `server.serverpb.EventsResponse.Event` proto.
 export interface EventInfo {
   CascadeDroppedViews?: string[];
-  Config?: string;
   DatabaseName?: string;
   DescriptorType?: string;
   DescriptorName?: string;
@@ -236,6 +241,7 @@ export interface EventInfo {
   RoleName?: string;
   SchemaName?: string;
   SequenceName?: string;
+  SetInfo?: string[];
   SettingName?: string;
   Statement?: string;
   TableName?: string;
@@ -266,6 +272,7 @@ export interface EventInfo {
   ForceNotice?: string;
   PreviousDescriptor?: string;
   NewDescriptor?: string;
+  StoreID?: string;
 }
 
 export function getDroppedObjectsText(eventInfo: EventInfo): string {

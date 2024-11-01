@@ -43,7 +43,7 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zAQx9_3Kax7odW81naCNvxUGGHLVChLO21orlDW3FhEsTPbnTKhfvcpCQNa1ED84PbO_v3P_7OcW3C_lyAh-nY-PozPSO84ns6mn8d9Mo3G0fsZuSYnyeSUXKG59OmPJZKvH6MkIs5f5tqjdbjwrrd3-mU8i88n8dms1xMDQcRA9CnpBQNGggHr9_ek_BBNTqNZckErrZs-mSTHUUKOLsg1UNAmw7P0Bh3I78BhTqGwZoHOGVulbusNcVaCZBRyXax8lZ5TWBiLIG_B536JIGFWnTHBNEM7ZEAhQ5_my1r23sKoOsBlrjMsgcK0SLWTZKjgSKnyZ6ZUyZlSJXtugjddGa6ApDojASPG_0LrYL6mYFb-wY_z6RWC5Gv6cs-x_oPWY3aSLz1atEO-afz_elQWlhhNRlwSV7kmzqfWy9pF8HZfKSaYUow9NwFBnXXFKvNb7ilMVl6SEd_ZB9GlD59Mru-uXuy6-sLmN6n9-1CajsTO6kGX6vfdDzZrN3m5_WIYZyFrhrj75Yw3fw4OD-4H4-GT-GHnxngXPon35OOHNxL9F_Q87OJ6aqxHOww3PY_4653y-13kE3SF0Q435Hcps_WcAmZX2HwynFnZBZ5bs6jLNOGk5upEhs43q7wJYt0sVQd8DPNWWLTDohUO2uGgFQ7b4bAV3t-C5-tX_wIAAP__VL3gzA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlGFv2jwQx98_n8K6NwU9LthJquepX9GWdMsEpYNMW7UglJErjQhxZpuVquK7T0kKLWlDy70wubP9u_PfZx5B_05AgPvjunfmXZFG1xv5o6-9Jhm5PffCJ3NyORz0yQzlxIS_EiTfP7tDl2gziVODSuPU6MZR_1vP964H3pXfaFgti1gtq0lJw24xYrdYs3kkxCd30Hf94Q3NWYsmGQy77pCc35A5UEhlhFfhAjWIn8BhTCFTcopaS5WHHosFXrQCwSjEabY0eXhMYSoVgngEE5sEQYCf1zjEMELVZkAhQhPGSYHdHqGTFzCJ0whXQOFCJstFqgWZl5UBhVEW5oF2AOdBsLqNgmDFWRCs2HsDHB-6hwdAwjQiNiPS3KHSMF5TkEvzfERtwhmC4C808bog2Jp-XBYv_YPKYHQZJwYVqjbf1WYz764yRWRKOlwQnatAtAmVEcWp7P9OgoBZLAgYe28Agml06LZcjIoaFAZLI0iH1-piVXThh-jyRcbpU7dYe7ql_Jpkc3x4q2PqSrMrpVmHlLa9Knu3sDIuqi-Qceaw0qynX854-XF6dro1xp1X_vPKHfvfeeUfiZcPuWM1P3BBTkUF-xAVRlIZVG1nV4MO_7c23UklnXNIuiHqTKYad9LVZWKVTMd8PaaA0QzL_ywtl2qK10pOi7WlOyhARSBCbcpZXjpeupnSRmG42D7zlyS-l2TVk3iVZO0l2fUkq0qy95KcepJdJTl7SSf7dBpTuE3k_SSOQMCmZ4_fGDYG-YZwpvMGGN3J-wLrP2T59d2GiUYK_XCOXTSoFnEaaxNPQRi1xPX6n78BAAD__8kUP_s=
 
 # The inverted filterer handles five inverted index rows with decoded
 # datums, where the first column is the PK (k) and the second is the cellid
@@ -61,7 +61,7 @@ statement ok
 ALTER INDEX geo_table@geom_index SPLIT AT VALUES (1152921574000000000)
 
 query TI colnames,rowsort
-SELECT replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index]
+SELECT replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index WITH DETAILS]
 ----
 replicas  lease_holder
 {1}       1
@@ -94,19 +94,20 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zAQx9_3Kax7odW81naCNvxUGGHLVChLO21orlDW3FhEsTPbnTKhfvcpCQNa1ED84PbO_v3P_7OcW3C_lyAh-nY-PozPSO84ns6mn8d9Mo3G0fsZuSYnyeSUXKG59OmPJZKvH6MkIs5f5tqjdbjwrrd3-mU8i88n8dms1xMDQcRA9CnpBQNGggHr9_ek_BBNTqNZckErrZs-mSTHUUKOLsg1UNAmw7P0Bh3I78BhTqGwZoHOGVulbusNcVaCZBRyXax8lZ5TWBiLIG_B536JIGFWnTHBNEM7ZEAhQ5_my1r23sKoOsBlrjMsgcK0SLWTZKjgSKnyZ6ZUyZlSJXtugjddGa6ApDojASPG_0LrYL6mYFb-wY_z6RWC5Gv6cs-x_oPWY3aSLz1atEO-afz_elQWlhhNRlwSV7kmzqfWy9pF8HZfKSaYUow9NwFBnXXFKvNb7ilMVl6SEd_ZB9GlD59Mru-uXuy6-sLmN6n9-1CajsTO6kGX6vfdDzZrN3m5_WIYZyFrhrj75Yw3fw4OD-4H4-GT-GHnxngXPon35OOHNxL9F_Q87OJ6aqxHOww3PY_4653y-13kE3SF0Q435Hcps_WcAmZX2HwynFnZBZ5bs6jLNOGk5upEhs43q7wJYt0sVQd8DPNWWLTDohUO2uGgFQ7b4bAV3t-C5-tX_wIAAP__VL3gzA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlGFv2jwQx98_n8K6NwU9LthJquepX9GWdMsEpYNMW7UglJErjQhxZpuVquK7T0kKLWlDy70wubP9u_PfZx5B_05AgPvjunfmXZFG1xv5o6-9Jhm5PffCJ3NyORz0yQzlxIS_EiTfP7tDl2gziVODSuPU6MZR_1vP964H3pXfaFgti1gtq0lJw24xYrdYs3kkxCd30Hf94Q3NWYsmGQy77pCc35A5UEhlhFfhAjWIn8BhTCFTcopaS5WHHosFXrQCwSjEabY0eXhMYSoVgngEE5sEQYCf1zjEMELVZkAhQhPGSYHdHqGTFzCJ0whXQOFCJstFqgWZl5UBhVEW5oF2AOdBsLqNgmDFWRCs2HsDHB-6hwdAwjQiNiPS3KHSMF5TkEvzfERtwhmC4C808bog2Jp-XBYv_YPKYHQZJwYVqjbf1WYz764yRWRKOlwQnatAtAmVEcWp7P9OgoBZLAgYe28Agml06LZcjIoaFAZLI0iH1-piVXThh-jyRcbpU7dYe7ql_Jpkc3x4q2PqSrMrpVmHlLa9Knu3sDIuqi-Qceaw0qynX854-XF6dro1xp1X_vPKHfvfeeUfiZcPuWM1P3BBTkUF-xAVRlIZVG1nV4MO_7c23UklnXNIuiHqTKYad9LVZWKVTMd8PaaA0QzL_ywtl2qK10pOi7WlOyhARSBCbcpZXjpeupnSRmG42D7zlyS-l2TVk3iVZO0l2fUkq0qy95KcepJdJTl7SSf7dBpTuE3k_SSOQMCmZ4_fGDYG-YZwpvMGGN3J-wLrP2T59d2GiUYK_XCOXTSoFnEaaxNPQRi1xPX6n78BAAD__8kUP_s=
 
 statement ok
 ALTER INDEX geo_table@geom_index EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1152921574000000000)
 
 query TTTI colnames,rowsort
-SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index]
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index WITH DETAILS]
+ORDER BY 1
 ----
-start_key             end_key               replicas  lease_holder
-NULL                  /1152921574000000000  {1}       1
-/1152921574000000000  NULL                  {2}       2
+start_key              end_key                replicas  lease_holder
+<before:/Table/67>     …/1152921574000000000  {1}       1
+…/1152921574000000000  <after:/Max>           {2}       2
 
-# Distributed.
+# Distributed. TODO(treilly): This claims to be distributed, but it isn't. What gives?
 query T
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE ST_Intersects('MULTIPOINT((2.2 2.2), (3.0 3.0))'::geometry, geom) ORDER BY k
@@ -132,7 +133,7 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zAQx9_3Kax7odW81naCNvxUGGHLVChLO21orlDW3FhEsTPbnTKhfvcpCQNa1ED84PbO_v3P_7OcW3C_lyAh-nY-PozPSO84ns6mn8d9Mo3G0fsZuSYnyeSUXKG59OmPJZKvH6MkIs5f5tqjdbjwrrd3-mU8i88n8dms1xMDQcRA9CnpBQNGggHr9_ek_BBNTqNZckErrZs-mSTHUUKOLsg1UNAmw7P0Bh3I78BhTqGwZoHOGVulbusNcVaCZBRyXax8lZ5TWBiLIG_B536JIGFWnTHBNEM7ZEAhQ5_my1r23sKoOsBlrjMsgcK0SLWTZKjgSKnyZ6ZUyZlSJXtugjddGa6ApDojASPG_0LrYL6mYFb-wY_z6RWC5Gv6cs-x_oPWY3aSLz1atEO-afz_elQWlhhNRlwSV7kmzqfWy9pF8HZfKSaYUow9NwFBnXXFKvNb7ilMVl6SEd_ZB9GlD59Mru-uXuy6-sLmN6n9-1CajsTO6kGX6vfdDzZrN3m5_WIYZyFrhrj75Yw3fw4OD-4H4-GT-GHnxngXPon35OOHNxL9F_Q87OJ6aqxHOww3PY_4653y-13kE3SF0Q435Hcps_WcAmZX2HwynFnZBZ5bs6jLNOGk5upEhs43q7wJYt0sVQd8DPNWWLTDohUO2uGgFQ7b4bAV3t-C5-tX_wIAAP__VL3gzA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlGFv2jwQx98_n8K6NwU9LthJquepX9GWdMsEpYNMW7UglJErjQhxZpuVquK7T0kKLWlDy70wubP9u_PfZx5B_05AgPvjunfmXZFG1xv5o6-9Jhm5PffCJ3NyORz0yQzlxIS_EiTfP7tDl2gziVODSuPU6MZR_1vP964H3pXfaFgti1gtq0lJw24xYrdYs3kkxCd30Hf94Q3NWYsmGQy77pCc35A5UEhlhFfhAjWIn8BhTCFTcopaS5WHHosFXrQCwSjEabY0eXhMYSoVgngEE5sEQYCf1zjEMELVZkAhQhPGSYHdHqGTFzCJ0whXQOFCJstFqgWZl5UBhVEW5oF2AOdBsLqNgmDFWRCs2HsDHB-6hwdAwjQiNiPS3KHSMF5TkEvzfERtwhmC4C808bog2Jp-XBYv_YPKYHQZJwYVqjbf1WYz764yRWRKOlwQnatAtAmVEcWp7P9OgoBZLAgYe28Agml06LZcjIoaFAZLI0iH1-piVXThh-jyRcbpU7dYe7ql_Jpkc3x4q2PqSrMrpVmHlLa9Knu3sDIuqi-Qceaw0qynX854-XF6dro1xp1X_vPKHfvfeeUfiZcPuWM1P3BBTkUF-xAVRlIZVG1nV4MO_7c23UklnXNIuiHqTKYad9LVZWKVTMd8PaaA0QzL_ywtl2qK10pOi7WlOyhARSBCbcpZXjpeupnSRmG42D7zlyS-l2TVk3iVZO0l2fUkq0qy95KcepJdJTl7SSf7dBpTuE3k_SSOQMCmZ4_fGDYG-YZwpvMGGN3J-wLrP2T59d2GiUYK_XCOXTSoFnEaaxNPQRi1xPX6n78BAAD__8kUP_s=
 
 # Data is distributed, but the filterer can't be distributed since it is not a union.
 query T
@@ -160,7 +161,7 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zwUhu-_X2GdG1p9Xms7QRu-KoywZSqUpZ02NFco1GcsosSZ7aIg1P8-JWFAQQ3EF27PsZ_3-D2WcwfuzxIkRD9Ox_vxCekdxtPZ9Ou4T6bROPo4I1fkKJkck0s05z69WCL5_jlKIuL8-cLcoEV9cdvbOf42nsWnk_hk1uuJgSBiIPqU9IIBI8GA9fs7Un6KJsfRLDmjldR1n0ySwyghB2fkCijkRuNJeo0O5E_gMKdQWLNA54ytUnf1hliXIBmFLC9WvkrPKSyMRZB34DO_RJAwq46YYKrRDhlQ0OjTbFnLPjgYVQc4z3KNJVCYFmnuJBkqOFCq_KWVKjlTqmSvTfCuK8MVkDTXJGDE-N9oHczXFMzKP_pxPr1EkHxN3-45zm_QetRH2dKjRTvkm8b_rUdlYYnJyYhL4irXxPnUelm7CN7vKsUEU4qx1yYgmOuuWGX-mXsKk5WXZMS39kF06cMXk-X3Vy-2XX1hs-vU3j6WpiOxtXrQpfpD94PN2k1ePnswjLOQNUPc_3LGmz97-3sPg_HwRfy4c2N8CF_EO_LpuxuJ_htaHnYxPTXWox2Gm5ZH_P-t8rtd5BN0hckdbshvU2brOQXUl9h8MZxZ2QWeWrOoyzThpObqhEbnm1XeBHHeLFUHfArzVli0w6IVDtrhoBUO2-GwFd59Bs_X__0NAAD___MV38o=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFv2jAQx9_3Kax7KWgu2EmqrX6iLemWCUoHTFu1IJSSK40IcWablqriu09JCi1pQ8s9mNzZ_t357zOPoP_FIMD9c9k58S5Ire0NhoOfnToZuB33bEhm5Lzf65IpyrEJrmMkv7-7fZdoM57IO1QYXj_UDrq_OkPvsuddDGs1q2ERq2HVKanZDUbsBqvXD4T45va67rB_RTPUvE56_bbbJ6dXZAYUEhniRTBHDeIvcBhRSJWcoNZSZaHHfIEXLkEwClGSLkwWHlGYSIUgHsFEJkYQMMxK7GMQomoyoBCiCaI4x25O0MoKGEdJiEugcCbjxTzRgsyKyoDCIA2yQNOHU99f3oS-v-TM95fsvQEO993DfSBBEhKbEWluUWkYrSjIhXk-ojbBFEHwF5p4bRBsRT8ui5fcoTIYnkexQYWqybe1Wc-7y1QRmZAWF0RnKhBtAmVEfir7y5HvM4v5PmPvDUAwCffdlolRUoNCb2EEafFKXaySLnwfXX7IKHnqFmtHtxRf43SGD291TFVpdqk0a5_SNldlbxdWxEXpATLOHFaY9fTLGS8-jk-ON8a488p_XrllX51X_oF4-Y5bVv0D9-OURLD3EWEglUHVdLYlaPHPlemOSumcfdL1Uacy0biVrioTK2U65KsRBQynWPxlablQE7xUcpKvLdxeDsoDIWpTzPLC8ZL1lDYKg_nmlb8k8Z0kq5rEyyRrJ8muJlllkr2T5FST7DLJ2Uk62qXTiMJNLO_HUQgC1j17-MawNsg2BFOdNcDgVt7n2OFDml3fTRBrpNANZthGg2oeJZE20QSEUQtcrT79DwAA__9E0T75
 
 # Move all the index data that will be read to node 2 while the query executes
 # at node 1. The filtering moves to node 2 when it is distributable.
@@ -169,14 +170,16 @@ statement ok
 ALTER INDEX geo_table@geom_index EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)
 
 query TTTI colnames,rowsort
-SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index]
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index WITH DETAILS]
+ORDER BY 1
 ----
-start_key             end_key               replicas  lease_holder
-NULL                  /1152921574000000000  {2}       2
-/1152921574000000000  NULL                  {2}       2
+start_key              end_key                replicas  lease_holder
+<before:/Table/67>     …/1152921574000000000  {2}       2
+…/1152921574000000000  <after:/Max>           {2}       2
 
-# Filtering is placed at node 2.
-query T
+# Filtering is placed at node 2. We need a retry here to account for possibly
+# stale dist sender caches.
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE ST_Intersects('MULTIPOINT((2.2 2.2), (3.0 3.0))'::geometry, geom) ORDER BY k
 ----
@@ -201,10 +204,13 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zwUhu-_X2GdG1p9prWdlA1fFUbYMpWWpZ02NFcoa85YRLEz2506of73KQ0DAmogvnB7jv2ck_e17Ftwv5YgIfp6PjqKx6RzEk9n00-jLplGo-jdjFyT02RyRq7QXPr0-xLJlw9REhHnL3Pt0TpceNfZO_s8msXnk3g863RETxDRE11KOkGPkaDHut09Kd9Hk7NollzQstZNl0ySkyghxxfkGihok-E4vUEH8htwoCBgTqGwZoHOGVumb7eb4mwNklHIdbHyZXpOYWEsgrwFn_slgoSx2TdFfwAUMvRpvtxu21AwK_8AOZ9eIciDDX1UmDcXnpUGJJhmaPusVh7u_RmW6i5zneEaKEyLVDtJ-gqOlVr_yJRac6bUmr00wX5bhisgqc5IwIjxP9E62KWZt9Ec699oPWan-dKjRdvndeH_1qN1YYnRZMglcaVq4nxqvdyqCN4MlGKCKcXYSxMQ1FlbrBT_RD2FycpLMuQ7fRBtfPhocn139GLX0Rc2v0ntn4fWdCh2dg_adL93P6j3rvLy6XVknIWsGuLulzNe_Tk8OrwfjIfP4oedtfE2fBbvyce3eii6r_A8bKN6aqxH2w_rmof8_53lB7XyL7wTCbrCaIeveijYZk4Bsyus3iJnVnaB59Ystm2qcLLltokMna9WD6og1tVS-YGPYd4Ii2ZYNMJBMxw0wmEzHDbCg2Z40AizJ_B889_fAAAA___nMRL3
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlN9v2joUx9_vX2Gdl4KuATsJvbd-oi3plokfHTBt1VKhjJzSiBBntlmpKv73KaRQSBta_ODEx_bn63x9cp5A_45BgPvjunPu9Uil7Q1Hw6-dKhm6HfdyRGbkatDvkinKsQl-xUi-f3YHLtFmHCUGlcaJ0ZWT7rfOyLvue71RpWLVLWLVrSolFbvOiF1n1eqJEJ_cftcdDW5oxppXSX_Qdgfk4obMgEIiQ-wFc9QgfgIHChbcUkiVnKDWUmXhp_UiL1yCYBSiJF2YLHxLYSIVgngCE5kYQUBP1mTaaAKFEE0QxetlKwpyYV42aRNMEcTpjorXBtFc0R0hflholBkywCBE1WB7crD1q5V97ThKQlwChUsZL-aJFmSW2wAUhmmQBRo-XPj-8i70_SVnvr9k73VQO3YP94EESUhsRqS5R6WhzBZesIUdY4uX_EFlMLyKYoMKVYPve7OZd5epIjIhLS6Izlwg2gTKiPVX2f81fZ9ZzPcZe68Dgkl47LbMjIIbFPoLI0iLl_piFXzhx_jyRUbJc7ZYB7IlfxunM3x8K2PKjmYXjmYdc7TtVdn7B8vjovi7M84cljfr-ckZz1_Ozs-2jXHn1fhl5V7733k1PhG7VaNlVT9wQU7BBfsYF4ZSGVQNZ9-DFv-3VK5ZkHP25N6pUwPUqUw0fqhQsYJSja9uKWA4xbw4arlQE7xWcrJemw_7a9A6EKI2-expPvCSzZQ2CoP59jffJfGDJOsIknWQZJeTeJFkHyQ55SSrSHIOkprlJLtIah4ksXKSk93iXSwfxlEIAjbZX3uj2zTINgRTnaXS8F4-rLGjxzRLhLsg1kihG8ywjQbVPEoibaIJCKMWuFr98zcAAP__BJd7Wg==
 
 # Filtering is at gateway node since the filter is not distributable.
-query T
+#
+# TODO(treilly): What the text above claims does not square with the figure
+# generated below.
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE ST_CoveredBy('MULTIPOINT((2.2 2.2), (3.0 3.0))'::geometry, geom) ORDER BY k
 ----
@@ -229,13 +235,30 @@ vectorized: true
                   table: geo_table@geom_index
                   spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFP2zAQx9_3Kax7odVMazspG34qjLBlKi1LO21orlCobyyixJntoiLU7z6lYUBBDcQPbu_s3__yP8u-A_d3DhKin6eDg3hIWkfxeDL-NmiTcTSIPk3IFTlORifkEs25Ty_mSH58iZKIOH8-MzdoUV_ctnZOvg8m8ekoHk5aLdERRHREm5JW0GEk6LB2e0fKz9HoJJokZ7SUum6TUXIUJeTwjFwBhdxoHKbX6ED-Ag4UBEwpFNbM0Dljy_TdelOslyAZhSwvFr5MTynMjEWQd-AzP0eQMDS7puj2gIJGn2bz9bYVBbPwj5Dz6SWC3FvRJ8K8XnhS-k8w1Wi7bEMeHtrTL92dZ7nGJVAYF2nuJOkqOFRq-VsrteRMqSV7bYLdpgxXQNJck4AR4_-gdbDNM2_iOc5v0HrUx9nco0Xb5ZvG_69Hy8ISk5M-l8SVronzqfVy7SL40FOKCaYUY69NQDDXTbHS_DP3FEYLL0mfb-2DaNKHrybL749ebDv6wmbXqb19LE37Ymv1oEn1h-4Hm7WrvHx2GxlnIauGuP_ljFd_9g_2Hwbj4Yv4cefG-Bi-iHfk00vdF-03tDxsYnpsrEfbDTct9_n7rfK9DflXnokEXWFyh296J9hqSgH1JVZPkTMLO8NTa2brMlU4WnPrhEbnq9W9Kojzaqn8wKcwr4VFPSxq4aAeDmrhsB4Oa-FePdyrhdkzeLp69y8AAP__-8wR9Q==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlN9T6jgUx9_3r8icF2E2QNIWd80TKnW3O_xwgTv3OrcOU-kRO5SmNwmK4_C_3ykVhGpR8pA2J8nnm35zel5A_4pBgPvjunPu9Uil7Q1Hw_87VTJ0O-7liMzI1aDfJVOUYxPcxUi-_-sOXKLNeCIfUWF491w56X7rjLzrvtcbVSpW3SJW3apSUrHrjNh1Vq2eCPGP2--6o8ENzVDzKukP2u6AXNyQGVBIZIi9YI4axE_gQMGCWwqpkhPUWqos_LJe5IVLEIxClKQLk4VvKUykQhAvYCITIwjoyZpMG02gEKIJoni9bEVBLszbJm2CKYI43VHx2iCaK7ojxA8LjTI_BhiEqBpsTw62drWyrx1HSYhLoHAp48U80YLMchuAwjANskDDhwvfX96Hvr_kzPeX7LMOasfu4T6QIAmJzYg0D6g0lNnCC7awY2zxkkdUBsOrKDaoUDX4vjebeXeZKiIT0uKC6MwFok2gjFh_lf1X0_eZxXyfsc86IJiEx27LzCi4QaG_MIK0eKkvVsEXfowv_8koec0W60C25G_jdIbPH2VM2dHswtGsY462vSp7_2B5XBT-dsaZw_JmvT454_nL2fnZtjHuvBu_rdxrfzvvxidit2i0rOoX7scpmGAfY8JQKoOq4exb0OJ_lso1C3LOntwnZWqAOpWJxi_VKVZQqvHVLQUMp5jXRi0XaoLXSk7Wa_Nhfw1aB0LUJp89zQdespnSRmEw3_7luyR-kGQdQbIOkuxyEi-S7IMkp5xkFUnOQVKznGQXSc2DJFZOcrJbvI_l0zgKQcAm-2sfdJsG2YZgqrNUGj7IpzV29JxmiXAfxBopdIMZttGgmkdJpE00AWHUAlerP34HAAD__9wDelg=
 
 # Bounding box operations.
 statement ok
 SET CLUSTER SETTING sql.spatial.experimental_box2d_comparison_operators.enabled = on
 
-query T
+query TTTI colnames,rowsort
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@geom_index WITH DETAILS]
+ORDER BY 1
+----
+start_key              end_key                replicas  lease_holder
+<before:/Table/67>     …/1152921574000000000  {2}       2
+…/1152921574000000000  <after:/Max>           {2}       2
+
+query ITTTI colnames,rowsort
+SELECT range_id, start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX geo_table@primary WITH DETAILS]
+ORDER BY lease_holder, start_key
+----
+range_id  start_key           end_key                                   replicas  lease_holder
+69        <before:/Table/67>  <after:/Table/106/2/1152921574000000000>  {2}       2
+
+# We should see a distributed execution (though need to retry to purge possibly
+# stale dist sender caches).
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE geom && 'POINT(3.0 3.0)'::geometry
 ----
@@ -257,9 +280,9 @@ vectorized: true
               table: geo_table@geom_index
               spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk29v0z4Qx5__XoV1T7pJ3mon7Q_kR-VPBkFdW9pKgHA1hfooEa0dbAcFVX3vKAlsS6emxA9Oujt_7vw96_bgfmxBQPRxNn4RT8jF63ixXLwfX5JFNI5eLcl3cjOf3pINmjuffNki-fA2mkelvyMyZyz4v7akN5vGk-VFeM1IeM0ue0K8iaa30XL-CShoo3CS7NCB-AwcKASwopBZs0bnjC3D--pSrAoQjEKqs9yX4RWFtbEIYg8-9VsEARNzZbL-ACgo9Em6ra4dKJjcP0DOJxsEMTzQR4V5e-FlKXCOiULbZ43ycK9_VCq_S7XCAigsskQ7QfoSXkpZfFVSFpxJWbBzBq66MlwCSbQiISPGf0Pr4JRm3kVzrH-i9ahu0q1Hi7bPm8L_5qMis8RoMuKCuFI1cT6xXlQqwmdDKVnApGTsnAGCWnXFSvFH6ilMcy_IiJ-cQ9BlDu9Mqv98fXDq6zOb7hL766E1HQUnu4ddut9PP2z2ruOCjIKjZWOccfb0PB888XuisYnnhjZoPPvMJs7RZUY7_KdVZIcVBVQbrLfdmdyucWbNumpTu9OKqwIKna-zw9qJdZ0qH_gY5q1w0A4HrXDYDoet8KAdHrTC7AheHf77HQAA__-eq8eX
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlNFv2j4Qx99_f4V1L20lU-yE_jb5ia1Nt0wtdIC0TXOFMnKlEcHObGelqvjfJyejg7TAyIOFz77v3X18xxPYnzkIiL7eXL2Le-T4Ih6Ohp-vTsgwuorOR2RGLgf9azJFPXbJjxzJl4_RIPL7OZElY8H_9UqObvpxb3QcnjISnrKTIyE-RP3raDT4BhSUTrGXzNGC-A4cKARwS6EweoLWauPNT9WlOF2AYBQyVZTOm28pTLRBEE_gMpcjCOjpli7aHaCQokuyvLq2pKBL99fJumSKIM7WosQXIDpLuhaI7w408gUPMEnRtNlGOHjm0fUkxplKcQEUznVezpUVZEYrREBhWCTe0JbwXsrFXSrlgjMpF2zfAq1DfbgEkqiUhIxod4_GwjYsvIGFHYIlVr_QOEwvs9yhQdPmm2xW59GiMEQr0uWCWE-BWJcYJ6qqwjdnUrKAScnYvgUIqvRQNw-jQYNCv3SCdPlWLkGDCz-EyyedqT_dEuzolvrXuJjh42sdsy21sJFacEhqz08VbiZW2wXpBo1hZpxx9vJ723mxPxIbk76PcKdRRrhRxp7JH6AttLL4T6PPGpFafHlLAdMp1n83VpdmgjdGT6q79bZfCVWGFK2rT8_qTaxWR9YZTObPg7OuxHcqBQcoBTuVwu1KvKkU7lTqbFcKmkqdnUpsu1Lo2d_l-mGcpSBg1T-tV5bVB94hmVrfAMN7_VDJjh4L_3x3SW6RwnUywwt0aOaZyqzLJiCcKXG5_O93AAAA__-ryibG
 
-query T
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE 'POINT(3.0 3.0)'::geometry::box2d && geom
 ----
@@ -281,9 +304,9 @@ vectorized: true
               table: geo_table@geom_index
               spans: 31 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk9Fv2j4Qx99_f8XpXmglV9gJ_Db5ibGmGhODDpCGNKMqwzcWDezMNlMmxP8-Jdna0o5Q_HDS3flz5-9Zt0P_Y40Sk_nt8M1gBBfXg-ls-nF4CdNkmLydwXe4mYw_wIrsXUi_rAk-vUsmCbS44II_P687z_yWlP3xPLoGteU8-r-2ZcENMjRW0yjdkEf5GQUyjHDBMHd2Sd5bV4Z31aWBLlByhpnJt6EMLxgurSOUOwxZWBNKHNkrm7c7yFBTSLN1dW3P0G7DA-RDuiKU3T17VFg0F56VyieUanJtflAe7wfTKxXdZUZTgQyneWq8hLbCvlLFV61UIbhSBT9l8OpcRiiE1GiIOdjwjZzHY5rFOZoH5ie5QPomWwdy5NriUPjffFLkDqyBnpDgS9XgQ-qCrFTEr7pK8Ygrxfkpg0BGn4uV4p-oZzjeBgk9cXQO0TlzeG8z8-fro2Nfn7tsk7pfD61ZLzraPT6n-_3048PedVxCqz-eX8QQsxjiy5b856r1ohfMpHPwqhOLNiGfW-PpRZvG9wuGpFdUL7O3W7ekW2eXVZvaHVdcFdDkQ53t1s7A1KnygY9h0QhHzXDUCMfNcNwId5rhTiPMn8CL_X-_AwAA__8rRsTS
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlVFv2jAQx9_3Kax7oZWMsBO6TX5iLVRjaksHSKs0VyjDVxoR7Mx2VqqK7z45GV1JC5Q8nPDZ97_zL3fkCdzvDAT0bq4vvvSvyFG3PxqPvl8ck1Hvonc2JnNyPhxckhmaiU9-ZUh-fO0Ne6TBOOPs9fO5_WrdEOJ0cBN1iSwYiz5WNggugII2Cq-SBToQP4EDhQhuKeTWTNE5Y4P7qTzUV0sQjEKq88IH9y2FqbEI4gl86jMEAVemafJWGygo9EmalcdWFEzh_wc5n8wQxMmLLP0uiPaKvkjEdycaBxJDTBTaFttIB8-gOuGGk1QrXAKFM5MVC-0EmdP11Ud5EhwtCadSLu-UlEvOpFyyfQaah8ZwCSTRisSMGH-P1sE2LLyGhR2Cpa__oPWoztPMo0Xb4pts1vu9ZW6J0aTDBXGBAnE-sV6Ut4o_nUjJIiYlY_sMENTq0LAAo0aDwqDwgnT4Vi5RjQs_hMs3k-p_3RLt6Jbq1ySf4-NbHbOttLhWWnRIac-vKt4srPIL0jgd3BzFJKYxiY8b4s1R7kTvANiuVRlvVLlnsIfocqMdvmuyWS1Tk69uKaCaYfVv4kxhp3htzbQ8Wy0HpVDpUOh8tXtSLfp6veW8xWTxPBcvlfhOpegApWinUrxdideV4p1K7e1KUV2pvVOJbVeKA_u7zDxMUgUC1p-F5htm_UAISGYuNMDo3jyUsuPHPLy-uyRzSOEymWMXPdpFqlPn0ykIbwtcrT78DQAA__8x_SQB
 
-query T
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE 'LINESTRING(1.0 1.0, 5.0 5.0)'::geometry ~ geom
 ----
@@ -305,9 +328,9 @@ vectorized: true
               table: geo_table@geom_index
               spans: 33 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlG9v2j4Qx5__XoV1T2glF-wk6Cf5EfsTukwUuoC0TTOqMnxj0cDObDNlQuy1T0nWFpAIxVIc3Z0_d_meddmC-7kCAfGn-9GrZEyu3ibT2fTD6JpM41H8ZkZ-kGE6uSNLNA8--7pC8vFdnMakM0rG8XSWJuPbK95lhHcZJf0uq57rjhC38eQunqWfyZ8KXQMFbRSOszU6EF-AA4UA5hQKaxbonLGVe1sfSlQJglHIdbHxlXtOYWEsgtiCz_0KQcDY3JiiFwEFhT7LV_WxHQWz8c-Q89kSQfR3dC8xb088qzSmmCm0PXaQHp5aMKgUPeRaYQkUpkWmnSA9Ca-lLL8pKUvOpCzZuQ1uLmW4BJJpRcKAGP8drYNTmvklmhP9C61HNcxXHi3aHj8U_hiPy8ISo8mAC-Iq1cT5zHpRqwj_70vJAiYlY-c2IKjVpVgl_kg9hcnGCzLgJ_sQXNKH9ybX_64-OHX1hc3Xmf39XJoOgpPVw0uqP3U_PKzd-AXpMM4C1qzH994asnDYZvMoYsd2RxwM6iB4QUejA01nxjRFVxjt8EVzynZzCqiW2PwKnNnYBd5bs6jLNOak5mqHQuebaL8xEt2Eqg_ch3krHLTDQSsctsNhKxy1w1ErzI7g-e6_vwEAAP__M6HNEQ==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUVFFv2jAQft-vsO6FVjLFToIm-YmtDV0mCh0gbdNSoYxcaUSIM9usVBX77ZOT0UFUQmMpTu58993d58s9g_6VggD_2-3gQzAkZ1fBZDr5MjgnE3_gX07JkvTHoxuyQDkz0c8UyddP_tgnrUEw9CfTcTC8PuMXjPALRkn3gtnnvCXEtT-68afj7-SPdV0BhUzGOIxWqEH8AA4UHLijkCs5R62lsurnwiiINyAYhSTL18aq7yjMpUIQz2ASkyIIGMq2zDseUIjRRElamG0pyLX576RNtEAQ3b0owRUIb0v3AvH6QFNb8xijGFWHHYSDF0p6tsJZksW4AQqXMl2vMi3Iku5Kn-SRVXRC-BiGm_s4DDecheGGndqg3dSHh0CiLCauQ6R5QKXhGC28QgtrQkuQ_UZlMO4nqUGFqsMPudmd-5tcEZmRHhdEWxaINpEyoqjKfd8NQ-awMGTs1AYEs7ipmyWjwgaF0doI0uNHeXEqvPAmvHyWSfavW5yabim_ZvkSn17rmGOpuZXUnCapvVyVe5hYqRekxThzWLl2773VZ26_Tuaex6pySxwMgp7zBvq9So3uQY0nxsIYdS4zjW-aC6wSqc23dxQwXmA5i7RcqzneKjkvbEtxVAAVihi1KU-7pRBkuyNtFEarl79qH4nXIjkNkJxaJPc4Eq8iubVI3nEkp4rk1SKx40iu5f4-lY-zJAYBuy5qv7LtFliHaKFtA0we5GMBO33K7fXdR6lGCjfREq_QoFolWaJNMgdh1Bq323d_AwAA__97SixA
 
-query T
+query T retry
 EXPLAIN (DISTSQL)
 SELECT k FROM geo_table WHERE geom ~ 'LINESTRING(1.0 1.0, 5.0 5.0)'::geometry::box2d
 ----
@@ -329,4 +352,4 @@ vectorized: true
               table: geo_table@geom_index
               spans: 30 spans
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUk9-LGjEQx9_7V4R5uTvIYZJdKc2TtbdSi9WrChUaObZmapdqsk1i2SL2by-72zt_gGvdhywzyWcm32-YLfifK5CQzB4Hb_tDcvvQn0wnnwZ3ZJIMkndT8oP0xqOPZIn2KaRfV0g-v0_GSRmvyR9ywzgTrP6e_wdfj0W9ppjHMTuNb6TsjmbiASgYq3GYrtGD_AIcKAiYU8idXaD31pXpbXWorwuQjEJm8k0o03MKC-sQ5BZCFlYIEob23uatGChoDGm2qo7tKNhN2EM-pEsE2d7Rg8K8ufC0tGWMqUbXYkfl4cW1TunXU2Y0FkBhkqfGS9JS0FWq-KaVKjhTqmCXFri_luEKSGo0EW-IDd_ReTinmV-juW9-oQuoe9kqoEPX4sfCn_eTInfEGtLhkvhSNfEhdUFWKqLXbaWYYEoxdmkBgkZfi5XiT9RTGG2CJB1-1gdxjQ8fbGb-Pb049_S5y9ap-71vTTvibPfomu4v7kfHveu8JB1Rjmh3NLvlhNM2ad_dyP10XTIiPrrKhekao8-t8fhf48V2cwqol1hPsLcbt8BHZxdVmzocVVyV0OhDvduug76pt8oLHsK8ERbNsGiEo2Y4aoTjZjhuhNkJPN-9-hsAAP___rvHVQ==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUlFFv2jAQx9_3Kax7aSsZYSdB0_zEWkBjaksHSKu0VCjDVxoR7Mw2K1XFPvvkZFCIShh-MNzZ_t_l5zu_gv2VgYDu_d315_4tOe_0R-PRt-sLMuped6_GZE56w8ENmaGeuORnhuT7l-6w6-0F-UPOGGcBK8fmd2f0WNirs3kUsap9JsTl4D7oAAWlJd4mC7QgfgAHCgE8UMiNnqK12nj3a7GpL1cgGIVU5Uvn3Q8UptogiFdwqcsQBNzqhs6bEVCQ6JI0K7atKeileztkXTJDEK2dKP0OiGhNdwLx-kBjj2mIiUTTZHvhYEux7flNUiVxBRSudLZcKCvInBZggcIoT7yjGcNlHK8eZRyvOIvjFTs2QePUMzwGkihJgk9Euyc0Fg5h4RUs7BQsffUbjUPZSzOHBk2T77PZrHdXuSFakTYXxHoKxLrEOFF8VfixFccsYHHM2LEJCCp56jEPo0KDwmDpBGnzg1yCChd-CpevOlX_qiWoqZby3ySf48t7FXMotbCSWnBKaturCvcTK_2CtAP_BFwO7s854bRFWhdn4q17j1GLKqmFe6kd6eYh2lwri__VzqwSqcHXDxRQzrB8QqxemineGT0t9pbmoBAqHBKtK1dbpdFXmyXrDCaLbTPsKvFapeAEpaBWKTysxKtKYa1SdFgpqCpFtUrssFLo2T9m-nmSShCwefob70ybAf5AMrO-AEZP-rmQHb_k_voek8wihZtkjh10aBapSq1LpyCcWeJ6_eFvAAAA__-RAiaE

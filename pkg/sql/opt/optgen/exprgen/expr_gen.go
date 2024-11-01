@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package exprgen
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"reflect"
@@ -18,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/distribution"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang"
@@ -35,44 +32,65 @@ import (
 //
 // For example, if the input is "(Eq (Const 1) (Const 2))", the output is the
 // corresponding expression tree:
-//   eq [type=bool]
-//    ├── const: 1 [type=int]
-//    └── const: 2 [type=int]
+//
+//	eq [type=bool]
+//	 ├── const: 1 [type=int]
+//	 └── const: 2 [type=int]
 //
 // There are some peculiarities compared to the usual opt-gen replace syntax:
 //
-//  - Filters are specified as simply [ <condition> ... ]; no FiltersItem is
-//    necessary.
+//   - Filters are specified as simply [ <condition> ... ]; no FiltersItem is
+//     necessary.
 //
-//  - Various implicit conversions are allowed for convenience, e.g. list of
-//    columns to ColList/ColSet.
+//   - Various implicit conversions are allowed for convenience, e.g. list of
+//     columns to ColList/ColSet.
 //
-//  - Operation privates (e.g. ScanPrivate) are specified as lists of fields
-//    of the form [ (FiledName <value>) ]. For example:
-//      [ (Table "abc") (Index "abc@ab") (Cols "a,b") ]
-//    Implicit conversions are allowed here for column lists, orderings, etc.
+//   - Operation privates (e.g. ScanPrivate) are specified as lists of fields
+//     of the form [ (FiledName <value>) ]. For example:
+//     [ (Table "abc") (Index "abc@ab") (Cols "a,b") ]
+//     Implicit conversions are allowed here for column lists, orderings, etc.
 //
-//  - A Root custom function is used to set the physical properties of the root.
-//    Setting the physical properties (in particular the presentation) is always
-//    necessary for the plan to be run via PREPARE .. AS OPT PLAN '..'.
+//   - A Root custom function is used to set the physical properties of the root.
+//     Setting the physical properties (in particular the presentation) is always
+//     necessary for the plan to be run via PREPARE .. AS OPT PLAN '..'.
 //
 // Some examples of valid inputs:
-//    (Tuple [ (True) (False) ] "tuple{bool, bool}" )
 //
-//    (Root
-//      (Scan [ (Table "abc") (Index "abc@ab") (Cols "a,b") ])
-//      (Presentation "a,b")
-//      (OrderingChoice "+a,+b")
-//    )
+//	(Tuple [ (True) (False) ] "tuple{bool, bool}" )
 //
-//    (Select
-//      (Scan [ (Table "abc") (Cols "a,b,c") ])
-//      [ (Eq (Var "a") (Const 1)) ]
-//    )
+//	(Root
+//	  (Scan [ (Table "abc") (Index "abc@ab") (Cols "a,b") ])
+//	  (Presentation "a,b")
+//	  (OrderingChoice "+a,+b")
+//	)
+//
+//	(Select
+//	  (Scan [ (Table "abc") (Cols "a,b,c") ])
+//	  [ (Eq (Var "a") (Const 1)) ]
+//	)
 //
 // For more examples, see the various testdata/ files.
-//
-func Build(catalog cat.Catalog, factory *norm.Factory, input string) (_ opt.Expr, err error) {
+func Build(
+	ctx context.Context, catalog cat.Catalog, factory *norm.Factory, input string,
+) (_ opt.Expr, err error) {
+	return buildAndOptimize(ctx, catalog, nil /* optimizer */, factory, input)
+}
+
+// Optimize generates an expression from an optgen string and runs normalization
+// and exploration rules. The string must represent a relational expression.
+func Optimize(
+	ctx context.Context, catalog cat.Catalog, o *xform.Optimizer, input string,
+) (_ opt.Expr, err error) {
+	return buildAndOptimize(ctx, catalog, o, o.Factory(), input)
+}
+
+func buildAndOptimize(
+	ctx context.Context,
+	catalog cat.Catalog,
+	optimizer *xform.Optimizer,
+	factory *norm.Factory,
+	input string,
+) (_ opt.Expr, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(exprGenErr); ok {
@@ -89,7 +107,7 @@ func Build(catalog cat.Catalog, factory *norm.Factory, input string) (_ opt.Expr
 			mem: factory.Memo(),
 			cat: catalog,
 		},
-		coster: xform.MakeDefaultCoster(factory.Memo()),
+		coster: xform.MakeDefaultCoster(ctx, factory.EvalContext(), factory.Memo(), optimizer),
 	}
 
 	// To create a valid optgen "file", we create a rule with a bogus match.
@@ -105,7 +123,17 @@ func Build(catalog cat.Catalog, factory *norm.Factory, input string) (_ opt.Expr
 	} else {
 		expr = result.(opt.Expr)
 	}
-	eg.populateBestProps(expr, required)
+
+	// A non-nil optimizer indicates that exploration should be performed.
+	if optimizer != nil {
+		if rel, ok := expr.(memo.RelExpr); ok {
+			optimizer.Memo().SetRoot(rel, &physical.Required{})
+			return optimizer.Optimize()
+		}
+		return nil, errors.AssertionFailedf("expropt requires a relational expression")
+	}
+
+	eg.populateBestProps(ctx, expr, required)
 	if rel, ok := expr.(memo.RelExpr); ok {
 		eg.mem.SetRoot(rel, required)
 	}
@@ -275,6 +303,9 @@ func (eg *exprGen) castToDesiredType(arg interface{}, desiredType reflect.Type) 
 		if desiredType == reflect.TypeOf(memo.ScanLimit(0)) {
 			return memo.MakeScanLimit(int64(*i), false)
 		}
+		if desiredType == reflect.TypeOf(int64(0)) {
+			return int64(*i)
+		}
 	}
 
 	if str, ok := arg.(string); ok {
@@ -353,10 +384,12 @@ func convertSlice(
 
 // populateBestProps sets the physical properties and costs of the expressions
 // in the tree. Returns the cost of the expression tree.
-func (eg *exprGen) populateBestProps(expr opt.Expr, required *physical.Required) memo.Cost {
+func (eg *exprGen) populateBestProps(
+	ctx context.Context, expr opt.Expr, required *physical.Required,
+) memo.Cost {
 	rel, _ := expr.(memo.RelExpr)
 	if rel != nil {
-		if !xform.CanProvidePhysicalProps(rel, required) {
+		if !xform.CanProvidePhysicalProps(ctx, eg.f.EvalContext(), rel, required) {
 			panic(errorf("operator %s cannot provide required props %s", rel.Op(), required))
 		}
 	}
@@ -369,14 +402,15 @@ func (eg *exprGen) populateBestProps(expr opt.Expr, required *physical.Required)
 		} else {
 			childProps = xform.BuildChildPhysicalPropsScalar(eg.mem, expr, i)
 		}
-		cost += eg.populateBestProps(expr.Child(i), childProps)
+		cost += eg.populateBestProps(ctx, expr.Child(i), childProps)
 	}
 
 	if rel != nil {
 		provided := &physical.Provided{}
 		// BuildProvided relies on ProvidedPhysical() being set in the children, so
 		// it must run after the recursive calls on the children.
-		provided.Ordering = ordering.BuildProvided(rel, &required.Ordering)
+		provided.Ordering = ordering.BuildProvided(eg.f.EvalContext(), rel, &required.Ordering)
+		provided.Distribution = distribution.BuildProvided(ctx, eg.f.EvalContext(), rel, &required.Distribution)
 
 		cost += eg.coster.ComputeCost(rel, required)
 		eg.mem.SetBestProps(rel, required, provided, cost)

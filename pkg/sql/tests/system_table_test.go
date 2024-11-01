@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -17,16 +12,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
@@ -37,6 +40,7 @@ import (
 func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	const keysPerDesc = 2
 
 	testutils.RunTrueAndFalse(t, "system tenant", func(t *testing.T, systemTenant bool) {
@@ -44,10 +48,10 @@ func TestInitialKeys(t *testing.T) {
 		var nonDescKeys int
 		if systemTenant {
 			codec = keys.SystemSQLCodec
-			nonDescKeys = 10
+			nonDescKeys = 17
 		} else {
-			codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
-			nonDescKeys = 3
+			codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
+			nonDescKeys = 8
 		}
 
 		ms := bootstrap.MakeMetadataSchema(codec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
@@ -61,9 +65,11 @@ func TestInitialKeys(t *testing.T) {
 		desc, err := sql.CreateTestTableDescriptor(
 			context.Background(),
 			keys.SystemDatabaseID,
-			keys.MaxReservedDescID,
+			descpb.ID(1000 /* suitably large descriptor ID */),
 			"CREATE TABLE system.x (val INTEGER PRIMARY KEY)",
-			descpb.NewBasePrivilegeDescriptor(security.NodeUserName()),
+			catpb.NewBasePrivilegeDescriptor(username.NodeUserName()),
+			nil,
+			nil,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -77,7 +83,7 @@ func TestInitialKeys(t *testing.T) {
 
 		// Verify that IDGenerator value is correct.
 		found := false
-		idgen := codec.DescIDSequenceKey()
+		idgen := codec.SequenceKey(keys.DescIDSequenceID)
 		var idgenkv roachpb.KeyValue
 		for _, v := range kv {
 			if v.Key.Equal(idgen) {
@@ -95,7 +101,7 @@ func TestInitialKeys(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if a, e := i, int64(keys.MinUserDescID); a != e {
+		if a, e := i, int64(desc.GetID()+1); a != e {
 			t.Fatalf("Expected next descriptor ID to be %d, was %d", e, a)
 		}
 	})
@@ -104,7 +110,8 @@ func TestInitialKeys(t *testing.T) {
 func TestInitialKeysAndSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	datadriven.RunTest(t, "testdata/initial_keys", func(t *testing.T, d *datadriven.TestData) string {
+
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "initial_keys"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "initial-keys":
 			var tenant string
@@ -118,7 +125,7 @@ func TestInitialKeysAndSplits(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				codec = keys.MakeSQLCodec(roachpb.MakeTenantID(id))
+				codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(id))
 			}
 
 			ms := bootstrap.MakeMetadataSchema(
@@ -157,46 +164,87 @@ func TestInitialKeysAndSplits(t *testing.T) {
 func TestSystemTableLiterals(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	type testcase struct {
 		schema string
 		pkg    catalog.TableDescriptor
 	}
 
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	s := tc.Servers[0]
+
 	testcases := make(map[string]testcase)
-	for schema, desc := range systemschema.SystemTableDescriptors {
-		if _, alreadyExists := testcases[desc.GetName()]; alreadyExists {
-			t.Fatalf("system table %q already exists", desc.GetName())
+	for _, table := range systemschema.MakeSystemTables() {
+		if _, alreadyExists := testcases[table.GetName()]; alreadyExists {
+			t.Fatalf("system table %q already exists", table.GetName())
 		}
-		testcases[desc.GetName()] = testcase{
-			schema: schema,
-			pkg:    desc,
+		testcases[table.GetName()] = testcase{
+			schema: table.Schema,
+			pkg:    table,
 		}
 	}
 
-	const expectedNumberOfSystemTables = 37
-	require.Equal(t, expectedNumberOfSystemTables, len(testcases))
+	require.Equal(t, bootstrap.NumSystemTablesForSystemTenant, len(testcases))
+
+	runTest := func(t *testing.T, name string, test testcase) {
+		privs := *test.pkg.GetPrivileges()
+		desc := test.pkg
+		// Allocate an ID to dynamically allocated system tables.
+		if desc.GetID() == 0 {
+			mut := desc.NewBuilder().BuildCreatedMutable().(*tabledesc.Mutable)
+			mut.ID = keys.MaxReservedDescID + 1
+			desc = mut.ImmutableCopy().(catalog.TableDescriptor)
+		}
+		leaseManager := s.LeaseManager().(*lease.Manager)
+		collection := descs.MakeTestCollection(ctx, keys.SystemSQLCodec, leaseManager)
+
+		gen, err := sql.CreateTestTableDescriptor(
+			context.Background(),
+			keys.SystemDatabaseID,
+			desc.GetID(),
+			test.schema,
+			&privs,
+			s.DB().NewTxn(ctx, "create-test-table-desc"),
+			&collection,
+		)
+		if err != nil {
+			t.Fatalf("test: %+v, err: %v", test, err)
+		}
+		require.NoError(t, desctestutils.TestingValidateSelf(gen))
+
+		// The tables with regional by row compatible indexes had their
+		// indexes rewritten to ID 2. There is no way to specify index
+		// ids in SQL, so we need to manually patch the descriptor to
+		// get the sql constructed descriptor to match the statically
+		// constructed descriptor.
+		switch gen.GetID() {
+		case keys.SqllivenessID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.SQLInstancesTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.LeaseTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 3
+			gen.TableDescriptor.NextIndexID = 4
+		}
+
+		if desc.TableDesc().Equal(gen.TableDesc()) {
+			return
+		}
+		diff := strings.Join(pretty.Diff(desc.TableDesc(), gen.TableDesc()), "\n")
+		t.Errorf("%s table descriptor generated from CREATE TABLE statement does not match "+
+			"hardcoded table descriptor:\n%s", desc.GetName(), diff)
+	}
 
 	for name, test := range testcases {
 		t.Run(name, func(t *testing.T) {
-			privs := *test.pkg.GetPrivileges()
-			gen, err := sql.CreateTestTableDescriptor(
-				context.Background(),
-				keys.SystemDatabaseID,
-				test.pkg.GetID(),
-				test.schema,
-				&privs,
-			)
-			if err != nil {
-				t.Fatalf("test: %+v, err: %v", test, err)
-			}
-			require.NoError(t, catalog.ValidateSelf(gen))
-
-			if test.pkg.TableDesc().Equal(gen.TableDesc()) {
-				return
-			}
-			diff := strings.Join(pretty.Diff(test.pkg.TableDesc(), gen.TableDesc()), "\n")
-			t.Errorf("%s table descriptor generated from CREATE TABLE statement does not match "+
-				"hardcoded table descriptor:\n%s", test.pkg.GetName(), diff)
+			runTest(t, name, test)
 		})
 	}
 }

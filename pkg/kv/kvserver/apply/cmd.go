@@ -1,29 +1,40 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package apply
 
-import "context"
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+)
 
 // Command is a command that has been successfully replicated through raft
 // by being durably committed to the raft log of a quorum of peers in a raft
 // group.
 type Command interface {
 	// Index is the log index of the corresponding raft entry.
-	Index() uint64
-	// IsTrivial returns whether the command can apply in a batch.
+	Index() kvpb.RaftIndex
+	// IsTrivial returns whether the command can apply in a batch with other
+	// "trivial" commands. This is the case if the log entry represented by the
+	// Command is a simple write, as is the case for all user-issued mutations.
+	//
+	// Nontrivial commands (splits, etc) will be applied in their own apply.Batch.
 	IsTrivial() bool
 	// IsLocal returns whether the command was locally proposed. Command
 	// that were locally proposed typically have a client waiting on a
 	// response, so there is additional urgency to apply them quickly.
 	IsLocal() bool
+	// Ctx returns the Context in which operations on this Command should be
+	// performed.
+	//
+	// A Command does the unusual thing of capturing a Context because commands
+	// are generally processed in batches, but different commands might want their
+	// events going to different places. In particular, commands that have been
+	// proposed locally get a tracing span tied to the local proposal.
+	Ctx() context.Context
 	// AckErrAndFinish signals that the application of the command has been
 	// rejected due to the provided error. It also relays this rejection of
 	// the command to its client if it was proposed locally. An error will
@@ -167,12 +178,13 @@ func takeWhileCmdIter(iter CommandIterator, pred func(Command) bool) CommandIter
 // responsible for converting Commands into CheckedCommand. The function
 // closes the provided iterator.
 func mapCmdIter(
-	iter CommandIterator, fn func(Command) (CheckedCommand, error),
+	iter CommandIterator, fn func(context.Context, Command) (CheckedCommand, error),
 ) (CheckedCommandIterator, error) {
 	defer iter.Close()
 	ret := iter.NewCheckedList()
 	for iter.Valid() {
-		checked, err := fn(iter.Cur())
+		cur := iter.Cur()
+		checked, err := fn(cur.Ctx(), cur)
 		if err != nil {
 			ret.Close()
 			return nil, err
@@ -188,12 +200,13 @@ func mapCmdIter(
 // is responsible for converting CheckedCommand into AppliedCommand. The
 // function closes the provided iterator.
 func mapCheckedCmdIter(
-	iter CheckedCommandIterator, fn func(CheckedCommand) (AppliedCommand, error),
+	iter CheckedCommandIterator, fn func(context.Context, CheckedCommand) (AppliedCommand, error),
 ) (AppliedCommandIterator, error) {
 	defer iter.Close()
 	ret := iter.NewAppliedList()
 	for iter.Valid() {
-		applied, err := fn(iter.CurChecked())
+		curChecked := iter.CurChecked()
+		applied, err := fn(curChecked.Ctx(), curChecked)
 		if err != nil {
 			ret.Close()
 			return nil, err

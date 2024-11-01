@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -14,6 +9,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
@@ -23,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 )
 
 // hashAggregatorState represents the state of the hash aggregator operator.
@@ -110,7 +106,8 @@ type hashAggregator struct {
 	buckets []*aggBucket
 	// ht stores tuples that are "heads" of the corresponding aggregation
 	// groups ("head" here means the tuple that was first seen from the group).
-	ht *colexechash.HashTable
+	ht                  *colexechash.HashTable
+	hashTableNumBuckets uint32
 
 	// state stores the current state of hashAggregator.
 	state hashAggregatorState
@@ -130,8 +127,10 @@ type hashAggregator struct {
 	}
 
 	// inputTrackingState tracks all the input tuples which is needed in order
-	// to fallback to the external hash aggregator.
+	// to fall back to the external hash aggregator.
 	inputTrackingState struct {
+		// tuples can be nil when input tuples tracking is not needed, or when
+		// the queue has been closed.
 		tuples            *colexecutils.SpillingQueue
 		zeroBatchEnqueued bool
 	}
@@ -140,16 +139,11 @@ type hashAggregator struct {
 	// populating the output.
 	curOutputBucketIdx int
 
-	maxOutputBatchMemSize int64
-	// maxCapacity if non-zero indicates the target capacity of the output
-	// batch. It is set when, after setting a row, we realize that the output
-	// batch has exceeded the memory limit.
-	maxCapacity int
-	output      coldata.Batch
+	output coldata.Batch
 
 	aggFnsAlloc *colexecagg.AggregateFuncsAlloc
 	hashAlloc   aggBucketAlloc
-	datumAlloc  rowenc.DatumAlloc
+	datumAlloc  tree.DatumAlloc
 	toClose     colexecop.Closers
 
 	// Distincter finds distinct groups in partially sorted input columns.
@@ -181,7 +175,7 @@ func randomizeHashAggregatorMaxBuffered() {
 	if maxHashAggregatorMaxBuffered > coldata.MaxBatchSize {
 		maxHashAggregatorMaxBuffered = coldata.MaxBatchSize
 	}
-	hashAggregatorMaxBuffered = util.ConstantWithMetamorphicTestRange(
+	hashAggregatorMaxBuffered = metamorphic.ConstantWithTestRange(
 		"hash-aggregator-max-buffered",
 		coldata.MaxBatchSize,
 		coldata.BatchSize(),
@@ -193,39 +187,54 @@ func randomizeHashAggregatorMaxBuffered() {
 // The input specifications to this function are the same as that of the
 // NewOrderedAggregator function.
 // newSpillingQueueArgs - when non-nil - specifies the arguments to
-// instantiate a SpillingQueue with which will be used to keep all of the
-// input tuples in case the in-memory hash aggregator needs to fallback to
+// instantiate a SpillingQueue with which will be used to keep all the
+// input tuples in case the in-memory hash aggregator needs to fall back to
 // the disk-backed operator. Pass in nil in order to not track all input
 // tuples.
 func NewHashAggregator(
-	args *colexecagg.NewAggregatorArgs,
+	ctx context.Context,
+	args *colexecagg.NewHashAggregatorArgs,
 	newSpillingQueueArgs *colexecutils.NewSpillingQueueArgs,
-	outputUnlimitedAllocator *colmem.Allocator,
-	maxOutputBatchMemSize int64,
 ) colexecop.ResettableOperator {
+	initialAllocSize, maxAllocSize := int64(1), int64(hashAggregatorAllocSize)
+	if args.EstimatedRowCount != 0 {
+		// Use uint64s for comparison to prevent overflow in case
+		// args.EstimatedRowCount is larger than MaxInt64.
+		if args.EstimatedRowCount >= uint64(maxAllocSize) {
+			initialAllocSize = maxAllocSize
+		} else {
+			initialAllocSize = int64(args.EstimatedRowCount)
+		}
+	}
 	aggFnsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		args, args.Spec.Aggregations, hashAggregatorAllocSize, colexecagg.HashAggKind,
+		ctx, args.NewAggregatorArgs, args.Spec.Aggregations, initialAllocSize, maxAllocSize, colexecagg.HashAggKind,
 	)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
-	hashAgg := &hashAggregator{
-		OneInputNode:          colexecop.NewOneInputNode(args.Input),
-		hashTableAllocator:    args.Allocator,
-		spec:                  args.Spec,
-		state:                 hashAggregatorBuffering,
-		inputTypes:            args.InputTypes,
-		outputTypes:           args.OutputTypes,
-		inputArgsConverter:    inputArgsConverter,
-		toClose:               toClose,
-		maxOutputBatchMemSize: maxOutputBatchMemSize,
-		aggFnsAlloc:           aggFnsAlloc,
-		hashAlloc:             aggBucketAlloc{allocator: args.Allocator},
+	// This number was chosen after running the micro-benchmarks and relevant
+	// TPCH queries using tpchvec/bench.
+	hashTableNumBuckets := uint32(256)
+	if args.TestingKnobs.HashTableNumBuckets != 0 {
+		hashTableNumBuckets = args.TestingKnobs.HashTableNumBuckets
 	}
-	hashAgg.accountingHelper.Init(outputUnlimitedAllocator, args.OutputTypes)
+	hashAgg := &hashAggregator{
+		OneInputNode:        colexecop.NewOneInputNode(args.Input),
+		hashTableAllocator:  args.HashTableAllocator,
+		spec:                args.Spec,
+		state:               hashAggregatorBuffering,
+		inputTypes:          args.InputTypes,
+		outputTypes:         args.OutputTypes,
+		inputArgsConverter:  inputArgsConverter,
+		toClose:             toClose,
+		aggFnsAlloc:         aggFnsAlloc,
+		hashAlloc:           aggBucketAlloc{allocator: args.Allocator},
+		hashTableNumBuckets: hashTableNumBuckets,
+	}
+	hashAgg.accountingHelper.Init(args.OutputUnlimitedAllocator, args.MaxOutputBatchMemSize, args.OutputTypes, false /* alwaysReallocate */)
 	hashAgg.bufferingState.tuples = colexecutils.NewAppendOnlyBufferedBatch(args.Allocator, args.InputTypes, nil /* colsToStore */)
-	hashAgg.datumAlloc.AllocSize = hashAggregatorAllocSize
-	hashAgg.aggHelper = newAggregatorHelper(args, &hashAgg.datumAlloc, true /* isHashAgg */, hashAggregatorMaxBuffered)
+	hashAgg.datumAlloc.DefaultAllocSize = hashAggregatorAllocSize
+	hashAgg.aggHelper = newAggregatorHelper(args.NewAggregatorArgs, &hashAgg.datumAlloc, true /* isHashAgg */, hashAggregatorMaxBuffered)
 	if newSpillingQueueArgs != nil {
 		hashAgg.inputTrackingState.tuples = colexecutils.NewSpillingQueue(newSpillingQueueArgs)
 	}
@@ -243,15 +252,18 @@ func (op *hashAggregator) Init(ctx context.Context) {
 		return
 	}
 	op.Input.Init(op.Ctx)
-	// These numbers were chosen after running the micro-benchmarks and relevant
+	// This number was chosen after running the micro-benchmarks and relevant
 	// TPCH queries using tpchvec/bench.
 	const hashTableLoadFactor = 0.1
-	const hashTableNumBuckets = 256
 	op.ht = colexechash.NewHashTable(
 		op.Ctx,
 		op.hashTableAllocator,
+		// The hash aggregator will buffer tuples from the input until it has
+		// hashAggregatorMaxBuffered of them. This is coldata.MaxBatchSize in
+		// production builds.
+		hashAggregatorMaxBuffered,
 		hashTableLoadFactor,
-		hashTableNumBuckets,
+		op.hashTableNumBuckets,
 		op.inputTypes,
 		op.spec.GroupCols,
 		true, /* allowNullEquality */
@@ -275,64 +287,70 @@ func (op *hashAggregator) setupScratchSlices(numBuffered int) {
 //
 // Let's go through an example of how this function works: our input stream
 // contains the following tuples:
-//   {-3}, {-3}, {-2}, {-1}, {-4}, {-1}, {-1}, {-4}.
+//
+//	{-3}, {-3}, {-2}, {-1}, {-4}, {-1}, {-1}, {-4}.
+//
 // (Note that negative values are chosen in order to visually distinguish them
 // from the IDs that we'll be working with below.)
 // We will use coldata.BatchSize() == 4 and let's assume that we will use a
 // simple hash function h(i) = i % 2 with two buckets in the hash table.
 //
 // I. we get a batch [-3, -3, -2, -1].
-//   1. a) compute hash buckets: ProbeScratch.next = [reserved, 1, 1, 0, 1]
-//      b) build 'next' chains between hash buckets:
-//           ProbeScratch.first = [3, 1] (length of first == # of hash buckets)
-//           ProbeScratch.next = [reserved, 2, 4, 0, 0]
-//         (Note that we have a hash collision in the bucket with hash 1.)
-//      c) find "equality" buckets (populate HeadID):
-//           ProbeScratch.HeadID = [1, 1, 3, 4]
-//         (This means that tuples at position 0 and 1 are the same, and the
-//          tuple at position HeadID-1 is the head of the equality chain.)
-//   2. divide all tuples into the equality chains based on HeadID:
-//        eqChains[0] = [0, 1]
-//        eqChains[1] = [2]
-//        eqChains[2] = [3]
-//      The special "heads of equality chains" selection vector is [0, 2, 3].
-//   3. we don't have any existing buckets yet, so this step is a noop.
-//   4. each of the three equality chains contains tuples from a separate
-//      aggregation group, so we perform aggregation on each of them in turn.
-//   After we do so, we will have three buckets and the hash table will contain
-//   three tuples (with buckets and tuples corresponding to each other):
+//  1. a) compute hash buckets: ProbeScratch.Next = [reserved, 1, 1, 0, 1]
+//     b) build 'Next' chains between hash buckets:
+//     ProbeScratch.First = [3, 1] (length of First == # of hash buckets)
+//     ProbeScratch.Next = [reserved, 2, 4, 0, 0]
+//     (Note that we have a hash collision in the bucket with hash 1.)
+//     c) find "equality" buckets (populate HeadID):
+//     ProbeScratch.HeadID = [1, 1, 3, 4]
+//     (This means that tuples at position 0 and 1 are the same, and the
+//     tuple at position HeadID-1 is the head of the equality chain.)
+//  2. divide all tuples into the equality chains based on HeadID:
+//     eqChains[0] = [0, 1]
+//     eqChains[1] = [2]
+//     eqChains[2] = [3]
+//     The special "heads of equality chains" selection vector is [0, 2, 3].
+//  3. we don't have any existing buckets yet, so this step is a noop.
+//  4. each of the three equality chains contains tuples from a separate
+//     aggregation group, so we perform aggregation on each of them in turn.
+//     After we do so, we will have three buckets and the hash table will contain
+//     three tuples (with buckets and tuples corresponding to each other):
 //     buckets = [<bucket for -3>, <bucket for -2>, <bucket for -1>]
 //     ht.Vals = [-3, -2, -1].
-//   We have fully processed the first batch.
+//     We have fully processed the first batch.
 //
 // II. we get a batch [-4, -1, -1, -4].
-//   1. a) compute hash buckets: ProbeScratch.next = [reserved, 0, 1, 1, 0]
-//      b) build 'next' chains between hash buckets:
-//           ProbeScratch.first = [1, 2]
-//           ProbeScratch.next = [reserved, 4, 3, 0, 0]
-//      c) find "equality" buckets:
-//           ProbeScratch.HeadID = [1, 2, 2, 1]
-//   2. divide all tuples into the equality chains based on HeadID:
-//        eqChains[0] = [0, 3]
-//        eqChains[1] = [1, 2]
-//      The special "heads of equality chains" selection vector is [0, 1].
-//   3. probe that special "heads" selection vector against the tuples already
-//      present in the hash table:
-//        ProbeScratch.HeadID = [0, 3]
-//      Value 0 indicates that the first equality chain doesn't have an
-//      existing bucket, but the second chain does and the ID of its bucket is
-//      HeadID-1 = 2. We aggregate the second equality chain into that bucket.
-//   4. the first equality chain contains tuples from a new aggregation group,
-//      so we create a new bucket for it and perform the aggregation.
-//   After we do so, we will have four buckets and the hash table will contain
-//   four tuples:
+//
+//  1. a) compute hash buckets: ProbeScratch.Next = [reserved, 0, 1, 1, 0]
+//     b) build 'next' chains between hash buckets:
+//     ProbeScratch.First = [1, 2]
+//     ProbeScratch.Next = [reserved, 4, 3, 0, 0]
+//     c) find "equality" buckets:
+//     ProbeScratch.HeadID = [1, 2, 2, 1]
+//
+//  2. divide all tuples into the equality chains based on HeadID:
+//     eqChains[0] = [0, 3]
+//     eqChains[1] = [1, 2]
+//     The special "heads of equality chains" selection vector is [0, 1].
+//
+//  3. probe that special "heads" selection vector against the tuples already
+//     present in the hash table:
+//     ProbeScratch.HeadID = [0, 3]
+//     Value 0 indicates that the first equality chain doesn't have an
+//     existing bucket, but the second chain does and the ID of its bucket is
+//     HeadID-1 = 2. We aggregate the second equality chain into that bucket.
+//
+//  4. the first equality chain contains tuples from a new aggregation group,
+//     so we create a new bucket for it and perform the aggregation.
+//     After we do so, we will have four buckets and the hash table will contain
+//     four tuples:
 //     buckets = [<bucket for -3>, <bucket for -2>, <bucket for -1>, <bucket for -4>]
 //     ht.Vals = [-3, -2, -1, -4].
-//   We have fully processed the second batch.
+//     We have fully processed the second batch.
 //
-//  We have processed the input fully, so we're ready to emit the output.
+//     We have processed the input fully, so we're ready to emit the output.
 //
-// NOTE: b *must* be non-zero length batch.
+// NOTE: b *must* be a non-zero length batch.
 func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 	op.setupScratchSlices(b.Length())
 	inputVecs := b.ColVecs()
@@ -342,6 +360,7 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 	op.ht.ComputeHashAndBuildChains(b)
 	op.ht.FindBuckets(
 		b, op.ht.Keys, op.ht.ProbeScratch.First, op.ht.ProbeScratch.Next, op.ht.CheckProbeForDistinct,
+		false /* zeroHeadIDForDistinctTuple */, true, /* probingAgainstItself */
 	)
 
 	// Step 2: now that we have op.ht.ProbeScratch.HeadID populated we can
@@ -359,8 +378,12 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 	// the equality chains (which the selection vector on b currently contains)
 	// against the heads of the existing groups.
 	if len(op.buckets) > 0 {
+		// Here we want for each equality chain that doesn't have a match with
+		// already existing groups have its HeadID value set to 0.
+		const zeroHeadIDForDistinctTuple = true
 		op.ht.FindBuckets(
 			b, op.ht.Keys, op.ht.BuildScratch.First, op.ht.BuildScratch.Next, op.ht.CheckBuildForAggregation,
+			zeroHeadIDForDistinctTuple, false, /* probingAgainstItself */
 		)
 		for eqChainsSlot, HeadID := range op.ht.ProbeScratch.HeadID[:eqChainsCount] {
 			if HeadID != 0 {
@@ -429,7 +452,11 @@ func (op *hashAggregator) onlineAgg(b coldata.Batch) {
 	}
 }
 
-func (op *hashAggregator) ExportBuffered(input colexecop.Operator) coldata.Batch {
+func (op *hashAggregator) ExportBuffered(colexecop.Operator) coldata.Batch {
+	if op.inputTrackingState.tuples == nil {
+		// All tuples have been exported.
+		return coldata.ZeroBatch
+	}
 	if !op.inputTrackingState.zeroBatchEnqueued {
 		// Per the contract of the spilling queue, we need to append a
 		// zero-length batch.
@@ -441,6 +468,40 @@ func (op *hashAggregator) ExportBuffered(input colexecop.Operator) coldata.Batch
 		colexecerror.InternalError(err)
 	}
 	return batch
+}
+
+// ReleaseBeforeExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (op *hashAggregator) ReleaseBeforeExport() {
+	if op.ht == nil {
+		// Resources have already been released.
+		return
+	}
+	// The hash table is tracked by its own allocator.
+	op.ht.Release()
+	defer op.hashAlloc.allocator.ReleaseAll()
+	// We only need to keep a handful of fields that will be used to export
+	// buffered tuples and to properly close the resources. None of these
+	// resources are tracked by the allocator, so releasing all the memory in
+	// the defer above is ok.
+	*op = hashAggregator{
+		InitHelper:         op.InitHelper,
+		inputTrackingState: op.inputTrackingState,
+		toClose:            op.toClose,
+	}
+}
+
+// ReleaseAfterExport implements the colexecop.BufferingInMemoryOperator
+// interface.
+func (op *hashAggregator) ReleaseAfterExport(colexecop.Operator) {
+	if op.inputTrackingState.tuples == nil {
+		// Resources have already been released.
+		return
+	}
+	if err := op.inputTrackingState.tuples.Close(op.Ctx); err != nil {
+		colexecerror.InternalError(err)
+	}
+	op.inputTrackingState.tuples = nil
 }
 
 func (op *hashAggregator) Reset(ctx context.Context) {
@@ -469,17 +530,31 @@ func (op *hashAggregator) resetBucketsAndTrackingState(ctx context.Context) {
 	op.curOutputBucketIdx = 0
 }
 
-func (op *hashAggregator) Close() error {
+func (op *hashAggregator) Close(ctx context.Context) error {
 	if !op.CloserHelper.Close() {
 		return nil
 	}
 	op.accountingHelper.Release()
 	var retErr error
 	if op.inputTrackingState.tuples != nil {
-		retErr = op.inputTrackingState.tuples.Close(op.EnsureCtx())
+		retErr = op.inputTrackingState.tuples.Close(ctx)
 	}
-	if err := op.toClose.Close(); err != nil {
+	if err := op.toClose.Close(ctx); err != nil {
 		retErr = err
 	}
 	return retErr
 }
+
+// HashAggregationDiskSpillingEnabledSettingName is the cluster setting name for
+// HashAggregationDiskSpillingEnabled.
+const HashAggregationDiskSpillingEnabledSettingName = "sql.distsql.temp_storage.hash_agg.enabled"
+
+// HashAggregationDiskSpillingEnabled is a cluster setting that allows to
+// disable hash aggregator disk spilling.
+var HashAggregationDiskSpillingEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	HashAggregationDiskSpillingEnabledSettingName,
+	"set to false to disable hash aggregator disk spilling "+
+		"(this will improve performance, but the query might hit the memory limit)",
+	true,
+)

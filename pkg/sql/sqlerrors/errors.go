@@ -1,23 +1,30 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqlerrors exports errors which can occur in the sql package.
 package sqlerrors
 
 import (
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -26,6 +33,36 @@ const (
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
 		"until end of transaction block"
 )
+
+// EnforceHomeRegionFurtherInfo is the suffix to append to every error returned
+// due to turning on the enforce_home_region session setting, and provides some
+// information for users or app developers.
+const EnforceHomeRegionFurtherInfo = "For more information, see https://www.cockroachlabs.com/docs/stable/cost-based-optimizer.html#control-whether-queries-are-limited-to-a-single-region"
+
+// NewSchemaChangeOnLockedTableErr creates an error signaling schema
+// change statement is attempted on a table with locked schema.
+func NewSchemaChangeOnLockedTableErr(tableName string) error {
+	return errors.WithHintf(pgerror.Newf(pgcode.OperatorIntervention,
+		`schema changes are disallowed on table %q because it is locked`, tableName),
+		"To unlock the table, try \"ALTER TABLE %v SET (schema_locked = false);\" "+
+			"\nAfter schema change completes, we recommend setting it back to true with "+
+			"\"ALTER TABLE %v SET (schema_locked = true);\"", tableName, tableName)
+}
+
+// NewDisallowedSchemaChangeOnLDRTableErr creates an error that indicates that
+// the schema change is disallowed because the table is being used by a
+// logical data replication job.
+func NewDisallowedSchemaChangeOnLDRTableErr(tableName string, jobIDs []catpb.JobID) error {
+	ids := make([]string, len(jobIDs))
+	for i, v := range jobIDs {
+		ids[i] = strconv.Itoa(int(v))
+	}
+	return pgerror.Newf(
+		pgcode.FeatureNotSupported,
+		"this schema change is disallowed on table %s because it is referenced by "+
+			"one or more logical replication jobs [%s]", tableName, strings.Join(ids, ", "),
+	)
+}
 
 // NewTransactionAbortedError creates an error for trying to run a command in
 // the context of transaction that's in the aborted state. Any statement other
@@ -47,6 +84,40 @@ func NewTransactionCommittedError() error {
 // NewNonNullViolationError creates an error for a violation of a non-NULL constraint.
 func NewNonNullViolationError(columnName string) error {
 	return pgerror.Newf(pgcode.NotNullViolation, "null value in column %q violates not-null constraint", columnName)
+}
+
+func NewAlterColumnTypeColOwnsSequenceNotSupportedErr() error {
+	return unimplemented.NewWithIssuef(
+		48244, "ALTER COLUMN TYPE for a column that owns a sequence "+
+			"is currently not supported")
+}
+
+func NewAlterColumnTypeColWithConstraintNotSupportedErr() error {
+	return unimplemented.NewWithIssuef(
+		48288, "ALTER COLUMN TYPE for a column that has a constraint "+
+			"is currently not supported")
+}
+
+func NewAlterColumnTypeColInIndexNotSupportedErr() error {
+	return unimplemented.NewWithIssuef(
+		47636, "ALTER COLUMN TYPE requiring rewrite of on-disk "+
+			"data is currently not supported for columns that are part of an index")
+}
+
+// NewInvalidAssignmentCastError creates an error that is used when a mutation
+// cannot be performed because there is not a valid assignment cast from a
+// value's type to the type of the target column.
+func NewInvalidAssignmentCastError(
+	sourceType *types.T, targetType *types.T, targetColName string,
+) error {
+	return errors.WithHint(
+		pgerror.Newf(
+			pgcode.DatatypeMismatch,
+			"value type %s doesn't match type %s of column %q",
+			sourceType, targetType, tree.ErrNameString(targetColName),
+		),
+		"you will need to rewrite or cast the expression",
+	)
 }
 
 // NewGeneratedAlwaysAsIdentityColumnOverrideError creates an error for
@@ -121,17 +192,9 @@ func NewInvalidWildcardError(name string) error {
 		"%q does not match any valid database or schema", name)
 }
 
-// NewUndefinedObjectError returns the correct undefined object error based on
-// the kind of object that was requested.
-func NewUndefinedObjectError(name tree.NodeFormatter, kind tree.DesiredObjectKind) error {
-	switch kind {
-	case tree.TableObject:
-		return NewUndefinedRelationError(name)
-	case tree.TypeObject:
-		return NewUndefinedTypeError(name)
-	default:
-		return errors.AssertionFailedf("unknown object kind %d", kind)
-	}
+// NewUndefinedObjectError creates an error that represents a missing object.
+func NewUndefinedObjectError(name tree.NodeFormatter) error {
+	return pgerror.Newf(pgcode.UndefinedObject, "object %q does not exist", tree.ErrString(name))
 }
 
 // NewUndefinedTypeError creates an error that represents a missing type.
@@ -145,9 +208,14 @@ func NewUndefinedRelationError(name tree.NodeFormatter) error {
 		"relation %q does not exist", tree.ErrString(name))
 }
 
-// NewColumnAlreadyExistsError creates an error for a preexisting column.
-func NewColumnAlreadyExistsError(name, relation string) error {
+// NewColumnAlreadyExistsInRelationError creates an error for a preexisting column in relation.
+func NewColumnAlreadyExistsInRelationError(name, relation string) error {
 	return pgerror.Newf(pgcode.DuplicateColumn, "column %q of relation %q already exists", name, relation)
+}
+
+// NewColumnAlreadyExistsInIndexError creates an error for a  preexisting column in index.
+func NewColumnAlreadyExistsInIndexError(idxName, colName string) error {
+	return pgerror.Newf(pgcode.DuplicateColumn, "index %q already contains column %q", idxName, colName)
 }
 
 // NewDatabaseAlreadyExistsError creates an error for a preexisting database.
@@ -160,11 +228,23 @@ func NewSchemaAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", name)
 }
 
-// WrapErrorWhileConstructingObjectAlreadyExistsErr is used to wrap an error
-// when an error occurs while trying to get the colliding object for an
-// ObjectAlreadyExistsErr.
-func WrapErrorWhileConstructingObjectAlreadyExistsErr(err error) error {
-	return pgerror.WithCandidateCode(errors.Wrap(err, "object already exists"), pgcode.DuplicateObject)
+func NewUnsupportedUnvalidatedConstraintError(constraintType catconstants.ConstraintType) error {
+	return pgerror.Newf(pgcode.FeatureNotSupported,
+		"%v constraints cannot be marked NOT VALID", constraintType)
+}
+
+// NewInvalidActionOnComputedFKColumnError creates an error when there is an
+// attempt to have an unsupported action on a FK over a computed column.
+func NewInvalidActionOnComputedFKColumnError(onUpdateAction bool) error {
+	// Pick the 'ON UPDATE' or 'ON DELETE' keyword. If both actions are set we
+	// include 'ON UPDATE' in the error text. This is consistent with postgres.
+	var keyword redact.SafeString = "DELETE"
+	if onUpdateAction {
+		keyword = "UPDATE"
+	}
+	return pgerror.Newf(pgcode.InvalidForeignKey,
+		"invalid ON %s action for foreign key constraint containing computed column", keyword,
+	)
 }
 
 // MakeObjectAlreadyExistsError creates an error for a namespace collision
@@ -215,6 +295,145 @@ func NewDependentObjectErrorf(format string, args ...interface{}) error {
 	return pgerror.Newf(pgcode.DependentObjectsStillExist, format, args...)
 }
 
+// NewDependentBlocksOpError creates an error because dependingObjName (of type
+// dependingObjType) has a reference to objName (of objType) when someone attempts
+// to `op` on it.
+// E.g. DROP INDEX "idx" when a VIEW "v" depends on this index and thus will block
+// this drop index.
+func NewDependentBlocksOpError(op, objType, objName, dependentType, dependentName string) error {
+	return errors.WithHintf(
+		NewDependentObjectErrorf("cannot %s %s %q because %s %q depends on it",
+			op, objType, objName, dependentType, dependentName),
+		"consider dropping %q first.", dependentName)
+}
+
+func NewAlterColTypeInCombinationNotSupportedError() error {
+	return unimplemented.NewWithIssuef(
+		49351, "ALTER COLUMN TYPE cannot be used in combination "+
+			"with other ALTER TABLE commands")
+}
+
+const PrimaryIndexSwapDetail = `CRDB's implementation for "ADD COLUMN", "DROP COLUMN", and "ALTER PRIMARY KEY" will drop the old/current primary index and create a new one.`
+
+// NewColumnReferencedByPrimaryKeyError is returned when attempting to drop a
+// column which is a part of the table's primary key.
+//
+// Note that this limitation is not fundamental; in postgres when dropping a
+// primary key column, it would silently drop the primary key constraint. At
+// the time of writing, cockroach does not permit dropping a primary key
+// constraint as it may require populating a new implicit rowid column for the
+// implicit primary key we use.
+func NewColumnReferencedByPrimaryKeyError(colName string) error {
+	return pgerror.Newf(pgcode.InvalidColumnReference,
+		"column %q is referenced by the primary key", colName)
+}
+
+// NewAlterDependsOnDurationExprError creates an error for attempting to alter
+// the internal column created for the duration expression. These are tables
+// that define the ttl_expire_after setting.
+func NewAlterDependsOnDurationExprError(op, objType, colName, tabName string) error {
+	return errors.WithHintf(
+		pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			`cannot %s %s %s while ttl_expire_after is set`,
+			redact.SafeString(op), redact.SafeString(objType), colName,
+		),
+		"use ALTER TABLE %s RESET (ttl) instead",
+		tabName,
+	)
+}
+
+// NewAlterDependsOnExpirationExprError creates an error for attempting to alter
+// the column that is referenced in the expiration expression.
+func NewAlterDependsOnExpirationExprError(
+	op, objType, colName, tabName, expirationExpr string,
+) error {
+	return errors.WithHintf(
+		pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			`cannot %s %s %q referenced by row-level TTL expiration expression %q`,
+			redact.SafeString(op), redact.SafeString(objType), colName,
+			expirationExpr,
+		),
+		"use ALTER TABLE %s SET (ttl_expiration_expression = ...) to change the expression",
+		tabName,
+	)
+}
+
+// NewColumnReferencedByComputedColumnError is returned when dropping a column
+// and that column being dropped is referenced by a computed column. Note that
+// the cockroach behavior where this error is returned does not match the
+// postgres behavior.
+func NewColumnReferencedByComputedColumnError(droppingColumn, computedColumn string) error {
+	return pgerror.Newf(
+		pgcode.InvalidColumnReference,
+		"column %q is referenced by computed column %q",
+		droppingColumn,
+		computedColumn,
+	)
+}
+
+// ColumnReferencedByPartialIndex is returned when an attempt is made to
+// modify a column that is referenced in a partial index's predicate.
+func ColumnReferencedByPartialIndex(op, objType, column, partialIndex string) error {
+	return errors.WithIssueLink(errors.WithHintf(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"cannot %s %s %q because it is referenced by partial index %q",
+			op, objType, column, partialIndex,
+		),
+		"drop the partial index first, then %s the %s",
+		op, objType,
+	), errors.IssueLink{IssueURL: build.MakeIssueURL(97372)})
+}
+
+// ColumnReferencedByPartialUniqueWithoutIndexConstraint is almost the same as
+// ColumnReferencedByPartialIndex except it's used when altering a column that is
+// referenced in a partial unique without index constraint's predicate.
+func ColumnReferencedByPartialUniqueWithoutIndexConstraint(
+	op, objType, column, partialUWIConstraint string,
+) error {
+	return errors.WithIssueLink(errors.WithHintf(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"cannot %s %s %q because it is referenced by partial unique constraint %q",
+			op, objType, column, partialUWIConstraint,
+		),
+		"drop the unique constraint first, then %s the %s",
+		op, objType,
+	), errors.IssueLink{IssueURL: build.MakeIssueURL(97372)})
+}
+
+// NewUniqueConstraintReferencedByForeignKeyError generates an error to be
+// returned when dropping a unique constraint that is relied upon by an
+// inbound foreign key constraint.
+func NewUniqueConstraintReferencedByForeignKeyError(
+	uniqueConstraintOrIndexToDrop, tableName string,
+) error {
+	return pgerror.Newf(
+		pgcode.DependentObjectsStillExist,
+		"%q is referenced by foreign key from table %q",
+		uniqueConstraintOrIndexToDrop, tableName,
+	)
+}
+
+// NewUndefinedUserError returns an undefined user error.
+func NewUndefinedUserError(user username.SQLUsername) error {
+	return pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", user)
+}
+
+// NewUndefinedConstraintError returns a missing constraint error.
+func NewUndefinedConstraintError(constraintName, tableName string) error {
+	return pgerror.Newf(pgcode.UndefinedObject,
+		"constraint %q of relation %q does not exist", constraintName, tableName)
+}
+
+// NewUndefinedTriggerError returns a missing constraint error.
+func NewUndefinedTriggerError(triggerName, tableName string) error {
+	return pgerror.Newf(pgcode.UndefinedObject,
+		"trigger %q of relation %q does not exist", triggerName, tableName)
+}
+
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(rangeID roachpb.RangeID, origErr error) error {
 	return pgerror.Wrapf(origErr, pgcode.RangeUnavailable, "key range id:%d is unavailable", rangeID)
@@ -233,9 +452,41 @@ func NewAggInAggError() error {
 	return pgerror.New(pgcode.Grouping, "aggregate function calls cannot be nested")
 }
 
+// NewInvalidVolatilityError creates an error for the case when provided
+// volatility options are not valid through CREATE/REPLACE/ALTER FUNCTION.
+func NewInvalidVolatilityError(err error) error {
+	return pgerror.Wrap(err, pgcode.InvalidFunctionDefinition, "invalid volatility")
+}
+
+func NewCannotModifyVirtualSchemaError(schema string) error {
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"%s is a virtual schema and cannot be modified", tree.ErrNameString(schema))
+}
+
+// NewInsufficientPrivilegeOnDescriptorError creates an InsufficientPrivilege
+// error saying the `user` does not have any of the privilege in `orPrivs` on
+// the descriptor.
+func NewInsufficientPrivilegeOnDescriptorError(
+	user username.SQLUsername, orPrivs []privilege.Kind, descType string, descName string,
+) error {
+	orPrivsInStr := make([]string, 0, len(orPrivs))
+	for _, priv := range orPrivs {
+		orPrivsInStr = append(orPrivsInStr, string(priv.DisplayName()))
+	}
+	sort.Strings(orPrivsInStr)
+	privsStr := strings.Join(orPrivsInStr, " or ")
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s does not have %s privilege on %s %s",
+		user, privsStr, descType, descName)
+}
+
 // QueryTimeoutError is an error representing a query timeout.
 var QueryTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
+
+// TxnTimeoutError is an error representing a transasction timeout.
+var TxnTimeoutError = pgerror.New(
+	pgcode.QueryCanceled, "query execution canceled due to transaction timeout")
 
 // IsOutOfMemoryError checks whether this is an out of memory error.
 func IsOutOfMemoryError(err error) bool {
@@ -257,6 +508,31 @@ func IsUndefinedRelationError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedTable)
 }
 
+// IsUndefinedDatabaseError checks whether this is an undefined database error.
+func IsUndefinedDatabaseError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedDatabase)
+}
+
+// IsUndefinedSchemaError checks whether this is an undefined schema error.
+func IsUndefinedSchemaError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedSchema)
+}
+
+// IsMissingDescriptorError checks whether the error has any indication
+// that it corresponds to a missing descriptor of any kind.
+//
+// Note that this does not deal with the lower-level
+// catalog.ErrDescriptorNotFound error. That error should be transformed
+// by this package for all uses in the SQL layer and coming out of
+// descs.Collection functions.
+func IsMissingDescriptorError(err error) bool {
+	return IsUndefinedRelationError(err) ||
+		IsUndefinedSchemaError(err) ||
+		IsUndefinedDatabaseError(err) ||
+		errHasCode(err, pgcode.UndefinedObject) ||
+		errHasCode(err, pgcode.UndefinedFunction)
+}
+
 func errHasCode(err error, code ...pgcode.Code) bool {
 	pgCode := pgerror.GetPGCode(err)
 	for _, c := range code {
@@ -266,3 +542,34 @@ func errHasCode(err error, code ...pgcode.Code) bool {
 	}
 	return false
 }
+
+// IsDistSQLRetryableError returns true if the supplied error, or any of its parent
+// causes is an rpc error.
+// This is an unfortunate implementation that should be looking for a more
+// specific error.
+func IsDistSQLRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// TODO(knz): this is a bad implementation. Make it go away
+	// by avoiding string comparisons.
+
+	errStr := err.Error()
+	// When a crdb node dies, any DistSQL flows with processors scheduled on
+	// it get an error with "rpc error" in the message from the call to
+	// `(*DistSQLPlanner).Run`.
+	return strings.Contains(errStr, `rpc error`)
+}
+
+var (
+	ErrEmptyDatabaseName = pgerror.New(pgcode.Syntax, "empty database name")
+	ErrNoDatabase        = pgerror.New(pgcode.InvalidName, "no database specified")
+	ErrNoSchema          = pgerror.Newf(pgcode.InvalidName, "no schema specified")
+	ErrNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
+	ErrNoType            = pgerror.New(pgcode.InvalidName, "no type specified")
+	ErrNoFunction        = pgerror.New(pgcode.InvalidName, "no function specified")
+	ErrNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
+)
+
+var ErrNoZoneConfigApplies = errors.New("no zone config applies")

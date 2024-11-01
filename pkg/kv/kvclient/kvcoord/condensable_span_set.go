@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -27,6 +23,13 @@ import (
 // "footprint" of the set to grow, so the set should be thought of as on
 // overestimate.
 type condensableSpanSet struct {
+	// TODO(nvanbenschoten): It feels like there is a lot that we could do with
+	// this data structure to 1) reduce the per span overhead, and 2) avoid the
+	// retention of many small keys for the duration of a transaction. For
+	// instance, we could allocate a single large block of memory and copy keys
+	// into it. We could also store key lengths inline to minimize the per-span
+	// overhead. Recognizing that many spans are actually point keys would also
+	// help.
 	s     []roachpb.Span
 	bytes int64
 
@@ -36,11 +39,17 @@ type condensableSpanSet struct {
 	// memory without losing fidelity, in which case this flag would not be set
 	// (e.g. merging overlapping or adjacent spans).
 	condensed bool
+
+	// Avoid heap allocations for transactions with a small number of spans.
+	sAlloc [2]roachpb.Span
 }
 
 // insert adds new spans to the condensable span set. No attempt to condense the
 // set or deduplicate the new span with existing spans is made.
 func (s *condensableSpanSet) insert(spans ...roachpb.Span) {
+	if cap(s.s) == 0 {
+		s.s = s.sAlloc[:0]
+	}
 	s.s = append(s.s, spans...)
 	for _, sp := range spans {
 		s.bytes += spanSize(sp)
@@ -129,7 +138,7 @@ func (s *condensableSpanSet) maybeCondense(
 
 	// Sort the buckets by size and collapse from largest to smallest
 	// until total size of uncondensed spans no longer exceeds threshold.
-	sort.Slice(buckets, func(i, j int) bool { return buckets[i].bytes > buckets[j].bytes })
+	slices.SortFunc(buckets, func(a, b spanBucket) int { return -cmp.Compare(a.bytes, b.bytes) })
 	s.s = localSpans // reset to hold just the local spans; will add newly condensed and remainder
 	for _, bucket := range buckets {
 		// Condense until we get to half the threshold.
@@ -232,9 +241,7 @@ func (s *condensableSpanSet) bytesSize() int64 {
 }
 
 func spanSize(sp roachpb.Span) int64 {
-	return int64(len(sp.Key) + len(sp.EndKey))
-}
-
-func keySize(k roachpb.Key) int64 {
-	return int64(len(k))
+	// Since the span is included into a []roachpb.Span, we also need to account
+	// for the overhead of storing it in that slice.
+	return roachpb.SpanOverhead + int64(cap(sp.Key)+cap(sp.EndKey))
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package azure allows roachprod to create instances within the
 // Microsoft Azure cloud.
@@ -29,22 +24,22 @@
 //
 // The following resources are created for each cluster:
 //
-//  Roachprod "commons"
-//  | Resource Group (one per Location / Region)
-//  |   VNet          (10.<offset>/16)
-//  |     Subnet      (10.<offset>/18 range)
+//	Roachprod "commons"
+//	| Resource Group (one per Location / Region)
+//	|   VNet          (10.<offset>/16)
+//	|     Subnet      (10.<offset>/18 range)
 //
-//  Per cluster
-//  | Resource Group (one per Location / Region)
-//  |   []IPAddress   (public IP address for each VM)
-//  |   []NIC         (bound to IPAddress and to a common Subnet)
-//  |   []VM          (bound to a NIC)
-//  |     OSDisk      (100GB, standard SSD storage)
+//	Per cluster
+//	| Resource Group (one per Location / Region)
+//	|   []IPAddress   (public IP address for each VM)
+//	|   []NIC         (bound to IPAddress and to a common Subnet)
+//	|   []VM          (bound to a NIC)
+//	|     OSDisk      (100GB, standard SSD storage)
 //
 // Roachprod creates a "common" resource group, VNet, and Subnet for
 // each location that clusters may be deployed into. Each NIC that is
 // created will be bound to a common subnet. All of the managed VNets
 // are peered together. This allows arbitrary connectivity between
-// roachprod-managed clusters (e.g. to test cluster migration
+// roachprod-managed clusters (e.g. to test cluster upgrade
 // strategies).
 package azure

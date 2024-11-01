@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -25,13 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/google/btree"
 )
 
 func makeAmbCtx() log.AmbientContext {
-	return log.AmbientContext{Tracer: tracing.NewTracer()}
+	return log.MakeTestingAmbientCtxWithNewTracer()
 }
 
 // Test implementation of a range set backed by btree.BTree.
@@ -54,13 +48,13 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 		repl := &Replica{
 			RangeID: desc.RangeID,
 		}
-		repl.mu.state.Stats = &enginepb.MVCCStats{
+		repl.shMu.state.Stats = &enginepb.MVCCStats{
 			KeyBytes:  1,
 			ValBytes:  2,
 			KeyCount:  1,
 			LiveCount: 1,
 		}
-		repl.mu.state.Desc = desc
+		repl.shMu.state.Desc = desc
 		repl.startKey = desc.StartKey // actually used by replicasByKey
 		if exRngItem := rs.replicasByKey.ReplaceOrInsert((*btreeReplica)(repl)); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", repl)
@@ -113,8 +107,8 @@ type testQueue struct {
 	disabled       bool
 }
 
-// setDisabled suspends processing of items from the queue.
-func (tq *testQueue) setDisabled(d bool) {
+// SetDisabled suspends processing of items from the queue.
+func (tq *testQueue) SetDisabled(d bool) {
 	tq.Lock()
 	defer tq.Unlock()
 	tq.disabled = d
@@ -151,6 +145,17 @@ func (tq *testQueue) Start(stopper *stop.Stopper) {
 func (tq *testQueue) MaybeAddAsync(
 	ctx context.Context, replI replicaInQueue, now hlc.ClockTimestamp,
 ) {
+	repl := replI.(*Replica)
+
+	tq.Lock()
+	defer tq.Unlock()
+	if index := tq.indexOf(repl.RangeID); index == -1 {
+		tq.ranges = append(tq.ranges, repl)
+	}
+}
+
+// NB: AddAsync on a testQueue is actually synchronous.
+func (tq *testQueue) AddAsync(ctx context.Context, replI replicaInQueue, prio float64) {
 	repl := replI.(*Replica)
 
 	tq.Lock()
@@ -206,10 +211,9 @@ func TestScannerAddToQueues(t *testing.T) {
 	ranges := newTestRangeSet(count, t)
 	q1, q2 := &testQueue{}, &testQueue{}
 	// We don't want to actually consume entries from the queues during this test.
-	q1.setDisabled(true)
-	q2.setDisabled(true)
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	q1.SetDisabled(true)
+	q2.SetDisabled(true)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q1, q2)
 	s.stopper = stop.NewStopper()
@@ -261,8 +265,7 @@ func TestScannerTiming(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			ranges := newTestRangeSet(count, t)
 			q := &testQueue{}
-			mc := hlc.NewManualClock(123)
-			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 			s := newReplicaScanner(makeAmbCtx(), clock, duration, 0, 0, ranges)
 			s.AddQueues(q)
 			s.stopper = stop.NewStopper()
@@ -345,8 +348,7 @@ func TestScannerDisabled(t *testing.T) {
 	const count = 3
 	ranges := newTestRangeSet(count, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()
@@ -410,8 +412,7 @@ func TestScannerEmptyRangeSet(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ranges := newTestRangeSet(0, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, time.Hour, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()

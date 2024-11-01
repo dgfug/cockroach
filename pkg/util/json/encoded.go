@@ -1,24 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
 	"strconv"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
@@ -583,9 +578,30 @@ func (j *jsonEncoded) AsBool() (bool, bool) {
 	return decoded.AsBool()
 }
 
-func (j *jsonEncoded) Compare(other JSON) (int, error) {
+func (j *jsonEncoded) AsArray() ([]JSON, bool) {
+	if dec := j.alreadyDecoded(); dec != nil {
+		return dec.AsArray()
+	}
+	decoded, err := j.decode()
+	if err != nil {
+		return nil, false
+	}
+	return decoded.AsArray()
+}
+
+func (j *jsonEncoded) Compare(other JSON) (_ int, err error) {
 	if other == nil {
 		return -1, nil
+	}
+	// We must first check for the special case of empty arrays, which are the
+	// minimum JSON value.
+	switch {
+	case isEmptyArray(j) && isEmptyArray(other):
+		return 0, nil
+	case isEmptyArray(j):
+		return -1, nil
+	case isEmptyArray(other):
+		return 1, nil
 	}
 	if cmp := cmpJSONTypes(j.Type(), other.Type()); cmp != 0 {
 		return cmp, nil
@@ -664,15 +680,6 @@ func (j *jsonEncoded) FetchValKeyOrIdx(key string) (JSON, error) {
 	return nil, nil
 }
 
-func (j *jsonEncoded) Format(buf *bytes.Buffer) {
-	decoded, err := j.decode()
-	if err != nil {
-		fmt.Fprintf(buf, `<corrupt JSON data: %s>`, err.Error())
-	} else {
-		decoded.Format(buf)
-	}
-}
-
 // RemoveIndex implements the JSON interface.
 func (j *jsonEncoded) RemoveIndex(idx int) (JSON, bool, error) {
 	decoded, err := j.shallowDecode()
@@ -737,6 +744,15 @@ func (j *jsonEncoded) Len() int {
 		return 0
 	}
 	return j.containerLen
+}
+
+// EncodeForwardIndex implements the JSON interface.
+func (j *jsonEncoded) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]byte, error) {
+	decoded, err := j.decode()
+	if err != nil {
+		return nil, err
+	}
+	return decoded.EncodeForwardIndex(buf, dir)
 }
 
 // EncodeInvertedIndexKeys implements the JSON interface.

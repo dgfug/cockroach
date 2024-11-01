@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -37,8 +32,10 @@ import (
 // the first within its peer group. Peers are tuples that belong to the same
 // partition and are equal on the ordering columns. If orderingCols is empty,
 // then all tuples within the partition are peers.
-// - partitionColIdx, if not columnOmitted, *must* specify the column in which
-//   'true' indicates the start of a new partition.
+//
+// NOTE: partitionColIdx, if not columnOmitted, *must* specify the column in which
+// 'true' indicates the start of a new partition.
+//
 // NOTE: the input *must* already be ordered on ordCols.
 func NewWindowPeerGrouper(
 	allocator *colmem.Allocator,
@@ -121,11 +118,6 @@ func (p *_PEER_GROUPER_STRINGOp) Next() coldata.Batch {
 	// {{end}}
 	sel := b.Selection()
 	peersVec := b.ColVec(p.outputColIdx)
-	if peersVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		peersVec.Nulls().UnsetNulls()
-	}
 	peersCol := peersVec.Bool()
 	if sel != nil {
 		for _, i := range sel[:n] {

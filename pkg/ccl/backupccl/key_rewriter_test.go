@@ -1,10 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backupccl
 
@@ -15,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -74,15 +72,16 @@ func TestKeyRewriter(t *testing.T) {
 		},
 	}
 
-	kr, err := makeKeyRewriterFromRekeys(keys.SystemSQLCodec, rekeys)
+	kr, err := MakeKeyRewriterFromRekeys(keys.SystemSQLCodec, rekeys,
+		nil /* tenantRekeys */, false /* restoreTenantFromStream */)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Run("normal", func(t *testing.T) {
 		key := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec,
-			systemschema.NamespaceTable, desc.GetPrimaryIndexID())
-		newKey, ok, err := kr.RewriteKey(key)
+			systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())
+		newKey, ok, err := kr.RewriteKey(key, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,8 +99,8 @@ func TestKeyRewriter(t *testing.T) {
 
 	t.Run("prefix end", func(t *testing.T) {
 		key := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec,
-			systemschema.NamespaceTable, desc.GetPrimaryIndexID())).PrefixEnd()
-		newKey, ok, err := kr.RewriteKey(key)
+			systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())).PrefixEnd()
+		newKey, ok, err := kr.RewriteKey(key, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,16 +120,16 @@ func TestKeyRewriter(t *testing.T) {
 		desc.ID = oldID + 10
 		desc2 := tabledesc.NewBuilder(&desc.TableDescriptor).BuildCreatedMutableTable()
 		desc2.ID += 10
-		newKr, err := makeKeyRewriterFromRekeys(keys.SystemSQLCodec, []execinfrapb.TableRekey{
+		newKr, err := MakeKeyRewriterFromRekeys(keys.SystemSQLCodec, []execinfrapb.TableRekey{
 			{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, desc.TableDesc())},
 			{OldID: uint32(desc.ID), NewDesc: mustMarshalDesc(t, desc2.TableDesc())},
-		})
+		}, nil /* tenantRekeys */, false /* restoreTenantFromStream */)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		key := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, systemschema.NamespaceTable, desc.GetPrimaryIndexID())
-		newKey, ok, err := newKr.RewriteKey(key)
+		key := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())
+		newKey, ok, err := newKr.RewriteKey(key, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -146,59 +145,139 @@ func TestKeyRewriter(t *testing.T) {
 		}
 	})
 
-	t.Run("tenants", func(t *testing.T) {
-		testTenantRekey := func(srcTenant, destTenant roachpb.TenantID) {
-			desc.ID = oldID + 10
-			srcCodec := keys.MakeSQLCodec(srcTenant)
-			destCodec := keys.MakeSQLCodec(destTenant)
-			newKr, err := makeKeyRewriterFromRekeys(destCodec, []execinfrapb.TableRekey{
-				{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, desc.TableDesc())},
-			})
-			require.NoError(t, err)
+	t.Run("importing", func(t *testing.T) {
 
-			key := rowenc.MakeIndexKeyPrefix(srcCodec, systemschema.NamespaceTable, desc.GetPrimaryIndexID())
-			newKey, ok, err := newKr.RewriteKey(key)
-			require.NoError(t, err)
-			if !ok {
-				t.Fatalf("expected rewrite")
-			}
-			noTenantKey, tenantID, err := keys.DecodeTenantPrefix(newKey)
-			require.NoError(t, err)
-			require.Equal(t, destTenant, tenantID)
-			_, id, err := encoding.DecodeUvarintAscending(noTenantKey)
-			require.NoError(t, err)
-			require.Equal(t, oldID+10, descpb.ID(id))
+		// Create a new key rewriter with a table descriptor undergoing an in-progress import.
+		desc.ID = oldID + 20
+		desc.ImportStartWallTime = 2
+		newKr, err := MakeKeyRewriterFromRekeys(keys.SystemSQLCodec, []execinfrapb.TableRekey{
+			{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, desc.TableDesc())},
+		}, nil /* tenantRekeys */, false /* restoreTenantFromStream */)
+		require.NoError(t, err)
+
+		key := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec,
+			systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())
+
+		// If the passed in walltime is at or above the ImportStartWalltime,
+		// rewriting should not have occurred.
+		_, ok, err := newKr.RewriteKey(key, 2)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		// Else, the key should get encoded normally.
+		newKey, ok, err := newKr.RewriteKey(key, 1)
+
+		if err != nil {
+			t.Fatal(err)
 		}
-
-		systemTenant := roachpb.SystemTenantID
-		tenant3 := roachpb.MakeTenantID(3)
-		tenant4 := roachpb.MakeTenantID(4)
-
-		tcs := []struct {
-			from, to roachpb.TenantID
-		}{
-			{from: systemTenant, to: tenant3},
-			{from: tenant3, to: tenant3},
-			{from: tenant3, to: tenant4},
-			// TODO: Restoring to the system tenant is currently special cased.
-			// {from: tenant3, to: systemTenant},
+		if !ok {
+			t.Fatal("expected rewrite")
 		}
-
-		for _, tc := range tcs {
-			t.Run(fmt.Sprintf("from-tenant-%v-to-%v", tc.from, tc.to), func(t *testing.T) {
-				testTenantRekey(tc.from, tc.to)
-			})
+		_, id, err := encoding.DecodeUvarintAscending(newKey)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if descpb.ID(id) != oldID+20 {
+			t.Fatalf("got %d expected %d", id, newID)
 		}
 	})
+	systemTenant := roachpb.SystemTenantID
+	tenant3 := roachpb.MustMakeTenantID(3)
+	tenant4 := roachpb.MustMakeTenantID(4)
 
+	// Restoring a tenant's data from a backup as another tenant.
+	testTableRekeyAsDiffTenant := func(srcTenant, destTenant roachpb.TenantID) {
+		desc.ID = oldID + 10
+		srcCodec := keys.MakeSQLCodec(srcTenant)
+		destCodec := keys.MakeSQLCodec(destTenant)
+		newKr, err := MakeKeyRewriterFromRekeys(destCodec, []execinfrapb.TableRekey{
+			{OldID: uint32(oldID), NewDesc: mustMarshalDesc(t, desc.TableDesc())},
+		}, nil /* tenantRekeys */, false /* restoreTenantFromStream */)
+		require.NoError(t, err)
+
+		key := rowenc.MakeIndexKeyPrefix(srcCodec, systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())
+		newKey, ok, err := newKr.RewriteKey(key, 0)
+		require.NoError(t, err)
+		if !ok {
+			t.Fatalf("expected rewrite")
+		}
+		noTenantKey, tenantID, err := keys.DecodeTenantPrefix(newKey)
+		require.NoError(t, err)
+		require.Equal(t, destTenant, tenantID)
+		_, id, err := encoding.DecodeUvarintAscending(noTenantKey)
+		require.NoError(t, err)
+		require.Equal(t, oldID+10, descpb.ID(id))
+	}
+
+	tcs := []struct {
+		from, to roachpb.TenantID
+	}{
+		{from: systemTenant, to: tenant3},
+		{from: tenant3, to: tenant3},
+		{from: tenant3, to: tenant4},
+		// TODO: Restoring to the system tenant is currently special cased.
+		// {from: tenant3, to: systemTenant},
+	}
+	for _, tc := range tcs {
+		t.Run(fmt.Sprintf("from-tenant-%v-to-%v", tc.from, tc.to), func(t *testing.T) {
+			testTableRekeyAsDiffTenant(tc.from, tc.to)
+		})
+	}
+
+	// Restoring a tenant from replication stream to another tenant.
+	testTenantRekey := func(srcTenant, destTenant roachpb.TenantID) {
+		desc.ID = oldID + 10
+		srcCodec := keys.MakeSQLCodec(srcTenant)
+		destCodec := keys.MakeSQLCodec(destTenant)
+		newKr, err := MakeKeyRewriterFromRekeys(destCodec, nil,
+			[]execinfrapb.TenantRekey{
+				{
+					OldID: srcTenant,
+					NewID: destTenant,
+				},
+			}, true /* restoreTenantFromStream */)
+		require.NoError(t, err)
+
+		key := rowenc.MakeIndexKeyPrefix(srcCodec, systemschema.NamespaceTable.GetID(), desc.GetPrimaryIndexID())
+		oldNoTenantKey, oldTenantID, err := keys.DecodeTenantPrefix(key)
+		require.NoError(t, err)
+		newKey, ok, err := newKr.RewriteKey(key, 0)
+		require.NoError(t, err)
+		if !ok {
+			t.Fatalf("expected rewrite")
+		}
+
+		require.NoError(t, err)
+		newNoTenantKey, newTenantID, err := keys.DecodeTenantPrefix(newKey)
+		require.NoError(t, err)
+		require.Equal(t, srcTenant, oldTenantID)
+		require.Equal(t, destTenant, newTenantID)
+		require.Equal(t, oldNoTenantKey, newNoTenantKey)
+	}
+
+	tcs = []struct {
+		from, to roachpb.TenantID
+	}{
+		// Rewriting a system tenant is not supported
+		{from: tenant3, to: tenant3},
+		{from: tenant3, to: tenant4},
+	}
+	for _, tc := range tcs {
+		t.Run(fmt.Sprintf("from-tenant-%v-to-%v", tc.from, tc.to), func(t *testing.T) {
+			testTenantRekey(tc.from, tc.to)
+		})
+	}
 }
 
 // mustMarshalDesc marshals the provided TableDescriptor.
 func mustMarshalDesc(t *testing.T, tableDesc *descpb.TableDescriptor) []byte {
-	desc := tabledesc.NewBuilder(tableDesc).BuildImmutable().DescriptorProto()
+	pb := tabledesc.NewBuilder(tableDesc).BuildCreatedMutable().DescriptorProto()
 	// Set the timestamp to a non-zero value.
-	descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(desc, hlc.Timestamp{WallTime: 1})
-	bytes, err := protoutil.Marshal(desc)
+	mut, err := descbuilder.BuildMutable(nil /* original */, pb, hlc.Timestamp{WallTime: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes, err := protoutil.Marshal(mut.DescriptorProto())
 	if err != nil {
 		t.Fatal(err)
 	}

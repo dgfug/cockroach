@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -20,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -37,8 +32,11 @@ func TestRangeReport(t *testing.T) {
 	// the cluster. We disable the cluster's own production of reports so that it
 	// doesn't interfere with the test.
 	ReporterInterval.Override(ctx, &st.SV, 0)
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
-	con := s.InternalExecutor().(sqlutil.InternalExecutor)
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		Settings:          st,
+	})
+	con := s.InternalExecutor().(isql.Executor)
 	defer s.Stopper().Stop(ctx)
 
 	// Verify that tables are empty.
@@ -89,7 +87,7 @@ func TestRangeReport(t *testing.T) {
 		{"2", "4", "3", "1", "0", "1", "0"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"3", "'2001-01-01 10:00:00+00:00'"},
+		{"3", "'2001-01-01 10:00:00+00'"},
 	})
 	require.Equal(t, 3, r.LastUpdatedRowCount())
 
@@ -120,7 +118,7 @@ func TestRangeReport(t *testing.T) {
 		{"4", "4", "3", "1", "0", "1", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"3", "'2001-01-01 11:00:00+00:00'"},
+		{"3", "'2001-01-01 11:00:00+00'"},
 	})
 	require.Equal(t, 3, r.LastUpdatedRowCount())
 
@@ -170,7 +168,7 @@ func TestRangeReport(t *testing.T) {
 		{"4", "4", "3", "1", "0", "1", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"3", "'2001-01-01 12:00:00+00:00'"},
+		{"3", "'2001-01-01 12:00:00+00'"},
 	})
 	require.Equal(t, 3, r.LastUpdatedRowCount())
 
@@ -189,7 +187,7 @@ func TestRangeReport(t *testing.T) {
 		{"1", "3", "3", "1", "0", "1", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"3", "'2001-01-01 12:30:00+00:00'"},
+		{"3", "'2001-01-01 12:30:00+00'"},
 	})
 	require.Equal(t, 2, r.LastUpdatedRowCount())
 }
@@ -245,7 +243,7 @@ func TestReplicationStatsReport(t *testing.T) {
 		{
 			name: "simple no violations",
 			baseReportTestCase: baseReportTestCase{
-				defaultZone: zone{replicas: 3},
+				defaultZone: zone{voters: 3},
 				schema: []database{
 					{
 						name: "db1",
@@ -262,7 +260,7 @@ func TestReplicationStatsReport(t *testing.T) {
 						},
 						zone: &zone{
 							// Change replication options so that db1 gets a report entry.
-							replicas: 3,
+							voters: 3,
 						},
 					},
 					{
@@ -326,7 +324,7 @@ func TestReplicationStatsReport(t *testing.T) {
 		{
 			name: "simple violations",
 			baseReportTestCase: baseReportTestCase{
-				defaultZone: zone{replicas: 3},
+				defaultZone: zone{voters: 3},
 				schema: []database{
 					{
 						name: "db1",
@@ -381,7 +379,7 @@ func TestReplicationStatsReport(t *testing.T) {
 		{
 			name: "joint consensus",
 			baseReportTestCase: baseReportTestCase{
-				defaultZone: zone{replicas: 3},
+				defaultZone: zone{voters: 3},
 				schema: []database{
 					{
 						name: "db1",
@@ -429,7 +427,138 @@ func TestReplicationStatsReport(t *testing.T) {
 					},
 				},
 			},
-		}}
+		},
+		{
+			name: "simple no violations with non-voters",
+			baseReportTestCase: baseReportTestCase{
+				defaultZone: zone{voters: 1, nonVoters: 2},
+				schema: []database{
+					{
+						name: "db1",
+						tables: []table{
+							{name: "t1",
+								partitions: []partition{{
+									name:  "p1",
+									start: []int{100},
+									end:   []int{200},
+									zone:  &zone{constraints: "[+p1]"},
+								}},
+							},
+							{name: "t2"},
+						},
+						zone: &zone{
+							// Change replication options so that db1 gets a report entry.
+							nonVoters: 3,
+						},
+					},
+				},
+				splits: []split{
+					{key: "/Table/t1", stores: "1 2 3"},
+					{key: "/Table/t1/pk", stores: "1 2 3"},
+					{key: "/Table/t1/pk/1", stores: "1 2 3"},
+					{key: "/Table/t1/pk/2", stores: "1 2 3"},
+					{key: "/Table/t1/pk/3", stores: "1 2 3"},
+					{key: "/Table/t1/pk/100", stores: "1 2 3"},
+					{key: "/Table/t1/pk/150", stores: "1 2 3"},
+					{key: "/Table/t1/pk/200", stores: "1 2 3"},
+					{key: "/Table/t2", stores: "1 2 3"},
+					{key: "/Table/t2/pk", stores: "1 2 3"},
+				},
+				nodes: []node{
+					{id: 1, stores: []store{{id: 1}}},
+					{id: 2, stores: []store{{id: 2}}},
+					{id: 3, stores: []store{{id: 3}}},
+				},
+			},
+			exp: []replicationStatsEntry{
+				{
+					object: "db1",
+					zoneRangeStatus: zoneRangeStatus{
+						numRanges:       8,
+						unavailable:     0,
+						underReplicated: 0,
+						// All ranges are over-replicated because they have
+						// too many voters.
+						overReplicated: 8,
+					},
+				},
+				{
+					object: "t1.p1",
+					zoneRangeStatus: zoneRangeStatus{
+						numRanges:       2,
+						unavailable:     0,
+						underReplicated: 0,
+						overReplicated:  2,
+					},
+				},
+			},
+		},
+		{
+			name: "voters inherited and overwriting lower level num replicas",
+			baseReportTestCase: baseReportTestCase{
+				defaultZone: zone{voters: 3, nonVoters: 1},
+				schema: []database{
+					{
+						name: "db1",
+						tables: []table{
+							{name: "t1",
+								partitions: []partition{{
+									name:  "p1",
+									start: []int{100},
+									end:   []int{200},
+									zone:  &zone{constraints: "[+p1]"},
+								}},
+							},
+							{name: "t2"},
+						},
+						zone: &zone{
+							// Change replication options so that db1 gets a report entry.
+							nonVoters: 2,
+						},
+					},
+				},
+				splits: []split{
+					{key: "/Table/t1", stores: "1 2 3"},
+					{key: "/Table/t1/pk", stores: "1 2 3"},
+					{key: "/Table/t1/pk/1", stores: "1 2 3"},
+					{key: "/Table/t1/pk/2", stores: "1 2 3"},
+					{key: "/Table/t1/pk/3", stores: "1 2 3"},
+					{key: "/Table/t1/pk/100", stores: "1 2 3"},
+					{key: "/Table/t1/pk/150", stores: "1 2 3"},
+					{key: "/Table/t1/pk/200", stores: "1 2 3"},
+					{key: "/Table/t2", stores: "1 2 3"},
+					{key: "/Table/t2/pk", stores: "1 2 3"},
+				},
+				nodes: []node{
+					{id: 1, stores: []store{{id: 1}}},
+					{id: 2, stores: []store{{id: 2}}},
+					{id: 3, stores: []store{{id: 3}}},
+				},
+			},
+			exp: []replicationStatsEntry{
+				{
+					object: "db1",
+					zoneRangeStatus: zoneRangeStatus{
+						// no ranges are over-replicated because voters is inherited
+						// from the higher level
+						numRanges:       8,
+						unavailable:     0,
+						underReplicated: 0,
+						overReplicated:  0,
+					},
+				},
+				{
+					object: "t1.p1",
+					zoneRangeStatus: zoneRangeStatus{
+						numRanges:       2,
+						unavailable:     0,
+						underReplicated: 0,
+						overReplicated:  0,
+					},
+				},
+			},
+		},
+	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			runReplicationStatsTest(t, tc)

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -23,23 +18,23 @@ import (
 // addPartialIndexPredicatesForTable finds all partial indexes in the table and
 // adds their predicates to the table metadata (see
 // TableMeta.partialIndexPredicates). The predicates are converted from strings
-// to ScalarExprs here.
-//
-// The predicates are used as "known truths" about table data. Any predicates
-// containing non-immutable operators are omitted.
+// to ScalarExprs here. The predicates are used as known truths about table
+// data. If any predicates contain non-immutable expressions, this function
+// panics.
 //
 // scan is an optional argument that is a Scan expression on the table. If scan
 // outputs all the ordinary columns in the table, we avoid constructing a new
 // scan. A scan and its logical properties are required in order to fully
 // normalize the partial index predicates.
 func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, scan memo.RelExpr) {
-	// We do not want to track view deps here, otherwise a view depending
-	// on a table with a partial index predicate using an UDT will result in a
-	// type dependency being added between the view and the UDT.
-	if b.trackViewDeps {
-		b.trackViewDeps = false
+	// We do not want to track view/function deps here, otherwise a view/function
+	// depending on a table with a partial index predicate using an UDT will
+	// result in a type dependency being added between the view/function and the
+	// UDT.
+	if b.trackSchemaDeps {
+		b.trackSchemaDeps = false
 		defer func() {
-			b.trackViewDeps = true
+			b.trackSchemaDeps = true
 		}()
 	}
 	tab := tabMeta.Table

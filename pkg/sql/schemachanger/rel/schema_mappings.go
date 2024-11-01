@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
@@ -40,6 +35,13 @@ func EntityMapping(typ reflect.Type, opts ...EntityMappingOption) SchemaOption {
 // EntityAttr defines a mapping of selector[s] to Attr for an entity.
 func EntityAttr(a Attr, selectors ...string) EntityMappingOption {
 	return attrMapping{a: a, selectors: selectors}
+}
+
+// EntityAttrOneOf defines a mapping of selector[s] to Attr for an entity.
+// The entity is a one of, so the selector covers all possible types of the
+// one of under the same name.
+func EntityAttrOneOf(a Attr, selector string, selectorTypes ...reflect.Type) EntityMappingOption {
+	return attrMapping{a: a, selectors: []string{selector}, selectorTypes: selectorTypes, isOneOfElement: true}
 }
 
 // schemaMappings defines how to map data types to Attr.
@@ -91,8 +93,10 @@ func (t entityMapping) apply(mappings *schemaMappings) {
 // attrMapping is used in mappings to describe how attributes are mapped to
 // struct fields as part of an entityMapping.
 type attrMapping struct {
-	a         Attr
-	selectors []string
+	a              Attr
+	selectors      []string
+	selectorTypes  []reflect.Type
+	isOneOfElement bool
 }
 
 func (a attrMapping) apply(tm *entityMapping) {

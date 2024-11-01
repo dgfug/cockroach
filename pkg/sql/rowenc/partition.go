@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowenc
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
@@ -56,21 +52,27 @@ type PartitionTuple struct {
 	SpecialCount int
 }
 
-func (t *PartitionTuple) String() string {
-	f := tree.NewFmtCtx(tree.FmtSimple)
-	f.WriteByte('(')
+var _ tree.NodeFormatter = &PartitionTuple{}
+
+func (t *PartitionTuple) Format(ctx *tree.FmtCtx) {
+	ctx.WriteByte('(')
 	for i := 0; i < len(t.Datums)+t.SpecialCount; i++ {
 		if i > 0 {
-			f.WriteString(", ")
+			ctx.WriteString(", ")
 		}
 		if i < len(t.Datums) {
-			f.FormatNode(t.Datums[i])
+			ctx.FormatNode(t.Datums[i])
 		} else {
-			f.WriteString(t.Special.String())
+			ctx.WriteString(t.Special.String())
 		}
 	}
-	f.WriteByte(')')
-	return f.CloseAndGetString()
+	ctx.WriteByte(')')
+}
+
+func (t *PartitionTuple) String() string {
+	ctx := tree.NewFmtCtx(tree.FmtSimple)
+	ctx.FormatNode(t)
+	return ctx.CloseAndGetString()
 }
 
 // DecodePartitionTuple parses columns (which are a prefix of the columns of
@@ -102,7 +104,7 @@ func (t *PartitionTuple) String() string {
 // DEFAULT) is valid but (1, DEFAULT, 2) is not. Similarly for range
 // partitioning and MINVALUE/MAXVALUE.
 func DecodePartitionTuple(
-	a *DatumAlloc,
+	a *tree.DatumAlloc,
 	codec keys.SQLCodec,
 	tableDesc catalog.TableDescriptor,
 	index catalog.Index,
@@ -120,7 +122,7 @@ func DecodePartitionTuple(
 
 	for i := len(prefixDatums); i < index.NumKeyColumns() && i < len(prefixDatums)+part.NumColumns(); i++ {
 		colID := index.GetKeyColumnID(i)
-		col, err := tableDesc.FindColumnWithID(colID)
+		col, err := catalog.MustFindColumnByID(tableDesc, colID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -142,7 +144,7 @@ func DecodePartitionTuple(
 			t.SpecialCount++
 		} else {
 			var datum tree.Datum
-			datum, valueEncBuf, err = DecodeTableValue(a, col.GetType(), valueEncBuf)
+			datum, valueEncBuf, err = valueside.Decode(a, col.GetType(), valueEncBuf)
 			if err != nil {
 				return nil, nil, errors.Wrapf(err, "decoding")
 			}
@@ -163,9 +165,12 @@ func DecodePartitionTuple(
 		colMap.Set(index.GetKeyColumnID(i), i)
 	}
 
-	indexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, index.GetID())
-	key, _, err := EncodePartialIndexKey(
-		tableDesc, index, len(allDatums), colMap, allDatums, indexKeyPrefix)
+	indexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), index.GetID())
+	keyAndSuffixCols := tableDesc.IndexFetchSpecKeyAndSuffixColumns(index)
+	if len(allDatums) > len(keyAndSuffixCols) {
+		return nil, nil, errors.Errorf("encoding too many columns (%d)", len(allDatums))
+	}
+	key, _, err := EncodePartialIndexKey(keyAndSuffixCols[:len(allDatums)], colMap, allDatums, indexKeyPrefix)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package timer defines an Analyzer that detects correct use of
 // timeutil.Timer.
@@ -43,22 +38,21 @@ var Analyzer = &analysis.Analyzer{
 // statement. The timers are usually used as timeouts on these select
 // statements, and need to be reset after each iteration.
 //
-// for {
-//   timer.Reset(...)
-//   select {
-//     case <-timer.C:
-//       timer.Read = true   <--  lint verifies that this line is present
-//     case ...:
-//   }
-// }
-//
+//	for {
+//	  timer.Reset(...)
+//	  select {
+//	    case <-timer.C:
+//	      timer.Read = true   <--  lint verifies that this line is present
+//	    case ...:
+//	  }
+//	}
 func run(pass *analysis.Pass) (interface{}, error) {
 	selectorIsTimer := func(s *ast.SelectorExpr) bool {
 		tv, ok := pass.TypesInfo.Types[s.X]
 		if !ok {
 			return false
 		}
-		typ := tv.Type.Underlying()
+		typ := tv.Type
 		for {
 			ptr, pok := typ.(*types.Pointer)
 			if !pok {
@@ -70,10 +64,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		if !ok {
 			return false
 		}
-		if named.Obj().Type().String() != "github.com/cockroachdb/cockroach/pkg/util/timeutil.Timer" {
-			return false
-		}
-		return true
+		const timerName = "github.com/cockroachdb/cockroach/pkg/util/timeutil.Timer"
+		return named.Obj().Type().String() == timerName
 	}
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)

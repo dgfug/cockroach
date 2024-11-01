@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqltestutils provides helper methods for testing sql packages.
 package sqltestutils
@@ -15,18 +10,22 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -34,8 +33,17 @@ import (
 // AddImmediateGCZoneConfig set the GC TTL to 0 for the given table ID. One must
 // make sure to disable strict GC TTL enforcement when using this.
 func AddImmediateGCZoneConfig(sqlDB *gosql.DB, id descpb.ID) (zonepb.ZoneConfig, error) {
+	return UpdateGCZoneConfig(sqlDB, id, 0)
+}
+
+// UpdateGCZoneConfig sets the GC TTL to a custom value for the given table ID.
+// If setting the value to 0, one must make sure to disable strict GC TTL
+// enforcement when using this.
+func UpdateGCZoneConfig(
+	sqlDB *gosql.DB, id descpb.ID, ttlSeconds int32,
+) (zonepb.ZoneConfig, error) {
 	cfg := zonepb.DefaultZoneConfig()
-	cfg.GC.TTLSeconds = 0
+	cfg.GC.TTLSeconds = ttlSeconds
 	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		return cfg, err
@@ -53,6 +61,20 @@ func DisableGCTTLStrictEnforcement(t *testing.T, db *gosql.DB) (cleanup func()) 
 		_, err := db.Exec(`SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
 		require.NoError(t, err)
 	}
+}
+
+// SetShortRangeFeedIntervals is a helper to set the cluster settings
+// pertaining to rangefeeds to short durations. This is helps tests which
+// rely on zone/span configuration changes to propagate.
+func SetShortRangeFeedIntervals(t *testing.T, db sqlutils.DBHandle) {
+	tdb := sqlutils.MakeSQLRunner(db)
+	short := "'20ms'"
+	if util.RaceEnabled {
+		short = "'200ms'"
+	}
+	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = `+short)
+	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = `+short)
+	tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = `+short)
 }
 
 // AddDefaultZoneConfig adds an entry for the given id into system.zones.
@@ -77,9 +99,9 @@ func BulkInsertIntoTable(sqlDB *gosql.DB, maxValue int) error {
 }
 
 // GetTableKeyCount returns the number of keys in t.test.
-func GetTableKeyCount(ctx context.Context, kvDB *kv.DB) (int, error) {
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
+func GetTableKeyCount(ctx context.Context, kvDB *kv.DB, codec keys.SQLCodec) (int, error) {
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "test")
+	tablePrefix := codec.TablePrefix(uint32(tableDesc.GetID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0)
 	return len(kvs), err
@@ -87,8 +109,8 @@ func GetTableKeyCount(ctx context.Context, kvDB *kv.DB) (int, error) {
 
 // CheckTableKeyCountExact returns whether the number of keys in t.test
 // equals exactly e.
-func CheckTableKeyCountExact(ctx context.Context, kvDB *kv.DB, e int) error {
-	if count, err := GetTableKeyCount(ctx, kvDB); err != nil {
+func CheckTableKeyCountExact(ctx context.Context, kvDB *kv.DB, codec keys.SQLCodec, e int) error {
+	if count, err := GetTableKeyCount(ctx, kvDB, codec); err != nil {
 		return err
 	} else if count != e {
 		return errors.Newf("expected %d key value pairs, but got %d", e, count)
@@ -98,8 +120,10 @@ func CheckTableKeyCountExact(ctx context.Context, kvDB *kv.DB, e int) error {
 
 // CheckTableKeyCount returns the number of KVs in the DB, the multiple
 // should be the number of columns.
-func CheckTableKeyCount(ctx context.Context, kvDB *kv.DB, multiple int, maxValue int) error {
-	return CheckTableKeyCountExact(ctx, kvDB, multiple*(maxValue+1))
+func CheckTableKeyCount(
+	ctx context.Context, kvDB *kv.DB, codec keys.SQLCodec, multiple int, maxValue int,
+) error {
+	return CheckTableKeyCountExact(ctx, kvDB, codec, multiple*(maxValue+1))
 }
 
 // IsClientSideQueryCanceledErr returns whether err is a client-side
@@ -109,4 +133,29 @@ func IsClientSideQueryCanceledErr(err error) bool {
 		return pgcode.MakeCode(string(pqErr.Code)) == pgcode.QueryCanceled
 	}
 	return pgerror.GetPGCode(err) == pgcode.QueryCanceled
+}
+
+// ArrayStringToSlice converts a string array column to a string slice.
+// "{}" -> {}
+// "{a}" -> {"a"}
+// "{a,b}" -> {"a", "b"}
+func ArrayStringToSlice(t *testing.T, array string, message ...string) []string {
+	length := len(array)
+	require.GreaterOrEqual(t, length, 2, message)
+	require.Equal(t, "{", string(array[0]), message)
+	require.Equal(t, "}", string(array[length-1]), message)
+	if length == 2 {
+		return []string{}
+	}
+	return strings.Split(array[1:length-1], ",")
+}
+
+// PGXConn is a helper to create a pgx.Conn from a url.
+func PGXConn(t *testing.T, connURL url.URL) (*pgx.Conn, error) {
+	t.Helper()
+	pgxConfig, err := pgx.ParseConfig(connURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pgx.ConnectConfig(context.Background(), pgxConfig)
 }

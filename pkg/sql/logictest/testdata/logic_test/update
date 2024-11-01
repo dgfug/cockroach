@@ -7,14 +7,23 @@ CREATE TABLE kv (
 statement error value type tuple{int, int} doesn't match type int of column "v"
 UPDATE kv SET v = (SELECT (10, 11))
 
-statement error value type decimal doesn't match type int of column "v"
+statement ok
 UPDATE kv SET v = 3.2
 
-statement error value type decimal doesn't match type int of column "v"
+statement ok
 UPDATE kv SET (k, v) = (3, 3.2)
 
-statement error value type decimal doesn't match type int of column "v"
+statement ok
 UPDATE kv SET (k, v) = (SELECT 3, 3.2)
+
+statement error value type string doesn't match type int of column "v"
+UPDATE kv SET v = '3.2'::STRING
+
+statement error value type string doesn't match type int of column "v"
+UPDATE kv SET (k, v) = (3, '3.2'::STRING)
+
+statement error value type string doesn't match type int of column "v"
+UPDATE kv SET (k, v) = (SELECT 3, '3.2'::STRING)
 
 statement count 4
 INSERT INTO kv VALUES (1, 2), (3, 4), (5, 6), (7, 8)
@@ -347,7 +356,7 @@ CREATE TABLE pks (
 statement count 2
 INSERT INTO pks VALUES (1, 2, 3), (4, 5, 3)
 
-statement error duplicate key value violates unique constraint "i"\nDETAIL: Key \(k2,v\)=\(5,3\) already exists\.
+statement error duplicate key value violates unique constraint "i"\nDETAIL: Key \(k2, v\)=\(5, 3\) already exists\.
 UPDATE pks SET k2 = 5 where k1 = 1
 
 # Test updating only one of the columns of a multi-column primary key.
@@ -378,8 +387,11 @@ UPDATE kv SET v = v + 1 ORDER BY v DESC LIMIT 3 RETURNING k,v
 
 # Check that UPDATE properly supports LIMIT (MySQL extension)
 
+statement ok
+TRUNCATE kv;
+
 statement count 3
-TRUNCATE kv; INSERT INTO kv VALUES (1, 2), (2, 3), (3, 4)
+INSERT INTO kv VALUES (1, 2), (2, 3), (3, 4)
 
 query II
 UPDATE kv SET v = v - 1 WHERE k < 10 ORDER BY k LIMIT 1 RETURNING k, v
@@ -443,10 +455,16 @@ subtest fk_contraint_check_validation_ordering
 # foreign key validation.
 statement ok
 CREATE TABLE src(x VARCHAR PRIMARY KEY);
-  INSERT INTO src(x) VALUES ('abc');
-  CREATE TABLE derived(x CHAR(3) REFERENCES src(x),
-                       y VARCHAR CHECK(length(y) < 4) REFERENCES src(x));
-  INSERT INTO derived(x, y) VALUES ('abc', 'abc')
+
+statement ok
+INSERT INTO src(x) VALUES ('abc');
+
+statement ok
+CREATE TABLE derived(x CHAR(3) REFERENCES src(x),
+                     y VARCHAR CHECK(length(y) < 4) REFERENCES src(x));
+
+statement ok
+INSERT INTO derived(x, y) VALUES ('abc', 'abc')
 
 # Sanity check that the FK constraints gets actually validated
 statement error foreign key
@@ -464,16 +482,16 @@ statement ok
 CREATE TABLE t29494(x INT PRIMARY KEY); INSERT INTO t29494 VALUES (12)
 
 statement ok
-BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 # Check that the new column is not visible
 query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
 CREATE TABLE public.t29494 (
-   x INT8 NOT NULL,
-   CONSTRAINT t29494_pkey PRIMARY KEY (x ASC),
-   FAMILY "primary" (x)
+  x INT8 NOT NULL,
+  CONSTRAINT t29494_pkey PRIMARY KEY (x ASC)
 )
 
 # Check that the new column is not usable in RETURNING
@@ -483,7 +501,9 @@ UPDATE t29494 SET x = 123 RETURNING y
 # Check the new column is not assignable. We need to restart
 # the txn because the error above trashed it.
 statement ok
-ROLLBACK; BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+ROLLBACK;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 # Returning * doesn't return y
 query I
@@ -497,7 +517,9 @@ UPDATE t29494 SET y = 123
 # Check the new column is not usable in assignments. We need to
 # restart the txn because the error above trashed it.
 statement ok
-ROLLBACK; BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+ROLLBACK;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 statement error column "y" is being backfilled
 UPDATE t29494 SET x = y
@@ -513,7 +535,8 @@ statement ok
 INSERT INTO mutation VALUES (1, 1)
 
 statement ok
-BEGIN; ALTER TABLE mutation add COLUMN o INT DEFAULT(10), ADD COLUMN p INT AS (o + n) STORED
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE mutation add COLUMN o INT DEFAULT(10), ADD COLUMN p INT AS (o + n) STORED
 
 statement ok
 UPDATE mutation SET m=2 WHERE n=1
@@ -539,7 +562,7 @@ UPDATE t32477 SET x = count(x)
 statement error window functions are not allowed in UPDATE SET
 UPDATE t32477 SET x = rank() OVER ()
 
-statement error generator functions are not allowed in UPDATE SET
+statement error pq: generate_series\(\): set-returning functions are not allowed in UPDATE SET
 UPDATE t32477 SET x = generate_series(1,2)
 
 #regression test for #32054
@@ -650,3 +673,26 @@ SELECT * FROM generated_as_id_t ORDER BY a;
 7  4  4
 8  5  5
 9  6  6
+
+# Regression test for #107634. Do not allow aggregate functions in ORDER BY.
+subtest regression_107634
+
+statement ok
+CREATE TABLE t107634 (a INT)
+
+statement error pgcode 42803 sum\(\): aggregate functions are not allowed in ORDER BY in UPDATE
+UPDATE t107634 SET a = 1 ORDER BY sum(a) LIMIT 1;
+
+subtest end
+
+# Regression test for #108166. Do not allow aggregate functions in ORDER BY when
+# the function is wrapped by a conditional expression.
+subtest regression_108166
+
+statement ok
+CREATE TABLE t108166 (a INT)
+
+statement error pgcode 42803 sum\(\): aggregate functions are not allowed in ORDER BY in UPDATE
+UPDATE t108166 SET a = 1 ORDER BY COALESCE(sum(a), 1) LIMIT 1;
+
+subtest end

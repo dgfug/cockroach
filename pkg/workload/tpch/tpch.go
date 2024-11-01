@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpch
 
@@ -96,23 +91,23 @@ var tpchMeta = workload.Meta{
 			`enable-checks`: {RuntimeOnly: true},
 			`vectorize`:     {RuntimeOnly: true},
 		}
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed`)
+		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed.`)
 		g.flags.IntVar(&g.scaleFactor, `scale-factor`, 1,
-			`Linear scale of how much data to use (each SF is ~1GB)`)
-		g.flags.BoolVar(&g.fks, `fks`, true, `Add the foreign keys`)
+			`Linear scale of how much data to use (each SF is ~1GB).`)
+		g.flags.BoolVar(&g.fks, `fks`, true, `Add foreign keys relationships.`)
 		g.flags.StringVar(&g.queriesRaw, `queries`,
 			`1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22`,
-			`Queries to run. Use a comma separated list of query numbers`)
+			`Queries to run. Use a comma separated list of query numbers.`)
 		g.flags.BoolVar(&g.enableChecks, `enable-checks`, false,
 			"Enable checking the output against the expected rows (default false). "+
 				"Note that the checks are only supported for scale factor 1 of the backup "+
-				"stored at 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup'")
+				"stored at 'gs://cockroach-fixtures-us-east1/workload/tpch/scalefactor=1/backup'.")
 		g.flags.StringVar(&g.vectorize, `vectorize`, `on`,
-			`Set vectorize session variable`)
+			`Set vectorize session variable.`)
 		g.flags.BoolVar(&g.useClusterVectorizeSetting, `default-vectorize`, false,
-			`Ignore vectorize option and use the current cluster setting sql.defaults.vectorize`)
+			`Ignore vectorize option and use the current cluster setting sql.defaults.vectorize.`)
 		g.flags.BoolVar(&g.verbose, `verbose`, false,
-			`Prints out the queries being run as well as histograms`)
+			`Prints out the queries being run as well as histograms.`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -123,6 +118,9 @@ func (*tpch) Meta() workload.Meta { return tpchMeta }
 
 // Flags implements the Flagser interface.
 func (w *tpch) Flags() workload.Flags { return w.flags }
+
+// ConnFlags implements the ConnFlagser interface.
+func (w *tpch) ConnFlags() *workload.ConnFlags { return w.connFlags }
 
 // Hooks implements the Hookser interface.
 func (w *tpch) Hooks() workload.Hooks {
@@ -145,7 +143,7 @@ func (w *tpch) Hooks() workload.Hooks {
 			}
 			return nil
 		},
-		PostLoad: func(db *gosql.DB) error {
+		PostLoad: func(_ context.Context, db *gosql.DB) error {
 			if w.fks {
 				// We avoid validating foreign keys because we just generated the data
 				// set and don't want to scan over the entire thing again.
@@ -190,9 +188,6 @@ func (w *tpch) Hooks() workload.Hooks {
 type generateLocals struct {
 	rng *rand.Rand
 
-	// namePerm is a slice of ordinals into randPartNames.
-	namePerm []int
-
 	orderData *orderSharedRandomData
 }
 
@@ -201,13 +196,8 @@ func (w *tpch) Tables() []workload.Table {
 	if w.localsPool == nil {
 		w.localsPool = &sync.Pool{
 			New: func() interface{} {
-				namePerm := make([]int, len(randPartNames))
-				for i := range namePerm {
-					namePerm[i] = i
-				}
 				return &generateLocals{
-					rng:      rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
-					namePerm: namePerm,
+					rng: rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
 					orderData: &orderSharedRandomData{
 						partKeys:   make([]int, 0, 7),
 						shipDates:  make([]int64, 0, 7),
@@ -303,10 +293,6 @@ func (w *tpch) Tables() []workload.Table {
 func (w *tpch) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -315,12 +301,13 @@ func (w *tpch) Ops(
 	db.SetMaxOpenConns(w.connFlags.Concurrency + 1)
 	db.SetMaxIdleConns(w.connFlags.Concurrency + 1)
 
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		worker := &worker{
-			config: w,
-			hists:  reg.GetHandle(),
-			db:     db,
+			config:  w,
+			hists:   reg.GetHandle(),
+			db:      db,
+			queries: makeQueriesForStream(i),
 		}
 		ql.WorkerFns = append(ql.WorkerFns, worker.run)
 	}
@@ -328,10 +315,11 @@ func (w *tpch) Ops(
 }
 
 type worker struct {
-	config *tpch
-	hists  *histogram.Histograms
-	db     *gosql.DB
-	ops    int
+	config  *tpch
+	hists   *histogram.Histograms
+	db      *gosql.DB
+	ops     int
+	queries map[int]string
 }
 
 func (w *worker) run(ctx context.Context) error {
@@ -342,7 +330,7 @@ func (w *worker) run(ctx context.Context) error {
 	if !w.config.useClusterVectorizeSetting {
 		prefix = fmt.Sprintf("SET vectorize = '%s';", w.config.vectorize)
 	}
-	query := fmt.Sprintf("%s %s", prefix, QueriesByNumber[queryNum])
+	query := fmt.Sprintf("%s %s", prefix, w.queries[queryNum])
 
 	vals := make([]interface{}, maxCols)
 	for i := range vals {
@@ -355,7 +343,7 @@ func (w *worker) run(ctx context.Context) error {
 		defer rows.Close()
 	}
 	if err != nil {
-		return errors.Errorf("[q%d]: %s", queryNum, err)
+		return errors.Wrapf(err, "[q%d]", queryNum)
 	}
 	var numRows int
 	// NOTE: we should *NOT* return an error from this function right away
@@ -366,7 +354,7 @@ func (w *worker) run(ctx context.Context) error {
 			if w.config.enableChecks {
 				if _, checkOnlyRowCount := numExpectedRowsByQueryNumber[queryNum]; !checkOnlyRowCount {
 					if err = rows.Scan(vals[:numColsByQueryNumber[queryNum]]...); err != nil {
-						return errors.Errorf("[q%d]: %s", queryNum, err)
+						return errors.Wrapf(err, "[q%d]", queryNum)
 					}
 
 					expectedRow := expectedRowsByQueryNumber[queryNum][numRows]
@@ -451,7 +439,7 @@ func (w *worker) run(ctx context.Context) error {
 	// We first check whether there is any error that came from the server (for
 	// example, an out of memory error). If there is, we return it.
 	if err := rows.Err(); err != nil {
-		return errors.Errorf("[q%d]: %s", queryNum, err)
+		return errors.Wrapf(err, "[q%d]", queryNum)
 	}
 	// Now we check whether there was an error while consuming the rows.
 	if expectedOutputError != nil {

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
@@ -16,7 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"hash/crc32"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"time"
 
@@ -90,7 +85,7 @@ func (j *JoinToken) UnmarshalText(text []byte) error {
 	switch v := joinTokenVersion(text[0]); v {
 	case joinTokenV0:
 		decoder := base64.NewDecoder(base64.URLEncoding, bytes.NewReader(text[1:]))
-		decoded, err := ioutil.ReadAll(decoder)
+		decoded, err := io.ReadAll(decoder)
 		if err != nil {
 			return err
 		}

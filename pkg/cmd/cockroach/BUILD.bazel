@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "cockroach_lib",
@@ -13,8 +14,17 @@ go_library(
     ],
 )
 
+disallowed_imports_test(
+    "cockroach_lib",
+    [
+        "//pkg/sql/randgen",
+        "//pkg/testutils/testcluster",
+    ],
+)
+
 go_binary(
     name = "cockroach",
     embed = [":cockroach_lib"],
+    exec_properties = {"Pool": "large"},
     visibility = ["//visibility:public"],
 )

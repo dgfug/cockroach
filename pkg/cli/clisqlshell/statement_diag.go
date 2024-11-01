@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 	"text/tabwriter"
@@ -44,9 +40,7 @@ func (c *cliState) handleStatementDiag(
 		}
 		id, err := strconv.ParseInt(args[0], 10, 64)
 		if err != nil {
-			return c.invalidSyntaxf(
-				errState, "%s", errors.Wrapf(err, "%q is not a valid bundle ID", args[1]),
-			)
+			return c.cliError(errState, errors.Wrapf(err, "%q is not a valid bundle ID", args[1]))
 		}
 		var filename string
 		if len(args) > 1 {
@@ -54,7 +48,8 @@ func (c *cliState) handleStatementDiag(
 		} else {
 			filename = fmt.Sprintf("stmt-bundle-%d.zip", id)
 		}
-		cmdErr = clisqlclient.StmtDiagDownloadBundle(c.conn, id, filename)
+		cmdErr = clisqlclient.StmtDiagDownloadBundle(
+			context.Background(), c.conn, id, filename)
 		if cmdErr == nil {
 			fmt.Fprintf(c.iCtx.stdout, "Bundle saved to %q\n", filename)
 		}
@@ -75,7 +70,7 @@ func (c *cliState) statementDiagList() error {
 	const timeFmt = "2006-01-02 15:04:05 MST"
 
 	// -- List bundles --
-	bundles, err := clisqlclient.StmtDiagListBundles(c.conn)
+	bundles, err := clisqlclient.StmtDiagListBundles(context.Background(), c.conn)
 	if err != nil {
 		return err
 	}

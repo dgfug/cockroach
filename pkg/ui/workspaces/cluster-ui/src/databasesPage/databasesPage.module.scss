@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 @import "src/core/index.module";
 
@@ -16,18 +11,34 @@
       font-family: $font-family--semi-bold;
     }
 
-    &-size {
+    &-size,
+    &-table-count,
+    &-range-count {
       width: 10em;
+      text-align: right;
+      padding-right: $spacing-x-large;
     }
-
-    &-table-count, &-range-count {
-      width: 7em;
+    &-idx-rec {
+      width: 20em;
     }
   }
 
   &__no-result {
     @include text--body-strong;
   }
+
+  &__cell-error {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    svg {
+      fill: $colors--warning;
+    }
+  }
+}
+
+.sorted-table {
+  width: 100%;
 }
 
 .icon {
@@ -60,4 +71,26 @@
   &--primary {
     fill: $colors--primary-text;
   }
+
+    &--warning {
+      fill: $colors--functional-orange-3;
+    }
+}
+
+.index-recommendations-icon {
+  &__exist {
+    height: 10px;
+    width: 20px;
+    fill: $colors--functional-orange-3;
+  }
+
+  &__none {
+    height: 10px;
+    width: 20px;
+    fill: $colors--neutral-11;
+  }
+}
+
+.page-config {
+  margin-bottom: $spacing-smaller;
 }

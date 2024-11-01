@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -22,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -30,9 +27,9 @@ import (
 func TestInvertedJoinProvided(t *testing.T) {
 	tc := testcat.New()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 
 	// Add the table with the inverted index.

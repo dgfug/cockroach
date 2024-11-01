@@ -1,22 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
@@ -24,16 +19,13 @@ import (
 // InsertNewStats inserts a slice of statistics at the current time into the
 // system table.
 func InsertNewStats(
-	ctx context.Context,
-	executor sqlutil.InternalExecutor,
-	txn *kv.Txn,
-	tableStats []*TableStatisticProto,
+	ctx context.Context, settings *cluster.Settings, txn isql.Txn, tableStats []*TableStatisticProto,
 ) error {
 	var err error
 	for _, statistic := range tableStats {
 		err = InsertNewStat(
 			ctx,
-			executor,
+			settings,
 			txn,
 			statistic.TableID,
 			statistic.Name,
@@ -43,6 +35,8 @@ func InsertNewStats(
 			int64(statistic.NullCount),
 			int64(statistic.AvgSize),
 			statistic.HistogramData,
+			statistic.PartialPredicate,
+			statistic.FullStatisticID,
 		)
 		if err != nil {
 			return err
@@ -57,13 +51,15 @@ func InsertNewStats(
 // stats caches on all other nodes).
 func InsertNewStat(
 	ctx context.Context,
-	executor sqlutil.InternalExecutor,
-	txn *kv.Txn,
+	settings *cluster.Settings,
+	txn isql.Txn,
 	tableID descpb.ID,
 	name string,
 	columnIDs []descpb.ColumnID,
 	rowCount, distinctCount, nullCount, avgSize int64,
 	h *HistogramData,
+	partialPredicate string,
+	fullStatisticID uint64,
 ) error {
 	// We must pass a nil interface{} if we want to insert a NULL.
 	var nameVal, histogramVal interface{}
@@ -85,8 +81,15 @@ func InsertNewStat(
 		}
 	}
 
-	_, err := executor.Exec(
-		ctx, "insert-statistic", txn,
+	// Need to assign to a nil interface{} to be able
+	// to insert NULL value.
+	var predicateValue interface{}
+	if partialPredicate != "" {
+		predicateValue = partialPredicate
+	}
+
+	_, err := txn.Exec(
+		ctx, "insert-statistic", txn.KV(),
 		`INSERT INTO system.table_statistics (
 					"tableID",
 					"name",
@@ -95,8 +98,10 @@ func InsertNewStat(
 					"distinctCount",
 					"nullCount",
 					"avgSize",
-					histogram
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					histogram,
+					"partialPredicate",
+					"fullStatisticID"
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		tableID,
 		nameVal,
 		columnIDsVal,
@@ -105,6 +110,8 @@ func InsertNewStat(
 		nullCount,
 		avgSize,
 		histogramVal,
+		predicateValue,
+		fullStatisticID,
 	)
 	return err
 }

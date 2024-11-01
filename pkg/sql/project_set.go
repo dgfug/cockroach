@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -24,7 +19,7 @@ import (
 // returns tuples of values from a,b,c picked "simultaneously". NULLs
 // are used when an iterator is "shorter" than another. For example:
 //
-//    zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
+//	zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
 //
 // In this context, projectSetNode corresponds to a relational
 // operator project(R, a, b, c, ...) which, for each row in R,

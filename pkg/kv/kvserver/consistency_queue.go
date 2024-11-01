@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -14,6 +9,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -24,6 +22,7 @@ import (
 )
 
 var consistencyCheckInterval = settings.RegisterDurationSetting(
+	settings.SystemOnly,
 	"server.consistency_check.interval",
 	"the time between range consistency checks; set to 0 to disable consistency checking."+
 		" Note that intervals that are too short can negatively impact performance.",
@@ -32,14 +31,25 @@ var consistencyCheckInterval = settings.RegisterDurationSetting(
 )
 
 var consistencyCheckRate = settings.RegisterByteSizeSetting(
+	settings.SystemOnly,
 	"server.consistency_check.max_rate",
 	"the rate limit (bytes/sec) to use for consistency checks; used in "+
 		"conjunction with server.consistency_check.interval to control the "+
 		"frequency of consistency checks. Note that setting this too high can "+
 		"negatively impact performance.",
 	8<<20, // 8MB
-	validatePositive,
-).WithPublic()
+	settings.PositiveInt,
+	settings.WithPublic)
+
+// skipConsitencyQueueForExternalBytes is a setting that controls whether
+// replicas with external bytes should be processed by the consitency
+// queue.
+var skipConsitencyQueueForExternalBytes = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"server.consistency_check.skip_external_bytes.enabled",
+	"skip the consistency queue for external bytes",
+	true,
+)
 
 // consistencyCheckRateBurstFactor we use this to set the burst parameter on the
 // quotapool.RateLimiter. It seems overkill to provide a user setting for this,
@@ -53,6 +63,11 @@ const consistencyCheckRateBurstFactor = 8
 // churn on timers.
 const consistencyCheckRateMinWait = 100 * time.Millisecond
 
+// consistencyCheckSyncTimeout is the max amount of time the consistency check
+// computation and the checksum collection request will wait for each other
+// before giving up.
+const consistencyCheckSyncTimeout = 5 * time.Second
+
 var testingAggressiveConsistencyChecks = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_AGGRESSIVE", false)
 
 type consistencyQueue struct {
@@ -60,6 +75,8 @@ type consistencyQueue struct {
 	interval       func() time.Duration
 	replicaCountFn func() int
 }
+
+var _ queueImpl = &consistencyQueue{}
 
 // A data wrapper to allow for the shouldQueue method to be easier to test.
 type consistencyShouldQueueData struct {
@@ -81,15 +98,18 @@ func newConsistencyQueue(store *Store) *consistencyQueue {
 	q.baseQueue = newBaseQueue(
 		"consistencyChecker", q, store,
 		queueConfig{
-			maxSize:              defaultQueueMaxSize,
-			needsLease:           true,
-			needsSystemConfig:    false,
-			acceptsUnsplitRanges: true,
-			successes:            store.metrics.ConsistencyQueueSuccesses,
-			failures:             store.metrics.ConsistencyQueueFailures,
-			pending:              store.metrics.ConsistencyQueuePending,
-			processingNanos:      store.metrics.ConsistencyQueueProcessingNanos,
-			processTimeoutFunc:   makeRateLimitedTimeoutFunc(consistencyCheckRate),
+			maxSize:                             defaultQueueMaxSize,
+			needsLease:                          true,
+			needsSpanConfigs:                    false,
+			acceptsUnsplitRanges:                true,
+			successes:                           store.metrics.ConsistencyQueueSuccesses,
+			failures:                            store.metrics.ConsistencyQueueFailures,
+			storeFailures:                       store.metrics.StoreFailures,
+			pending:                             store.metrics.ConsistencyQueuePending,
+			processingNanos:                     store.metrics.ConsistencyQueueProcessingNanos,
+			processTimeoutFunc:                  makeRateLimitedTimeoutFunc(consistencyCheckRate),
+			disabledConfig:                      kvserverbase.ConsistencyQueueEnabled,
+			skipIfReplicaHasExternalFilesConfig: skipConsitencyQueueForExternalBytes,
 		},
 	)
 	return q
@@ -106,7 +126,7 @@ func (q *consistencyQueue) shouldQueue(
 			},
 			isNodeAvailable: func(nodeID roachpb.NodeID) bool {
 				if repl.store.cfg.NodeLiveness != nil {
-					return repl.store.cfg.NodeLiveness.IsAvailableNotDraining(nodeID)
+					return repl.store.cfg.NodeLiveness.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.ConsistencyQueue)
 				}
 				// Some tests run without a NodeLiveness configured.
 				return true
@@ -159,7 +179,7 @@ func (q *consistencyQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 
-	req := roachpb.CheckConsistencyRequest{
+	req := kvpb.CheckConsistencyRequest{
 		// Tell CheckConsistency that the caller is the queue. This triggers
 		// code to handle inconsistencies by recomputing with a diff and
 		// instructing the nodes in the minority to terminate with a fatal
@@ -167,7 +187,7 @@ func (q *consistencyQueue) process(
 		// inconsistency but the persisted stats are found to disagree with
 		// those reflected in the data. All of this really ought to be lifted
 		// into the queue in the future.
-		Mode: roachpb.ChecksumMode_CHECK_VIA_QUEUE,
+		Mode: kvpb.ChecksumMode_CHECK_VIA_QUEUE,
 	}
 	resp, pErr := repl.CheckConsistency(ctx, req)
 	if pErr != nil {
@@ -193,6 +213,11 @@ func (q *consistencyQueue) process(
 	return true, nil
 }
 
+func (*consistencyQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 	// An interval between replicas to space consistency checks out over
 	// the check interval.
@@ -209,5 +234,9 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 
 // purgatoryChan returns nil.
 func (*consistencyQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*consistencyQueue) updateChan() <-chan time.Time {
 	return nil
 }

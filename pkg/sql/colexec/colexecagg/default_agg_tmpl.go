@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -30,7 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -41,7 +37,7 @@ type default_AGGKINDAgg struct {
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
-	fn  tree.AggregateFunc
+	fn  eval.AggregateFunc
 	ctx context.Context
 	// inputArgsConverter is managed by the aggregator, and this function can
 	// simply call GetDatumColumn.
@@ -56,21 +52,13 @@ type default_AGGKINDAgg struct {
 
 var _ AggregateFunc = &default_AGGKINDAgg{}
 
-func (a *default_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
-	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
-}
-
 func (a *default_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 	// Note that we only need to account for the memory of the output vector
 	// and not for the intermediate results of aggregation since the aggregate
 	// function itself does the latter.
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -124,9 +112,10 @@ func (a *default_AGGKINDAgg) Reset() {
 }
 
 func newDefault_AGGKINDAggAlloc(
+	ctx context.Context,
 	allocator *colmem.Allocator,
-	constructor execinfrapb.AggregateConstructor,
-	evalCtx *tree.EvalContext,
+	constructor execagg.AggregateConstructor,
+	evalCtx *eval.Context,
 	inputArgsConverter *colconv.VecToDatumConverter,
 	numArguments int,
 	constArguments tree.Datums,
@@ -143,6 +132,7 @@ func newDefault_AGGKINDAggAlloc(
 			allocSize: allocSize,
 		},
 		constructor:        constructor,
+		ctx:                ctx,
 		evalCtx:            evalCtx,
 		inputArgsConverter: inputArgsConverter,
 		resultConverter:    colconv.GetDatumToPhysicalFn(outputType),
@@ -155,8 +145,9 @@ type default_AGGKINDAggAlloc struct {
 	aggAllocBase
 	aggFuncs []default_AGGKINDAgg
 
-	constructor execinfrapb.AggregateConstructor
-	evalCtx     *tree.EvalContext
+	constructor execagg.AggregateConstructor
+	ctx         context.Context
+	evalCtx     *eval.Context
 	// inputArgsConverter is a converter from coldata.Vecs to tree.Datums that
 	// is shared among all aggregate functions and is managed by the aggregator
 	// (meaning that the aggregator operator is responsible for calling
@@ -197,21 +188,21 @@ func (a *default_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 	f := &a.aggFuncs[0]
 	*f = default_AGGKINDAgg{
 		fn:                 a.constructor(a.evalCtx, a.arguments),
-		ctx:                a.evalCtx.Context,
+		ctx:                a.ctx,
 		inputArgsConverter: a.inputArgsConverter,
 		resultConverter:    a.resultConverter,
 	}
 	f.allocator = a.allocator
 	f.scratch.otherArgs = a.otherArgsScratch
-	a.allocator.AdjustMemoryUsage(f.fn.Size())
+	a.allocator.AdjustMemoryUsageAfterAllocation(f.fn.Size())
 	a.aggFuncs = a.aggFuncs[1:]
 	a.returnedFns = append(a.returnedFns, f)
 	return f
 }
 
-func (a *default_AGGKINDAggAlloc) Close() error {
+func (a *default_AGGKINDAggAlloc) Close(ctx context.Context) error {
 	for _, fn := range a.returnedFns {
-		fn.fn.Close(fn.ctx)
+		fn.fn.Close(ctx)
 	}
 	a.returnedFns = nil
 	return nil

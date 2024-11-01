@@ -1,14 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import classNames from "classnames/bind";
+
 import styles from "./filter.module.scss";
 
 const cx = classNames.bind(styles);
@@ -38,4 +34,14 @@ export const checkbox = {
 export const applyBtn = {
   wrapper: cx("apply-btn__wrapper"),
   btn: cx("apply-btn__btn"),
+};
+
+export const clearBnt = {
+  btn: cx("clear-btn"),
+};
+
+export const badge = {
+  area: cx("badges-area"),
+  wrapper: cx("badge-wrapper"),
+  closeArea: cx("close-area"),
 };

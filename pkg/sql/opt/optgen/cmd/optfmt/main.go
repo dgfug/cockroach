@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // optfmt pretty prints .opt files.
 package main
@@ -16,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -42,7 +36,7 @@ func main() {
 	args := flag.Args()
 	switch len(args) {
 	case 0:
-		orig, err := ioutil.ReadAll(os.Stdin)
+		orig, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -81,7 +75,7 @@ func main() {
 			}
 		}
 		if *write {
-			err := ioutil.WriteFile(name, []byte(prettied), 0666)
+			err := os.WriteFile(name, []byte(prettied), 0666)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %s\n", name, err)
 				os.Exit(1)
@@ -145,7 +139,7 @@ type pp struct {
 }
 
 func prettyFile(name string) (orig []byte, pretty string, err error) {
-	orig, err = ioutil.ReadFile(name)
+	orig, err = os.ReadFile(name)
 	if err != nil {
 		return orig, "", err
 	}
@@ -174,7 +168,10 @@ func prettyify(r io.Reader, n int, exprgen bool) (string, error) {
 		exprs = parser.Exprs()
 	}
 	d := p.toDoc(exprs)
-	s := pretty.Pretty(d, n, false, 4, nil)
+	s, err := pretty.Pretty(d, n, false, 4, nil)
+	if err != nil {
+		return "", err
+	}
 
 	// Remove any whitespace at EOL. This can happen in define rules where
 	// we always insert a blank line above comments which are nested with

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -19,17 +14,22 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -54,7 +54,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 		t.Run(fmt.Sprintf("with-initial-version=%t", withInitialVersion), func(t *testing.T) {
 			const numStores = 3
 			ctx := context.Background()
-			migrationVersion := roachpb.Version{Major: 42}
+			migrationVersion := roachpb.Version{Major: 1000042}
 
 			storeKnobs := &kvserver.StoreTestingKnobs{
 				DisableEagerReplicaRemoval: true,
@@ -84,7 +84,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 
 			for _, node := range []int{n2, n3} {
 				ts := tc.Servers[node]
-				store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+				store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 				if pErr != nil {
 					t.Fatal(pErr)
 				}
@@ -106,7 +106,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 			}
 
 			ts := tc.Servers[n2]
-			store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+			store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 			if pErr != nil {
 				t.Fatal(pErr)
 			}
@@ -137,7 +137,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true // we'll control it ourselves
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserver.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		// We'll want a signal for when the snapshot was received by the sender.
 		once.Do(func() { close(blockUntilSnapshotCh) })
 
@@ -179,7 +179,8 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 	repl, err := store.GetReplica(desc.RangeID)
 	require.NoError(t, err)
 	testutils.SucceedsSoon(t, func() error {
-		trace, processErr, err := store.ManuallyEnqueue(ctx, "raftsnapshot", repl, true /* skipShouldQueue */)
+		traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, store.GetStoreConfig().Tracer(), "trace-enqueue")
+		processErr, err := store.Enqueue(traceCtx, "raftsnapshot", repl, true /* skipShouldQueue */, false /* async */)
 		if err != nil {
 			return err
 		}
@@ -187,7 +188,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 			return processErr
 		}
 		const msg = `skipping snapshot; replica is likely a LEARNER in the process of being added: (n2,s2):2LEARNER`
-		formattedTrace := trace.String()
+		formattedTrace := rec().String()
 		if !strings.Contains(formattedTrace, msg) {
 			return errors.Errorf(`expected "%s" in trace got:\n%s`, msg, formattedTrace)
 		}
@@ -218,7 +219,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 
 	for _, node := range []int{n1, n2} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -239,8 +240,8 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 	blockApplicationCh := make(chan struct{})
 
 	// We're going to be migrating from startV to endV.
-	startV := roachpb.Version{Major: 41}
-	endV := roachpb.Version{Major: 42}
+	startV := clusterversion.Latest.Version()
+	endV := roachpb.Version{Major: 1000042}
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
@@ -249,11 +250,21 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 			Settings: cluster.MakeTestingClusterSettingsWithVersions(endV, startV, false),
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					BinaryVersionOverride:          startV,
-					DisableAutomaticVersionUpgrade: 1,
+					ClusterVersionOverride:         startV,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+				},
+				UpgradeManager: &upgradebase.TestingKnobs{
+					ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+						res := clusterversion.ListBetween(from, to)
+						// Pretend endV is a valid version.
+						if from.Less(endV) && to.AtLeast(endV) {
+							res = append(res, endV)
+						}
+						return res
+					},
 				},
 				Store: &kvserver.StoreTestingKnobs{
-					TestingApplyFilter: func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+					TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 						if args.StoreID == roachpb.StoreID(n3) && args.State != nil && args.State.Version != nil {
 							<-blockApplicationCh
 						}
@@ -272,14 +283,14 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 
 	for _, node := range []int{n1, n2, n3} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
 
 		repl := store.LookupReplica(roachpb.RKey(k))
 		require.NotNil(t, repl)
-		require.Equal(t, repl.Version(), startV)
+		require.Equal(t, startV, repl.Version())
 	}
 
 	desc := tc.LookupRangeOrFatal(t, k)
@@ -305,7 +316,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 
 	for _, node := range []int{n1, n2, n3} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}

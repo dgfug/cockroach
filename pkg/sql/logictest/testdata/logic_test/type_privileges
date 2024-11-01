@@ -1,5 +1,3 @@
-# LogicTest: !3node-tenant(50049)
-
 # Types created in the public schema have usage provided to public.
 user root
 
@@ -91,9 +89,6 @@ statement error pq: invalid privilege type ZONECONFIG for type
 GRANT ZONECONFIG ON type TEST to testuser
 
 # ALL, and GRANT should be grantable to enums.
-
-statement ok
-GRANT GRANT ON type TEST to testuser
 
 statement ok
 GRANT ALL ON type TEST to testuser

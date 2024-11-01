@@ -326,7 +326,7 @@ EXECUTE z(3)
 statement ok
 PREPARE z2(int) AS WITH foo AS (SELECT * FROM x WHERE a = $1) SELECT * FROM x2 ORDER BY a
 
-query I
+query I nosort
 EXECUTE z2(1)
 ----
 1
@@ -366,7 +366,7 @@ PREPARE z6(int) AS
       (WITH foo AS (SELECT $1 + x) SELECT * FROM foo)
     )
 
-query II
+query II rowsort
 EXECUTE z6(3)
 ----
 1 4
@@ -396,7 +396,7 @@ SELECT sum(n) FROM t
 5050
 
 # Test where initial query has duplicate columns.
-query II
+query II rowsort
 WITH RECURSIVE cte(a, b) AS (
     SELECT 0, 0
   UNION ALL
@@ -411,7 +411,7 @@ WITH RECURSIVE cte(a, b) AS (
 5  50
 
 # Test where recursive query has duplicate columns.
-query II
+query II rowsort
 WITH RECURSIVE cte(a, b) AS (
     SELECT 0, 1
   UNION ALL
@@ -733,18 +733,22 @@ INSERT INTO graph_node (id, parent) VALUES
   ('C', 'B'),
   ('D', 'C')
 
-query T rowsort
+# The recursive query seed column types must match the output columns types.
+query error pgcode 42804 recursive query \"nodes\" column 1 has type string in non-recursive term but type varchar overall
 WITH RECURSIVE nodes AS (
   SELECT 'A' AS id
   UNION ALL
   SELECT graph_node.id FROM graph_node JOIN nodes ON graph_node.parent = nodes.id
 )
 SELECT * FROM nodes
-----
-A
-B
-C
-D
+
+# The recursive query seed column types must match the output columns types.
+query error pgcode 42804 recursive query \"foo\" column 1 has type int in non-recursive term but type decimal overall
+WITH RECURSIVE foo(i) AS
+    (SELECT i FROM (VALUES(1),(2)) t(i)
+    UNION ALL
+    SELECT (i+1)::numeric(10,0) FROM foo WHERE i < 10)
+SELECT * FROM foo
 
 # Tests with correlated CTEs.
 statement ok
@@ -997,6 +1001,31 @@ EXPERIMENTAL SCRUB TABLE t WITH OPTIONS INDEX ALL
 statement ok
 RESET CLUSTER SETTING sql.multiple_modifications_of_table.enabled
 
+# Multiple mutations can also be explicitly allowed with a session setting.
+statement ok
+SET enable_multiple_modifications_of_table = true
+
+# Multiple updates of different rows in the same table.
+query II rowsort
+WITH
+  u1 AS (UPDATE t SET j = j - 40 WHERE i < 20 RETURNING *),
+  u2 AS (UPDATE t SET j = j + 40 WHERE i >= 20 RETURNING *)
+TABLE u1 UNION ALL TABLE u2
+----
+2 60
+4 60
+6 60
+8 60
+20 440
+
+# Check for corruption.
+query TTTTTTTT
+EXPERIMENTAL SCRUB TABLE t WITH OPTIONS INDEX ALL
+----
+
+statement ok
+RESET enable_multiple_modifications_of_table
+
 # Tests with multiple mutations on the same table, modifying the same
 # rows. These testcases vary the type of mutation and the form. All should fail
 # with an error. When issue 70731 is fixed, some might no longer fail.
@@ -1023,7 +1052,7 @@ SELECT i, j FROM u@u_j_idx
 
 # Multiple upserts of the same row. Might succeed after issue 70731 is fixed,
 # depending on the implementation, but should not cause corruption.
-query error pgcode 0A000 multiple modification subqueries of the same table
+query error pgcode 0A000 multiple mutations of the same table
 WITH
   v AS (UPSERT INTO u VALUES (0, 1) RETURNING *),
   w AS (UPSERT INTO u SELECT i, j + 1 FROM v RETURNING *)
@@ -1042,7 +1071,7 @@ SELECT i, j FROM u@u_j_idx
 # Multiple updates of the same row. Might succeed after issue 70731 is fixed,
 # depending on the implementation, but should not cause corruption. The order of
 # CTE execution is not necessarily defined here.
-query error pgcode 0A000 multiple modification subqueries of the same table
+query error pgcode 0A000 multiple mutations of the same table
 WITH
   v AS (UPDATE u SET j = 3 WHERE i = 0 RETURNING *),
   w AS (UPDATE u SET j = 4 WHERE i = 0 RETURNING *)
@@ -1061,7 +1090,7 @@ SELECT i, j FROM u@u_j_idx
 # Multiple updates of the same row. Might succeed after issue 70731 is fixed,
 # depending on the implementation, but should not cause corruption. The order of
 # CTE execution should be deterministic.
-query error pgcode 0A000 multiple modification subqueries of the same table
+query error pgcode 0A000 multiple mutations of the same table
 WITH
   v AS (UPDATE u SET j = 5 WHERE i = 0 RETURNING *),
   w AS (UPDATE u SET j = v.j + 1 FROM v WHERE u.i = v.i RETURNING *)
@@ -1079,7 +1108,7 @@ SELECT i, j FROM u@u_j_idx
 
 # Multiple inserts of the same row into the same table, most should become
 # updates due to conflicts. Might succeed after issue 70731 is fixed.
-query error pgcode 0A000 multiple modification subqueries of the same table
+query error pgcode 0A000 multiple mutations of the same table
 WITH
   v AS (INSERT INTO u VALUES (0, 42), (1, 42) ON CONFLICT (i) DO UPDATE SET j = 52 RETURNING *)
 INSERT INTO u SELECT i, j + 1 FROM v ON CONFLICT (i) DO UPDATE SET j = v.j + 100 RETURNING *
@@ -1096,7 +1125,7 @@ SELECT i, j FROM u@u_j_idx
 
 # Multiple deletes of the same row. Might succeed after issue 70731 is fixed,
 # though the order of CTE execution is undefined.
-query error pgcode 0A000 multiple modification subqueries of the same table
+query error pgcode 0A000 multiple mutations of the same table
 WITH
   v AS (DELETE FROM u ORDER BY i LIMIT 1 RETURNING *),
   w AS (DELETE FROM u ORDER BY i LIMIT 2 RETURNING *)
@@ -1116,3 +1145,177 @@ SELECT i, j FROM u@u_j_idx
 query TTTTTTTT
 EXPERIMENTAL SCRUB TABLE u WITH OPTIONS INDEX ALL
 ----
+
+# Example pulled from a blog post.
+# https://malisper.me/the-missing-postgres-scan-the-loose-index-scan
+statement ok
+CREATE TABLE ints (n BIGINT, INDEX (n));
+
+statement ok
+INSERT INTO ints
+VALUES (1), (1), (1), (2), (4), (4), (4), (4), (5), (5),
+  (6), (7), (7), (7), (8), (9), (9), (9), (9), (9);
+
+query I
+WITH RECURSIVE temp (i) AS (
+  (SELECT n FROM ints ORDER BY n ASC LIMIT 1)
+UNION ALL (
+  SELECT n FROM temp,
+    LATERAL (
+      SELECT n
+      FROM ints
+      WHERE n > i
+      ORDER BY n ASC
+      LIMIT 1
+    ) sub
+  )
+)
+SELECT count(*) FROM temp;
+----
+8
+
+query I rowsort
+WITH RECURSIVE temp (i) AS (
+  (SELECT n FROM ints ORDER BY n ASC LIMIT 1)
+UNION ALL (
+  SELECT n FROM temp,
+    LATERAL (
+      SELECT n
+      FROM ints
+      WHERE n > i
+      ORDER BY n ASC
+      LIMIT 1
+    ) sub
+  )
+)
+SELECT * FROM temp;
+----
+1
+2
+4
+5
+6
+7
+8
+9
+
+# Added limit to the recursive branch.
+query I
+WITH RECURSIVE temp (i) AS (
+  (SELECT n FROM ints ORDER BY n ASC LIMIT 1)
+UNION ALL (
+  SELECT n FROM temp,
+    LATERAL (
+      SELECT n
+      FROM ints
+      WHERE n > i
+      ORDER BY n ASC
+      LIMIT 1
+    ) sub LIMIT 1
+  )
+)
+SELECT count(*) FROM temp;
+----
+8
+
+query I rowsort
+WITH RECURSIVE temp (i) AS (
+  (SELECT n FROM ints ORDER BY n ASC LIMIT 1)
+UNION ALL (
+  SELECT n FROM temp,
+    LATERAL (
+      SELECT n
+      FROM ints
+      WHERE n > i
+      ORDER BY n ASC
+      LIMIT 1
+    ) sub LIMIT 1
+  )
+)
+SELECT * FROM temp;
+----
+1
+2
+4
+5
+6
+7
+8
+9
+
+# Regression test for #95360. A NOT MATERIALIZED CTE should not be inlined if it
+# has a mutation.
+statement ok
+CREATE TABLE t95360 (a INT, b INT)
+
+# Note: The correlated subquery with a UNION ALL forces the optimizer to use an
+# apply-join, which would execute the INSERT once for each row in v if the
+# INSERT was inlined.
+statement ok
+WITH insVals AS NOT MATERIALIZED (INSERT INTO t95360 VALUES (1, 10) RETURNING a)
+SELECT * FROM (VALUES (1), (2), (3)) v(a)
+WHERE EXISTS (SELECT * FROM insVals WHERE a = v.a UNION ALL SELECT a FROM (VALUES (4)) w(a) WHERE a = v.a)
+
+query II
+SELECT * FROM t95360
+----
+1  10
+
+# Regression tests for #93370. Do not convert a non-recursive CTE
+# that uses UNION ALL and WITH RECURSIVE to UNION.
+query I rowsort
+WITH RECURSIVE
+   x(id) AS
+     (SELECT 1 UNION ALL SELECT id+1 FROM x WHERE id < 3 ),
+   y(id) AS
+     (SELECT * FROM x UNION ALL SELECT * FROM x)
+ SELECT * FROM y
+----
+1
+2
+3
+1
+2
+3
+
+statement ok
+CREATE TABLE t93370 (i INT);
+INSERT INTO t93370 VALUES (1), (2), (3)
+
+query I rowsort
+WITH RECURSIVE
+   y(id) AS (SELECT * FROM t93370 UNION ALL SELECT * FROM t93370)
+ SELECT * FROM y
+----
+1
+2
+3
+1
+2
+3
+
+# Regression test for #100561.
+statement ok
+CREATE TABLE t100561a (a INT);
+CREATE TABLE t100561b (k INT PRIMARY KEY, b INT);
+INSERT INTO t100561b VALUES (1, NULL)
+
+# Control: a query with a subquery.
+query II
+SELECT t3.c2, t3.c1 FROM (
+  SELECT t2.b AS c1, t2.k AS c2 FROM t100561a t1 FULL OUTER JOIN t100561b t2 ON true
+) AS t3, t100561b t2
+WHERE t3.c2 = t2.k
+----
+1  NULL
+
+# A query like the one above, rewritten with a CTE, should produce the same
+# result.
+query II
+WITH t3(c1, c2) AS (
+  SELECT t2.b AS c1, t2.k AS c2 FROM t100561a t1 FULL OUTER JOIN t100561b t2 ON true
+)
+SELECT t3.c2, t3.c1 FROM t3, t100561b t2
+WHERE t3.c2 = t2.k
+----
+1  NULL

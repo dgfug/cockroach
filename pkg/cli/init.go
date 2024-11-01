@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -18,11 +13,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 )
 
 var initCmd = &cobra.Command{
@@ -39,20 +33,41 @@ you would use for the sql command).
 	RunE: clierrorplus.MaybeDecorateError(runInit),
 }
 
+var initCmdOptions = struct {
+	virtualized      bool
+	virtualizedEmpty bool
+}{}
+
 func runInit(cmd *cobra.Command, args []string) error {
+	if initCmdOptions.virtualized && initCmdOptions.virtualizedEmpty {
+		return errors.Newf("only one of --virtualized and --virtualized-empty can be used")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Wait for the node to be ready for initialization.
-	conn, finish, err := waitForClientReadinessAndGetClientGRPCConn(ctx)
+	if err := dialAndCheckHealth(ctx); err != nil {
+		return err
+	}
+	conn, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
 	defer finish()
 
+	typ := serverpb.InitType_NONE
+	if initCmdOptions.virtualized {
+		typ = serverpb.InitType_VIRTUALIZED
+	} else if initCmdOptions.virtualizedEmpty {
+		typ = serverpb.InitType_VIRTUALIZED_EMPTY
+	}
+
 	// Actually perform cluster initialization.
 	c := serverpb.NewInitClient(conn)
-	if _, err = c.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
+	if _, err = c.Bootstrap(ctx, &serverpb.BootstrapRequest{
+		InitType: typ,
+	}); err != nil {
 		return err
 	}
 
@@ -60,61 +75,47 @@ func runInit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// waitForClientReadinessAndGetClientGRPCConn waits for the node to
-// be ready for initialization. This check ensures that the `init`
-// command is less likely to fail because it was issued too
-// early. In general, retrying the `init` command is dangerous [0],
-// so we make a best effort at minimizing chances for users to
-// arrive in an uncomfortable situation.
+// dialAndCheckHealth waits for the node to be ready for initialization. This
+// check ensures that the `init` command is less likely to fail because it was
+// issued too early. In general, retrying the `init` command is dangerous [0],
+// so we make a best effort at minimizing chances for users to arrive in an
+// uncomfortable situation.
 //
 // [0]: https://github.com/cockroachdb/cockroach/pull/19753#issuecomment-341561452
-func waitForClientReadinessAndGetClientGRPCConn(
-	ctx context.Context,
-) (conn *grpc.ClientConn, finish func(), err error) {
-	defer func() {
-		// If we're returning with an error, tear down the gRPC connection
-		// that's been established, if any.
-		if finish != nil && err != nil {
-			finish()
-		}
-	}()
-
+func dialAndCheckHealth(ctx context.Context) error {
 	retryOpts := retry.Options{InitialBackoff: time.Second, MaxBackoff: time.Second}
-	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		if err = contextutil.RunWithTimeout(ctx, "init-open-conn", 5*time.Second,
-			func(ctx context.Context) error {
-				// (Attempt to) establish the gRPC connection. If that fails,
-				// it may be that the server hasn't started to listen yet, in
-				// which case we'll retry.
-				conn, _, finish, err = getClientGRPCConn(ctx, serverCfg)
-				if err != nil {
-					return err
-				}
 
-				// Access the /health endpoint. Until/unless this succeeds, the
-				// node is not yet fully initialized and ready to accept
-				// Bootstrap requests.
-				ac := serverpb.NewAdminClient(conn)
-				_, err := ac.Health(ctx, &serverpb.HealthRequest{})
-				return err
-			}); err != nil {
+	tryConnect := func(ctx context.Context) error {
+		// (Attempt to) establish the gRPC connection. If that fails,
+		// it may be that the server hasn't started to listen yet, in
+		// which case we'll retry.
+		conn, finish, err := getClientGRPCConn(ctx, serverCfg)
+		if err != nil {
+			return err
+		}
+		defer finish()
+
+		// Access the /health endpoint. Until/unless this succeeds, the
+		// node is not yet fully initialized and ready to accept
+		// Bootstrap requests.
+		ac := serverpb.NewAdminClient(conn)
+		_, err = ac.Health(ctx, &serverpb.HealthRequest{})
+		return err
+	}
+
+	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+		if err := timeutil.RunWithTimeout(
+			ctx, "init-open-conn", 5*time.Second, tryConnect,
+		); err != nil {
 			err = errors.Wrapf(err, "node not ready to perform cluster initialization")
 			fmt.Fprintln(stderr, "warning:", err, "(retrying)")
-
-			// We're going to retry; first cancel the connection that's
-			// been established, if any.
-			if finish != nil {
-				finish()
-				finish = nil
-			}
-			// Then retry.
 			continue
 		}
 
-		// No error - connection was established and health endpoint is
-		// ready.
-		return conn, finish, err
+		// We managed to connect and run a sanity check. Note however that `conn` in
+		// `tryConnect` was established using a context that is now canceled, so we
+		// let the caller do its own dial.
+		return nil
 	}
-	err = errors.New("maximum number of retries exceeded")
-	return
+	return errors.New("maximum number of retries exceeded")
 }

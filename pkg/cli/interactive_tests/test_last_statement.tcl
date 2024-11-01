@@ -8,22 +8,22 @@ spawn /bin/bash
 send "PS1=':''/# '\r"
 eexpect ":/# "
 
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
 
-start_test "Check that an error in the last statement is propagated to the shell."
+start_test "Even if the last statement has a syntax error, if the user explicitly exits, the shell status should be normal exit."
 send "select ++;\r"
 eexpect "syntax error"
 eexpect root@
 send "\\q\r"
 eexpect ":/# "
 send "echo hello \$?\r"
-eexpect "hello 1"
+eexpect "hello 0"
 eexpect ":/# "
 end_test
 
 start_test "Check that an incomplete last statement in interactive mode is not executed."
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
 send "drop database if exists t cascade; create database t; create table t.foo(x int);\r"
 eexpect "CREATE TABLE"
@@ -33,7 +33,7 @@ eexpect " ->"
 send_eof
 eexpect ":/# "
 
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
 send "select count(*) from t.foo;\r"
 eexpect "0"

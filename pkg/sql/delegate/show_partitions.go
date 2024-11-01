@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -14,7 +9,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -25,14 +19,8 @@ import (
 func (d *delegator) delegateShowPartitions(n *tree.ShowPartitions) (tree.Statement, error) {
 	sqltelemetry.IncrementShowCounter(sqltelemetry.Partitions)
 	if n.IsTable {
-		flags := cat.Flags{AvoidDescriptorCaches: true, NoTableStats: true}
-		tn := n.Table.ToTableName()
-
-		dataSource, resName, err := d.catalog.ResolveDataSource(d.ctx, flags, &tn)
+		_, resName, err := d.resolveAndModifyUnresolvedObjectName(n.Table)
 		if err != nil {
-			return nil, err
-		}
-		if err := d.catalog.CheckAnyPrivilege(d.ctx, dataSource); err != nil {
 			return nil, err
 		}
 
@@ -69,7 +57,7 @@ func (d *delegator) delegateShowPartitions(n *tree.ShowPartitions) (tree.Stateme
 		ORDER BY
 			1, 2, 3, 4, 5, 6, 7, 8, 9;
 		`
-		return parse(fmt.Sprintf(showTablePartitionsQuery,
+		return d.parse(fmt.Sprintf(showTablePartitionsQuery,
 			lexbase.EscapeSQLString(resName.Table()),
 			lexbase.EscapeSQLString(resName.Catalog()),
 			resName.CatalogName.String()))
@@ -105,31 +93,19 @@ func (d *delegator) delegateShowPartitions(n *tree.ShowPartitions) (tree.Stateme
 			tables.name, partitions.name, 1, 4, 5, 6, 7, 8, 9;
 		`
 		// Note: n.Database.String() != string(n.Database)
-		return parse(fmt.Sprintf(showDatabasePartitionsQuery, n.Database.String(), lexbase.EscapeSQLString(string(n.Database))))
+		return d.parse(fmt.Sprintf(showDatabasePartitionsQuery, n.Database.String(), lexbase.EscapeSQLString(string(n.Database))))
 	}
 
-	flags := cat.Flags{AvoidDescriptorCaches: true, NoTableStats: true}
-	tn := n.Index.Table
-
 	// Throw a more descriptive error if the user did not use the index hint syntax.
-	if tn.ObjectName == "" {
+	tableIndexName := &n.Index
+	if tableIndexName.Table.ObjectName == "" {
 		err := errors.New("no table specified")
 		err = pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
 		err = errors.WithHint(err, "Specify a table using the hint syntax of table@index.")
 		return nil, err
 	}
 
-	dataSource, resName, err := d.catalog.ResolveDataSource(d.ctx, flags, &tn)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := d.catalog.CheckAnyPrivilege(d.ctx, dataSource); err != nil {
-		return nil, err
-	}
-
-	// Force resolution of the index.
-	_, _, err = cat.ResolveTableIndex(d.ctx, d.catalog, flags, &n.Index)
+	_, resName, err := d.resolveAndModifyTableIndexName(tableIndexName)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +140,7 @@ func (d *delegator) delegateShowPartitions(n *tree.ShowPartitions) (tree.Stateme
 	ORDER BY
 		1, 2, 3, 4, 5, 6, 7, 8, 9;
 	`
-	return parse(fmt.Sprintf(showIndexPartitionsQuery,
+	return d.parse(fmt.Sprintf(showIndexPartitionsQuery,
 		lexbase.EscapeSQLString(n.Index.Index.String()),
 		lexbase.EscapeSQLString(resName.Table()),
 		resName.Table(),

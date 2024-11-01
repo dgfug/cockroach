@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // ZipfGenerator implements the Incrementing Zipfian Random Number Generator from
 // [1]: "Quickly Generating Billion-Record Synthetic Databases"
@@ -83,12 +78,12 @@ func NewZipfGenerator(
 	// Compute hidden parameters
 	zeta2, err := computeZetaFromScratch(2, theta)
 	if err != nil {
-		return nil, errors.Errorf("Could not compute zeta(2,theta): %s", err)
+		return nil, errors.Wrap(err, "Could not compute zeta(2,theta)")
 	}
 	var zetaN float64
 	zetaN, err = computeZetaFromScratch(iMax+1-iMin, theta)
 	if err != nil {
-		return nil, errors.Errorf("Could not compute zeta(%d,theta): %s", iMax, err)
+		return nil, errors.Wrapf(err, "Could not compute zeta(%d,theta)", iMax)
 	}
 	z.alpha = 1.0 / (1.0 - theta)
 	z.zipfGenMu.eta = (1 - math.Pow(2.0/float64(z.zipfGenMu.iMax+1-z.iMin), 1.0-theta)) / (1.0 - zeta2/zetaN)
@@ -120,7 +115,7 @@ func computeZetaFromScratch(n uint64, theta float64) (float64, error) {
 	}
 	zeta, err := computeZetaIncrementally(0, n, theta, 0.0)
 	if err != nil {
-		return zeta, errors.Errorf("could not compute zeta: %s", err)
+		return zeta, errors.Wrap(err, "could not compute zeta")
 	}
 	return zeta, nil
 }
@@ -129,6 +124,7 @@ func computeZetaFromScratch(n uint64, theta float64) (float64, error) {
 // according to the Zipf distribution.
 func (z *ZipfGenerator) Uint64() uint64 {
 	z.zipfGenMu.mu.Lock()
+	defer z.zipfGenMu.mu.Unlock()
 	u := z.zipfGenMu.r.Float64()
 	uz := u * z.zipfGenMu.zetaN
 	var result uint64
@@ -143,7 +139,6 @@ func (z *ZipfGenerator) Uint64() uint64 {
 	if z.verbose {
 		fmt.Printf("Uint64[%d, %d] -> %d\n", z.iMin, z.zipfGenMu.iMax, result)
 	}
-	z.zipfGenMu.mu.Unlock()
 	return result
 }
 
@@ -151,16 +146,15 @@ func (z *ZipfGenerator) Uint64() uint64 {
 // that depend on it. It throws an error if the recomputation failed.
 func (z *ZipfGenerator) IncrementIMax(count uint64) error {
 	z.zipfGenMu.mu.Lock()
+	defer z.zipfGenMu.mu.Unlock()
 	zetaN, err := computeZetaIncrementally(
 		z.zipfGenMu.iMax+1-z.iMin, z.zipfGenMu.iMax+count+1-z.iMin, z.theta, z.zipfGenMu.zetaN)
 	if err != nil {
-		z.zipfGenMu.mu.Unlock()
-		return errors.Errorf("Could not incrementally compute zeta: %s", err)
+		return errors.Wrap(err, "Could not incrementally compute zeta")
 	}
 	z.zipfGenMu.iMax += count
 	eta := (1 - math.Pow(2.0/float64(z.zipfGenMu.iMax+1-z.iMin), 1.0-z.theta)) / (1.0 - z.zeta2/zetaN)
 	z.zipfGenMu.eta = eta
 	z.zipfGenMu.zetaN = zetaN
-	z.zipfGenMu.mu.Unlock()
 	return nil
 }

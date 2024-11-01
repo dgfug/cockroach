@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
@@ -43,18 +38,90 @@ func (s *Smither) pickAnyType(typ *types.T) *types.T {
 		if typ.ArrayContents().Family() == types.AnyFamily {
 			typ = randgen.RandArrayContentsType(s.rnd)
 		}
+	case types.DecimalFamily:
+		if s.disableDecimals {
+			typ = s.randType()
+		}
+	case types.OidFamily:
+		if s.disableOIDs {
+			typ = s.randType()
+		}
 	}
 	return typ
+}
+
+var simpleScalarTypes = func() (typs []*types.T) {
+	for _, t := range types.Scalar {
+		switch t {
+		case types.Box2D, types.Geography, types.Geometry, types.INet, types.PGLSN,
+			types.RefCursor, types.TSQuery, types.TSVector:
+			// Skip fancy types.
+		default:
+			typs = append(typs, t)
+		}
+	}
+	return typs
+}()
+
+func isSimpleSeedType(typ *types.T) bool {
+	switch typ.Family() {
+	case types.BoolFamily, types.IntFamily, types.DecimalFamily, types.FloatFamily, types.StringFamily,
+		types.BytesFamily, types.DateFamily, types.TimestampFamily, types.IntervalFamily, types.TimeFamily, types.TimeTZFamily:
+		return true
+	case types.ArrayFamily:
+		return isSimpleSeedType(typ.ArrayContents())
+	case types.TupleFamily:
+		for _, t := range typ.TupleContents() {
+			if !isSimpleSeedType(t) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Smither) randScalarType() *types.T {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	scalarTypes := types.Scalar
+	if s.simpleScalarTypes {
+		scalarTypes = simpleScalarTypes
+	}
 	if s.types != nil {
 		scalarTypes = s.types.scalarTypes
 	}
-	return randgen.RandTypeFromSlice(s.rnd, scalarTypes)
+	var typ *types.T
+	for {
+		typ = randgen.RandTypeFromSlice(s.rnd, scalarTypes)
+		if (s.disableDecimals && typ.Family() == types.DecimalFamily) ||
+			(s.disableOIDs && typ.Family() == types.OidFamily) {
+			continue
+		}
+		break
+	}
+	return typ
+}
+
+// isScalarType returns true if t is a member of types.Scalar, or a user defined
+// enum.
+// Requires s.lock to be held.
+func (s *Smither) isScalarType(t *types.T) bool {
+	s.lock.AssertRHeld()
+	scalarTypes := types.Scalar
+	if s.simpleScalarTypes {
+		scalarTypes = simpleScalarTypes
+	}
+	if s.types != nil {
+		scalarTypes = s.types.scalarTypes
+	}
+	for i := range scalarTypes {
+		if t.Equivalent(scalarTypes[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Smither) randType() *types.T {
@@ -64,7 +131,24 @@ func (s *Smither) randType() *types.T {
 	if s.types != nil {
 		seedTypes = s.types.seedTypes
 	}
-	return randgen.RandTypeFromSlice(s.rnd, seedTypes)
+	var typ *types.T
+	for {
+		typ = randgen.RandTypeFromSlice(s.rnd, seedTypes)
+		if s.disableDecimals && typ.Family() == types.DecimalFamily ||
+			(s.disableOIDs && typ.Family() == types.OidFamily) {
+			continue
+		}
+		if s.postgres && typ.Identical(types.Name) {
+			// Name type in CRDB doesn't match Postgres behavior. Exclude for tests
+			// which compare CRDB behavior to Postgres.
+			continue
+		}
+		if s.simpleScalarTypes && !isSimpleSeedType(typ) {
+			continue
+		}
+		break
+	}
+	return typ
 }
 
 func (s *Smither) makeDesiredTypes() []*types.T {
@@ -79,7 +163,8 @@ func (s *Smither) makeDesiredTypes() []*types.T {
 }
 
 type typeInfo struct {
-	udts        map[tree.TypeName]*types.T
+	udts        []*types.T
+	udtNames    []tree.TypeName
 	seedTypes   []*types.T
 	scalarTypes []*types.T
 }
@@ -89,11 +174,12 @@ func (s *Smither) ResolveType(
 	_ context.Context, name *tree.UnresolvedObjectName,
 ) (*types.T, error) {
 	key := tree.MakeSchemaQualifiedTypeName(name.Schema(), name.Object())
-	res, ok := s.types.udts[key]
-	if !ok {
-		return nil, errors.Newf("type name %s not found by smither", name.Object())
+	for i, typeName := range s.types.udtNames {
+		if typeName == key {
+			return s.types.udts[i], nil
+		}
 	}
-	return res, nil
+	return nil, errors.Newf("type name %s not found by smither", name.Object())
 }
 
 // ResolveTypeByOID implements the tree.TypeReferenceResolver interface.

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -14,13 +9,16 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,11 +34,18 @@ func setDb(t *testing.T, db *gosql.DB, name string) {
 func TestCreateRandomSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()() // allow usage of partitions
 
 	ctx := context.Background()
-
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SpanConfig: &spanconfig.TestingKnobs{
+				LimiterLimitOverride: func() int64 {
+					return math.MaxInt64
+				},
+			},
+		},
+	})
 	defer s.Stopper().Stop(ctx)
 
 	if _, err := db.Exec("CREATE DATABASE test; CREATE DATABASE test2"); err != nil {
@@ -53,21 +58,21 @@ func TestCreateRandomSchema(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	for i := 0; i < 100; i++ {
-		createTable := randgen.RandCreateTable(rng, "table", i)
+		createTable := randgen.RandCreateTable(ctx, rng, "table", i, randgen.TableOptNone)
 		setDb(t, db, "test")
 		_, err := db.Exec(toStr(createTable))
 		if err != nil {
 			t.Fatal(createTable, err)
 		}
 
-		var tabName, tabStmt, secondTabStmt string
+		var quotedTabName, tabStmt, secondTabStmt string
 		if err := db.QueryRow(fmt.Sprintf("SHOW CREATE TABLE %s",
-			createTable.Table.String())).Scan(&tabName, &tabStmt); err != nil {
+			createTable.Table.String())).Scan(&quotedTabName, &tabStmt); err != nil {
 			t.Fatal(err)
 		}
 
-		if tabName != createTable.Table.String() {
-			t.Fatalf("found table name %s, expected %s", tabName, createTable.Table.String())
+		if quotedTabName != createTable.Table.String() {
+			t.Fatalf("found table name %s, expected %s", quotedTabName, createTable.Table.String())
 		}
 
 		// Reparse the show create table statement that's stored in the database.
@@ -86,12 +91,12 @@ func TestCreateRandomSchema(t *testing.T) {
 		}
 
 		if err := db.QueryRow(fmt.Sprintf("SHOW CREATE TABLE %s",
-			tabName)).Scan(&tabName, &secondTabStmt); err != nil {
+			quotedTabName)).Scan(&quotedTabName, &secondTabStmt); err != nil {
 			t.Fatal(err)
 		}
 
-		if tabName != createTable.Table.String() {
-			t.Fatalf("found table name %s, expected %s", tabName, createTable.Table.String())
+		if quotedTabName != createTable.Table.String() {
+			t.Fatalf("found table name %s, expected %s", quotedTabName, createTable.Table.String())
 		}
 		// Reparse the show create table statement that's stored in the database.
 		secondParsed, err := parser.ParseOne(secondTabStmt)

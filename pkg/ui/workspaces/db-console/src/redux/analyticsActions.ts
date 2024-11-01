@@ -1,12 +1,9 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+import { TimeScale } from "@cockroachlabs/cluster-ui";
 
 import { PayloadAction } from "src/interfaces/action";
 
@@ -17,13 +14,22 @@ export const TRACK_STATEMENTS_PAGINATION =
 export const TRACK_TABLE_SORT = "cockroachui/analytics/TRACK_TABLE_SORT";
 export const TRACK_DOWNLOAD_DIAGNOSTIC_BUNDLE =
   "cockroachui/analytics/TRACK_DOWNLOAD_DIAGNOSTIC_BUNDLE";
+export const TRACK_CANCEL_DIAGNOSTIC_BUNDLE =
+  "cockroachui/analytics/TRACK_CANCEL_DIAGNOSTIC_BUNDLE";
 export const TRACK_STATEMENT_DETAILS_SUBNAV_SELECTION =
   "cockroachui/analytics/TRACK_STATEMENT_DETAILS_SUBNAV_SELECTION";
-
+export const TRACK_APPLY_SEARCH_CRITERIA =
+  "cockroachui/analytics/TRACK_APPLY_SEARCH_CRITERIA";
 export interface TableSortActionPayload {
   tableName: string;
   columnName: string;
   ascending?: boolean;
+}
+
+export interface ApplySearchCriteriaPayload {
+  ts: TimeScale;
+  limit: number;
+  sort: string;
 }
 
 export function trackStatementsSearchAction(
@@ -68,11 +74,35 @@ export function trackDownloadDiagnosticsBundleAction(
   };
 }
 
+export function trackCancelDiagnosticsBundleAction(
+  statementFingerprint: string,
+): PayloadAction<string> {
+  return {
+    type: TRACK_CANCEL_DIAGNOSTIC_BUNDLE,
+    payload: statementFingerprint,
+  };
+}
+
 export function trackStatementDetailsSubnavSelectionAction(
   tabName: string,
 ): PayloadAction<string> {
   return {
     type: TRACK_STATEMENT_DETAILS_SUBNAV_SELECTION,
     payload: tabName,
+  };
+}
+
+export function trackApplySearchCriteriaAction(
+  ts: TimeScale,
+  limit: number,
+  sort: string,
+): PayloadAction<ApplySearchCriteriaPayload> {
+  return {
+    type: TRACK_APPLY_SEARCH_CRITERIA,
+    payload: {
+      ts,
+      limit,
+      sort,
+    },
   };
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package resolver_test
 
@@ -15,19 +10,31 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/stretchr/testify/require"
 )
 
 // fakeMetadata represents a fake table resolution environment for tests.
@@ -433,7 +440,7 @@ func TestResolveTablePatternOrName(t *testing.T) {
 				if err != nil {
 					return nil, "", err
 				}
-				tp, err := stmt.AST.(*tree.Grant).Targets.Tables[0].NormalizeTablePattern()
+				tp, err := stmt.AST.(*tree.Grant).Targets.Tables.TablePatterns[0].NormalizeTablePattern()
 				if err != nil {
 					return nil, "", err
 				}
@@ -511,4 +518,264 @@ func TestResolveTablePatternOrName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveIndex(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	tDB := sqlutils.MakeSQLRunner(sqlDB)
+
+	tDB.Exec(t, `
+CREATE SCHEMA test_sc;
+CREATE TABLE a (a INT, INDEX idx1(a));
+CREATE TABLE b (a INT, INDEX idx2(a));
+CREATE TABLE c (a INT, INDEX idx2(a));`,
+	)
+
+	testCases := []struct {
+		testName         string
+		name             *tree.TableIndexName
+		expected         string
+		errIfNotRequired bool
+	}{
+		// Both table name and index are set.
+		{
+			testName: "both table name and index are set",
+			name:     newTableIndexName("defaultdb", "public", "a", "idx1"),
+			expected: `defaultdb.public.a@idx1`,
+		},
+		{
+			testName: "both table name and index are set, but no index",
+			name:     newTableIndexName("defaultdb", "public", "a", "idx2"),
+			expected: `error: index "idx2" does not exist`,
+		},
+
+		// Only table name is set.
+		{
+			testName: "only table name is set",
+			name:     newTableIndexName("defaultdb", "public", "a", ""),
+			expected: `defaultdb.public.a@a_pkey`,
+		},
+		{
+			testName: "only table name is set, but bad db",
+			name:     newTableIndexName("z", "public", "a", ""),
+			expected: `error: database "z" does not exist`,
+		},
+		{
+			testName: "only table name is set, but bad table",
+			name:     newTableIndexName("defaultdb", "public", "z", ""),
+			expected: `error: relation "defaultdb.public.z" does not exist`,
+		},
+
+		// Only index name is set.
+		{
+			testName: "only index name is set",
+			name:     newTableIndexName("", "", "", "idx1"),
+			expected: `defaultdb.public.a@idx1`,
+		},
+		{
+			testName: "only index name is set with db and schema",
+			name:     newTableIndexName("defaultdb", "public", "", "idx1"),
+			expected: `defaultdb.public.a@idx1`,
+		},
+		{
+			testName: "only index name is set with schema",
+			name:     newTableIndexName("", "public", "", "idx1"),
+			expected: `defaultdb.public.a@idx1`,
+		},
+		{
+			testName:         "only index name is set with bad db",
+			name:             newTableIndexName("z", "public", "", "idx2"),
+			expected:         `error: target database or schema does not exist`,
+			errIfNotRequired: true,
+		},
+		{
+			testName:         "ambiguous index name",
+			name:             newTableIndexName("", "", "", "idx2"),
+			expected:         `error: index name "idx2" is ambiguous (found in defaultdb.public.c and defaultdb.public.b)`,
+			errIfNotRequired: true,
+		},
+	}
+
+	var m sessiondatapb.MigratableSession
+	var sessionSerialized []byte
+	tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
+	require.NoError(t, protoutil.Unmarshal(sessionSerialized, &m))
+	sd, err := sessiondata.UnmarshalNonLocal(m.SessionData)
+	require.NoError(t, err)
+	sd.SessionData = m.SessionData
+	sd.LocalOnlySessionData = m.LocalOnlySessionData
+
+	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+		planner, cleanup := sql.NewInternalPlanner(
+			"resolve-index", txn.KV(), username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
+		)
+		defer cleanup()
+
+		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
+		// Set "defaultdb" as current database.
+		ec.SessionData().Database = "defaultdb"
+		// Put a good schema before our target schema to make sure schemas are looped through.
+		searchPath := ec.SessionData().SearchPath.GetPathArray()
+		ec.SessionData().SearchPath = ec.SessionData().SearchPath.UpdatePaths(append([]string{"test_sc"}, searchPath...))
+		schemaResolver := sql.NewSkippingCacheSchemaResolver(
+			col, ec.SessionDataStack, txn.KV(), planner.(scbuild.AuthorizationAccessor),
+		)
+
+		// Make sure we're looking at correct default db and search path.
+		require.Equal(t, "defaultdb", schemaResolver.CurrentDatabase())
+		require.Equal(t, []string{"test_sc", "$user", "public"}, schemaResolver.CurrentSearchPath().GetPathArray())
+
+		for _, tc := range testCases {
+			t.Run(tc.testName, func(t *testing.T) {
+				_, prefix, tblDesc, idxDesc, err := resolver.ResolveIndex(
+					ctx, schemaResolver, tc.name, tree.IndexLookupFlags{Required: true, IncludeNonActiveIndex: true})
+				var res string
+				if err != nil {
+					res = fmt.Sprintf("error: %s", err.Error())
+				} else {
+					res = fmt.Sprintf("%s.%s.%s@%s", prefix.Database.GetName(), prefix.Schema.GetName(), tblDesc.GetName(), idxDesc.GetName())
+				}
+				require.Equal(t, tc.expected, res)
+
+				_, _, _, _, err = resolver.ResolveIndex(
+					ctx, schemaResolver, tc.name, tree.IndexLookupFlags{Required: false, IncludeNonActiveIndex: true})
+				if tc.errIfNotRequired {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func TestResolveIndexWithOfflineTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	tDB := sqlutils.MakeSQLRunner(sqlDB)
+
+	tDB.Exec(t, `
+CREATE TABLE foo (i INT PRIMARY KEY, s STRING);
+CREATE INDEX foo_idx ON foo (s);
+CREATE TABLE baz (i INT PRIMARY KEY, s STRING);
+CREATE INDEX baz_idx ON baz (s);
+`)
+
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		tn := tree.NewTableNameWithSchema("defaultdb", "public", "baz")
+		_, tbl, err := descs.PrefixAndMutableTable(ctx, col.MutableByName(txn.KV()), tn)
+		require.NoError(t, err)
+		tbl.SetOffline("testing-index-resolving")
+		err = col.WriteDesc(ctx, false, tbl, txn.KV())
+		require.NoError(t, err)
+		return nil
+	})
+	require.NoError(t, err)
+
+	var m sessiondatapb.MigratableSession
+	var sessionSerialized []byte
+	tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
+	require.NoError(t, protoutil.Unmarshal(sessionSerialized, &m))
+	sd, err := sessiondata.UnmarshalNonLocal(m.SessionData)
+	require.NoError(t, err)
+	sd.SessionData = m.SessionData
+	sd.LocalOnlySessionData = m.LocalOnlySessionData
+
+	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+		planner, cleanup := sql.NewInternalPlanner(
+			"resolve-index", txn.KV(), username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
+		)
+		defer cleanup()
+
+		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
+		// Set "defaultdb" as current database.
+		ec.SessionData().Database = "defaultdb"
+		schemaResolver := sql.NewSkippingCacheSchemaResolver(
+			col, ec.SessionDataStack, txn.KV(), planner.(scbuild.AuthorizationAccessor),
+		)
+		// Make sure we're looking at correct default db and search path.
+		require.Equal(t, "defaultdb", schemaResolver.CurrentDatabase())
+		require.Equal(t, []string{"$user", "public"}, schemaResolver.CurrentSearchPath().GetPathArray())
+
+		// Make sure that baz table is skipped when `IncludeOfflineTable` flag is
+		// false, so that index baz_idx cannot be found.
+		found, _, _, _, err := resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "baz_idx"),
+			tree.IndexLookupFlags{
+				Required:              false,
+				IncludeNonActiveIndex: false,
+				IncludeOfflineTable:   false,
+			},
+		)
+		require.NoError(t, err)
+		require.False(t, found)
+
+		// Make sure that baz table is considered when `IncludeOfflineTable` flag is
+		// true, so that index baz_idx can be found.
+		found, _, _, _, err = resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "baz_idx"),
+			tree.IndexLookupFlags{
+				Required:              true,
+				IncludeNonActiveIndex: true,
+				IncludeOfflineTable:   true,
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		// Make sure that baz table is taken care of so that it does not error out
+		// when resolving index on other tables. Note that because table name is not
+		// given, all tables on current search path are searched.
+		found, _, _, _, err = resolver.ResolveIndex(
+			ctx,
+			schemaResolver,
+			newTableIndexName("", "", "", "foo_idx"),
+			tree.IndexLookupFlags{
+				Required:              true,
+				IncludeNonActiveIndex: false,
+				IncludeOfflineTable:   false,
+			},
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func newTableIndexName(db, sc, tbl, idx string) *tree.TableIndexName {
+	name := &tree.TableIndexName{
+		Index: tree.UnrestrictedName(idx),
+		Table: tree.TableName{},
+	}
+	name.Table.ObjectName = tree.Name(tbl)
+	name.Table.CatalogName = tree.Name(db)
+	name.Table.SchemaName = tree.Name(sc)
+	if db != "" {
+		name.Table.ExplicitCatalog = true
+	}
+	if sc != "" {
+		name.Table.ExplicitSchema = true
+	}
+	return name
 }

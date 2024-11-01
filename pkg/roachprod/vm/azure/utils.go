@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package azure
 
@@ -22,22 +17,34 @@ import (
 // created from /mnt/data<disknum> to the mount point.
 // azureStartupArgs specifies template arguments for the setup template.
 type azureStartupArgs struct {
-	RemoteUser      string // The uname for /data* directories.
-	AttachedDiskLun *int   // Use attached disk, with specified LUN; Use local ssd if nil.
+	RemoteUser           string // The uname for /data* directories.
+	AttachedDiskLun      *int   // Use attached disk, with specified LUN; Use local ssd if nil.
+	DisksInitializedFile string // File to touch when disks are initialized.
+	OSInitializedFile    string // File to touch when OS is initialized.
+	StartupLogs          string // File to redirect startup script output logs.
+	DiskControllerNVMe   bool   // Interface data disk via NVMe
 }
 
 const azureStartupTemplate = `#!/bin/bash
 
 # Script for setting up a Azure machine for roachprod use.
-set -xe
+# ensure any failure fails the entire script
+set -eux
+
+# Redirect output to stdout/err and a log file
+exec &> >(tee -a {{ .StartupLogs }})
+
+# Log the startup of the script with a timestamp
+echo "startup script starting: $(date -u)"
 mount_opts="defaults"
 
-{{if .AttachedDiskLun}}
+devices=()
+{{if .DiskControllerNVMe}}
+# Setup nvme network storage, need to remove nvme OS disk from the device list.
+devices=($(realpath -qe /dev/disk/by-id/nvme-* | grep -v "nvme0n1" | sort -u))
+{{else if .AttachedDiskLun}}
 # Setup network attached storage
 devices=("/dev/disk/azure/scsi1/lun{{.AttachedDiskLun}}")
-{{else}}
-# Setup local storage.
-devices=($(realpath -qe /dev/disk/by-id/nvme-* | sort -u))
 {{end}}
 
 if (( ${#devices[@]} == 0 ));
@@ -55,6 +62,7 @@ else
     sudo mount -o "${mount_opts}" "${disk}" "${mount}"
     echo "${disk} ${mount} ext4 ${mount_opts} 1 1" | sudo tee -a /etc/fstab
     ln -s "${mount}" "/mnt/$(basename $mount)"
+    tune2fs -m 0 ${disk}
   done
   chown {{.RemoteUser}} /data*
 fi
@@ -67,6 +75,9 @@ sh -c 'echo "MaxStartups 64:30:128" >> /etc/ssh/sshd_config'
 # Crank up the logging for issues such as:
 # https://github.com/cockroachdb/cockroach/issues/36929
 sed -i'' 's/LogLevel.*$/LogLevel DEBUG3/' /etc/ssh/sshd_config
+# N.B. RSA SHA1 is no longer supported in the latest versions of OpenSSH. Existing tooling, e.g.,
+# jepsen still relies on it for authentication.
+sudo sh -c 'echo "PubkeyAcceptedAlgorithms +ssh-rsa" >> /etc/ssh/sshd_config'
 service sshd restart
 # increase the default maximum number of open file descriptors for
 # root and non-root users. Load generators running a lot of concurrent
@@ -81,6 +92,16 @@ net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=60
 net.ipv4.tcp_keepalive_probes=5
 EOF
+
+# N.B. Ubuntu 22.04 changed the location of tcpdump to /usr/bin. Since existing tooling, e.g.,
+# jepsen uses /usr/sbin, we create a symlink.
+# See https://ubuntu.pkgs.org/22.04/ubuntu-main-amd64/tcpdump_4.99.1-3build2_amd64.deb.html
+sudo ln -s /usr/bin/tcpdump /usr/sbin/tcpdump
+
+# Uninstall unattended-upgrades
+systemctl stop unattended-upgrades
+sudo rm -rf /var/log/unattended-upgrades
+apt-get purge -y unattended-upgrades
 
 # Enable core dumps
 cat <<EOF > /etc/security/limits.d/core_unlimited.conf
@@ -98,7 +119,12 @@ sed -i'~' 's/enabled=1/enabled=0/' /etc/default/apport
 sed -i'~' '/.*kernel\\.core_pattern.*/c\\' /etc/sysctl.conf
 echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
 sysctl --system  # reload sysctl settings
-touch /mnt/data1/.roachprod-initialized
+
+sudo sed -i 's/#LoginGraceTime .*/LoginGraceTime 0/g' /etc/ssh/sshd_config
+sudo service ssh restart
+
+touch {{ .DisksInitializedFile }}
+touch {{ .OSInitializedFile }}
 `
 
 // evalStartupTemplate evaluates startup template defined above and returns
@@ -108,10 +134,10 @@ touch /mnt/data1/.roachprod-initialized
 // CTRL-c while roachprod waiting for initialization to complete (otherwise, roachprod
 // tries to destroy partially created cluster).
 // Then, ssh to one of the machines:
-//    1. /var/log/cloud-init-output.log contains the output of all the steps
-//       performed by cloud-init, including the steps performed by above script.
-//    2. You can extract uploaded script and try executing/debugging it via:
-//       sudo cloud-init query userdata > script.sh
+//  1. /var/log/cloud-init-output.log contains the output of all the steps
+//     performed by cloud-init, including the steps performed by above script.
+//  2. You can extract uploaded script and try executing/debugging it via:
+//     sudo cloud-init query userdata > script.sh
 func evalStartupTemplate(args azureStartupArgs) (string, error) {
 	cloudInit := bytes.NewBuffer(nil)
 	encoder := base64.NewEncoder(base64.StdEncoding, cloudInit)

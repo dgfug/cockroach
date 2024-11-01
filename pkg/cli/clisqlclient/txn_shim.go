@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
@@ -30,17 +25,17 @@ type sqlTxnShim struct {
 
 var _ crdb.Tx = sqlTxnShim{}
 
-func (t sqlTxnShim) Commit(context.Context) error {
-	return t.conn.Exec(`COMMIT`, nil)
+func (t sqlTxnShim) Commit(ctx context.Context) error {
+	return t.conn.Exec(ctx, `COMMIT`)
 }
 
-func (t sqlTxnShim) Rollback(context.Context) error {
-	return t.conn.Exec(`ROLLBACK`, nil)
+func (t sqlTxnShim) Rollback(ctx context.Context) error {
+	return t.conn.Exec(ctx, `ROLLBACK`)
 }
 
-func (t sqlTxnShim) Exec(_ context.Context, query string, values ...interface{}) error {
+func (t sqlTxnShim) Exec(ctx context.Context, query string, values ...interface{}) error {
 	if len(values) != 0 {
 		panic("sqlTxnShim.ExecContext must not be called with values")
 	}
-	return t.conn.Exec(query, nil)
+	return t.conn.Exec(ctx, query)
 }

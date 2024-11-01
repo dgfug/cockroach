@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -17,7 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,12 +27,11 @@ type invariantsChecker struct {
 	metadataSource colexecop.MetadataSource
 }
 
-var _ colexecop.DrainableOperator = &invariantsChecker{}
-var _ colexecop.ClosableOperator = &invariantsChecker{}
+var _ colexecop.DrainableClosableOperator = &invariantsChecker{}
 
 // NewInvariantsChecker creates a new invariantsChecker.
-func NewInvariantsChecker(input colexecop.Operator) colexecop.DrainableOperator {
-	if !util.CrdbTestBuild {
+func NewInvariantsChecker(input colexecop.Operator) colexecop.DrainableClosableOperator {
+	if !buildutil.CrdbTestBuild {
 		colexecerror.InternalError(errors.AssertionFailedf(
 			"an invariantsChecker is attempted to be created in non-test build",
 		))
@@ -96,12 +90,6 @@ func (i *invariantsChecker) Next() coldata.Batch {
 	if n == 0 {
 		return b
 	}
-	for colIdx := 0; colIdx < b.Width(); colIdx++ {
-		v := b.ColVec(colIdx)
-		if v.IsBytesLike() {
-			coldata.AssertOffsetsAreNonDecreasing(v, n)
-		}
-	}
 	if sel := b.Selection(); sel != nil {
 		for i := 1; i < n; i++ {
 			if sel[i] <= sel[i-1] {
@@ -127,10 +115,10 @@ func (i *invariantsChecker) DrainMeta() []execinfrapb.ProducerMetadata {
 }
 
 // Close is part of the colexecop.ClosableOperator interface.
-func (i *invariantsChecker) Close() error {
+func (i *invariantsChecker) Close(ctx context.Context) error {
 	c, ok := i.Input.(colexecop.Closer)
 	if !ok {
 		return nil
 	}
-	return c.Close()
+	return c.Close(ctx)
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -62,7 +58,7 @@ func TestUpdateAbortSpan(t *testing.T) {
 	}
 	as := abortspan.New(desc.RangeID)
 
-	txn := roachpb.MakeTransaction("test", txnKey, 0, hlc.Timestamp{WallTime: 1}, 0)
+	txn := roachpb.MakeTransaction("test", txnKey, 0, 0, hlc.Timestamp{WallTime: 1}, 0, 1, 0, false /* omitInRangefeeds */)
 	newTxnAbortSpanEntry := roachpb.AbortSpanEntry{
 		Key:       txn.Key,
 		Timestamp: txn.WriteTimestamp,
@@ -72,7 +68,7 @@ func TestUpdateAbortSpan(t *testing.T) {
 	// Priority don't matter other than that they allow us to detect changes
 	// in the AbortSpanEntry.
 	prevTxn := txn.Clone()
-	prevTxn.WriteTimestamp.Add(-1, 0)
+	prevTxn.WriteTimestamp = prevTxn.WriteTimestamp.Add(-1, 0)
 	prevTxn.Priority--
 	prevTxnAbortSpanEntry := roachpb.AbortSpanEntry{
 		Key:       prevTxn.Key,
@@ -84,7 +80,8 @@ func TestUpdateAbortSpan(t *testing.T) {
 	type evalFn func(storage.ReadWriter, EvalContext, *enginepb.MVCCStats) error
 	addIntent := func(b storage.ReadWriter, _ EvalContext, ms *enginepb.MVCCStats) error {
 		val := roachpb.MakeValueFromString("val")
-		return storage.MVCCPut(ctx, b, ms, intentKey, txn.ReadTimestamp, val, &txn)
+		_, err := storage.MVCCPut(ctx, b, intentKey, txn.ReadTimestamp, val, storage.MVCCWriteOptions{Txn: &txn, Stats: ms})
+		return err
 	}
 	addPrevAbortSpanEntry := func(b storage.ReadWriter, rec EvalContext, ms *enginepb.MVCCStats) error {
 		return UpdateAbortSpan(ctx, rec, b, ms, prevTxn.TxnMeta, true /* poison */)
@@ -102,15 +99,15 @@ func TestUpdateAbortSpan(t *testing.T) {
 
 	// Request helpers.
 	endTxn := func(b storage.ReadWriter, rec EvalContext, ms *enginepb.MVCCStats, commit bool, poison bool) error {
-		req := roachpb.EndTxnRequest{
-			RequestHeader: roachpb.RequestHeader{Key: txnKey},
+		req := kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: txnKey},
 			Commit:        commit,
 			Poison:        poison,
 			LockSpans:     []roachpb.Span{{Key: intentKey}},
 		}
 		args := CommandArgs{
 			EvalCtx: rec,
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Timestamp: txn.ReadTimestamp,
 				Txn:       &txn,
 			},
@@ -118,15 +115,15 @@ func TestUpdateAbortSpan(t *testing.T) {
 			Stats: ms,
 		}
 
-		var resp roachpb.EndTxnResponse
+		var resp kvpb.EndTxnResponse
 		_, err := EndTxn(ctx, b, args, &resp)
 		return err
 	}
 	resolveIntent := func(
 		b storage.ReadWriter, rec EvalContext, ms *enginepb.MVCCStats, status roachpb.TransactionStatus, poison bool,
 	) error {
-		req := roachpb.ResolveIntentRequest{
-			RequestHeader: roachpb.RequestHeader{Key: intentKey},
+		req := kvpb.ResolveIntentRequest{
+			RequestHeader: kvpb.RequestHeader{Key: intentKey},
 			IntentTxn:     txn.TxnMeta,
 			Status:        status,
 			Poison:        poison,
@@ -137,15 +134,15 @@ func TestUpdateAbortSpan(t *testing.T) {
 			Stats:   ms,
 		}
 
-		var resp roachpb.ResolveIntentResponse
+		var resp kvpb.ResolveIntentResponse
 		_, err := ResolveIntent(ctx, b, args, &resp)
 		return err
 	}
 	resolveIntentRange := func(
 		b storage.ReadWriter, rec EvalContext, ms *enginepb.MVCCStats, status roachpb.TransactionStatus, poison bool,
 	) error {
-		req := roachpb.ResolveIntentRangeRequest{
-			RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey},
+		req := kvpb.ResolveIntentRangeRequest{
+			RequestHeader: kvpb.RequestHeader{Key: startKey, EndKey: endKey},
 			IntentTxn:     txn.TxnMeta,
 			Status:        status,
 			Poison:        poison,
@@ -156,7 +153,7 @@ func TestUpdateAbortSpan(t *testing.T) {
 			Stats:   ms,
 		}
 
-		var resp roachpb.ResolveIntentRangeResponse
+		var resp kvpb.ResolveIntentRangeResponse
 		_, err := ResolveIntentRange(ctx, b, args, &resp)
 		return err
 	}
@@ -734,14 +731,9 @@ func TestUpdateAbortSpan(t *testing.T) {
 			defer db.Close()
 			batch := db.NewBatch()
 			defer batch.Close()
-			st := makeClusterSettingsUsingEngineIntentsSetting(db)
 			evalCtx := &MockEvalCtx{
-				ClusterSettings: st,
-				Desc:            &desc,
-				AbortSpan:       as,
-				CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-					return true, hlc.Timestamp{}, 0
-				},
+				Desc:      &desc,
+				AbortSpan: as,
 			}
 			ms := enginepb.MVCCStats{}
 			if c.before != nil {

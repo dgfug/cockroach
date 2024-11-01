@@ -1,53 +1,150 @@
-try-import %workspace%/.bazelrc.user
+# HEY! DON'T edit this file unless you really want to change a configuration for
+# everyone building cockroach ever.
+# This file is checked into tree and is not auto-generated.
+# If you are following directions from `dev doctor`, you probably want to put
+# your configurations in ~/.bazelrc or .bazelrc.user instead.
+# Configurations in ~/.bazelrc apply to all Bazel builds across all projects on
+# your machine. Configurations in .bazelrc.user apply only to builds in this
+# workspace. Take a closer look to see which one `dev doctor` is talking about.
+# Note that .bazelrc.user should be in your checkout (next to this file), not
+# your home directory.
 
-build --symlink_prefix=_bazel/ --ui_event_filters=-DEBUG --define gotags=bazel,crdb_test_off,gss --experimental_proto_descriptor_sets_include_source_info --incompatible_strict_action_env
-test --config=test
-build:with_ui --define cockroach_with_ui=y
-build:test --define gotags=bazel,crdb_test,gss
-build:race --@io_bazel_rules_go//go/config:race --test_env=GORACE=halt_on_error=1 --test_sharding_strategy=disabled
-test:test --test_env=TZ=
+# Ignore warnings about using a source directory as an input file. This is
+# evidently a bug in rules_js that they haven't fixed yet. It seems it's
+# "mostly" fixed except for packages that have patches or lifecycle hooks.
+# Unfortunately that's many of the packages we use, so builds will be very
+# noisy without this. See aspect-build/rules_js#1408. When the upstream issue
+# is fixed, this should be removed.
+startup --host_jvm_args=-DBAZEL_TRACK_SOURCE_DIRECTORIES=1
+
+# Define a set up flag aliases, so people can use `--cross` instead of the
+# longer `//build/toolchains:cross_flag`.
+build --flag_alias=bazel_code_coverage=//build/toolchains:bazel_code_coverage_flag
+build --flag_alias=crdb_test=//build/toolchains:crdb_test_flag
+build --flag_alias=crdb_test_off=//build/toolchains:crdb_test_off_flag
+build --flag_alias=cross=//build/toolchains:cross_flag
+build --flag_alias=dev=//build/toolchains:dev_flag
+build --flag_alias=force_build_cdeps=//build/toolchains:force_build_cdeps_flag
+build --flag_alias=heavy=//build/toolchains:heavy_flag
+
+build:crdb_test_off --crdb_test_off
+build:cross --cross
+build:dev --dev
+build:force_build_cdeps --force_build_cdeps
+build:heavy --heavy
+build:lintonbuild --run_validations
+build:nolintonbuild --norun_validations
+# Note: nonogo is classically the name of the nolintonbuild configuration.
+build:nonogo --config nolintonbuild
+build:test --crdb_test
+
+# Basic settings.
+common --noenable_bzlmod
+build --enable_platform_specific_config
+build --define gotags=bazel,gss
+build --experimental_proto_descriptor_sets_include_source_info
+build --incompatible_strict_action_env --incompatible_enable_cc_toolchain_resolution
+build --symlink_prefix=_bazel/
+build --strip=never
+common --experimental_allow_tags_propagation
+test --config=test --experimental_ui_max_stdouterr_bytes=10485760
+build --ui_event_filters=-DEBUG
 query --ui_event_filters=-DEBUG
+clean --ui_event_filters=-WARNING
+info --ui_event_filters=-WARNING
 
+build:race --@io_bazel_rules_go//go/config:race "--test_env=GORACE=halt_on_error=1 log_path=stdout"
+test:test --test_env=TZ=
+# Note: these timeout values are used indirectly in `build/teamcity/cockroach/ci/tests/testrace_impl.sh`.
+# If those values are updated, the script should be updated accordingly.
+test:race --test_timeout=1200,6000,18000,72000
+test:race --heavy
+
+# CI uses a custom timeout for enormous targets.
+test:use_ci_timeouts --test_timeout=60,300,900,900
 # CI should always run with `--config=ci`.
-build:ci --experimental_convenience_symlinks=ignore
+build:cibase --config=lintonbuild
 # Set `-test.v` in Go tests.
 # Ref: https://github.com/bazelbuild/rules_go/pull/2456
-test:ci --test_env=GO_TEST_WRAP_TESTV=1
+test:cibase --test_env=GO_TEST_WRAP_TESTV=1
 # Dump all output for failed tests to the build log.
 test:ci --test_output=errors
 # Put all tmp artifacts in /artifacts/tmp.
 test:ci --test_tmpdir=/artifacts/tmp
+build:ci --config=cibase
 
 build:cross --stamp
-build:cross --host_crosstool_top=@toolchain_cross_x86_64-unknown-linux-gnu//:suite
-build:cross --define cockroach_cross=y
 
-# cross-compilation configurations. Add e.g. --config=crosslinux to turn these on
-# TODO(ricky): Having to specify both the `platform` and the `crosstool_top` is
-# weird, but I think `rules_foreign_cc` doesn't play too nicely with `--platforms`?
-build:crosslinux --platforms=//build/toolchains:cross_linux
-build:crosslinux --crosstool_top=@toolchain_cross_x86_64-unknown-linux-gnu//:suite
+# Cross-compilation configurations. Add e.g. --config=crosslinux to turn these on.
+# Generally these should be used for development builds. Each cross config has
+# a corresponding `base` config that is the same thing but without the
+# `--workspace_status_command`; if using these `base` configs, you need to
+# specify an appropriate `--workspace_status_command`. These `base` configs are
+# used by the release process which needs to have more control over stamping.
 build:crosslinux '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-pc-linux-gnu'
-build:crosslinux --config=cross
-build:crosswindows --platforms=//build/toolchains:cross_windows
-build:crosswindows --crosstool_top=@toolchain_cross_x86_64-w64-mingw32//:suite
+build:crosslinux --config=crosslinuxbase
+build:crosslinuxbase --platforms=//build/toolchains:cross_linux
+build:crosslinuxbase --config=cross
+build:crosslinuxfips '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-pc-linux-gnu'
+build:crosslinuxfips --config=crosslinuxfipsbase
+build:crosslinuxfipsbase --platforms=//build/toolchains:cross_linux
+build:crosslinuxfipsbase --config=cross
+build:crosslinuxfipsbase --@io_bazel_rules_go//go/toolchain:sdk_version=1.22.5fips
 build:crosswindows '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-w64-mingw32'
-build:crosswindows --config=cross
-build:crossmacos --platforms=//build/toolchains:cross_macos
-build:crossmacos --crosstool_top=@toolchain_cross_x86_64-apple-darwin19//:suite
-build:crossmacos '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-apple-darwin19'
-build:crossmacos --config=cross
-build:crosslinuxarm --platforms=//build/toolchains:cross_linux_arm
-build:crosslinuxarm --crosstool_top=@toolchain_cross_aarch64-unknown-linux-gnu//:suite
+build:crosswindows --config=crosswindowsbase
+build:crosswindowsbase --platforms=//build/toolchains:cross_windows
+build:crosswindowsbase --config=cross
+build:crossmacos '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-apple-darwin21.2'
+build:crossmacos --config=crossmacosbase
+build:crossmacosbase --platforms=//build/toolchains:cross_macos
+build:crossmacosbase --config=cross
+build:crossmacosarm '--workspace_status_command=./build/bazelutil/stamp.sh aarch64-apple-darwin21.2'
+build:crossmacosarm --config=crossmacosarmbase
+build:crossmacosarmbase --platforms=//build/toolchains:cross_macos_arm
+build:crossmacosarmbase --config=cross
 build:crosslinuxarm '--workspace_status_command=./build/bazelutil/stamp.sh aarch64-unknown-linux-gnu'
-build:crosslinuxarm --config=cross
+build:crosslinuxarm --config=crosslinuxarmbase
+build:crosslinuxarmbase --platforms=//build/toolchains:cross_linux_arm
+build:crosslinuxarmbase --config=cross
+build:crosslinuxs390x '--workspace_status_command=./build/bazelutil/stamp.sh s390x-unknown-linux-gnu'
+build:crosslinuxs390x --config=crosslinuxs390xbase
+build:crosslinuxs390xbase --platforms=//build/toolchains:cross_linux_s390x
+build:crosslinuxs390xbase --config=cross
 
-# developer configurations. Add e.g. --config=devdarwinx86_64 to turn these on.
-build:devdarwinx86_64 --crosstool_top=@toolchain_dev_darwin_x86-64//:suite
-# NOTE(ricky): This is consumed in `BUILD` files (see
-# `build/toolchains/BUILD.bazel`).
+# devdarwinx86_64 is a legacy setting that implies `--config=dev`.
 build:devdarwinx86_64 --config=dev
-build:dev --define cockroach_bazel_dev=y
-build:dev --stamp --workspace_status_command=./build/bazelutil/stamp.sh
+build:macos --action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
+build:macos --host_action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
+
+build:macos --linkopt="-Xlinker"
+build:macos --linkopt="-no_warn_duplicate_libraries"
+
+build:engflowbase --define=EXECUTOR=remote
+build:engflowbase --disk_cache=
+build:engflowbase --experimental_inmemory_dotd_files
+build:engflowbase --experimental_inmemory_jdeps_files
+build:engflowbase --remote_timeout=600
+build:engflowbase --nolegacy_important_outputs
+build:engflowbase --grpc_keepalive_time=30s
+build:engflowbase --remote_cache_compression=true
+build:engflowbase --action_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+build:engflowbase --extra_execution_platforms=//build/toolchains:cross_linux
+build:engflowbase --remote_upload_local_results=false
+build:engflowbase --remote_download_toplevel
+build:engflowbase --config=cibase
+test:engflowbase --test_env=REMOTE_EXEC=1
+test:engflowbase --test_env=GOTRACEBACK=all
+build:engflow --config=engflowbase
+build:engflow --remote_cache=grpcs://tanzanite.cluster.engflow.com
+build:engflow --remote_executor=grpcs://tanzanite.cluster.engflow.com
+build:engflow --bes_backend=grpcs://tanzanite.cluster.engflow.com
+build:engflow --bes_results_url=https://tanzanite.cluster.engflow.com/invocation/
+build:engflowpublic --config=engflowbase
+build:engflowpublic --remote_cache=grpcs://mesolite.cluster.engflow.com
+build:engflowpublic --remote_executor=grpcs://mesolite.cluster.engflow.com
+build:engflowpublic --bes_backend=grpcs://mesolite.cluster.engflow.com
+build:engflowpublic --bes_results_url=https://mesolite.cluster.engflow.com/invocation/
+
+try-import %workspace%/.bazelrc.user
 
 # vi: ft=sh

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,13 +9,17 @@ import (
 	"context"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -28,8 +27,8 @@ import (
 // GrantRoleNode creates entries in the system.role_members table.
 // This is called from GRANT <ROLE>
 type GrantRoleNode struct {
-	roles       []security.SQLUsername
-	members     []security.SQLUsername
+	roles       []username.SQLUsername
+	members     []username.SQLUsername
 	adminOption bool
 
 	run grantRoleRun
@@ -50,39 +49,48 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 	ctx, span := tracing.ChildSpan(ctx, n.StatementTag())
 	defer span.Finish()
 
-	hasAdminRole, err := p.HasAdminRole(ctx)
+	hasCreateRolePriv, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEROLE)
 	if err != nil {
 		return nil, err
 	}
+
 	// Check permissions on each role.
 	allRoles, err := p.MemberOfWithAdminOption(ctx, p.User())
 	if err != nil {
 		return nil, err
 	}
+	grantingRoleHasAdminOptionOnAdmin := allRoles[username.AdminRoleName()]
 
-	inputRoles, err := n.Roles.ToSQLUsernames()
+	inputRoles, err := decodeusername.FromNameList(n.Roles)
 	if err != nil {
 		return nil, err
 	}
-	inputMembers, err := n.Members.ToSQLUsernames(p.SessionData(), security.UsernameValidation)
+	inputMembers, err := decodeusername.FromRoleSpecList(
+		p.SessionData(), username.PurposeValidation, n.Members,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, r := range inputRoles {
-		// If the user is an admin, don't check if the user is allowed to add/drop
-		// roles in the role. However, if the role being modified is the admin role, then
-		// make sure the user is an admin with the admin option.
-		if hasAdminRole && !r.IsAdminRole() {
+		// If the current user has CREATEROLE, and the role being granted is not an
+		// admin there is no need to check if the user is allowed to grant/revoke
+		// membership in the role. However, if the role being granted is an admin,
+		// then make sure the current user also has the admin option for that role.
+		grantedRoleIsAdmin, err := p.UserHasAdminRole(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		if hasCreateRolePriv && !grantedRoleIsAdmin {
 			continue
 		}
-		if isAdmin, ok := allRoles[r]; !ok || !isAdmin {
-			if r.IsAdminRole() {
+		if hasAdminOption := allRoles[r]; !hasAdminOption && !grantingRoleHasAdminOptionOnAdmin {
+			if grantedRoleIsAdmin {
 				return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-					"%s is not a role admin for role %s", p.User(), r)
+					"%s must have admin option on role %q", p.User(), r)
 			}
 			return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-				"%s is not a superuser or role admin for role %s", p.User(), r)
+				"%s must have CREATEROLE or have admin option on role %q", p.User(), r)
 		}
 	}
 
@@ -103,18 +111,17 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 			for name := range roleoption.ByName {
 				if maybeOption == name {
 					return nil, errors.WithHintf(
-						pgerror.Newf(pgcode.UndefinedObject,
-							"role/user %s does not exist", r),
+						sqlerrors.NewUndefinedUserError(r),
 						"%s is a role option, try using ALTER ROLE to change a role's options.", maybeOption)
 				}
 			}
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", r)
+			return nil, sqlerrors.NewUndefinedUserError(r)
 		}
 	}
 
 	for _, m := range inputMembers {
 		if _, ok := roles[m]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", m)
+			return nil, sqlerrors.NewUndefinedUserError(m)
 		}
 	}
 
@@ -122,7 +129,7 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 	// means checking whether we have an expanded relationship (grant.Role ∈ ... ∈ grant.Member)
 	// For each grant.Role, we lookup all the roles it is a member of.
 	// After adding a given edge (grant.Member ∈ grant.Role), we add the edge to the list as well.
-	allRoleMemberships := make(map[security.SQLUsername]map[security.SQLUsername]bool)
+	allRoleMemberships := make(map[username.SQLUsername]map[username.SQLUsername]bool)
 	for _, r := range inputRoles {
 		allRoles, err := p.MemberOfWithAdminOption(ctx, r)
 		if err != nil {
@@ -148,7 +155,7 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 			}
 			// Add the new membership. We don't care about the actual bool value.
 			if _, ok := allRoleMemberships[m]; !ok {
-				allRoleMemberships[m] = make(map[security.SQLUsername]bool)
+				allRoleMemberships[m] = make(map[username.SQLUsername]bool)
 			}
 			allRoleMemberships[m][r] = false
 		}
@@ -162,34 +169,36 @@ func (p *planner) GrantRoleNode(ctx context.Context, n *tree.GrantRole) (*GrantR
 }
 
 func (n *GrantRoleNode) startExec(params runParams) error {
-	opName := "grant-role"
+	var rowsAffected int
+
 	// Add memberships. Existing memberships are allowed.
 	// If admin option is false, we do not remove it from existing memberships.
-	memberStmt := `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ($1, $2, $3) ON CONFLICT ("role", "member")`
+	memberStmt := `
+INSERT INTO system.role_members ("role", "member", "isAdmin", role_id, member_id)
+VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $1), (SELECT user_id FROM system.users WHERE username = $2))
+ON CONFLICT ("role", "member")`
 	if n.adminOption {
 		// admin option: true, set "isAdmin" even if the membership exists.
-		memberStmt += ` DO UPDATE SET "isAdmin" = true`
+		memberStmt += ` DO UPDATE SET "isAdmin" = true WHERE role_members."isAdmin" IS NOT true`
 	} else {
 		// admin option: false, do not clear it from existing memberships.
 		memberStmt += ` DO NOTHING`
 	}
 
-	var rowsAffected int
 	for _, r := range n.roles {
 		for _, m := range n.members {
-			affected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-				params.ctx,
-				opName,
-				params.p.txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			memberStmtRowsAffected, err := params.p.InternalSQLTxn().ExecEx(
+				params.ctx, "grant-role", params.p.Txn(),
+				sessiondata.NodeUserSessionDataOverride,
 				memberStmt,
-				r.Normalized(), m.Normalized(), n.adminOption,
+				r.Normalized(),
+				m.Normalized(),
+				n.adminOption,
 			)
 			if err != nil {
 				return err
 			}
-
-			rowsAffected += affected
+			rowsAffected += memberStmtRowsAffected
 		}
 	}
 
@@ -202,7 +211,17 @@ func (n *GrantRoleNode) startExec(params runParams) error {
 
 	n.run.rowsAffected += rowsAffected
 
-	return nil
+	sqlUsernameToStrings := func(sqlUsernames []username.SQLUsername) []string {
+		strings := make([]string, len(sqlUsernames))
+		for i, sqlUsername := range sqlUsernames {
+			strings[i] = sqlUsername.Normalized()
+		}
+		return strings
+	}
+
+	return params.p.logEvent(params.ctx,
+		0, /* no target */
+		&eventpb.GrantRole{GranteeRoles: sqlUsernameToStrings(n.roles), Members: sqlUsernameToStrings(n.members)})
 }
 
 // Next implements the planNode interface.

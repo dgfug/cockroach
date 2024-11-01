@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvprober
 
@@ -25,15 +20,18 @@ var (
 	ReadInterval         = readInterval
 	WriteEnabled         = writeEnabled
 	WriteInterval        = writeInterval
+	QuarantineEnabled    = quarantineWriteEnabled
+	QuarantineInterval   = quarantineWriteInterval
 	NumStepsToPlanAtOnce = numStepsToPlanAtOnce
+	TracingEnabled       = tracingEnabled
 )
 
 func (p *Prober) ReadProbe(ctx context.Context, db *kv.DB) {
-	p.readProbe(ctx, db, p.readPlanner)
+	p.readProbe(ctx, p.readPlanner)
 }
 
 func (p *Prober) WriteProbe(ctx context.Context, db *kv.DB) {
-	p.writeProbe(ctx, db, p.writePlanner)
+	p.writeProbe(ctx, p.writePlanner)
 }
 
 type recordingPlanner struct {
@@ -50,7 +48,7 @@ func (rp *recordingPlanner) next(ctx context.Context) (Step, error) {
 func (p *Prober) WriteProbeReturnLastStep(ctx context.Context, db *kv.DB) *Step {
 	rp := &recordingPlanner{}
 	rp.pl = p.writePlanner
-	p.writeProbe(ctx, db, rp)
+	p.writeProbe(ctx, rp)
 	return &rp.last
 }
 

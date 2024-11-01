@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -55,6 +51,9 @@ type Chaos struct {
 	// Chaos is responsible for closing the channel when the test is over.
 	// This is optional.
 	ChaosEventCh chan ChaosEvent
+	// Env is an array of enviroment variables to set when restarting nodes.
+	// Ex. "COCKROACH_CHANGEFEED_TESTING_FAST_RETRY=true"
+	Env []string
 }
 
 // ChaosEventType signifies an event that occurs during chaos.
@@ -135,12 +134,17 @@ func (ch *Chaos) Runner(
 			ch.sendEvent(ChaosEventTypePreShutdown, target)
 			if ch.DrainAndQuit {
 				l.Printf("stopping and draining %v\n", target)
-				if err := c.StopE(ctx, target, option.StopArgs("--sig=15"), option.WithWorkerAction()); err != nil {
+				stopOpts := option.DefaultStopOpts()
+				stopOpts.RoachprodOpts.Sig = 15
+				stopOpts.RoachtestOpts.Worker = true
+				if err := c.StopE(ctx, l, stopOpts, target); err != nil {
 					return errors.Wrapf(err, "could not stop node %s", target)
 				}
 			} else {
 				l.Printf("killing %v\n", target)
-				if err := c.StopE(ctx, target, option.WithWorkerAction()); err != nil {
+				stopOpts := option.DefaultStopOpts()
+				stopOpts.RoachtestOpts.Worker = true
+				if err := c.StopE(ctx, l, stopOpts, target); err != nil {
 					return errors.Wrapf(err, "could not stop node %s", target)
 				}
 			}
@@ -151,7 +155,11 @@ func (ch *Chaos) Runner(
 				// NB: the roachtest harness checks that at the end of the test,
 				// all nodes that have data also have a running process.
 				l.Printf("restarting %v (chaos is done)\n", target)
-				if err := c.StartE(ctx, target, option.WithWorkerAction()); err != nil {
+				startOpts := option.DefaultStartOpts()
+				startOpts.RoachtestOpts.Worker = true
+				settings := install.MakeClusterSettings()
+				settings.Env = append(settings.Env, ch.Env...)
+				if err := c.StartE(ctx, l, startOpts, settings, target); err != nil {
 					return errors.Wrapf(err, "could not restart node %s", target)
 				}
 				return nil
@@ -163,7 +171,11 @@ func (ch *Chaos) Runner(
 				// already canceled.
 				tCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if err := c.StartE(tCtx, target, option.WithWorkerAction()); err != nil {
+				startOpts := option.DefaultStartOpts()
+				startOpts.RoachtestOpts.Worker = true
+				settings := install.MakeClusterSettings()
+				settings.Env = append(settings.Env, ch.Env...)
+				if err := c.StartE(tCtx, l, startOpts, settings, target); err != nil {
 					return errors.Wrapf(err, "could not restart node %s", target)
 				}
 				return ctx.Err()
@@ -172,7 +184,11 @@ func (ch *Chaos) Runner(
 			l.Printf("restarting %v after %s of downtime\n", target, downTime)
 			t.Reset(period)
 			ch.sendEvent(ChaosEventTypePreStartup, target)
-			if err := c.StartE(ctx, target, option.WithWorkerAction()); err != nil {
+			startOpts := option.DefaultStartOpts()
+			startOpts.RoachtestOpts.Worker = true
+			settings := install.MakeClusterSettings()
+			settings.Env = append(settings.Env, ch.Env...)
+			if err := c.StartE(ctx, l, startOpts, settings, target); err != nil {
 				return errors.Wrapf(err, "could not restart node %s", target)
 			}
 			ch.sendEvent(ChaosEventTypeStartupComplete, target)

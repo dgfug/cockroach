@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -15,15 +10,18 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,15 +41,8 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 		// implicitCommit says whether we expect the transaction to satisfy the
 		// implicit-commit condition.
 		implicitCommit bool
-		// If implicitCommit is false, writeTooOld dictates what kind of push will
-		// be experienced by one of the txn's intents. An intent being pushed is the
-		// reason why the implicit-commit condition is expected to fail. We simulate
-		// both pushes by the timestamp cache, and by deferred write-too-old
-		// conditions.
-		writeTooOld bool
 		// futureWrites dictates whether the transaction has been writing at the
-		// present time or whether it has been writing into the future with a
-		// synthetic timestamp.
+		// present time or whether it has been writing into the future.
 		futureWrites bool
 	}{
 		{
@@ -59,11 +50,6 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 		},
 		{
 			implicitCommit: false,
-			writeTooOld:    false,
-		},
-		{
-			implicitCommit: false,
-			writeTooOld:    true,
 		},
 		{
 			implicitCommit: true,
@@ -71,26 +57,19 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 		},
 		{
 			implicitCommit: false,
-			writeTooOld:    false,
-			futureWrites:   true,
-		},
-		{
-			implicitCommit: false,
-			writeTooOld:    true,
 			futureWrites:   true,
 		},
 	} {
-		name := fmt.Sprintf("%d-commit:%t,writeTooOld:%t,futureWrites:%t", i, tc.implicitCommit, tc.writeTooOld, tc.futureWrites)
+		name := fmt.Sprintf("%d-commit:%t,futureWrites:%t", i, tc.implicitCommit, tc.futureWrites)
 		t.Run(name, func(t *testing.T) {
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			manual := hlc.NewManualClock(123)
-			cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+			cfg := TestStoreConfig(hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123))))
 			// Set the RecoverIndeterminateCommitsOnFailedPushes flag to true so
 			// that a push on a STAGING transaction record immediately launches
 			// the transaction recovery process.
 			cfg.TestingKnobs.EvalKnobs.RecoverIndeterminateCommitsOnFailedPushes = true
-			store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+			store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 			// Create a transaction that will get stuck performing a parallel commit.
 			txn := newTransaction("txn", keyA, 1, store.Clock())
@@ -100,7 +79,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			// where it has refreshed up to its write timestamp in preparation
 			// to commit.
 			if tc.futureWrites {
-				txn.WriteTimestamp = txn.ReadTimestamp.Add(50, 0).WithSynthetic(true)
+				txn.WriteTimestamp = txn.ReadTimestamp.Add(50, 0)
 				txn.ReadTimestamp = txn.WriteTimestamp // simulate refresh
 			}
 
@@ -109,7 +88,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			keyAVal := []byte("value")
 			pArgs := putArgs(keyA, keyAVal)
 			pArgs.Sequence = 1
-			h := roachpb.Header{Txn: txn}
+			h := kvpb.Header{Txn: txn}
 			if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, &pArgs); pErr != nil {
 				t.Fatal(pErr)
 			}
@@ -118,18 +97,11 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			// conflicting operation on keyB to prevent the transaction's write to
 			// keyB from writing at its desired timestamp. This prevents an implicit
 			// commit state.
-			conflictH := roachpb.Header{Timestamp: txn.WriteTimestamp.Next()}
+			conflictH := kvpb.Header{Timestamp: txn.WriteTimestamp.Next()}
 			if !tc.implicitCommit {
-				if !tc.writeTooOld {
-					gArgs := getArgs(keyB)
-					if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &gArgs); pErr != nil {
-						t.Fatal(pErr)
-					}
-				} else {
-					pArgs = putArgs(keyB, []byte("pusher val"))
-					if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &pArgs); pErr != nil {
-						t.Fatal(pErr)
-					}
+				gArgs := getArgs(keyB)
+				if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &gArgs); pErr != nil {
+					t.Fatal(pErr)
 				}
 			}
 
@@ -167,7 +139,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 				t.Fatal(pErr)
 			}
 			if tc.implicitCommit {
-				if val := gReply.(*roachpb.GetResponse).Value; val == nil {
+				if val := gReply.(*kvpb.GetResponse).Value; val == nil {
 					t.Fatalf("expected non-nil value when reading key %v", keyA)
 				} else if valBytes, err := val.GetBytes(); err != nil {
 					t.Fatal(err)
@@ -175,7 +147,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 					t.Fatalf("actual value %q did not match expected value %q", valBytes, keyAVal)
 				}
 			} else {
-				if val := gReply.(*roachpb.GetResponse).Value; val != nil {
+				if val := gReply.(*kvpb.GetResponse).Value; val != nil {
 					t.Fatalf("expected nil value when reading key %v; found %v", keyA, val)
 				}
 			}
@@ -186,7 +158,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			if pErr != nil {
 				t.Fatal(pErr)
 			}
-			status := qtReply.(*roachpb.QueryTxnResponse).QueriedTxn.Status
+			status := qtReply.(*kvpb.QueryTxnResponse).QueriedTxn.Status
 			expStatus := roachpb.ABORTED
 			if tc.implicitCommit {
 				expStatus = roachpb.COMMITTED
@@ -203,20 +175,19 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 // transaction. The test contains a subtest for each of the combinations of the
 // following boolean options:
 //
-// - pushAbort: configures whether or not the high-priority operation is a
+//   - pushAbort: configures whether or not the high-priority operation is a
 //     read (false) or a write (true), which dictates the kind of push
 //     operation dispatched against the staging transaction.
 //
-// - newEpoch: configures whether or not the staging transaction wrote the
+//   - newEpoch: configures whether or not the staging transaction wrote the
 //     intent which the high-priority operation conflicts with at a higher
 //     epoch than it is staged at. If true, the staging transaction is not
 //     implicitly committed.
 //
-// - newTimestamp: configures whether or not the staging transaction wrote the
+//   - newTimestamp: configures whether or not the staging transaction wrote the
 //     intent which the high-priority operation conflicts with at a higher
 //     timestamp than it is staged at. If true, the staging transaction is not
 //     implicitly committed.
-//
 func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -225,9 +196,9 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 	run := func(t *testing.T, pushAbort, newEpoch, newTimestamp bool) {
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
-		manual := hlc.NewManualClock(123)
-		cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
-		store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+		manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+		cfg := TestStoreConfig(hlc.NewClockForTesting(manual))
+		store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 		// Create a transaction that will get stuck performing a parallel
 		// commit.
@@ -239,19 +210,19 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 		keyAVal := []byte("value")
 		pArgs := putArgs(keyA, keyAVal)
 		pArgs.Sequence = 1
-		h := roachpb.Header{Txn: txn}
+		h := kvpb.Header{Txn: txn}
 		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, &pArgs)
 		require.Nil(t, pErr, "error: %s", pErr)
 
 		// The second write may or may not be bumped.
 		pArgs = putArgs(keyB, []byte("value2"))
 		pArgs.Sequence = 2
-		h2 := roachpb.Header{Txn: txn.Clone()}
+		h2 := kvpb.Header{Txn: txn.Clone()}
 		if newEpoch {
 			h2.Txn.BumpEpoch()
 		}
 		if newTimestamp {
-			manual.Increment(100)
+			manual.Advance(100)
 			h2.Txn.WriteTimestamp = store.Clock().Now()
 		}
 		_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), h2, &pArgs)
@@ -269,7 +240,7 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 		require.Equal(t, roachpb.STAGING, etReply.Header().Txn.Status)
 
 		// Issue a conflicting, high-priority operation.
-		var conflictArgs roachpb.Request
+		var conflictArgs kvpb.Request
 		if pushAbort {
 			pArgs = putArgs(keyB, []byte("value3"))
 			conflictArgs = &pArgs
@@ -277,8 +248,8 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 			gArgs := getArgs(keyB)
 			conflictArgs = &gArgs
 		}
-		manual.Increment(100)
-		conflictH := roachpb.Header{
+		manual.Advance(100)
+		conflictH := kvpb.Header{
 			UserPriority: roachpb.MaxUserPriority,
 			Timestamp:    store.Clock().Now(),
 		}
@@ -289,7 +260,7 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 		qtArgs := queryTxnArgs(txn.TxnMeta, false /* waitForUpdate */)
 		qtReply, pErr := kv.SendWrapped(ctx, store.TestSender(), &qtArgs)
 		require.Nil(t, pErr, "error: %s", pErr)
-		qtTxn := qtReply.(*roachpb.QueryTxnResponse).QueriedTxn
+		qtTxn := qtReply.(*kvpb.QueryTxnResponse).QueriedTxn
 
 		if !newEpoch && !newTimestamp {
 			// The transaction was implicitly committed at its initial epoch and
@@ -297,23 +268,9 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 			require.Equal(t, roachpb.COMMITTED, qtTxn.Status)
 			require.Equal(t, txn.Epoch, qtTxn.Epoch)
 			require.Equal(t, txn.WriteTimestamp, qtTxn.WriteTimestamp)
-		} else if newEpoch {
-			// The transaction is aborted if that's what the high-priority
-			// request wants. Otherwise, the transaction's record is bumped to
-			// the new epoch pulled from its intent and pushed above the
-			// high-priority request's timestamp.
-			if pushAbort {
-				require.Equal(t, roachpb.ABORTED, qtTxn.Status)
-			} else /* pushTimestamp */ {
-				require.Equal(t, roachpb.PENDING, qtTxn.Status)
-				require.Equal(t, txn.Epoch+1, qtTxn.Epoch)
-				require.Equal(t, conflictH.Timestamp.Next(), qtTxn.WriteTimestamp)
-			}
-		} else /* if newTimestamp */ {
-			// The transaction is aborted, even if the high-priority request
-			// only needed it to be pushed to a higher timestamp. This is
-			// because we don't allow a STAGING transaction record to move back
-			// to PENDING in the same epoch.
+		} else {
+			// The pusher knows that the transaction is not implicitly committed, so
+			// it is aborted.
 			require.Equal(t, roachpb.ABORTED, qtTxn.Status)
 		}
 	}
@@ -325,6 +282,127 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 			})
 		})
 	})
+}
+
+// TestTxnRecoveryFromStagingWithoutHighPriority tests that the transaction
+// recovery process is NOT initiated by a normal-priority operation which
+// encounters a staging transaction. Instead, the normal-priority operation
+// waits for the committing transaction to complete. The test contains a subtest
+// for each of the combinations of the following options:
+//
+//   - pusheeIsoLevel: configures the isolation level of the pushee (committing)
+//     transaction. Isolation levels affect the behavior of pushes of pending
+//     transactions, but not of staging transactions.
+//
+//   - pusheeCommits: configures whether or not the staging transaction is
+//     implicitly and, eventually, explicitly committed or not.
+//
+//   - pusherWriting: configures whether or not the conflicting operation is a
+//     read (false) or a write (true), which dictates the kind of push operation
+//     dispatched against the staging transaction.
+func TestTxnRecoveryFromStagingWithoutHighPriority(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	run := func(t *testing.T, pusheeIsoLevel isolation.Level, pusheeCommits, pusherWriting bool) {
+		stopper := stop.NewStopper()
+		defer stopper.Stop(ctx)
+		manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+		cfg := TestStoreConfig(hlc.NewClockForTesting(manual))
+		store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+
+		// Create a transaction that will get stuck performing a parallel
+		// commit.
+		keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
+		txn := newTransaction("txn", keyA, 1, store.Clock())
+		txn.IsoLevel = pusheeIsoLevel
+
+		// Issue two writes, which will be considered in-flight at the time of
+		// the transaction's EndTxn request.
+		keyAVal := []byte("value")
+		pArgs := putArgs(keyA, keyAVal)
+		pArgs.Sequence = 1
+		h := kvpb.Header{Txn: txn}
+		_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, &pArgs)
+		require.Nil(t, pErr, "error: %s", pErr)
+
+		pArgs = putArgs(keyB, []byte("value2"))
+		pArgs.Sequence = 2
+		h2 := kvpb.Header{Txn: txn.Clone()}
+		if !pusheeCommits {
+			// If we're not going to have the pushee commit, make sure it never enters
+			// the implicit commit state by bumping the timestamp of one of its writes.
+			manual.Advance(100)
+			h2.Txn.WriteTimestamp = store.Clock().Now()
+		}
+		_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), h2, &pArgs)
+		require.Nil(t, pErr, "error: %s", pErr)
+
+		// Issue a parallel commit, which will put the transaction into a
+		// STAGING state. Include both writes as the EndTxn's in-flight writes.
+		et, etH := endTxnArgs(txn, true)
+		et.InFlightWrites = []roachpb.SequencedWrite{
+			{Key: keyA, Sequence: 1},
+			{Key: keyB, Sequence: 2},
+		}
+		etReply, pErr := kv.SendWrappedWith(ctx, store.TestSender(), etH, &et)
+		require.Nil(t, pErr, "error: %s", pErr)
+		require.Equal(t, roachpb.STAGING, etReply.Header().Txn.Status)
+
+		// Issue a conflicting, normal-priority operation.
+		var conflictArgs kvpb.Request
+		if pusherWriting {
+			pArgs = putArgs(keyB, []byte("value3"))
+			conflictArgs = &pArgs
+		} else {
+			gArgs := getArgs(keyB)
+			conflictArgs = &gArgs
+		}
+		manual.Advance(100)
+		pErrC := make(chan *kvpb.Error, 1)
+		require.NoError(t, stopper.RunAsyncTask(ctx, "conflict", func(ctx context.Context) {
+			_, pErr := kv.SendWrapped(ctx, store.TestSender(), conflictArgs)
+			pErrC <- pErr
+		}))
+
+		// Wait for the conflict to push and be queued in the txn wait queue.
+		testutils.SucceedsSoon(t, func() error {
+			select {
+			case pErr := <-pErrC:
+				t.Fatalf("conflicting operation unexpectedly completed: pErr=%s", pErr)
+			default:
+			}
+			if v := store.txnWaitMetrics.PusherWaiting.Value(); v != 1 {
+				return errors.Errorf("expected 1 pusher waiting, found %d", v)
+			}
+			return nil
+		})
+
+		// Finalize the STAGING txn, either by committing it or by aborting it.
+		et2, et2H := endTxnArgs(txn, pusheeCommits)
+		etReply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), et2H, &et2)
+		require.Nil(t, pErr, "error: %s", pErr)
+		expStatus := roachpb.COMMITTED
+		if !pusheeCommits {
+			expStatus = roachpb.ABORTED
+		}
+		require.Equal(t, expStatus, etReply.Header().Txn.Status)
+
+		// This will unblock the conflicting operation, which should succeed.
+		pErr = <-pErrC
+		require.Nil(t, pErr, "error: %s", pErr)
+	}
+
+	for _, pusheeIsoLevel := range isolation.Levels() {
+		t.Run("pushee_iso_level="+pusheeIsoLevel.String(), func(t *testing.T) {
+			testutils.RunTrueAndFalse(t, "pushee_commits", func(t *testing.T, pusheeCommits bool) {
+				testutils.RunTrueAndFalse(t, "pusher_writing", func(t *testing.T, pusherWriting bool) {
+					run(t, pusheeIsoLevel, pusheeCommits, pusherWriting)
+				})
+			})
+		})
+	}
 }
 
 // TestTxnClearRangeIntents tests whether a ClearRange call blindly removes
@@ -347,7 +425,7 @@ func TestTxnClearRangeIntents(t *testing.T) {
 	cfg := TestStoreConfig(nil)
 	// Immediately launch transaction recovery when pushing a STAGING txn.
 	cfg.TestingKnobs.EvalKnobs.RecoverIndeterminateCommitsOnFailedPushes = true
-	store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+	store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 	// Set up a couple of keys to write, and a range to clear that covers
 	// B and its intent.
@@ -357,7 +435,7 @@ func TestTxnClearRangeIntents(t *testing.T) {
 
 	// Create a transaction that will get stuck performing a parallel commit.
 	txn := newTransaction("txn", keyA, 1, store.Clock())
-	txnHeader := roachpb.Header{Txn: txn}
+	txnHeader := kvpb.Header{Txn: txn}
 
 	// Issue two writes, which will be considered in-flight at the time of the
 	// transaction's EndTxn request.
@@ -384,61 +462,38 @@ func TestTxnClearRangeIntents(t *testing.T) {
 
 	// Make sure intents exists for keys A and B.
 	queryIntent := queryIntentArgs(keyA, txn.TxnMeta, false)
-	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryIntent)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &queryIntent)
 	require.Nil(t, pErr, "error: %s", pErr)
-	require.True(t, reply.(*roachpb.QueryIntentResponse).FoundIntent, "intent missing for %q", keyA)
+	require.True(t, reply.(*kvpb.QueryIntentResponse).FoundUnpushedIntent, "intent missing for %q", keyA)
 
 	queryIntent = queryIntentArgs(keyB, txn.TxnMeta, false)
-	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryIntent)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &queryIntent)
 	require.Nil(t, pErr, "error: %s", pErr)
-	require.True(t, reply.(*roachpb.QueryIntentResponse).FoundIntent, "intent missing for %q", keyB)
+	require.True(t, reply.(*kvpb.QueryIntentResponse).FoundUnpushedIntent, "intent missing for %q", keyB)
 
 	// Call ClearRange covering key B and its intent.
 	clearRange := clearRangeArgs(clearFrom, clearTo)
-	_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &clearRange)
+	_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &clearRange)
 	require.Nil(t, pErr, "error: %s", pErr)
 
 	// If separated intents are enabled, all should be well.
-	if store.engine.IsSeparatedIntentsEnabledForTesting(ctx) {
-		// Reading A should succeed, but B should be gone.
-		get := getArgs(keyA)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &get)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.NotNil(t, reply.(*roachpb.GetResponse).Value, "expected value for A")
-		value, err := reply.(*roachpb.GetResponse).Value.GetBytes()
-		require.NoError(t, err)
-		require.Equal(t, value, valueA)
+	// Reading A should succeed, but B should be gone.
+	get := getArgs(keyA)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &get)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.NotNil(t, reply.(*kvpb.GetResponse).Value, "expected value for A")
+	value, err := reply.(*kvpb.GetResponse).Value.GetBytes()
+	require.NoError(t, err)
+	require.Equal(t, value, valueA)
 
-		get = getArgs(keyB)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &get)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.Nil(t, reply.(*roachpb.GetResponse).Value, "unexpected value for B")
+	get = getArgs(keyB)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &get)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.Nil(t, reply.(*kvpb.GetResponse).Value, "unexpected value for B")
 
-		// Query the original transaction, which should now be committed.
-		queryTxn := queryTxnArgs(txn.TxnMeta, false)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryTxn)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.Equal(t, roachpb.COMMITTED, reply.(*roachpb.QueryTxnResponse).QueriedTxn.Status)
-
-	} else {
-		// If separated intents are disabled, ClearRange will have removed B's
-		// intent without resolving it. When we read A, txn recovery will expect
-		// to find B's intent, but when missing it assumes the txn did not
-		// complete and aborts it, rolling back all writes (including A).
-		get := getArgs(keyA)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &get)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.Nil(t, reply.(*roachpb.GetResponse).Value, "unexpected value for A")
-
-		get = getArgs(keyB)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &get)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.Nil(t, reply.(*roachpb.GetResponse).Value, "unexpected value for B")
-
-		// Query the original transaction, which should now be aborted.
-		queryTxn := queryTxnArgs(txn.TxnMeta, false)
-		reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryTxn)
-		require.Nil(t, pErr, "error: %s", pErr)
-		require.Equal(t, roachpb.ABORTED, reply.(*roachpb.QueryTxnResponse).QueriedTxn.Status)
-	}
+	// Query the original transaction, which should now be committed.
+	queryTxn := queryTxnArgs(txn.TxnMeta, false)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, &queryTxn)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.Equal(t, roachpb.COMMITTED, reply.(*kvpb.QueryTxnResponse).QueriedTxn.Status)
 }

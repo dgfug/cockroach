@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree_test
 
@@ -30,6 +25,7 @@ func TestParseColumnType(t *testing.T) {
 		expectedType *types.T
 	}{
 		{"BIT", types.MakeBit(1)},
+		{"BIT(0)", types.MakeBit(0)},
 		{"VARBIT", types.MakeVarBit(0)},
 		{"BIT(2)", types.MakeBit(2)},
 		{"VARBIT(2)", types.MakeVarBit(2)},
@@ -68,6 +64,7 @@ func TestParseColumnType(t *testing.T) {
 		{"CHAR(11) COLLATE de", types.MakeCollatedString(types.MakeChar(11), "de")},
 		{"VARCHAR COLLATE en", types.MakeCollatedString(types.VarChar, "en")},
 		{"VARCHAR(2) COLLATE en", types.MakeCollatedString(types.MakeVarChar(2), "en")},
+		{"REFCURSOR", types.RefCursor},
 	}
 	for i, d := range testData {
 		t.Run(d.str, func(t *testing.T) {

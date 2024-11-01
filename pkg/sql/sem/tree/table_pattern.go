@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -71,6 +66,13 @@ func (at *AllTablesSelector) NormalizeTablePattern() (TablePattern, error) { ret
 // TablePatterns implement a comma-separated list of table patterns.
 // Used by e.g. the GRANT statement.
 type TablePatterns []TablePattern
+
+// TableAttrs saves the table petterns and a bool field SequenceOnly that shows
+// if all tables are sequences.
+type TableAttrs struct {
+	SequenceOnly  bool
+	TablePatterns TablePatterns
+}
 
 // Format implements the NodeFormatter interface.
 func (tt *TablePatterns) Format(ctx *FmtCtx) {

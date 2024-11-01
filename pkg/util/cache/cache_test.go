@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // This code is based on: https://github.com/golang/groupcache/
 
@@ -14,6 +9,7 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"reflect"
 	"testing"
 
@@ -26,6 +22,12 @@ type testKey string
 // Compare implements llrb.Comparable.
 func (tk testKey) Compare(b llrb.Comparable) int {
 	return bytes.Compare([]byte(tk), []byte(b.(testKey)))
+}
+
+func intervalLogErrorf(t testing.TB) IntervalCacheLogErrorf {
+	return func(_ context.Context, f string, args ...interface{}) {
+		t.Logf(f, args...)
+	}
 }
 
 var getTests = []struct {
@@ -261,7 +263,7 @@ func TestOrderedCacheClear(t *testing.T) {
 }
 
 func TestIntervalCache(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	key1 := ic.NewKey([]byte("a"), []byte("b"))
 	key2 := ic.NewKey([]byte("a"), []byte("c"))
 	key3 := ic.NewKey([]byte("d"), []byte("d\x00"))
@@ -291,7 +293,7 @@ func TestIntervalCache(t *testing.T) {
 }
 
 func TestIntervalCacheOverlap(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	ic.Add(ic.NewKey([]byte("a"), []byte("c")), 1)
 	ic.Add(ic.NewKey([]byte("c"), []byte("e")), 2)
 	ic.Add(ic.NewKey([]byte("b"), []byte("g")), 3)
@@ -314,7 +316,7 @@ func TestIntervalCacheOverlap(t *testing.T) {
 }
 
 func TestIntervalCacheClear(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	key1 := ic.NewKey([]byte("a"), []byte("c"))
 	key2 := ic.NewKey([]byte("c"), []byte("e"))
 	ic.Add(key1, 1)
@@ -336,7 +338,7 @@ func TestIntervalCacheClear(t *testing.T) {
 }
 
 func TestIntervalCacheClearWithAdjustedBounds(t *testing.T) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(t))
 	entry1 := &Entry{Key: ic.NewKey([]byte("a"), []byte("bb")), Value: 1}
 	ic.AddEntry(entry1)
 	entry1.Key.(*IntervalKey).End = []byte("b")
@@ -388,7 +390,7 @@ func BenchmarkOrderedCache(b *testing.B) {
 }
 
 func BenchmarkIntervalCache(b *testing.B) {
-	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction})
+	ic := NewIntervalCache(Config{Policy: CacheLRU, ShouldEvict: noEviction}, intervalLogErrorf(b))
 	testKeys := []interface{}{
 		ic.NewKey([]byte("a"), []byte("c")),
 		ic.NewKey([]byte("b"), []byte("d")),

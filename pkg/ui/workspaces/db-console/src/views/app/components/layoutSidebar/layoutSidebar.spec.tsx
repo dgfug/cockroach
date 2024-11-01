@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import { shallow } from "enzyme";
 import { createMemoryHistory, History } from "history";
+import React from "react";
 import { match as Match } from "react-router";
-import { assert } from "chai";
-import "src/enzymeInit";
+
 import { Sidebar } from "./index";
 
 describe("LayoutSidebar", () => {
@@ -30,7 +24,7 @@ describe("LayoutSidebar", () => {
     };
   });
 
-  it("does not show Network Latency link for single node cluster", () => {
+  it("does not show Network link for single node cluster", () => {
     const wrapper = shallow(
       <Sidebar
         history={history}
@@ -39,12 +33,12 @@ describe("LayoutSidebar", () => {
         isSingleNodeCluster={true}
       />,
     );
-    assert.isFalse(
+    expect(
       wrapper.findWhere(w => w.prop("to") === "/reports/network").exists(),
-    );
+    ).toBe(false);
   });
 
-  it("shows Network Latency link for multi node cluster", () => {
+  it("shows Network link for multi node cluster", () => {
     const wrapper = shallow(
       <Sidebar
         history={history}
@@ -53,8 +47,8 @@ describe("LayoutSidebar", () => {
         isSingleNodeCluster={false}
       />,
     );
-    assert.isTrue(
+    expect(
       wrapper.findWhere(w => w.prop("to") === "/reports/network").exists(),
-    );
+    ).toBe(true);
   });
 });

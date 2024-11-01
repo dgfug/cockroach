@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,12 +9,12 @@ import (
 	"context"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -42,7 +37,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	}
 
 	if n.Name == "" {
-		return nil, errEmptyDatabaseName
+		return nil, sqlerrors.ErrEmptyDatabaseName
 	}
 
 	if tmpl := n.Template; tmpl != "" {
@@ -99,7 +94,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if n.Placement != tree.DataPlacementUnspecified {
 		if !p.EvalContext().SessionData().PlacementEnabled {
 			return nil, errors.WithHint(pgerror.New(
-				pgcode.FeatureNotSupported,
+				pgcode.ExperimentalFeature,
 				"PLACEMENT requires that the session setting enable_multiregion_placement_policy "+
 					"is enabled",
 			),
@@ -107,12 +102,6 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 					" enable_multiregion_placement_policy = true or enable the cluster setting"+
 					" sql.defaults.multiregion_placement_policy.enabled",
 			)
-		}
-
-		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.DatabasePlacementPolicy) {
-			return nil, pgerror.Newf(pgcode.FeatureNotSupported,
-				"version %v must be finalized to use PLACEMENT",
-				clusterversion.ByKey(clusterversion.DatabasePlacementPolicy))
 		}
 
 		if n.PrimaryRegion == tree.PrimaryRegionNotSpecifiedName {
@@ -131,18 +120,41 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		}
 	}
 
-	hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
-	if err != nil {
+	if err := p.CanCreateDatabase(ctx); err != nil {
 		return nil, err
 	}
-	if !hasCreateDB {
+
+	if n.PrimaryRegion == tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion != tree.SecondaryRegionNotSpecifiedName {
 		return nil, pgerror.New(
-			pgcode.InsufficientPrivilege,
-			"permission denied to create database",
+			pgcode.InvalidDatabaseDefinition,
+			"PRIMARY REGION must be specified when using SECONDARY REGION",
+		)
+	}
+
+	if n.PrimaryRegion != tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion == n.PrimaryRegion {
+		return nil, pgerror.New(
+			pgcode.InvalidDatabaseDefinition,
+			"SECONDARY REGION can not be the same as the PRIMARY REGION",
 		)
 	}
 
 	return &createDatabaseNode{n: n}, nil
+}
+
+// CanCreateDatabase returns nil if current user has CREATEDB system privilege
+// or the equivalent, legacy role options.
+func (p *planner) CanCreateDatabase(ctx context.Context) error {
+	hasCreateDB, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEDB)
+	if err != nil {
+		return err
+	}
+	if !hasCreateDB {
+		return pgerror.New(
+			pgcode.InsufficientPrivilege,
+			"permission denied to create database",
+		)
+	}
+	return nil
 }
 
 func (n *createDatabaseNode) startExec(params runParams) error {

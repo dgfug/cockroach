@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -15,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -84,6 +80,8 @@ type timeSeriesMaintenanceQueue struct {
 	mem            *mon.BytesMonitor
 }
 
+var _ queueImpl = &timeSeriesMaintenanceQueue{}
+
 // newTimeSeriesMaintenanceQueue returns a new instance of
 // timeSeriesMaintenanceQueue.
 func newTimeSeriesMaintenanceQueue(
@@ -93,29 +91,24 @@ func newTimeSeriesMaintenanceQueue(
 		tsData:         tsData,
 		replicaCountFn: store.ReplicaCount,
 		db:             db,
-		mem: mon.NewUnlimitedMonitor(
-			context.Background(),
-			"timeseries-maintenance-queue",
-			mon.MemoryResource,
-			nil,
-			nil,
-			// Begin logging messages if we exceed our planned memory usage by
-			// more than triple.
-			TimeSeriesMaintenanceMemoryBudget*3,
-			store.cfg.Settings,
-		),
+		mem: mon.NewUnlimitedMonitor(context.Background(), mon.Options{
+			Name:     "timeseries-maintenance-queue",
+			Settings: store.cfg.Settings,
+		}),
 	}
 	q.baseQueue = newBaseQueue(
 		"timeSeriesMaintenance", q, store,
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.TimeSeriesMaintenanceQueueSuccesses,
 			failures:             store.metrics.TimeSeriesMaintenanceQueueFailures,
+			storeFailures:        store.metrics.StoreFailures,
 			pending:              store.metrics.TimeSeriesMaintenanceQueuePending,
 			processingNanos:      store.metrics.TimeSeriesMaintenanceQueueProcessingNanos,
+			disabledConfig:       kvserverbase.TimeSeriesMaintenanceQueueEnabled,
 		},
 	)
 
@@ -146,11 +139,10 @@ func (q *timeSeriesMaintenanceQueue) process(
 	ctx context.Context, repl *Replica, _ spanconfig.StoreReader,
 ) (processed bool, err error) {
 	desc := repl.Desc()
-	snap := repl.store.Engine().NewSnapshot()
+	eng := repl.store.StateEngine()
 	now := repl.store.Clock().Now()
-	defer snap.Close()
 	if err := q.tsData.MaintainTimeSeries(
-		ctx, snap, desc.StartKey, desc.EndKey, q.db, q.mem, TimeSeriesMaintenanceMemoryBudget, now,
+		ctx, eng, desc.StartKey, desc.EndKey, q.db, q.mem, TimeSeriesMaintenanceMemoryBudget, now,
 	); err != nil {
 		return false, err
 	}
@@ -159,6 +151,11 @@ func (q *timeSeriesMaintenanceQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 	return true, nil
+}
+
+func (*timeSeriesMaintenanceQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
 }
 
 func (q *timeSeriesMaintenanceQueue) timer(duration time.Duration) time.Duration {
@@ -176,5 +173,9 @@ func (q *timeSeriesMaintenanceQueue) timer(duration time.Duration) time.Duration
 }
 
 func (*timeSeriesMaintenanceQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*timeSeriesMaintenanceQueue) updateChan() <-chan time.Time {
 	return nil
 }

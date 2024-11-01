@@ -1,20 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,13 +34,13 @@ import (
 // entirely. This is possible if the function removes all of the in-flight
 // writes from an EndTxn request that was committing in parallel with writes
 // which all happened to be on the same range as the transaction record.
-func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, error) {
-	args, hasET := ba.GetArg(roachpb.EndTxn)
+func maybeStripInFlightWrites(ba *kvpb.BatchRequest) (*kvpb.BatchRequest, error) {
+	args, hasET := ba.GetArg(kvpb.EndTxn)
 	if !hasET {
 		return ba, nil
 	}
 
-	et := args.(*roachpb.EndTxnRequest)
+	et := args.(*kvpb.EndTxnRequest)
 	otherReqs := ba.Requests[:len(ba.Requests)-1]
 	if !et.IsParallelCommit() || len(otherReqs) == 0 {
 		return ba, nil
@@ -55,11 +51,18 @@ func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, 
 	// append. Code below can use origET to recreate the in-flight write set if
 	// any elements remain in it.
 	origET := et
-	et = origET.ShallowCopy().(*roachpb.EndTxnRequest)
+	etAlloc := new(struct {
+		et    kvpb.EndTxnRequest
+		union kvpb.RequestUnion_EndTxn
+	})
+	etAlloc.et = *origET // shallow copy
+	etAlloc.union.EndTxn = &etAlloc.et
+	et = &etAlloc.et
 	et.InFlightWrites = nil
 	et.LockSpans = et.LockSpans[:len(et.LockSpans):len(et.LockSpans)] // immutable
-	ba.Requests = append([]roachpb.RequestUnion(nil), ba.Requests...)
-	ba.Requests[len(ba.Requests)-1].MustSetInner(et)
+	ba = ba.ShallowCopy()
+	ba.Requests = append([]kvpb.RequestUnion(nil), ba.Requests...)
+	ba.Requests[len(ba.Requests)-1].Value = &etAlloc.union
 
 	// Fast-path: If we know that this batch contains all of the transaction's
 	// in-flight writes, then we can avoid searching in the in-flight writes set
@@ -70,10 +73,10 @@ func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, 
 		for _, ru := range otherReqs {
 			req := ru.GetInner()
 			switch {
-			case roachpb.IsIntentWrite(req) && !roachpb.IsRange(req):
-				// Concurrent point write.
+			case kvpb.CanParallelCommit(req):
+				// Concurrent point write being committed in parallel.
 				writes++
-			case req.Method() == roachpb.QueryIntent:
+			case req.Method() == kvpb.QueryIntent:
 				// Earlier pipelined point write that hasn't been proven yet.
 				writes++
 			default:
@@ -101,9 +104,9 @@ func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, 
 		req := ru.GetInner()
 		seq := req.Header().Sequence
 		switch {
-		case roachpb.IsIntentWrite(req) && !roachpb.IsRange(req):
-			// Concurrent point write.
-		case req.Method() == roachpb.QueryIntent:
+		case kvpb.CanParallelCommit(req):
+			// Concurrent point write being committed in parallel.
+		case req.Method() == kvpb.QueryIntent:
 			// Earlier pipelined point write that hasn't been proven yet. We
 			// could remove from the in-flight writes set when we see these,
 			// but doing so would prevent us from using the optimization we
@@ -171,77 +174,72 @@ func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, 
 // diverged and where bumping is possible. When possible, this allows the
 // transaction to commit without having to retry.
 //
-// Returns true if the timestamp was bumped.
+// Returns true if the timestamp was bumped. Also returns the possibly updated
+// batch request, which is shallow-copied on write.
 //
 // Note that this, like all the server-side bumping of the read timestamp, only
 // works for batches that exclusively contain writes; reads cannot be bumped
 // like this because they've already acquired timestamp-aware latches.
 func maybeBumpReadTimestampToWriteTimestamp(
-	ctx context.Context, ba *roachpb.BatchRequest, latchSpans *spanset.SpanSet,
-) bool {
+	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard,
+) (*kvpb.BatchRequest, bool) {
 	if ba.Txn == nil {
-		return false
+		return ba, false
+	}
+	if !ba.CanForwardReadTimestamp {
+		return ba, false
 	}
 	if ba.Txn.ReadTimestamp == ba.Txn.WriteTimestamp {
-		return false
+		return ba, false
 	}
-	arg, ok := ba.GetArg(roachpb.EndTxn)
+	arg, ok := ba.GetArg(kvpb.EndTxn)
 	if !ok {
-		return false
+		return ba, false
 	}
-	etArg := arg.(*roachpb.EndTxnRequest)
-	if ba.CanForwardReadTimestamp && !batcheval.IsEndTxnExceedingDeadline(ba.Txn.WriteTimestamp, etArg) {
-		return tryBumpBatchTimestamp(ctx, ba, ba.Txn.WriteTimestamp, latchSpans)
+	et := arg.(*kvpb.EndTxnRequest)
+	if batcheval.IsEndTxnExceedingDeadline(ba.Txn.WriteTimestamp, et.Deadline) {
+		return ba, false
 	}
-	return false
+	return tryBumpBatchTimestamp(ctx, ba, g, ba.Txn.WriteTimestamp)
 }
 
 // tryBumpBatchTimestamp attempts to bump ba's read and write timestamps to ts.
 //
-// Returns true if the timestamp was bumped. Returns false if the timestamp could
-// not be bumped.
+// This function is called both below and above latching, which is indicated by
+// the concurrency guard argument. The concurrency guard, if not nil, indicates
+// that the caller is holding latches and cannot adjust its timestamp beyond the
+// limits of what is protected by those latches. If the concurrency guard is
+// nil, the caller indicates that it is not holding latches and can therefore
+// more freely adjust its timestamp because it will re-acquire latches at
+// whatever timestamp the batch is bumped to.
+//
+// Returns true if the timestamp was bumped. Returns false if the timestamp
+// could not be bumped. Also returns the possibly updated batch request, which
+// is shallow-copied on write.
 func tryBumpBatchTimestamp(
-	ctx context.Context, ba *roachpb.BatchRequest, ts hlc.Timestamp, latchSpans *spanset.SpanSet,
-) bool {
-	if len(latchSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanGlobal)) > 0 {
-		// If the batch acquired any read latches with bounded (MVCC) timestamps
-		// then we can not trivially bump the batch's timestamp without dropping
-		// and re-acquiring those latches. Doing so could allow the request to
-		// read at an unprotected timestamp. We only look at global latch spans
-		// because local latch spans always use unbounded (NonMVCC) timestamps.
-		//
-		// NOTE: even if we hold read latches with high enough timestamps to
-		// fully cover ("protect") the batch at the new timestamp, we still
-		// don't want to allow the bump. This is because a batch with read spans
-		// and a higher timestamp may now conflict with locks that it previously
-		// did not. However, server-side retries don't re-scan the lock table.
-		// This can lead to requests missing unreplicated locks in the lock
-		// table that they should have seen or discovering replicated intents in
-		// MVCC that they should not have seen (from the perspective of the lock
-		// table's AddDiscoveredLock method).
-		//
-		// NOTE: we could consider adding a retry-loop above the latch
-		// acquisition to allow this to be retried, but given that we try not to
-		// mix read-only and read-write requests, doing so doesn't seem worth
-		// it.
-		return false
+	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard, ts hlc.Timestamp,
+) (*kvpb.BatchRequest, bool) {
+	if g != nil && !g.IsolatedAtLaterTimestamps() {
+		return ba, false
 	}
 	if ts.Less(ba.Timestamp) {
 		log.Fatalf(ctx, "trying to bump to %s <= ba.Timestamp: %s", ts, ba.Timestamp)
 	}
-	ba.Timestamp = ts
-	if txn := ba.Txn; txn == nil {
-		return true
+	if ba.Txn == nil {
+		log.VEventf(ctx, 2, "bumping batch timestamp to %s from %s", ts, ba.Timestamp)
+		ba = ba.ShallowCopy()
+		ba.Timestamp = ts
+		return ba, true
 	}
 	if ts.Less(ba.Txn.ReadTimestamp) || ts.Less(ba.Txn.WriteTimestamp) {
 		log.Fatalf(ctx, "trying to bump to %s inconsistent with ba.Txn.ReadTimestamp: %s, "+
 			"ba.Txn.WriteTimestamp: %s", ts, ba.Txn.ReadTimestamp, ba.Txn.WriteTimestamp)
 	}
-	log.VEventf(ctx, 2, "bumping batch timestamp to: %s from read: %s, write: %s)",
+	log.VEventf(ctx, 2, "bumping batch timestamp to: %s from read: %s, write: %s",
 		ts, ba.Txn.ReadTimestamp, ba.Txn.WriteTimestamp)
+	ba = ba.ShallowCopy()
 	ba.Txn = ba.Txn.Clone()
-	ba.Txn.ReadTimestamp = ts
-	ba.Txn.WriteTimestamp = ts
-	ba.Txn.WriteTooOld = false
-	return true
+	ba.Txn.BumpReadTimestamp(ts)
+	ba.Timestamp = ba.Txn.ReadTimestamp // Refresh just updated ReadTimestamp
+	return ba, true
 }

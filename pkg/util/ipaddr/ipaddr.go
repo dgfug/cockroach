@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ipaddr
 
@@ -34,12 +29,12 @@ type Addr uint128.Uint128
 
 // IPAddr stores an IP address's family, IP, and host mask. This was chosen over
 // Go's "net" IP, as that struct doesn't work well for what we need to do.
-// 	- It discards information when parsing IPv4, forcing it to be IPv6, and then
-// 		assuming IPv4-mapped IPv6 addresses are purely IPv4 (only for printing).
-// 		This is solved by having a Family field.
-// 	- ParseIP and ParseCIDR are very strict, whereas postgres' INET and CIDR
-// 	  have very relaxed constraints for parsing an IP.
-//  - Doing int64 operations is much more efficient than byte slice operations.
+//   - It discards information when parsing IPv4, forcing it to be IPv6, and then
+//     assuming IPv4-mapped IPv6 addresses are purely IPv4 (only for printing).
+//     This is solved by having a Family field.
+//   - ParseIP and ParseCIDR are very strict, whereas postgres' INET and CIDR
+//     have very relaxed constraints for parsing an IP.
+//   - Doing int64 operations is much more efficient than byte slice operations.
 type IPAddr struct {
 	// Family denotes what type of IP the original IP was.
 	Family IPFamily

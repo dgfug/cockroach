@@ -22,6 +22,7 @@
 <tr><td><a href="float.html">float</a> <code>%</code> <a href="float.html">float</a></td><td><a href="float.html">float</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>%</code> <a href="decimal.html">decimal</a></td><td><a href="decimal.html">decimal</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>%</code> <a href="int.html">int</a></td><td><a href="int.html">int</a></td></tr>
+<tr><td><a href="string.html">string</a> <code>%</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>&</code></td><td>Return</td></tr>
@@ -54,6 +55,7 @@
 <tr><td><a href="interval.html">interval</a> <code>*</code> <a href="decimal.html">decimal</a></td><td><a href="interval.html">interval</a></td></tr>
 <tr><td><a href="interval.html">interval</a> <code>*</code> <a href="float.html">float</a></td><td><a href="interval.html">interval</a></td></tr>
 <tr><td><a href="interval.html">interval</a> <code>*</code> <a href="int.html">int</a></td><td><a href="interval.html">interval</a></td></tr>
+<tr><td>vector <code>*</code> vector</td><td>vector</td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>+</code></td><td>Return</td></tr>
@@ -68,6 +70,7 @@
 <tr><td><a href="date.html">date</a> <code>+</code> timetz</td><td><a href="timestamp.html">timestamptz</a></td></tr>
 <tr><td><a href="decimal.html">decimal</a> <code>+</code> <a href="decimal.html">decimal</a></td><td><a href="decimal.html">decimal</a></td></tr>
 <tr><td><a href="decimal.html">decimal</a> <code>+</code> <a href="int.html">int</a></td><td><a href="decimal.html">decimal</a></td></tr>
+<tr><td><a href="decimal.html">decimal</a> <code>+</code> pg_lsn</td><td>pg_lsn</td></tr>
 <tr><td><a href="float.html">float</a> <code>+</code> <a href="float.html">float</a></td><td><a href="float.html">float</a></td></tr>
 <tr><td><a href="inet.html">inet</a> <code>+</code> <a href="int.html">int</a></td><td><a href="inet.html">inet</a></td></tr>
 <tr><td><a href="int.html">int</a> <code>+</code> <a href="date.html">date</a></td><td><a href="date.html">date</a></td></tr>
@@ -80,12 +83,14 @@
 <tr><td><a href="interval.html">interval</a> <code>+</code> <a href="timestamp.html">timestamp</a></td><td><a href="timestamp.html">timestamp</a></td></tr>
 <tr><td><a href="interval.html">interval</a> <code>+</code> <a href="timestamp.html">timestamptz</a></td><td><a href="timestamp.html">timestamptz</a></td></tr>
 <tr><td><a href="interval.html">interval</a> <code>+</code> timetz</td><td>timetz</td></tr>
+<tr><td>pg_lsn <code>+</code> <a href="decimal.html">decimal</a></td><td>pg_lsn</td></tr>
 <tr><td><a href="time.html">time</a> <code>+</code> <a href="date.html">date</a></td><td><a href="timestamp.html">timestamp</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>+</code> <a href="interval.html">interval</a></td><td><a href="time.html">time</a></td></tr>
 <tr><td><a href="timestamp.html">timestamp</a> <code>+</code> <a href="interval.html">interval</a></td><td><a href="timestamp.html">timestamp</a></td></tr>
 <tr><td><a href="timestamp.html">timestamptz</a> <code>+</code> <a href="interval.html">interval</a></td><td><a href="timestamp.html">timestamptz</a></td></tr>
 <tr><td>timetz <code>+</code> <a href="date.html">date</a></td><td><a href="timestamp.html">timestamptz</a></td></tr>
 <tr><td>timetz <code>+</code> <a href="interval.html">interval</a></td><td>timetz</td></tr>
+<tr><td>vector <code>+</code> vector</td><td>vector</td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>-</code></td><td>Return</td></tr>
@@ -109,6 +114,8 @@
 <tr><td>jsonb <code>-</code> <a href="int.html">int</a></td><td>jsonb</td></tr>
 <tr><td>jsonb <code>-</code> <a href="string.html">string</a></td><td>jsonb</td></tr>
 <tr><td>jsonb <code>-</code> <a href="string.html">string[]</a></td><td>jsonb</td></tr>
+<tr><td>pg_lsn <code>-</code> <a href="decimal.html">decimal</a></td><td>pg_lsn</td></tr>
+<tr><td>pg_lsn <code>-</code> pg_lsn</td><td><a href="decimal.html">decimal</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>-</code> <a href="interval.html">interval</a></td><td><a href="time.html">time</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>-</code> <a href="time.html">time</a></td><td><a href="interval.html">interval</a></td></tr>
 <tr><td><a href="timestamp.html">timestamp</a> <code>-</code> <a href="interval.html">interval</a></td><td><a href="timestamp.html">timestamp</a></td></tr>
@@ -118,6 +125,7 @@
 <tr><td><a href="timestamp.html">timestamptz</a> <code>-</code> <a href="timestamp.html">timestamp</a></td><td><a href="interval.html">interval</a></td></tr>
 <tr><td><a href="timestamp.html">timestamptz</a> <code>-</code> <a href="timestamp.html">timestamptz</a></td><td><a href="interval.html">interval</a></td></tr>
 <tr><td>timetz <code>-</code> <a href="interval.html">interval</a></td><td>timetz</td></tr>
+<tr><td>vector <code>-</code> vector</td><td>vector</td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>-></code></td><td>Return</td></tr>
@@ -187,6 +195,8 @@
 <tr><td>jsonb <code><</code> jsonb</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code><</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code><</code> oid</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>pg_lsn <code><</code> pg_lsn</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>refcursor <code><</code> refcursor</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string</a> <code><</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string[]</a> <code><</code> <a href="string.html">string[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="time.html">time</a> <code><</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -206,6 +216,17 @@
 <tr><td><a href="uuid.html">uuid</a> <code><</code> <a href="uuid.html">uuid</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid[]</a> <code><</code> <a href="uuid.html">uuid[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>varbit <code><</code> varbit</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>vector <code><</code> vector</td><td><a href="bool.html">bool</a></td></tr>
+</tbody></table>
+<table><thead>
+<tr><td><code><#></code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td>vector <code><#></code> vector</td><td><a href="float.html">float</a></td></tr>
+</tbody></table>
+<table><thead>
+<tr><td><code><-></code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td>vector <code><-></code> vector</td><td><a href="float.html">float</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code><<</code></td><td>Return</td></tr>
@@ -250,6 +271,8 @@
 <tr><td>jsonb <code><=</code> jsonb</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code><=</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code><=</code> oid</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>pg_lsn <code><=</code> pg_lsn</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>refcursor <code><=</code> refcursor</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string</a> <code><=</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string[]</a> <code><=</code> <a href="string.html">string[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="time.html">time</a> <code><=</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -269,6 +292,12 @@
 <tr><td><a href="uuid.html">uuid</a> <code><=</code> <a href="uuid.html">uuid</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid[]</a> <code><=</code> <a href="uuid.html">uuid[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>varbit <code><=</code> varbit</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>vector <code><=</code> vector</td><td><a href="bool.html">bool</a></td></tr>
+</tbody></table>
+<table><thead>
+<tr><td><code><=></code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td>vector <code><=></code> vector</td><td><a href="float.html">float</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code><@</code></td><td>Return</td></tr>
@@ -312,6 +341,8 @@
 <tr><td>jsonb <code>=</code> jsonb</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code>=</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code>=</code> oid</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>pg_lsn <code>=</code> pg_lsn</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>refcursor <code>=</code> refcursor</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>=</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string[]</a> <code>=</code> <a href="string.html">string[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>=</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -327,10 +358,13 @@
 <tr><td>timestamptz <code>=</code> timestamptz</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>timetz <code>=</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>timetz <code>=</code> timetz</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>tsquery <code>=</code> tsquery</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>tsvector <code>=</code> tsvector</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>tuple <code>=</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid</a> <code>=</code> <a href="uuid.html">uuid</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid[]</a> <code>=</code> <a href="uuid.html">uuid[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>varbit <code>=</code> varbit</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>vector <code>=</code> vector</td><td><a href="bool.html">bool</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>>></code></td><td>Return</td></tr>
@@ -361,6 +395,12 @@
 <tr><td>jsonb <code>@></code> jsonb</td><td><a href="bool.html">bool</a></td></tr>
 </tbody></table>
 <table><thead>
+<tr><td><code>@@</code></td><td>Return</td></tr>
+</thead><tbody>
+<tr><td>tsquery <code>@@</code> tsvector</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>tsvector <code>@@</code> tsquery</td><td><a href="bool.html">bool</a></td></tr>
+</tbody></table>
+<table><thead>
 <tr><td><code>ILIKE</code></td><td>Return</td></tr>
 </thead><tbody>
 <tr><td><a href="string.html">string</a> <code>ILIKE</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -383,6 +423,8 @@
 <tr><td><a href="interval.html">interval</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>jsonb <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>pg_lsn <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>refcursor <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="timestamp.html">timestamp</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
@@ -391,6 +433,7 @@
 <tr><td>tuple <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid</a> <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>varbit <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>vector <code>IN</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>IS NOT DISTINCT FROM</code></td><td>Return</td></tr>
@@ -429,6 +472,8 @@
 <tr><td>jsonb <code>IS NOT DISTINCT FROM</code> jsonb</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code>IS NOT DISTINCT FROM</code> <a href="int.html">int</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>oid <code>IS NOT DISTINCT FROM</code> oid</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>pg_lsn <code>IS NOT DISTINCT FROM</code> pg_lsn</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>refcursor <code>IS NOT DISTINCT FROM</code> refcursor</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>IS NOT DISTINCT FROM</code> <a href="string.html">string</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="string.html">string[]</a> <code>IS NOT DISTINCT FROM</code> <a href="string.html">string[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="time.html">time</a> <code>IS NOT DISTINCT FROM</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
@@ -444,11 +489,16 @@
 <tr><td>timestamptz <code>IS NOT DISTINCT FROM</code> timestamptz</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>timetz <code>IS NOT DISTINCT FROM</code> <a href="time.html">time</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>timetz <code>IS NOT DISTINCT FROM</code> timetz</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>tsquery <code>IS NOT DISTINCT FROM</code> tsquery</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>tsvector <code>IS NOT DISTINCT FROM</code> tsvector</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>tuple <code>IS NOT DISTINCT FROM</code> tuple</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>unknown <code>IS NOT DISTINCT FROM</code> unknown</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>unknown <code>IS NOT DISTINCT FROM</code> void</td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid</a> <code>IS NOT DISTINCT FROM</code> <a href="uuid.html">uuid</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td><a href="uuid.html">uuid[]</a> <code>IS NOT DISTINCT FROM</code> <a href="uuid.html">uuid[]</a></td><td><a href="bool.html">bool</a></td></tr>
 <tr><td>varbit <code>IS NOT DISTINCT FROM</code> varbit</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>vector <code>IS NOT DISTINCT FROM</code> vector</td><td><a href="bool.html">bool</a></td></tr>
+<tr><td>void <code>IS NOT DISTINCT FROM</code> unknown</td><td><a href="bool.html">bool</a></td></tr>
 </tbody></table>
 <table><thead>
 <tr><td><code>LIKE</code></td><td>Return</td></tr>
@@ -527,6 +577,10 @@
 <tr><td>jsonb <code>||</code> <a href="string.html">string</a></td><td><a href="string.html">string</a></td></tr>
 <tr><td>oid <code>||</code> oid</td><td>oid</td></tr>
 <tr><td>oid <code>||</code> <a href="string.html">string</a></td><td><a href="string.html">string</a></td></tr>
+<tr><td>pg_lsn <code>||</code> pg_lsn</td><td>pg_lsn</td></tr>
+<tr><td>pg_lsn <code>||</code> <a href="string.html">string</a></td><td><a href="string.html">string</a></td></tr>
+<tr><td>refcursor <code>||</code> refcursor</td><td>refcursor</td></tr>
+<tr><td>refcursor <code>||</code> <a href="string.html">string</a></td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="bool.html">bool</a></td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> box2d</td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="date.html">date</a></td><td><a href="string.html">string</a></td></tr>
@@ -539,6 +593,8 @@
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="interval.html">interval</a></td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> jsonb</td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> oid</td><td><a href="string.html">string</a></td></tr>
+<tr><td><a href="string.html">string</a> <code>||</code> pg_lsn</td><td><a href="string.html">string</a></td></tr>
+<tr><td><a href="string.html">string</a> <code>||</code> refcursor</td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="string.html">string</a></td><td><a href="string.html">string</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="string.html">string[]</a></td><td><a href="string.html">string[]</a></td></tr>
 <tr><td><a href="string.html">string</a> <code>||</code> <a href="time.html">time</a></td><td><a href="string.html">string</a></td></tr>

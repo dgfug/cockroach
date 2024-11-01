@@ -1,19 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
 import "testing"
 
-func BenchmarkSystemDatabaseQueries(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkSystemDatabaseQueries(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("SystemDatabaseQueries", []RoundTripBenchTestCase{
 		// This query performs 1-2 lookups: getting the descriptor ID by Name, then
 		// fetching the system table descriptor. The descriptor is then cached.
 		{
@@ -34,7 +30,5 @@ func BenchmarkSystemDatabaseQueries(b *testing.B) {
 			Setup: `SET sql_safe_updates = false; USE "";`,
 			Stmt:  `SELECT username, "hashedPassword"  FROM system.users WHERE username = 'root'`,
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }

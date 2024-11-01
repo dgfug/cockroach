@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package txnwait
 
@@ -14,11 +9,15 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"runtime/pprof"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -44,49 +43,105 @@ var TxnLivenessHeartbeatMultiplier = envutil.EnvOrDefaultInt(
 // mutable to allow tests to override it.
 //
 // Use TestingOverrideTxnLivenessThreshold to override the value in tests.
-var TxnLivenessThreshold = time.Duration(TxnLivenessHeartbeatMultiplier) * base.DefaultTxnHeartbeatInterval
+//
+// This is an atomic to avoid data races as some tests want to update this
+// in a running cluster.
+var TxnLivenessThreshold = func() *atomic.Int64 {
+	var a atomic.Int64
+	a.Store(int64(TxnLivenessHeartbeatMultiplier) * int64(base.DefaultTxnHeartbeatInterval))
+	return &a
+}()
 
 // TestingOverrideTxnLivenessThreshold allows tests to override the transaction
 // liveness threshold. The function returns a closure that should be called to
 // reset the value.
 func TestingOverrideTxnLivenessThreshold(t time.Duration) func() {
-	old := TxnLivenessThreshold
-	TxnLivenessThreshold = t
+	old := TxnLivenessThreshold.Swap(int64(t))
 	return func() {
-		TxnLivenessThreshold = old
+		TxnLivenessThreshold.Store(old)
 	}
 }
 
-// ShouldPushImmediately returns whether the PushTxn request should
-// proceed without queueing. This is true for pushes which are neither
-// ABORT nor TIMESTAMP, but also for ABORT and TIMESTAMP pushes where
-// the pushee has min priority or pusher has max priority.
-func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
-	if req.Force {
+// ShouldPushImmediately returns whether the PushTxn request should proceed
+// without queueing. This is true for pushes which are neither ABORT nor
+// TIMESTAMP, but also for ABORT and TIMESTAMP pushes with WaitPolicy_Error or
+// where the pusher has priority.
+func ShouldPushImmediately(
+	req *kvpb.PushTxnRequest, pusheeStatus roachpb.TransactionStatus, wp lock.WaitPolicy,
+) bool {
+	if req.Force || wp == lock.WaitPolicy_Error {
 		return true
 	}
-	if !(req.PushType == roachpb.PUSH_ABORT || req.PushType == roachpb.PUSH_TIMESTAMP) {
-		return true
+	return CanPushWithPriority(
+		req.PushType,
+		req.PusherTxn.IsoLevel, req.PusheeTxn.IsoLevel,
+		req.PusherTxn.Priority, req.PusheeTxn.Priority,
+		pusheeStatus,
+	)
+}
+
+// CanPushWithPriority returns true if the pusher can perform the specified push
+// type on the pushee, based on the two txns' isolation levels, their priorities,
+// and the pushee's status.
+func CanPushWithPriority(
+	pushType kvpb.PushTxnType,
+	pusherIso, pusheeIso isolation.Level,
+	pusherPri, pusheePri enginepb.TxnPriority,
+	pusheeStatus roachpb.TransactionStatus,
+) bool {
+	// Normalize the transaction priorities so that normal user priorities are
+	// considered equal for the purposes of pushing.
+	normalize := func(p enginepb.TxnPriority) enginepb.TxnPriority {
+		switch p {
+		case enginepb.MinTxnPriority, enginepb.MaxTxnPriority:
+			return p
+		default /* normal txn priorities */ :
+			return enginepb.MinTxnPriority + 1
+		}
 	}
-	p1, p2 := req.PusherTxn.Priority, req.PusheeTxn.Priority
-	if p1 > p2 && (p1 == enginepb.MaxTxnPriority || p2 == enginepb.MinTxnPriority) {
+	pusherPri, pusheePri = normalize(pusherPri), normalize(pusheePri)
+	switch pushType {
+	case kvpb.PUSH_ABORT:
+		return pusherPri > pusheePri
+	case kvpb.PUSH_TIMESTAMP:
+		// If the pushee transaction is STAGING, only let the PUSH_TIMESTAMP through
+		// to disrupt the transaction commit if the pusher has a higher priority. If
+		// the priorities are equal, the PUSH_TIMESTAMP should wait for the commit
+		// to complete.
+		if pusheeStatus == roachpb.STAGING {
+			return pusherPri > pusheePri
+		}
+		// Otherwise, the pushee has not yet started committing...
+
+		// If the pushee transaction tolerates write skew, the PUSH_TIMESTAMP is
+		// harmless, so let it through.
+		return pusheeIso.ToleratesWriteSkew() ||
+			// Else, if the pushee transaction does not tolerate write skew but the
+			// pusher transaction does (and expects other to), let the PUSH_TIMESTAMP
+			// proceed as long as the pusher has at least the same priority.
+			(pusherIso.ToleratesWriteSkew() && pusherPri >= pusheePri) ||
+			// Otherwise, if neither transaction tolerates write skew, let the
+			// PUSH_TIMESTAMP proceed only if the pusher has a higher priority.
+			(pusherPri > pusheePri)
+	case kvpb.PUSH_TOUCH:
 		return true
+	default:
+		panic("unreachable")
 	}
-	return false
 }
 
 // isPushed returns whether the PushTxn request has already been
 // fulfilled by the current transaction state. This may be true
 // for transactions with pushed timestamps.
-func isPushed(req *roachpb.PushTxnRequest, txn *roachpb.Transaction) bool {
-	return (txn.Status.IsFinalized() ||
-		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.LessEq(txn.WriteTimestamp)))
+func isPushed(req *kvpb.PushTxnRequest, txn *roachpb.Transaction) bool {
+	return txn.Status.IsFinalized() ||
+		(req.PushType == kvpb.PUSH_TIMESTAMP && req.PushTo.LessEq(txn.WriteTimestamp))
 }
 
 // TxnExpiration computes the timestamp after which the transaction will be
 // considered expired.
 func TxnExpiration(txn *roachpb.Transaction) hlc.Timestamp {
-	return txn.LastActive().Add(TxnLivenessThreshold.Nanoseconds(), 0)
+	return txn.LastActive().Add(TxnLivenessThreshold.Load(), 0)
 }
 
 // IsExpired is true if the given transaction is expired.
@@ -97,8 +152,8 @@ func IsExpired(now hlc.Timestamp, txn *roachpb.Transaction) bool {
 // createPushTxnResponse returns a PushTxnResponse struct with a
 // copy of the supplied transaction. It is necessary to fully copy
 // each field in the transaction to avoid race conditions.
-func createPushTxnResponse(txn *roachpb.Transaction) *roachpb.PushTxnResponse {
-	return &roachpb.PushTxnResponse{PusheeTxn: *txn}
+func createPushTxnResponse(txn *roachpb.Transaction) *kvpb.PushTxnResponse {
+	return &kvpb.PushTxnResponse{PusheeTxn: *txn}
 }
 
 // A waitingPush represents a PushTxn command that is waiting on the
@@ -106,7 +161,7 @@ func createPushTxnResponse(txn *roachpb.Transaction) *roachpb.PushTxnResponse {
 // set of all txns which are waiting on this txn in order to detect
 // dependency cycles.
 type waitingPush struct {
-	req *roachpb.PushTxnRequest
+	req *kvpb.PushTxnRequest
 	// pending channel receives updated, pushed txn or nil if queue is cleared.
 	pending chan *roachpb.Transaction
 	mu      struct {
@@ -184,7 +239,7 @@ type Config struct {
 // TestingKnobs represents testing knobs for a Queue.
 type TestingKnobs struct {
 	// OnTxnWaitEnqueue is called when a would-be pusher joins a wait queue.
-	OnPusherBlocked func(ctx context.Context, push *roachpb.PushTxnRequest)
+	OnPusherBlocked func(ctx context.Context, push *kvpb.PushTxnRequest)
 	// OnTxnUpdate is called by Queue.UpdateTxn.
 	OnTxnUpdate func(ctx context.Context, txn *roachpb.Transaction)
 }
@@ -203,8 +258,9 @@ type TestingKnobs struct {
 //
 // Queue is thread safe.
 type Queue struct {
-	cfg Config
-	mu  struct {
+	cfg   Config
+	every log.EveryN // dictates logging for transaction aborts resulting from deadlock detection
+	mu    struct {
 		syncutil.RWMutex
 		txns    map[uuid.UUID]*pendingTxn
 		queries map[uuid.UUID]*waitingQueries
@@ -213,7 +269,10 @@ type Queue struct {
 
 // NewQueue instantiates a new Queue.
 func NewQueue(cfg Config) *Queue {
-	return &Queue{cfg: cfg}
+	return &Queue{
+		cfg:   cfg,
+		every: log.Every(1 * time.Second),
+	}
 }
 
 // Enable allows transactions to be enqueued and waiting pushers
@@ -393,7 +452,7 @@ func (q *Queue) GetDependents(txnID uuid.UUID) []uuid.UUID {
 // the QueryTxnRequest has had its status or priority updated
 // or whether the known set of dependent transactions has
 // changed.
-func (q *Queue) isTxnUpdated(pending *pendingTxn, req *roachpb.QueryTxnRequest) bool {
+func (q *Queue) isTxnUpdated(pending *pendingTxn, req *kvpb.QueryTxnRequest) bool {
 	// First check whether txn status or priority has changed.
 	txn := pending.getTxn()
 	if txn.Status.IsFinalized() || txn.Priority > req.Txn.Priority {
@@ -429,12 +488,8 @@ func (q *Queue) releaseWaitingQueriesLocked(ctx context.Context, txnID uuid.UUID
 // If the transaction is successfully pushed while this method is waiting,
 // the first return value is a non-nil PushTxnResponse object.
 func (q *Queue) MaybeWaitForPush(
-	ctx context.Context, req *roachpb.PushTxnRequest,
-) (*roachpb.PushTxnResponse, *roachpb.Error) {
-	if ShouldPushImmediately(req) {
-		return nil, nil
-	}
-
+	ctx context.Context, req *kvpb.PushTxnRequest, wp lock.WaitPolicy,
+) (*kvpb.PushTxnResponse, *kvpb.Error) {
 	q.mu.Lock()
 	// If the txn wait queue is not enabled or if the request is not
 	// contained within the replica, do nothing. The request can fall
@@ -456,6 +511,9 @@ func (q *Queue) MaybeWaitForPush(
 	if txn := pending.getTxn(); isPushed(req, txn) {
 		q.mu.Unlock()
 		return createPushTxnResponse(txn), nil
+	} else if ShouldPushImmediately(req, txn.Status, wp) {
+		q.mu.Unlock()
+		return nil, nil
 	}
 
 	push := &waitingPush{
@@ -495,12 +553,23 @@ func (q *Queue) MaybeWaitForPush(
 		req.PusheeTxn.ID.Short(),
 		waitingPushesCount,
 	)
+	var res *kvpb.PushTxnResponse
+	var err *kvpb.Error
+	labels := pprof.Labels("pushee", req.PusheeTxn.ID.String(), "pusher", pusherStr)
+	pprof.Do(ctx, labels, func(ctx context.Context) {
+		res, err = q.waitForPush(ctx, req, push, pending)
+	})
+	return res, err
+}
 
+func (q *Queue) waitForPush(
+	ctx context.Context, req *kvpb.PushTxnRequest, push *waitingPush, pending *pendingTxn,
+) (*kvpb.PushTxnResponse, *kvpb.Error) {
 	// Wait for any updates to the pusher txn to be notified when
 	// status, priority, or dependents (for deadlock detection) have
 	// changed.
 	var queryPusherCh <-chan *roachpb.Transaction // accepts updates to the pusher txn
-	var queryPusherErrCh <-chan *roachpb.Error    // accepts errors querying the pusher txn
+	var queryPusherErrCh <-chan *kvpb.Error       // accepts errors querying the pusher txn
 	var readyCh chan struct{}                     // signaled when pusher txn should be queried
 
 	// Query the pusher if it's a valid read-write transaction.
@@ -530,7 +599,7 @@ func (q *Queue) MaybeWaitForPush(
 	defer func() { metrics.PusherWaitTime.RecordValue(timeutil.Since(tBegin).Nanoseconds()) }()
 
 	slowTimerThreshold := time.Minute
-	slowTimer := timeutil.NewTimer()
+	var slowTimer timeutil.Timer
 	defer slowTimer.Stop()
 	slowTimer.Reset(slowTimerThreshold)
 
@@ -562,7 +631,7 @@ func (q *Queue) MaybeWaitForPush(
 		case <-ctx.Done():
 			// Caller has given up.
 			log.VEvent(ctx, 2, "pusher giving up due to context cancellation")
-			return nil, roachpb.NewError(ctx.Err())
+			return nil, kvpb.NewError(ctx.Err())
 		case <-q.cfg.Stopper.ShouldQuiesce():
 			// Let the push out so that they can be sent looking elsewhere.
 			return nil, nil
@@ -641,14 +710,14 @@ func (q *Queue) MaybeWaitForPush(
 			switch updatedPusher.Status {
 			case roachpb.COMMITTED:
 				log.VEventf(ctx, 1, "pusher committed: %v", updatedPusher)
-				return nil, roachpb.NewErrorWithTxn(roachpb.NewTransactionStatusError(
-					roachpb.TransactionStatusError_REASON_TXN_COMMITTED,
+				return nil, kvpb.NewErrorWithTxn(kvpb.NewTransactionStatusError(
+					kvpb.TransactionStatusError_REASON_TXN_COMMITTED,
 					"already committed"),
 					updatedPusher)
 			case roachpb.ABORTED:
 				log.VEventf(ctx, 1, "pusher aborted: %v", updatedPusher)
-				return nil, roachpb.NewErrorWithTxn(
-					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED), updatedPusher)
+				return nil, kvpb.NewErrorWithTxn(
+					kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_PUSHER_ABORTED), updatedPusher)
 			}
 			log.VEventf(ctx, 2, "pusher was updated: %v", updatedPusher)
 			if updatedPusher.Priority > pusherPriority {
@@ -684,9 +753,15 @@ func (q *Queue) MaybeWaitForPush(
 				// Break the deadlock if the pusher has higher priority.
 				p1, p2 := pusheePriority, pusherPriority
 				if p1 < p2 || (p1 == p2 && bytes.Compare(req.PusheeTxn.ID.GetBytes(), req.PusherTxn.ID.GetBytes()) < 0) {
+					// NB: It's useful to have logs indicating the transactions involved
+					// in a deadlock, but we don't want these to be too spammy.
+					level := log.Level(1)
+					if q.every.ShouldLog() {
+						level = 0 // will behave like a log.Infof
+					}
 					log.VEventf(
 						ctx,
-						1,
+						level,
 						"%s breaking deadlock by force push of %s; dependencies=%s",
 						req.PusherTxn.ID.Short(),
 						req.PusheeTxn.ID.Short(),
@@ -711,9 +786,7 @@ func (q *Queue) MaybeWaitForPush(
 // request hasn't specified WaitForUpdate, return immediately. If
 // there is a queue, enqueue this request as a waiter and enter a
 // select loop waiting for any updates to the target transaction.
-func (q *Queue) MaybeWaitForQuery(
-	ctx context.Context, req *roachpb.QueryTxnRequest,
-) *roachpb.Error {
+func (q *Queue) MaybeWaitForQuery(ctx context.Context, req *kvpb.QueryTxnRequest) *kvpb.Error {
 	if !req.WaitForUpdate {
 		return nil
 	}
@@ -781,7 +854,7 @@ func (q *Queue) MaybeWaitForQuery(
 	select {
 	case <-ctx.Done():
 		// Caller has given up.
-		return roachpb.NewError(ctx.Err())
+		return kvpb.NewError(ctx.Err())
 	case <-maxWaitCh:
 		return nil
 	case <-query.pending:
@@ -805,9 +878,9 @@ func (q *Queue) MaybeWaitForQuery(
 // invocation of QueryTxn in order to avoid busy querying.
 func (q *Queue) startQueryPusherTxn(
 	ctx context.Context, push *waitingPush, readyCh <-chan struct{},
-) (<-chan *roachpb.Transaction, <-chan *roachpb.Error) {
+) (<-chan *roachpb.Transaction, <-chan *kvpb.Error) {
 	ch := make(chan *roachpb.Transaction, 1)
-	errCh := make(chan *roachpb.Error, 1)
+	errCh := make(chan *kvpb.Error, 1)
 	push.mu.Lock()
 	var waitingTxns []uuid.UUID
 	if push.mu.dependents != nil {
@@ -825,7 +898,7 @@ func (q *Queue) startQueryPusherTxn(
 			// We use a backoff/retry here in case the pusher transaction
 			// doesn't yet exist.
 			for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
-				var pErr *roachpb.Error
+				var pErr *kvpb.Error
 				var updatedPusher *roachpb.Transaction
 				updatedPusher, waitingTxns, pErr = q.queryTxnStatus(
 					ctx, pusher.TxnMeta, true, waitingTxns,
@@ -865,16 +938,16 @@ func (q *Queue) startQueryPusherTxn(
 				// push waiter requires another query of the pusher txn.
 				select {
 				case <-ctx.Done():
-					errCh <- roachpb.NewError(ctx.Err())
+					errCh <- kvpb.NewError(ctx.Err())
 					return
 				case <-readyCh:
 				}
 				// Reset the retry to query again immediately.
 				r.Reset()
 			}
-			errCh <- roachpb.NewError(ctx.Err())
+			errCh <- kvpb.NewError(ctx.Err())
 		}); err != nil {
-		errCh <- roachpb.NewError(err)
+		errCh <- kvpb.NewError(err)
 	}
 	return ch, errCh
 }
@@ -890,11 +963,11 @@ func (q *Queue) startQueryPusherTxn(
 // the list of transactions which are waiting on the updated txn.
 func (q *Queue) queryTxnStatus(
 	ctx context.Context, txnMeta enginepb.TxnMeta, wait bool, dependents []uuid.UUID,
-) (*roachpb.Transaction, []uuid.UUID, *roachpb.Error) {
+) (*roachpb.Transaction, []uuid.UUID, *kvpb.Error) {
 	b := &kv.Batch{}
 	b.Header.Timestamp = q.cfg.Clock.Now()
-	b.AddRawRequest(&roachpb.QueryTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	b.AddRawRequest(&kvpb.QueryTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnMeta.Key,
 		},
 		Txn:              txnMeta,
@@ -913,7 +986,7 @@ func (q *Queue) queryTxnStatus(
 		//
 		// Scenario:
 		// - we're aborted and don't know if we have a read-write conflict
-		// - the push above fails and we get a WriteIntentError
+		// - the push above fails and we get a LockConflictError
 		// - we try to update our transaction (right here, and if we don't we might
 		// be stuck in a race, that's why we do this - the txn proto we're using
 		// might be outdated)
@@ -923,17 +996,11 @@ func (q *Queue) queryTxnStatus(
 		//
 		// so something is sketchy here, but it should all resolve nicely when we
 		// don't use store.db for these internal requests any more.
-		return nil, nil, roachpb.NewError(err)
+		return nil, nil, kvpb.NewError(err)
 	}
 	br := b.RawResponse()
-	resp := br.Responses[0].GetInner().(*roachpb.QueryTxnResponse)
-	// ID can be nil if no HeartbeatTxn has been sent yet and we're talking to a
-	// 2.1 node.
-	// TODO(nvanbenschoten): Remove this in 2.3.
-	if updatedTxn := &resp.QueriedTxn; updatedTxn.ID != (uuid.UUID{}) {
-		return updatedTxn, resp.WaitingTxns, nil
-	}
-	return nil, nil, nil
+	resp := br.Responses[0].GetInner().(*kvpb.QueryTxnResponse)
+	return &resp.QueriedTxn, resp.WaitingTxns, nil
 }
 
 // forcePushAbort upgrades the PushTxn request to a "forced" push abort, which
@@ -941,12 +1008,12 @@ func (q *Queue) queryTxnStatus(
 // the pushee. This mechanism can be used to break deadlocks between conflicting
 // transactions.
 func (q *Queue) forcePushAbort(
-	ctx context.Context, req *roachpb.PushTxnRequest,
-) (*roachpb.PushTxnResponse, *roachpb.Error) {
+	ctx context.Context, req *kvpb.PushTxnRequest,
+) (*kvpb.PushTxnResponse, *kvpb.Error) {
 	log.VEventf(ctx, 1, "force pushing %v to break deadlock", req.PusheeTxn.ID)
 	forcePush := *req
 	forcePush.Force = true
-	forcePush.PushType = roachpb.PUSH_ABORT
+	forcePush.PushType = kvpb.PUSH_ABORT
 	b := &kv.Batch{}
 	b.Header.Timestamp = q.cfg.Clock.Now()
 	b.Header.Timestamp.Forward(req.PushTo)

@@ -1,0 +1,29 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "sqlstatsccl_test",
+    # Explicitly indicate timeout as some of the tests (ie TestSQLStatsRegions) might take up to 3 min to run.
+    timeout = "moderate",
+    srcs = [
+        "main_test.go",
+        "sql_stats_test.go",
+    ],
+    deps = [
+        "//pkg/base",
+        "//pkg/ccl",
+        "//pkg/roachpb",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
+        "//pkg/server",
+        "//pkg/sql/appstatspb",
+        "//pkg/testutils",
+        "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
+        "//pkg/testutils/sqlutils",
+        "//pkg/testutils/testcluster",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
+        "//pkg/util/randutil",
+        "@com_github_stretchr_testify//require",
+    ],
+)

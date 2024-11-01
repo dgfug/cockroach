@@ -1,244 +1,243 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scplan
 
 import (
-	"sort"
+	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scgraph"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/deprules"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/opgen"
-	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/opgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/current"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/release_24_1"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/release_24_2"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/release_24_3"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // Params holds the arguments for planning.
 type Params struct {
+	// context.Context for planning.
+	Ctx context.Context
+
+	// ActiveVersion contains the version currently active in the cluster.
+	ActiveVersion clusterversion.ClusterVersion
+
+	// InRollback is used to indicate whether we've already been reverted.
+	// Note that when in rollback, there is no turning back and all work is
+	// non-revertible. Theory dictates that this is fine because of how we
+	// had carefully crafted stages to only allow entering rollback while it
+	// remains safe to do so.
+	InRollback bool
+
 	// ExecutionPhase indicates the phase that the plan should be constructed for.
 	ExecutionPhase scop.Phase
-	// CreatedDescriptorIDs contains IDs for new descriptors created by the same
-	// schema changer (i.e., earlier in the same transaction). New descriptors
-	// can have most of their schema changes fully executed in the same
-	// transaction.
-	//
-	// This doesn't do anything right now.
-	CreatedDescriptorIDs catalog.DescriptorIDSet
+
+	// SchemaChangerJobIDSupplier is used to return the JobID for a
+	// job if one should exist.
+	SchemaChangerJobIDSupplier func() jobspb.JobID
+
+	// SkipPlannerSanityChecks, if false, strictly enforces sanity checks in the
+	// declarative schema changer planner.
+	SkipPlannerSanityChecks bool
+
+	// MemAcc returns the injected bound account that
+	// tracks memory allocations that long-live `scplan.MakePlan` function.
+	// It is currently only used to track memory allocation for EXPLAIN(DDL)
+	// output, as it's considered a continuation of the planning process.
+	MemAcc *mon.BoundAccount
 }
+
+// Exported internal types
+type (
+	// Graph is an exported alias of scgraph.Graph.
+	Graph = scgraph.Graph
+
+	// Stage is an exported alias of scstage.Stage.
+	Stage = scstage.Stage
+)
 
 // A Plan is a schema change plan, primarily containing ops to be executed that
 // are partitioned into stages.
 type Plan struct {
-	Params  Params
-	Initial scpb.State
-	Graph   *scgraph.Graph
-	Stages  []Stage
+	scpb.CurrentState
+	Params Params
+	Graph  *scgraph.Graph
+	JobID  jobspb.JobID
+	Stages []Stage
 }
 
-// A Stage is a sequence of ops to be executed "together" as part of a schema
-// change.
-//
-// Stages also contain the state before and after the execution of the ops in
-// the stage, reflecting the fact that any set of ops can be thought of as a
-// transition from one state to another.
-type Stage struct {
-	Before, After scpb.State
-	Ops           scop.Ops
-	Revertible    bool
+// StagesForCurrentPhase returns the stages in the execution phase specified in
+// the plan params.
+func (p Plan) StagesForCurrentPhase() []scstage.Stage {
+	for i, s := range p.Stages {
+		if s.Phase > p.Params.ExecutionPhase {
+			return p.Stages[:i]
+		}
+	}
+	return p.Stages
 }
 
 // MakePlan generates a Plan for a particular phase of a schema change, given
-// the initial state for a set of targets.
-func MakePlan(initial scpb.State, params Params) (_ Plan, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			rAsErr, ok := r.(error)
-			if !ok {
-				rAsErr = errors.Errorf("panic during MakePlan: %v", r)
-			}
-			err = errors.CombineErrors(err, rAsErr)
-		}
-	}()
-
-	g, err := opgen.BuildGraph(params.ExecutionPhase, initial)
-	if err != nil {
-		return Plan{}, err
+// the initial state for a set of targets. Returns an error when planning fails.
+func MakePlan(ctx context.Context, initial scpb.CurrentState, params Params) (p Plan, err error) {
+	defer scerrors.StartEventf(
+		ctx,
+		"building declarative schema changer plan in %s (rollback=%v) for %s",
+		redact.Safe(params.ExecutionPhase),
+		redact.Safe(params.InRollback),
+		redact.Safe(initial.StatementTags()),
+	).HandlePanicAndLogError(ctx, &err)
+	p = Plan{
+		CurrentState: initial,
+		Params:       params,
 	}
-	if err := deprules.Apply(g); err != nil {
-		return Plan{}, err
+	err = makePlan(ctx, &p)
+	if err != nil && ctx.Err() == nil {
+		err = p.DecorateErrorWithPlanDetails(err)
 	}
-
-	stages := buildStages(initial, g, params)
-	return Plan{
-		Params:  params,
-		Initial: initial,
-		Graph:   g,
-		Stages:  stages,
-	}, nil
+	return p, err
 }
 
-// validateStages sanity checks stages to ensure no
-// invalid execution plans are made.
-func validateStages(stages []Stage) {
-	revertibleAllowed := true
-	for idx, stage := range stages {
-		if !stage.Revertible {
-			revertibleAllowed = false
-		}
-		if stage.Revertible && !revertibleAllowed {
-			panic(errors.AssertionFailedf(
-				"invalid execution plan revertability flipped at stage (%d): %v", idx, stage))
+func makePlan(ctx context.Context, p *Plan) (err error) {
+	{
+		start := timeutil.Now()
+		// Generate the graph used to build the stages.
+		p.Graph = buildGraph(ctx, p.Params.ActiveVersion, p.CurrentState)
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "graph generation took %v", timeutil.Since(start))
 		}
 	}
+	{
+		start := timeutil.Now()
+		p.Stages = scstage.BuildStages(
+			ctx,
+			p.CurrentState,
+			p.Params.ExecutionPhase,
+			p.Graph,
+			p.Params.SchemaChangerJobIDSupplier,
+			!p.Params.SkipPlannerSanityChecks,
+		)
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "stage generation took %v", timeutil.Since(start))
+		}
+	}
+	if n := len(p.Stages); n > 0 && p.Stages[n-1].Phase > scop.PreCommitPhase {
+		// Only get the job ID if it's actually been assigned already.
+		p.JobID = p.Params.SchemaChangerJobIDSupplier()
+	}
+	if err := scstage.ValidateStages(p.TargetState, p.Stages, p.Graph); err != nil {
+		panic(errors.Wrapf(err, "invalid execution plan"))
+	}
+	return nil
 }
 
-func buildStages(init scpb.State, g *scgraph.Graph, params Params) []Stage {
-	// Fetch the order of the graph, which will be used to
-	// evaluating edges in topological order.
-	nodeRanks, err := g.GetNodeRanks()
+// rulesForReleaseInfo tracks the active version and registry for
+// each given release.
+type rulesForRelease struct {
+	activeVersion clusterversion.Key
+	rulesRegistry *rules.Registry
+}
+
+// rulesForRelease supported rules for each release, this is an ordered array
+// with the newest supported version first.
+var rulesForReleases = []rulesForRelease{
+	{activeVersion: clusterversion.Latest, rulesRegistry: current.GetRegistry()},
+	{activeVersion: clusterversion.V24_3, rulesRegistry: release_24_3.GetRegistry()},
+	{activeVersion: clusterversion.V24_2, rulesRegistry: release_24_2.GetRegistry()},
+	{activeVersion: clusterversion.V24_1, rulesRegistry: release_24_1.GetRegistry()},
+}
+
+// minVersionForRules the oldest version supported by the rules.
+var minVersionForRules = rulesForReleases[len(rulesForReleases)-1].activeVersion
+
+// GetRulesRegistryForRelease returns the rules registry based on the current
+// active version of cockroach. In a mixed version state, it's possible for the state
+// generated by a newer version of cockroach to be incompatible with old versions.
+// For example dependent objects or combinations of them in a partially executed,
+// plan may reach states where older versions of cockroach may not be able
+// to plan further (and vice versa). To eliminate the possibility of these issues, we
+// will plan with the set of rules belonging to the currently active version. One
+// example of this is the dependency between index name and secondary indexes
+// is more relaxed on 23.1 vs 22.2, which can lead to scenarios where the index
+// name may become public before the index is public (which was disallowed on older
+// versions).
+func GetRulesRegistryForRelease(
+	_ context.Context, activeVersion clusterversion.ClusterVersion,
+) *rules.Registry {
+	for _, r := range rulesForReleases {
+		if activeVersion.IsActive(r.activeVersion) {
+			return r.rulesRegistry
+		}
+	}
+	return nil
+}
+
+// GetReleasesForRulesRegistries returns all the supported version
+// numbers within the rule's registry.
+func GetReleasesForRulesRegistries() []clusterversion.ClusterVersion {
+	supportedVersions := make([]clusterversion.ClusterVersion, 0, len(rulesForReleases))
+	for _, r := range rulesForReleases {
+		supportedVersions = append(supportedVersions,
+			clusterversion.ClusterVersion{
+				Version: r.activeVersion.Version(),
+			})
+	}
+	return supportedVersions
+}
+
+// getMinValidVersionForRules this returns either the current active version,
+// or the minimum version for the rules tht we support (which ever is greater)
+func getMinValidVersionForRules(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion,
+) clusterversion.ClusterVersion {
+	if !activeVersion.IsActive(minVersionForRules) {
+		log.Warningf(ctx, "falling back to rules for minimum version (%v),"+
+			"active version was : %v",
+			minVersionForRules,
+			activeVersion)
+		return clusterversion.ClusterVersion{
+			Version: minVersionForRules.Version(),
+		}
+	}
+	return activeVersion
+}
+
+func applyDepRules(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion, g *scgraph.Graph,
+) error {
+	activeVersion = getMinValidVersionForRules(ctx, activeVersion)
+	registry := GetRulesRegistryForRelease(ctx, activeVersion)
+	return registry.ApplyDepRules(ctx, g)
+}
+
+func buildGraph(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion, cs scpb.CurrentState,
+) *scgraph.Graph {
+	g, err := opgen.BuildGraph(ctx, activeVersion, cs)
 	if err != nil {
-		panic(err)
+		panic(errors.Wrapf(err, "build graph op edges"))
 	}
-	// TODO(ajwerner): deal with the case where the target status was
-	// fulfilled by something that preceded the initial state.
-	cur := init
-	fulfilled := map[*scpb.Node]struct{}{}
-	filterUnsatisfiedEdgesStep := func(edges []*scgraph.OpEdge) ([]*scgraph.OpEdge, bool) {
-		candidates := make(map[*scpb.Node]struct{})
-		for _, e := range edges {
-			candidates[e.To()] = struct{}{}
-		}
-		// Check to see if the current set of edges will have their dependencies met
-		// if they are all run. Any which will not must be pruned. This greedy
-		// algorithm works, but a justification is in order.
-		failed := map[*scgraph.OpEdge]struct{}{}
-		for _, e := range edges {
-			_ = g.ForEachDepEdgeFrom(e.To(), func(de *scgraph.DepEdge) error {
-				_, isFulfilled := fulfilled[de.To()]
-				_, isCandidate := candidates[de.To()]
-				if isFulfilled || isCandidate {
-					return nil
-				}
-				failed[e] = struct{}{}
-				return iterutil.StopIteration()
-			})
-		}
-		if len(failed) == 0 {
-			return edges, true
-		}
-		truncated := edges[:0]
-		for _, e := range edges {
-			if _, found := failed[e]; !found {
-				truncated = append(truncated, e)
-			}
-		}
-		return truncated, false
+	err = applyDepRules(ctx, activeVersion, g)
+	if err != nil {
+		panic(errors.Wrapf(err, "build graph dep edges"))
 	}
-	filterUnsatisfiedEdges := func(edges []*scgraph.OpEdge) ([]*scgraph.OpEdge, bool) {
-		for len(edges) > 0 {
-			if filtered, done := filterUnsatisfiedEdgesStep(edges); !done {
-				edges = filtered
-			} else {
-				return filtered, true
-			}
-		}
-		return edges, false
+	err = g.Validate()
+	if err != nil {
+		panic(errors.Wrapf(err, "validate graph"))
 	}
-	buildStageType := func(edges []*scgraph.OpEdge) (Stage, bool) {
-		edges, ok := filterUnsatisfiedEdges(edges)
-		if !ok {
-			return Stage{}, false
-		}
-		sort.SliceStable(edges,
-			func(i, j int) bool {
-				// Higher ranked edges should go first.
-				return nodeRanks[edges[i].To()] > nodeRanks[edges[j].To()]
-			})
-
-		next := append(cur[:0:0], cur...)
-		isStageRevertible := true
-		var ops []scop.Op
-		for revertible := 1; revertible >= 0; revertible-- {
-			isStageRevertible = revertible == 1
-			for _, e := range edges {
-				for i, ts := range cur {
-					if e.From() == ts && isStageRevertible == e.Revertible() {
-						next[i] = e.To()
-						ops = append(ops, e.Op()...)
-						break
-					}
-				}
-			}
-			// If we added non-revertible stages
-			// then this stage is done
-			if len(ops) != 0 {
-				break
-			}
-		}
-		return Stage{
-			Before:     cur,
-			After:      next,
-			Ops:        scop.MakeOps(ops...),
-			Revertible: isStageRevertible,
-		}, true
-	}
-
-	var stages []Stage
-	for {
-		// Note that the current nodes are fulfilled for the sake of dependency
-		// checking.
-		for _, ts := range cur {
-			fulfilled[ts] = struct{}{}
-		}
-
-		// Extract the set of op edges for the current stage.
-		var opEdges []*scgraph.OpEdge
-		for _, t := range cur {
-			// TODO(ajwerner): improve the efficiency of this lookup.
-			// Look for an opEdge from this node. Then, for the other side
-			// of the opEdge, look for dependencies.
-			if oe, ok := g.GetOpEdgeFrom(t); ok {
-				opEdges = append(opEdges, oe)
-			}
-		}
-
-		// Group the op edges a per-type basis.
-		opTypes := make(map[scop.Type][]*scgraph.OpEdge)
-		for _, oe := range opEdges {
-			for _, op := range oe.Op() {
-				opTypes[op.Type()] = append(opTypes[op.Type()], oe)
-			}
-		}
-
-		// Greedily attempt to find a stage which can be executed. This is sane
-		// because once a dependency is met, it never becomes unmet.
-		var didSomething bool
-		var s Stage
-		for _, typ := range []scop.Type{
-			scop.MutationType,
-			scop.BackfillType,
-			scop.ValidationType,
-		} {
-			if s, didSomething = buildStageType(opTypes[typ]); didSomething {
-				break
-			}
-		}
-		if !didSomething {
-			break
-		}
-		stages = append(stages, s)
-		cur = s.After
-	}
-	validateStages(stages)
-	return stages
+	return g
 }

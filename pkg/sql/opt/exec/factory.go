@@ -1,13 +1,9 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package exec contains execution-related utilities. (See README.md.)
 package exec
 
 import (
@@ -16,11 +12,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 )
 
@@ -28,11 +26,70 @@ import (
 // (currently maps to sql.planNode).
 type Node interface{}
 
-// Plan represents the plan for a query (currently maps to sql.planTop).
+// Plan represents the plan for a query (currently maps to sql.planComponents).
 // For simple queries, the plan is associated with a single Node tree.
 // For queries containing subqueries, the plan is associated with multiple Node
 // trees (see ConstructPlan).
 type Plan interface{}
+
+// PlanFlags tracks various properties of the built plan.
+type PlanFlags uint32
+
+const (
+	// PlanFlagIsDDL is set if the statement contains DDL.
+	PlanFlagIsDDL = (1 << iota)
+
+	// PlanFlagContainsFullTableScan is set if the statement contains an
+	// unconstrained primary index scan. This could be a full scan of any
+	// cardinality. Full scans of virtual tables are ignored.
+	PlanFlagContainsFullTableScan
+
+	// PlanFlagContainsFullIndexScan is set if the statement contains an
+	// unconstrained non-partial secondary index scan. This could be a full scan
+	// of any cardinality. Full scans of virtual tables are ignored.
+	PlanFlagContainsFullIndexScan
+
+	// PlanFlagContainsLargeFullTableScan is set if the statement contains an
+	// unconstrained primary index scan estimated to read more than
+	// large_full_scan_rows (or without available stats). Large scans of virtual
+	// tables are ignored.
+	PlanFlagContainsLargeFullTableScan
+
+	// PlanFlagContainsLargeFullIndexScan is set if the statement contains an
+	// unconstrained non-partial secondary index scan estimated to read more than
+	// large_full_scan_rows (or without available stats). Large scans of virtual
+	// tables are ignored.
+	PlanFlagContainsLargeFullIndexScan
+
+	// PlanFlagContainsMutation is set if the whole plan contains any mutations.
+	PlanFlagContainsMutation
+
+	// PlanFlagContainsLocking is set if at least one node in the plan uses
+	// locking. (Examples of plans using locking include SELECT FOR UPDATE and
+	// SELECT FOR SHARE, UPDATE, UPSERT, and FK checks under read committed
+	// isolation.)
+	PlanFlagContainsLocking
+
+	// PlanFlagCheckContainsLocking is set if at least one node in at least one
+	// check plan uses locking. Typically this is set for plans with FK checks
+	// under read committed isolation.
+	PlanFlagCheckContainsLocking
+)
+
+// IsSet returns true if the receiver has all of the given flags set.
+func (pf PlanFlags) IsSet(flags PlanFlags) bool {
+	return (pf & flags) == flags
+}
+
+// Set sets all of the given flags in the receiver.
+func (pf *PlanFlags) Set(flags PlanFlags) {
+	*pf |= flags
+}
+
+// Unset unsets all of the given flags in the receiver.
+func (pf *PlanFlags) Unset(flags PlanFlags) {
+	*pf &^= flags
+}
 
 // ScanParams contains all the parameters for a table scan.
 type ScanParams struct {
@@ -54,14 +111,18 @@ type ScanParams struct {
 
 	Reverse bool
 
-	// If true, the scan will scan all spans in parallel. It should only be set to
-	// true if there is a known upper bound on the number of rows that will be
-	// scanned. It should not be set if there is a hard or soft limit.
+	// If true, the scan will scan all spans in parallel. It should only be set
+	// to true if there is a known upper bound on the number of rows that will
+	// be scanned, or if 'unbounded_parallel_scans' session variable is 'true'.
+	// It should not be set if there is a hard or soft limit.
 	Parallelize bool
 
-	Locking *tree.LockingItem
+	// Row-level locking properties.
+	Locking opt.Locking
 
-	EstimatedRowCount float64
+	// EstimatedRowCount, if set, is the estimated number of rows that will be
+	// scanned, rounded up.
+	EstimatedRowCount uint64
 
 	// If true, we are performing a locality optimized search. In order for this
 	// to work correctly, the execution engine must create a local DistSQL plan
@@ -122,18 +183,18 @@ const (
 type TableColumnOrdinal int32
 
 // TableColumnOrdinalSet contains a set of TableColumnOrdinal values.
-type TableColumnOrdinalSet = util.FastIntSet
+type TableColumnOrdinalSet = intsets.Fast
 
 // NodeColumnOrdinal is the 0-based ordinal index of a column produced by a
 // Node. It is used when referring to a column in an input to an operator.
 type NodeColumnOrdinal int32
 
 // NodeColumnOrdinalSet contains a set of NodeColumnOrdinal values.
-type NodeColumnOrdinalSet = util.FastIntSet
+type NodeColumnOrdinalSet = intsets.Fast
 
 // CheckOrdinalSet contains the ordinal positions of a set of check constraints
 // taken from the opt.Table.Check collection.
-type CheckOrdinalSet = util.FastIntSet
+type CheckOrdinalSet = intsets.Fast
 
 // AggInfo represents an aggregation (see ConstructGroupBy).
 type AggInfo struct {
@@ -149,6 +210,10 @@ type AggInfo struct {
 	// Filter is the index of the column, if any, which should be used as the
 	// FILTER condition for the aggregate. If there is no filter, Filter is -1.
 	Filter NodeColumnOrdinal
+
+	// DistsqlBlocklist is set to true when this aggregate function cannot be
+	// evaluated in distributed fashion.
+	DistsqlBlocklist bool
 }
 
 // WindowInfo represents the information about a window function that must be
@@ -204,14 +269,19 @@ type RecursiveCTEIterationFn func(ef Factory, bufferRef Node) (Plan, error)
 // ApplyJoinPlanRightSideFn creates a plan for an iteration of ApplyJoin, given
 // a row produced from the left side. The plan is guaranteed to produce the
 // rightColumns passed to ConstructApplyJoin (in order).
-type ApplyJoinPlanRightSideFn func(ef Factory, leftRow tree.Datums) (Plan, error)
+type ApplyJoinPlanRightSideFn func(ctx context.Context, ef Factory, leftRow tree.Datums) (Plan, error)
 
-// Cascade describes a cascading query. The query uses a node created by
-// ConstructBuffer as an input; it should only be triggered if this buffer is
-// not empty.
-type Cascade struct {
-	// FKName is the name of the foreign key constraint.
-	FKName string
+// PostQuery describes a cascading query or an AFTER trigger action. The query
+// uses a node created by ConstructBuffer as an input; it should only be
+// triggered if this buffer is not empty.
+type PostQuery struct {
+	// FKConstraint is used for logging and EXPLAIN purposes. It is nil if this
+	// PostQuery describes a set of AFTER triggers.
+	FKConstraint cat.ForeignKeyConstraint
+
+	// Triggers is used for logging and EXPLAIN purposes. It is nil if this
+	// PostQuery describes a foreign-key cascade action.
+	Triggers []cat.Trigger
 
 	// Buffer is the Node returned by ConstructBuffer which stores the input to
 	// the mutation. It is nil if the cascade does not require a buffer.
@@ -236,27 +306,50 @@ type Cascade struct {
 	PlanFn func(
 		ctx context.Context,
 		semaCtx *tree.SemaContext,
-		evalCtx *tree.EvalContext,
+		evalCtx *eval.Context,
 		execFactory Factory,
 		bufferRef Node,
 		numBufferedRows int,
 		allowAutoCommit bool,
 	) (Plan, error)
+
+	// GetExplainPlan returns the explain plan for the cascade query. It will
+	// always return a cached plan if there is one, and the boolean argument
+	// controls whether this function can create a new plan (which will be
+	// cached going forward). If createPlanIfMissing is false and there is no
+	// cached plan, then nil, nil is returned.
+	GetExplainPlan func(_ context.Context, createPlanIfMissing bool) (Plan, error)
 }
 
-// InsertFastPathFKCheck contains information about a foreign key check to be
-// performed by the insert fast-path (see ConstructInsertFastPath). It
-// identifies the index into which we can perform the lookup.
-type InsertFastPathFKCheck struct {
+// InsertFastPathCheck contains information about a foreign key or
+// uniqueness check to be performed by the insert fast-path (see
+// ConstructInsertFastPath). It identifies the index into which we can perform
+// the lookup.
+type InsertFastPathCheck struct {
 	ReferencedTable cat.Table
 	ReferencedIndex cat.Index
 
-	// InsertCols contains the FK columns from the origin table, in the order of
-	// the ReferencedIndex columns. For each, the value in the array indicates the
-	// index of the column in the input table.
+	// This is the ordinal of the check in the table's unique constraints.
+	CheckOrdinal int
+
+	// InsertCols contains the table column ordinals of the referenced index key
+	// columns. The position in this slice corresponds with the ordinal of the
+	// referenced index column (its position in the index key).
 	InsertCols []TableColumnOrdinal
 
 	MatchMethod tree.CompositeKeyMatchMethod
+
+	// Row-level locking properties of the check.
+	Locking opt.Locking
+
+	// DatumsFromConstraint contains constant values from the insert row for the
+	// columns in the unique constraint. Columns not available directly from the
+	// insert row or computed from insert row values (computed column) may be
+	// filled in from a CHECK constraint on the column. The number of entries
+	// corresponds with the number of KV lookups. For example, when built from
+	// analyzing a locality-optimized operation accessing 1 local region and 2
+	// remote regions, the resulting DatumsFromConstraint would have 3 entries.
+	DatumsFromConstraint []tree.Datums
 
 	// MkErr is called when a violation is detected (i.e. the index has no entries
 	// for a given inserted row). The values passed correspond to InsertCols
@@ -307,6 +400,12 @@ type EstimatedStats struct {
 	// LimitHint is the "soft limit" of the number of result rows that may be
 	// required. See physical.Required for details.
 	LimitHint float64
+	// Forecast is set only for scans; it is true if the stats for the scan were
+	// forecasted rather than collected.
+	Forecast bool
+	// ForecastAt is set only for scans with forecasted stats; it is the time the
+	// forecast was for (which could be in the past, present, or future).
+	ForecastAt time.Time
 }
 
 // ExecutionStats contain statistics about a given operator gathered from the
@@ -321,10 +420,81 @@ type ExecutionStats struct {
 	// operator.
 	VectorizedBatchCount optional.Uint
 
-	KVTime           optional.Duration
-	KVContentionTime optional.Duration
-	KVBytesRead      optional.Uint
-	KVRowsRead       optional.Uint
+	KVTime                optional.Duration
+	KVContentionTime      optional.Duration
+	KVBytesRead           optional.Uint
+	KVPairsRead           optional.Uint
+	KVRowsRead            optional.Uint
+	KVBatchRequestsIssued optional.Uint
+	UsedStreamer          bool
+
+	// Storage engine iterator statistics
+	//
+	// These statistics provide observability into the work performed by
+	// low-level iterators during the execution of a query. Interpreting these
+	// statistics requires some context on the mechanics of MVCC and LSMs.
+	//
+	//
+	// SeekCount and StepCount record the cumulative number of seeks and steps
+	// performed on Pebble iterators while servicing a query. Every scan or
+	// point lookup within a KV range requires reading from two distinct
+	// keyspaces within the storage engine: the MVCC row data keyspace and the
+	// lock table. As an example, a typical point lookup will seek once within
+	// the MVCC row data and once within the lock table, yielding SeekCount=2.
+	//
+	// Cockroach's MVCC layer is implemented (mostly) above Pebble, so the keys
+	// returned by Pebble iterators can be MVCC garbage. An accumulation of MVCC
+	// garbage amplifies the number of top-level Pebble iterator operations
+	// performed, inflating {Seek,Step}Count relative to RowCount.
+	//
+	//
+	// InternalSeekCount and InternalStepCount record the cumulative number of
+	// low-level seeks and steps performed among LSM internal keys while
+	// servicing a query. These internal keys have a many-to-one relationship
+	// with the visible keys returned by the Pebble iterator due to the
+	// mechanics of a LSM. When mutating the LSM, deleted or overwritten keys
+	// are not updated in-place. Instead new 'internal keys' are recorded, and
+	// Pebble iterators are responsible for ignoring obsolete, shadowed internal
+	// keys. Asynchronous background compactions are responsible for eventually
+	// removing obsolete internal keys to reclaim storage space and reduce the
+	// amount of work iterators must perform.
+	//
+	// Internal keys that must be seeked or stepped through can originate from a
+	// few sources:
+	//   - Tombstones: Pebble models deletions as tombstone internal keys. An
+	//     iterator observing a tombstone must skip both the tombstone itself
+	//     and any shadowed keys. In Cockroach, these tombstones may be written
+	//     within the MVCC keyspace due to transaction aborts and MVCC garbage
+	//     collection. These tombstones may be written within the lock table
+	//     during intent resolution.
+	//   - Overwritten keys: Overwriting existing keys adds new internal keys,
+	//     again requiring iterators to skip the obsolete shadowed keys.
+	//     Overwritten keys should be rare since (a) CockroachDB's MVCC layer
+	//     creates new KV versions (across different transactions) (b)
+	//     transactions that write the same key multiple times will cause
+	//     overwrites to the MVCC key and the lock table key, but they should be
+	//     rare.
+	//   - Concurrent writes: While a Pebble iterator is open, new keys may be
+	//     committed to the LSM. The internal Pebble iterator will observe these
+	//     new keys but skip over them to ensure the Pebble iterator provides a
+	//     consistent view of the LSM state.
+	//   - LSM snapshots: Cockroach's KV layer sometimes opens a 'LSM snapshot,'
+	//     which provides a long-lived consistent view of the LSM at a
+	//     particular moment. LSM snapshots prevent compactions from deleting
+	//     obsolete keys if they're required for the LSM snapshot's consistent
+	//     view. Snapshots don't introduce new obsolete internal keys, just
+	//     postpone their reclamation during compactions.
+	//   - MVCC range tombstones: Although the MVCC layer is mostly implemented
+	//     above the Pebble interface, Pebble iterators perform a role in the
+	//     implementation of MVCC range tombstones used for bulk deletions (eg,
+	//     table drops, truncates, import cancellation) in 23.1+. In some cases,
+	//     Pebble iterators will skip over garbage MVCC keys if they're marked
+	//     as garbage by a MVCC range tombstone. Since stepping over these
+	//     skipped keys is performed internally within Pebble, these steps are
+	//     recorded within InternalStepCounts.
+	//
+	// Typically, a large amplification of internal iterator seeks/steps
+	// relative to top-level seeks/steps is unexpected.
 
 	StepCount         optional.Uint
 	InternalStepCount optional.Uint
@@ -333,13 +503,19 @@ type ExecutionStats struct {
 
 	MaxAllocatedMem  optional.Uint
 	MaxAllocatedDisk optional.Uint
+	SQLCPUTime       optional.Duration
 
-	// Nodes on which this operator was executed.
-	Nodes []string
-
-	// Regions on which this operator was executed.
+	// SQLNodes on which this operator was executed.
+	SQLNodes []string
+	// KVNodes that served read requests.
+	KVNodes []string
+	// Regions on which this operator was executed. Includes both KV and SQL
+	// processing.
 	// Only being generated on EXPLAIN ANALYZE.
 	Regions []string
+	// UsedFollowerRead indicates whether at least some reads were served by the
+	// follower replicas.
+	UsedFollowerRead bool
 }
 
 // BuildPlanForExplainFn builds an execution plan against the given
@@ -359,4 +535,35 @@ const (
 	PartialStreaming
 	// Streaming means that the grouping columns are fully ordered.
 	Streaming
+)
+
+// JoinAlgorithm is the type of join algorithm used.
+type JoinAlgorithm int8
+
+// The following are all the supported join algorithms.
+const (
+	HashJoin JoinAlgorithm = iota
+	CrossJoin
+	IndexJoin
+	LookupJoin
+	MergeJoin
+	InvertedJoin
+	ApplyJoin
+	ZigZagJoin
+	NumJoinAlgorithms
+)
+
+// ScanCountType is the type of count of scan operations in a query.
+type ScanCountType int
+
+const (
+	// ScanCount is the count of all scans in a query.
+	ScanCount ScanCountType = iota
+	// ScanWithStatsCount is the count of scans with statistics in a query.
+	ScanWithStatsCount
+	// ScanWithStatsForecastCount is the count of scans which used forecasted
+	// statistics in a query.
+	ScanWithStatsForecastCount
+	// NumScanCountTypes is the total number of types of counts of scans.
+	NumScanCountTypes
 )

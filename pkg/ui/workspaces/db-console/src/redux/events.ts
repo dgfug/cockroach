@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { AdminUIState } from "src/redux/state";
 
@@ -14,7 +9,7 @@ import { AdminUIState } from "src/redux/state";
  * eventsSelector selects the list of events from the store.
  */
 export function eventsSelector(state: AdminUIState) {
-  return state.cachedData.events.data && state.cachedData.events.data.events;
+  return state.cachedData.events?.data?.results;
 }
 
 /**
@@ -27,3 +22,7 @@ export function eventsValidSelector(state: AdminUIState) {
 export function eventsLastErrorSelector(state: AdminUIState) {
   return state.cachedData.events.lastError;
 }
+
+export const eventsMaxApiReached = (state: AdminUIState): boolean => {
+  return !!state.cachedData.events?.data?.maxSizeReached;
+};

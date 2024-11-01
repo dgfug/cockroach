@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -17,9 +12,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -37,7 +31,7 @@ func TestMaterializedViewClearedAfterRefresh(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
@@ -55,18 +49,31 @@ CREATE MATERIALIZED VIEW t.v AS SELECT x FROM t.t;
 		t.Fatal(err)
 	}
 
-	descBeforeRefresh := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
+	descBeforeRefresh := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
 
 	// Update the view and refresh it.
 	if _, err := sqlDB.Exec(`
 INSERT INTO t.t VALUES (3);
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`
 REFRESH MATERIALIZED VIEW t.v;
 `); err != nil {
 		t.Fatal(err)
 	}
 
+	// Verify that refreshing with a prepared statement works.
+	preparedStmt, err := sqlDB.Prepare(`REFRESH MATERIALIZED VIEW t.v;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preparedStmt.Exec(); err != nil {
+		t.Fatal(err)
+	}
+
 	// Add a zone config to delete all table data.
-	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descBeforeRefresh.GetID())
+	_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDB, descBeforeRefresh.GetID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +98,7 @@ func TestMaterializedViewRefreshVisibility(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 
 	waitForCommit, waitToProceed, refreshDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	params.Knobs = base.TestingKnobs{
@@ -106,17 +113,14 @@ func TestMaterializedViewRefreshVisibility(t *testing.T) {
 
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+	runner := sqlutils.MakeSQLRunner(sqlDB)
 
 	// Make a materialized view and update the data behind it.
-	if _, err := sqlDB.Exec(`
-CREATE DATABASE t;
-CREATE TABLE t.t (x INT);
-INSERT INTO t.t VALUES (1), (2);
-CREATE MATERIALIZED VIEW t.v AS SELECT x FROM t.t;
-INSERT INTO t.t VALUES (3);
-`); err != nil {
-		t.Fatal(err)
-	}
+	runner.Exec(t, `CREATE DATABASE t;`)
+	runner.Exec(t, `CREATE TABLE t.t (x INT);`)
+	runner.Exec(t, `INSERT INTO t.t VALUES (1), (2);`)
+	runner.Exec(t, `CREATE MATERIALIZED VIEW t.v AS SELECT x FROM t.t;`)
+	runner.Exec(t, `INSERT INTO t.t VALUES (3);`)
 
 	// Start a refresh.
 	go func() {
@@ -129,7 +133,6 @@ INSERT INTO t.t VALUES (3);
 	<-waitForCommit
 
 	// Before the refresh commits, we shouldn't see any updated data.
-	runner := sqlutils.MakeSQLRunner(sqlDB)
 	runner.CheckQueryResults(t, "SELECT * FROM t.v ORDER BY x", [][]string{{"1"}, {"2"}})
 
 	// Let the refresh commit.
@@ -143,7 +146,7 @@ func TestMaterializedViewCleansUpOnRefreshFailure(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 
 	// Protects shouldError
 	var mu syncutil.Mutex
@@ -179,7 +182,7 @@ CREATE MATERIALIZED VIEW t.v AS SELECT x FROM t.t;
 		t.Fatal(err)
 	}
 
-	descBeforeRefresh := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
+	descBeforeRefresh := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
 
 	// Add a zone config to delete all table data.
 	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descBeforeRefresh.GetID())
@@ -209,7 +212,7 @@ func TestDropMaterializedView(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlRaw, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
@@ -226,7 +229,7 @@ CREATE TABLE t.t (x INT);
 INSERT INTO t.t VALUES (1), (2);
 CREATE MATERIALIZED VIEW t.v AS SELECT x FROM t.t;
 `)
-	desc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "v")
 	// Add a zone config to delete all table data.
 	_, err := sqltestutils.AddImmediateGCZoneConfig(sqlRaw, desc.GetID())
 	require.NoError(t, err)

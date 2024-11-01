@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colcontainer
 
@@ -119,7 +114,12 @@ type PartitionedDiskQueue struct {
 
 	numOpenFDs  int
 	fdSemaphore semaphore.Semaphore
-	diskAcc     *mon.BoundAccount
+	// Note that the accounts below are shared among all disk queues; however,
+	// since there is no concurrency between using those queues, it is ok to
+	// share the accounts given that they only grow or shrink and never get
+	// closed.
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
 }
 
 var _ PartitionedQueue = &PartitionedDiskQueue{}
@@ -140,6 +140,7 @@ func NewPartitionedDiskQueue(
 	fdSemaphore semaphore.Semaphore,
 	partitionerStrategy PartitionerStrategy,
 	diskAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) *PartitionedDiskQueue {
 	return &PartitionedDiskQueue{
 		typs:                     typs,
@@ -150,6 +151,7 @@ func NewPartitionedDiskQueue(
 		lastEnqueuedPartitionIdx: -1,
 		fdSemaphore:              fdSemaphore,
 		diskAcc:                  diskAcc,
+		diskQueueMemAcc:          diskQueueMemAcc,
 	}
 }
 
@@ -198,15 +200,14 @@ func (p *PartitionedDiskQueue) closeReadPartition(idx int) error {
 	return nil
 }
 
-func (p *PartitionedDiskQueue) acquireNewFD(ctx context.Context) error {
+func (p *PartitionedDiskQueue) acquireNewFD(ctx context.Context) {
 	if p.fdSemaphore == nil {
-		return nil
+		return
 	}
 	if err := p.fdSemaphore.Acquire(ctx, 1); err != nil {
-		return err
+		colexecerror.ExpectedError(err)
 	}
 	p.numOpenFDs++
-	return nil
 }
 
 // Enqueue enqueues a batch at partition partitionIdx.
@@ -241,12 +242,10 @@ func (p *PartitionedDiskQueue) Enqueue(
 			// Acquire only one file descriptor. This will represent the write file
 			// descriptor. When we start Dequeueing from this partition, this will
 			// represent the read file descriptor.
-			if err := p.acquireNewFD(ctx); err != nil {
-				return err
-			}
+			p.acquireNewFD(ctx)
 		}
 		// Partition has not been created yet.
-		q, err := NewDiskQueue(ctx, p.typs, p.cfg, p.diskAcc)
+		q, err := NewDiskQueue(ctx, p.typs, p.cfg, p.diskAcc, p.diskQueueMemAcc)
 		if err != nil {
 			return err
 		}
@@ -286,9 +285,7 @@ func (p *PartitionedDiskQueue) Dequeue(
 	case partitionStateClosedForWriting, partitionStateClosedForReading:
 		// There will never be a file descriptor acquired for a partition in this
 		// state, so acquire it.
-		if err := p.acquireNewFD(ctx); err != nil {
-			return err
-		}
+		p.acquireNewFD(ctx)
 		p.partitions[idx].state = partitionStateReading
 	case partitionStateReading:
 	// Do nothing.

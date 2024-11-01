@@ -1,19 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This test compares a dump generated from PostgreSQL with the pg_catalog
 // or information_schema database and compares the differences at cockroach
 // db skipping all the known diffs. To Run:
 //
 // SCENARIO 1. Using defaults, will test using defaults:
-//    rdbms=postgres, catalog=pg_catalog, no rewrite diffs, no adding missing tables.
+//
+//	rdbms=postgres, catalog=pg_catalog, no rewrite diffs, no adding missing tables.
+//
 // cd pkg/sql
 // go test -run TestDiffTool
 //
@@ -21,21 +18,24 @@
 // add -rewrite-diffs flag when running this test:
 //
 // SCENARIO 2: Updating known diffs, will use same defaults as SCENARIO 1,
-//    Except that it will rewrite known diffs
+//
+//	Except that it will rewrite known diffs
 //
 // cd pkg/sql
 // go test -run TestDiffTool --rewrite-diffs
 //
 // SCENARIO 3: Need to add missing tables/columns, this also have same defaults as
-//    SCENARIO 1, except for adding missing tables/columns.
-//    NOTE: This options only works for pg_catalog and information_schema from postgres
-//          information_schema can't add missing columns, only missing tables.
+//
+//	SCENARIO 1, except for adding missing tables/columns.
+//	NOTE: This options only works for pg_catalog and information_schema from postgres
+//	      information_schema can't add missing columns, only missing tables.
 //
 // cd pkg/sql
 // go test -run TestDiffTool --add-missing-tables
 //
 // SCENARIO 4: Want to check differences on information_schema from postgres.
-//    NOTE: This can be combined with --add-missing-tables or --rewrite-diffs
+//
+//	NOTE: This can be combined with --add-missing-tables or --rewrite-diffs
 //
 // cd pkg/sql
 // go test -run TestDiffTool --catalog information_schema
@@ -46,8 +46,9 @@
 // go test -run TestInformationSchemaPostgres
 //
 // SCENARIO 5: Want to check differences on information_schema from mysql.
-//    NOTE: --add-missing-tables is not allowed when using rdbms != postgres.
-//          --rewrite-diffs is allowed.
+//
+//	NOTE: --add-missing-tables is not allowed when using rdbms != postgres.
+//	      --rewrite-diffs is allowed.
 //
 // cd pkg/sql
 // go test -run TestDiffTool --catalog information_schema --rdbms mysql
@@ -58,41 +59,45 @@
 // got test -run TestInformationSchemaMySQL
 //
 // To create/update dump files from postgres/mysql see:
-//    pkg/cmd/generate-metadata-tables/main.go
+//
+//	pkg/cmd/generate-metadata-tables/main.go
 //
 // Most common use case is Updating/Adding missing columns:
 //
-//    1. Run pkg/cmd/generate-metadata-tables/main.go with flags to connect
-//       postgres.
-//    2. Run SCENARIO 3 to add missing tables/columns.
-//    3. Run SCENARIO 2 to update expected diffs.
-//    4. Validate SCENARIO 1 passes.
-//    5. Rewrite logic tests, the most probable logic tests that might fail
-//       after adding missing tables are:
-//       - pg_catalog
-//       - information_schema
-//       - create_statements
-//       - create_statements
-//       - grant_table
-//       - table
+//  1. Run pkg/cmd/generate-metadata-tables/main.go with flags to connect
+//     postgres.
 //
-//       NOTE: Even if you updated pg_catalog, It is recommended that you rewrite
-//             information_schema logic tests.
+//  2. Run SCENARIO 3 to add missing tables/columns.
+//
+//  3. Run SCENARIO 2 to update expected diffs.
+//
+//  4. Validate SCENARIO 1 passes.
+//
+//  5. Rewrite logic tests, the most probable logic tests that might fail
+//     after adding missing tables are:
+//     - pg_catalog
+//     - information_schema
+//     - create_statements
+//     - create_statements
+//     - grant_table
+//     - table
+//
+//     NOTE: Even if you updated pg_catalog, It is recommended that you rewrite
+//     information_schema logic tests.
 //
 // How to debug using Goland:
-//    1. Go to Run/Debug configurations
-//    2. Select "Go Test"
-//    3. Click Add configuration or edit an existing configuration
-//    4. Give it a Name, set directory to pkg/sql and set the program arguments with the
-//       scenario that you want to test: example of program arguments:
-//       -run TestDiffTool --add-missing-tables
-//       NOTE: In the program arguments you can use another flag called test-data-filename
-//             If you want to use a different JSON source (Like a testing JSON just for
-//             debugging purposes).
+//  1. Go to Run/Debug configurations
+//  2. Select "Go Test"
+//  3. Click Add configuration or edit an existing configuration
+//  4. Give it a Name, set directory to pkg/sql and set the program arguments with the
+//     scenario that you want to test: example of program arguments:
+//     -run TestDiffTool --add-missing-tables
+//     NOTE: In the program arguments you can use another flag called test-data-filename
+//     If you want to use a different JSON source (Like a testing JSON just for
+//     debugging purposes).
 //
 // Where to start when debugging?
 // -> func TestDiffTool
-//
 package sql
 
 import (
@@ -132,7 +137,7 @@ import (
 const (
 	testdata            = "testdata" // testdata directory
 	catalogPkg          = "catalog"
-	catconstantsPkg     = "catconstants"
+	catconstantsPkg     = "catconstants2"
 	constantsGo         = "constants.go"
 	vtablePkg           = "vtable"
 	pgCatalogGo         = "pg_catalog.go"
@@ -211,19 +216,23 @@ var none = struct{}{}
 // Add any function that cannot be automatically detected.
 var mappedPopulateFunctions = map[string]string{
 	// Currently pg_type cannot be found automatically by this code because it is
-	// not the populate function.
-	"addPGTypeRow": "PGCatalogType",
+	// not the populate function. Same for pg_proc.
+	"addPGTypeRow":           "PGCatalogType",
+	"addPgProcUDFRow":        "PGCatalogProc",
+	"addPgProcBuiltinRow":    "PgCatalogProc",
+	"addRowForTimezoneNames": "PgCatalogTimezoneNames",
+	"populatePgDescription":  "PGCatalogDescription",
 }
 
 // schemaCodeFixer have specific configurations to fix the files with virtual
 // schema definitions.
 type schemaCodeFixer struct {
-	// catConstantsSchemaID contains the constant in catconstants which is the
+	// catConstantsSchemaID contains the constant in catconstants2 which is the
 	// id for the virtualSchema, it usually have the same prefix as in
 	// catConstantsPrefix + ID but this is sorted and placed before the other
 	// ids that are for the tables in that virtualSchema.
 	catConstantsSchemaID string
-	// catConstantsPrefix is the prefix for the catconstants of the tables in
+	// catConstantsPrefix is the prefix for the catconstants2 of the tables in
 	// this virtualSchema.
 	catConstantsPrefix string
 	// vtableFilename is the location of the vtable constants for the
@@ -369,7 +378,7 @@ func (d *VirtualSchemaDiffTool) rewriteDiffs(
 	}
 }
 
-// fixConstants updates catconstants that are needed for pgCatalog.
+// fixConstants updates catconstants2 that are needed for pgCatalog.
 func (scf schemaCodeFixer) fixConstants(t *testing.T, unimplementedTables PGMetadataTables) {
 	constantsFileName := filepath.Join(".", catalogPkg, catconstantsPkg, constantsGo)
 	// pgConstants will contains all the pgCatalog tableID constant adding the
@@ -463,12 +472,12 @@ func (scf schemaCodeFixer) fixVtable(
 		}
 
 		first := true
-		for tableName, columns := range unimplementedTables {
+		for tableName, tableInfo := range unimplementedTables {
 			if _, ok := existingTables[tableName]; ok {
 				// Table already implemented.
 				continue
 			}
-			createTable, err := scf.createTableConstant(tableName, columns)
+			createTable, err := scf.createTableConstant(tableName, tableInfo)
 			if err != nil {
 				// We can not implement this table as this uses types not implemented.
 				t.Log(err)
@@ -503,7 +512,7 @@ func getMissingColumnsText(
 	if _, fixable := nilPopulateTables[constName]; !fixable {
 		return ""
 	}
-	columns, found := unimplementedColumns[tableName]
+	tableInfo, found := unimplementedColumns[tableName]
 	if !found {
 		return ""
 	}
@@ -513,8 +522,8 @@ func getMissingColumnsText(
 		// Previous line already had comma.
 		prefix = "\n"
 	}
-	for columnName, columnType := range columns {
-		formatColumn(&sb, prefix, columnName, columnType)
+	for _, columnName := range tableInfo.ColumnNames {
+		formatColumn(&sb, prefix, columnName, tableInfo.Columns[columnName])
 		pgCode.addRowPositions.addMissingColumn(constName, columnName)
 		prefix = ",\n"
 	}
@@ -540,7 +549,7 @@ func (scf schemaCodeFixer) fixCatalogGo(t *testing.T, unimplementedTables PGMeta
 			text := reader.Text()
 			trimText := strings.TrimSpace(text)
 			if trimText == scf.textForNewTableInsertion {
-				//VirtualSchemas doesn't have a particular place to start we just print
+				// VirtualSchemas doesn't have a particular place to start we just print
 				// it before virtualTablePosition.
 				output.appendString(scf.printVirtualSchemas(unimplementedTables))
 			}
@@ -575,7 +584,7 @@ func fixPgCatalogGoColumns(pgCode *pgCatalogCode) {
 			if currentPosition < len(positions) && int64(scannedUntil+count) > positions[currentPosition].insertPosition {
 				relativeIndex := int(positions[currentPosition].insertPosition-int64(scannedUntil)) - 1
 				left := text[:relativeIndex]
-				indentation := indentationRE.FindStringSubmatch(text)[1] //The way it is it should at least give ""
+				indentation := indentationRE.FindStringSubmatch(text)[1] // The way it is it should at least give ""
 				if len(strings.TrimSpace(left)) > 0 {
 					// Parenthesis is right after the last variable in this case
 					// indentation is correct.
@@ -769,17 +778,17 @@ func (scf schemaCodeFixer) constantName(tableName string, suffix string) string 
 
 // createTableConstant formats the text for vtable constants.
 func (scf schemaCodeFixer) createTableConstant(
-	tableName string, columns PGMetadataColumns,
+	tableName string, tableInfo PGMetadataTableInfo,
 ) (string, error) {
 	var sb strings.Builder
 	constName := scf.constantName(tableName, "")
-	if notImplementedTypes := columns.getUnimplementedTypes(); len(notImplementedTypes) > 0 {
+	if notImplementedTypes := tableInfo.Columns.getUnimplementedTypes(); len(notImplementedTypes) > 0 {
 		return "", fmt.Errorf("not all types are implemented %s: %v", tableName, notImplementedTypes)
 	}
 
 	sb.WriteString("\n//")
 	sb.WriteString(constName)
-	sb.WriteString(" is an empty table in the pg_catalog that is not implemented yet\n")
+	sb.WriteString(fmt.Sprintf(" is an empty table in the %s that is not implemented yet\n", scf.schema.name))
 	sb.WriteString("const ")
 	sb.WriteString(constName)
 	sb.WriteString(" = `\n")
@@ -789,8 +798,8 @@ func (scf schemaCodeFixer) createTableConstant(
 	sb.WriteString(tableName)
 	sb.WriteString(" (\n")
 	prefix := ""
-	for columnName, columnType := range columns {
-		formatColumn(&sb, prefix, columnName, columnType)
+	for _, columnName := range tableInfo.ColumnNames {
+		formatColumn(&sb, prefix, columnName, tableInfo.Columns[columnName])
 		prefix = ",\n"
 	}
 	sb.WriteString("\n)`\n")
@@ -834,8 +843,13 @@ func getTableNameFromCreateTable(createTableText string) (string, error) {
 		return "", err
 	}
 
-	create := stmt.AST.(*tree.CreateTable)
-	return create.Table.Table(), nil
+	if create, ok := stmt.AST.(*tree.CreateTable); ok {
+		return create.Table.Table(), nil
+	}
+	if create, ok := stmt.AST.(*tree.CreateView); ok {
+		return create.Name.Table(), nil
+	}
+	return "", errors.Newf("could not find table name in stmt: %s", createTableText)
 }
 
 // getUndefinedTablesText retrieves pgCatalog.undefinedTables, then it merges the
@@ -922,7 +936,7 @@ func (scf schemaCodeFixer) getTableDefinitionsText(unimplementedTables PGMetadat
 	}
 
 	for tableName := range unimplementedTables {
-		defName := "catconstants." + scf.constantName(tableName, tableIDSuffix)
+		defName := "catconstants2." + scf.constantName(tableName, tableIDSuffix)
 		if _, ok := tableDefs[defName]; ok {
 			// Not overriding existing tableDefinitions
 			delete(unimplementedTables, tableName)
@@ -1417,6 +1431,9 @@ func (d *VirtualSchemaDiffTool) TestTable(tableName string, fn func(t *testing.T
 	})
 }
 
+// Prevent the linter from emitting unused warnings.
+var _ = (*VirtualSchemaDiffTool).Run
+
 // Run will execute the diff tool with all the configurations that are in VirtualSchemaDiffTool structure.
 func (d *VirtualSchemaDiffTool) Run() {
 	if _, codeFixerExists := codeFixers[d.catalogName]; d.addMissingTables && (d.rdbmsName != Postgres || !codeFixerExists) {
@@ -1435,10 +1452,10 @@ func (d *VirtualSchemaDiffTool) Run() {
 		diffs = make(PGMetadataTableDiffs)
 	}
 
-	for pgTable, pgColumns := range pgTables {
+	for pgTable, pgTableInfo := range pgTables {
 		sum.TotalTables++
 		d.TestTable(pgTable, func(t *testing.T) {
-			crdbColumns, ok := crdbTables[pgTable]
+			crdbTableInfo, ok := crdbTables[pgTable]
 			expectedMissingTable := diffs.isExpectedMissingTable(pgTable)
 			if !ok {
 				if !expectedMissingTable {
@@ -1452,9 +1469,10 @@ func (d *VirtualSchemaDiffTool) Run() {
 				return
 			}
 
-			for expColumnName, expColumn := range pgColumns {
+			for _, expColumnName := range pgTableInfo.ColumnNames {
+				expColumn := pgTableInfo.Columns[expColumnName]
 				sum.TotalColumns++
-				gotColumn, ok := crdbColumns[expColumnName]
+				gotColumn, ok := crdbTableInfo.Columns[expColumnName]
 				expectedMissingColumn := diffs.isExpectedMissingColumn(pgTable, expColumnName)
 				if !ok {
 					if !expectedMissingColumn {
@@ -1564,7 +1582,7 @@ func validatePGCatalogCodeParser(t *testing.T) {
 		constants := readAllVTableConstants(t)
 		for _, vTableConstant := range constants {
 			if _, ok := pgCode.fixableTables[vTableConstant]; !ok {
-				t.Errorf("virtual table with constant %s cannot be fixed because could not found populate function", vTableConstant)
+				t.Errorf("virtual table with constant %s cannot be fixed because we could not find the populate function", vTableConstant)
 			}
 		}
 

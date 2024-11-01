@@ -1,6 +1,9 @@
+exports_files(["testdata/errcheck_excludes.txt"])
+
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 # gazelle:build_tags lint
+# gazelle:build_tags nightly
 
 go_library(
     name = "lint",
@@ -11,21 +14,47 @@ go_library(
 
 go_test(
     name = "lint_test",
-    srcs = ["lint_test.go"],
-    data = glob(["testdata/**"]),
+    size = "enormous",
+    # keep
+    srcs = [
+        "gen-lint_test.go",
+        "nightly_lint_test.go",
+    ],
+    data = glob(["testdata/**"]) + [
+        "//.github:CODEOWNERS",
+        "//build/bazelutil:nogo_config.json",
+        "//pkg/sql/opt/optgen/cmd/optfmt",
+        "@co_honnef_go_tools//cmd/staticcheck",
+        "@com_github_cockroachdb_crlfmt//:crlfmt",
+    ],
     embed = [":lint"],
-    gotags = ["lint"],
+    embedsrcs = ["gcassert_paths.txt"],
+    tags = [
+        "integration",
+        "no-remote-exec",
+    ],
     visibility = ["//build/bazelutil:__subpackages__"],
     deps = [
         "//pkg/build/bazel",
+        "//pkg/cmd/urlcheck/lib/urlcheck",
         "//pkg/internal/codeowners",
+        "//pkg/sql/parser",
         "//pkg/sql/sem/builtins",
-        "//pkg/testutils/buildutil",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/skip",
+        "//pkg/util/envutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_ghemawat_stream//:stream",
         "@com_github_jordanlewis_gcassert//:gcassert",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_tools//go/packages",
     ],
+)
+
+genrule(
+    name = "gen-lint-test",
+    srcs = ["lint_test.go"],
+    outs = ["gen-lint_test.go"],
+    cmd = "cat $< | grep -v '//go:build' | grep -v '// +build' > $@",
 )

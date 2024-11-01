@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -17,7 +12,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/encodingtype"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -76,6 +70,7 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 		return func(r redactablePackage) redactablePackage {
 			if !r.redactable {
 				r.msg = []byte(redact.EscapeBytes(r.msg))
+				r.tags = formattableTags(redact.EscapeBytes([]byte(r.tags)))
 				r.redactable = true
 			}
 			return r
@@ -84,6 +79,7 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 		return func(r redactablePackage) redactablePackage {
 			if r.redactable {
 				r.msg = redact.RedactableBytes(r.msg).StripMarkers()
+				r.tags = formattableTags(redact.RedactableBytes(r.tags).StripMarkers())
 				r.redactable = false
 			}
 			return r
@@ -92,8 +88,10 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 		return func(r redactablePackage) redactablePackage {
 			if r.redactable {
 				r.msg = []byte(redact.RedactableBytes(r.msg).Redact())
+				r.tags = formattableTags(redact.RedactableBytes(r.tags).Redact())
 			} else {
 				r.msg = redact.RedactedMarker()
+				r.tags = r.tags.redactTagValues(true /* preserveMarkers */)
 				r.redactable = true
 			}
 			return r
@@ -102,9 +100,11 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 		return func(r redactablePackage) redactablePackage {
 			if r.redactable {
 				r.msg = redact.RedactableBytes(r.msg).Redact().StripMarkers()
+				r.tags = formattableTags(redact.RedactableBytes(r.tags).Redact().StripMarkers())
 				r.redactable = false
 			} else {
 				r.msg = strippedMarker
+				r.tags = r.tags.redactTagValues(false /* preserveMarkers */)
 			}
 			return r
 		}
@@ -113,32 +113,29 @@ func getEditor(editMode EditSensitiveData) redactEditor {
 	}
 }
 
-var strippedMarker = redact.RedactableBytes(redact.RedactedMarker()).StripMarkers()
+var redactedMarker = redact.RedactedMarker()
+var strippedMarker = redact.RedactableBytes(redactedMarker).StripMarkers()
 
 // maybeRedactEntry transforms a logpb.Entry to either strip
 // sensitive data or keep it, or strip the redaction markers or keep them,
 // or a combination of both. The specific behavior is selected
 // by the provided redactEditor.
-func maybeRedactEntry(payload entryPayload, editor redactEditor) entryPayload {
+func maybeRedactEntry(payload entryPayload, editor redactEditor) (res entryPayload) {
 	r := redactablePackage{
 		redactable: payload.redactable,
+		tags:       payload.tags,
 		msg:        []byte(payload.message),
 	}
 	r = editor(r)
-	return entryPayload{
-		redactable: r.redactable,
-		message:    string(r.msg),
-	}
+	res.redactable = r.redactable
+	res.message = string(r.msg)
+	res.tags = r.tags
+	return res
 }
-
-// Safe constructs a SafeFormatter / SafeMessager.
-// This is obsolete. Use redact.Safe directly.
-// TODO(knz): Remove this.
-var Safe = redact.Safe
 
 func init() {
 	// We consider booleans and numeric values to be always safe for
-	// reporting. A log call can opt out by using redact.Unsafe() around
+	// reporting. A log call can opt out by using encoding.Unsafe() around
 	// a value that would be otherwise considered safe.
 	redact.RegisterSafeType(reflect.TypeOf(true)) // bool
 	redact.RegisterSafeType(reflect.TypeOf(123))  // int
@@ -167,32 +164,13 @@ func init() {
 
 type redactablePackage struct {
 	msg        []byte
+	tags       formattableTags
 	redactable bool
 }
 
 const redactableIndicator = "⋮"
 
 var redactableIndicatorBytes = []byte(redactableIndicator)
-
-func renderTagsAsRedactable(tags *logtags.Buffer) redact.RedactableString {
-	if tags == nil {
-		return ""
-	}
-	var buf redact.StringBuilder
-	comma := redact.SafeString("")
-	for _, t := range tags.Get() {
-		buf.SafeString(comma)
-		buf.Print(redact.Safe(t.Key()))
-		if v := t.Value(); v != nil && v != "" {
-			if len(t.Key()) > 1 {
-				buf.SafeRune('=')
-			}
-			buf.Print(v)
-		}
-		comma = ","
-	}
-	return buf.RedactableString()
-}
 
 // TestingSetRedactable sets the redactable flag on the file output of
 // the debug logger for usage in a test. The caller is responsible
@@ -216,4 +194,38 @@ func TestingSetRedactable(redactableLogs bool) (cleanup func()) {
 			debugLog.sinkInfos[i].editor = e
 		}
 	}
+}
+
+// SafeOperational is a transparent wrapper around `redact.Safe` that
+// acts as documentation for *why* the object is being marked as safe.
+// In this case, the intent is to label this piece of information as
+// "operational" data which is helpful for telemetry and operator
+// actions. Typically, this includes schema structure and information
+// about internals that is *not* user data or derived from user data.
+func SafeOperational(s interface{}) redact.SafeValue {
+	return redact.Safe(s)
+}
+
+// SafeManaged marks the provided argument as safe from a redaction
+// perspective in cases where the node is being run as part of a managed
+// service. This is indicated via the `COCKROACH_REDACTION_POLICY_MANAGED`
+// environment variable.
+//
+// Certain types of data is normally considered "sensitive" from a
+// redaction perspective when logged from on-premises deployments, such
+// as CLI arguments and HTTP addresses. However, when running in a
+// managed service, such as CockroachCloud, this information is already
+// known to the operators and does not need to be treated as sensitive.
+//
+// NB: If the argument itself implements the redact.SafeFormatter interface,
+// then we delegate to its implementation in either case.
+//
+// NB: This approach is lightweight, but is not sustainable to build on top of.
+// We should be looking for more holistic approaches to conditional redaction.
+// See https://github.com/cockroachdb/cockroach/issues/87038 for details.
+func SafeManaged(a interface{}) interface{} {
+	if !logging.hasManagedRedactionPolicy() {
+		return a
+	}
+	return redact.Safe(a)
 }

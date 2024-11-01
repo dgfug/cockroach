@@ -1,20 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
 import (
 	"context"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -22,25 +18,24 @@ import (
 // the behavior and outcome of a transaction. It records information about the
 // requests that a transaction sends and updates counters and histograms when
 // the transaction completes.
-//
-// TODO(nvanbenschoten): Unit test this file.
 type txnMetricRecorder struct {
-	wrapped lockedSender
-	metrics *TxnMetrics
-	clock   *hlc.Clock
+	wrapped    lockedSender
+	metrics    *TxnMetrics
+	timeSource timeutil.TimeSource
 
 	txn            *roachpb.Transaction
-	txnStartNanos  int64
+	txnStart       time.Time
 	onePCCommit    bool
 	parallelCommit bool
+	readOnlyCommit bool
 }
 
 // SendLocked is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) SendLocked(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
-	if m.txnStartNanos == 0 {
-		m.txnStartNanos = timeutil.Now().UnixNano()
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+	if m.txnStart.IsZero() {
+		m.txnStart = m.timeSource.Now()
 	}
 
 	br, pErr := m.wrapped.SendLocked(ctx, ba)
@@ -70,7 +65,9 @@ func (*txnMetricRecorder) populateLeafInputState(*roachpb.LeafTxnInputState) {}
 func (*txnMetricRecorder) populateLeafFinalState(*roachpb.LeafTxnFinalState) {}
 
 // importLeafFinalState is part of the txnInterceptor interface.
-func (*txnMetricRecorder) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) {}
+func (*txnMetricRecorder) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error {
+	return nil
+}
 
 // epochBumpedLocked is part of the txnInterceptor interface.
 func (*txnMetricRecorder) epochBumpedLocked() {}
@@ -81,6 +78,11 @@ func (*txnMetricRecorder) createSavepointLocked(context.Context, *savepoint) {}
 // rollbackToSavepointLocked is part of the txnInterceptor interface.
 func (*txnMetricRecorder) rollbackToSavepointLocked(context.Context, savepoint) {}
 
+// setReadOnlyCommit records the transaction commit as a read-only commit. Such
+// commits do not send EndTxn requests because they have no writes to commit or
+// locks to release.
+func (m *txnMetricRecorder) setReadOnlyCommit() { m.readOnlyCommit = true }
+
 // closeLocked is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) closeLocked() {
 	if m.onePCCommit {
@@ -89,11 +91,14 @@ func (m *txnMetricRecorder) closeLocked() {
 	if m.parallelCommit {
 		m.metrics.ParallelCommits.Inc(1)
 	}
+	if m.readOnlyCommit {
+		m.metrics.CommitsReadOnly.Inc(1)
+	}
 
-	if m.txnStartNanos != 0 {
-		duration := timeutil.Now().UnixNano() - m.txnStartNanos
-		if duration >= 0 {
-			m.metrics.Durations.RecordValue(duration)
+	if !m.txnStart.IsZero() {
+		dur := m.timeSource.Since(m.txnStart)
+		if dur >= 0 {
+			m.metrics.Durations.RecordValue(dur.Nanoseconds())
 		}
 	}
 	restarts := int64(m.txn.Epoch)

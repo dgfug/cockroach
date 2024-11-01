@@ -1,11 +1,19 @@
-# Both separated and interleaved intents, and one inline meta.
+# Separated intents, and one inline meta. Also some locks to ignore.
 define
 locks
-meta k=a ts=20 txn=1
+meta k=a str=intent ts=20 txn=1
+meta k=a str=shared       txn=1
+meta k=b str=intent ts=30 txn=2
+meta k=b str=exclusive    txn=2
+meta k=d str=shared       txn=1
+meta k=d str=shared       txn=2
+meta k=d str=shared       txn=3
+meta k=d str=shared       txn=4
+meta k=d str=shared       txn=5
+meta k=d str=shared       txn=6
 mvcc
 value k=a ts=20 v=a20
 value k=a ts=10 v=a10
-meta k=b ts=30 txn=2
 value k=b ts=30 v=b30
 meta k=c
 value k=d ts=25 v=d25
@@ -40,7 +48,6 @@ prev
 prev
 prev
 stats
-set-upper k=c
 seek-ge k=b
 stats
 next
@@ -65,7 +72,7 @@ next: output: value k=b ts=30.000000000,0 v=b30
 next: output: meta k=c
 next: output: value k=d ts=25.000000000,0 v=d25
 next: output: .
-stats: (interface (dir, seek, step): (fwd, 2, 7), (rev, 0, 0)), (internal (dir, seek, step): (fwd, 2, 7), (rev, 0, 0))
+stats: seeked 3 times (3 internal); stepped 18 times (14 internal)
 prev: output: value k=d ts=25.000000000,0 v=d25
 prev: output: meta k=c
 prev: output: value k=b ts=30.000000000,0 v=b30
@@ -74,17 +81,16 @@ prev: output: value k=a ts=10.000000000,0 v=a10
 prev: output: value k=a ts=20.000000000,0 v=a20
 prev: output: meta k=a ts=20.000000000,0 txn=1
 prev: output: .
-stats: (interface (dir, seek, step): (fwd, 2, 7), (rev, 0, 13)), (internal (dir, seek, step): (fwd, 2, 7), (rev, 2, 7))
-set-upper c
+stats: seeked 4 times (3 fwd/1 rev, internal: 3 fwd/3 rev); stepped 36 times (18 fwd/18 rev, internal: 14 fwd/15 rev)
 seek-ge "b"/0,0: output: meta k=b ts=30.000000000,0 txn=2
-stats: (interface (dir, seek, step): (fwd, 4, 7), (rev, 0, 13)), (internal (dir, seek, step): (fwd, 4, 7), (rev, 2, 7))
+stats: seeked 6 times (5 fwd/1 rev, internal: 5 fwd/3 rev); stepped 36 times (18 fwd/18 rev, internal: 14 fwd/15 rev)
 next: output: value k=b ts=30.000000000,0 v=b30
-next: output: .
+next: output: meta k=c
 prev: output: value k=b ts=30.000000000,0 v=b30
 prev: output: meta k=b ts=30.000000000,0 txn=2
 prev: output: value k=a ts=10.000000000,0 v=a10
 seek-lt "b"/0,0: output: value k=a ts=10.000000000,0 v=a10
-stats: (interface (dir, seek, step): (fwd, 4, 9), (rev, 2, 19)), (internal (dir, seek, step): (fwd, 4, 9), (rev, 6, 13))
+stats: seeked 8 times (5 fwd/3 rev, internal: 5 fwd/5 rev); stepped 48 times (22 fwd/26 rev, internal: 17 fwd/26 rev)
 next: output: meta k=b ts=30.000000000,0 txn=2
 prev: output: value k=a ts=10.000000000,0 v=a10
 prev: output: value k=a ts=20.000000000,0 v=a20
@@ -158,8 +164,7 @@ seek-ge "f"/0,0: output: .
 seek-ge "c"/0,0: output: meta k=c
 next: output: .
 
-# Prefix iteration and NextKey. What we will see after the prefix is
-# exhausted is undefined.
+# Prefix iterators will be exhausted on NextKey().
 iter prefix=true
 seek-ge k=d
 next-key
@@ -172,10 +177,10 @@ next-key
 seek-ge "d"/0,0: output: value k=d ts=25.000000000,0 v=d25
 next-key: output: .
 seek-ge "a"/0,0: output: meta k=a ts=20.000000000,0 txn=1
-next-key: output: meta k=b ts=30.000000000,0 txn=2
+next-key: output: .
 seek-ge "a"/0,0: output: meta k=a ts=20.000000000,0 txn=1
 next: output: value k=a ts=20.000000000,0 v=a20
-next-key: output: meta k=b ts=30.000000000,0 txn=2
+next-key: output: .
 
 # Seek to particular timestamp.
 iter lower=a upper=f
@@ -293,17 +298,17 @@ next-key: output: value k=d ts=25.000000000,0 v=d25
 next-key: output: .
 
 
-# Multiple separated intents and multiple interleaved intents.
+# Many separated intents.
 define
 locks
-meta k=b ts=20 txn=2
-meta k=d ts=40 txn=4
-meta k=e ts=50 txn=5
+meta k=a str=intent ts=10 txn=1
+meta k=b str=intent ts=20 txn=2
+meta k=c str=intent ts=30 txn=3
+meta k=d str=intent ts=40 txn=4
+meta k=e str=intent ts=50 txn=5
 mvcc
-meta k=a ts=10 txn=1
 value k=a ts=10 v=a10
 value k=b ts=20 v=b20
-meta k=c ts=30 txn=3
 value k=c ts=30 v=c30
 value k=d ts=40 v=d40
 value k=e ts=50 v=e50
@@ -367,49 +372,23 @@ prev: output: value k=a ts=10.000000000,0 v=a10
 prev: output: meta k=a ts=10.000000000,0 txn=1
 prev: output: .
 
-# Error case: Multiple separated intents with no provisional values
+# Local keys. This exercises local keys having separated locks.
 define
 locks
-meta k=b ts=20 txn=2
-meta k=d ts=40 txn=4
-----
-
-iter lower=a upper=f
-seek-ge k=a
-next
-seek-lt k=e
-next
-seek-ge k=d
-next-key
-seek-ge k=d
-prev
-seek-lt k=e
-prev
-----
-seek-ge "a"/0,0: output: meta k=b ts=20.000000000,0 txn=2
-next: output: err: intentIter at intent, but iter not at provisional value
-seek-lt "e"/0,0: output: meta k=d ts=40.000000000,0 txn=4
-next: output: err: intent has no provisional value
-seek-ge "d"/0,0: output: meta k=d ts=40.000000000,0 txn=4
-next-key: output: err: intentIter at intent, but iter not at provisional value
-seek-ge "d"/0,0: output: meta k=d ts=40.000000000,0 txn=4
-prev: output: err: iter not at provisional value, cmp: -1
-seek-lt "e"/0,0: output: meta k=d ts=40.000000000,0 txn=4
-prev: output: err: reverse iteration discovered intent without provisional value
-
-# Local range keys. This exercises local keys having separated locks.
-define
-locks
-meta k=Lb ts=20 txn=2
-meta k=Lc ts=30 txn=4
+meta k=La str=intent ts=10 txn=1
+meta k=La str=shared       txn=1
+meta k=Lb str=intent ts=20 txn=2
+meta k=Lc str=intent ts=30 txn=4
+meta k=Lc str=exclusive    txn=4
+meta k=Ld str=exclusive    txn=4
 mvcc
-meta k=La ts=10 txn=1
 value k=La ts=10 v=a10
 value k=Lb ts=20 v=b20
 value k=Lc ts=30 v=c30
+value k=Ld ts=30 v=d40
 ----
 
-iter lower=La upper=Ld
+iter lower=La upper=Le
 seek-ge k=La
 next
 next
@@ -417,6 +396,8 @@ next
 next
 next
 next
+next
+prev
 prev
 prev
 prev
@@ -431,7 +412,9 @@ next: output: meta k=Lb ts=20.000000000,0 txn=2
 next: output: value k=Lb ts=20.000000000,0 v=b20
 next: output: meta k=Lc ts=30.000000000,0 txn=4
 next: output: value k=Lc ts=30.000000000,0 v=c30
+next: output: value k=Ld ts=30.000000000,0 v=d40
 next: output: .
+prev: output: value k=Ld ts=30.000000000,0 v=d40
 prev: output: value k=Lc ts=30.000000000,0 v=c30
 prev: output: meta k=Lc ts=30.000000000,0 txn=4
 prev: output: value k=Lb ts=20.000000000,0 v=b20
@@ -442,7 +425,7 @@ prev: output: .
 
 # Confirm that the lock table iterator does not step out of the lock table
 # keys space despite no lower bound.
-iter upper=Lc
+iter upper=Ld
 seek-ge k=La
 next
 prev
@@ -464,13 +447,15 @@ next: output: meta k=Lb ts=20.000000000,0 txn=2
 # Confirm that the underlying MVCCIterator does not iterate into the lock
 # table key space despite no upper bound.
 iter lower=La
-seek-lt k=Ld
+seek-lt k=Le
 prev
 prev
 prev
 prev
 prev
 prev
+prev
+next
 next
 next
 next
@@ -481,7 +466,8 @@ next
 next
 prev
 ----
-seek-lt "Ld"/0,0: output: value k=Lc ts=30.000000000,0 v=c30
+seek-lt "Le"/0,0: output: value k=Ld ts=30.000000000,0 v=d40
+prev: output: value k=Lc ts=30.000000000,0 v=c30
 prev: output: meta k=Lc ts=30.000000000,0 txn=4
 prev: output: value k=Lb ts=20.000000000,0 v=b20
 prev: output: meta k=Lb ts=20.000000000,0 txn=2
@@ -494,9 +480,10 @@ next: output: meta k=Lb ts=20.000000000,0 txn=2
 next: output: value k=Lb ts=20.000000000,0 v=b20
 next: output: meta k=Lc ts=30.000000000,0 txn=4
 next: output: value k=Lc ts=30.000000000,0 v=c30
+next: output: value k=Ld ts=30.000000000,0 v=d40
 next: output: .
 next: output: .
-prev: output: value k=Lc ts=30.000000000,0 v=c30
+prev: output: value k=Ld ts=30.000000000,0 v=d40
 
 iter prefix=true
 seek-ge k=Lb
@@ -531,10 +518,10 @@ seek-ge "Lc"/25.000000000,0: output: .
 # slice is smaller than cap and the first byte beyond len is 0.
 define
 locks
-meta k=abcdefg\0 ts=20 txn=1
-meta k=b\0c\0d ts=20 txn=1
-meta k=bcdefgh\0 ts=20 txn=1
-meta k=cdefghijklmnopq\0 ts=20 txn=1
+meta k=abcdefg\0         str=intent ts=20 txn=1
+meta k=b\0c\0d           str=intent ts=20 txn=1
+meta k=bcdefgh\0         str=intent ts=20 txn=1
+meta k=cdefghijklmnopq\0 str=intent ts=20 txn=1
 mvcc
 value k=abcdefg\0 ts=20 v=a
 value k=b\0c\0d ts=20 v=b1
@@ -593,12 +580,12 @@ prev: output: .
 
 define
 locks
-meta k=Lb ts=20 txn=2
-meta k=Lc ts=30 txn=4
-meta k=b ts=40 txn=5
-meta k=d ts=50 txn=6
+meta k=La str=intent ts=10 txn=1
+meta k=Lb str=intent ts=20 txn=2
+meta k=Lc str=intent ts=30 txn=4
+meta k=b  str=intent ts=40 txn=5
+meta k=d  str=intent ts=50 txn=6
 mvcc
-meta k=La ts=10 txn=1
 value k=La ts=10 v=a10
 value k=Lb ts=20 v=b20
 value k=Lc ts=30 v=c30
@@ -677,9 +664,9 @@ seek-ge "c"/0,0: output: .
 # worthwhile for the intentInterleavingIter to work cleanly here.
 define
 locks
-meta k=Lb ts=20 txn=2
-meta k=Sc ts=30 txn=3
-meta k=d ts=40 txn=4
+meta k=Lb str=intent ts=20 txn=2
+meta k=Sc str=intent ts=30 txn=3
+meta k=d  str=intent ts=40 txn=4
 mvcc
 value k=Lb ts=20 v=b20
 value k=Sc ts=30 v=c30
@@ -767,8 +754,8 @@ prev: output: value k=Sc ts=30.000000000,0 v=c30
 # non-zero timestamps is bogus, but harmless.
 define
 locks
-meta k=Lb ts=20 txn=2
-meta k=e ts=50 txn=3
+meta k=Lb str=intent ts=20 txn=2
+meta k=e  str=intent ts=50 txn=3
 mvcc
 value k=Lb ts=20 v=b20
 value k=Sc ts=30 v=c30

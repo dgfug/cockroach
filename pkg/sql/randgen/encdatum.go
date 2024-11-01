@@ -1,32 +1,27 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randgen
 
 import (
 	"math/rand"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // RandDatumEncoding returns a random DatumEncoding value.
-func RandDatumEncoding(rng *rand.Rand) descpb.DatumEncoding {
-	return descpb.DatumEncoding(rng.Intn(len(descpb.DatumEncoding_value)))
+func RandDatumEncoding(rng *rand.Rand) catenumpb.DatumEncoding {
+	return catenumpb.DatumEncoding(rng.Intn(len(catenumpb.DatumEncoding_value)))
 }
 
 // RandEncDatum generates a random EncDatum (of a random type).
 func RandEncDatum(rng *rand.Rand) (rowenc.EncDatum, *types.T) {
-	typ := RandEncodableType(rng)
+	typ := RandType(rng)
 	datum := RandDatum(rng, typ, true /* nullOk */)
 	return rowenc.DatumToEncDatum(typ, datum), typ
 }
@@ -69,7 +64,7 @@ func RandEncDatumRowOfTypes(rng *rand.Rand, types []*types.T) rowenc.EncDatumRow
 // RandEncDatumRows generates EncDatumRows where all rows follow the same random
 // []ColumnType structure.
 func RandEncDatumRows(rng *rand.Rand, numRows, numCols int) (rowenc.EncDatumRows, []*types.T) {
-	types := RandEncodableColumnTypes(rng, numCols)
+	types := RandColumnTypes(rng, numCols)
 	return RandEncDatumRowsOfTypes(rng, numRows, types), types
 }
 
@@ -191,7 +186,7 @@ func GenEncDatumRowsBytes(inputRows [][][]byte) rowenc.EncDatumRows {
 	rows := make(rowenc.EncDatumRows, len(inputRows))
 	for i, inputRow := range inputRows {
 		for _, x := range inputRow {
-			rows[i] = append(rows[i], rowenc.EncDatumFromEncoded(descpb.DatumEncoding_VALUE, x))
+			rows[i] = append(rows[i], rowenc.EncDatumFromEncoded(catenumpb.DatumEncoding_VALUE, x))
 		}
 	}
 	return rows

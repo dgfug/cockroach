@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
@@ -15,9 +10,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,8 +19,7 @@ import (
 // iteration. For example, the iterator would skip over inverted and partial
 // indexes given these flags:
 //
-//   flags := rejectInvertedIndexes|rejectPartialIndexes
-//
+//	flags := rejectInvertedIndexes|rejectPartialIndexes
 type indexRejectFlags int8
 
 const (
@@ -51,8 +44,8 @@ const (
 // scanIndexIter is a helper struct that facilitates iteration over the indexes
 // of a Scan operator table.
 type scanIndexIter struct {
-	evalCtx *tree.EvalContext
-	f       *norm.Factory
+	evalCtx *eval.Context
+	e       *explorer
 	im      *partialidx.Implicator
 	tabMeta *opt.TableMeta
 
@@ -86,8 +79,8 @@ type scanIndexIter struct {
 
 // Init initializes a new scanIndexIter.
 func (it *scanIndexIter) Init(
-	evalCtx *tree.EvalContext,
-	f *norm.Factory,
+	evalCtx *eval.Context,
+	e *explorer,
 	mem *memo.Memo,
 	im *partialidx.Implicator,
 	scanPrivate *memo.ScanPrivate,
@@ -98,7 +91,7 @@ func (it *scanIndexIter) Init(
 	// reused. Field reuse must be explicit.
 	*it = scanIndexIter{
 		evalCtx:     evalCtx,
-		f:           f,
+		e:           e,
 		im:          im,
 		tabMeta:     mem.Metadata().TableMeta(scanPrivate.Table),
 		scanPrivate: scanPrivate,
@@ -119,10 +112,10 @@ func (it *scanIndexIter) Init(
 //
 // Consider the indexes and query:
 //
-//   CREATE INDEX idx1 ON t (a) WHERE c > 0
-//   CREATE INDEX idx2 ON t (b) WHERE c > 0
+//	CREATE INDEX idx1 ON t (a) WHERE c > 0
+//	CREATE INDEX idx2 ON t (b) WHERE c > 0
 //
-//   SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 0
+//	SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 0
 //
 // The optimal query plan is a zigzag join over idx1 and idx2. Planning a zigzag
 // join requires a nested loop over the indexes of a table. The outer loop will
@@ -143,10 +136,10 @@ func (it *scanIndexIter) Init(
 //
 // Consider the indexes and query:
 //
-//   CREATE INDEX idx1 ON t (a) WHERE b > 0
-//   CREATE INDEX idx2 ON t (c) WHERE d > 0
+//	CREATE INDEX idx1 ON t (a) WHERE b > 0
+//	CREATE INDEX idx2 ON t (c) WHERE d > 0
 //
-//   SELECT * FROM t WHERE a = 1 AND b > 0 AND c = 2 AND d > 0
+//	SELECT * FROM t WHERE a = 1 AND b > 0 AND c = 2 AND d > 0
 //
 // The optimal query plan is a zigzag join over idx1 and idx2 with no remaining
 // Select filters. If the original filters were passed to the inner loop's Init,
@@ -219,12 +212,20 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 			continue
 		}
 
-		// If we are forcing a specific index, ignore all other indexes.
-		if it.scanPrivate.Flags.ForceIndex && ord != it.scanPrivate.Flags.Index {
-			continue
-		}
-
 		index := it.tabMeta.Table.Index(ord)
+		if it.scanPrivate.Flags.ForceIndex {
+			// If we are forcing a specific index, ignore all other indexes.
+			if ord != it.scanPrivate.Flags.Index {
+				continue
+			}
+		} else {
+			// If we are not forcing any specific index and not visible index feature is
+			// enabled here, ignore not visible indexes.
+			if it.tabMeta.IsIndexNotVisible(ord, it.e.o.rng) && !it.scanPrivate.Flags.DisableNotVisibleIndex &&
+				!it.evalCtx.SessionData().OptimizerUseNotVisibleIndexes {
+				continue
+			}
+		}
 
 		// Skip over inverted indexes if rejectInvertedIndexes is set.
 		if it.hasRejectFlags(rejectInvertedIndexes) && index.IsInverted() {
@@ -315,7 +316,12 @@ func (it *scanIndexIter) filtersImplyPredicate(
 	pred memo.FiltersExpr,
 ) (remainingFilters memo.FiltersExpr, ok bool) {
 	// Return the remaining filters if the filters imply the predicate.
-	if remainingFilters, ok = it.im.FiltersImplyPredicate(it.filters, pred); ok {
+	var computedCols map[opt.ColumnID]opt.ScalarExpr
+	if it.e.evalCtx.SessionData().OptimizerProveImplicationWithVirtualComputedColumns {
+		computedCols = it.tabMeta.ComputedCols
+	}
+	if remainingFilters, ok =
+		it.im.FiltersImplyPredicate(it.filters, pred, computedCols); ok {
 		return remainingFilters, true
 	}
 
@@ -327,7 +333,8 @@ func (it *scanIndexIter) filtersImplyPredicate(
 	// filters-implication are a subset of the remaining filters from
 	// originalFilters-implication.
 	if it.originalFilters != nil {
-		if remainingFilters, ok = it.im.FiltersImplyPredicate(it.originalFilters, pred); ok {
+		if remainingFilters, ok =
+			it.im.FiltersImplyPredicate(it.originalFilters, pred, computedCols); ok {
 			return remainingFilters, true
 		}
 	}
@@ -338,7 +345,7 @@ func (it *scanIndexIter) filtersImplyPredicate(
 // extractConstNonCompositeColumns returns the set of columns held constant by
 // the given filters and of types that do not have composite encodings.
 func (it *scanIndexIter) extractConstNonCompositeColumns(f memo.FiltersExpr) opt.ColSet {
-	constCols := memo.ExtractConstColumns(f, it.evalCtx)
+	constCols := memo.ExtractConstColumns(it.e.ctx, f, it.evalCtx)
 	var constNonCompositeCols opt.ColSet
 	for col, ok := constCols.Next(0); ok; col, ok = constCols.Next(col + 1) {
 		ord := it.tabMeta.MetaID.ColumnOrdinal(col)
@@ -362,14 +369,14 @@ func (it *scanIndexIter) buildConstProjectionsFromPredicate(
 		ord := it.tabMeta.MetaID.ColumnOrdinal(col)
 		typ := it.tabMeta.Table.Column(ord).DatumType()
 
-		val := memo.ExtractValueForConstColumn(pred, it.evalCtx, col)
+		val := memo.ExtractValueForConstColumn(it.e.ctx, pred, it.evalCtx, col)
 		if val == nil {
 			panic(errors.AssertionFailedf("could not extract constant value for column %d", col))
 		}
 
-		scalar := it.f.ConstructConstVal(val, typ)
+		scalar := it.e.f.ConstructConstVal(val, typ)
 
-		proj = append(proj, it.f.ConstructProjectionsItem(
+		proj = append(proj, it.e.f.ConstructProjectionsItem(
 			scalar,
 			col,
 		))

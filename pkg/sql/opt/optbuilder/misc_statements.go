@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -45,11 +41,23 @@ func (b *Builder) buildControlJobs(n *tree.ControlJobs, inScope *scope) (outScop
 	)
 	outScope = inScope.push()
 	outScope.expr = b.factory.ConstructControlJobs(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		reason,
 		&memo.ControlJobsPrivate{
 			Props:   inputScope.makePhysicalProps(),
 			Command: n.Command,
+		},
+	)
+	return outScope
+}
+
+func (b *Builder) buildShowCompletions(n *tree.ShowCompletions, inScope *scope) (outScope *scope) {
+	outScope = inScope.push()
+	b.synthesizeResultColumns(outScope, colinfo.ShowCompletionsColumns)
+	outScope.expr = b.factory.ConstructShowCompletions(
+		&memo.ShowCompletionsPrivate{
+			Command: n,
+			Columns: colsToColList(outScope.cols),
 		},
 	)
 	return outScope
@@ -71,7 +79,7 @@ func (b *Builder) buildCancelQueries(n *tree.CancelQueries, inScope *scope) (out
 	)
 	outScope = inScope.push()
 	outScope.expr = b.factory.ConstructCancelQueries(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		&memo.CancelPrivate{
 			Props:    inputScope.makePhysicalProps(),
 			IfExists: n.IfExists,
@@ -96,7 +104,7 @@ func (b *Builder) buildCancelSessions(n *tree.CancelSessions, inScope *scope) (o
 	)
 	outScope = inScope.push()
 	outScope.expr = b.factory.ConstructCancelSessions(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		&memo.CancelPrivate{
 			Props:    inputScope.makePhysicalProps(),
 			IfExists: n.IfExists,
@@ -108,10 +116,6 @@ func (b *Builder) buildCancelSessions(n *tree.CancelSessions, inScope *scope) (o
 func (b *Builder) buildControlSchedules(
 	n *tree.ControlSchedules, inScope *scope,
 ) (outScope *scope) {
-	if err := b.catalog.RequireAdminRole(b.ctx, n.StatementTag()); err != nil {
-		panic(err)
-	}
-
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
 	emptyScope := b.allocScope()
@@ -128,7 +132,7 @@ func (b *Builder) buildControlSchedules(
 
 	outScope = inScope.push()
 	outScope.expr = b.factory.ConstructControlSchedules(
-		inputScope.expr.(memo.RelExpr),
+		inputScope.expr,
 		&memo.ControlSchedulesPrivate{
 			Props:   inputScope.makePhysicalProps(),
 			Command: n.Command,
@@ -139,6 +143,13 @@ func (b *Builder) buildControlSchedules(
 
 func (b *Builder) buildCreateStatistics(n *tree.CreateStats, inScope *scope) (outScope *scope) {
 	outScope = inScope.push()
+
+	// We add AS OF SYSTEM TIME '-1us' to trigger use of inconsistent
+	// scans if left unspecified. This prevents GC TTL errors.
+	if n.Options.AsOf.Expr == nil {
+		n.Options.AsOf.Expr = tree.NewStrVal("-1us")
+	}
+
 	outScope.expr = b.factory.ConstructCreateStatistics(&memo.CreateStatisticsPrivate{
 		Syntax: n,
 	})

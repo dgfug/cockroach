@@ -1,16 +1,11 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecjoin
 
-import "github.com/cockroachdb/cockroach/pkg/util"
+import "github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 
 // circularGroupsBuffer is a struct designed to store the groups' slices for a
 // given column. It starts out small and will grow dynamically if necessary
@@ -47,7 +42,7 @@ type circularGroupsBuffer struct {
 
 // groupsBufferInitialSize determines the size used in initial allocations of
 // the slices of the circularGroupsBuffer.
-var groupsBufferInitialSize = util.ConstantWithMetamorphicTestRange(
+var groupsBufferInitialSize = metamorphic.ConstantWithTestRange(
 	"merge-joiner-groups-buffer",
 	8,  /* defaultValue */
 	1,  /* min */
@@ -82,19 +77,23 @@ func getGroupsBufferCapacity(size int) int {
 // Since we have a circular buffer, it is possible for groups to wrap when
 // capacity is reached. Consider an example when size = 3 and startIdx = 6 when
 // maximum number of groups is present:
-//   buffer = [1, 2, 3, 4, 5, x, 0]
-//  (integers denote different groups and 'x' stands for a garbage).
+//
+//	 buffer = [1, 2, 3, 4, 5, x, 0]
+//	(integers denote different groups and 'x' stands for a garbage).
+//
 // When getGroups() is called, for ease of usage we need to return the buffer
 // "flattened out", and in order to reduce allocation, we actually reserve
 // 4*size. In the example above we will copy the buffer as:
-//   buffer = [1, 2, 3, 4, 5, x, 0, 1, 2, 3, 4, 5]
+//
+//	buffer = [1, 2, 3, 4, 5, x, 0, 1, 2, 3, 4, 5]
+//
 // and will return buffer[6:12] when getGroups is called.
 // The calculations for why 4*size is sufficient:
-// - the largest position in which the first group can be placed is 2*size
-//   (capacity field enforces that)
-// - the largest number of groups to copy from the "physical" start of the
-//   buffer is 2*size-1
-// - adding those two numbers we arrive at 4*size.
+//   - the largest position in which the first group can be placed is 2*size
+//     (capacity field enforces that)
+//   - the largest number of groups to copy from the "physical" start of the
+//     buffer is 2*size-1
+//   - adding those two numbers we arrive at 4*size.
 func getGroupsSlicesLen(size int) int {
 	return 4 * size
 }

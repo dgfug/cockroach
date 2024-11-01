@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metamorphic
 
@@ -49,7 +44,7 @@ func standardOptions(i int) *pebble.Options {
 `,
 		7: `
 [Options]
-  mem_table_size=1000
+  mem_table_size=2000
 `,
 		8: `
 [Options]
@@ -93,7 +88,7 @@ func standardOptions(i int) *pebble.Options {
   max_concurrent_compactions=2
 `,
 	}
-	if i < 0 || i > len(stdOpts) {
+	if i < 0 || i >= len(stdOpts) {
 		panic("invalid index for standard option")
 	}
 	opts := storage.DefaultPebbleOptions()
@@ -129,9 +124,10 @@ func randomOptions() *pebble.Options {
 	}
 	opts.MaxManifestFileSize = 1 << rngIntRange(rng, 1, 28)
 	opts.MaxOpenFiles = int(rngIntRange(rng, 20, 2000))
-	opts.MemTableSize = 1 << rngIntRange(rng, 10, 28)
+	opts.MemTableSize = 1 << rngIntRange(rng, 11, 28)
 	opts.MemTableStopWritesThreshold = int(rngIntRange(rng, 2, 7))
-	opts.MaxConcurrentCompactions = int(rngIntRange(rng, 1, 4))
+	maxConcurrentCompactions := int(rngIntRange(rng, 1, 4))
+	opts.MaxConcurrentCompactions = func() int { return maxConcurrentCompactions }
 
 	opts.Cache = pebble.NewCache(1 << rngIntRange(rng, 1, 30))
 	defer opts.Cache.Unref()

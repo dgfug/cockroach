@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -26,10 +21,10 @@ import (
 // indexCheckOperation implements the checkOperation interface. It is a
 // scrub check for a secondary index's integrity. This operation will
 // detect:
-// 1) Missing index entries. When there is a secondary index entry
-//    expected, but is not found.
-// 2) Dangling index references. When there is a secondary index entry
-//    that refers to a primary index key that cannot be found.
+//  1. Missing index entries. When there is a secondary index entry
+//     expected, but is not found.
+//  2. Dangling index references. When there is a secondary index entry
+//     that refers to a primary index key that cannot be found.
 type indexCheckOperation struct {
 	tableName *tree.TableName
 	tableDesc catalog.TableDescriptor
@@ -113,10 +108,10 @@ func (o *indexCheckOperation) Start(params runParams) error {
 	}
 
 	checkQuery := createIndexCheckQuery(
-		colNames(pkColumns), colNames(otherColumns), o.tableDesc.GetID(), o.index.GetID(),
+		colNames(pkColumns), colNames(otherColumns), o.tableDesc.GetID(), o.index, o.tableDesc.GetPrimaryIndexID(),
 	)
 
-	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBuffered(
+	rows, err := params.p.InternalSQLTxn().QueryBuffered(
 		ctx, "scrub-index", params.p.txn, checkQuery,
 	)
 	if err != nil {
@@ -234,62 +229,70 @@ func (o *indexCheckOperation) Close(ctx context.Context) {
 //
 // For example, given the following table schema:
 //
-//   CREATE TABLE table (
-//     k INT, l INT, a INT, b INT, c INT,
-//     PRIMARY KEY (k, l),
-//     INDEX idx (a,b),
-//   )
+//	CREATE TABLE table (
+//	  k INT, l INT, a INT, b INT, c INT,
+//	  PRIMARY KEY (k, l),
+//	  INDEX idx (a,b),
+//	)
 //
 // The generated query to check the `v_idx` will be:
 //
-//   SELECT pri.k  pri.l, pri.a, pri.b,
-//          sec.k, sec.l, sec.a, sec.b
-//   FROM
-//     (SELECT k, l, a, b FROM [tbl_id AS table_pri]@{FORCE_INDEX=[1]}) AS pri
-//   FULL OUTER JOIN
-//     (SELECT k, l, a, b FROM [tbl_id AS table_sec]@{FORCE_INDEX=[idx_id]} AS sec
-//   ON
-//     pri.k = sec.k AND
-//     pri.l = sec.l AND
-//     pri.a IS NOT DISTINCT FROM sec.a AND
-//     pri.b IS NOT DISTINCT FROM sec.b
-//   WHERE
-//     pri.k IS NULL OR sec.k IS NULL
+//	SELECT pri.k  pri.l, pri.a, pri.b,
+//	       sec.k, sec.l, sec.a, sec.b
+//	FROM
+//	  (SELECT k, l, a, b FROM [tbl_id AS table_pri]@{FORCE_INDEX=[pri_idx_id]}) AS pri
+//	FULL OUTER JOIN
+//	  (SELECT k, l, a, b FROM [tbl_id AS table_sec]@{FORCE_INDEX=[idx_id]} AS sec
+//	ON
+//	  pri.k = sec.k AND
+//	  pri.l = sec.l AND
+//	  pri.a IS NOT DISTINCT FROM sec.a AND
+//	  pri.b IS NOT DISTINCT FROM sec.b
+//	WHERE
+//	  pri.k IS NULL OR sec.k IS NULL
 //
 // Explanation:
-//   1) We scan both the primary index and the secondary index.
 //
-//   2) We join them on equality on the PK columns and "IS NOT DISTINCT FROM" on
-//      the other index columns. "IS NOT DISTINCT FROM" is like equality except
-//      that NULL equals NULL; it is not needed for the PK columns because those
-//      can't be NULL.
+//  1. We scan both the primary index and the secondary index.
 //
-//      Note: currently, only the PK columns will be used as join equality
-//      columns, but that is sufficient.
+//  2. We join them on equality on the PK columns and "IS NOT DISTINCT FROM" on
+//     the other index columns. "IS NOT DISTINCT FROM" is like equality except
+//     that NULL equals NULL; it is not needed for the PK columns because those
+//     can't be NULL.
 //
-//   3) We select the "outer" rows (those that had no match), effectively
-//      achieving a "double" anti-join. We use the PK columns which cannot be
-//      NULL except on these rows.
+//     Note: currently, only the PK columns will be used as join equality
+//     columns, but that is sufficient.
 //
-//   4) The results are as follows:
-//       - if a PK column on the left is NULL, that means that the right-hand
-//         side row from the secondary index had no match in the primary index.
-//       - if a PK column on the right is NULL, that means that the left-hand
-//         side row from the primary key had no match in the secondary index.
+//  3. We select the "outer" rows (those that had no match), effectively
+//     achieving a "double" anti-join. We use the PK columns which cannot be
+//     NULL except on these rows.
 //
+//  4. The results are as follows:
+//     - if a PK column on the left is NULL, that means that the right-hand
+//     side row from the secondary index had no match in the primary index.
+//     - if a PK column on the right is NULL, that means that the left-hand
+//     side row from the primary key had no match in the secondary index.
 func createIndexCheckQuery(
-	pkColumns []string, otherColumns []string, tableID descpb.ID, indexID descpb.IndexID,
+	pkColumns []string,
+	otherColumns []string,
+	tableID descpb.ID,
+	index catalog.Index,
+	primaryIndexID descpb.IndexID,
 ) string {
 	allColumns := append(pkColumns, otherColumns...)
+	predicate := ""
+	if index.IsPartial() {
+		predicate = fmt.Sprintf(" WHERE %s", index.GetPredicate())
+	}
 	// We need to make sure we can handle the non-public column `rowid`
 	// that is created for implicit primary keys. In order to do so, the
 	// rendered columns need to explicit in the inner selects.
 	const checkIndexQuery = `
     SELECT %[1]s, %[2]s
     FROM
-      (SELECT %[8]s FROM [%[3]d AS table_pri]@{FORCE_INDEX=[1]}) AS pri
+      (SELECT %[8]s FROM [%[3]d AS table_pri]@{FORCE_INDEX=[%[9]d]}%[10]s) AS pri
     FULL OUTER JOIN
-      (SELECT %[8]s FROM [%[3]d AS table_sec]@{FORCE_INDEX=[%[4]d]}) AS sec
+      (SELECT %[8]s FROM [%[3]d AS table_sec]@{FORCE_INDEX=[%[4]d]}%[10]s) AS sec
     ON %[5]s
     WHERE %[6]s IS NULL OR %[7]s IS NULL`
 	return fmt.Sprintf(
@@ -305,7 +308,7 @@ func createIndexCheckQuery(
 		tableID,
 
 		// 4
-		indexID,
+		index.GetID(),
 
 		// 5: pri.k = sec.k AND pri.l = sec.l AND
 		//    pri.a IS NOT DISTINCT FROM sec.a AND pri.b IS NOT DISTINCT FROM sec.b
@@ -326,5 +329,12 @@ func createIndexCheckQuery(
 
 		// 8: k, l, a, b
 		strings.Join(colRefs("", append(pkColumns, otherColumns...)), ", "),
+
+		// 9
+		primaryIndexID,
+
+		// 10: WHERE <some predicate>
+		// Can be empty string for non-partial indexes
+		predicate,
 	)
 }

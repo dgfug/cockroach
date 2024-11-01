@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
@@ -15,7 +10,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
 )
@@ -58,7 +54,7 @@ func (o *Optimizer) TryPlaceholderFastPath() (_ opt.Expr, ok bool, err error) {
 	// performance significantly (see #64214). So we only use the fast path if the
 	// estimated row count is small; typically this will happen when we constrain
 	// columns that form a key and we know there will be at most one row.
-	if rootRelProps.Stats.RowCount > maxRowCountForPlaceholderFastPath {
+	if rootRelProps.Statistics().RowCount > maxRowCountForPlaceholderFastPath {
 		return nil, false, nil
 	}
 
@@ -198,6 +194,9 @@ func (o *Optimizer) TryPlaceholderFastPath() (_ opt.Expr, ok bool, err error) {
 		for j := range sel.Filters {
 			eq := sel.Filters[j].Condition.(*memo.EqExpr)
 			if v := eq.Left.(*memo.VariableExpr); v.Col == col {
+				if !verifyType(o.mem.Metadata(), col, eq.Right.DataType()) {
+					return nil, false, nil
+				}
 				span[i] = eq.Right
 				break
 			}
@@ -215,9 +214,18 @@ func (o *Optimizer) TryPlaceholderFastPath() (_ opt.Expr, ok bool, err error) {
 	o.mem.SetBestProps(placeholderScan, rootPhysicalProps, &physical.Provided{}, 1.0 /* cost */)
 	o.mem.SetRoot(placeholderScan, rootPhysicalProps)
 
-	if util.CrdbTestBuild && !o.mem.IsOptimized() {
+	if buildutil.CrdbTestBuild && !o.mem.IsOptimized() {
 		return nil, false, errors.AssertionFailedf("IsOptimized() should be true")
 	}
 
 	return placeholderScan, true, nil
+}
+
+// verifyType checks that the type of the index column col matches the
+// given type. We disallow mixed-type comparisons because it would result in
+// incorrect encodings (See #4313 and #81315).
+// TODO(rytaft): We may be able to use the placeholder fast path for
+// this case if we add logic similar to UnifyComparisonTypes.
+func verifyType(md *opt.Metadata, col opt.ColumnID, typ *types.T) bool {
+	return typ.Family() == types.UnknownFamily || md.ColumnMeta(col).Type.Equivalent(typ)
 }

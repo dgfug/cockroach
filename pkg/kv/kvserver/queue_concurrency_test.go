@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -17,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -44,7 +42,8 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper := stop.NewStopper()
+	tr := tracing.NewTracer()
+	stopper := stop.NewStopper(stop.WithTracer(tr))
 	defer stopper.Stop(ctx)
 
 	// We'll use this many ranges, each of which is added a few times to the
@@ -59,9 +58,11 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		// We don't care about these, but we don't want to crash.
 		successes:       metric.NewCounter(metric.Metadata{Name: "processed"}),
 		failures:        metric.NewCounter(metric.Metadata{Name: "failures"}),
+		storeFailures:   metric.NewCounter(metric.Metadata{Name: "store_failures"}),
 		pending:         metric.NewGauge(metric.Metadata{Name: "pending"}),
 		processingNanos: metric.NewCounter(metric.Metadata{Name: "processingnanos"}),
 		purgatory:       metric.NewGauge(metric.Metadata{Name: "purgatory"}),
+		disabledConfig:  testQueueEnabled,
 	}
 
 	// Set up a fake store with just exactly what the code calls into. Ideally
@@ -69,9 +70,10 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	// replicaInQueue, but this isn't an ideal world. Deal with it.
 	store := &Store{
 		cfg: StoreConfig{
-			Clock:             hlc.NewClock(hlc.UnixNano, time.Second),
-			AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
+			Clock:             hlc.NewClockForTesting(nil),
+			AmbientCtx:        log.MakeTestingAmbientContext(tr),
 			DefaultSpanConfig: roachpb.TestingDefaultSpanConfig(),
+			Settings:          cluster.MakeTestingClusterSettingsWithVersions(clusterversion.Latest.Version(), clusterversion.Latest.Version(), true),
 		},
 	}
 
@@ -84,7 +86,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 			} else if n == 1 {
 				return false, errors.New("injected regular error")
 			} else if n == 2 {
-				return false, &benignError{errors.New("injected benign error")}
+				return false, benignerror.New(errors.New("injected benign error"))
 			}
 			return false, &testPurgatoryError{}
 		},
@@ -130,6 +132,8 @@ type fakeQueueImpl struct {
 	pr func(context.Context, *Replica, spanconfig.StoreReader) (processed bool, err error)
 }
 
+var _ queueImpl = &fakeQueueImpl{}
+
 func (fakeQueueImpl) shouldQueue(
 	context.Context, hlc.ClockTimestamp, *Replica, spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
@@ -142,12 +146,21 @@ func (fq fakeQueueImpl) process(
 	return fq.pr(ctx, repl, confReader)
 }
 
+func (fakeQueueImpl) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (fakeQueueImpl) timer(time.Duration) time.Duration {
 	return time.Nanosecond
 }
 
 func (fakeQueueImpl) purgatoryChan() <-chan time.Time {
 	return time.After(time.Nanosecond)
+}
+
+func (fakeQueueImpl) updateChan() <-chan time.Time {
+	return nil
 }
 
 type fakeReplica struct {
@@ -166,13 +179,12 @@ func (fr *fakeReplica) IsDestroyed() (DestroyReason, error) { return destroyReas
 func (fr *fakeReplica) Desc() *roachpb.RangeDescriptor {
 	return &roachpb.RangeDescriptor{RangeID: fr.rangeID, EndKey: roachpb.RKey("z")}
 }
-func (fr *fakeReplica) maybeInitializeRaftGroup(context.Context) {}
 func (fr *fakeReplica) redirectOnOrAcquireLease(
 	context.Context,
-) (kvserverpb.LeaseStatus, *roachpb.Error) {
+) (kvserverpb.LeaseStatus, *kvpb.Error) {
 	// baseQueue only checks that the returned error is nil.
 	return kvserverpb.LeaseStatus{}, nil
 }
-func (fr *fakeReplica) LeaseStatusAt(context.Context, hlc.ClockTimestamp) kvserverpb.LeaseStatus {
+func (fr *fakeReplica) CurrentLeaseStatus(context.Context) kvserverpb.LeaseStatus {
 	return kvserverpb.LeaseStatus{}
 }

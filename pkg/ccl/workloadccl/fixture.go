@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadccl
 
@@ -15,26 +12,24 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
-	"cloud.google.com/go/storage"
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
-	"google.golang.org/api/iterator"
-)
-
-const (
-	fixtureGCSURIScheme = `gs`
 )
 
 func init() {
@@ -43,12 +38,21 @@ func init() {
 
 // FixtureConfig describes a storage place for fixtures.
 type FixtureConfig struct {
-	// GCSBucket is a Google Cloud Storage bucket.
-	GCSBucket string
+	// StorageProvider specifies the name of storage provider as supported by cloud
+	// storage.  Default "gs" (other providers include "s3", and "azure").
+	StorageProvider string
 
-	// GCSPrefix is a prefix to prepend to each Google Cloud Storage object
-	// path.
-	GCSPrefix string
+	// Bucket is a Cloud Storage bucket.
+	Bucket string
+
+	// Basename is appended to the bucket to form a path to the fixtures directory.
+	Basename string
+
+	// AuthParams are the authentication related query parameters added to the URI
+	// to be able to access fixture path.  By default, IMPLICIT authentication is used.
+	// Otherwise, it can be overriden to add cloud specific authentication parameters,
+	// such as access keys, billing projects, and others.
+	AuthParams string
 
 	// CSVServerURL is a url to a `./workload csv-server` to use as a source of
 	// CSV data. The url is anything accepted by our backup/restore. Notably, if
@@ -56,29 +60,15 @@ type FixtureConfig struct {
 	// `http://localhost:<port>` will work.
 	CSVServerURL string
 
-	// BillingProject if non-empty, is the Google Cloud project to bill for all
-	// storage requests. This is required to be set if using a "requestor pays"
-	// bucket.
-	BillingProject string
-
 	// If TableStats is true, CREATE STATISTICS is called on all tables before
 	// creating the fixture.
 	TableStats bool
 }
 
-func (s FixtureConfig) objectPathToURI(folder string) string {
-	u := &url.URL{
-		Scheme: fixtureGCSURIScheme,
-		Host:   s.GCSBucket,
-		Path:   folder,
-	}
-	q := url.Values{}
-	if s.BillingProject != `` {
-		q.Add("GOOGLE_BILLING_PROJECT", s.BillingProject)
-	}
-	q.Add("AUTH", "implicit")
-	u.RawQuery = q.Encode()
-	return u.String()
+// ObjectPathToURI returns URI for the optional folder path components.
+func (s FixtureConfig) ObjectPathToURI(folders ...string) string {
+	path := filepath.Join(folders...)
+	return fmt.Sprintf("%s://%s/%s/%s?%s", s.StorageProvider, s.Bucket, s.Basename, path, s.AuthParams)
 }
 
 // Fixture describes pre-computed data for a Generator, allowing quick
@@ -104,6 +94,7 @@ func serializeOptions(gen workload.Generator) string {
 		return ``
 	}
 	// NB: VisitAll visits in a deterministic (alphabetical) order.
+
 	var buf bytes.Buffer
 	flags := f.Flags()
 	flags.VisitAll(func(f *pflag.Flag) {
@@ -118,65 +109,46 @@ func serializeOptions(gen workload.Generator) string {
 	return buf.String()
 }
 
-func generatorToGCSFolder(config FixtureConfig, gen workload.Generator) string {
+func generatorToStorageFolder(gen workload.Generator) string {
 	meta := gen.Meta()
-	return filepath.Join(
-		config.GCSPrefix,
-		meta.Name,
-		fmt.Sprintf(`version=%s,%s`, meta.Version, serializeOptions(gen)),
-	)
+	return filepath.Join(meta.Name,
+		fmt.Sprintf(`version=%s,%s`, meta.Version, serializeOptions(gen)))
 }
 
-// FixtureURL returns the URL for pre-computed Generator data stored on GCS.
+// FixtureURL returns the URL for pre-computed Generator data stored in the cloud.
 func FixtureURL(config FixtureConfig, gen workload.Generator) string {
-	return config.objectPathToURI(generatorToGCSFolder(config, gen))
+	return config.ObjectPathToURI(generatorToStorageFolder(gen))
 }
 
-// GetFixture returns a handle for pre-computed Generator data stored on GCS. It
+// GetFixture returns a handle for pre-computed Generator data stored in the cloud. It
 // is expected that the generator will have had Configure called on it.
 func GetFixture(
-	ctx context.Context, gcs *storage.Client, config FixtureConfig, gen workload.Generator,
+	ctx context.Context, es cloud.ExternalStorage, config FixtureConfig, gen workload.Generator,
 ) (Fixture, error) {
 	var fixture Fixture
-	var err error
-	var notFound bool
-	for r := retry.StartWithCtx(ctx, retry.Options{MaxRetries: 10}); r.Next(); {
-		err = func() error {
-			b := gcs.Bucket(config.GCSBucket)
-			if config.BillingProject != `` {
-				b = b.UserProject(config.BillingProject)
-			}
-
-			fixtureFolder := generatorToGCSFolder(config, gen)
-			_, err := b.Objects(ctx, &storage.Query{Prefix: fixtureFolder, Delimiter: `/`}).Next()
-			if errors.Is(err, iterator.Done) {
-				notFound = true
-				return errors.Errorf(`fixture not found: %s`, fixtureFolder)
-			} else if err != nil {
-				return err
-			}
-
-			fixture = Fixture{Config: config, Generator: gen}
-			for _, table := range gen.Tables() {
-				tableFolder := filepath.Join(fixtureFolder, table.Name)
-				_, err := b.Objects(ctx, &storage.Query{Prefix: tableFolder, Delimiter: `/`}).Next()
-				if errors.Is(err, iterator.Done) {
-					return errors.Errorf(`fixture table not found: %s`, tableFolder)
-				} else if err != nil {
-					return err
-				}
-				fixture.Tables = append(fixture.Tables, FixtureTable{
-					TableName: table.Name,
-					BackupURI: config.objectPathToURI(tableFolder),
-				})
-			}
+	fixtureFolder := generatorToStorageFolder(gen)
+	fixture = Fixture{Config: config, Generator: gen}
+	for _, table := range gen.Tables() {
+		tableFolder := filepath.Join(fixtureFolder, table.Name)
+		var files []string
+		if err := listDir(ctx, es, func(s string) error {
+			files = append(files, s)
 			return nil
-		}()
-		if err == nil || notFound {
-			break
+		}, tableFolder); err != nil {
+			return Fixture{}, err
 		}
+
+		if len(files) == 0 {
+			return Fixture{}, errors.Newf(
+				"expected non zero files for table %q in fixture folder %q", table.Name, tableFolder)
+		}
+
+		fixture.Tables = append(fixture.Tables, FixtureTable{
+			TableName: table.Name,
+			BackupURI: config.ObjectPathToURI(tableFolder),
+		})
 	}
-	return fixture, err
+	return fixture, nil
 }
 
 func csvServerPaths(
@@ -234,10 +206,6 @@ func csvServerPaths(
 	return paths
 }
 
-// Specify an explicit empty prefix for crdb_internal to avoid an error if
-// the database we're connected to does not exist.
-const numNodesQuery = `SELECT count(node_id) FROM "".crdb_internal.gossip_liveness`
-
 // MakeFixture regenerates a fixture, storing it to GCS. It is expected that the
 // generator will have had Configure called on it.
 //
@@ -250,7 +218,7 @@ const numNodesQuery = `SELECT count(node_id) FROM "".crdb_internal.gossip_livene
 func MakeFixture(
 	ctx context.Context,
 	sqlDB *gosql.DB,
-	gcs *storage.Client,
+	es cloud.ExternalStorage,
 	config FixtureConfig,
 	gen workload.Generator,
 	filesPerNode int,
@@ -263,10 +231,10 @@ func MakeFixture(
 		}
 	}
 
-	fixtureFolder := generatorToGCSFolder(config, gen)
-	if _, err := GetFixture(ctx, gcs, config, gen); err == nil {
+	fixtureFolder := generatorToStorageFolder(gen)
+	if _, err := GetFixture(ctx, es, config, gen); err == nil {
 		return Fixture{}, errors.Errorf(
-			`fixture %s already exists`, config.objectPathToURI(fixtureFolder))
+			`fixture %s already exists`, config.ObjectPathToURI(fixtureFolder))
 	}
 
 	dbName := gen.Meta().Name
@@ -275,6 +243,7 @@ func MakeFixture(
 	}
 	l := ImportDataLoader{
 		FilesPerNode: filesPerNode,
+		dbName:       dbName,
 	}
 	// NB: Intentionally don't use workloadsql.Setup because it runs the PostLoad
 	// hooks (adding foreign keys, etc), but historically the BACKUPs created by
@@ -313,7 +282,7 @@ func MakeFixture(
 		t := t
 		g.Go(func() error {
 			q := fmt.Sprintf(`BACKUP "%s"."%s" TO $1`, dbName, t.Name)
-			output := config.objectPathToURI(filepath.Join(fixtureFolder, t.Name))
+			output := config.ObjectPathToURI(filepath.Join(fixtureFolder, t.Name))
 			log.Infof(ctx, "Backing %s up to %q...", t.Name, output)
 			_, err := sqlDB.Exec(q, output)
 			return err
@@ -323,7 +292,7 @@ func MakeFixture(
 		return Fixture{}, err
 	}
 
-	return GetFixture(ctx, gcs, config, gen)
+	return GetFixture(ctx, es, config, gen)
 }
 
 // ImportDataLoader is an InitialDataLoader implementation that loads data with
@@ -332,6 +301,7 @@ type ImportDataLoader struct {
 	FilesPerNode int
 	InjectStats  bool
 	CSVServer    string
+	dbName       string
 }
 
 // InitialDataLoad implements the InitialDataLoader interface.
@@ -344,9 +314,8 @@ func (l ImportDataLoader) InitialDataLoad(
 
 	log.Infof(ctx, "starting import of %d tables", len(gen.Tables()))
 	start := timeutil.Now()
-	const useConnectionDB = ``
 	bytes, err := ImportFixture(
-		ctx, db, gen, useConnectionDB, l.FilesPerNode, l.InjectStats, l.CSVServer)
+		ctx, db, gen, l.dbName, l.FilesPerNode, l.InjectStats, l.CSVServer)
 	if err != nil {
 		return 0, errors.Wrap(err, `importing fixture`)
 	}
@@ -355,6 +324,29 @@ func (l ImportDataLoader) InitialDataLoad(
 		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
 
 	return bytes, nil
+}
+
+// Specify an explicit empty prefix for crdb_internal to avoid an error if
+// the database we're connected to does not exist.
+const numNodesQuery = `SELECT count(node_id) FROM "".crdb_internal.gossip_liveness`
+const numNodesQuerySQLInstances = `SELECT count(1) FROM system.sql_instances WHERE addr IS NOT NULL`
+
+func getNodeCount(ctx context.Context, sqlDB *gosql.DB) (int, error) {
+	var numNodes int
+	if err := sqlDB.QueryRow(numNodesQuery).Scan(&numNodes); err != nil {
+		// If the query is unsupported because we're in
+		// multi-tenant mode, use the sql_instances table.
+		if !strings.Contains(err.Error(), errorutil.UnsupportedUnderClusterVirtualizationMessage) {
+			return 0, err
+
+		}
+	} else {
+		return numNodes, nil
+	}
+	if err := sqlDB.QueryRow(numNodesQuerySQLInstances).Scan(&numNodes); err != nil {
+		return 0, err
+	}
+	return numNodes, nil
 }
 
 // ImportFixture works like MakeFixture, but instead of stopping halfway or
@@ -370,16 +362,14 @@ func ImportFixture(
 	injectStats bool,
 	csvServer string,
 ) (int64, error) {
-	for _, t := range gen.Tables() {
-		if t.InitialRows.FillBatch == nil {
-			return 0, errors.Errorf(
-				`import fixture is not supported for workload %s`, gen.Meta().Name,
-			)
-		}
+	if !workload.SupportsFixtures(gen) {
+		return 0, errors.Errorf(
+			`import fixture is not supported for workload %s`, gen.Meta().Name,
+		)
 	}
 
-	var numNodes int
-	if err := sqlDB.QueryRow(numNodesQuery).Scan(&numNodes); err != nil {
+	numNodes, err := getNodeCount(ctx, sqlDB)
+	if err != nil {
 		return 0, err
 	}
 
@@ -407,17 +397,43 @@ func ImportFixture(
 	// references). If create table is done in parallel with IMPORT, some IMPORT
 	// jobs may fail because the type is being modified concurrently with the
 	// IMPORT. Removing the need to pre-create is being tracked with #70987.
-	for _, table := range tables {
-		err := createFixtureTable(sqlDB, dbName, table)
-		if err != nil {
-			return 0, errors.Wrapf(err, `creating table %s`, table.Name)
+	const maxTableBatchSize = 5000
+	currentTable := 0
+	for currentTable < len(tables) {
+		batchEnd := min(currentTable+maxTableBatchSize, len(tables))
+		nextBatch := tables[currentTable:batchEnd]
+		if err := crdb.ExecuteTx(ctx, sqlDB, &gosql.TxOptions{}, func(tx *gosql.Tx) error {
+			for _, table := range nextBatch {
+				err := createFixtureTable(tx, dbName, table)
+				if err != nil {
+					return errors.Wrapf(err, `creating table %s`, table.Name)
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
 		}
+		currentTable += maxTableBatchSize
 	}
 
+	// Default to unbounded unless a flag exists for it.
+	concurrencyLimit := math.MaxInt
+	if flagser, ok := gen.(workload.Flagser); ok {
+		importLimit, err := flagser.Flags().GetInt("import-concurrency-limit")
+		if err == nil {
+			concurrencyLimit = importLimit
+		}
+	}
+	concurrentImportLimit := limit.MakeConcurrentRequestLimiter("workload_import", concurrencyLimit)
 	for _, t := range tables {
 		table := t
 		paths := csvServerPaths(pathPrefix, gen, table, numNodes*filesPerNode)
 		g.GoCtx(func(ctx context.Context) error {
+			res, err := concurrentImportLimit.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer res.Release()
 			tableBytes, err := importFixtureTable(
 				ctx, sqlDB, dbName, table, paths, `` /* output */, injectStats)
 			atomic.AddInt64(&bytesAtomic, tableBytes)
@@ -430,13 +446,21 @@ func ImportFixture(
 	return atomic.LoadInt64(&bytesAtomic), nil
 }
 
-func createFixtureTable(sqlDB *gosql.DB, dbName string, table workload.Table) error {
+func createFixtureTable(tx *gosql.Tx, dbName string, table workload.Table) error {
 	qualifiedTableName := makeQualifiedTableName(dbName, &table)
+	if table.ObjectPrefix != nil && table.ObjectPrefix.ExplicitCatalog {
+		// Switch databases if one is explicitly specified for multi-region
+		// configurations with multiple databases.
+		_, err := tx.Exec("USE $1", table.ObjectPrefix.Catalog())
+		if err != nil {
+			return err
+		}
+	}
 	createTable := fmt.Sprintf(
 		`CREATE TABLE IF NOT EXISTS %s %s`,
 		qualifiedTableName,
 		table.Schema)
-	_, err := sqlDB.Exec(createTable)
+	_, err := tx.Exec(createTable)
 	return err
 }
 
@@ -582,7 +606,12 @@ func injectStatistics(qualifiedTableName string, table *workload.Table, sqlDB *g
 // database name and table.
 func makeQualifiedTableName(dbName string, table *workload.Table) string {
 	if dbName == "" {
-		return fmt.Sprintf(`"%s"`, table.Name)
+		name := table.GetResolvedName()
+		if name.ObjectNamePrefix.ExplicitCatalog ||
+			name.ObjectNamePrefix.ExplicitSchema {
+			return name.FQString()
+		}
+		return fmt.Sprintf(`"%s"`, name.ObjectName)
 	}
 	return fmt.Sprintf(`"%s"."%s"`, dbName, table.Name)
 }
@@ -609,7 +638,7 @@ func RestoreFixture(
 		table := table
 		g.GoCtx(func(ctx context.Context) error {
 			start := timeutil.Now()
-			restoreStmt := fmt.Sprintf(`RESTORE %s.%s FROM $1 WITH into_db=$2`, genName, table.TableName)
+			restoreStmt := fmt.Sprintf(`RESTORE %s.%s FROM $1 WITH into_db=$2, unsafe_restore_incompatible_version`, genName, table.TableName)
 			log.Infof(ctx, "Restoring from %s", table.BackupURI)
 			var rows, index, tableBytes int64
 			var discard interface{}
@@ -666,32 +695,33 @@ func RestoreFixture(
 	return atomic.LoadInt64(&bytesAtomic), nil
 }
 
+func listDir(
+	ctx context.Context, es cloud.ExternalStorage, lsFn cloud.ListingFn, dir string,
+) error {
+	// There are no directories in cloud storage; so, we simulate.
+	// Directory must end in "/".  And we use "/" as delimiter.  That is, we will list
+	// anything under "dir/", but stop before the next "/".
+	if dir[len(dir)-1] != '/' {
+		dir = dir + "/"
+	}
+	if log.V(1) {
+		log.Infof(ctx, "Listing %s", dir)
+	}
+	return es.List(ctx, dir, "/", lsFn)
+}
+
 // ListFixtures returns the object paths to all fixtures stored in a FixtureConfig.
 func ListFixtures(
-	ctx context.Context, gcs *storage.Client, config FixtureConfig,
+	ctx context.Context, es cloud.ExternalStorage, config FixtureConfig,
 ) ([]string, error) {
-	b := gcs.Bucket(config.GCSBucket)
-	if config.BillingProject != `` {
-		b = b.UserProject(config.BillingProject)
-	}
-
 	var fixtures []string
-	gensPrefix := config.GCSPrefix + `/`
-	for genIter := b.Objects(ctx, &storage.Query{Prefix: gensPrefix, Delimiter: `/`}); ; {
-		gen, err := genIter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		} else if err != nil {
+	for _, gen := range workload.Registered() {
+		if err := listDir(ctx, es, func(s string) error {
+			// Anything that looks like a directory is a fixture.
+			fixtures = append(fixtures, filepath.Join(gen.Name, s))
+			return nil
+		}, gen.Name); err != nil {
 			return nil, err
-		}
-		for genConfigIter := b.Objects(ctx, &storage.Query{Prefix: gen.Prefix, Delimiter: `/`}); ; {
-			genConfig, err := genConfigIter.Next()
-			if errors.Is(err, iterator.Done) {
-				break
-			} else if err != nil {
-				return nil, err
-			}
-			fixtures = append(fixtures, genConfig.Prefix)
 		}
 	}
 	return fixtures, nil

@@ -1,28 +1,25 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree_test
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -157,7 +154,7 @@ func TestFormatExpr(t *testing.T) {
 		{`timestamp 'now'`, tree.FmtShowTypes,
 			`(('now')[string]::TIMESTAMP)[timestamp]`},
 		{`timestamptz '2003-01-01 00:00:00+03:00'`, tree.FmtShowTypes,
-			`('2003-01-01 00:00:00+03:00')[timestamptz]`},
+			`('2003-01-01 00:00:00+03')[timestamptz]`},
 		{`timestamptz '2003-01-01 00:00:00'`, tree.FmtShowTypes,
 			`(('2003-01-01 00:00:00')[string]::TIMESTAMPTZ)[timestamptz]`},
 		{`greatest(unique_rowid(), 12)`, tree.FmtShowTypes,
@@ -224,6 +221,8 @@ func TestFormatExpr(t *testing.T) {
 		{`'63616665-6630-3064-6465-616462656562':::UUID`, tree.FmtParsable,
 			`'63616665-6630-3064-6465-616462656562':::UUID`},
 
+		{`123::INT`, tree.FmtCheckEquivalence, `123:::INT8`},
+		{`ARRAY[1, 2]::INT[]`, tree.FmtCheckEquivalence, `ARRAY[1:::INT8, 2:::INT8]:::INT8[]`},
 		{`(123:::INT, 123:::DECIMAL)`, tree.FmtCheckEquivalence,
 			`(123:::INT8, 123:::DECIMAL)`},
 
@@ -238,7 +237,7 @@ func TestFormatExpr(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			semaContext := tree.MakeSemaContext()
+			semaContext := tree.MakeSemaContext(nil /* resolver */)
 			typeChecked, err := tree.TypeCheck(ctx, expr, &semaContext, types.Any)
 			if err != nil {
 				t.Fatal(err)
@@ -251,12 +250,84 @@ func TestFormatExpr(t *testing.T) {
 	}
 }
 
+// TestFormatUntypedExpr is similar to TestFormatExpr, but it does not
+// type-check the test expressions before formatting them. It allows for testing
+// formatting of mis-typed expressions.
+func TestFormatUntypedExpr(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testData := []struct {
+		expr     string
+		f        tree.FmtFlags
+		expected string
+	}{
+		{"((1, 2) AS foo)", tree.FmtHideConstants, "((_, _) AS foo)"},
+		{"((1, 2, 3) AS foo)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo)"},
+		{"((1, 2, 3) AS foo, bar)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"((1, 2, 3) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"((1, 2) AS foo, bar)", tree.FmtHideConstants, "((_, _) AS foo, bar)"},
+		{"((1, 2) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _) AS foo, bar, baz)"},
+		{"(ROW(1) AS foo)", tree.FmtHideConstants, "((_,) AS foo)"},
+		{"(ROW(1) AS foo, bar)", tree.FmtHideConstants, "((_,) AS foo, bar)"},
+		{"(ROW(1) AS foo, bar, baz)", tree.FmtHideConstants, "((_,) AS foo, bar, baz)"},
+		{"(ROW(1, 2) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _) AS foo, bar, baz)"},
+		{"(ROW(1, 2, 3) AS foo, bar)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"(ROW(1, 2, 3) AS foo, bar, baz)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo, bar)"},
+		{"(ROW(1, 2, 3) AS foo)", tree.FmtHideConstants, "((_, _, __more1_10__) AS foo)"},
+	}
+
+	for i, test := range testData {
+		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
+			expr, err := parser.ParseExpr(test.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exprStr := tree.AsStringWithFlags(expr, test.f)
+			if exprStr != test.expected {
+				t.Fatalf("expected %q, got %q", test.expected, exprStr)
+			}
+		})
+	}
+}
+
+func TestFmtShortenConstants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	testData := []struct {
+		expr     string
+		expected string
+	}{
+		{`VALUES (1), (2)`, `VALUES (1), (2)`},
+		{`VALUES (1), (2), (3), (4)`, `VALUES (1), (2), (__more1_10__), (4)`},
+		{`VALUES (1), (2), (3), (4), (5), (6)`, `VALUES (1), (2), (__more1_10__), (6)`},
+		{`VALUES (ARRAY[1, 2])`, `VALUES (ARRAY[1, 2])`},
+		{`VALUES (ARRAY[1, 2, 3, 4])`, `VALUES (ARRAY[1, 2, __more1_10__, 4])`},
+		{`VALUES (ARRAY[1, 2, 3, 4, 5, 6])`, `VALUES (ARRAY[1, 2, __more1_10__, 6])`},
+		{`SELECT (1, 2)`, `SELECT (1, 2)`},
+		{`SELECT (1, 2, 3, 4)`, `SELECT (1, 2, __more1_10__, 4)`},
+		{`SELECT (1, 2, 3, 4, 5, 6)`, `SELECT (1, 2, __more1_10__, 6)`},
+	}
+
+	for i, test := range testData {
+		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
+			stmt, err := parser.ParseOne(test.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stmtStr := tree.AsStringWithFlags(stmt.AST, tree.FmtShortenConstants)
+			if stmtStr != test.expected {
+				t.Fatalf("expected %q, got %q", test.expected, stmtStr)
+			}
+		})
+	}
+}
+
 func TestFormatExpr2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	enumMembers := []string{"hi", "hello"}
-	enumType := types.MakeEnum(typedesc.TypeIDToOID(500), typedesc.TypeIDToOID(100500))
+	enumType := types.MakeEnum(catid.TypeIDToOID(500), catid.TypeIDToOID(100500))
 	enumType.TypeMeta = types.UserDefinedTypeMetadata{
 		Name: &types.UserDefinedTypeName{
 			Schema: "test",
@@ -284,24 +355,24 @@ func TestFormatExpr2(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// This tests formatting from an expr AST. Suitable for use if your input
+	// This tests formatting from an stmt AST. Suitable for use if your input
 	// isn't easily creatable from a string without running an Eval.
 	testData := []struct {
 		expr     tree.Expr
 		f        tree.FmtFlags
 		expected string
 	}{
-		{tree.NewDOidWithName(tree.DInt(10), types.RegClass, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegClass, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regclass(10,'foo'):::REGCLASS`},
-		{tree.NewDOidWithName(tree.DInt(10), types.RegNamespace, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegNamespace, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regnamespace(10,'foo'):::REGNAMESPACE`},
-		{tree.NewDOidWithName(tree.DInt(10), types.RegProc, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegProc, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regproc(10,'foo'):::REGPROC`},
-		{tree.NewDOidWithName(tree.DInt(10), types.RegProcedure, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegProcedure, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regprocedure(10,'foo'):::REGPROCEDURE`},
-		{tree.NewDOidWithName(tree.DInt(10), types.RegRole, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegRole, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regrole(10,'foo'):::REGROLE`},
-		{tree.NewDOidWithName(tree.DInt(10), types.RegType, "foo"),
+		{tree.NewDOidWithTypeAndName(10, types.RegType, "foo"),
 			tree.FmtParsable, `crdb_internal.create_regtype(10,'foo'):::REGTYPE`},
 
 		// Ensure that nulls get properly type annotated when printed in an
@@ -328,7 +399,7 @@ func TestFormatExpr2(t *testing.T) {
 		},
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			tree.DNull, enumHi),
+			tree.DNull, &enumHi),
 			tree.FmtParsable,
 			`(NULL:::greeting, 'hi':::greeting)`,
 		},
@@ -337,13 +408,13 @@ func TestFormatExpr2(t *testing.T) {
 		// enclosing tuple for serialization purposes.
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			enumHi, enumHello),
+			&enumHi, &enumHello),
 			tree.FmtSerializable,
 			`(x'4201':::@100500, x'42':::@100500)`,
 		},
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{enumType, enumType}),
-			tree.DNull, enumHi),
+			tree.DNull, &enumHi),
 			tree.FmtSerializable,
 			`(NULL:::@100500, x'4201':::@100500)`,
 		},
@@ -352,7 +423,7 @@ func TestFormatExpr2(t *testing.T) {
 	ctx := context.Background()
 	for i, test := range testData {
 		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
-			semaCtx := tree.MakeSemaContext()
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
 			typeChecked, err := tree.TypeCheck(ctx, test.expr, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatal(err)
@@ -405,7 +476,7 @@ func TestFormatPgwireText(t *testing.T) {
 	}
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	for i, test := range testData {
 		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
@@ -413,12 +484,12 @@ func TestFormatPgwireText(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			semaCtx := tree.MakeSemaContext()
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
 			typeChecked, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatal(err)
 			}
-			typeChecked, err = evalCtx.NormalizeExpr(typeChecked)
+			typeChecked, err = normalize.Expr(ctx, evalCtx, typeChecked)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -454,11 +525,11 @@ func TestFormatNodeSummary(t *testing.T) {
 			expected: `SELECT id FROM system.jobs, (SELECT) AS args`,
 		},
 		{
-			stmt:     `INSERT INTO system.public.lease("descID", version, "nodeID", expiration) VALUES ('1232', '111', __more2__)`,
+			stmt:     `INSERT INTO system.public.lease("descID", version, "nodeID", expiration) VALUES ('1232', '111', __more1_10__)`,
 			expected: `INSERT INTO system.public.lease("descID", versi...)`,
 		},
 		{
-			stmt:     `INSERT INTO vehicles VALUES ($1, $2, __more6__)`,
+			stmt:     `INSERT INTO vehicles VALUES ($1, $2, __more1_10__)`,
 			expected: `INSERT INTO vehicles`,
 		},
 		{
@@ -479,7 +550,7 @@ func TestFormatNodeSummary(t *testing.T) {
 		},
 		{
 			stmt:     `UPDATE system.jobs SET status = $2, payload = $3, last_run = $4, num_runs = $5 WHERE internal_table_id = $1`,
-			expected: `UPDATE system.jobs SET status = $2, pa... WHERE internal_table_...`,
+			expected: `UPDATE system.jobs SET status = $1, pa... WHERE internal_table_...`,
 		},
 		{
 			stmt:     `UPDATE system.extra_extra_long_table_name SET (schedule_state, next_run) = ($1, $2) WHERE schedule_id = 'name'`,
@@ -528,7 +599,7 @@ func BenchmarkFormatRandomStatements(b *testing.B) {
 	} else {
 		runfile = filepath.Join("..", "..", "parser", "sql.y")
 	}
-	yBytes, err := ioutil.ReadFile(runfile)
+	yBytes, err := os.ReadFile(runfile)
 	if err != nil {
 		b.Fatalf("error reading grammar: %v", err)
 	}
@@ -576,4 +647,93 @@ func BenchmarkFormatRandomStatements(b *testing.B) {
 			}
 		}
 	})
+}
+
+// Verify FmtCollapseLists format flag works as expected.
+func TestFmtCollapseListsFormatFlag(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		stmt     string
+		expected string
+	}{
+		{
+			stmt:     `VALUES (())`,
+			expected: `VALUES (())`,
+		},
+		{
+			stmt:     `VALUES (1)`,
+			expected: `VALUES (1)`,
+		},
+		{
+			stmt:     `VALUES ((1, 2), (3, 4)), ((5, 6), (7, 8))`,
+			expected: `VALUES ((1, __more__), __more__), (__more__)`,
+		},
+		{
+			// For VALUES clauses, we always shorten the list of values.
+			// The first expression will be shortened if possible, and the
+			// rest of the values are replaced with __more__ regardless of
+			// whether or not they contain names.
+			stmt:     `VALUES ((a, b), (3, 4)), ((a, b), (1, 2))`,
+			expected: `VALUES ((a, b), (3, __more__)), (__more__)`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN ()`,
+			expected: `SELECT * FROM foo WHERE f IN ()`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN ($1)`,
+			expected: `SELECT * FROM foo WHERE f IN ($1,)`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN (2, (3 - $1)::INT, 2*3, -$2, NULL, 'ok', (3,$3))`,
+			expected: `SELECT * FROM foo WHERE f IN (2, __more__)`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN (1, 2, a, b, c)`,
+			expected: `SELECT * FROM foo WHERE f IN (1, 2, a, b, c)`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN (1, 2, a + 1)`,
+			expected: `SELECT * FROM foo WHERE f IN (1, 2, a + 1)`,
+		},
+		{
+			stmt:     `SELECT ARRAY[]`,
+			expected: `SELECT ARRAY[]`,
+		},
+		{
+			stmt:     `SELECT ARRAY['crdb', 'world', CAST((2*2*3) AS FLOAT)]`,
+			expected: `SELECT ARRAY['crdb', __more__]`,
+		},
+		{
+			stmt:     `SELECT ARRAY[1+2, -2, $1::INT, NULL, 4*$2::INT, 'hello-world']`,
+			expected: `SELECT ARRAY[1 + 2, __more__]`,
+		},
+		{
+			stmt:     `SELECT ARRAY[1, 2, 3]`,
+			expected: `SELECT ARRAY[1, __more__]`,
+		},
+		{
+			stmt:     `SELECT ARRAY[1, 2, 3, a]`,
+			expected: `SELECT ARRAY[1, 2, 3, a]`,
+		},
+		{
+			stmt:     `SELECT * FROM foo WHERE f IN (1) AND f IN (2)`,
+			expected: `SELECT * FROM foo WHERE (f IN (1,)) AND (f IN (2,))`,
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("%d %s", i, test.stmt), func(t *testing.T) {
+			stmt, err := parser.ParseOne(test.stmt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exprStr := tree.AsStringWithFlags(stmt.AST, tree.FmtCollapseLists)
+			if exprStr != test.expected {
+				t.Fatalf("expected %q, got %q", test.expected, exprStr)
+			}
+		})
+	}
 }

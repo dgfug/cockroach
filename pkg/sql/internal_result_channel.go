@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,7 +9,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/errors"
 )
 
@@ -49,7 +45,7 @@ type ieResultWriter interface {
 	finish()
 }
 
-var asyncIEResultChannelBufferSize = util.ConstantWithMetamorphicTestRange(
+var asyncIEResultChannelBufferSize = metamorphic.ConstantWithTestRange(
 	"async-IE-result-channel-buffer-size",
 	32, /* defaultValue */
 	1,  /* min */
@@ -111,14 +107,22 @@ func newSyncIEResultChannel() *ieResultChannel {
 func (i *ieResultChannel) firstResult(
 	ctx context.Context,
 ) (_ ieIteratorResult, done bool, err error) {
+	// errors.Wrap returns nil if err is nil.
+	const wrapMsg = "failed to read query result"
+	getCtxErr := func(ctx context.Context) error {
+		if ctx.Err() == nil {
+			return nil
+		}
+		return cancelchecker.QueryCanceledError
+	}
 	select {
 	case <-ctx.Done():
-		return ieIteratorResult{}, true, ctx.Err()
+		return ieIteratorResult{}, true, errors.Wrap(getCtxErr(ctx), wrapMsg)
 	case <-i.doneCh:
-		return ieIteratorResult{}, true, ctx.Err()
+		return ieIteratorResult{}, true, errors.Wrap(getCtxErr(ctx), wrapMsg)
 	case res, ok := <-i.dataCh:
 		if !ok {
-			return ieIteratorResult{}, true, ctx.Err()
+			return ieIteratorResult{}, true, errors.Wrap(getCtxErr(ctx), wrapMsg)
 		}
 		return res, false, nil
 	}
@@ -128,11 +132,13 @@ func (i *ieResultChannel) maybeUnblockWriter(ctx context.Context) (done bool, er
 	if i.async() {
 		return false, nil
 	}
+	// errors.Wrap returns nil if ctx.Err() is nil.
+	const wrapMsg = "maybe unblock writer"
 	select {
 	case <-ctx.Done():
-		return true, ctx.Err()
+		return true, errors.Wrap(ctx.Err(), wrapMsg)
 	case <-i.doneCh:
-		return true, ctx.Err()
+		return true, errors.Wrap(ctx.Err(), wrapMsg)
 	case i.waitCh <- struct{}{}:
 		return false, nil
 	}
@@ -181,13 +187,15 @@ func (i *ieResultChannel) close() error {
 var errIEResultChannelClosed = errors.New("ieResultReader closed")
 
 func (i *ieResultChannel) addResult(ctx context.Context, result ieIteratorResult) error {
+	// errors.Wrap returns nil if ctx.Err() is nil.
+	const wrapMsg = "add result"
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Wrap(ctx.Err(), wrapMsg)
 	case <-i.doneCh:
 		// Prefer the context error if there is one.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return errors.Wrap(ctx.Err(), wrapMsg)
 		}
 		return errIEResultChannelClosed
 	case i.dataCh <- result:
@@ -196,16 +204,18 @@ func (i *ieResultChannel) addResult(ctx context.Context, result ieIteratorResult
 }
 
 func (i *ieResultChannel) maybeBlock(ctx context.Context) error {
+	// errors.Wrap returns nil if ctx.Err() is nil.
+	const wrapMsg = "maybe block"
 	if i.async() {
 		return nil
 	}
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Wrap(ctx.Err(), wrapMsg)
 	case <-i.doneCh:
 		// Prefer the context error if there is one.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return errors.Wrap(ctxErr, wrapMsg)
 		}
 		return errIEResultChannelClosed
 	case <-i.waitCh:

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
@@ -15,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -49,13 +45,18 @@ type server struct {
 		is       *infoStore                         // The backing infostore
 		incoming nodeSet                            // Incoming client node IDs
 		nodeMap  map[util.UnresolvedAddr]serverInfo // Incoming client's local address -> serverInfo
-		// ready broadcasts a wakeup to waiting gossip requests. This is done
-		// via closing the current ready channel and opening a new one. This
-		// is required due to the fact that condition variables are not
-		// composable. There's an open proposal to add them:
-		// https://github.com/golang/go/issues/16620
-		ready chan struct{}
+		// The time at which we last checked if the network should be tightened.
+		// Used to avoid burning CPU and mutex cycles on checking too frequently.
+		lastTighten time.Time
 	}
+
+	// ready broadcasts a wakeup to waiting gossip requests. This is done
+	// via closing the current ready channel and opening a new one. This
+	// is required due to the fact that condition variables are not
+	// composable. There's an open proposal to add them:
+	// https://github.com/golang/go/issues/16620
+	ready atomic.Value
+
 	tighten chan struct{} // Sent on when we may want to tighten the network
 
 	nodeMetrics   Metrics
@@ -82,10 +83,10 @@ func newServer(
 		serverMetrics:  makeMetrics(),
 	}
 
-	s.mu.is = newInfoStore(s.AmbientContext, nodeID, util.UnresolvedAddr{}, stopper)
+	s.mu.is = newInfoStore(s.AmbientContext, nodeID, util.UnresolvedAddr{}, stopper, s.nodeMetrics)
 	s.mu.incoming = makeNodeSet(minPeers, metric.NewGauge(MetaConnectionsIncomingGauge))
 	s.mu.nodeMap = make(map[util.UnresolvedAddr]serverInfo)
-	s.mu.ready = make(chan struct{})
+	s.ready.Store(make(chan struct{}))
 
 	registry.AddMetric(s.mu.incoming.gauge)
 	registry.AddMetricStruct(s.nodeMetrics)
@@ -135,8 +136,12 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 
 	errCh := make(chan error, 1)
 
+	// Maintain what were the recently sent high water stamps to avoid resending
+	// them.
+	lastSentHighWaterStamps := make(map[roachpb.NodeID]int64)
+
 	if err := s.stopper.RunAsyncTask(ctx, "gossip receiver", func(ctx context.Context) {
-		errCh <- s.gossipReceiver(ctx, &args, send, stream.Recv)
+		errCh <- s.gossipReceiver(ctx, &args, &lastSentHighWaterStamps, send, stream.Recv)
 	}); err != nil {
 		return err
 	}
@@ -144,11 +149,10 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 	reply := new(Response)
 
 	for init := true; ; init = false {
+		// Remember the old ready so that if it gets replaced with a new one and is
+		// closed, we still trigger the select below.
+		ready := s.ready.Load().(chan struct{})
 		s.mu.Lock()
-		// Store the old ready so that if it gets replaced with a new one
-		// (once the lock is released) and is closed, we still trigger the
-		// select below.
-		ready := s.mu.ready
 		delta := s.mu.is.delta(args.HighWaterStamps)
 		if init {
 			s.mu.is.populateMostDistantMarkers(delta)
@@ -172,9 +176,12 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 				ratchetHighWaterStamp(args.HighWaterStamps, i.NodeID, i.OrigStamp)
 			}
 
+			var diffStamps map[roachpb.NodeID]int64
+			lastSentHighWaterStamps, diffStamps =
+				s.mu.is.getHighWaterStampsWithDiff(lastSentHighWaterStamps)
 			*reply = Response{
 				NodeID:          s.NodeID.Get(),
-				HighWaterStamps: s.mu.is.getHighWaterStamps(),
+				HighWaterStamps: diffStamps,
 				Delta:           delta,
 			}
 
@@ -182,10 +189,9 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 			if err := send(reply); err != nil {
 				return err
 			}
-			s.mu.Lock()
+		} else {
+			s.mu.Unlock()
 		}
-
-		s.mu.Unlock()
 
 		select {
 		case <-s.stopper.ShouldQuiesce():
@@ -200,6 +206,7 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 func (s *server) gossipReceiver(
 	ctx context.Context,
 	argsPtr **Request,
+	lastSentHighWaterStampsPtr *map[roachpb.NodeID]int64,
 	senderFn func(*Response) error,
 	receiverFn func() (*Request, error),
 ) error {
@@ -311,9 +318,12 @@ func (s *server) gossipReceiver(
 		}
 		s.maybeTightenLocked()
 
+		var diffStamps map[roachpb.NodeID]int64
+		*lastSentHighWaterStampsPtr, diffStamps =
+			s.mu.is.getHighWaterStampsWithDiff(*lastSentHighWaterStampsPtr)
 		*reply = Response{
 			NodeID:          s.NodeID.Get(),
-			HighWaterStamps: s.mu.is.getHighWaterStamps(),
+			HighWaterStamps: diffStamps,
 		}
 
 		s.mu.Unlock()
@@ -344,6 +354,11 @@ func (s *server) gossipReceiver(
 }
 
 func (s *server) maybeTightenLocked() {
+	now := timeutil.Now()
+	if now.Before(s.mu.lastTighten.Add(gossipTightenInterval)) {
+		// It hasn't been long since we last tightened the network, so skip it.
+		return
+	}
 	select {
 	case s.tighten <- struct{}{}:
 	default:
@@ -362,11 +377,7 @@ func (s *server) start(addr net.Addr) {
 	broadcast := func() {
 		// Close the old ready and open a new one. This will broadcast to all
 		// receivers and setup a fresh channel to replace the closed one.
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		ready := make(chan struct{})
-		close(s.mu.ready)
-		s.mu.ready = ready
+		close(s.ready.Swap(make(chan struct{})).(chan struct{}))
 	}
 
 	// We require redundant callbacks here as the broadcast callback is
@@ -379,14 +390,17 @@ func (s *server) start(addr net.Addr) {
 	waitQuiesce := func(context.Context) {
 		<-s.stopper.ShouldQuiesce()
 
-		s.mu.Lock()
-		unregister()
-		s.mu.Unlock()
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			unregister()
+		}()
 
 		broadcast()
 	}
-	if err := s.stopper.RunAsyncTask(context.Background(), "gossip-wait-quiesce", waitQuiesce); err != nil {
-		waitQuiesce(context.Background())
+	bgCtx := s.AnnotateCtx(context.Background())
+	if err := s.stopper.RunAsyncTask(bgCtx, "gossip-wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(bgCtx)
 	}
 }
 

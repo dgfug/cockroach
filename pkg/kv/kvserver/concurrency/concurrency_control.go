@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package concurrency provides a concurrency manager structure that
 // encapsulates the details of concurrency control and contention handling for
@@ -17,13 +12,17 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 )
 
 // Manager is a structure that sequences incoming requests and provides
@@ -51,7 +50,7 @@ import (
 // Specifically, write intents (replicated, exclusive locks) are stored inline
 // in the MVCC keyspace, so they are not detectable until request evaluation
 // time. To accommodate this form of lock storage, the manager exposes a
-// HandleWriterIntentError method, which can be used in conjunction with a retry
+// HandleLockConflictError method, which can be used in conjunction with a retry
 // loop around evaluation to integrate external locks with the concurrency
 // manager structure. In the future, we intend to pull all locks, including
 // those associated with write intents, into the concurrency manager directly
@@ -65,54 +64,54 @@ import (
 // ignore any queue that has formed on the lock. For other exceptions, see the
 // later comment for lockTable.
 //
-// Internal Components
+// # Internal Components
 //
 // The concurrency manager is composed of a number of internal synchronization,
 // bookkeeping, and queueing structures. Each of these is discussed in more
 // detail on their interface definition. The following diagram details how the
 // components are tied together:
 //
-//  +---------------------+---------------------------------------------+
-//  | concurrency.Manager |                                             |
-//  +---------------------+                                             |
-//  |                                                                   |
-//  +------------+  acquire  +--------------+        acquire            |
-//    Sequence() |--->--->---| latchManager |<---<---<---<---<---<---+  |
-//  +------------+           +--------------+                        |  |
-//  |                         / check locks + wait queues            |  |
-//  |                        v  if conflict, enter q & drop latches  ^  |
-//  |         +---------------------------------------------------+  |  |
-//  |         | [ lockTable ]                                     |  |  |
-//  |         | [    key1   ]    -------------+-----------------+ |  ^  |
-//  |         | [    key2   ]  /  lockState:  | lockWaitQueue:  |----<---<---<----+
-//  |         | [    key3   ]-{   - lock type | +-[a]<-[b]<-[c] | |  |  |         |
-//  |         | [    key4   ]  \  - txn  meta | |  (no latches) |-->-^  |         |
-//  |         | [    key5   ]    -------------+-|---------------+ |     |         |
-//  |         | [    ...    ]                   v                 |     |         ^
-//  |         +---------------------------------|-----------------+     |         | if lock found, HandleWriterIntentError()
-//  |                 |                         |                       |         |  - enter lockWaitQueue
-//  |                 |       +- may be remote -+--+                    |         |  - drop latches
-//  |                 |       |                    |                    |         |  - wait for lock update / release
-//  |                 v       v                    ^                    |         |
-//  |                 |    +--------------------------+                 |         ^
-//  |                 |    | txnWaitQueue:            |                 |         |
-//  |                 |    | (located on txn record's |                 |         |
-//  |                 v    |  leaseholder replica)    |                 |         |
-//  |                 |    |--------------------------|                 |         ^
-//  |                 |    | [txn1] [txn2] [txn3] ... |----<---<---<---<----+     |
-//  |                 |    +--------------------------+                 |   | if txn push failed, HandleTransactionPushError()
-//  |                 |                                                 |   |  - enter txnWaitQueue
-//  |                 |                                                 |   ^  - drop latches
-//  |                 |                                                 |   |  - wait for txn record update
-//  |                 |                                                 |   |     |
-//  |                 |                                                 |   |     |
-//  |                 +--> retain latches --> remain at head of queues ---> evaluate ---> Finish()
-//  |                                                                   |
-//  +----------+                                                        |
-//    Finish() | ---> exit wait queues ---> drop latches -----------------> respond ...
-//  +----------+                                                        |
-//  |                                                                   |
-//  +-------------------------------------------------------------------+
+//	+---------------------+---------------------------------------------+
+//	| concurrency.Manager |                                             |
+//	+---------------------+                                             |
+//	|                                                                   |
+//	+------------+  acquire  +--------------+        acquire            |
+//	  Sequence() |--->--->---| latchManager |<---<---<---<---<---<---+  |
+//	+------------+           +--------------+                        |  |
+//	|                         / check locks + wait queues            |  |
+//	|                        v  if conflict, enter q & drop latches  ^  |
+//	|         +---------------------------------------------------+  |  |
+//	|         | [ lockTable ]                                     |  |  |
+//	|         | [    key1   ]    -------------+-----------------+ |  ^  |
+//	|         | [    key2   ]  /  keyLocks:   | lockWaitQueue:  |----<---<---<----+
+//	|         | [    key3   ]-{   - lock type | +-[a]<-[b]<-[c] | |  |  |         |
+//	|         | [    key4   ]  \  - txn  meta | |  (no latches) |-->-^  |         |
+//	|         | [    key5   ]    -------------+-|---------------+ |     |         |
+//	|         | [    ...    ]                   v                 |     |         ^
+//	|         +---------------------------------|-----------------+     |         | if lock found, HandleLockConflictError()
+//	|                 |                         |                       |         |  - enter lockWaitQueue
+//	|                 |       +- may be remote -+--+                    |         |  - drop latches
+//	|                 |       |                    |                    |         |  - wait for lock update / release
+//	|                 v       v                    ^                    |         |
+//	|                 |    +--------------------------+                 |         ^
+//	|                 |    | txnWaitQueue:            |                 |         |
+//	|                 |    | (located on txn record's |                 |         |
+//	|                 v    |  leaseholder replica)    |                 |         |
+//	|                 |    |--------------------------|                 |         ^
+//	|                 |    | [txn1] [txn2] [txn3] ... |----<---<---<---<----+     |
+//	|                 |    +--------------------------+                 |   | if txn push failed, HandleTransactionPushError()
+//	|                 |                                                 |   |  - enter txnWaitQueue
+//	|                 |                                                 |   ^  - drop latches
+//	|                 |                                                 |   |  - wait for txn record update
+//	|                 |                                                 |   |     |
+//	|                 |                                                 |   |     |
+//	|                 +--> retain latches --> remain at head of queues ---> evaluate ---> Finish()
+//	|                                                                   |
+//	+----------+                                                        |
+//	  Finish() | ---> exit wait queues ---> drop latches -----------------> respond ...
+//	+----------+                                                        |
+//	|                                                                   |
+//	+-------------------------------------------------------------------+
 //
 // See the comments on individual components for a more detailed look at their
 // interface and inner-workings.
@@ -152,7 +151,7 @@ type Manager interface {
 	TransactionManager
 	RangeStateListener
 	MetricExporter
-	TestStateExporter
+	TestingAccessor
 }
 
 // RequestSequencer is concerned with the sequencing of concurrent requests. It
@@ -189,18 +188,27 @@ type RequestSequencer interface {
 	// does so, it will not return a request guard.
 	SequenceReq(context.Context, *Guard, Request, RequestEvalKind) (*Guard, Response, *Error)
 
+	// PoisonReq idempotently marks a Guard as poisoned, indicating that its
+	// latches may be held for an indefinite amount of time. Requests waiting on
+	// this Guard will be notified. Latch acquisitions under poison.Policy_Error
+	// react to this by failing with a poison.PoisonedError, while requests under
+	// poison.Policy_Wait continue waiting, but propagate the poisoning upwards.
+	//
+	// See poison.Policy for details.
+	PoisonReq(*Guard)
+
 	// FinishReq marks the request as complete, releasing any protection
 	// the request had against conflicting requests and allowing conflicting
 	// requests that are blocked on this one to proceed. The guard should not
 	// be used after being released.
-	FinishReq(*Guard)
+	FinishReq(context.Context, *Guard)
 }
 
 // ContentionHandler is concerned with handling contention-related errors. This
 // typically involves preparing the request to be queued upon a retry. It is one
 // of the roles of Manager.
 type ContentionHandler interface {
-	// HandleWriterIntentError consumes a WriteIntentError by informing the
+	// HandleLockConflictError consumes a LockConflictError by informing the
 	// concurrency manager about the replicated write intent that was missing
 	// from its lock table which was found during request evaluation (while
 	// holding latches) under the provided lease sequence. After doing so, it
@@ -213,12 +221,12 @@ type ContentionHandler interface {
 	// Example usage: Txn A scans the lock table and does not see an intent on
 	// key K from txn B because the intent is not being tracked in the lock
 	// table. Txn A moves on to evaluation. While scanning, it notices the
-	// intent on key K. It throws a WriteIntentError which is consumed by this
+	// intent on key K. It throws a LockConflictError which is consumed by this
 	// method before txn A retries its scan. During the retry, txn A scans the
 	// lock table and observes the lock on key K, so it enters the lock's
 	// wait-queue and waits for it to be resolved.
-	HandleWriterIntentError(
-		context.Context, *Guard, roachpb.LeaseSequence, *roachpb.WriteIntentError,
+	HandleLockConflictError(
+		context.Context, *Guard, roachpb.LeaseSequence, *kvpb.LockConflictError,
 	) (*Guard, *Error)
 
 	// HandleTransactionPushError consumes a TransactionPushError thrown by a
@@ -237,7 +245,7 @@ type ContentionHandler interface {
 	// before txn A retries its push. During the retry, txn A finds that txn B
 	// is being tracked in the txn wait-queue so it waits there for txn B to
 	// finish.
-	HandleTransactionPushError(context.Context, *Guard, *roachpb.TransactionPushError) *Guard
+	HandleTransactionPushError(context.Context, *Guard, *kvpb.TransactionPushError) *Guard
 }
 
 // LockManager is concerned with tracking locks that are stored on the manager's
@@ -251,6 +259,10 @@ type LockManager interface {
 	// updated or released a lock or range of locks that it previously held.
 	// The Durability field of the lock update struct is ignored.
 	OnLockUpdated(context.Context, *roachpb.LockUpdate)
+
+	// QueryLockTableState gathers detailed metadata on locks tracked in the lock
+	// table that are part of the provided span and key scope, up to provided limits.
+	QueryLockTableState(ctx context.Context, span roachpb.Span, opts QueryLockTableOptions) ([]roachpb.LockStateInfo, QueryLockTableResumeState)
 }
 
 // TransactionManager is concerned with tracking transactions that have their
@@ -307,16 +319,20 @@ type MetricExporter interface {
 	// TxnWaitQueueMetrics()
 }
 
-// TestStateExporter is concerned with providing testing hooks that expose the
+// TestingAccessor is concerned with providing testing hooks that expose the
 // state of the concurrency manager, to be used by unit tests outside of the
 // concurrency package. It is one of the roles of Manager.
-type TestStateExporter interface {
+type TestingAccessor interface {
 	// TestingLockTableString returns a debug string representing the state of the
 	// lockTable.
 	TestingLockTableString() string
 
 	// TestingTxnWaitQueue returns the concurrency manager's txnWaitQueue.
 	TestingTxnWaitQueue() *txnwait.Queue
+
+	// TestingSetMaxLocks updates the locktable's lock limit. This can be used to
+	// force the locktable to exceed its limit and clear locks.
+	TestingSetMaxLocks(n int64)
 }
 
 ///////////////////////////////////
@@ -333,10 +349,10 @@ type TestStateExporter interface {
 //
 // The setting can change across different calls to SequenceReq. The
 // permissible sequences are:
-// - OptimisticEval: when optimistic evaluation succeeds.
-// - OptimisticEval, PessimisticAfterFailedOptimisticEval, PessimisticEval*:
-//   when optimistic evaluation failed.
-// - PessimisticEval+: when only pessimistic evaluation was attempted.
+//   - OptimisticEval: when optimistic evaluation succeeds.
+//   - OptimisticEval, PessimisticAfterFailedOptimisticEval, PessimisticEval*:
+//     when optimistic evaluation failed.
+//   - PessimisticEval+: when only pessimistic evaluation was attempted.
 type RequestEvalKind int
 
 const (
@@ -362,10 +378,10 @@ type Request struct {
 	Timestamp hlc.Timestamp
 
 	// The priority of the request. Only set if Txn is nil.
-	Priority roachpb.UserPriority
+	NonTxnPriority roachpb.UserPriority
 
 	// The consistency level of the request. Only set if Txn is nil.
-	ReadConsistency roachpb.ReadConsistencyType
+	ReadConsistency kvpb.ReadConsistencyType
 
 	// The wait policy of the request. Signifies how the request should
 	// behave if it encounters conflicting locks held by other active
@@ -385,8 +401,15 @@ type Request struct {
 	// with a WriteIntentError instead of entering the queue and waiting.
 	MaxLockWaitQueueLength int
 
+	// AdmissionHeader is the header in the request's BatchRequest. It is plumbed
+	// through for intent resolution admission control.
+	AdmissionHeader kvpb.AdmissionHeader
+
+	// The poison.Policy to use for this Request.
+	PoisonPolicy poison.Policy
+
 	// The individual requests in the batch.
-	Requests []roachpb.RequestUnion
+	Requests []kvpb.RequestUnion
 
 	// The maximal set of spans that the request will access. Latches
 	// will be acquired for these spans.
@@ -396,22 +419,23 @@ type Request struct {
 	// not also passed an exiting Guard.
 	LatchSpans *spanset.SpanSet
 
-	// The maximal set of spans within which the request expects to have
-	// isolation from conflicting transactions. Conflicting locks within
-	// these spans will be queued on and conditionally pushed.
+	// The maximal set of spans within which the request expects to have isolation
+	// from conflicting transactions. The level of isolation for a span is
+	// dictated by its corresponding lock Strength. Conflicting locks within these
+	// spans will be queued on and conditionally pushed.
 	//
-	// Note that unlike LatchSpans, the timestamps that these spans are
-	// declared at are NOT consulted. All read spans are considered to take
-	// place at the transaction's read timestamp (Txn.ReadTimestamp) and all
-	// write spans are considered to take place the transaction's write
-	// timestamp (Txn.WriteTimestamp). If the request is non-transactional
-	// (Txn == nil), all reads and writes are considered to take place at
-	// Timestamp.
-	//
-	// Note: ownership of the SpanSet is assumed by the Request once it is
+	// Note: ownership of the LockSpanSet is assumed by the Request once it is
 	// passed to SequenceReq. Only supplied to SequenceReq if the method is
 	// not also passed an exiting Guard.
-	LockSpans *spanset.SpanSet
+	LockSpans *lockspanset.LockSpanSet
+
+	// The SafeFormatter capable of formatting the request. This is used to enrich
+	// logging with request level information when latches conflict.
+	BaFmt redact.SafeFormatter
+
+	// DeadlockTimeout is the amount of time that the request will wait on a lock
+	// before pushing the lock holder's transaction for deadlock detection.
+	DeadlockTimeout time.Duration
 }
 
 // Guard is returned from Manager.SequenceReq. The guard is passed back in to
@@ -428,10 +452,36 @@ type Guard struct {
 // Response is a slice of responses to requests in a batch. This type is used
 // when the concurrency manager is able to respond to a request directly during
 // sequencing.
-type Response = []roachpb.ResponseUnion
+type Response = []kvpb.ResponseUnion
 
-// Error is an alias for a roachpb.Error.
-type Error = roachpb.Error
+// Error is an alias for a kvpb.Error.
+type Error = kvpb.Error
+
+// QueryLockTableOptions bundles the options for the QueryLockTableState function.
+type QueryLockTableOptions struct {
+	MaxLocks           int64
+	TargetBytes        int64
+	IncludeUncontended bool
+}
+
+// QueryLockTableResumeState bundles the return metadata on the pagination of
+// results from the QueryLockTableState function.
+type QueryLockTableResumeState struct {
+	ResumeSpan   *roachpb.Span
+	ResumeReason kvpb.ResumeReason
+
+	// ResumeNextBytes represents the size (in bytes) of the next
+	// roachpb.LockStateInfo object that would have been returned by
+	// QueryLockTableState if it were not limited by MaxLocks or TargetBytes.
+	// As such, this value is only set if ResumeSpan, ResumeReason have been set.
+	ResumeNextBytes int64
+
+	// TotalBytes is the byte size of the roachpb.LockStateInfo objects returned
+	// by QueryLockTableState, and is always set. This value is used to calculate
+	// the remaining quota of bytes (from TargetBytes) that can be used in
+	// querying other ranges served by the same request.
+	TotalBytes int64
+}
 
 ///////////////////////////////////
 // Internal Structure Interfaces //
@@ -464,10 +514,13 @@ type latchManager interface {
 	// WaitFor waits for conflicting latches on the specified spans without adding
 	// any latches itself. Fast path for operations that only require flushing out
 	// old operations without blocking any new ones.
-	WaitFor(ctx context.Context, spans *spanset.SpanSet) *Error
+	WaitFor(ctx context.Context, spans *spanset.SpanSet, pp poison.Policy, baFmt redact.SafeFormatter) *Error
 
-	// Releases latches, relinquish its protection from conflicting requests.
-	Release(latchGuard)
+	// Poison a guard's latches, allowing waiters to fail fast.
+	Poison(latchGuard)
+
+	// Release a guard's latches, relinquish its protection from conflicting requests.
+	Release(ctx context.Context, lg latchGuard)
 
 	// Metrics returns information about the state of the latchManager.
 	Metrics() LatchMetrics
@@ -481,15 +534,15 @@ type latchGuard interface{}
 // it, where conflicting transactions can queue while waiting for the lock to be
 // released.
 //
-//  +---------------------------------------------------+
-//  | [ lockTable ]                                     |
-//  | [    key1   ]    -------------+-----------------+ |
-//  | [    key2   ]  /  lockState:  | lockWaitQueue:  | |
-//  | [    key3   ]-{   - lock type | <-[a]<-[b]<-[c] | |
-//  | [    key4   ]  \  - txn meta  |                 | |
-//  | [    key5   ]    -------------+-----------------+ |
-//  | [    ...    ]                                     |
-//  +---------------------------------------------------+
+//	+---------------------------------------------------+
+//	| [ lockTable ]                                     |
+//	| [    key1   ]    -------------+-----------------+ |
+//	| [    key2   ]  /  keyLocks:   | lockWaitQueue:  | |
+//	| [    key3   ]-{   - lock type | <-[a]<-[b]<-[c] | |
+//	| [    key4   ]  \  - txn meta  |                 | |
+//	| [    key5   ]    -------------+-----------------+ |
+//	| [    ...    ]                                     |
+//	+---------------------------------------------------+
 //
 // The database is read and written using "requests". Transactions are composed
 // of one or more requests. Isolation is needed across requests. Additionally,
@@ -524,15 +577,14 @@ type latchGuard interface{}
 // conflict then the request that arrived first will typically be sequenced
 // first. There are some exceptions:
 //
-//  - a request that is part of a transaction which has already acquired a lock
-//    does not need to wait on that lock during sequencing, and can therefore
-//    ignore any queue that has formed on the lock.
+//   - a request that is part of a transaction which has already acquired a lock
+//     does not need to wait on that lock during sequencing, and can therefore
+//     ignore any queue that has formed on the lock.
 //
-//  - contending requests that encounter different levels of contention may be
-//    sequenced in non-FIFO order. This is to allow for more concurrency. e.g.
-//    if request R1 and R2 contend on key K2, but R1 is also waiting at key K1,
-//    R2 could slip past R1 and evaluate.
-//
+//   - contending requests that encounter different levels of contention may be
+//     sequenced in non-FIFO order. This is to allow for more concurrency. e.g.
+//     if request R1 and R2 contend on key K2, but R1 is also waiting at key K1,
+//     R2 could slip past R1 and evaluate.
 type lockTable interface {
 	requestQueuer
 
@@ -544,7 +596,7 @@ type lockTable interface {
 	// lockTableGuard and the subsequent calls reuse the previously returned
 	// one. The latches needed by the request must be held when calling this
 	// function.
-	ScanAndEnqueue(Request, lockTableGuard) lockTableGuard
+	ScanAndEnqueue(Request, lockTableGuard) (lockTableGuard, *Error)
 
 	// ScanOptimistic takes a snapshot of the lock table for later checking for
 	// conflicts, and returns a guard. It is for optimistic evaluation of
@@ -573,10 +625,10 @@ type lockTable interface {
 	// evaluation of this request. It adds the lock and enqueues this requester
 	// in its wait-queue. It is required that request evaluation discover such
 	// locks before acquiring its own locks, since the request needs to repeat
-	// ScanAndEnqueue. When consultFinalizedTxnCache=true, and the transaction
-	// holding the lock is finalized, the lock is not added to the lock table
-	// and instead tracked in the list of locks to resolve in the
-	// lockTableGuard.
+	// ScanAndEnqueue. When consultTxnStatusCache=true, and the transaction
+	// holding the lock is known to be pushed or finalized, the lock is not added
+	// to the lock table and instead tracked in the list of locks to resolve in
+	// the lockTableGuard.
 	//
 	// The lease sequence is used to detect lease changes between the when
 	// request that found the lock started evaluating and when the discovered
@@ -593,25 +645,37 @@ type lockTable interface {
 	// true) or whether it was ignored because the lockTable is currently
 	// disabled (false).
 	AddDiscoveredLock(
-		intent *roachpb.Intent, seq roachpb.LeaseSequence, consultFinalizedTxnCache bool,
-		guard lockTableGuard) (bool, error)
+		foundLock *roachpb.Lock, seq roachpb.LeaseSequence,
+		consultTxnStatusCache bool, guard lockTableGuard,
+	) (bool, error)
 
 	// AcquireLock informs the lockTable that a new lock was acquired or an
 	// existing lock was updated.
 	//
-	// The provided TxnMeta must be the same one used when the request scanned
-	// the lockTable initially. It must only be called in the evaluation phase
-	// before calling Dequeue, which means all the latches needed by the request
-	// are held. The key must be in the request's SpanSet with the appropriate
-	// SpanAccess: currently the strength is always Exclusive, so the span
-	// containing this key must be SpanReadWrite. This contract ensures that the
-	// lock is not held in a conflicting manner by a different transaction.
-	// Acquiring a lock that is already held by this transaction upgrades the
-	// lock's timestamp and strength, if necessary.
+	// The TxnMeta associated with the lock acquisition must be the same one used
+	// when the request scanned the lockTable initially. It must only be called in
+	// the evaluation phase, before calling Dequeue, which means all latches
+	// needed by the request are held. The key must be in the request's lock span
+	// set with the appropriate strength. Currently, the only strength with which a
+	// lock can be acquired is Intent[1]. This contract ensures that the lock is
+	// not held in a conflicting manner by a different transaction.
+	// Acquiring a lock that is already held by a transaction upgrades the lock's
+	// timestamp and strength. Any prior sequence numbers at which the lock was
+	// previously held and has since been rolled back are no longer tracked as
+	// well.
+	//
+	// [1] We are in an intermediate state where KV ignores lock strength supplied
+	// by SQL and acquires all locks with Intent locking strength. Notably, this
+	// includes in-memory Exclusive locks acquired for `SELECT FOR UPDATE` queries
+	// as well. While the Intent strength verbiage might be a bit surprising,
+	// there is no meaningful difference when it comes to conflict resolution
+	// between a lock and a request. This is a temporary state, which is bound to
+	// change as we go about supporting additional locking strengths in the lock
+	// table.
 	//
 	// For replicated locks, this must be called after the corresponding write
 	// intent has been applied to the replicated state machine.
-	AcquireLock(*enginepb.TxnMeta, roachpb.Key, lock.Strength, lock.Durability) error
+	AcquireLock(*roachpb.LockAcquisition) error
 
 	// UpdateLocks informs the lockTable that an existing lock or range of locks
 	// was either updated or released.
@@ -667,17 +731,25 @@ type lockTable interface {
 	//     txn.WriteTimestamp.
 	UpdateLocks(*roachpb.LockUpdate) error
 
-	// TransactionIsFinalized informs the lock table that a transaction is
-	// finalized. This is used by the lock table in a best-effort manner to avoid
-	// waiting on locks of finalized transactions and telling the caller via
-	// lockTableGuard.ResolveBeforeEvaluation to resolve a batch of intents.
-	TransactionIsFinalized(*roachpb.Transaction)
+	// PushedTransactionUpdated informs the lock table that a transaction has been
+	// pushed and is either finalized or has been moved to a higher timestamp.
+	// This is used by the lock table in a best-effort manner to avoid waiting on
+	// locks of finalized or pushed transactions and telling the caller via
+	// lockTableGuard.ResolveBeforeScanning to resolve a batch of intents.
+	PushedTransactionUpdated(*roachpb.Transaction)
+
+	// QueryLockTableState returns detailed metadata on locks managed by the lockTable.
+	QueryLockTableState(span roachpb.Span, opts QueryLockTableOptions) ([]roachpb.LockStateInfo, QueryLockTableResumeState)
 
 	// Metrics returns information about the state of the lockTable.
 	Metrics() LockTableMetrics
 
 	// String returns a debug string representing the state of the lockTable.
 	String() string
+
+	// TestingSetMaxLocks updates the locktable's lock limit. This can be used to
+	// force the locktable to exceed its limit and clear locks.
+	TestingSetMaxLocks(maxLocks int64)
 }
 
 // lockTableGuard is a handle to a request as it waits on conflicting locks in a
@@ -696,7 +768,7 @@ type lockTableGuard interface {
 	NewStateChan() chan struct{}
 
 	// CurState returns the latest waiting state.
-	CurState() waitingState
+	CurState() (waitingState, error)
 
 	// ResolveBeforeScanning lists the locks to resolve before scanning again.
 	// This must be called after:
@@ -705,14 +777,30 @@ type lockTableGuard interface {
 	//   the discovered locks have been added.
 	ResolveBeforeScanning() []roachpb.LockUpdate
 
-	// CheckOptimisticNoConflicts uses the SpanSet representing the spans that
+	// CheckOptimisticNoConflicts uses the LockSpanSet representing the spans that
 	// were actually read, to check for conflicting locks, after an optimistic
 	// evaluation. It returns true if there were no conflicts. See
 	// lockTable.ScanOptimistic for context. Note that the evaluation has
 	// already seen any intents (replicated single-key locks) that conflicted,
 	// so this checking is practically only going to find unreplicated locks
 	// that conflict.
-	CheckOptimisticNoConflicts(*spanset.SpanSet) (ok bool)
+	CheckOptimisticNoConflicts(*lockspanset.LockSpanSet) (ok bool)
+
+	// IsKeyLockedByConflictingTxn returns whether the specified key is locked by
+	// a conflicting transaction in the lockTableGuard's snapshot of the lock
+	// table, given the caller's own desired locking strength. If so, true is
+	// returned and so is the lock holder. If the lock is held by the transaction
+	// itself, there's no conflict to speak of, so false is returned.
+	//
+	// This method is used by requests in conjunction with the SkipLocked wait
+	// policy to determine which keys they should skip over during evaluation.
+	//
+	// If the supplied lock strength is locking (!= lock.None), then any queued
+	// locking requests that came before the lockTableGuard will also be checked
+	// for conflicts. This helps prevent a stream of locking SKIP LOCKED requests
+	// from starving out regular locking requests. In such cases, true is
+	// returned, but so is nil.
+	IsKeyLockedByConflictingTxn(context.Context, roachpb.Key, lock.Strength) (bool, *enginepb.TxnMeta, error)
 }
 
 // lockTableWaiter is concerned with waiting in lock wait-queues for locks held
@@ -726,10 +814,10 @@ type lockTableGuard interface {
 // that it is a part of.
 //
 // This waiting state responds to a set of state transitions in the lock table:
-//  - a conflicting lock is released
-//  - a conflicting lock is updated such that it no longer conflicts
-//  - a conflicting request in the lock wait-queue acquires the lock
-//  - a conflicting request in the lock wait-queue exits the lock wait-queue
+//   - a conflicting lock is released
+//   - a conflicting lock is updated such that it no longer conflicts
+//   - a conflicting request in the lock wait-queue acquires the lock
+//   - a conflicting request in the lock wait-queue exits the lock wait-queue
 //
 // These state transitions are typically reactive - the waiter can simply wait
 // for locks to be released or lock wait-queues to be exited by other actors.
@@ -759,7 +847,7 @@ type lockTableWaiter interface {
 	// ResolveDeferredIntents resolves the batch of intents if the provided
 	// error is nil. The batch of intents may be resolved more efficiently than
 	// if they were resolved individually.
-	ResolveDeferredIntents(context.Context, []roachpb.LockUpdate) *Error
+	ResolveDeferredIntents(context.Context, kvpb.AdmissionHeader, []roachpb.LockUpdate) *Error
 }
 
 // txnWaitQueue holds a collection of wait-queues for transaction records.
@@ -782,9 +870,9 @@ type lockTableWaiter interface {
 //
 // The first of these situations is failure of the conflicting transaction's
 // coordinator. This situation comes in two flavors:
-//  - before a transaction has been finalized (committed or aborted)
-//  - after a transaction has been finalized but before all of its intents have
-//    been resolved
+//   - before a transaction has been finalized (committed or aborted)
+//   - after a transaction has been finalized but before all of its intents have
+//     been resolved
 //
 // In the first of these flavors, the transaction record may still have a
 // PENDING status. Without a live transaction coordinator heartbeating it, the
@@ -818,64 +906,76 @@ type lockTableWaiter interface {
 // able to observe a full cycle in this graph and aborts one of the transactions
 // in the cycle to break the deadlock.
 //
-// Example of Distributed Deadlock Detection
+// # Example of Distributed Deadlock Detection
 //
 // The following diagram demonstrates how the txnWaitQueue interacts with
 // distributed deadlock detection.
 //
 //   - txnA enters txnB's txnWaitQueue during a PushTxn request (MaybeWaitForPush)
+//
 //   - txnB enters txnC's txnWaitQueue during a PushTxn request (MaybeWaitForPush)
+//
 //   - txnC enters txnA's txnWaitQueue during a PushTxn request (MaybeWaitForPush)
 //
-//          .-----------------------------------.
-//          |                                   |
-//          v                                   |
-//    [txnA record] --> [txnB record] --> [txnC record]
+//     .-----------------------------------.
+//     |                                   |
+//     v                                   |
+//     [txnA record] --> [txnB record] --> [txnC record]
 //     deps:             deps:             deps:
-//     - txnC            - txnA            - txnB
+//
+//   - txnC            - txnA            - txnB
 //
 //   - txnA queries its own txnWaitQueue using a QueryTxn request (MaybeWaitForQuery)
 //
-//          .-----------------------------------.
-//          |    ............                   |
-//          v    v          .                   |
-//    [txnA record] --> [txnB record] --> [txnC record]
+//     .-----------------------------------.
+//     |    ............                   |
+//     v    v          .                   |
+//     [txnA record] --> [txnB record] --> [txnC record]
 //     deps:             deps:             deps:
-//     - txnC            - txnA            - txnB
+//
+//   - txnC            - txnA            - txnB
 //
 //   - txnA finds that txnC is a dependent. It transfers this dependency to txnB
 //
-//          .-----------------------------------.
-//          |                                   |
-//          v                                   |
-//    [txnA record] --> [txnB record] --> [txnC record]
+//     .-----------------------------------.
+//     |                                   |
+//     v                                   |
+//     [txnA record] --> [txnB record] --> [txnC record]
 //     deps:             deps:             deps:
-//     - txnC            - txnA            - txnB
-//                       - txnC
+//
+//   - txnC            - txnA            - txnB
+//
+//   - txnC
 //
 //   - txnC queries its own txnWaitQueue using a QueryTxn request (MaybeWaitForQuery)
+//
 //   - txnB queries its own txnWaitQueue using a QueryTxn request (MaybeWaitForQuery)
+//
 //   - txnC finds that txnB is a dependent. It transfers this dependency to txnA
+//
 //   - txnB finds that txnA and txnC are dependents. It transfers these dependencies to txnC
 //
-//          .-----------------------------------.
-//          |                                   |
-//          v                                   |
-//    [txnA record] --> [txnB record] --> [txnC record]
+//     .-----------------------------------.
+//     |                                   |
+//     v                                   |
+//     [txnA record] --> [txnB record] --> [txnC record]
 //     deps:             deps:             deps:
-//     - txnC            - txnA            - txnB
-//     - txnB            - txnC            - txnA
-//                                         - txnC
+//
+//   - txnC            - txnA            - txnB
+//
+//   - txnB            - txnC            - txnA
+//
+//   - txnC
 //
 //   - txnB notices that txnC is a transitive dependency of itself. This indicates
 //     a cycle in the global wait-for graph. txnC is aborted, breaking the cycle
 //     and the deadlock
 //
-//    [txnA record] --> [txnB record] --> [txnC record: ABORTED]
+//     [txnA record] --> [txnB record] --> [txnC record: ABORTED]
 //
 //   - txnC releases its locks and the transactions proceed in order.
 //
-//    [txnA record] --> [txnB record] --> (free to commit)
+//     [txnA record] --> [txnB record] --> (free to commit)
 //
 // TODO(nvanbenschoten): if we exposed a "queue guard" interface, we could make
 // stronger guarantees around cleaning up enqueued txns when there are no
@@ -905,14 +1005,14 @@ type txnWaitQueue interface {
 	//
 	// If the transaction is successfully pushed while this method is waiting,
 	// the first return value is a non-nil PushTxnResponse object.
-	MaybeWaitForPush(context.Context, *roachpb.PushTxnRequest) (*roachpb.PushTxnResponse, *Error)
+	MaybeWaitForPush(context.Context, *kvpb.PushTxnRequest, lock.WaitPolicy) (*kvpb.PushTxnResponse, *Error)
 
 	// MaybeWaitForQuery checks whether there is a queue already established for
 	// transaction being queried. If not, or if the QueryTxn request hasn't
 	// specified WaitForUpdate, the method returns immediately. If there is a
 	// queue, the method enqueues this request as a waiter and waits for any
 	// updates to the target transaction.
-	MaybeWaitForQuery(context.Context, *roachpb.QueryTxnRequest) *Error
+	MaybeWaitForQuery(context.Context, *kvpb.QueryTxnRequest) *Error
 
 	// OnRangeDescUpdated informs the Queue that its range's descriptor has been
 	// updated.

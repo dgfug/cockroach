@@ -1,14 +1,11 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
+
+import "github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 
 // ObjectName is a common interface for qualified object names.
 type ObjectName interface {
@@ -22,6 +19,8 @@ type ObjectName interface {
 
 var _ ObjectName = &TableName{}
 var _ ObjectName = &TypeName{}
+var _ ObjectName = &RoutineName{}
+var _ ObjectName = &UnspecifiedObjectName{}
 
 // objName is the internal type for a qualified object.
 type objName struct {
@@ -32,6 +31,22 @@ type objName struct {
 	// ObjectNamePrefix is the path to the object.  This can be modified
 	// further by name resolution, see name_resolution.go.
 	ObjectNamePrefix
+}
+
+func makeQualifiedObjName(db, schema, object Name) objName {
+	return makeObjNameWithPrefix(ObjectNamePrefix{
+		CatalogName:     db,
+		SchemaName:      schema,
+		ExplicitSchema:  true,
+		ExplicitCatalog: true,
+	}, object)
+}
+
+func makeObjNameWithPrefix(prefix ObjectNamePrefix, object Name) objName {
+	return objName{
+		ObjectName:       object,
+		ObjectNamePrefix: prefix,
+	}
 }
 
 func (o *objName) Object() string {
@@ -56,6 +71,41 @@ func (o *objName) ToUnresolvedObjectName() *UnresolvedObjectName {
 	}
 	return u
 }
+
+func (o *objName) String() string { return AsString(o) }
+
+// FQString renders the table name in full, not omitting the prefix
+// schema and catalog names. Suitable for logging, etc.
+func (o *objName) FQString() string {
+	ctx := NewFmtCtx(FmtSimple)
+	schemaName := o.SchemaName.String()
+	// The pg_catalog and pg_extension schemas cannot be referenced from inside
+	// an anonymous ("") database. This makes their FQ string always relative.
+	if schemaName != catconstants.PgCatalogName && schemaName != catconstants.PgExtensionSchemaName {
+		ctx.FormatNode(&o.CatalogName)
+		ctx.WriteByte('.')
+	}
+	ctx.FormatNode(&o.SchemaName)
+	ctx.WriteByte('.')
+	ctx.FormatNode(&o.ObjectName)
+	return ctx.CloseAndGetString()
+}
+
+// Format implements the NodeFormatter interface.
+func (o *objName) Format(ctx *FmtCtx) {
+	ctx.FormatNode(&o.ObjectNamePrefix)
+	if o.ExplicitSchema || ctx.alwaysFormatTablePrefix() {
+		ctx.WriteByte('.')
+	}
+	ctx.FormatNode(&o.ObjectName)
+}
+
+// UnspecifiedObjectName is an object name correspond to any object type.
+type UnspecifiedObjectName struct {
+	objName
+}
+
+func (u UnspecifiedObjectName) objectName() {}
 
 // ObjectNamePrefix corresponds to the path prefix of an object name.
 type ObjectNamePrefix struct {
@@ -135,13 +185,26 @@ func (*UnresolvedObjectName) tableExpr() {}
 func NewUnresolvedObjectName(
 	numParts int, parts [3]string, annotationIdx AnnotationIdx,
 ) (*UnresolvedObjectName, error) {
-	u := &UnresolvedObjectName{
+	n, err := MakeUnresolvedObjectName(numParts, parts, annotationIdx)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+// MakeUnresolvedObjectName creates an unresolved object name, verifying that it
+// is well-formed.
+func MakeUnresolvedObjectName(
+	numParts int, parts [3]string, annotationIdx AnnotationIdx,
+) (UnresolvedObjectName, error) {
+	u := UnresolvedObjectName{
 		NumParts:      numParts,
 		Parts:         parts,
 		AnnotatedNode: AnnotatedNode{AnnIdx: annotationIdx},
 	}
 	if u.NumParts < 1 {
-		return nil, newInvTableNameError(u)
+		forErr := u // prevents u from escaping
+		return UnresolvedObjectName{}, newInvTableNameError(&forErr)
 	}
 
 	// Check that all the parts specified are not empty.
@@ -153,7 +216,8 @@ func NewUnresolvedObjectName(
 	}
 	for i := 0; i < lastCheck; i++ {
 		if len(u.Parts[i]) == 0 {
-			return nil, newInvTableNameError(u)
+			forErr := u // prevents u from escaping
+			return UnresolvedObjectName{}, newInvTableNameError(&forErr)
 		}
 	}
 	return u, nil
@@ -205,13 +269,11 @@ func (u *UnresolvedObjectName) Format(ctx *FmtCtx) {
 
 func (u *UnresolvedObjectName) String() string { return AsString(u) }
 
-// ToTableName converts the unresolved name to a table name.
-//
 // TODO(radu): the schema and catalog names might not be in the right places; we
 // would only figure that out during name resolution. This method is temporary,
 // while we change all the code paths to only use TableName after resolution.
-func (u *UnresolvedObjectName) ToTableName() TableName {
-	return TableName{objName{
+func (u *UnresolvedObjectName) toObjName() objName {
+	return objName{
 		ObjectName: Name(u.Parts[0]),
 		ObjectNamePrefix: ObjectNamePrefix{
 			SchemaName:      Name(u.Parts[1]),
@@ -219,7 +281,22 @@ func (u *UnresolvedObjectName) ToTableName() TableName {
 			ExplicitSchema:  u.NumParts >= 2,
 			ExplicitCatalog: u.NumParts >= 3,
 		},
-	}}
+	}
+}
+
+// ToTableName converts the unresolved name to a table name.
+func (u *UnresolvedObjectName) ToTableName() TableName {
+	return TableName{u.toObjName()}
+}
+
+// ToTypeName converts the unresolved name to a table name.
+func (u *UnresolvedObjectName) ToTypeName() TypeName {
+	return TypeName{u.toObjName()}
+}
+
+// ToRoutineName converts the unresolved name to a function name.
+func (u *UnresolvedObjectName) ToRoutineName() RoutineName {
+	return RoutineName{u.toObjName()}
 }
 
 // ToUnresolvedName converts the unresolved object name to the more general
@@ -257,3 +334,53 @@ func (u *UnresolvedObjectName) HasExplicitSchema() bool {
 func (u *UnresolvedObjectName) HasExplicitCatalog() bool {
 	return u.NumParts >= 3
 }
+
+// UnresolvedRoutineName is an unresolved function or procedure name. The two
+// implementations of this interface are used to differentiate between the two
+// types of routines for things like error messages.
+type UnresolvedRoutineName interface {
+	UnresolvedName() *UnresolvedName
+	isUnresolvedRoutineName()
+}
+
+// UnresolvedFunctionName is an unresolved function name.
+type UnresolvedFunctionName struct {
+	u *UnresolvedName
+}
+
+// MakeUnresolvedFunctionName returns a new UnresolvedFunctionName containing
+// the give UnresolvedName.
+func MakeUnresolvedFunctionName(u *UnresolvedName) UnresolvedFunctionName {
+	return UnresolvedFunctionName{u: u}
+}
+
+// UnresolvedName implements the UnresolvedRoutineName interface.
+func (u UnresolvedFunctionName) UnresolvedName() *UnresolvedName {
+	return u.u
+}
+
+// isUnresolvedRoutineName implements the UnresolvedRoutineName interface.
+func (u UnresolvedFunctionName) isUnresolvedRoutineName() {}
+
+var _ UnresolvedRoutineName = UnresolvedFunctionName{}
+
+// UnresolvedProcedureName is an unresolved procedure name.
+type UnresolvedProcedureName struct {
+	u *UnresolvedName
+}
+
+// MakeUnresolvedProcedureName returns a new UnresolvedProcedureName containing
+// the give UnresolvedName.
+func MakeUnresolvedProcedureName(u *UnresolvedName) UnresolvedProcedureName {
+	return UnresolvedProcedureName{u: u}
+}
+
+// isUnresolvedRoutineName implements the UnresolvedRoutineName interface.
+func (u UnresolvedProcedureName) isUnresolvedRoutineName() {}
+
+// UnresolvedName implements the UnresolvedRoutineName interface.
+func (u UnresolvedProcedureName) UnresolvedName() *UnresolvedName {
+	return u.u
+}
+
+var _ UnresolvedRoutineName = UnresolvedProcedureName{}

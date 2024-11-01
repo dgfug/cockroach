@@ -1,4 +1,9 @@
-@import '../core/index.module.scss';
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+@import "../core/index.module.scss";
 
 .text {
   letter-spacing: $letter-spacing--compact;
@@ -32,6 +37,10 @@
   @include text--code;
 }
 
+.text--caption {
+  @include text--caption;
+}
+
 .text--disabled {
   color: $colors--disabled;
 }
@@ -40,4 +49,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow: hidden;
+}
+
+.code-area {
+  background-color: $colors--neutral-1;
+  display: block;
+  margin-top: 20px;
+  margin-left: -5px;
+  padding: 10px;
+  padding-bottom: 30px;
 }

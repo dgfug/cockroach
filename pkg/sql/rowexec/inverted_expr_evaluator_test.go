@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -89,6 +85,7 @@ func keyIndexesToString(indexes [][]KeyIndex) string {
 
 func TestSetContainerUnion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	type testCase struct {
 		a        setContainer
@@ -111,6 +108,7 @@ func TestSetContainerUnion(t *testing.T) {
 
 func TestSetContainerIntersection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	type testCase struct {
 		a        setContainer
@@ -139,6 +137,7 @@ type keyAndIndex struct {
 // Tests both invertedExprEvaluator and batchedInvertedExprEvaluator.
 func TestInvertedExpressionEvaluator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	leaf1 := &spanExpression{
 		FactoredUnionSpans: []invertedSpan{{Start: []byte("a"), End: []byte("d")}},
@@ -302,6 +301,7 @@ func TestInvertedExpressionEvaluator(t *testing.T) {
 // overlapping spans.
 func TestFragmentedSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	expr1 := inverted.SpanExpressionProto{
 		Node: spanExpression{
@@ -362,6 +362,8 @@ func (t *testPreFilterer) PreFilter(
 
 func TestInvertedExpressionEvaluatorPreFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Setup expressions such that the same expression appears multiple times
 	// in a span.
 	leaf1 := &spanExpression{

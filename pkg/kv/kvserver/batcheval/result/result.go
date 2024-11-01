@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package result
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -26,7 +22,7 @@ import (
 // the proposing node may die before the local results are processed,
 // so any side effects here are only best-effort.
 type LocalResult struct {
-	Reply *roachpb.BatchResponse
+	Reply *kvpb.BatchResponse
 
 	// EncounteredIntents stores any intents from other transactions that the
 	// request encountered but did not conflict with. They should be handed off
@@ -51,6 +47,9 @@ type LocalResult struct {
 	// commit fails, or we may accidentally make uncommitted values
 	// live.
 	EndTxns []EndTxnIntents
+	// PopulateBarrierResponse will populate a BarrierResponse with the lease
+	// applied index and range descriptor when applied.
+	PopulateBarrierResponse bool
 
 	// When set (in which case we better be the first range), call
 	// GossipFirstRange if the Replica holds the lease.
@@ -78,6 +77,7 @@ func (lResult *LocalResult) IsZero() bool {
 		lResult.ResolvedLocks == nil &&
 		lResult.UpdatedTxns == nil &&
 		lResult.EndTxns == nil &&
+		!lResult.PopulateBarrierResponse &&
 		!lResult.GossipFirstRange &&
 		!lResult.MaybeGossipSystemConfig &&
 		!lResult.MaybeGossipSystemConfigIfHaveFailure &&
@@ -92,13 +92,13 @@ func (lResult *LocalResult) String() string {
 	return fmt.Sprintf("LocalResult (reply: %v, "+
 		"#encountered intents: %d, #acquired locks: %d, #resolved locks: %d"+
 		"#updated txns: %d #end txns: %d, "+
-		"GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
+		"PopulateBarrierResponse:%t GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
 		"MaybeGossipSystemConfigIfHaveFailure:%t MaybeAddToSplitQueue:%t "+
 		"MaybeGossipNodeLiveness:%s ",
 		lResult.Reply,
 		len(lResult.EncounteredIntents), len(lResult.AcquiredLocks), len(lResult.ResolvedLocks),
 		len(lResult.UpdatedTxns), len(lResult.EndTxns),
-		lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
+		lResult.PopulateBarrierResponse, lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
 		lResult.MaybeGossipSystemConfigIfHaveFailure, lResult.MaybeAddToSplitQueue,
 		lResult.MaybeGossipNodeLiveness)
 }
@@ -146,15 +146,29 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 	return r
 }
 
+// DetachPopulateBarrierResponse returns (and removes) the
+// PopulateBarrierResponse value from the local result.
+func (lResult *LocalResult) DetachPopulateBarrierResponse() bool {
+	if lResult == nil {
+		return false
+	}
+	r := lResult.PopulateBarrierResponse
+	lResult.PopulateBarrierResponse = false
+	return r
+}
+
 // Result is the result of evaluating a KV request. That is, the
 // proposer (which holds the lease, at least in the case in which the command
 // will complete successfully) has evaluated the request and is holding on to:
 //
 // a) changes to be written to disk when applying the command
 // b) changes to the state which may require special handling (i.e. code
-//    execution) on all Replicas
+//
+//	execution) on all Replicas
+//
 // c) data which isn't sent to the followers but the proposer needs for tasks
-//    it must run when the command has applied (such as resolving intents).
+//
+//	it must run when the command has applied (such as resolving intents).
 type Result struct {
 	Local        LocalResult
 	Replicated   kvserverpb.ReplicatedEvalResult
@@ -193,13 +207,16 @@ func coalesceBool(lhs *bool, rhs *bool) {
 func (p *Result) MergeAndDestroy(q Result) error {
 	if q.Replicated.State != nil {
 		if q.Replicated.State.RaftAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify RaftAppliedIndex")
 		}
 		if q.Replicated.State.LeaseAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify LeaseAppliedIndex")
 		}
 		if p.Replicated.State == nil {
 			p.Replicated.State = &kvserverpb.ReplicaState{}
+		}
+		if q.Replicated.State.RaftAppliedIndexTerm != 0 {
+			return errors.AssertionFailedf("must not specify RaftAppliedIndexTerm")
 		}
 		if p.Replicated.State.Desc == nil {
 			p.Replicated.State.Desc = q.Replicated.State.Desc
@@ -217,10 +234,12 @@ func (p *Result) MergeAndDestroy(q Result) error {
 
 		if p.Replicated.State.TruncatedState == nil {
 			p.Replicated.State.TruncatedState = q.Replicated.State.TruncatedState
+			p.Replicated.RaftExpectedFirstIndex = q.Replicated.RaftExpectedFirstIndex
 		} else if q.Replicated.State.TruncatedState != nil {
 			return errors.AssertionFailedf("conflicting TruncatedState")
 		}
 		q.Replicated.State.TruncatedState = nil
+		q.Replicated.RaftExpectedFirstIndex = 0
 
 		if q.Replicated.State.GCThreshold != nil {
 			if p.Replicated.State.GCThreshold == nil {
@@ -230,6 +249,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			}
 			q.Replicated.State.GCThreshold = nil
 		}
+
+		if p.Replicated.State.GCHint == nil {
+			p.Replicated.State.GCHint = q.Replicated.State.GCHint
+		} else if q.Replicated.State.GCHint != nil {
+			return errors.AssertionFailedf("conflicting GC hint")
+		}
+		q.Replicated.State.GCHint = nil
 
 		if p.Replicated.State.Version == nil {
 			p.Replicated.State.Version = q.Replicated.State.Version
@@ -290,6 +316,21 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	}
 	q.Replicated.AddSSTable = nil
 
+	if p.Replicated.LinkExternalSSTable == nil {
+		p.Replicated.LinkExternalSSTable = q.Replicated.LinkExternalSSTable
+	} else if q.Replicated.LinkExternalSSTable != nil {
+		return errors.AssertionFailedf("conflicting LinkExternalSSTable")
+	}
+	q.Replicated.LinkExternalSSTable = nil
+
+	if p.Replicated.MVCCHistoryMutation == nil {
+		p.Replicated.MVCCHistoryMutation = q.Replicated.MVCCHistoryMutation
+	} else if q.Replicated.MVCCHistoryMutation != nil {
+		p.Replicated.MVCCHistoryMutation.Spans = append(p.Replicated.MVCCHistoryMutation.Spans,
+			q.Replicated.MVCCHistoryMutation.Spans...)
+	}
+	q.Replicated.MVCCHistoryMutation = nil
+
 	if p.Replicated.PrevLeaseProposal == nil {
 		p.Replicated.PrevLeaseProposal = q.Replicated.PrevLeaseProposal
 	} else if q.Replicated.PrevLeaseProposal != nil {
@@ -303,6 +344,11 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		return errors.AssertionFailedf("conflicting prior read summary")
 	}
 	q.Replicated.PriorReadSummary = nil
+
+	if !p.Replicated.IsProbe {
+		p.Replicated.IsProbe = q.Replicated.IsProbe
+	}
+	q.Replicated.IsProbe = false
 
 	if p.Local.EncounteredIntents == nil {
 		p.Local.EncounteredIntents = q.Local.EncounteredIntents
@@ -338,6 +384,14 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		p.Local.EndTxns = append(p.Local.EndTxns, q.Local.EndTxns...)
 	}
 	q.Local.EndTxns = nil
+
+	if !p.Local.PopulateBarrierResponse {
+		p.Local.PopulateBarrierResponse = q.Local.PopulateBarrierResponse
+	} else {
+		// PopulateBarrierResponse is only valid for a single Barrier response.
+		return errors.AssertionFailedf("multiple PopulateBarrierResponse results")
+	}
+	q.Local.PopulateBarrierResponse = false
 
 	if p.Local.MaybeGossipNodeLiveness == nil {
 		p.Local.MaybeGossipNodeLiveness = q.Local.MaybeGossipNodeLiveness

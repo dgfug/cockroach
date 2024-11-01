@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -24,8 +19,9 @@ package colexecagg
 import (
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -41,6 +37,7 @@ var (
 	_ tree.AggType
 	_ apd.Context
 	_ duration.Duration
+	_ = typeconv.TypeFamilyToCanonicalTypeFamily
 )
 
 // {{/*
@@ -58,7 +55,27 @@ func _ASSIGN_SUBTRACT(_, _, _, _, _, _ string) {
 	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
+// _ALLOC_CODE is the template variable that is replaced in agg_gen_util.go by
+// the template code for sharing allocator objects.
+const _ALLOC_CODE = 0
+
 // */}}
+
+// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq .SumKind "Int"}}
+const sumIntNumOverloads = 3
+
+// {{else}}
+const sumNumOverloads = 6
+
+// {{end}}
+// {{end}}
+
+// {{with .Infos}}
+
+var _ = _ALLOC_CODE
+
+// {{end}}
 
 func newSum_SUMKIND_AGGKINDAggAlloc(
 	allocator *colmem.Allocator, t *types.T, allocSize int64,
@@ -66,7 +83,7 @@ func newSum_SUMKIND_AGGKINDAggAlloc(
 	allocBase := aggAllocBase{allocator: allocator, allocSize: allocSize}
 	switch t.Family() {
 	// {{range .Infos}}
-	case _TYPE_FAMILY:
+	case _CANONICAL_TYPE_FAMILY:
 		switch t.Width() {
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
@@ -87,58 +104,37 @@ func newSum_SUMKIND_AGGKINDAggAlloc(
 type sum_SUMKIND_TYPE_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
+	// col points to the output vector we are updating.
+	col _RET_GOTYPESLICE
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
 	// curAgg holds the running total, so we can index into the slice once per
 	// group, instead of on each iteration.
 	curAgg _RET_GOTYPE
-	// col points to the output vector we are updating.
-	col []_RET_GOTYPE
 	// numNonNull tracks the number of non-null values we have seen for the group
 	// that is currently being aggregated.
 	numNonNull uint64
-	// {{if .NeedsHelper}}
-	// {{/*
-	// overloadHelper is used only when we perform the summation of integers
-	// and get a decimal result which is the case when {{if .NeedsHelper}}
-	// evaluates to true. In all other cases we don't want to wastefully
-	// allocate the helper.
-	// */}}
-	overloadHelper execgen.OverloadHelper
-	// {{end}}
 }
 
 var _ AggregateFunc = &sum_SUMKIND_TYPE_AGGKINDAgg{}
 
-func (a *sum_SUMKIND_TYPE_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *sum_SUMKIND_TYPE_AGGKINDAgg) SetOutput(vec *coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
 	a.col = vec._RET_TYPE()
 }
 
+// {{end}}
+
 func (a *sum_SUMKIND_TYPE_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
-	// {{if .NeedsHelper}}
-	// {{/*
-	// overloadHelper is used only when we perform the summation of integers
-	// and get a decimal result which is the case when {{if .NeedsHelper}}
-	// evaluates to true. In all other cases we don't want to wastefully
-	// allocate the helper.
-	// */}}
-	// In order to inline the templated code of overloads, we need to have a
-	// "_overloadHelper" local variable of type "overloadHelper".
-	_overloadHelper := a.overloadHelper
-	// {{end}}
 	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.TemplateType(), vec.Nulls()
 	// {{if not (eq "_AGGKIND" "Window")}}
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups and col to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -194,7 +190,7 @@ func (a *sum_SUMKIND_TYPE_AGGKINDAgg) Compute(
 	// {{end}}
 	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
 	if newCurAggSize != oldCurAggSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -207,17 +203,14 @@ func (a *sum_SUMKIND_TYPE_AGGKINDAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
+	col := a.col
+	// {{else}}
+	col := a.vec._RET_TYPE()
 	// {{end}}
 	if a.numNonNull == 0 {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		// {{if eq "_AGGKIND" "Window"}}
-		// We need to copy the value because window functions reuse the aggregation
-		// between rows.
-		execgen.COPYVAL(a.col[outputIdx], a.curAgg)
-		// {{else}}
-		a.col[outputIdx] = a.curAgg
-		// {{end}}
+		col.Set(outputIdx, a.curAgg)
 	}
 }
 
@@ -255,13 +248,8 @@ func (a *sum_SUMKIND_TYPE_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 // Remove implements the slidingWindowAggregateFunc interface (see
 // window_aggregator_tmpl.go).
 func (a *sum_SUMKIND_TYPE_AGGKINDAgg) Remove(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int,
 ) {
-	// {{if .NeedsHelper}}
-	// In order to inline the templated code of overloads, we need to have a
-	// "_overloadHelper" local variable of type "overloadHelper".
-	_overloadHelper := a.overloadHelper
-	// {{end}}
 	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.TemplateType(), vec.Nulls()

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -18,18 +14,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-// Most of the functionality in statistics.go is tested by the data-driven
-// testing in logical_props_factory_test.go. This file contains tests for
-// functions in statistics.go that cannot be tested using the data-driven
-// testing framework.
+// Most of the functionality in statistics.go is tested by data-driven
+// testing. This file contains tests for functions in statistics.go that cannot
+// be tested using the data-driven testing framework.
 
 // Test getting statistics from constraints that cannot yet be inferred
 // by the optimizer.
 func TestGetStatsFromConstraint(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	evalCtx.SessionData().OptimizerUseMultiColStats = true
 
 	catalog := testcat.New()
@@ -88,7 +85,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	}
 
 	var mem Memo
-	mem.Init(&evalCtx)
+	mem.Init(context.Background(), &evalCtx)
 	tn := tree.NewUnqualifiedTableName("sel")
 	tab := catalog.Table(tn)
 	tabID := mem.Metadata().AddTable(tab, tn)
@@ -104,7 +101,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 		}
 
 		sb := &statisticsBuilder{}
-		sb.init(&evalCtx, mem.Metadata())
+		sb.init(context.Background(), &evalCtx, mem.Metadata())
 
 		// Make the scan.
 		scan := mem.MemoizeScan(&ScanPrivate{Table: tabID, Cols: cols})
@@ -113,16 +110,17 @@ func TestGetStatsFromConstraint(t *testing.T) {
 		sel := mem.MemoizeSelect(scan, TrueFilter)
 
 		relProps := &props.Relational{Cardinality: props.AnyCardinality}
-		relProps.NotNullCols = cs.ExtractNotNullCols(&evalCtx)
-		s := &relProps.Stats
+		relProps.NotNullCols = cs.ExtractNotNullCols(ctx, &evalCtx)
+		s := relProps.Statistics()
 		s.Init(relProps)
 
 		// Calculate distinct counts.
-		sb.applyConstraintSet(cs, true /* tight */, sel, relProps, &relProps.Stats)
+		sb.applyConstraintSet(cs, true /* tight */, sel, relProps, relProps.Statistics())
 
 		// Calculate row count and selectivity.
-		s.RowCount = scan.Relational().Stats.RowCount
-		s.ApplySelectivity(sb.selectivityFromMultiColDistinctCounts(cols, sel, s))
+		s.RowCount = scan.Relational().Statistics().RowCount
+		selectivity, _, _ := sb.selectivityFromMultiColDistinctCounts(cols, sel, s)
+		s.ApplySelectivity(selectivity)
 
 		// Update null counts.
 		sb.updateNullCountsFromNotNullCols(relProps.NotNullCols, s)
@@ -150,36 +148,36 @@ func TestGetStatsFromConstraint(t *testing.T) {
 
 	var columns45 constraint.Columns
 	columns45.Init([]opt.OrderingColumn{4, 5})
-	keyCtx45 := constraint.MakeKeyContext(&columns45, &evalCtx)
+	keyCtx45 := constraint.MakeKeyContext(ctx, &columns45, &evalCtx)
 
 	cs1 := constraint.SingleConstraint(&c1)
 	statsFunc(
 		cs1,
-		"[rows=140000000, distinct(1)=7, null(1)=0]",
+		"[rows=1.4e+08, distinct(1)=7, null(1)=0]",
 	)
 
 	cs2 := constraint.SingleConstraint(&c2)
 	statsFunc(
 		cs2,
-		"[rows=3.33333333e+09, distinct(2)=166.666667, null(2)=0]",
+		"[rows=3.333333e+09, distinct(2)=166.667, null(2)=0]",
 	)
 
 	cs3 := constraint.SingleConstraint(&c3)
 	statsFunc(
 		cs3,
-		"[rows=20000000, distinct(3)=1, null(3)=0]",
+		"[rows=2e+07, distinct(3)=1, null(3)=0]",
 	)
 
 	cs12 := constraint.SingleConstraint(&c12)
 	statsFunc(
 		cs12,
-		"[rows=20000000, distinct(1)=1, null(1)=0]",
+		"[rows=2e+07, distinct(1)=1, null(1)=0]",
 	)
 
 	cs123 := constraint.SingleConstraint(&c123)
 	statsFunc(
 		cs123,
-		"[rows=36040, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=5, null(3)=0, distinct(1,2)=1, null(1,2)=0, distinct(1-3)=5, null(1-3)=0]",
+		"[rows=400, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=5, null(3)=0, distinct(1,2)=1, null(1,2)=0, distinct(1-3)=5, null(1-3)=0]",
 	)
 
 	cs123n := constraint.SingleConstraint(&c123n)
@@ -203,7 +201,7 @@ func TestGetStatsFromConstraint(t *testing.T) {
 	cs312 := constraint.SingleConstraint(&c312)
 	statsFunc(
 		cs312,
-		"[rows=24490654.6, distinct(1)=2, null(1)=0, distinct(2)=7, null(2)=0, distinct(3)=2, null(3)=0, distinct(1-3)=26.9394737, null(1-3)=0]",
+		"[rows=2.449065e+07, distinct(1)=2, null(1)=0, distinct(2)=7, null(2)=0, distinct(3)=2, null(3)=0, distinct(1-3)=26.9395, null(1-3)=0]",
 	)
 
 	cs312n := constraint.SingleConstraint(&c312n)
@@ -212,16 +210,16 @@ func TestGetStatsFromConstraint(t *testing.T) {
 		"[rows=160000, distinct(1)=2, null(1)=0, distinct(3)=2, null(3)=0, distinct(1,3)=4, null(1,3)=0]",
 	)
 
-	cs := cs3.Intersect(&evalCtx, cs123)
+	cs := cs3.Intersect(ctx, &evalCtx, cs123)
 	statsFunc(
 		cs,
-		"[rows=909098.909, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(1-3)=1, null(1-3)=0]",
+		"[rows=909098.9, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(1-3)=1, null(1-3)=0]",
 	)
 
-	cs = cs32.Intersect(&evalCtx, cs123)
+	cs = cs32.Intersect(ctx, &evalCtx, cs123)
 	statsFunc(
 		cs,
-		"[rows=909098.909, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(1-3)=1, null(1-3)=0]",
+		"[rows=909098.9, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(3)=1, null(3)=0, distinct(1-3)=1, null(1-3)=0]",
 	)
 
 	cs45 := constraint.SingleSpanConstraint(&keyCtx45, &sp45)

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -104,11 +99,6 @@ func (r *_ROW_NUMBER_STRINGOp) Next() coldata.Batch {
 	partitionCol := batch.ColVec(r.partitionColIdx).Bool()
 	// {{end}}
 	rowNumberVec := batch.ColVec(r.outputColIdx)
-	if rowNumberVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		rowNumberVec.Nulls().UnsetNulls()
-	}
 	rowNumberCol := rowNumberVec.Int64()
 	sel := batch.Selection()
 	if sel != nil {

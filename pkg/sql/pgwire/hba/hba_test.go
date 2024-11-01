@@ -1,27 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package hba
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/rulebasedscanner"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
 	"github.com/kr/pretty"
 )
 
 func TestParse(t *testing.T) {
-	datadriven.RunTest(t, filepath.Join("testdata", "parse"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "parse"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			switch td.Cmd {
 			case "multiline":
@@ -35,15 +31,15 @@ func TestParse(t *testing.T) {
 				return out.String()
 
 			case "line":
-				tokens, err := tokenize(td.Input)
+				tokens, err := rulebasedscanner.Tokenize(td.Input)
 				if err != nil {
 					td.Fatalf(t, "%v", err)
 				}
-				if len(tokens.lines) != 1 {
+				if len(tokens.Lines) != 1 {
 					td.Fatalf(t, "line parse only valid with one line of input")
 				}
 				prefix := "" // For debugging, use prefix := pretty.Sprint(tokens.lines[0]) + "\n"
-				entry, err := parseHbaLine(tokens.lines[0])
+				entry, err := parseHbaLine(tokens.Lines[0])
 				if err != nil {
 					return prefix + fmt.Sprintf("error: %v\n", err)
 				}
@@ -56,7 +52,7 @@ func TestParse(t *testing.T) {
 }
 
 func TestParseAndNormalizeAuthConfig(t *testing.T) {
-	datadriven.RunTest(t, filepath.Join("testdata", "normalization"),
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "normalization"),
 		func(t *testing.T, td *datadriven.TestData) string {
 			switch td.Cmd {
 			case "hba":

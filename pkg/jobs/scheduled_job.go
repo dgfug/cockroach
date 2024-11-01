@@ -1,33 +1,28 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/gorhill/cronexpr"
+	"github.com/robfig/cron/v3"
 )
 
 // scheduledJobRecord is a reflective representation of a row in
@@ -36,9 +31,9 @@ import (
 // name in the system.scheduled_job table containing the data for the field.
 // Do not manipulate these fields directly, use methods in the ScheduledJob.
 type scheduledJobRecord struct {
-	ScheduleID      int64                     `col:"schedule_id"`
+	ScheduleID      jobspb.ScheduleID         `col:"schedule_id"`
 	ScheduleLabel   string                    `col:"schedule_name"`
-	Owner           security.SQLUsername      `col:"owner"`
+	Owner           username.SQLUsername      `col:"owner"`
 	NextRun         time.Time                 `col:"next_run"`
 	ScheduleState   jobspb.ScheduleState      `col:"schedule_state"`
 	ScheduleExpr    string                    `col:"schedule_expr"`
@@ -46,9 +41,6 @@ type scheduledJobRecord struct {
 	ExecutorType    string                    `col:"executor_type"`
 	ExecutionArgs   jobspb.ExecutionArguments `col:"execution_args"`
 }
-
-// InvalidScheduleID is a constant indicating the schedule ID is not valid.
-const InvalidScheduleID int64 = 0
 
 // ScheduledJob  is a representation of the scheduled job.
 // This struct can marshal/unmarshal changes made to the underlying system.scheduled_job table.
@@ -79,7 +71,7 @@ func NewScheduledJob(env scheduledjobs.JobSchedulerEnv) *ScheduledJob {
 // scheduledJobNotFoundError is returned from load when the scheduled job does
 // not exist.
 type scheduledJobNotFoundError struct {
-	scheduleID int64
+	scheduleID jobspb.ScheduleID
 }
 
 // Error makes scheduledJobNotFoundError an error.
@@ -93,35 +85,39 @@ func HasScheduledJobNotFoundError(err error) bool {
 	return errors.HasType(err, (*scheduledJobNotFoundError)(nil))
 }
 
-// LoadScheduledJob loads scheduled job record from the database.
-func LoadScheduledJob(
-	ctx context.Context,
-	env scheduledjobs.JobSchedulerEnv,
-	id int64,
-	ex sqlutil.InternalExecutor,
-	txn *kv.Txn,
-) (*ScheduledJob, error) {
-	row, cols, err := ex.QueryRowExWithCols(ctx, "lookup-schedule", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-		fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = %d",
-			env.ScheduledJobsTableName(), id))
+func ScheduledJobDB(db isql.DB) ScheduledJobStorage {
+	return scheduledJobStorageDB{db: db}
+}
 
-	if err != nil {
-		return nil, errors.CombineErrors(err, &scheduledJobNotFoundError{scheduleID: id})
-	}
-	if row == nil {
-		return nil, &scheduledJobNotFoundError{scheduleID: id}
-	}
+func ScheduledJobTxn(txn isql.Txn) ScheduledJobStorage {
+	return scheduledJobStorageTxn{txn: txn}
+}
 
-	j := NewScheduledJob(env)
-	if err := j.InitFromDatums(row, cols); err != nil {
-		return nil, err
-	}
-	return j, nil
+type ScheduledJobStorage interface {
+	// Load loads scheduled job record from the database.
+	Load(ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID) (*ScheduledJob, error)
+
+	// DeleteByID removes this schedule with the given ID.
+	// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
+	DeleteByID(ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID) error
+
+	// Create persists this schedule in the system.scheduled_jobs table.
+	// Sets j.scheduleID to the ID of the newly created schedule.
+	// Only the values initialized in this schedule are written to the specified transaction.
+	// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
+	Create(ctx context.Context, j *ScheduledJob) error
+
+	// Delete removes this schedule.
+	// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
+	Delete(ctx context.Context, j *ScheduledJob) error
+
+	// Update saves changes made to this schedule.
+	// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
+	Update(ctx context.Context, j *ScheduledJob) error
 }
 
 // ScheduleID returns schedule ID.
-func (j *ScheduledJob) ScheduleID() int64 {
+func (j *ScheduledJob) ScheduleID() jobspb.ScheduleID {
 	return j.rec.ScheduleID
 }
 
@@ -137,12 +133,12 @@ func (j *ScheduledJob) SetScheduleLabel(label string) {
 }
 
 // Owner returns schedule owner.
-func (j *ScheduledJob) Owner() security.SQLUsername {
+func (j *ScheduledJob) Owner() username.SQLUsername {
 	return j.rec.Owner
 }
 
 // SetOwner updates schedule owner.
-func (j *ScheduledJob) SetOwner(owner security.SQLUsername) {
+func (j *ScheduledJob) SetOwner(owner username.SQLUsername) {
 	j.rec.Owner = owner
 	j.markDirty("owner")
 }
@@ -194,12 +190,13 @@ func (j *ScheduledJob) Frequency() (time.Duration, error) {
 		return 0, errors.Newf(
 			"schedule %d is not periodic", j.rec.ScheduleID)
 	}
-	expr, err := cronexpr.Parse(j.rec.ScheduleExpr)
+	expr, err := cron.ParseStandard(j.rec.ScheduleExpr)
 	if err != nil {
 		return 0, errors.Wrapf(err,
 			"parsing schedule expression: %q; it must be a valid cron expression",
 			j.rec.ScheduleExpr)
 	}
+
 	next := expr.Next(j.env.Now())
 	nextNext := expr.Next(next)
 	return nextNext.Sub(next), nil
@@ -211,7 +208,7 @@ func (j *ScheduledJob) ScheduleNextRun() error {
 		return errors.Newf(
 			"cannot set next run for schedule %d (empty schedule)", j.rec.ScheduleID)
 	}
-	expr, err := cronexpr.Parse(j.rec.ScheduleExpr)
+	expr, err := cron.ParseStandard(j.rec.ScheduleExpr)
 	if err != nil {
 		return errors.Wrapf(err, "parsing schedule expression: %q", j.rec.ScheduleExpr)
 	}
@@ -237,12 +234,14 @@ func (j *ScheduledJob) SetScheduleDetails(details jobspb.ScheduleDetails) {
 }
 
 // SetScheduleStatus sets schedule status.
-func (j *ScheduledJob) SetScheduleStatus(fmtOrMsg string, args ...interface{}) {
-	if len(args) == 0 {
-		j.rec.ScheduleState.Status = fmtOrMsg
-	} else {
-		j.rec.ScheduleState.Status = fmt.Sprintf(fmtOrMsg, args...)
-	}
+func (j *ScheduledJob) SetScheduleStatus(msg string) {
+	j.rec.ScheduleState.Status = msg
+	j.markDirty("schedule_state")
+}
+
+// SetScheduleStatusf sets schedule status.
+func (j *ScheduledJob) SetScheduleStatusf(format string, args ...interface{}) {
+	j.rec.ScheduleState.Status = fmt.Sprintf(format, args...)
 	j.markDirty("schedule_state")
 }
 
@@ -288,85 +287,210 @@ func (j *ScheduledJob) InitFromDatums(datums []tree.Datum, cols []colinfo.Result
 			"datums length != columns length: %d != %d", len(datums), len(cols))
 	}
 
-	record := reflect.ValueOf(&j.rec).Elem()
+	modified := false
 
-	numInitialized := 0
 	for i, col := range cols {
-		native, err := datumToNative(datums[i])
-		if err != nil {
-			return err
-		}
-
-		if native == nil {
+		datum := tree.UnwrapDOidWrapper(datums[i])
+		if datum == tree.DNull {
+			// Skip over any null values
 			continue
 		}
 
-		fieldNum, ok := columnNameToField[col.Name]
-		if !ok {
-			// Table contains columns we don't care about (e.g. created)
+		switch col.Name {
+		case "schedule_id":
+			dint, ok := datum.(*tree.DInt)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dint, datum)
+			}
+			j.rec.ScheduleID = jobspb.ScheduleID(*dint)
+
+		case "schedule_name":
+			dstring, ok := datum.(*tree.DString)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dstring, datum)
+			}
+			j.rec.ScheduleLabel = string(*dstring)
+
+		case "owner":
+			dstring, ok := datum.(*tree.DString)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dstring, datum)
+			}
+			j.rec.Owner = username.MakeSQLUsernameFromPreNormalizedString(string(*dstring))
+
+		case "next_run":
+			dtime, ok := datum.(*tree.DTimestampTZ)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dtime, datum)
+			}
+			j.rec.NextRun = dtime.Time
+
+		case "schedule_state":
+			dbytes, ok := datum.(*tree.DBytes)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dbytes, datum)
+			}
+			if err := protoutil.Unmarshal([]byte(*dbytes), &j.rec.ScheduleState); err != nil {
+				return err
+			}
+
+		case "schedule_expr":
+			dstring, ok := datum.(*tree.DString)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dstring, datum)
+			}
+			j.rec.ScheduleExpr = string(*dstring)
+
+		case "schedule_details":
+			dbytes, ok := datum.(*tree.DBytes)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dbytes, datum)
+			}
+			if err := protoutil.Unmarshal([]byte(*dbytes), &j.rec.ScheduleDetails); err != nil {
+				return err
+			}
+
+		case "executor_type":
+			dstring, ok := datum.(*tree.DString)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dstring, datum)
+			}
+			j.rec.ExecutorType = string(*dstring)
+
+		case "execution_args":
+			dbytes, ok := datum.(*tree.DBytes)
+			if !ok {
+				return errors.Newf("expected %q to be %T got %T", col.Name, dbytes, datum)
+			}
+			if err := protoutil.Unmarshal([]byte(*dbytes), &j.rec.ExecutionArgs); err != nil {
+				return err
+			}
+
+		default:
+			// Ignore any unrecognized fields. This behavior is historical and tested
+			// but it's unclear why unrecognized fields would appear.
 			continue
 		}
 
-		field := record.Field(fieldNum)
+		modified = true
 
-		if data, ok := native.([]byte); ok {
-			// []byte == protocol message.
-			if pb, ok := field.Addr().Interface().(protoutil.Message); ok {
-				if err := protoutil.Unmarshal(data, pb); err != nil {
-					return err
-				}
-			} else {
-				return errors.Newf(
-					"field %s with value of type %T is does not appear to be a protocol message",
-					field.String(), field.Addr().Interface())
-			}
-		} else {
-			// We ought to be able to assign native directly to our field.
-			// But, be paranoid and double check.
-			rv := reflect.ValueOf(native)
-			if !rv.Type().AssignableTo(field.Type()) {
-				// Is this the owner field? This needs special treatment.
-				ok := false
-				if col.Name == "owner" {
-					// The owner field has type SQLUsername, but the datum is a
-					// simple string.  So we need to convert.
-					//
-					// TODO(someone): We need a more generic mechanism than this
-					// naive go reflect stuff here.
-					var s string
-					s, ok = native.(string)
-					if ok {
-						// Replace the value by one of the right type.
-						rv = reflect.ValueOf(security.MakeSQLUsernameFromPreNormalizedString(s))
-					}
-				}
-				if !ok {
-					return errors.Newf("value of type %T cannot be assigned to %s",
-						native, field.Type().String())
-				}
-			}
-			field.Set(rv)
-		}
-		numInitialized++
 	}
 
-	if numInitialized == 0 {
-		return errors.New("did not initialize any schedule field")
+	if !modified {
+		return errors.Newf("no fields initialized")
 	}
 
 	j.scheduledTime = j.rec.NextRun
+
 	return nil
 }
 
-// Create persists this schedule in the system.scheduled_jobs table.
-// Sets j.scheduleID to the ID of the newly created schedule.
-// Only the values initialized in this schedule are written to the specified transaction.
-// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
-func (j *ScheduledJob) Create(ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn) error {
+type scheduledJobStorageDB struct{ db isql.DB }
+
+func (s scheduledJobStorageDB) DeleteByID(
+	ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID,
+) error {
+	return s.run(ctx, func(ctx context.Context, txn scheduledJobStorageTxn) error {
+		return txn.DeleteByID(ctx, env, id)
+	})
+}
+
+func (s scheduledJobStorageDB) Load(
+	ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID,
+) (*ScheduledJob, error) {
+	var j *ScheduledJob
+	if err := s.run(ctx, func(
+		ctx context.Context, txn scheduledJobStorageTxn,
+	) (err error) {
+		j, err = txn.Load(ctx, env, id)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+func (s scheduledJobStorageDB) run(
+	ctx context.Context, f func(ctx context.Context, txn scheduledJobStorageTxn) error,
+) error {
+	return s.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
+		return f(ctx, scheduledJobStorageTxn{txn})
+	})
+}
+
+func (s scheduledJobStorageDB) runAction(
+	ctx context.Context,
+	f func(scheduledJobStorageTxn, context.Context, *ScheduledJob) error,
+	j *ScheduledJob,
+) error {
+	return s.run(ctx, func(ctx context.Context, txn scheduledJobStorageTxn) error {
+		return f(txn, ctx, j)
+	})
+}
+
+func (s scheduledJobStorageDB) Create(ctx context.Context, j *ScheduledJob) error {
+	return s.runAction(ctx, scheduledJobStorageTxn.Create, j)
+}
+
+func (s scheduledJobStorageDB) Delete(ctx context.Context, j *ScheduledJob) error {
+	return s.runAction(ctx, scheduledJobStorageTxn.Delete, j)
+}
+
+func (s scheduledJobStorageDB) Update(ctx context.Context, j *ScheduledJob) error {
+	return s.runAction(ctx, scheduledJobStorageTxn.Update, j)
+}
+
+type scheduledJobStorageTxn struct{ txn isql.Txn }
+
+func (s scheduledJobStorageTxn) DeleteByID(
+	ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID,
+) error {
+	_, err := s.txn.ExecEx(
+		ctx,
+		"delete-schedule",
+		s.txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf(
+			"DELETE FROM %s WHERE schedule_id = $1",
+			env.ScheduledJobsTableName(),
+		),
+		id,
+	)
+	return err
+}
+
+func (s scheduledJobStorageTxn) Load(
+	ctx context.Context, env scheduledjobs.JobSchedulerEnv, id jobspb.ScheduleID,
+) (*ScheduledJob, error) {
+	row, cols, err := s.txn.QueryRowExWithCols(ctx, "lookup-schedule", s.txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = %d",
+			env.ScheduledJobsTableName(), id))
+
+	if err != nil {
+		return nil, errors.CombineErrors(err, &scheduledJobNotFoundError{scheduleID: id})
+	}
+	if row == nil {
+		return nil, &scheduledJobNotFoundError{scheduleID: id}
+	}
+
+	j := NewScheduledJob(env)
+	if err := j.InitFromDatums(row, cols); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+func (s scheduledJobStorageTxn) Create(ctx context.Context, j *ScheduledJob) error {
 	if j.rec.ScheduleID != 0 {
 		return errors.New("cannot specify schedule id when creating new cron job")
 	}
-
+	if j.rec.ScheduleDetails.ClusterID.Equal(uuid.UUID{}) {
+		return errors.New("scheduled job created without a cluster ID")
+	}
+	if j.rec.ScheduleDetails.CreationClusterVersion.Equal(clusterversion.ClusterVersion{}) {
+		return errors.New("scheduled job created without a cluster version")
+	}
 	if !j.isDirty() {
 		return errors.New("no settings specified for scheduled job")
 	}
@@ -376,8 +500,8 @@ func (j *ScheduledJob) Create(ctx context.Context, ex sqlutil.InternalExecutor, 
 		return err
 	}
 
-	row, retCols, err := ex.QueryRowExWithCols(ctx, "sched-create", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+	row, retCols, err := s.txn.QueryRowExWithCols(ctx, "sched-create", s.txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf("INSERT INTO %s (%s) VALUES(%s) RETURNING schedule_id",
 			j.env.ScheduledJobsTableName(), strings.Join(cols, ","), generatePlaceholders(len(qargs))),
 		qargs...,
@@ -393,9 +517,20 @@ func (j *ScheduledJob) Create(ctx context.Context, ex sqlutil.InternalExecutor, 
 	return j.InitFromDatums(row, retCols)
 }
 
-// Update saves changes made to this schedule.
-// If an error is returned, it is callers responsibility to handle it (e.g. rollback transaction).
-func (j *ScheduledJob) Update(ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn) error {
+func (s scheduledJobStorageTxn) Delete(ctx context.Context, j *ScheduledJob) error {
+	if j.rec.ScheduleID == 0 {
+		return errors.New("cannot delete schedule: missing schedule id")
+	}
+	_, err := s.txn.ExecEx(ctx, "sched-delete", s.txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf("DELETE FROM %s WHERE schedule_id = %d",
+			j.env.ScheduledJobsTableName(), j.ScheduleID()),
+	)
+
+	return err
+}
+
+func (s scheduledJobStorageTxn) Update(ctx context.Context, j *ScheduledJob) error {
 	if !j.isDirty() {
 		return nil
 	}
@@ -413,8 +548,8 @@ func (j *ScheduledJob) Update(ctx context.Context, ex sqlutil.InternalExecutor, 
 		return nil // Nothing changed.
 	}
 
-	n, err := ex.ExecEx(ctx, "sched-update", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+	n, err := s.txn.ExecEx(ctx, "sched-update", s.txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf("UPDATE %s SET (%s) = (%s) WHERE schedule_id = %d",
 			j.env.ScheduledJobsTableName(), strings.Join(cols, ","),
 			generatePlaceholders(len(qargs)), j.ScheduleID()),
@@ -431,6 +566,9 @@ func (j *ScheduledJob) Update(ctx context.Context, ex sqlutil.InternalExecutor, 
 
 	return nil
 }
+
+var _ ScheduledJobStorage = (*scheduledJobStorageTxn)(nil)
+var _ ScheduledJobStorage = (*scheduledJobStorageDB)(nil)
 
 // marshalChanges marshals all changes in the in-memory representation and returns
 // the names of the columns and marshaled values.
@@ -510,40 +648,4 @@ func marshalProto(message protoutil.Message) (tree.Datum, error) {
 		return nil, err
 	}
 	return tree.NewDBytes(tree.DBytes(data)), nil
-}
-
-// datumToNative is a helper to convert tree.Datum into Go native
-// types.  We only care about types stored in the system.scheduled_jobs table.
-func datumToNative(datum tree.Datum) (interface{}, error) {
-	datum = tree.UnwrapDatum(nil, datum)
-	if datum == tree.DNull {
-		return nil, nil
-	}
-	switch d := datum.(type) {
-	case *tree.DString:
-		return string(*d), nil
-	case *tree.DInt:
-		return int64(*d), nil
-	case *tree.DTimestampTZ:
-		return d.Time, nil
-	case *tree.DBytes:
-		return []byte(*d), nil
-	}
-	return nil, errors.Newf("cannot handle type %T", datum)
-}
-
-var columnNameToField = make(map[string]int)
-
-func init() {
-	// Initialize columnNameToField map, mapping system.schedule_job columns
-	// to the appropriate fields int he scheduledJobRecord.
-	j := reflect.TypeOf(scheduledJobRecord{})
-
-	for f := 0; f < j.NumField(); f++ {
-		field := j.Field(f)
-		col := field.Tag.Get("col")
-		if col != "" {
-			columnNameToField[col] = f
-		}
-	}
 }

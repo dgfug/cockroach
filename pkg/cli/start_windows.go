@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -16,8 +11,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 )
 
-// drainSignals are the signals that will cause the server to drain and exit.
-var drainSignals = []os.Signal{os.Interrupt}
+// DrainSignals are the signals that will cause the server to drain and exit.
+var DrainSignals = []os.Signal{os.Interrupt}
 
 // termSignal is the signal that causes an idempotent graceful
 // shutdown (i.e. second occurrence does not incur hard shutdown).
@@ -25,6 +20,14 @@ var termSignal os.Signal = nil
 
 // quitSignal is the signal to recognize to dump Go stacks.
 var quitSignal os.Signal = nil
+
+// debugSignal is the signal to open a pprof debugging server.
+var debugSignal os.Signal = nil
+
+// exitAbruptlySignal is the signal to make the process exit immediately. It is
+// preferable to SIGKILL when running with coverage instrumentation because the
+// coverage profile gets dumped on exit.
+var exitAbruptlySignal os.Signal = nil
 
 const backgroundFlagDefined = false
 
@@ -41,4 +44,9 @@ func maybeRerunBackground() (bool, error) {
 
 func disableOtherPermissionBits() {
 	// No-op on windows, which does not support umask.
+}
+
+func closeAllSockets() {
+	// No-op on windows.
+	// TODO(jackson): Is there something else we can do on Windows?
 }

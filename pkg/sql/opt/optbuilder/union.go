@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,6 +9,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -81,8 +77,8 @@ func (b *Builder) buildSetOp(
 	rightCols := colsToColList(rightScope.cols)
 	newCols := colsToColList(outScope.cols)
 
-	left := leftScope.expr.(memo.RelExpr)
-	right := rightScope.expr.(memo.RelExpr)
+	left := leftScope.expr
+	right := rightScope.expr
 	private := memo.SetPrivate{LeftCols: leftCols, RightCols: rightCols, OutCols: newCols}
 
 	if all {
@@ -115,7 +111,6 @@ func (b *Builder) buildSetOp(
 // Throws an error if the scopes don't have the same number of columns, or when
 // column types don't match 1-1 or can't be cast to a single output type. The
 // error messages use clauseTag.
-//
 func (b *Builder) typeCheckSetOp(
 	leftScope, rightScope *scope, clauseTag string,
 ) (setOpTypes []*types.T, leftCastsNeeded, rightCastsNeeded bool) {
@@ -153,15 +148,24 @@ func determineUnionType(left, right *types.T, clauseTag string) *types.T {
 	}
 
 	if left.Equivalent(right) {
-		// Do a best-effort attempt to determine which type is "larger".
-		if left.Width() > right.Width() {
-			return left
-		}
+		// In the default case, use the left type.
+		src, tgt := right, left
 		if left.Width() < right.Width() {
-			return right
+			// If the right type is "larger", use it.
+			src, tgt = left, right
 		}
-		// In other cases, use the left type.
-		return left
+		if !cast.ValidCast(src, tgt, cast.ContextExplicit) {
+			// Error if no cast exists from src to tgt.
+			// TODO(#75103): For legacy reasons, we check for a valid cast in
+			// the most permissive context, cast.ContextExplicit. To be
+			// consistent with Postgres, we should check for a valid cast in the
+			// most restrictive context, cast.ContextImplicit.
+			panic(pgerror.Newf(
+				pgcode.DatatypeMismatch,
+				"%v types %s and %s cannot be matched", clauseTag, left, right,
+			))
+		}
+		return tgt
 	}
 	leftFam, rightFam := left.Family(), right.Family()
 
@@ -189,7 +193,7 @@ func determineUnionType(left, right *types.T, clauseTag string) *types.T {
 		return right
 	}
 
-	// TODO(radu): Postgres has more encompassing rules:
+	// TODO(#75103): Postgres has more encompassing rules:
 	// http://www.postgresql.org/docs/12/static/typeconv-union-case.html
 	panic(pgerror.Newf(
 		pgcode.DatatypeMismatch,
@@ -198,9 +202,11 @@ func determineUnionType(left, right *types.T, clauseTag string) *types.T {
 }
 
 // addCasts adds a projection to a scope, adding casts as necessary so that the
-// resulting columns have the given types.
+// resulting columns have the given types. This function assumes that there is a
+// valid cast from the column types in dst.cols to the corresponding types in
+// outTypes.
 func (b *Builder) addCasts(dst *scope, outTypes []*types.T) *scope {
-	expr := dst.expr.(memo.RelExpr)
+	expr := dst.expr
 	dstCols := dst.cols
 
 	dst = dst.push()

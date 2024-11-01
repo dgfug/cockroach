@@ -1,19 +1,15 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
 import "testing"
 
-func BenchmarkDropRole(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkDropRole(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("DropRole", []RoundTripBenchTestCase{
 		{
 			Name:  "drop 1 role",
 			Setup: "CREATE ROLE a",
@@ -29,13 +25,12 @@ func BenchmarkDropRole(b *testing.B) {
 			Setup: "CREATE ROLE a; CREATE ROLE b; CREATE ROLE c;",
 			Stmt:  "DROP ROLE a, b, c",
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }
 
-func BenchmarkDropTable(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkDropTable(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("DropTable", []RoundTripBenchTestCase{
 		{
 			Name:  "drop 1 table",
 			Setup: "CREATE TABLE t1()",
@@ -51,13 +46,12 @@ func BenchmarkDropTable(b *testing.B) {
 			Setup: "CREATE TABLE t1(); CREATE TABLE t2(); CREATE TABLE t3();",
 			Stmt:  "DROP TABLE t1,t2,t3",
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }
 
-func BenchmarkDropView(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkDropView(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("DropView", []RoundTripBenchTestCase{
 		{
 			Name:  "drop 1 view",
 			Setup: "CREATE TABLE t(x INT); CREATE VIEW vx1 AS SELECT x FROM t",
@@ -78,13 +72,12 @@ CREATE VIEW vx2 AS SELECT x FROM t;
 CREATE VIEW vx3 AS SELECT x FROM t;`,
 			Stmt: "DROP VIEW vx1,vx2,vx3",
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }
 
-func BenchmarkDropSequence(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkDropSequence(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("DropSequence", []RoundTripBenchTestCase{
 		{
 			Name:  "drop 1 sequence",
 			Setup: "CREATE SEQUENCE s",
@@ -100,13 +93,12 @@ func BenchmarkDropSequence(b *testing.B) {
 			Setup: "CREATE SEQUENCE s1; CREATE SEQUENCE s2; CREATE SEQUENCE s3;",
 			Stmt:  "DROP SEQUENCE s1,s2,s3",
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }
 
-func BenchmarkDropDatabase(b *testing.B) {
-	tests := []RoundTripBenchTestCase{
+func BenchmarkDropDatabase(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("DropDatabase", []RoundTripBenchTestCase{
 		{
 			Name: "drop database 0 tables",
 			Setup: `CREATE DATABASE d; 
@@ -137,7 +129,5 @@ CREATE TABLE t2();
 CREATE TABLE t3();`,
 			Stmt: "DROP DATABASE d",
 		},
-	}
-
-	RunRoundTripBenchmark(b, tests)
+	})
 }

@@ -1,16 +1,15 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package fuzzystrmatch
 
-import "testing"
+import (
+	crypto_rand "crypto/rand"
+	"math/rand"
+	"testing"
+)
 
 func TestSoundex(t *testing.T) {
 	tt := []struct {
@@ -39,11 +38,24 @@ func TestSoundex(t *testing.T) {
 		},
 		{
 			Source:   "🌞",
-			Expected: "000",
+			Expected: "",
 		},
 		{
 			Source:   "😄 🐃 🐯 🕣 💲 🏜 👞 🔠 🌟 📌",
 			Expected: "",
+		},
+		{
+			Source:   "zażółćx",
+			Expected: "Z200",
+		},
+		{
+			Source:   "K😋",
+			Expected: "K000",
+		},
+		// Regression test for #82640, just ensure we don't panic.
+		{
+			Source:   "l�qă�_��",
+			Expected: "L200",
 		},
 	}
 
@@ -53,6 +65,16 @@ func TestSoundex(t *testing.T) {
 			t.Fatalf("error convert string to its Soundex code with source=%q"+
 				" expected %s got %s", tc.Source, tc.Expected, got)
 		}
+	}
+
+	// Run some random test cases to make sure we don't panic.
+
+	for i := 0; i < 1000; i++ {
+		l := rand.Int31n(10)
+		b := make([]byte, l)
+		_, _ = crypto_rand.Read(b)
+
+		soundex(string(b))
 	}
 }
 

@@ -1,51 +1,42 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package localcluster
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	gosql "database/sql"
 	"fmt"
 	"go/build"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/gogo/protobuf/proto"
@@ -242,8 +233,8 @@ func (c *Cluster) joins() []string {
 			})
 		}
 	}
-	sort.Slice(joins, func(i, j int) bool {
-		return joins[i].seq < joins[j].seq
+	slices.SortFunc(joins, func(a, b addrAndSeq) int {
+		return cmp.Compare(a.seq, b.seq)
 	})
 
 	if len(joins) == 0 {
@@ -268,18 +259,12 @@ func (c *Cluster) RPCPort(nodeIdx int) string {
 }
 
 func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*Node, <-chan error) {
-	baseCtx := &base.Config{
-		User:     security.NodeUserName(),
-		Insecure: true,
-	}
-	rpcCtx := rpc.NewContext(rpc.ContextOptions{
-		TenantID:   roachpb.SystemTenantID,
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Config:     baseCtx,
-		Clock:      hlc.NewClock(hlc.UnixNano, 0),
-		Stopper:    c.stopper,
-		Settings:   cluster.MakeTestingClusterSettings(),
-	})
+	opts := rpc.DefaultContextOptions()
+	opts.Insecure = true
+	opts.Stopper = c.stopper
+	opts.Settings = cluster.MakeTestingClusterSettings()
+	opts.ClientOnly = true
+	rpcCtx := rpc.NewContext(ctx, opts)
 
 	n := &Node{
 		Cfg:    cfg,
@@ -483,7 +468,7 @@ func (n *Node) Alive() bool {
 }
 
 // StatusClient returns a StatusClient set up to talk to this node.
-func (n *Node) StatusClient() serverpb.StatusClient {
+func (n *Node) StatusClient(ctx context.Context) serverpb.StatusClient {
 	n.Lock()
 	existingClient := n.statusClient
 	n.Unlock()
@@ -492,7 +477,7 @@ func (n *Node) StatusClient() serverpb.StatusClient {
 		return existingClient
 	}
 
-	conn, _, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
+	conn, err := n.rpcCtx.GRPCUnvalidatedDial(n.RPCAddr(), roachpb.Locality{}).Connect(ctx)
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize status client: %s", err)
 	}
@@ -666,7 +651,7 @@ func (n *Node) httpAddrFile() string {
 }
 
 func readFileOrEmpty(f string) string {
-	c, err := ioutil.ReadFile(f)
+	c, err := os.ReadFile(f)
 	if err != nil {
 		if !oserror.IsNotExist(err) {
 			panic(err)
@@ -712,7 +697,7 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 			return nil
 		}
 
-		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
+		urlBytes, err := os.ReadFile(n.listeningURLFile())
 		if err != nil {
 			log.Infof(ctx, "%v", err)
 			continue
@@ -726,15 +711,19 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 		}
 
 		if n.Cfg.RPCPort == 0 {
-			n.Lock()
-			n.rpcPort = pgURL.Port()
-			n.Unlock()
+			func() {
+				n.Lock()
+				defer n.Unlock()
+				n.rpcPort = pgURL.Port()
+			}()
 		}
 
 		pgURL.Path = n.Cfg.DB
-		n.Lock()
-		n.pgURL = pgURL.String()
-		n.Unlock()
+		func() {
+			n.Lock()
+			defer n.Unlock()
+			n.pgURL = pgURL.String()
+		}()
 
 		var uiURL *url.URL
 
@@ -748,9 +737,11 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 		//
 		// This can be improved by making the below code run opportunistically whenever the
 		// http port is required but isn't initialized yet.
-		n.Lock()
-		n.db = makeDB(n.pgURL, n.Cfg.NumWorkers, n.Cfg.DB)
-		n.Unlock()
+		func() {
+			n.Lock()
+			defer n.Unlock()
+			n.db = makeDB(n.pgURL, n.Cfg.NumWorkers, n.Cfg.DB)
+		}()
 
 		{
 			var uiStr string

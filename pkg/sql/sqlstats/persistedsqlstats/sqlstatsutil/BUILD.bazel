@@ -12,14 +12,16 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/sql/appstatspb",
         "//pkg/sql/sem/tree",
         "//pkg/util/encoding",
         "//pkg/util/json",
         "//pkg/util/timeutil",
-        "@com_github_cockroachdb_apd_v2//:apd",
+        "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_text//cases",
+        "@org_golang_x_text//language",
     ],
 )
 
@@ -28,7 +30,7 @@ go_test(
     srcs = ["json_encoding_test.go"],
     embed = [":sqlstatsutil"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/sql/appstatspb",
         "//pkg/util/json",
         "//pkg/util/leaktest",
         "//pkg/util/log",

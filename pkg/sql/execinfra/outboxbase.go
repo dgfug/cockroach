@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfra
 
@@ -40,11 +35,11 @@ type Dialer interface {
 // user, since the receiver at the other end will hang for
 // SettingFlowStreamTimeout waiting for a successful connection attempt.
 func GetConnForOutbox(
-	ctx context.Context, dialer Dialer, nodeID roachpb.NodeID, timeout time.Duration,
+	ctx context.Context, dialer Dialer, sqlInstanceID base.SQLInstanceID, timeout time.Duration,
 ) (conn *grpc.ClientConn, err error) {
 	firstConnectionAttempt := timeutil.Now()
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
-		conn, err = dialer.DialNoBreaker(ctx, nodeID, rpc.DefaultClass)
+		conn, err = dialer.DialNoBreaker(ctx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
 		if err == nil || timeutil.Since(firstConnectionAttempt) > timeout {
 			break
 		}

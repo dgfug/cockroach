@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,11 +9,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
@@ -43,32 +37,16 @@ func (n *controlJobsNode) FastPathResults() (int, bool) {
 }
 
 func (n *controlJobsNode) startExec(params runParams) error {
-	userIsAdmin, err := params.p.HasAdminRole(params.ctx)
-	if err != nil {
-		return err
-	}
-
-	// users can pause/resume/cancel jobs owned by non-admin users
-	// if they have CONTROLJOBS privilege.
-	if !userIsAdmin {
-		hasControlJob, err := params.p.HasRoleOption(params.ctx, roleoption.CONTROLJOB)
-		if err != nil {
-			return err
-		}
-
-		if !hasControlJob {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s privilege",
-				params.p.User(), roleoption.CONTROLJOB)
-		}
-	}
-
 	if n.desiredStatus != jobs.StatusPaused && len(n.reason) > 0 {
 		return errors.AssertionFailedf("status %v is not %v and thus does not support a reason %v",
 			n.desiredStatus, jobs.StatusPaused, n.reason)
 	}
 
 	reg := params.p.ExecCfg().JobRegistry
+	globalPrivileges, err := jobsauth.GetGlobalJobPrivileges(params.ctx, params.p)
+	if err != nil {
+		return err
+	}
 	for {
 		ok, err := n.rows.Next(params)
 		if err != nil {
@@ -88,41 +66,26 @@ func (n *controlJobsNode) startExec(params runParams) error {
 			return errors.AssertionFailedf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
 		}
 
-		job, err := reg.LoadJobWithTxn(params.ctx, jobspb.JobID(jobID), params.p.Txn())
-		if err != nil {
-			return err
-		}
-
-		if job != nil {
-			owner := job.Payload().UsernameProto.Decode()
-
-			if !userIsAdmin {
-				ok, err := params.p.UserHasAdminRole(params.ctx, owner)
-				if err != nil {
+		if err := reg.UpdateJobWithTxn(params.ctx, jobspb.JobID(jobID), params.p.InternalSQLTxn(),
+			func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				if err := jobsauth.Authorize(params.ctx, params.p,
+					md.ID, md.Payload, jobsauth.ControlAccess, globalPrivileges); err != nil {
 					return err
 				}
-
-				// Owner is an admin but user executing the statement is not.
-				if ok {
-					return pgerror.Newf(pgcode.InsufficientPrivilege,
-						"only admins can control jobs owned by other admins")
+				switch n.desiredStatus {
+				case jobs.StatusPaused:
+					return ju.PauseRequested(params.ctx, txn, md, n.reason)
+				case jobs.StatusRunning:
+					return ju.Unpaused(params.ctx, md)
+				case jobs.StatusCanceled:
+					return ju.CancelRequested(params.ctx, md)
+				default:
+					return errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
 				}
-			}
-		}
-
-		switch n.desiredStatus {
-		case jobs.StatusPaused:
-			err = reg.PauseRequested(params.ctx, params.p.txn, jobspb.JobID(jobID), n.reason)
-		case jobs.StatusRunning:
-			err = reg.Unpause(params.ctx, params.p.txn, jobspb.JobID(jobID))
-		case jobs.StatusCanceled:
-			err = reg.CancelRequested(params.ctx, params.p.txn, jobspb.JobID(jobID))
-		default:
-			err = errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
-		}
-		if err != nil {
+			}); err != nil {
 			return err
 		}
+
 		n.numRows++
 	}
 	switch n.desiredStatus {

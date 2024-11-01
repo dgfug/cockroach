@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldata
 
@@ -18,21 +13,26 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
+// Use double of the max inline length so that we get a mix of inlinable and
+// non-inlinable values.
+const testMaxElementLength = BytesMaxInlineLength * 2
+
 type bytesMethod int
 
 const (
 	set bytesMethod = iota
 	window
+	copyMethod
 	copySlice
 	appendSlice
-	appendVal
+	appendSliceWithSel
 )
 
 func (m bytesMethod) String() string {
@@ -41,18 +41,20 @@ func (m bytesMethod) String() string {
 		return "Set"
 	case window:
 		return "Window"
+	case copyMethod:
+		return "copy"
 	case copySlice:
 		return "CopySlice"
 	case appendSlice:
 		return "AppendSlice"
-	case appendVal:
-		return "AppendVal"
+	case appendSliceWithSel:
+		return "appendSliceWithSel"
 	default:
 		panic(fmt.Sprintf("unknown bytes method %d", m))
 	}
 }
 
-var bytesMethods = []bytesMethod{set, window, copySlice, appendSlice, appendVal}
+var bytesMethods = []bytesMethod{set, window, copyMethod, copySlice, appendSlice, appendSliceWithSel}
 
 // applyMethodsAndVerify applies the given methods on b1 and a reference
 // [][]byte implementation and checks if the results are equal. If
@@ -86,13 +88,8 @@ func applyMethodsAndVerify(
 		debugString += m.String()
 		switch m {
 		case set:
-			// Can only Set starting from maxSetLength - 1 (or zero if maxSetLength is
-			// zero).
-			i := b1.maxSetLength - 1 + rng.Intn(b1.Len()-(b1.maxSetLength-1))
-			if i < 0 {
-				i = 0
-			}
-			new := make([]byte, rng.Intn(16))
+			i := rng.Intn(n)
+			new := make([]byte, rng.Intn(testMaxElementLength))
 			rng.Read(new)
 			debugString += fmt.Sprintf("(%d, %v)", i, new)
 			b1.Set(i, new)
@@ -106,9 +103,6 @@ func applyMethodsAndVerify(
 			debugString += fmt.Sprintf("(%d, %d)", start, end)
 			b1Window := b1.Window(start, end)
 			b2Window := b2[start:end]
-			// b1Window is not allowed to be modified, so we check explicitly whether
-			// it equals the reference, and we do not update b1 and b2.
-			b1Window.AssertOffsetsAreNonDecreasing(b1Window.Len())
 			debugString += fmt.Sprintf("\n%s\n", b1Window)
 			if err := verifyEqual(b1Window, b2Window); err != nil {
 				return errors.Wrapf(err,
@@ -116,6 +110,12 @@ func applyMethodsAndVerify(
 					debugString, b1Window.String(), prettyByteSlice(b2Window))
 			}
 			continue
+		case copyMethod:
+			destIdx := rng.Intn(n)
+			srcIdx := rng.Intn(sourceN)
+			debugString += fmt.Sprintf("(%d, %d)", destIdx, srcIdx)
+			b1.Copy(b1Source, destIdx, srcIdx)
+			b2[destIdx] = append([]byte(nil), b2Source[srcIdx]...)
 		case copySlice, appendSlice:
 			// Generate a length-inclusive destIdx.
 			destIdx := rng.Intn(n + 1)
@@ -136,10 +136,6 @@ func applyMethodsAndVerify(
 			} else {
 				b1.AppendSlice(b1Source, destIdx, srcStartIdx, srcEndIdx)
 				b2 = append(b2[:destIdx], b2Source[srcStartIdx:srcEndIdx]...)
-				if selfReferencingSources {
-					b1Source = b1
-					b2Source = b2
-				}
 				numNewVals = srcEndIdx - srcStartIdx
 			}
 			// Deep copy the copied/appended byte slices.
@@ -147,12 +143,25 @@ func applyMethodsAndVerify(
 			for i := range b2Slice {
 				b2Slice[i] = append([]byte(nil), b2Slice[i]...)
 			}
-		case appendVal:
-			v := make([]byte, 16)
-			rng.Read(v)
-			debugString += fmt.Sprintf("(%v)", v)
-			b1.AppendVal(v)
-			b2 = append(b2, v)
+		case appendSliceWithSel:
+			// Generate a length-inclusive destIdx.
+			destIdx := rng.Intn(n + 1)
+			var sel []int
+			for i := 0; i < sourceN; i++ {
+				if rng.Float64() < 0.5 {
+					sel = append(sel, i)
+				}
+			}
+			// Make sure that the length never becomes zero.
+			if destIdx == 0 && len(sel) == 0 {
+				sel = []int{rng.Intn(sourceN)}
+			}
+			debugString += fmt.Sprintf("(%d, %v)", destIdx, sel)
+			b1.appendSliceWithSel(b1Source, destIdx, sel)
+			b2 = append([][]byte(nil), b2[:destIdx]...)
+			for _, srcIdx := range sel {
+				b2 = append(b2, append([]byte(nil), b2Source[srcIdx]...))
+			}
 			if selfReferencingSources {
 				b1Source = b1
 				b2Source = b2
@@ -160,12 +169,11 @@ func applyMethodsAndVerify(
 		default:
 			return errors.Errorf("unknown method name: %s", m)
 		}
-		b1.AssertOffsetsAreNonDecreasing(b1.Len())
 		debugString += fmt.Sprintf("\n%s\n", b1)
 		if err := verifyEqual(b1, b2); err != nil {
 			return errors.Wrapf(err,
-				"\ndebugString:\n%s\nflat (maxSetLength=%d):\n%s\nreference:\n%s",
-				debugString, b1.maxSetLength, b1.String(), prettyByteSlice(b2))
+				"\ndebugString:\n%s\nflat:\n%s\nreference:\n%s",
+				debugString, b1.String(), prettyByteSlice(b2))
 		}
 	}
 	return nil
@@ -203,16 +211,24 @@ func TestBytesRefImpl(t *testing.T) {
 		maxLength        = 16
 		nRuns            = 100
 	)
+	v := make([]byte, testMaxElementLength)
+	var flat *Bytes
 
 	for nRun := 0; nRun < nRuns; nRun++ {
 		n := 1 + rng.Intn(maxLength)
 
-		flat := NewBytes(n)
+		if flat != nil && cap(flat.elements) >= n && rng.Float64() < 0.5 {
+			// If the flat vector is large enough, reuse it with 50% chance.
+			flat.Reset()
+			flat.elements = flat.elements[:n]
+		} else {
+			flat = NewBytes(n)
+		}
 		reference := make([][]byte, n)
 		for i := 0; i < n; i++ {
-			v := make([]byte, rng.Intn(16))
+			v = v[:rng.Intn(testMaxElementLength)]
 			rng.Read(v)
-			flat.Set(i, append([]byte(nil), v...))
+			flat.Set(i, v)
 			reference[i] = append([]byte(nil), v...)
 		}
 
@@ -223,13 +239,13 @@ func TestBytesRefImpl(t *testing.T) {
 		selfReferencingSources := true
 		if rng.Float64() < 0.5 {
 			selfReferencingSources = false
-			sourceN := 1 + rng.Intn(maxLength)
+			sourceN := 1 + rng.Intn(testMaxElementLength)
 			flatSource = NewBytes(sourceN)
 			referenceSource = make([][]byte, sourceN)
 			for i := 0; i < sourceN; i++ {
-				v := make([]byte, rng.Intn(16))
+				v = v[:rng.Intn(testMaxElementLength)]
 				rng.Read(v)
-				flatSource.Set(i, append([]byte(nil), v...))
+				flatSource.Set(i, v)
 				referenceSource[i] = append([]byte(nil), v...)
 			}
 		}
@@ -241,7 +257,15 @@ func TestBytesRefImpl(t *testing.T) {
 		numCalls := 1 + rng.Intn(maxNumberOfCalls)
 		methods := make([]bytesMethod, 0, numCalls)
 		for i := 0; i < numCalls; i++ {
-			methods = append(methods, bytesMethods[rng.Intn(len(bytesMethods))])
+			m := bytesMethods[rng.Intn(len(bytesMethods))]
+			if selfReferencingSources {
+				// appendSlice and appendSliceWithSel are not supported with
+				// self-referencing sources.
+				for m == appendSlice || m == appendSliceWithSel {
+					m = bytesMethods[rng.Intn(len(bytesMethods))]
+				}
+			}
+			methods = append(methods, m)
 		}
 		if err := applyMethodsAndVerify(rng, flat, flatSource, reference, referenceSource, methods, selfReferencingSources); err != nil {
 			t.Logf("nRun = %d\n", nRun)
@@ -254,49 +278,28 @@ func TestBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	t.Run("Simple", func(t *testing.T) {
-		b1 := NewBytes(0)
-		b1.AppendVal([]byte("hello"))
+		b1 := NewBytes(2)
+		b1.Set(0, []byte("hello"))
 		require.Equal(t, "hello", string(b1.Get(0)))
-		b1.AppendVal(nil)
+		b1.Set(1, nil)
 		require.Equal(t, []byte{}, b1.Get(1))
 		require.Equal(t, 2, b1.Len())
-		// Verify that we cannot overwrite a value.
-		require.Panics(
-			t,
-			func() { b1.Set(0, []byte("not allowed")) },
-			"should be unable to overwrite value",
-		)
-
-		// However, it is legal to overwrite the last value.
-		b1.Set(1, []byte("ok"))
-
-		// If we Reset the Bytes, we can Set any index.
-		b1.Reset()
-		b1.Set(1, []byte("new usage"))
-		// But not an index before that.
-		require.Panics(
-			t,
-			func() { b1.Set(0, []byte("still not allowed")) },
-			"should be unable to overwrite value",
-		)
-
-		// Same with Reset.
-		b1.Reset()
-		b1.Set(1, []byte("reset new usage"))
 	})
 
 	t.Run("Append", func(t *testing.T) {
-		b1 := NewBytes(0)
-		b2 := NewBytes(0)
-		b2.AppendVal([]byte("source bytes value"))
-		b1.AppendVal([]byte("one"))
-		b1.AppendVal([]byte("two"))
+		b1 := NewBytes(2)
+		b2 := NewBytes(1)
+		b2.Set(0, []byte("source bytes value"))
+		b1.Set(0, []byte("one"))
+		b1.Set(1, []byte("two"))
 		// Truncate b1.
 		require.Equal(t, 2, b1.Len())
 		b1.AppendSlice(b2, 0, 0, 0)
 		require.Equal(t, 0, b1.Len())
 
-		b1.AppendVal([]byte("hello again"))
+		// Modify the vector so that it has one element.
+		b1.elements = b1.elements[:1]
+		b1.Set(0, []byte("hello again"))
 
 		// Try appending b2 3 times. The first time will overwrite the current
 		// present value in b1.
@@ -308,10 +311,10 @@ func TestBytes(t *testing.T) {
 			}
 		}
 
-		b2 = NewBytes(0)
-		b2.AppendVal([]byte("hello again"))
-		b2.AppendVal([]byte("hello again"))
-		b2.AppendVal([]byte("hello again"))
+		b2 = NewBytes(3)
+		b2.Set(0, []byte("hello again"))
+		b2.Set(1, []byte("hello again"))
+		b2.Set(2, []byte("hello again"))
 		// Try to append only a subset of the source keeping the first element of
 		// b1 intact.
 		b1.AppendSlice(b2, 1, 1, 2)
@@ -320,33 +323,15 @@ func TestBytes(t *testing.T) {
 		require.Equal(t, "hello again", string(b1.Get(1)))
 	})
 
-	t.Run("AppendZeroSlice", func(t *testing.T) {
-		// This test makes sure that b.maxSetIndex is updated correctly when we
-		// create a long flat bytes vector but not set all the values and then
-		// truncate the vector. The expected behavior is that offsets must be
-		// backfilled, and once a new value is appended, it should be
-		// retrievable.
-		b := NewBytes(5)
-		b.Set(0, []byte("zero"))
-		require.Equal(t, 5, b.Len())
-		b.AppendSlice(b, 3, 0, 0)
-		require.Equal(t, 3, b.Len())
-		b.AppendVal([]byte("three"))
-		require.Equal(t, 4, b.Len())
-		require.Equal(t, "zero", string(b.Get(0)))
-		require.Equal(t, "three", string(b.Get(3)))
-		b.AssertOffsetsAreNonDecreasing(b.Len())
-	})
-
 	t.Run("Copy", func(t *testing.T) {
-		b1 := NewBytes(0)
-		b2 := NewBytes(0)
-		b1.AppendVal([]byte("one"))
-		b1.AppendVal([]byte("two"))
-		b1.AppendVal([]byte("three"))
+		b1 := NewBytes(3)
+		b2 := NewBytes(2)
+		b1.Set(0, []byte("one"))
+		b1.Set(1, []byte("two"))
+		b1.Set(2, []byte("three"))
 
-		b2.AppendVal([]byte("source one"))
-		b2.AppendVal([]byte("source two"))
+		b2.Set(0, []byte("source one"))
+		b2.Set(1, []byte("source two"))
 
 		// Copy "source two" into "two"'s position. This also tests that elements
 		// following the copied element are correctly shifted.
@@ -366,8 +351,7 @@ func TestBytes(t *testing.T) {
 
 		// Set the length to 1 and follow it with testing a full overwrite of
 		// only one element.
-		b1.offsets = b1.offsets[:2]
-		b1.maxSetLength = 1
+		b1.elements = b1.elements[:1]
 		require.Equal(t, 1, b1.Len())
 		b1.CopySlice(b2, 0, 0, b2.Len())
 		require.Equal(t, 1, b1.Len())
@@ -380,10 +364,10 @@ func TestBytes(t *testing.T) {
 	})
 
 	t.Run("Window", func(t *testing.T) {
-		b1 := NewBytes(0)
-		b1.AppendVal([]byte("one"))
-		b1.AppendVal([]byte("two"))
-		b1.AppendVal([]byte("three"))
+		b1 := NewBytes(3)
+		b1.Set(0, []byte("one"))
+		b1.Set(1, []byte("two"))
+		b1.Set(2, []byte("three"))
 
 		w := b1.Window(0, 3)
 		require.NotEqual(t, unsafe.Pointer(b1), unsafe.Pointer(w), "Bytes.Window should create a new object")
@@ -392,18 +376,18 @@ func TestBytes(t *testing.T) {
 		require.Equal(t, "two", string(b1.Get(1)))
 		require.Equal(t, "two", string(b2.Get(0)))
 
-		require.Panics(t, func() { b2.AppendVal([]byte("four")) }, "appending to the window into b1 should have panicked")
+		require.Panics(t, func() { b2.Set(0, []byte("four")) }, "modifying the window into b1 should have panicked")
 	})
 
 	t.Run("String", func(t *testing.T) {
-		b1 := NewBytes(0)
+		b1 := NewBytes(3)
 		vals := [][]byte{
 			[]byte("one"),
 			[]byte("two"),
 			[]byte("three"),
 		}
 		for i := range vals {
-			b1.AppendVal(vals[i])
+			b1.Set(i, vals[i])
 		}
 
 		// The values should be printed using the String function.
@@ -424,33 +408,6 @@ func TestBytes(t *testing.T) {
 				strings.Contains(b2String, fmt.Sprint(vals[1])) &&
 				strings.Contains(b2String, fmt.Sprint(vals[2])),
 		)
-	})
-
-	t.Run("InvariantSimple", func(t *testing.T) {
-		b1 := NewBytes(8)
-		b1.Set(0, []byte("zero"))
-		other := b1.Window(0, 2)
-		other.AssertOffsetsAreNonDecreasing(2)
-
-		b2 := NewBytes(8)
-		b2.Set(0, []byte("zero"))
-		b2.Set(2, []byte("two"))
-		other = b2.Window(0, 4)
-		other.AssertOffsetsAreNonDecreasing(4)
-	})
-
-	t.Run("Truncate", func(t *testing.T) {
-		b := NewBytes(8)
-		b.Set(4, []byte("foo"))
-		require.Equal(t, 5, b.maxSetLength)
-		require.Panics(t, func() { b.Set(1, []byte("bar")) })
-		b.Truncate(1)
-		require.Equal(t, 1, b.maxSetLength)
-		require.NotPanics(t, func() { b.Set(1, []byte("baz")) })
-		require.Equal(t, 2, b.maxSetLength)
-		b.Truncate(0)
-		require.Equal(t, 0, b.maxSetLength)
-		require.NotPanics(t, func() { b.Set(4, []byte("deadbeef")) })
 	})
 
 	t.Run("Abbreviated", func(t *testing.T) {
@@ -481,13 +438,48 @@ func TestBytes(t *testing.T) {
 			}
 		}
 	})
+
+	// AppendSliceWithReset verifies that reusing the old non-inlined value
+	// (that is past the length of the elements slice) doesn't lead to a
+	// corruption.
+	t.Run("AppendSliceWithReset", func(t *testing.T) {
+		// Operate only with large values that are not inlined.
+		v0 := make([]byte, 2*BytesMaxInlineLength)
+		shortV0 := v0[:BytesMaxInlineLength+1]
+		v1 := make([]byte, 2*BytesMaxInlineLength)
+		for i := range v1 {
+			v1[i] = 1
+		}
+
+		b := NewBytes(2)
+		b2 := NewBytes(1)
+		b.Set(0, shortV0)
+		b.Set(1, v1)
+		b.Set(0, v0)
+
+		// Now b.buffer = shortV0 | v1 | v0.
+
+		// Truncate b to length 1.
+		b.AppendSlice(b2, 1, 0, 0)
+
+		b.Reset()
+		b.Set(0, v0)
+		b2.Set(0, v1)
+
+		// Here is the meat of the test - if b.elements[1] has not been properly
+		// reset, then it could reuse the old non-inlined value in the buffer
+		// corrupting the value of v0.
+		b.AppendSlice(b2, 1 /* destIdx */, 0 /* srcStartIdx */, 1 /* srcEndIdx */)
+		require.Equal(t, v0, b.Get(0))
+		require.Equal(t, v1, b.Get(1))
+	})
 }
 
 func TestProportionalSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// Use a large value so that the bytes vector needs to expand.
-	value := make([]byte, 3*BytesInitialAllocationFactor)
+	// Use a large value so that elements are not inlined.
+	value := make([]byte, 3*BytesMaxInlineLength)
 
 	rng, _ := randutil.NewTestRand()
 	// We need a number divisible by 4.
@@ -513,12 +505,12 @@ func TestProportionalSize(t *testing.T) {
 
 const letters = "abcdefghijklmnopqrstuvwxyz"
 
-func TestToArrowSerializationFormat(t *testing.T) {
+func TestArrowConversion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rng, _ := randutil.NewTestRand()
 	nullChance := 0.2
-	maxStringLength := 10
+	maxStringLength := BytesMaxInlineLength * 2
 	numElements := 1 + rng.Intn(BatchSize())
 
 	b := NewBytes(numElements)
@@ -526,22 +518,27 @@ func TestToArrowSerializationFormat(t *testing.T) {
 		if rng.Float64() < nullChance {
 			continue
 		}
-		element := []byte(randgen.RandString(rng, 1+rng.Intn(maxStringLength), letters))
+		element := []byte(util.RandString(rng, 1+rng.Intn(maxStringLength), letters))
 		b.Set(i, element)
 	}
-	// We have to call this in case there are trailing nulls.
-	b.UpdateOffsetsToBeNonDecreasing(numElements)
 
-	startIdx := rng.Intn(numElements)
-	endIdx := startIdx + rng.Intn(numElements-startIdx)
-	if endIdx == startIdx {
-		endIdx++
+	source := b
+	if rng.Float64() < 0.5 {
+		// Sometimes use a window into Bytes to increase test coverage.
+		startIdx := rng.Intn(numElements)
+		endIdx := startIdx + rng.Intn(numElements-startIdx)
+		if endIdx == startIdx {
+			endIdx++
+		}
+		source = b.Window(startIdx, endIdx)
 	}
-	wind := b.Window(startIdx, endIdx)
+	n := source.Len()
 
-	data, offsets := wind.ToArrowSerializationFormat(wind.Len())
+	var data []byte
+	var offsets []int32
+	data, offsets = source.Serialize(n, data, offsets)
 
-	require.Equal(t, wind.Len(), len(offsets)-1)
+	require.Equal(t, n, len(offsets)-1)
 	require.Equal(t, int32(0), offsets[0])
 	require.Equal(t, len(data), int(offsets[len(offsets)-1]))
 
@@ -550,39 +547,26 @@ func TestToArrowSerializationFormat(t *testing.T) {
 		require.GreaterOrEqualf(t, offsets[i], offsets[i-1], "unexpectedly found decreasing offsets: %v", offsets)
 	}
 
-	// Verify that the data contains the correct values.
-	for i := 0; i < len(offsets)-1; i++ {
-		element := data[offsets[i]:offsets[i+1]]
-		require.Equal(t, wind.Get(i), element)
+	converted := NewBytes(n)
+	if rng.Float64() < 0.5 {
+		// Make a copy sometimes to simulate data and offsets being sent across
+		// the wire.
+		data = append([]byte(nil), data...)
+		offsets = append([]int32(nil), offsets...)
 	}
-}
-
-func TestForRegressions(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	t.Run("Regression test for #42054", func(t *testing.T) {
-		b := NewBytes(4)
-		b.Set(0, []byte("zero"))
-		b.Set(1, []byte("one"))
-		b.Set(2, []byte("two"))
-
-		// Emulate copying when the first two values are null and the last is
-		// non-null.
-		b.Reset()
-		b.Set(2, []byte("three"))
-		b.AssertOffsetsAreNonDecreasing(2)
-
-		b.Reset()
-		b.Set(0, []byte("zero"))
-		b.Set(1, []byte("one"))
-		b.Set(2, []byte("two"))
-		b.Set(3, []byte("three"))
-
-		// Emulate copying when the first and last values are non-null, and the
-		// middle two are null.
-		b.Reset()
-		b.Set(0, []byte("zero"))
-		b.Set(3, []byte("four"))
-		b.AssertOffsetsAreNonDecreasing(3)
-	})
+	converted.Deserialize(data, offsets)
+	// Verify that the data contains the correct values.
+	for i := 0; i < n; i++ {
+		expected, actual := source.Get(i), converted.Get(i)
+		// When values are NULL or zero-length, they can have different
+		// representations ([]byte{nil} and []byte{}), so we convert both to the
+		// former.
+		if len(expected) == 0 {
+			expected = nil
+		}
+		if len(actual) == 0 {
+			actual = nil
+		}
+		require.Equal(t, expected, actual)
+	}
 }

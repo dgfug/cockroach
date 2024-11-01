@@ -1,128 +1,109 @@
 #!/usr/bin/env bash
 
-# This script may be used to produce a branch bumping the Pebble
-# version. The storage team bumps CockroachDB's Pebble dependency
-# frequently, and this script automates some of that work.
+# Copyright 2021 The Cockroach Authors.
 #
-# To bump the master branch's Pebble dependency to the current pebble
-# repository's master branch HEAD, run:
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
+# NOTE: After a new release has been cut, update this to the appropriate
+# Cockroach branch name (i.e. release-23.2, etc.), and corresponding Pebble
+# branch name (e.g. crl-release-23.2, etc.). Also update pebble nightly scripts
+# in build/teamcity/cockroach/nightlies to use `@crl-release-xy.z` instead of
+# `@master`.
+BRANCH=master
+PEBBLE_BRANCH=master
+
+# This script may be used to produce a branch bumping the Pebble version. The
+# storage team bumps CockroachDB's Pebble dependency frequently, and this script
+# automates some of that work.
 #
-#   ./scripts/bump-pebble.sh master
+# To bump the Pebble dependency to the corresponding pebble branch HEAD, run:
 #
-# If you'd like to bump the Pebble version in a release branch, pass the
-# release branch name as the sole argument. The script expects there to
-# exist a corresponding branch on the Pebble repository, prefixed with
-# 'crl-'. To bump the `release-21.1` branch's Pebble version, run:
+#   ./scripts/bump-pebble.sh [<pebble-sha>]
 #
-#   ./scripts/bump-pebble.sh release-21.1
+# If <pebble-sha> is not provided, the latest sha on $PEBBLE_BRANCH is used.
 #
-# This command will construct a pull request bumping the Pebble version
-# to the current HEAD of the `crl-release-21.1` Pebble branch on the
-# Pebble repository.
+# The script must be run from the cockroach repo root, and the repo should be up
+# to date. If $BRANCH is checked out, the script first creates a new branch and
+# checks it out. Otherwise, the current branch is used.
 
 set -euo pipefail
 
-echoerr() { printf "%s\n" "$*" >&2; }
 pushd() { builtin pushd "$@" > /dev/null; }
 popd() { builtin popd "$@" > /dev/null; }
 
-BRANCH=${1}
-PEBBLE_BRANCH=${BRANCH}
-if [ "$BRANCH" != "master" ]; then
-    PEBBLE_BRANCH="crl-$BRANCH"
-fi
-COCKROACH_DIR="$(go env GOPATH)/src/github.com/cockroachdb/cockroach"
-PEBBLE_DIR="$(go env GOPATH)/src/github.com/cockroachdb/pebble"
-VENDORED_DIR="$COCKROACH_DIR/vendor"
-
-# Make sure that the cockroachdb remotes match what we expect. The
-# `upstream` remote must point to github.com/cockroachdb/cockroach.
-pushd "$COCKROACH_DIR"
-git submodule update --init --recursive
-set +e
-COCKROACH_UPSTREAM_URL="$(git config --get remote.upstream.url)"
-set -e
-if [ "$COCKROACH_UPSTREAM_URL" != "git@github.com:cockroachdb/cockroach.git" ]; then
-    echoerr "Error: Expected the upstream remote to be the primary cockroachdb repository"
-    echoerr "at git@github.com:cockroachdb/cockroach.git. Found:"
-    echoerr ""
-    echoerr "  $COCKROACH_UPSTREAM_URL"
-    echoerr ""
-    exit 1
-fi
-popd
-
-# Make sure that the cockroachdb remotes match what we expect. The
-# `upstream` remote must point to github.com/cockroachdb/pebble.
-pushd "$PEBBLE_DIR"
-set +e
-PEBBLE_UPSTREAM_URL="$(git config --get remote.upstream.url)"
-set -e
-if [ "$PEBBLE_UPSTREAM_URL" != "git@github.com:cockroachdb/pebble.git" ]; then
-    echoerr "Error: Expected the upstream remote to be the cockroachdb/pebble repository"
-    echoerr "at git@github.com:cockroachdb/pebble.git. Found:"
-    echoerr ""
-    echoerr "  $PEBBLE_UPSTREAM_URL"
-    echoerr ""
-    exit 1
-fi
-popd
-
-# Ensure the local CockroachDB release branch is up-to-date with
-# upstream and grab the current Pebble SHA.
-pushd "$COCKROACH_DIR"
-git fetch upstream "$BRANCH"
-git checkout "$BRANCH"
-git rebase "upstream/$BRANCH"
+# Grab the current Pebble SHA.
 OLD_SHA=$(grep 'github.com/cockroachdb/pebble' go.mod | grep -o -E '[a-f0-9]{12}$')
-popd
+echo "Current pebble SHA: $OLD_SHA"
 
-# Ensure the local Pebble release branch is up-to-date with upstream,
-# and grab the desired Pebble SHA.
+git submodule update --init --recursive
+
+PEBBLE_UPSTREAM_URL="https://github.com/cockroachdb/pebble.git"
+
+# Check out the pebble repo in a temporary directory.
+PEBBLE_DIR=$(mktemp -d)
+trap "rm -rf $PEBBLE_DIR" EXIT
+
+echo
+git clone --no-checkout "$PEBBLE_UPSTREAM_URL" "$PEBBLE_DIR"
+echo
+
 pushd "$PEBBLE_DIR"
-git fetch upstream "$PEBBLE_BRANCH"
-NEW_SHA=$(git rev-parse "upstream/$PEBBLE_BRANCH")
-COMMITS=$(git log --pretty='format:%h %s' "$OLD_SHA..$NEW_SHA" | grep -v 'Merge pull request')
-echo "$COMMITS"
+if [ -z "${1-}" ]; then
+  # Use the latest commit in the correct branch.
+  NEW_SHA=$(git rev-parse "origin/$PEBBLE_BRANCH")
+  echo "Using latest pebble $PEBBLE_BRANCH SHA $NEW_SHA"
+else
+  NEW_SHA=$(git rev-parse "$1")
+  # Verify that the given commit is in the correct pebble branch.
+  if ! git merge-base --is-ancestor $NEW_SHA "origin/$PEBBLE_BRANCH"; then
+    echo "Error: $NEW_SHA is not an ancestor of the pebble branch $PEBBLE_BRANCH" >&2
+    exit 1
+  fi
+  echo "Using provided SHA $NEW_SHA."
+fi
+
+# Sanity check: the old SHA should be an ancestor of the new SHA.
+if ! git merge-base --is-ancestor $OLD_SHA $NEW_SHA; then
+  echo "Error: current pebble SHA $OLD_SHA is not an ancestor of $NEW_SHA (?!)" >&2
+  exit 1
+fi
+
+COMMITS=$(git log --no-merges --pretty='format: * [`%h`](https://github.com/cockroachdb/pebble/commit/%h) %s' "$OLD_SHA..$NEW_SHA")
 popd
 
-VENDORED_BRANCH="$USER/pebble-${BRANCH}-${NEW_SHA:0:12}"
-COCKROACH_BRANCH="$USER/pebble-${BRANCH}-${NEW_SHA:0:12}"
+echo
+echo "$COMMITS"
+echo
 
-# Pull in the Pebble module at the desired SHA and rebuild the vendor
-# directory.
-pushd "$COCKROACH_DIR"
+# If the script is run from $BRANCH, create a new local branch.
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [ "$CURRENT_BRANCH" == "$BRANCH" ]; then
+  COCKROACH_BRANCH="$USER/pebble-${BRANCH}-${NEW_SHA:0:12}"
+  echo "Creating and switching to new branch $COCKROACH_BRANCH"
+  git branch -D "$COCKROACH_BRANCH" || true
+  git checkout -b $COCKROACH_BRANCH
+else
+  echo "Using current branch $CURRENT_BRANCH."
+fi
+
+# Pull in the Pebble module at the desired SHA.
+./dev generate go
 go get "github.com/cockroachdb/pebble@${NEW_SHA}"
 go mod tidy
-make -k vendor_rebuild
-popd
-
-# Commit all the pending vendor directory changes to a new
-# github.com/cockroachdb/vendored repository branch, including the
-# commit history.
-pushd "$VENDORED_DIR"
-git branch -D "$VENDORED_BRANCH" || true
-git checkout -b "$VENDORED_BRANCH"
-git add --all
-git commit -m "bump Pebble to ${NEW_SHA:0:12}
-
-$COMMITS"
-git push -u --force origin "$VENDORED_BRANCH"
-popd
 
 # Create the branch and commit on the CockroachDB repository.
-pushd "$COCKROACH_DIR"
-make bazel-generate
-git add go.mod go.sum DEPS.bzl
-git add vendor
-git branch -D "$COCKROACH_BRANCH" || true
-git checkout -b "$COCKROACH_BRANCH"
-git commit -m "vendor: bump Pebble to ${NEW_SHA:0:12}
+./dev generate bazel --mirror
+git add go.mod go.sum DEPS.bzl build/bazelutil/distdir_files.bzl
+git commit -m "go.mod: bump Pebble to ${NEW_SHA:0:12}
+
+Changes:
 
 $COMMITS
 
-Release note:
+Release note: none.
+Epic: none.
 "
 # Open an editor to allow the user to set the release note.
 git commit --amend
-popd

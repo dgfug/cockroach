@@ -1,53 +1,41 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { get } from "lodash";
-import { assert } from "chai";
-import { createSandbox } from "sinon";
+import get from "lodash/get";
+
 import { track } from "./trackTimeScaleSelected";
-
-const sandbox = createSandbox();
 
 describe("trackTimeScaleSelected", () => {
   const scale = "Last 2 weeks";
 
-  afterEach(() => {
-    sandbox.reset();
-  });
-
   it("should only call track once", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
     track(spy)(scale);
-    assert.isTrue(spy.calledOnce);
+    expect(spy).toHaveBeenCalled();
   });
 
   it("should send the right event", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
     const expected = "Time Scale Selected";
 
     track(spy)(scale);
 
-    const sent = spy.getCall(0).args[0];
+    const sent = spy.mock.calls[0][0];
     const event = get(sent, "event");
 
-    assert.isTrue(event === expected);
+    expect(event === expected).toBe(true);
   });
 
   it("should send the correct payload", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
 
     track(spy)(scale);
 
-    const sent = spy.getCall(0).args[0];
+    const sent = spy.mock.calls[0][0];
     const timeScale = get(sent, "properties.timeScale");
 
-    assert.isTrue(timeScale === scale);
+    expect(timeScale === scale).toBe(true);
   });
 });

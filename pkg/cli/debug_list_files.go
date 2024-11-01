@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -46,13 +41,11 @@ func runDebugListFiles(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	// Connect to the node pointed to in the command line.
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	status, finish, err := getStatusClient(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
 	defer finish()
-
-	status := serverpb.NewStatusClient(conn)
 
 	// Retrieve the details for the head node.
 	firstNodeDetails, err := status.Details(ctx, &serverpb.DetailsRequest{NodeId: "local"})

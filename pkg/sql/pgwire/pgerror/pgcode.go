@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgerror
 
@@ -25,7 +20,6 @@ func WithCandidateCode(err error, code pgcode.Code) error {
 	if err == nil {
 		return nil
 	}
-
 	return &withCandidateCode{cause: err, code: code.String()}
 }
 
@@ -42,20 +36,24 @@ func HasCandidateCode(err error) bool {
 // - at each level:
 //
 //   - if there is a candidate code at that level, that is used;
+//
 //   - otherwise, it calls computeDefaultCode().
 //     if the function returns an empty string,
 //     UncategorizedError is used.
 //     An example implementation for computeDefaultCode is provided below.
 //
-// - after that, it combines the code computed already for the cause
-//   (inner) and the new code just computed at the current level (outer)
-//   as follows:
+//   - after that, it combines the code computed already for the cause
+//     (inner) and the new code just computed at the current level (outer)
+//     as follows:
 //
 //   - if the outer code is uncategorized, the inner code is kept no
 //     matter what.
+//
 //   - if the outer code has the special XX prefix, that is kept.
 //     (The "XX" prefix signals importance in the pg code hierarchy.)
+//
 //   - if the inner code is not uncategorized, it is retained.
+//
 //   - otherwise the outer code is retained.
 //
 // This function should not be used directly. It is only exported
@@ -109,14 +107,14 @@ func ComputeDefaultCode(err error) pgcode.Code {
 	return pgcode.Code{}
 }
 
-// ClientVisibleRetryError mirrors roachpb.ClientVisibleRetryError but
+// ClientVisibleRetryError mirrors kvpb.ClientVisibleRetryError but
 // is defined here to avoid an import cycle.
 type ClientVisibleRetryError interface {
 	ClientVisibleRetryError()
 }
 
 // ClientVisibleAmbiguousError mirrors
-// roachpb.ClientVisibleAmbiguousError but is defined here to avoid an
+// kvpb.ClientVisibleAmbiguousError but is defined here to avoid an
 // import cycle.
 type ClientVisibleAmbiguousError interface {
 	ClientVisibleAmbiguousError()

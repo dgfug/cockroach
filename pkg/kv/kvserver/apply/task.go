@@ -1,20 +1,15 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package apply
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // StateMachine represents an instance of a replicated state machine being
@@ -25,20 +20,26 @@ import (
 // All state transitions performed by the state machine are expected to be
 // deterministic, which ensures that if each instance is driven from the
 // same consistent shared log, they will all stay in sync.
+//
+// The implementation may not be and commonly is not thread safe.
 type StateMachine interface {
-	// NewBatch creates a new batch that is suitable for accumulating the
-	// effects that a group of Commands will have on the replicated state
-	// machine. Commands are staged in the batch one-by-one and then the
-	// entire batch is committed at once.
+	// NewEphemeralBatch creates an EphemeralBatch. This kind of batch is not able
+	// to make changes to the StateMachine, but can be used for the purpose of
+	// checking commands to determine whether they will be rejected or not when
+	// staged in a real Batch. The principal user of ephemeral batches is
+	// AckCommittedEntriesBeforeApplication.
 	//
-	// Batch comes in two flavors - real batches and ephemeral batches.
-	// Real batches are capable of accumulating updates from commands and
-	// applying them to the state machine. Ephemeral batches are not able
-	// to make changes to the durable state machine, but can still be used
-	// for the purpose of checking commands to determine whether they will
-	// be rejected or not when staged in a real batch. The principal user
-	// of ephemeral batches is AckCommittedEntriesBeforeApplication.
-	NewBatch(ephemeral bool) Batch
+	// There must only be a single EphemeralBatch *or* Batch open at any given
+	// point in time.
+	NewEphemeralBatch() EphemeralBatch
+	// NewBatch creates a new batch that is suitable for accumulating the effects
+	// that a group of Commands will have on the replicated state machine.
+	// Commands are staged in the batch one-by-one and then the entire batch is
+	// applied to the StateMachine at once via its ApplyToStateMachine method.
+	//
+	// There must only be a single EphemeralBatch *or* Batch open at any given
+	// point in time.
+	NewBatch() Batch
 	// ApplySideEffects applies the in-memory side-effects of a Command to
 	// the replicated state machine. The method will be called in the order
 	// that the commands are committed to the state machine's log. Once the
@@ -52,7 +53,7 @@ type StateMachine interface {
 	// an untimely crash. This means that applying these side-effects will
 	// typically update the in-memory representation of the state machine
 	// to the same state that it would be in if the process restarted.
-	ApplySideEffects(CheckedCommand) (AppliedCommand, error)
+	ApplySideEffects(context.Context, CheckedCommand) (AppliedCommand, error)
 }
 
 // ErrRemoved can be returned from ApplySideEffects which will stop the task
@@ -60,19 +61,32 @@ type StateMachine interface {
 // only be thrown by non-trivial commands.
 var ErrRemoved = errors.New("replica removed")
 
+// An EphemeralBatch can stage a number of commands, but lacks the ability
+// to apply them to a state machine.
+type EphemeralBatch interface {
+	// Stage inserts a Command into the Batch. In doing so, the Command is
+	// checked for rejection and a CheckedCommand is returned.
+	//
+	// TODO(tbg): consider renaming this to Add, so that in implementations
+	// of this we less unambiguously refer to "staging" commands into the
+	// pebble batch.
+	Stage(context.Context, Command) (CheckedCommand, error)
+	// Close closes the batch and releases any resources that it holds.
+	Close()
+}
+
 // Batch accumulates a series of updates from Commands and performs them
 // all at once to its StateMachine when applied. Groups of Commands will be
 // staged in the Batch such that one or more trivial Commands are staged or
 // exactly one non-trivial Command is staged.
 type Batch interface {
-	// Stage inserts a Command into the Batch. In doing so, the Command is
-	// checked for rejection and a CheckedCommand is returned.
-	Stage(Command) (CheckedCommand, error)
+	EphemeralBatch
 	// ApplyToStateMachine applies the persistent state transitions staged
 	// in the Batch to the StateMachine, atomically.
+	//
+	// Command application can not resume in the event of an error, that is,
+	// the surrounding StateMachine must be considered defunct.
 	ApplyToStateMachine(context.Context) error
-	// Close closes the batch and releases any resources that it holds.
-	Close()
 }
 
 // Decoder is capable of decoding a list of committed raft entries and
@@ -178,19 +192,7 @@ func (t *Task) assertDecoded() {
 //     it is applied. Because of this, the client can be informed of the success of
 //     a write at this point, but we cannot release that write's latches until the
 //     write has applied. See ProposalData.signalProposalResult/finishApplication.
-//
-//  4. etcd/raft may provided a series of CommittedEntries in a Ready struct that
-//     haven't actually been appended to our own log. This is most common in single
-//     node replication groups, but it is possible when a follower in a multi-node
-//     replication group is catching up after falling behind. In the first case,
-//     the entries are not yet committed so acknowledging them would be a lie. In
-//     the second case, the entries are committed so we could acknowledge them at
-//     this point, but doing so seems risky. To avoid complications in either case,
-//     the method takes a maxIndex parameter that limits the indexes that it will
-//     acknowledge. Typically, callers will supply the highest index that they have
-//     durably written to their raft log for this upper bound.
-//
-func (t *Task) AckCommittedEntriesBeforeApplication(ctx context.Context, maxIndex uint64) error {
+func (t *Task) AckCommittedEntriesBeforeApplication(ctx context.Context) error {
 	t.assertDecoded()
 	if !t.anyLocal {
 		return nil // fast-path
@@ -198,18 +200,15 @@ func (t *Task) AckCommittedEntriesBeforeApplication(ctx context.Context, maxInde
 
 	// Create a new ephemeral application batch. All we're interested in is
 	// whether commands will be rejected or not when staged in a real batch.
-	batch := t.sm.NewBatch(true /* ephemeral */)
+	batch := t.sm.NewEphemeralBatch()
 	defer batch.Close()
 
 	iter := t.dec.NewCommandIter()
 	defer iter.Close()
 
 	// Collect a batch of trivial commands from the applier. Stop at the first
-	// non-trivial command or at the first command with an index above maxIndex.
+	// non-trivial command.
 	batchIter := takeWhileCmdIter(iter, func(cmd Command) bool {
-		if cmd.Index() > maxIndex {
-			return false
-		}
 		return cmd.IsTrivial()
 	})
 
@@ -225,7 +224,7 @@ func (t *Task) AckCommittedEntriesBeforeApplication(ctx context.Context, maxInde
 	// want to retry the command instead of returning the error to the client.
 	return forEachCheckedCmdIter(ctx, stagedIter, func(cmd CheckedCommand, ctx context.Context) error {
 		if !cmd.Rejected() && cmd.IsLocal() && cmd.CanAckBeforeApplication() {
-			return cmd.AckSuccess(ctx)
+			return cmd.AckSuccess(cmd.Ctx())
 		}
 		return nil
 	})
@@ -267,7 +266,7 @@ func (t *Task) ApplyCommittedEntries(ctx context.Context) error {
 // b) exactly one non-trivial command
 func (t *Task) applyOneBatch(ctx context.Context, iter CommandIterator) error {
 	// Create a new application batch.
-	batch := t.sm.NewBatch(false /* ephemeral */)
+	batch := t.sm.NewBatch()
 	defer batch.Close()
 
 	// Consume a batch-worth of commands.

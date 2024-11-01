@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // An ordered key encoding scheme for arbitrary-precision fixed-point
 // numeric values based on sqlite4's key encoding:
@@ -21,7 +16,7 @@ import (
 	"math/big"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/errors"
 )
 
@@ -495,9 +490,9 @@ func decodeLargeNumber(
 // EncodeNonsortingDecimal returns the resulting byte slice with the
 // encoded decimal appended to b. The encoding is limited compared to
 // standard encodings in this package in that
-// - It will not sort lexicographically
-// - It does not encode its length or terminate itself, so decoding
-//   functions must be provided the exact encoded bytes
+//   - It will not sort lexicographically
+//   - It does not encode its length or terminate itself, so decoding
+//     functions must be provided the exact encoded bytes
 //
 // The encoding assumes that any number can be written as ±0.xyz... * 10^exp,
 // where xyz is a digit string, x != 0, and the last decimal in xyz is also
@@ -511,21 +506,22 @@ func decodeLargeNumber(
 // the digit string is added as a big-endian byte slice.
 //
 // All together, the encoding looks like:
-//   <marker><uvarint exponent><big-endian encoded big.Int>.
+//
+//	<marker><uvarint exponent><big-endian encoded big.Int>.
 //
 // The markers are shared with the sorting decimal encoding as follows:
-//  decimalNaN              -> decimalNaN
-//  decimalNegativeInfinity -> decimalNegativeInfinity
-//  decimalNegLarge         -> decimalNegValPosExp
-//  decimalNegMedium        -> decimalNegValZeroExp
-//  decimalNegSmall         -> decimalNegValNegExp
-//  decimalZero             -> decimalZero
-//  decimalPosSmall         -> decimalPosValNegExp
-//  decimalPosMedium        -> decimalPosValZeroExp
-//  decimalPosLarge         -> decimalPosValPosExp
-//  decimalInfinity         -> decimalInfinity
-//  decimalNaNDesc          -> decimalNaNDesc
 //
+//	decimalNaN              -> decimalNaN
+//	decimalNegativeInfinity -> decimalNegativeInfinity
+//	decimalNegLarge         -> decimalNegValPosExp
+//	decimalNegMedium        -> decimalNegValZeroExp
+//	decimalNegSmall         -> decimalNegValNegExp
+//	decimalZero             -> decimalZero
+//	decimalPosSmall         -> decimalPosValNegExp
+//	decimalPosMedium        -> decimalPosValZeroExp
+//	decimalPosLarge         -> decimalPosValPosExp
+//	decimalInfinity         -> decimalInfinity
+//	decimalNaNDesc          -> decimalNaNDesc
 func EncodeNonsortingDecimal(b []byte, d *apd.Decimal) []byte {
 	neg := d.Negative
 	switch d.Form {

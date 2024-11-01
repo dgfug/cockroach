@@ -26,21 +26,33 @@
 #   /   \             /   \
 #  a     1           2     1
 #
-# See the NormalizeConstEqNe pattern for the definition of constant expression
-# tree. Also, the NormalizePlusMult pattern ensures that constant expression
-# trees are on the right side of the expression, so no "flipped" pattern is
-# necessary. Other patterns will fold new constant expressions further.
+# The rule can only perform this transformation if all of the following criteria
+# are met:
+#
+#   1. The generated Minus expression will error if there is an overflow (see
+#      ArithmeticErrorsOnOverflow).
+#   2. A Minus overload for the given input types exists and has an appropriate
+#      volatility.
+#  2. There is no error when evaluating the new binary expression.
 #
 # NOTE: Ne is not part of the operator choices because it wasn't handled in
 #       normalize.go either. We can add once we've proved it's OK to do so.
 [NormalizeCmpPlusConst, Normalize]
 (Eq | Ge | Gt | Le | Lt
-    (Plus $leftLeft:^(ConstValue) $leftRight:(ConstValue))
-    $right:(ConstValue) &
-        (CanConstructBinary Minus $right $leftRight)
+    (Plus $leftLeft:^(ConstValue) $leftRight:(Const))
+    $right:(Const) &
+        (ArithmeticErrorsOnOverflow
+            (TypeOf $right)
+            (TypeOf $leftRight)
+        ) &
+        (CanConstructBinary Minus $right $leftRight) &
+        (Let
+            ($result $ok):(FoldBinary Minus $right $leftRight)
+            $ok
+        )
 )
 =>
-((OpName) $leftLeft (Minus $right $leftRight))
+((OpName) $leftLeft $result)
 
 # NormalizeCmpMinusConst builds up constant expression trees on one side of the
 # comparison, in cases like this:
@@ -50,16 +62,22 @@
 #   /   \           /   \
 #  a     1         2     1
 #
-# See the NormalizeConstEqNe pattern for the definition of constant expression
-# tree. Other patterns will fold new constant expressions further.
+# See NormalizeCmpPlusConst for more details.
 [NormalizeCmpMinusConst, Normalize]
 (Eq | Ge | Gt | Le | Lt
-    (Minus $leftLeft:^(ConstValue) $leftRight:(ConstValue))
-    $right:(ConstValue) &
-        (CanConstructBinary Plus $right $leftRight)
+    (Minus $leftLeft:^(ConstValue) $leftRight:(Const))
+    $right:(Const) &
+        (ArithmeticErrorsOnOverflow
+            (TypeOf $right)
+            (TypeOf $leftRight)
+        ) &
+        (CanConstructBinary Plus $right $leftRight) &
+        (Let
+            ($result $ok):(FoldBinary Plus $right $leftRight) $ok
+        )
 )
 =>
-((OpName) $leftLeft (Plus $right $leftRight))
+((OpName) $leftLeft $result)
 
 # NormalizeCmpConstMinus builds up constant expression trees on one side of the
 # comparison, in cases like this:
@@ -69,17 +87,22 @@
 #   /   \        /   \
 #  1     a      1     2
 #
-# See the NormalizeConstEqNe pattern for the definition of constant expression
-# tree. Other patterns will switch the constant to the right side and fold the
-# constant expression if possible.
+# See NormalizeCmpPlusConst for more details.
 [NormalizeCmpConstMinus, Normalize]
 (Eq | Ge | Gt | Le | Lt
-    (Minus $leftLeft:(ConstValue) $leftRight:^(ConstValue))
-    $right:(ConstValue) &
-        (CanConstructBinary Minus $leftLeft $right)
+    (Minus $leftLeft:(Const) $leftRight:^(ConstValue))
+    $right:(Const) &
+        (ArithmeticErrorsOnOverflow
+            (TypeOf $leftLeft)
+            (TypeOf $right)
+        ) &
+        (CanConstructBinary Minus $leftLeft $right) &
+        (Let
+            ($result $ok):(FoldBinary Minus $leftLeft $right) $ok
+        )
 )
 =>
-((OpName) (Minus $leftLeft $right) $leftRight)
+((OpName) $result $leftRight)
 
 # NormalizeTupleEquality breaks up expressions like:
 #   (a, b, c) = (x, y, z)
@@ -98,8 +121,8 @@
 [FoldNullComparisonLeft, Normalize]
 (Eq | Ne | Ge | Gt | Le | Lt | Like | NotLike | ILike | NotILike
         | SimilarTo | NotSimilarTo | RegMatch | NotRegMatch
-        | RegIMatch | NotRegIMatch | Contains | Overlaps
-        | JsonExists | JsonSomeExists | JsonAllExists
+        | RegIMatch | NotRegIMatch | Contains | ContainedBy
+        | Overlaps | JsonExists | JsonSomeExists | JsonAllExists
     $left:(Null)
     *
 )
@@ -234,68 +257,6 @@
     $tz
     (MakeTimeZoneFunction (FirstScalarListExpr $args) $right)
 )
-
-# FoldEqZeroSTDistance matches an expression of the form: 'ST_Distance(a,b) = 0'
-# and replaces it with 'ST_Intersects(a,b)'. This replacement allows for
-# early-exit behavior, and may allow an inverted index scan to be generated.
-[FoldEqZeroSTDistance, Normalize]
-(Eq
-    (Function $args:* $private:(FunctionPrivate "st_distance")) &
-        ^(STDistanceUseSpheroid $args)
-    $right:(Const
-        $value:* & (IsFloatDatum $value) & (DatumsEqual $value 0)
-    )
-)
-=>
-(MakeIntersectionFunction $args)
-
-# FoldCmpSTDistanceLeft replaces an expression of the form:
-# 'ST_Distance(...) <= x' with a call to ST_DWithin or ST_DWithinExclusive. This
-# replacement allows early-exit behavior, and may enable use of an inverted
-# index scan. See the MakeSTDWithin method for the specific variation on
-# ST_DWithin that is used to replace expressions with different comparison
-# operators (e.g. '<' vs '<=').
-[FoldCmpSTDistanceLeft, Normalize]
-(Ge | Gt | Le | Lt
-    (Function $args:* $private:(FunctionPrivate "st_distance"))
-    $right:*
-)
-=>
-(MakeSTDWithinLeft (OpName) $args $right)
-
-# FoldCmpSTDistanceRight mirrors FoldCmpSTDistanceLeft.
-[FoldCmpSTDistanceRight, Normalize]
-(Ge | Gt | Le | Lt
-    $left:*
-    (Function $args:* $private:(FunctionPrivate "st_distance"))
-)
-=>
-(MakeSTDWithinRight (OpName) $args $left)
-
-# FoldCmpSTMaxDistanceLeft is a variant of FoldCmpSTDistanceLeft that matches
-# ST_MaxDistance instead of ST_Distance.
-[FoldCmpSTMaxDistanceLeft, Normalize]
-(Ge | Gt | Le | Lt
-    (Function
-        $args:*
-        $private:(FunctionPrivate "st_maxdistance")
-    )
-    $right:*
-)
-=>
-(MakeSTDFullyWithinLeft (OpName) $args $right)
-
-# FoldCmpSTMaxDistanceRight mirrors FoldCmpSTMaxDistanceLeft.
-[FoldCmpSTMaxDistanceRight, Normalize]
-(Ge | Gt | Le | Lt
-    $left:*
-    (Function
-        $args:*
-        $private:(FunctionPrivate "st_maxdistance")
-    )
-)
-=>
-(MakeSTDFullyWithinRight (OpName) $args $left)
 
 # FoldEqTrue replaces x = True with x.
 [FoldEqTrue, Normalize]

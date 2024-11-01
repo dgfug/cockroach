@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow_test
 
@@ -23,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
@@ -38,11 +33,12 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
 	}
 
@@ -50,9 +46,10 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	typs := types.OneIntCol
 	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
-	col := colexec.NewBufferingColumnarizer(testAllocator, &flowCtx, 0 /* processorID */, input)
+	col := colexec.NewBufferingColumnarizerForTests(testAllocator, &flowCtx, 0 /* processorID */, input)
 	vee := newTestVectorizedInternalPanicEmitter(col)
 	mat := colexec.NewMaterializer(
+		nil, /* streamingMemAcc */
 		&flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: vee},
@@ -73,11 +70,12 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
 	}
 
@@ -85,9 +83,10 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	typs := types.OneIntCol
 	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
-	col := colexec.NewBufferingColumnarizer(testAllocator, &flowCtx, 0 /* processorID */, input)
+	col := colexec.NewBufferingColumnarizerForTests(testAllocator, &flowCtx, 0 /* processorID */, input)
 	nvee := newTestNonVectorizedPanicEmitter(col)
 	mat := colexec.NewMaterializer(
+		nil, /* streamingMemAcc */
 		&flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: nvee},

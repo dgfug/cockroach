@@ -1,25 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // Controller implements the SQL Stats subsystem control plane. This exposes
@@ -28,31 +23,28 @@ import (
 // subsystem.
 type Controller struct {
 	*sslocal.Controller
-	db *kv.DB
-	ie sqlutil.InternalExecutor
-	st *cluster.Settings
+	db        isql.DB
+	st        *cluster.Settings
+	clusterID func() uuid.UUID
 }
 
 // NewController returns a new instance of sqlstats.Controller.
 func NewController(
-	sqlStats *PersistedSQLStats,
-	status serverpb.SQLStatusServer,
-	db *kv.DB,
-	ie sqlutil.InternalExecutor,
+	sqlStats *PersistedSQLStats, status serverpb.SQLStatusServer, db isql.DB,
 ) *Controller {
 	return &Controller{
 		Controller: sslocal.NewController(sqlStats.SQLStats, status),
 		db:         db,
-		ie:         ie,
 		st:         sqlStats.cfg.Settings,
+		clusterID:  sqlStats.cfg.ClusterID,
 	}
 }
 
 // CreateSQLStatsCompactionSchedule implements the tree.SQLStatsController
 // interface.
 func (s *Controller) CreateSQLStatsCompactionSchedule(ctx context.Context) error {
-	return s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		_, err := CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, s.ie, txn, s.st)
+	return s.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		_, err := CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, s.st, s.clusterID())
 		return err
 	})
 }
@@ -65,23 +57,44 @@ func (s *Controller) ResetClusterSQLStats(ctx context.Context) error {
 		return err
 	}
 
-	resetSysTableStats := func(tableName string) error {
-		if _, err := s.ie.ExecEx(
-			ctx,
-			"reset-sql-stats",
-			nil, /* txn */
-			sessiondata.InternalExecutorOverride{
-				User: security.NodeUserName(),
-			},
-			"TRUNCATE "+tableName); err != nil {
-			return err
-		}
-
-		return nil
-	}
-	if err := resetSysTableStats("system.statement_statistics"); err != nil {
+	if err := s.resetSysTableStats(ctx, "system.statement_statistics"); err != nil {
 		return err
 	}
 
-	return resetSysTableStats("system.transaction_statistics")
+	if err := s.resetSysTableStats(ctx, "system.transaction_statistics"); err != nil {
+		return err
+	}
+
+	return s.ResetActivityTables(ctx)
+}
+
+// ResetActivityTables implements the tree.SQLStatsController interface. This
+// method resets the {statement|transaction}_activity system tables.
+func (s *Controller) ResetActivityTables(ctx context.Context) error {
+	if err := s.resetSysTableStats(ctx, "system.statement_activity"); err != nil {
+		return err
+	}
+
+	return s.resetSysTableStats(ctx, "system.transaction_activity")
+}
+
+// ResetInsightsTables implements the tree.SQLStatsController interface. This
+// method reset the {statement|transaction}_execution_insights tables.
+func (s *Controller) ResetInsightsTables(ctx context.Context) error {
+	if err := s.resetSysTableStats(ctx, "system.statement_execution_insights"); err != nil {
+		return err
+	}
+
+	return s.resetSysTableStats(ctx, "system.transaction_execution_insights")
+}
+
+func (s *Controller) resetSysTableStats(ctx context.Context, tableName string) (err error) {
+	ex := s.db.Executor()
+	_, err = ex.ExecEx(
+		ctx,
+		fmt.Sprintf("reset-%s", tableName),
+		nil, /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		"TRUNCATE "+tableName)
+	return err
 }

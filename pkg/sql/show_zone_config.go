@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -21,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	yaml "gopkg.in/yaml.v2"
@@ -65,17 +60,11 @@ const (
 )
 
 func (p *planner) ShowZoneConfig(ctx context.Context, n *tree.ShowZoneConfig) (planNode, error) {
-	if !ZonesTableExists(ctx, p.ExecCfg().Codec, p.ExecCfg().Settings.Version) {
-		// Secondary tenants prior to the introduction of system.zones for them
-		// could not set/show zone configurations on individual objects.
-		return nil, errorutil.UnsupportedWithMultiTenancy(MultitenancyZoneCfgIssueNo)
-	}
-
 	return &delayedNode{
 		name:    n.String(),
 		columns: showZoneConfigColumns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			v := p.newContainerValuesNode(showZoneConfigColumns, 0)
+			v := p.newContainerValuesNode(showZoneConfigColumns, 1)
 
 			// This signifies SHOW ALL.
 			// However, SHOW ALL should be handled by the delegate.
@@ -110,12 +99,7 @@ func getShowZoneConfigRow(
 			return nil, err
 		}
 	} else if zoneSpecifier.Database != "" {
-		database, err := p.Descriptors().GetImmutableDatabaseByName(
-			ctx,
-			p.txn,
-			string(zoneSpecifier.Database),
-			tree.DatabaseLookupFlags{Required: true},
-		)
+		database, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, string(zoneSpecifier.Database))
 		if err != nil {
 			return nil, err
 		}
@@ -124,7 +108,7 @@ func getShowZoneConfigRow(
 		}
 	}
 
-	targetID, err := resolveZone(ctx, p.ExecCfg().Codec, p.txn, &zoneSpecifier)
+	targetID, err := resolveZone(ctx, p.txn, p.Descriptors(), &zoneSpecifier, p.ExecCfg().Settings.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -136,9 +120,9 @@ func getShowZoneConfigRow(
 
 	subZoneIdx := uint32(0)
 	zoneID, zone, subzone, err := GetZoneConfigInTxn(
-		ctx, p.txn, p.ExecCfg().Codec, targetID, index, partition, false, /* getInheritedDefault */
+		ctx, p.txn, p.Descriptors(), targetID, index, partition, false, /* getInheritedDefault */
 	)
-	if errors.Is(err, errNoZoneConfigApplies) {
+	if errors.Is(err, sqlerrors.ErrNoZoneConfigApplies) {
 		// TODO(benesch): This shouldn't be the caller's responsibility;
 		// GetZoneConfigInTxn should just return the default zone config if no zone
 		// config applies.
@@ -175,12 +159,6 @@ func getShowZoneConfigRow(
 
 // zoneConfigToSQL pretty prints a zone configuration as a SQL string.
 func zoneConfigToSQL(zs *tree.ZoneSpecifier, zone *zonepb.ZoneConfig) (string, error) {
-	// Use FutureLineWrap to avoid wrapping long lines. This is required for
-	// cases where one of the zone config fields is longer than 80 characters.
-	// In that case, without FutureLineWrap, the output will have `\n`
-	// characters interspersed every 80 characters. FutureLineWrap ensures that
-	// the whole field shows up as a single line.
-	yaml.FutureLineWrap()
 	constraints, err := yamlMarshalFlow(zonepb.ConstraintsList{
 		Constraints: zone.Constraints,
 		Inherited:   zone.InheritedConstraints})

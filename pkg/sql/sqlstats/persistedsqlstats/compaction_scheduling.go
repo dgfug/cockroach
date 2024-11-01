@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
@@ -15,13 +10,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
 )
@@ -34,11 +29,11 @@ var ErrDuplicatedSchedules = errors.New("creating multiple sql stats compaction 
 
 // CreateSQLStatsCompactionScheduleIfNotYetExist registers SQL Stats compaction job with the
 // scheduled job subsystem so the compaction job can be run periodically. This
-// is done during the cluster startup migration.
+// is done during the cluster startup upgrade.
 func CreateSQLStatsCompactionScheduleIfNotYetExist(
-	ctx context.Context, ie sqlutil.InternalExecutor, txn *kv.Txn, st *cluster.Settings,
+	ctx context.Context, txn isql.Txn, st *cluster.Settings, clusterID uuid.UUID,
 ) (*jobs.ScheduledJob, error) {
-	scheduleExists, err := checkExistingCompactionSchedule(ctx, ie, txn)
+	scheduleExists, err := checkExistingCompactionSchedule(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -49,18 +44,22 @@ func CreateSQLStatsCompactionScheduleIfNotYetExist(
 
 	compactionSchedule := jobs.NewScheduledJob(scheduledjobs.ProdJobSchedulerEnv)
 
-	schedule := SQLStatsCleanupRecurrence.Get(&st.SV)
+	schedule := scheduledjobs.MaybeRewriteCronExpr(
+		clusterID, SQLStatsCleanupRecurrence.Get(&st.SV),
+	)
 	if err := compactionSchedule.SetSchedule(schedule); err != nil {
 		return nil, err
 	}
 
 	compactionSchedule.SetScheduleDetails(jobspb.ScheduleDetails{
-		Wait:    jobspb.ScheduleDetails_SKIP,
-		OnError: jobspb.ScheduleDetails_RETRY_SCHED,
+		Wait:                   jobspb.ScheduleDetails_SKIP,
+		OnError:                jobspb.ScheduleDetails_RETRY_SCHED,
+		ClusterID:              clusterID,
+		CreationClusterVersion: st.Version.ActiveVersion(ctx),
 	})
 
 	compactionSchedule.SetScheduleLabel(compactionScheduleName)
-	compactionSchedule.SetOwner(security.NodeUserName())
+	compactionSchedule.SetOwner(username.NodeUserName())
 
 	args, err := pbtypes.MarshalAny(&ScheduledSQLStatsCompactorExecutionArgs{})
 	if err != nil {
@@ -72,30 +71,22 @@ func CreateSQLStatsCompactionScheduleIfNotYetExist(
 	)
 
 	compactionSchedule.SetScheduleStatus(string(jobs.StatusPending))
-	if err = compactionSchedule.Create(ctx, ie, txn); err != nil {
+	if err := jobs.ScheduledJobTxn(txn).Create(ctx, compactionSchedule); err != nil {
 		return nil, err
 	}
 
 	return compactionSchedule, nil
 }
 
-// CreateCompactionJob creates a system.jobs record if there is no other
-// SQL Stats compaction job running. This is invoked by the scheduled job
-// Executor.
+// CreateCompactionJob creates a system.jobs record.
+// We do not need to worry about checking if the job already exist;
+// at most 1 job semantics are enforced by scheduled jobs system.
 func CreateCompactionJob(
-	ctx context.Context,
-	createdByInfo *jobs.CreatedByInfo,
-	txn *kv.Txn,
-	ie sqlutil.InternalExecutor,
-	jobRegistry *jobs.Registry,
+	ctx context.Context, createdByInfo *jobs.CreatedByInfo, txn isql.Txn, jobRegistry *jobs.Registry,
 ) (jobspb.JobID, error) {
-	if err := CheckExistingCompactionJob(ctx, nil /* job */, ie, txn); err != nil {
-		return jobspb.InvalidJobID, err
-	}
-
 	record := jobs.Record{
 		Description: "automatic SQL Stats compaction",
-		Username:    security.NodeUserName(),
+		Username:    username.NodeUserName(),
 		Details:     jobspb.AutoSQLStatsCompactionDetails{},
 		Progress:    jobspb.AutoSQLStatsCompactionProgress{},
 		CreatedBy:   createdByInfo,
@@ -108,33 +99,11 @@ func CreateCompactionJob(
 	return jobID, nil
 }
 
-// CheckExistingCompactionJob checks for existing SQL Stats Compaction job
-// that are either PAUSED, CANCELED, or RUNNING. If so, it returns a
-// ErrConcurrentSQLStatsCompaction.
-func CheckExistingCompactionJob(
-	ctx context.Context, job *jobs.Job, ie sqlutil.InternalExecutor, txn *kv.Txn,
-) error {
-	jobID := jobspb.InvalidJobID
-	if job != nil {
-		jobID = job.ID()
-	}
-	exists, err := jobs.RunningJobExists(ctx, jobID, ie, txn, func(payload *jobspb.Payload) bool {
-		return payload.Type() == jobspb.TypeAutoSQLStatsCompaction
-	})
-
-	if err == nil && exists {
-		err = ErrConcurrentSQLStatsCompaction
-	}
-	return err
-}
-
-func checkExistingCompactionSchedule(
-	ctx context.Context, ie sqlutil.InternalExecutor, txn *kv.Txn,
-) (exists bool, _ error) {
+func checkExistingCompactionSchedule(ctx context.Context, txn isql.Txn) (exists bool, _ error) {
 	query := "SELECT count(*) FROM system.scheduled_jobs WHERE schedule_name = $1"
 
-	row, err := ie.QueryRowEx(ctx, "check-existing-sql-stats-schedule", txn,
-		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
+	row, err := txn.QueryRowEx(ctx, "check-existing-sql-stats-schedule", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		query, compactionScheduleName,
 	)
 

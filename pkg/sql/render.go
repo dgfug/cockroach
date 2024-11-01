@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -38,11 +33,6 @@ type renderNode struct {
 	// potentially modified by index selection.
 	source planDataSource
 
-	// Helper for indexed vars. This holds the actual instances of
-	// IndexedVars replaced in Exprs. The indexed vars contain indices
-	// to the array of source columns.
-	ivarHelper tree.IndexedVarHelper
-
 	// Rendering expressions for rows and corresponding output columns.
 	render []tree.TypedExpr
 
@@ -57,19 +47,11 @@ type renderNode struct {
 	reqOrdering ReqOrdering
 }
 
-// IndexedVarEval implements the tree.IndexedVarContainer interface.
-func (r *renderNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	panic("renderNode can't be run in local mode")
-}
+var _ tree.IndexedVarContainer = &renderNode{}
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
 func (r *renderNode) IndexedVarResolvedType(idx int) *types.T {
 	return r.source.columns[idx].Typ
-}
-
-// IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.
-func (r *renderNode) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	return r.source.columns.NodeFormatter(idx)
 }
 
 func (r *renderNode) startExec(runParams) error {

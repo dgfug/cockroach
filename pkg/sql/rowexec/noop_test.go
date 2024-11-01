@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -19,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -30,12 +25,13 @@ func BenchmarkNoop(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	post := &execinfrapb.PostProcessSpec{}
 	disposer := &rowDisposer{}
@@ -50,11 +46,11 @@ func BenchmarkNoop(b *testing.B) {
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newNoopProcessor(flowCtx, 0 /* processorID */, input, post, disposer)
+				d, err := newNoopProcessor(ctx, flowCtx, 0 /* processorID */, input, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				d.Run(context.Background())
+				d.Run(context.Background(), disposer)
 				input.Reset()
 			}
 		})

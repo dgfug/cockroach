@@ -4,11 +4,11 @@ source [file join [file dirname $argv0] common.tcl]
 
 # This test ensures notices are being sent as expected.
 
-spawn $argv demo --no-example-database
+spawn $argv demo --no-line-editor --no-example-database --log-dir=logs
 eexpect root@
 
 start_test "Test that notices always appear at the end after all results."
-send "SELECT IF(@1=4,crdb_internal.notice('hello'),@1) AS MYRES FROM generate_series(1,10);\r"
+send "SELECT IF(i=4,crdb_internal.notice('hello'),i) AS MYRES FROM generate_series(1,10) g(i);\r"
 eexpect myres
 eexpect 1
 eexpect 10
@@ -26,6 +26,6 @@ eexpect "NOTICE: hello"
 eexpect "NOTICE: world"
 eexpect "WARNING: stay indoors"
 eexpect root@
-interrupt
+send_eof
 eexpect eof
 end_test

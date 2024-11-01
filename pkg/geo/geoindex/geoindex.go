@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geoindex
 
@@ -19,6 +14,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geogfn"
+	// Blank import so projections are initialized correctly.
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
@@ -239,33 +236,6 @@ func (gr RelationshipType) String() string {
 	return geoRelationshipTypeStr[gr]
 }
 
-// IsEmptyConfig returns whether the given config contains a geospatial index
-// configuration.
-func IsEmptyConfig(cfg *Config) bool {
-	if cfg == nil {
-		return true
-	}
-	return cfg.S2Geography == nil && cfg.S2Geometry == nil
-}
-
-// IsGeographyConfig returns whether the config is a geography geospatial
-// index configuration.
-func IsGeographyConfig(cfg *Config) bool {
-	if cfg == nil {
-		return false
-	}
-	return cfg.S2Geography != nil
-}
-
-// IsGeometryConfig returns whether the config is a geometry geospatial
-// index configuration.
-func IsGeometryConfig(cfg *Config) bool {
-	if cfg == nil {
-		return false
-	}
-	return cfg.S2Geometry != nil
-}
-
 // Key is one entry under which a geospatial shape is stored on behalf of an
 // Index. The index is of the form (Key, Primary Key).
 type Key uint64
@@ -411,17 +381,17 @@ func (rc simpleCovererImpl) covering(regions []s2.Region) s2.CellUnion {
 // cells below c). For example, consider a portion of the cell quad-tree
 // below:
 //
-//                      c0
-//                      |
-//                      c3
-//                      |
-//                  +---+---+
-//                  |       |
-//                 c13      c15
-//                  |       |
-//                 c53   +--+--+
-//                       |     |
-//                      c61    c64
+//	     c0
+//	     |
+//	     c3
+//	     |
+//	 +---+---+
+//	 |       |
+//	c13      c15
+//	 |       |
+//	c53   +--+--+
+//	      |     |
+//	     c61    c64
 //
 // Shape s could have a regular covering c15, c53, where c15 has 4 child cells
 // c61..c64, and shape s only intersects wit c61, c64. A different shape x
@@ -609,39 +579,43 @@ func coveredBy(_ context.Context, rc *s2.RegionCoverer, r []s2.Region) RPKeyExpr
 
 // The quad-trees stored in presentCells together represent a set expression.
 // This expression specifies:
-// - the path for each leaf to the root of that quad-tree. The index entries
-//   on each such path represent the shapes that cover that leaf. Hence these
-//   index entries for a single path need to be unioned to give the shapes
-//   that cover the leaf.
-// - The full expression specifies the shapes that cover all the leaves, so
-//   the union expressions for the paths must be intersected with each other.
+//   - the path for each leaf to the root of that quad-tree. The index entries
+//     on each such path represent the shapes that cover that leaf. Hence these
+//     index entries for a single path need to be unioned to give the shapes
+//     that cover the leaf.
+//   - The full expression specifies the shapes that cover all the leaves, so
+//     the union expressions for the paths must be intersected with each other.
 //
 // Reusing an example from earlier in this file, say the quad-tree is:
-//                      c0
-//                      |
-//                      c3
-//                      |
-//                  +---+---+
-//                  |       |
-//                 c13      c15
-//                  |       |
-//                 c53   +--+--+
-//                       |     |
-//                      c61    c64
+//
+//	     c0
+//	     |
+//	     c3
+//	     |
+//	 +---+---+
+//	 |       |
+//	c13      c15
+//	 |       |
+//	c53   +--+--+
+//	      |     |
+//	     c61    c64
 //
 // This tree represents the following expression (where I(c) are the index
 // entries stored at cell c):
-//  (I(c64) \union I(c15) \union I(c3) \union I(c0)) \intersection
-//  (I(c61) \union I(c15) \union I(c3) \union I(c0)) \intersection
-//  (I(c53) \union I(c13) \union I(c3) \union I(c0))
+//
+//	(I(c64) \union I(c15) \union I(c3) \union I(c0)) \intersection
+//	(I(c61) \union I(c15) \union I(c3) \union I(c0)) \intersection
+//	(I(c53) \union I(c13) \union I(c3) \union I(c0))
+//
 // In this example all the union sub-expressions have the same number of terms
 // but that does not need to be true.
 //
 // The above expression can be factored to eliminate repetition of the
 // same cell. The factored expression for this example is:
-//   I(c0) \union I(c3) \union
-//    ((I(c13) \union I(c53)) \intersection
-//     (I(c15) \union (I(c61) \intersection I(c64)))
+//
+//	I(c0) \union I(c3) \union
+//	 ((I(c13) \union I(c53)) \intersection
+//	  (I(c15) \union (I(c61) \intersection I(c64)))
 //
 // This function generates this factored expression represented in reverse
 // polish notation.
@@ -709,8 +683,8 @@ func (b *stringBuilderWithWrap) doWrap() {
 }
 
 // DefaultS2Config returns the default S2Config to initialize.
-func DefaultS2Config() *S2Config {
-	return &S2Config{
+func DefaultS2Config() *geopb.S2Config {
+	return &geopb.S2Config{
 		MinLevel: 0,
 		MaxLevel: 30,
 		LevelMod: 1,

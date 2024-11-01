@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -37,7 +33,7 @@ type streamMerger struct {
 	// when we want NULL to be meaningful during equality, for example
 	// during SCRUB secondary index checks.
 	nullEquality bool
-	datumAlloc   rowenc.DatumAlloc
+	datumAlloc   tree.DatumAlloc
 }
 
 func (sm *streamMerger) start(ctx context.Context) {
@@ -49,7 +45,7 @@ func (sm *streamMerger) start(ctx context.Context) {
 // the right stream, all matching on the equality columns. One of the sets can
 // be empty.
 func (sm *streamMerger) NextBatch(
-	ctx context.Context, evalCtx *tree.EvalContext,
+	ctx context.Context, evalCtx *eval.Context,
 ) ([]rowenc.EncDatumRow, []rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if sm.leftGroup == nil {
 		var meta *execinfrapb.ProducerMetadata
@@ -78,7 +74,7 @@ func (sm *streamMerger) NextBatch(
 	}
 
 	cmp, err := CompareEncDatumRowForMerge(
-		sm.left.types, lrow, rrow, sm.left.ordering, sm.right.ordering,
+		ctx, sm.left.types, sm.right.types, lrow, rrow, sm.left.ordering, sm.right.ordering,
 		sm.nullEquality, &sm.datumAlloc, evalCtx,
 	)
 	if err != nil {
@@ -107,12 +103,13 @@ func (sm *streamMerger) NextBatch(
 // a DatumAlloc which is used for decoding if any underlying EncDatum is not
 // yet decoded.
 func CompareEncDatumRowForMerge(
-	lhsTypes []*types.T,
+	ctx context.Context,
+	lhsTypes, rhsTypes []*types.T,
 	lhs, rhs rowenc.EncDatumRow,
 	leftOrdering, rightOrdering colinfo.ColumnOrdering,
 	nullEquality bool,
-	da *rowenc.DatumAlloc,
-	evalCtx *tree.EvalContext,
+	da *tree.DatumAlloc,
+	evalCtx *eval.Context,
 ) (int, error) {
 	if lhs == nil && rhs == nil {
 		return 0, nil
@@ -143,7 +140,7 @@ func CompareEncDatumRowForMerge(
 			}
 			continue
 		}
-		cmp, err := lhs[lIdx].Compare(lhsTypes[lIdx], da, evalCtx, &rhs[rIdx])
+		cmp, err := lhs[lIdx].CompareEx(ctx, lhsTypes[lIdx], da, evalCtx, &rhs[rIdx], rhsTypes[rIdx])
 		if err != nil {
 			return 0, err
 		}

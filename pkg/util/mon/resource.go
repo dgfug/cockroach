@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package mon
 
@@ -16,21 +11,15 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Resource is an interface used to abstract the specifics of tracking bytes
-// usage by different types of resources.
-type Resource interface {
-	NewBudgetExceededError(requestedBytes int64, reservedBytes int64, budgetBytes int64) error
-}
+// Resource indicates the type of resource a BytesMonitor is tracking.
+type Resource int8
 
-// memoryResource is a Resource that represents memory.
-type memoryResource struct{}
+const (
+	MemoryResource Resource = iota
+	DiskResource
+)
 
-// MemoryResource is a utility singleton used as an argument when creating a
-// BytesMonitor to indicate that the monitor will be tracking memory usage.
-var MemoryResource Resource = memoryResource{}
-
-// NewBudgetExceededError implements the Resource interface.
-func (m memoryResource) NewBudgetExceededError(
+func NewMemoryBudgetExceededError(
 	requestedBytes int64, reservedBytes int64, budgetBytes int64,
 ) error {
 	return pgerror.WithCandidateCode(
@@ -39,18 +28,12 @@ func (m memoryResource) NewBudgetExceededError(
 			errors.Safe(requestedBytes),
 			errors.Safe(reservedBytes),
 			errors.Safe(budgetBytes),
-		), pgcode.OutOfMemory)
+		),
+		pgcode.OutOfMemory,
+	)
 }
 
-// diskResource is a Resource that represents disk.
-type diskResource struct{}
-
-// DiskResource is a utility singleton used as an argument when creating a
-// BytesMonitor to indicate that the monitor will be tracking disk usage.
-var DiskResource Resource = diskResource{}
-
-// NewBudgetExceededError implements the Resource interface.
-func (d diskResource) NewBudgetExceededError(
+func newDiskBudgetExceededError(
 	requestedBytes int64, reservedBytes int64, budgetBytes int64,
 ) error {
 	return pgerror.WithCandidateCode(
@@ -59,5 +42,16 @@ func (d diskResource) NewBudgetExceededError(
 			errors.Safe(requestedBytes),
 			errors.Safe(reservedBytes),
 			errors.Safe(budgetBytes),
-		), pgcode.DiskFull)
+		),
+		pgcode.DiskFull,
+	)
+}
+
+func newRootSQLMemoryMonitorBudgetExceededError(
+	requestedBytes int64, reservedBytes int64, budgetBytes int64,
+) error {
+	return errors.WithHint(
+		NewMemoryBudgetExceededError(requestedBytes, reservedBytes, budgetBytes),
+		"Consider increasing --max-sql-memory startup parameter.", /* hint */
+	)
 }

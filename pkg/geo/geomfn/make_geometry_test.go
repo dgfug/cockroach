@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -251,7 +246,7 @@ func TestMakePolygon(t *testing.T) {
 			}
 			polygon, err := MakePolygon(outer, interior...)
 			if tc.err != nil {
-				require.Errorf(t, err, tc.err.Error())
+				require.Error(t, err, tc.err.Error())
 				require.EqualError(t, err, tc.err.Error())
 			} else {
 				require.NoError(t, err)
@@ -299,6 +294,74 @@ func TestMakePolygonWithSRID(t *testing.T) {
 			expected := geo.MustParseGeometry(tc.expected)
 			require.Equal(t, expected, polygon)
 			require.EqualValues(t, tc.srid, polygon.SRID())
+		})
+	}
+}
+
+func TestMakePolygonFromMultiLineString(t *testing.T) {
+	testCases := []struct {
+		name     string
+		g        string
+		srid     geopb.SRID
+		expected string
+		err      error
+	}{
+		{
+			"MLString with 1 linestring and default SRID",
+			"MULTILINESTRING((0 0, 1 0, 1 1, 0 1, 0 0))",
+			geopb.DefaultGeometrySRID,
+			"SRID=0;POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+			nil,
+		},
+		{
+			"MLString with 1 linestring and SRID",
+			"MULTILINESTRING((0 0, 1 0, 1 1, 0 1, 0 0))",
+			geopb.SRID(4326),
+			"SRID=4326;POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+			nil,
+		},
+		{
+			"MLString with 2 linestrings and SRID",
+			"MULTILINESTRING((0 0, 10 0, 10 10, 0 10, 0 0),(1 1, 1 2, 2 2, 2 1, 1 1))",
+			geopb.SRID(4326),
+			"SRID=4326;POLYGON((0 0, 10 0, 10 10, 0 10, 0 0),(1 1, 1 2, 2 2, 2 1, 1 1))",
+			nil,
+		},
+		{
+			"MLString with 3 linestrings and SRID",
+			"MULTILINESTRING((40 80,80 80,80 40,40 40,40 80),(50 70,70 70,70 50,50 50,50 70),(60 60,75 60,75 45,60 45,60 60))",
+			geopb.SRID(4000),
+			"SRID=4000;POLYGON((40 80,80 80,80 40,40 40,40 80),(50 70,70 70,70 50,50 50,50 70),(60 60,75 60,75 45,60 45,60 60))",
+			nil,
+		},
+		{
+			"Argument error, linestring input",
+			"LINESTRING(0 0, 1 0, 1 1, 0 1, 0 0)",
+			geopb.SRID(4326),
+			"",
+			errors.Newf("Input argument must be of type MULTISTRINGLINE"),
+		},
+		{
+			"Broken input, not closed linestring",
+			"MULTILINESTRING((0 0, 1 0, 1 1, 0 1))",
+			geopb.SRID(4326),
+			"",
+			errors.Newf("Multistring needs to have closed linestrings"),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := geo.MustParseGeometry(tc.g)
+			polygon, err := MakePolygonFromMultiLineString(g, tc.srid)
+			if tc.err != nil {
+				require.Error(t, err, tc.err.Error())
+			} else {
+				require.NoError(t, err)
+				expected := geo.MustParseGeometry(tc.expected)
+				require.Equal(t, expected, polygon)
+				require.EqualValues(t, tc.srid, polygon.SRID())
+			}
+
 		})
 	}
 }

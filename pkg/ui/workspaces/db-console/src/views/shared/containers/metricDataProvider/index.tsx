@@ -1,26 +1,39 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import {
+  util,
+  TimeWindow,
+  TimeScale,
+  findClosestTimeScale,
+  defaultTimeScaleOptions,
+} from "@cockroachlabs/cluster-ui";
+import { History } from "history";
+import isEqual from "lodash/isEqual";
+import isNil from "lodash/isNil";
+import isObject from "lodash/isObject";
+import map from "lodash/map";
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import React from "react";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
+
+import { PayloadAction } from "src/interfaces/action";
 import * as protos from "src/js/protos";
+import { refreshSettings } from "src/redux/apiReducers";
+import {
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+} from "src/redux/clusterSettings";
 import {
   MetricsQuery,
   requestMetrics as requestMetricsAction,
 } from "src/redux/metrics";
 import { AdminUIState } from "src/redux/state";
-import { MilliToNano } from "src/util/convert";
+import { adjustTimeScale, selectMetricsTime } from "src/redux/timeScale";
 import { findChildrenOfType } from "src/util/find";
 import {
   Metric,
@@ -28,10 +41,6 @@ import {
   MetricsDataComponentProps,
   QueryTimeInfo,
 } from "src/views/shared/components/metricQuery";
-import { PayloadAction } from "src/interfaces/action";
-import { TimeWindow, TimeScale } from "src/redux/timewindow";
-import { History } from "history";
-import { refreshSettings } from "src/redux/apiReducers";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -43,10 +52,10 @@ function queryFromProps(
 ): protos.cockroach.ts.tspb.IQuery {
   let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
   let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
-  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
+  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
 
   // Compute derivative function.
-  if (!_.isNil(metricProps.derivative)) {
+  if (!isNil(metricProps.derivative)) {
     derivative = metricProps.derivative;
   } else if (metricProps.rate) {
     derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.DERIVATIVE;
@@ -56,7 +65,7 @@ function queryFromProps(
         .NON_NEGATIVE_DERIVATIVE;
   }
   // Compute downsample function.
-  if (!_.isNil(metricProps.downsampler)) {
+  if (!isNil(metricProps.downsampler)) {
     downsampler = metricProps.downsampler;
   } else if (metricProps.downsampleMax) {
     downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
@@ -64,7 +73,7 @@ function queryFromProps(
     downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
   }
   // Compute aggregation function.
-  if (!_.isNil(metricProps.aggregator)) {
+  if (!isNil(metricProps.aggregator)) {
     sourceAggregator = metricProps.aggregator;
   } else if (metricProps.aggregateMax) {
     sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
@@ -73,10 +82,12 @@ function queryFromProps(
   } else if (metricProps.aggregateAvg) {
     sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
   }
-
+  const tenantSource =
+    metricProps.tenantSource || graphProps.tenantSource || undefined;
   return {
     name: metricProps.name,
     sources: metricProps.sources || graphProps.sources || undefined,
+    tenant_id: tenantSource ? { id: Long.fromString(tenantSource) } : undefined,
     downsampler: downsampler,
     source_aggregator: sourceAggregator,
     derivative: derivative,
@@ -92,7 +103,7 @@ interface MetricsDataProviderConnectProps {
   timeInfo: QueryTimeInfo;
   requestMetrics: typeof requestMetricsAction;
   refreshNodeSettings: typeof refreshSettings;
-  setTimeRange?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
+  setMetricsFixedWindow?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
   setTimeScale?: (ts: TimeScale) => PayloadAction<TimeScale>;
   history?: History;
 }
@@ -150,16 +161,15 @@ class MetricsDataProvider extends React.Component<
     ({ children }: MetricsDataProviderProps) => children,
     children => {
       // MetricsDataProvider should contain only one direct child.
-      const child: React.ReactElement<MetricsDataComponentProps> = React.Children.only(
-        this.props.children,
-      );
+      const child: React.ReactElement<MetricsDataComponentProps> =
+        React.Children.only(this.props.children);
       // Perform a simple DFS to find all children which are Metric objects.
       const selectors: React.ReactElement<MetricProps>[] = findChildrenOfType(
         children,
         Metric,
       );
       // Construct a query for each found selector child.
-      return _.map(selectors, s => queryFromProps(s.props, child.props));
+      return map(selectors, s => queryFromProps(s.props, child.props));
     },
   );
 
@@ -167,7 +177,7 @@ class MetricsDataProvider extends React.Component<
     (props: MetricsDataProviderProps) => props.timeInfo,
     this.queriesSelector,
     (timeInfo, queries) => {
-      if (!timeInfo) {
+      if (!timeInfo || queries.length === 0) {
         return undefined;
       }
       return new protos.cockroach.ts.tspb.TimeSeriesQueryRequest({
@@ -190,7 +200,7 @@ class MetricsDataProvider extends React.Component<
     }
     const { metrics, requestMetrics, id } = props;
     const nextRequest = metrics && metrics.nextRequest;
-    if (!nextRequest || !_.isEqual(nextRequest, request)) {
+    if (!nextRequest || !isEqual(nextRequest, request)) {
       requestMetrics(id, request);
     }
   }
@@ -214,7 +224,7 @@ class MetricsDataProvider extends React.Component<
       if (
         data &&
         request &&
-        _.isEqual(request.queries, this.requestMessage(this.props).queries)
+        isEqual(request.queries, this.requestMessage(this.props).queries)
       ) {
         return data;
       }
@@ -229,7 +239,7 @@ class MetricsDataProvider extends React.Component<
     const dataProps: MetricsDataComponentProps = {
       data: this.getData(),
       timeInfo: this.props.timeInfo,
-      setTimeRange: this.props.setTimeRange,
+      setMetricsFixedWindow: this.props.setMetricsFixedWindow,
       setTimeScale: this.props.setTimeScale,
       history: this.props.history,
       adjustTimeScaleOnChange,
@@ -244,16 +254,35 @@ class MetricsDataProvider extends React.Component<
 // timeInfoSelector converts the current global time window into a set of Long
 // timestamps, which can be sent with requests to the server.
 const timeInfoSelector = createSelector(
-  (state: AdminUIState) => state.timewindow,
-  tw => {
-    if (!_.isObject(tw.currentWindow)) {
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+  selectMetricsTime,
+  (sTTL, mTTL, metricsTime) => {
+    if (!isObject(metricsTime.currentWindow)) {
       return null;
     }
+    const { start: startMoment, end: endMoment } = metricsTime.currentWindow;
+    const start = startMoment.valueOf();
+    const end = endMoment.valueOf();
+    const syncedScale = findClosestTimeScale(
+      defaultTimeScaleOptions,
+      util.MilliToSeconds(end - start),
+    );
+    // Call adjustTimeScale to handle the case where the sample size
+    // (also known as resolution) is too small for a start and end time
+    // that is before the data's ttl.
+    const adjusted = adjustTimeScale(
+      { ...syncedScale, fixedWindowEnd: false },
+      { start: startMoment, end: endMoment },
+      sTTL,
+      mTTL,
+    );
+
     return {
-      start: Long.fromNumber(MilliToNano(tw.currentWindow.start.valueOf())),
-      end: Long.fromNumber(MilliToNano(tw.currentWindow.end.valueOf())),
+      start: Long.fromNumber(util.MilliToNano(start)),
+      end: Long.fromNumber(util.MilliToNano(end)),
       sampleDuration: Long.fromNumber(
-        MilliToNano(tw.scale.sampleSize.asMilliseconds()),
+        util.MilliToNano(adjusted.timeScale.sampleSize.asMilliseconds()),
       ),
     };
   },
@@ -265,16 +294,11 @@ const current = () => {
   now = moment(Math.floor(now.valueOf() / 10000) * 10000);
   return {
     start: Long.fromNumber(
-      MilliToNano(
-        now
-          .clone()
-          .subtract(30, "s")
-          .valueOf(),
-      ),
+      util.MilliToNano(now.clone().subtract(30, "s").valueOf()),
     ),
-    end: Long.fromNumber(MilliToNano(now.valueOf())),
+    end: Long.fromNumber(util.MilliToNano(now.valueOf())),
     sampleDuration: Long.fromNumber(
-      MilliToNano(moment.duration(10, "s").asMilliseconds()),
+      util.MilliToNano(moment.duration(10, "s").asMilliseconds()),
     ),
   };
 };

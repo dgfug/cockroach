@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -34,11 +29,13 @@ func TestLogGC(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	skip.UnderRace(t, "takes >1 min under race")
 
-	a := assert.New(t)
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	ts := s.(*TestServer)
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	a := assert.New(t)
+	ts, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	defer ts.Stopper().Stop(ctx)
+
 	const testRangeID = 10001
 	const table = "rangelog"
 
@@ -91,22 +88,28 @@ func TestLogGC(t *testing.T) {
 	logEvents(25, maxTS4)
 	a.Equal(175, rangeLogRowCount())
 
+	gc := func(ctx context.Context, table string, tsLow, tsHigh time.Time) (time.Time, int64, error) {
+		return gcSystemLog(ctx,
+			ts.SQLServerInternal().(*SQLServer),
+			"test", table, "timestamp", tsLow, tsHigh, 1000)
+	}
+
 	// GC up to maxTS1.
-	tm, rowsGCd, err := ts.GCSystemLog(ctx, table, timeutil.Unix(0, 0), maxTS1)
+	tm, rowsGCd, err := gc(ctx, table, timeutil.Unix(0, 0), maxTS1)
 	a.NoError(err)
 	a.Equal(maxTS1, tm)
 	a.True(rowsGCd >= 100, "Expected rowsGCd >= 100, found %d", rowsGCd)
 	a.Equal(75, rangeLogRowCount())
 
 	// GC exactly maxTS2.
-	tm, rowsGCd, err = ts.GCSystemLog(ctx, table, maxTS2, maxTS2)
+	tm, rowsGCd, err = gc(ctx, table, maxTS2, maxTS2)
 	a.NoError(err)
 	a.Equal(maxTS2, tm)
 	a.True(rowsGCd >= 1, "Expected rowsGCd >= 1, found %d", rowsGCd)
 	a.Equal(74, rangeLogRowCount())
 
 	// GC upto maxTS2.
-	tm, rowsGCd, err = ts.GCSystemLog(ctx, table, maxTS1, maxTS3)
+	tm, rowsGCd, err = gc(ctx, table, maxTS1, maxTS3)
 	a.NoError(err)
 	a.Equal(maxTS3, tm)
 	a.True(rowsGCd >= 49, "Expected rowsGCd >= 49, found %d", rowsGCd)
@@ -116,14 +119,14 @@ func TestLogGC(t *testing.T) {
 	a.Equal(2025, rangeLogRowCount())
 
 	// GC up to maxTS4.
-	tm, rowsGCd, err = ts.GCSystemLog(ctx, table, maxTS2, maxTS4)
+	tm, rowsGCd, err = gc(ctx, table, maxTS2, maxTS4)
 	a.NoError(err)
 	a.Equal(maxTS4, tm)
 	a.True(rowsGCd >= 25, "Expected rowsGCd >= 25, found %d", rowsGCd)
 	a.Equal(2000, rangeLogRowCount())
 
 	// GC everything.
-	tm, rowsGCd, err = ts.GCSystemLog(ctx, table, maxTS4, maxTS5)
+	tm, rowsGCd, err = gc(ctx, table, maxTS4, maxTS5)
 	a.NoError(err)
 	a.Equal(maxTS5, tm)
 	a.True(rowsGCd >= 2000, "Expected rowsGCd >= 2000, found %d", rowsGCd)
@@ -131,7 +134,7 @@ func TestLogGC(t *testing.T) {
 
 	// Ensure no errors when lowerBound > upperBound.
 	logEvents(5, maxTS6)
-	tm, rowsGCd, err = ts.GCSystemLog(ctx, table, maxTS6.Add(time.Hour), maxTS6)
+	tm, rowsGCd, err = gc(ctx, table, maxTS6.Add(time.Hour), maxTS6)
 	a.NoError(err)
 	a.Equal(maxTS6, tm)
 	a.Equal(int64(0), rowsGCd)

@@ -1,61 +1,55 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import { storiesOf, DecoratorFn } from "@storybook/react";
+import Long from "long";
+import React from "react";
+
+import statementsPagePropsFixture from "src/statementsPage/statementsPage.fixture";
 
 import {
   countBarChart,
-  rowsReadBarChart,
   bytesReadBarChart,
   latencyBarChart,
   maxMemUsageBarChart,
   networkBytesBarChart,
   retryBarChart,
 } from "./barCharts";
-import statementsPagePropsFixture from "src/statementsPage/statementsPage.fixture";
-import Long from "long";
 
-const { statements } = statementsPagePropsFixture;
+const statements =
+  statementsPagePropsFixture.statementsResponse.data.statements;
 
-const withinColumn = (width = "150px"): DecoratorFn => storyFn => {
-  const rowStyle = {
-    borderTop: "1px solid #e7ecf3",
-    borderBottom: "1px solid #e7ecf3",
+const withinColumn =
+  (width = "150px"): DecoratorFn =>
+  storyFn => {
+    const rowStyle = {
+      borderTop: "1px solid #e7ecf3",
+      borderBottom: "1px solid #e7ecf3",
+    };
+
+    const cellStyle = {
+      width: "190px",
+      padding: "10px 20px",
+    };
+
+    return (
+      <table>
+        <tbody>
+          <tr style={rowStyle}>
+            <td style={cellStyle}>
+              <div style={{ width }}>{storyFn()}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    );
   };
-
-  const cellStyle = {
-    width: "190px",
-    padding: "10px 20px",
-  };
-
-  return (
-    <table>
-      <tbody>
-        <tr style={rowStyle}>
-          <td style={cellStyle}>
-            <div style={{ width }}>{storyFn()}</div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  );
-};
 
 storiesOf("BarCharts", module)
   .add("countBarChart", () => {
     const chartFactory = countBarChart(statements);
-    return chartFactory(statements[0]);
-  })
-  .add("rowsReadBarChart", () => {
-    const chartFactory = rowsReadBarChart(statements);
     return chartFactory(statements[0]);
   })
   .add("bytesReadBarChart", () => {
@@ -83,10 +77,6 @@ storiesOf("BarCharts/within column (150px)", module)
   .addDecorator(withinColumn())
   .add("countBarChart", () => {
     const chartFactory = countBarChart(statements);
-    return chartFactory(statements[0]);
-  })
-  .add("rowsReadBarChart", () => {
-    const chartFactory = rowsReadBarChart(statements);
     return chartFactory(statements[0]);
   })
   .add("bytesReadBarChart", () => {

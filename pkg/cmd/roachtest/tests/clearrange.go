@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -20,8 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
 func registerClearRange(r registry.Registry) {
@@ -32,59 +27,63 @@ func registerClearRange(r registry.Registry) {
 			Owner: registry.OwnerStorage,
 			// 5h for import, 90 for the test. The import should take closer
 			// to <3:30h but it varies.
-			Timeout: 5*time.Hour + 90*time.Minute,
-			Cluster: r.MakeClusterSpec(10, spec.CPU(16)),
-			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				runClearRange(ctx, t, c, checks)
-			},
-		})
-
-		// Using a separate clearrange test on zfs instead of randomly
-		// using the same test, cause the Timeout might be different,
-		// and may need to be tweaked.
-		r.Add(registry.TestSpec{
-			Name:  fmt.Sprintf(`clearrange/zfs/checks=%t`, checks),
-			Skip:  "Consistently failing. See #70306 and #68420 for context.",
-			Owner: registry.OwnerStorage,
-			// 5h for import, 120 for the test. The import should take closer
-			// to <3:30h but it varies.
-			Timeout: 5*time.Hour + 120*time.Minute,
-			Cluster: r.MakeClusterSpec(10, spec.CPU(16), spec.SetFileSystem(spec.Zfs)),
+			Timeout:          5*time.Hour + 90*time.Minute,
+			Cluster:          r.MakeClusterSpec(10, spec.CPU(16)),
+			CompatibleClouds: registry.AllExceptAWS,
+			Suites:           registry.Suites(registry.Nightly),
+			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runClearRange(ctx, t, c, checks)
 			},
 		})
 	}
+	// Using a separate clearrange test on zfs instead of randomly
+	// using the same test, cause the Timeout might be different,
+	// and may need to be tweaked.
+	r.Add(registry.TestSpec{
+		Name:  `clearrange/zfs/checks=true`,
+		Owner: registry.OwnerStorage,
+		// 5h for import, 120 for the test. The import should take closer
+		// to <3:30h but it varies.
+		Timeout:           5*time.Hour + 120*time.Minute,
+		Cluster:           r.MakeClusterSpec(10, spec.CPU(16), spec.SetFileSystem(spec.Zfs)),
+		CompatibleClouds:  registry.OnlyGCE,
+		Suites:            registry.Suites(registry.Nightly),
+		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runClearRange(ctx, t, c, true /* checks */)
+		},
+	})
 }
 
 func runClearRange(ctx context.Context, t test.Test, c cluster.Cluster, aggressiveChecks bool) {
-	// Randomize starting with encryption-at-rest enabled.
-	c.EncryptAtRandom(true)
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-
 	t.Status("restoring fixture")
-	c.Start(ctx)
-
-	// NB: on a 10 node cluster, this should take well below 3h.
-	tBegin := timeutil.Now()
-	c.Run(ctx, c.Node(1), "./cockroach", "workload", "fixtures", "import", "bank",
-		"--payload-bytes=10240", "--ranges=10", "--rows=65104166", "--seed=4", "--db=bigbank")
-	t.L().Printf("import took %.2fs", timeutil.Since(tBegin).Seconds())
-	c.Stop(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+	m := c.NewMonitor(ctx)
+	m.Go(func(ctx context.Context) error {
+		// NB: on a 10 node cluster, this should take well below 3h.
+		tBegin := timeutil.Now()
+		c.Run(ctx, option.WithNodes(c.Node(1)), "./cockroach", "workload", "fixtures", "import", "bank",
+			"--payload-bytes=10240", "--ranges=10", "--rows=65104166", "--seed=4", "--db=bigbank", "{pgurl:1}")
+		t.L().Printf("import took %.2fs", timeutil.Since(tBegin).Seconds())
+		return nil
+	})
+	m.Wait()
+	c.Stop(ctx, t.L(), option.DefaultStopOpts())
 	t.Status()
 
-	var opts []option.Option
+	settings := install.MakeClusterSettings()
 	if aggressiveChecks {
 		// Run with an env var that runs a synchronous consistency check after each rebalance and merge.
 		// This slows down merges, so it might hide some races.
 		//
 		// NB: the below invocation was found to actually make it to the server at the time of writing.
-		opts = append(opts, option.StartArgs(
-			"--env", "COCKROACH_CONSISTENCY_AGGRESSIVE=true",
-			"--env", "COCKROACH_ENFORCE_CONSISTENT_STATS=true",
-		))
+		settings.Env = append(settings.Env, "COCKROACH_CONSISTENCY_AGGRESSIVE=true")
 	}
-	c.Start(ctx, opts...)
+
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings)
+	m = c.NewMonitor(ctx)
 
 	// Also restore a much smaller table. We'll use it to run queries against
 	// the cluster after having dropped the large table above, verifying that
@@ -92,37 +91,31 @@ func runClearRange(ctx context.Context, t test.Test, c cluster.Cluster, aggressi
 	t.Status(`restoring tiny table`)
 	defer t.WorkerStatus()
 
-	if t.BuildVersion().AtLeast(version.MustParse("v19.2.0")) {
-		conn := c.Conn(ctx, 1)
-		if _, err := conn.ExecContext(ctx, `SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 8`); err != nil {
-			t.Fatal(err)
-		}
-		conn.Close()
-	}
-
 	// Use a 120s connect timeout to work around the fact that the server will
 	// declare itself ready before it's actually 100% ready. See:
 	// https://github.com/cockroachdb/cockroach/issues/34897#issuecomment-465089057
-	c.Run(ctx, c.Node(1), `COCKROACH_CONNECT_TIMEOUT=120 ./cockroach sql --insecure -e "DROP DATABASE IF EXISTS tinybank"`)
-	c.Run(ctx, c.Node(1), "./cockroach", "workload", "fixtures", "import", "bank", "--db=tinybank",
-		"--payload-bytes=100", "--ranges=10", "--rows=800", "--seed=1")
+	c.Run(ctx, option.WithNodes(c.Node(1)), `COCKROACH_CONNECT_TIMEOUT=120 ./cockroach sql --url={pgurl:1} -e "DROP DATABASE IF EXISTS tinybank"`)
+	c.Run(ctx, option.WithNodes(c.Node(1)), "./cockroach", "workload", "fixtures", "import", "bank", "--db=tinybank",
+		"--payload-bytes=100", "--ranges=10", "--rows=800", "--seed=1", "{pgurl:1}")
 
 	t.Status()
 
 	// Set up a convenience function that we can call to learn the number of
 	// ranges for the bigbank.bank table (even after it's been dropped).
 	numBankRanges := func() func() int {
-		conn := c.Conn(ctx, 1)
+		conn := c.Conn(ctx, t.L(), 1)
 		defer conn.Close()
 
 		var startHex string
 		if err := conn.QueryRow(
-			`SELECT to_hex(start_key) FROM crdb_internal.ranges_no_leases WHERE database_name = 'bigbank' AND table_name = 'bank' ORDER BY start_key ASC LIMIT 1`,
+			`SELECT to_hex(raw_start_key)
+FROM [SHOW RANGES FROM TABLE bigbank.bank WITH KEYS]
+ORDER BY raw_start_key ASC LIMIT 1`,
 		).Scan(&startHex); err != nil {
 			t.Fatal(err)
 		}
 		return func() int {
-			conn := c.Conn(ctx, 1)
+			conn := c.Conn(ctx, t.L(), 1)
 			defer conn.Close()
 			var n int
 			if err := conn.QueryRow(
@@ -134,14 +127,13 @@ func runClearRange(ctx context.Context, t test.Test, c cluster.Cluster, aggressi
 		}
 	}()
 
-	m := c.NewMonitor(ctx)
 	m.Go(func(ctx context.Context) error {
-		c.Run(ctx, c.Node(1), `./cockroach workload init kv`)
-		c.Run(ctx, c.All(), `./cockroach workload run kv --concurrency=32 --duration=1h`)
+		c.Run(ctx, option.WithNodes(c.Node(1)), `./cockroach workload init kv {pgurl:1}`)
+		c.Run(ctx, option.WithNodes(c.All()), fmt.Sprintf(`./cockroach workload run kv --concurrency=32 --duration=1h --tolerate-errors {pgurl%s}`, c.All()))
 		return nil
 	})
 	m.Go(func(ctx context.Context) error {
-		conn := c.Conn(ctx, 1)
+		conn := c.Conn(ctx, t.L(), 1)
 		defer conn.Close()
 
 		if _, err := conn.ExecContext(ctx, `SET CLUSTER SETTING kv.range_merge.queue_enabled = true`); err != nil {
@@ -194,7 +186,7 @@ func runClearRange(ctx context.Context, t test.Test, c cluster.Cluster, aggressi
 				return err
 			}
 
-			t.WorkerStatus("waiting for ~", curBankRanges, " merges to complete (and for at least ", timeutil.Since(deadline), " to pass)")
+			t.WorkerStatus("waiting for ~", curBankRanges, " merges to complete (and for at least ", timeutil.Until(deadline), " to pass)")
 			select {
 			case <-after:
 			case <-ctx.Done():

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -29,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster/tc"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -243,7 +238,7 @@ func (a *allocSim) rangeInfo() allocStats {
 	for i := 0; i < len(a.Nodes); i++ {
 		go func(i int) {
 			defer wg.Done()
-			status := a.Nodes[i].StatusClient()
+			status := a.Nodes[i].StatusClient(context.Background())
 			if status == nil {
 				// Cluster is shutting down.
 				return
@@ -403,7 +398,7 @@ func handleStart() bool {
 	// in the few minutes after allocsim starts up causes it to take a long time
 	// for leases to settle onto other nodes even when requests are skewed heavily
 	// onto them.
-	kvserver.MinLeaseTransferStatsDuration = 10 * time.Second
+	allocatorimpl.MinLeaseTransferStatsDuration = 10 * time.Second
 
 	cli.Main()
 	return true
@@ -538,13 +533,15 @@ func main() {
 		os.Exit(exitStatus)
 	}()
 
+	for i := 0; i < c.Cfg.NumNodes; i++ {
+		cfg := c.Cfg.PerNodeCfg[i]
+		cfg.ExtraEnv = append(cfg.ExtraEnv, "COCKROACH_DISABLE_RAFT_LOG_SYNCHRONIZATION_UNSAFE=true")
+		c.Cfg.PerNodeCfg[i] = cfg
+	}
+
 	c.Start(context.Background())
 	defer c.Close()
 	c.UpdateZoneConfig(1, 1<<20)
-	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = true")
-	if err != nil {
-		log.Fatalf(context.Background(), "%v", err)
-	}
 	if len(config.Localities) != 0 {
 		a.runWithConfig(config)
 	} else {

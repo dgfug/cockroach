@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,8 +12,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -87,23 +83,22 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Configure the fetcher, which is only used to decode the returned keys from
-	// the DeleteRange, and is never used to actually fetch kvs.
-	table := row.FetcherTableArgs{
-		Desc:  d.desc,
-		Index: d.desc.GetPrimaryIndex(),
+	// Configure the fetcher, which is only used to decode the returned keys
+	// from the Del and the DelRange operations, and is never used to actually
+	// fetch kvs.
+	var spec fetchpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(
+		&spec, params.ExecCfg().Codec, d.desc, d.desc.GetPrimaryIndex(), nil, /* columnIDs */
+	); err != nil {
+		return err
 	}
 	if err := d.fetcher.Init(
 		params.ctx,
-		params.ExecCfg().Codec,
-		false, /* reverse */
-		descpb.ScanLockingStrength_FOR_NONE,
-		descpb.ScanLockingWaitPolicy_BLOCK,
-		0,     /* lockTimeout */
-		false, /* isCheck */
-		params.p.alloc,
-		nil, /* memMonitor */
-		table,
+		row.FetcherInitArgs{
+			WillUseKVProvider: true,
+			Alloc:             &tree.DatumAlloc{},
+			Spec:              &spec,
+		},
 	); err != nil {
 		return err
 	}
@@ -121,7 +116,9 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 			b := params.p.txn.NewBatch()
 			b.Header.MaxSpanRequestKeys = row.TableTruncateChunkSize
 			b.Header.LockTimeout = params.SessionData().LockTimeout
+			b.Header.DeadlockTimeout = params.SessionData().DeadlockTimeout
 			d.deleteSpans(params, b, spans)
+			log.VEventf(ctx, 2, "fast delete: processing %d spans", len(spans))
 			if err := params.p.txn.Run(ctx, b); err != nil {
 				return row.ConvertBatchError(ctx, d.desc, b)
 			}
@@ -142,7 +139,9 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 		// keys to delete in this command are low, so we're made safe.
 		b := params.p.txn.NewBatch()
 		b.Header.LockTimeout = params.SessionData().LockTimeout
+		b.Header.DeadlockTimeout = params.SessionData().DeadlockTimeout
 		d.deleteSpans(params, b, spans)
+		log.VEventf(ctx, 2, "fast delete: processing %d spans and committing", len(spans))
 		if err := params.p.txn.CommitInBatch(ctx, b); err != nil {
 			return row.ConvertBatchError(ctx, d.desc, b)
 		}
@@ -160,15 +159,23 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 	return nil
 }
 
-// deleteSpans adds each input span to a DelRange command in the given batch.
+// deleteSpans adds each input span to a Del or a DelRange command in the given
+// batch.
 func (d *deleteRangeNode) deleteSpans(params runParams, b *kv.Batch, spans roachpb.Spans) {
 	ctx := params.ctx
 	traceKV := params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 	for _, span := range spans {
-		if traceKV {
-			log.VEventf(ctx, 2, "DelRange %s - %s", span.Key, span.EndKey)
+		if span.EndKey == nil {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", span.Key)
+			}
+			b.Del(span.Key)
+		} else {
+			if traceKV {
+				log.VEventf(ctx, 2, "DelRange %s - %s", span.Key, span.EndKey)
+			}
+			b.DelRange(span.Key, span.EndKey, true /* returnKeys */)
 		}
-		b.DelRange(span.Key, span.EndKey, true /* returnKeys */)
 	}
 }
 
@@ -187,12 +194,9 @@ func (d *deleteRangeNode) processResults(
 				continue
 			}
 
-			after, ok, _, err := d.fetcher.ReadIndexKey(keyBytes)
+			after, _, err := d.fetcher.DecodeIndexKey(keyBytes)
 			if err != nil {
 				return nil, err
-			}
-			if !ok {
-				return nil, errors.AssertionFailedf("key did not match descriptor")
 			}
 			k := keyBytes[:len(keyBytes)-len(after)]
 			if !bytes.Equal(k, prev) {

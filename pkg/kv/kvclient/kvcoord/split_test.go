@@ -1,14 +1,9 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-package kvcoord
+package kvcoord_test
 
 import (
 	"context"
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -31,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // startTestWriter creates a writer which initiates a sequence of
@@ -107,7 +104,11 @@ func TestRangeSplitMeta(t *testing.T) {
 	for _, splitRKey := range splitKeys {
 		splitKey := roachpb.Key(splitRKey)
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+		if err := s.DB.AdminSplit(
+			ctx,
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			t.Fatal(err)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -115,7 +116,7 @@ func TestRangeSplitMeta(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		if _, err := storage.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, hlc.MaxTimestamp, storage.MVCCScanOptions{}); err != nil {
-			return errors.Errorf("failed to verify no dangling intents: %s", err)
+			return errors.Wrap(err, "failed to verify no dangling intents")
 		}
 		return nil
 	})
@@ -154,7 +155,11 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 			<-txnChannel
 		}
 		log.Infof(ctx, "starting split at key %q...", splitKey)
-		if pErr := s.DB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); pErr != nil {
+		if pErr := s.DB.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); pErr != nil {
 			t.Error(pErr)
 		}
 		log.Infof(ctx, "split at key %q complete", splitKey)
@@ -188,7 +193,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 			DisableScanner: true,
 		},
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), InitFactoryForLocalTestCluster)
+	s.Start(t, kvcoord.InitFactoryForLocalTestCluster)
 
 	// This is purely to silence log spam.
 	config.TestingSetupZoneConfigHook(s.Stopper())
@@ -208,7 +213,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 		// Scan the txn records.
 		rows, err := s.DB.Scan(ctx, keys.Meta2Prefix, keys.MetaMax, 0)
 		if err != nil {
-			return errors.Errorf("failed to scan meta2 keys: %s", err)
+			return errors.Wrap(err, "failed to scan meta2 keys")
 		}
 		if lr := len(rows); lr < 5 {
 			return errors.Errorf("expected >= 5 scans; got %d", lr)
@@ -227,7 +232,7 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// asynchronous split.
 	testutils.SucceedsSoon(t, func() error {
 		if _, err := storage.MVCCScan(ctx, s.Eng, keys.LocalMax, roachpb.KeyMax, hlc.MaxTimestamp, storage.MVCCScanOptions{}); err != nil {
-			return errors.Errorf("failed to verify no dangling intents: %s", err)
+			return errors.Wrap(err, "failed to verify no dangling intents")
 		}
 		return nil
 	})
@@ -249,20 +254,28 @@ func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 
 	splitKey := roachpb.Key("aa")
 	log.Infof(ctx, "starting split at key %q...", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 	log.Infof(ctx, "split at key %q first time complete", splitKey)
-	if err := s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey,
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 }
 
 // TestSplitStickyBit checks that the sticky bit is set when performing a manual
 // split. There are two cases to consider:
-// 1. Range is split so sticky bit is updated on RHS.
-// 2. Range is already split and split key is the start key of a range, so update
-//    the sticky bit of that range, but no range is split.
+//  1. Range is split so sticky bit is updated on RHS.
+//  2. Range is already split and split key is the start key of a range, so update
+//     the sticky bit of that range, but no range is split.
 func TestRangeSplitsStickyBit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -278,7 +291,11 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 	descKey := keys.RangeDescriptorKey(splitKey)
 
 	// Splitting range.
-	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey.AsRawKey(),
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +305,7 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if desc.GetStickyBit().IsEmpty() {
+	if desc.StickyBit.IsEmpty() {
 		t.Fatal("Sticky bit not set after splitting")
 	}
 
@@ -297,8 +314,21 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Ensure the sticky bit was removed.
+	err = s.DB.GetProto(ctx, descKey, &desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !desc.StickyBit.IsEmpty() {
+		t.Fatal("Sticky bit not unset after unsplitting")
+	}
+
 	// Splitting range.
-	if err := s.DB.AdminSplit(ctx, splitKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := s.DB.AdminSplit(
+		ctx,
+		splitKey.AsRawKey(),
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -307,7 +337,53 @@ func TestRangeSplitsStickyBit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if desc.GetStickyBit().IsEmpty() {
+	if desc.StickyBit.IsEmpty() {
 		t.Fatal("Sticky bit not set after splitting")
 	}
+
+	// TODO(arul): we should add something to ensure that the sticky bit is updated
+	// in the in-memory descriptor as well. See the comment on updateRangeDescriptor.
+	// As is, the test wouldn't catch if the StickyBitTrigger wasn't run in
+	// splitTxnStickyUpdateAttempt.
+}
+
+func TestSplitPredicates(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s := createTestDBWithKnobs(t, &kvserver.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		DisableMergeQueue: true,
+	})
+	defer s.Stop()
+
+	ctx := context.Background()
+
+	expire := hlc.MaxTimestamp
+
+	// Setup a known-span range [c, g) for some simple single predicate checks.
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("b"), expire))
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("g"), expire))
+	// c is below split key f, and is in [b, g).
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("f"), expire, roachpb.Key("c")))
+	// e is above split key d, and is in [b, f).
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("d"), expire, roachpb.Key("e")))
+	// b is above split key c, and is in [b, d) although just barely.
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("c"), expire, roachpb.Key("b")))
+
+	// Setup another known span [g, n) and test rejections with it.
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("n"), expire))
+
+	// Reject split at h that wanted b to be in range [g, n).
+	require.Error(t, s.DB.AdminSplit(ctx, roachpb.Key("h"), expire, roachpb.Key("b")))
+	// Reject split at h that wanted i, j, and z to be in range [g, n).
+	require.Error(t, s.DB.AdminSplit(ctx, roachpb.Key("h"), expire, roachpb.Key("i"), roachpb.Key("j"), roachpb.Key("z")))
+	// Reject split at h that wanted i, j, and n to be in range [g, n).
+	require.Error(t, s.DB.AdminSplit(ctx, roachpb.Key("h"), expire, roachpb.Key("i"), roachpb.Key("j"), roachpb.Key("n")))
+	// Reject split at h that wanted i, n and j to be in range [g, n).
+	require.Error(t, s.DB.AdminSplit(ctx, roachpb.Key("h"), expire, roachpb.Key("i"), roachpb.Key("n"), roachpb.Key("j")))
+
+	// Allow split at h that wanted i, k and j to be in range [g, n).
+	require.NoError(t, s.DB.AdminSplit(ctx, roachpb.Key("h"), expire, roachpb.Key("i"), roachpb.Key("k"), roachpb.Key("j")))
 }

@@ -1,253 +1,289 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package settings
 
 import (
 	"context"
 	"fmt"
-	"strings"
-	"sync/atomic"
-
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-// MaxSettings is the maximum number of settings that the system supports.
-// Exported for tests.
-const MaxSettings = 512
-
-// Values is a container that stores values for all registered settings.
-// Each setting is assigned a unique slot (up to MaxSettings).
-// Note that slot indices are 1-based (this is to trigger panics if an
-// uninitialized slot index is used).
-type Values struct {
-	container valuesContainer
-
-	overridesMu struct {
-		syncutil.Mutex
-		// defaultOverrides maintains the set of overridden default values (see
-		// Override()).
-		defaultOverrides valuesContainer
-		// setOverrides is the list of slots with values in defaultOverrides.
-		setOverrides map[int]struct{}
-	}
-
-	changeMu struct {
-		syncutil.Mutex
-		// NB: any in place modification to individual slices must also hold the
-		// lock, e.g. if we ever add RemoveOnChange or something.
-		onChange [MaxSettings][]func(ctx context.Context)
-	}
-	// opaque is an arbitrary object that can be set by a higher layer to make it
-	// accessible from certain callbacks (like state machine transformers).
-	opaque interface{}
-}
-
-type valuesContainer struct {
-	intVals     [MaxSettings]int64
-	genericVals [MaxSettings]atomic.Value
-}
-
-func (c *valuesContainer) setGenericVal(slotIdx int, newVal interface{}) {
-	c.genericVals[slotIdx].Store(newVal)
-}
-
-func (c *valuesContainer) setInt64Val(slotIdx int, newVal int64) bool {
-	return atomic.SwapInt64(&c.intVals[slotIdx], newVal) != newVal
-}
-
-var (
-	canonicalValues atomic.Value
-)
-
-// TODO is usable at callsites that do not have *settings.Values available.
-// Please don't use this.
-func TODO() *Values {
-	if ptr := canonicalValues.Load(); ptr != nil {
-		return ptr.(*Values)
-	}
-	return nil
-}
-
-// SetCanonicalValuesContainer sets the Values container that will be refreshed
-// at runtime -- ideally we should have no other *Values containers floating
-// around, as they will be stale / lies.
-func SetCanonicalValuesContainer(v *Values) {
-	canonicalValues.Store(v)
-}
-
-type testOpaqueType struct{}
-
-// TestOpaque can be passed to Values.Init when we are testing the settings
-// infrastructure.
-var TestOpaque interface{} = testOpaqueType{}
-
-// Init must be called before using a Values instance; it initializes all
-// variables to their defaults.
+// SettingName represents the user-visible name of a cluster setting.
+// The name is suitable for:
+// - SHOW/SET CLUSTER SETTING.
+// - inclusion in error messages.
 //
-// The opaque argument can be retrieved later via Opaque().
-func (sv *Values) Init(ctx context.Context, opaque interface{}) {
-	sv.opaque = opaque
-	for _, s := range registry {
-		s.setToDefault(ctx, sv)
-	}
-}
+// For internal storage, use the InternalKey type instead.
+type SettingName string
 
-// Opaque returns the argument passed to Init.
-func (sv *Values) Opaque() interface{} {
-	return sv.opaque
-}
+// InternalKey is the internal (storage) key for a cluster setting.
+// The internal key is suitable for use with:
+// - direct accesses to system.settings.
+// - rangefeed logic associated with system.settings.
+// - (in unit tests only) interchangeably with the name for SET CLUSTER SETTING.
+//
+// For user-visible displays, use the SettingName type instead.
+type InternalKey string
 
-func (sv *Values) settingChanged(ctx context.Context, slotIdx int) {
-	sv.changeMu.Lock()
-	funcs := sv.changeMu.onChange[slotIdx-1]
-	sv.changeMu.Unlock()
-	for _, fn := range funcs {
-		fn(ctx)
-	}
-}
-
-func (c *valuesContainer) getInt64(slotIdx int) int64 {
-	return atomic.LoadInt64(&c.intVals[slotIdx-1])
-}
-
-func (c *valuesContainer) getGeneric(slotIdx int) interface{} {
-	return c.genericVals[slotIdx-1].Load()
-}
-
-func (sv *Values) setInt64(ctx context.Context, slotIdx int, newVal int64) {
-	if sv.container.setInt64Val(slotIdx-1, newVal) {
-		sv.settingChanged(ctx, slotIdx)
-	}
-}
-
-// setDefaultOverrideInt64 overrides the default value for the respective
-// setting to newVal.
-func (sv *Values) setDefaultOverrideInt64(slotIdx int, newVal int64) {
-	sv.overridesMu.Lock()
-	defer sv.overridesMu.Unlock()
-	sv.overridesMu.defaultOverrides.setInt64Val(slotIdx-1, newVal)
-	sv.setDefaultOverrideLocked(slotIdx)
-}
-
-// setDefaultOverrideLocked marks slotIdx-1 as having an overridden default value.
-func (sv *Values) setDefaultOverrideLocked(slotIdx int) {
-	if sv.overridesMu.setOverrides == nil {
-		sv.overridesMu.setOverrides = make(map[int]struct{})
-	}
-	sv.overridesMu.setOverrides[slotIdx-1] = struct{}{}
-}
-
-// getDefaultOverrides checks whether there's a default override for slotIdx-1.
-// If there isn't, the first ret val is false. Otherwise, the first ret val is
-// true, the second is the int64 override and the last is a pointer to the
-// generic value override. Callers are expected to only use the override value
-// corresponding to their setting type.
-func (sv *Values) getDefaultOverride(slotIdx int) (bool, int64, *atomic.Value) {
-	slotIdx--
-	sv.overridesMu.Lock()
-	defer sv.overridesMu.Unlock()
-	if _, ok := sv.overridesMu.setOverrides[slotIdx]; !ok {
-		return false, 0, nil
-	}
-	return true,
-		sv.overridesMu.defaultOverrides.intVals[slotIdx],
-		&sv.overridesMu.defaultOverrides.genericVals[slotIdx]
-}
-
-func (sv *Values) setGeneric(ctx context.Context, slotIdx int, newVal interface{}) {
-	sv.container.setGenericVal(slotIdx-1, newVal)
-	sv.settingChanged(ctx, slotIdx)
-}
-
-func (sv *Values) getInt64(slotIdx int) int64 {
-	return sv.container.getInt64(slotIdx)
-}
-
-func (sv *Values) getGeneric(slotIdx int) interface{} {
-	return sv.container.getGeneric(slotIdx)
-}
-
-// setOnChange installs a callback to be called when a setting's value changes.
-// `fn` should avoid doing long-running or blocking work as it is called on the
-// goroutine which handles all settings updates.
-func (sv *Values) setOnChange(slotIdx int, fn func(ctx context.Context)) {
-	sv.changeMu.Lock()
-	sv.changeMu.onChange[slotIdx-1] = append(sv.changeMu.onChange[slotIdx-1], fn)
-	sv.changeMu.Unlock()
-}
-
-// Setting is a descriptor for each setting; once it is initialized, it is
-// immutable. The values for the settings are stored separately, in
-// Values. This way we can have a global set of registered settings, each
-// with potentially multiple instances.
+// Setting is the interface exposing the metadata for a cluster setting.
+//
+// The values for the settings are stored separately in Values. This allows
+// having a global (singleton) settings registry while allowing potentially
+// multiple "instances" (values) for each setting (e.g. for multiple test
+// servers in the same process).
 type Setting interface {
+	// Class returns the scope of the setting in multi-tenant scenarios.
+	Class() Class
+
+	// InternalKey returns the internal key used to store the setting.
+	// To display the name of the setting (eg. in errors etc) or the
+	// SET/SHOW CLUSTER SETTING statements, use the Name() method instead.
+	//
+	// The internal key is suitable for use with:
+	// - direct accesses to system.settings.
+	// - rangefeed logic associated with system.settings.
+	// - (in unit tests only) interchangeably with the name for SET CLUSTER SETTING.
+	InternalKey() InternalKey
+
+	// Name is the user-visible (display) name of the setting.
+	// The name is suitable for:
+	// - SHOW/SET CLUSTER SETTING.
+	// - inclusion in error messages.
+	Name() SettingName
+
 	// Typ returns the short (1 char) string denoting the type of setting.
 	Typ() string
+
 	// String returns the string representation of the setting's current value.
 	// It's used when materializing results for `SHOW CLUSTER SETTINGS` or `SHOW
 	// CLUSTER SETTING <setting-name>`.
+	//
+	// If this object implements a non-reportable setting that was retrieved for
+	// reporting (see LookupForReportingByKey), String hides the actual value.
 	String(sv *Values) string
+
+	// DefaultString returns the default value for the setting as a string. This
+	// is the same as calling String on the setting when it was never set.
+	DefaultString() string
+
 	// Description contains a helpful text explaining what the specific cluster
 	// setting is for.
 	Description() string
-	// Visibility controls whether or not the setting is made publicly visible.
-	// Reserved settings are still accessible to users, but they don't get
-	// listed out when retrieving all settings.
+
+	// Visibility returns whether the setting is made publicly visible. Reserved
+	// settings are still accessible to users, but they don't get listed out when
+	// retrieving all settings.
 	Visibility() Visibility
 
-	// SystemOnly indicates if a setting is only applicable to the system tenant.
-	SystemOnly() bool
+	// IsUnsafe returns whether the setting is unsafe, and thus requires
+	// a special interlock to set.
+	IsUnsafe() bool
+
+	// ValueOrigin returns the origin of the current value.
+	ValueOrigin(ctx context.Context, sv *Values) ValueOrigin
 }
 
-// WritableSetting is the exported interface of non-masked settings.
-type WritableSetting interface {
+// NonMaskedSetting is the exported interface of non-masked settings. A
+// non-masked setting provides access to the current value (even if the setting
+// is not reportable).
+//
+// A non-masked setting must not be used in the context of reporting values (see
+// LookupForReportingByKey).
+type NonMaskedSetting interface {
 	Setting
 
 	// Encoded returns the encoded representation of the current value of the
 	// setting.
 	Encoded(sv *Values) string
+
 	// EncodedDefault returns the encoded representation of the default value of
 	// the setting.
 	EncodedDefault() string
+
+	// DecodeToString returns the string representation of the provided
+	// encoded value.
+	// This is analogous to loading the setting from storage and
+	// then calling String() on it, however the setting is not modified.
+	// The string representation of the default value can be obtained
+	// by calling EncodedDefault() and then DecodeToString().
+	DecodeToString(encoded string) (repr string, err error)
+
 	// SetOnChange installs a callback to be called when a setting's value
 	// changes. `fn` should avoid doing long-running or blocking work as it is
 	// called on the goroutine which handles all settings updates.
 	SetOnChange(sv *Values, fn func(ctx context.Context))
+
 	// ErrorHint returns a hint message to be displayed to the user when there's
 	// an error.
 	ErrorHint() (bool, string)
 }
 
-type extendedSetting interface {
-	WritableSetting
+// Class describes the scope of a setting under cluster
+// virtualization.
+//
+// Guidelines for choosing a class:
+//
+//   - Make sure to read the descriptions below carefully to
+//     understand the differences in semantics.
+//
+//   - Rules of thumb:
+//
+//     1. if an end-user may benefit from modifying the setting
+//     through a SQL connection to a secondary tenant / virtual
+//     cluster, AND different virtual clusters should be able to use
+//     different values, the setting should have class
+//     ApplicationLevel.
+//
+//     2. if a setting should only be controlled by SREs in a
+//     multi-tenant deployment or in an organization that wishes to
+//     shield DB operations from application development, OR the
+//     behavior of CockroachDB is not well-defined if multiple tenants
+//     (virtual clusters) use different values concurrently, the
+//     setting must *not* use class ApplicationLevel.
+//
+//     3. if and only if a setting relevant to the KV/storage layer
+//     and whose value is shared across all virtual clusters is ever
+//     accessed by code in the application layer (SQL execution or
+//     HTTP handlers), use SystemVisible.
+//
+//     4. in other cases, use SystemOnly.
+type Class int8
 
-	isRetired() bool
-	setToDefault(ctx context.Context, sv *Values)
-	setDescription(desc string)
-	setSlotIdx(slotIdx int)
-	getSlotIdx() int
-	// isReportable indicates whether the value of the setting can be
-	// included in user-facing reports such as that produced by SHOW ALL
-	// CLUSTER SETTINGS.
-	// This only affects reports though; direct access is unconstrained.
-	// For example, `enterprise.license` is non-reportable:
-	// it cannot be listed, but can be accessed with `SHOW CLUSTER
-	// SETTING enterprise.license` or SET CLUSTER SETTING.
-	isReportable() bool
-}
+const (
+	// SystemOnly settings are specific to the KV/storage layer and
+	// cannot be accessed from application layer code (in particular not
+	// from SQL layer nor HTTP handlers).
+	//
+	// As a rule of thumb, use this class if:
+	//
+	//   - the setting may be accessed from the shared KV/storage layer;
+	//
+	//   - AND, the setting should only be controllable by SREs (not
+	//     end-users) in a multi-tenant environment, AND the behavior
+	//     of CockroachDB is not well-defined if different virtual
+	//     clusters were to use different values concurrently.
+	//
+	//     (If this part of the condition does not hold, consider
+	//     ApplicationLevel instead.)
+	//
+	//   - AND, its value is never needed in the application layer (i.e.
+	//     it is not read from SQL code, HTTP handlers or other code
+	//     that would run in SQL pods in a multi-tenant environment).
+	//
+	//     (If this part of the condition does not hold, consider
+	//     SystemVisible instead.)
+	//
+	//     Note: if a setting is only ever accessed in the SQL code
+	//     after it has ascertained that it was running for the system
+	//     interface; and we do not wish to display this setting in the
+	//     list displayed by `SHOW ALL CLUSTER SETTINGS` in virtual
+	//     clusters, the class SystemOnly is suitable. Hence the emphasis
+	//     on "would run in SQL pods" above.
+	SystemOnly Class = iota
 
-// Visibility describes how a user should feel confident that
-// they can customize the setting.  See the constant definitions below
-// for details.
-type Visibility int
+	// SystemVisible settings are specific to the KV/storage layer and
+	// are also visible to virtual clusters.
+	//
+	// As a rule of thumb, use this class if:
+	//
+	//   - the setting may be accessed from the shared KV/storage layer;
+	//
+	//   - AND the setting should only be controllable by operators of
+	//     the storage cluster (e.g. SREs in the case of a multi-tenant
+	//     environment) but having the storage cluster's value be
+	//     observable by virtual clusters is desirable.
+	//
+	//     (If this part of the condition does not hold, consider
+	//     ApplicationLevel instead.)
+	//
+	//   - AND, its value is sometimes needed in the application layer
+	//     (i.e. it may be read from SQL code, HTTP handlers or other
+	//     code that could run in SQL pods in a multi-tenant environment).
+	//
+	//     (If this part of the condition does not hold, consider
+	//     SystemOnly instead.)
+	//
+	// One use cases is to enable optimizations in the KV client side of
+	// virtual cluster RPCs. For example, if the storage layer uses a
+	// setting to decide the size of a response, making the setting
+	// visible enables the client in virtual cluster code to
+	// pre-allocate response buffers to match the size they expect to
+	// receive.
+	//
+	// Another use case is KV/storage feature flags, to enable a UX
+	// improvement in virtual clusters by avoiding requesting
+	// storage-level functionality when it is not enabled, such as
+	// rangefeeds and provide a better error message.
+	// (Without this extra logic, the error reported by KV/storage
+	// might be hard to read by end-users.)
+	//
+	// As a reminder, the setting values observed by a virtual cluster,
+	// both for its own application settings and those it observes for
+	// system-visible settings, can be overridden using ALTER VIRTUAL
+	// CLUSTER SET CLUSTER SETTING. This can be used during e.g.
+	// troubleshooting, to allow changing the observed value for a
+	// virtual cluster without a code change.
+	//
+	// A setting that is expected to be overridden in regular operation
+	// to to control application-level behavior is still an application
+	// setting, and should use the application class; system-visible is
+	// for use by settings that control the storage layer but need to be
+	// visible, rather than for settings that control the application
+	// layer but are intended to be read-only. This latter case should
+	// use ApplicationLayer, because it controls application behavior,
+	// and then rely on an override to prevent modification from within
+	// the virtual cluster.
+	SystemVisible
+
+	// ApplicationLevel settings are readable and can optionally be
+	// modified by virtual clusters.
+	//
+	// As a rule of thumb, use this class if:
+	//
+	//   - the setting is never accessed by the shared KV/storage layer;
+	//
+	//   - AND, any of the following holds:
+	//
+	//     - end-users may benefit from modifying the setting
+	//       through a SQL connection to a secondary tenant / virtual
+	//       cluster.
+	//
+	//       (If this part of the condition does not hold, but the other
+	//       part of the condition below does hold, consider still using
+	//       ApplicationLevel and force an override using ALTER VIRTUAL
+	//       CLUSTER SET CLUSTER SETTING. This makes the
+	//       ApplicationLevel setting effectively read-only from the
+	//       virtual cluster's perspective, because system overrides
+	//       cannot be modified by the virtual cluster.)
+	//
+	//     - OR, different virtual clusters should be able to
+	//       use different values for the setting.
+	//
+	//       (If this part of the condition does not hold, consider
+	//       SystemOnly or SystemVisible instead.)
+	//
+	// Note that each SQL layer has its own copy of ApplicationLevel
+	// settings; including the system tenant/interface. However, they
+	// are neatly partitioned such that a given virtual cluster can
+	// never observe the value set for another virtual cluster nor that
+	// set for the system tenant/interface.
+	//
+	// As a reminder, the setting values observed by a virtual cluster,
+	// both for its own application settings and those it observes for
+	// system-visible settings, can be overridden using ALTER VIRTUAL
+	// CLUSTER SET CLUSTER SETTING. This can be used during e.g.
+	// troubleshooting, to allow changing the observed value for a
+	// virtual cluster without a code change.
+	ApplicationLevel
+)
+
+// Visibility describes how a user should feel confident that they can customize
+// the setting.
+//
+// See the constant definitions below for details.
+type Visibility int8
 
 const (
 	// Reserved - which is the default - indicates that a setting is
@@ -264,110 +300,34 @@ const (
 	Public
 )
 
-type common struct {
-	description string
-	visibility  Visibility
-	systemOnly  bool
-	// Each setting has a slotIdx which is used as a handle with Values.
-	slotIdx       int
-	nonReportable bool
-	retired       bool
-}
+// ValueOrigin indicates the origin of the current value of a setting, e.g. if
+// it is coming from the in-code default or an explicit override.
+type ValueOrigin uint32
 
-func (i *common) isRetired() bool {
-	return i.retired
-}
+const (
+	// OriginDefault indicates the value in use is the default value.
+	OriginDefault ValueOrigin = iota
+	// OriginExplicitlySet indicates the value is has been set explicitly.
+	OriginExplicitlySet
+	// OriginExternallySet indicates the value has been set externally, such as
+	// via a host-cluster override for this or all tenant(s).
+	OriginExternallySet
+	// OriginOverride indicates the value has been set via a test override.
+	OriginOverride
+)
 
-func (i *common) setSlotIdx(slotIdx int) {
-	if slotIdx < 1 {
-		panic(fmt.Sprintf("Invalid slot index %d", slotIdx))
+func (v ValueOrigin) String() string {
+	if v > OriginOverride {
+		return fmt.Sprintf("invalid (%d)", v)
 	}
-	if slotIdx > MaxSettings {
-		panic("too many settings; increase MaxSettings")
-	}
-	i.slotIdx = slotIdx
-}
-func (i *common) getSlotIdx() int {
-	return i.slotIdx
+	return [...]string{"default", "override", "external-override", "test-override"}[v]
 }
 
-func (i *common) setDescription(s string) {
-	i.description = s
-}
+// SafeValue implements the redact.SafeValue interface.
+func (ValueOrigin) SafeValue() {}
 
-func (i common) Description() string {
-	return i.description
-}
+// SafeValue implements the redact.SafeValue interface.
+func (SettingName) SafeValue() {}
 
-func (i common) Visibility() Visibility {
-	return i.visibility
-}
-
-func (i common) SystemOnly() bool {
-	return i.systemOnly
-}
-
-func (i common) isReportable() bool {
-	return !i.nonReportable
-}
-
-func (i *common) ErrorHint() (bool, string) {
-	return false, ""
-}
-
-// SetReportable indicates whether a setting's value can show up in SHOW ALL
-// CLUSTER SETTINGS and telemetry reports.
-//
-// The setting can still be used with SET and SHOW if the exact
-// setting name is known. Use SetReportable(false) for data that must
-// be hidden from standard setting report, telemetry and
-// troubleshooting screenshots, such as license data or keys.
-//
-// All string settings are also non-reportable by default and must be
-// opted in to reports manually with SetReportable(true).
-func (i *common) SetReportable(reportable bool) {
-	i.nonReportable = !reportable
-}
-
-// SetVisibility customizes the visibility of a setting.
-func (i *common) SetVisibility(v Visibility) {
-	i.visibility = v
-}
-
-// SetRetired marks the setting as obsolete. It also hides
-// it from the output of SHOW CLUSTER SETTINGS.
-func (i *common) SetRetired() {
-	i.description = "do not use - " + i.description
-	i.retired = true
-}
-
-// SetOnChange installs a callback to be called when a setting's value changes.
-// `fn` should avoid doing long-running or blocking work as it is called on the
-// goroutine which handles all settings updates.
-func (i *common) SetOnChange(sv *Values, fn func(ctx context.Context)) {
-	sv.setOnChange(i.slotIdx, fn)
-}
-
-type numericSetting interface {
-	Setting
-	Validate(i int64) error
-	set(ctx context.Context, sv *Values, i int64) error
-}
-
-// TestingIsReportable is used in testing for reportability.
-func TestingIsReportable(s Setting) bool {
-	if _, ok := s.(*MaskedSetting); ok {
-		return false
-	}
-	if e, ok := s.(extendedSetting); ok {
-		return e.isReportable()
-	}
-	return true
-}
-
-// AdminOnly returns whether the setting can only be viewed and modified by
-// superusers. Otherwise, users with the MODIFYCLUSTERSETTING role privilege can
-// do so.
-func AdminOnly(name string) bool {
-	return !strings.HasPrefix(name, "sql.defaults.")
-}
+// SafeValue implements the redact.SafeValue interface.
+func (InternalKey) SafeValue() {}

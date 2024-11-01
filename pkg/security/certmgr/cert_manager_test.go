@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package certmgr
 
@@ -57,7 +52,7 @@ var cmLogRe = regexp.MustCompile(`event_log\.go`)
 
 // Check that the structured event was logged.
 func checkLogStructEntry(t *testing.T, expectSuccess bool, beforeReload time.Time) error {
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(beforeReload.UnixNano(),
 		math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
 	if err != nil {

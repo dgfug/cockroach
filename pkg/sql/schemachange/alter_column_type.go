@@ -1,21 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// schemachange contains utilities describing type conversions.
 package schemachange
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -208,10 +207,8 @@ func ClassifyConversion(
 	}
 
 	// See if there's existing cast logic.  If so, return general.
-	semaCtx := tree.MakeSemaContext()
-	if err := semaCtx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */); err != nil {
-		return ColumnConversionImpossible, err
-	}
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	semaCtx.Placeholders.Init(1 /* numPlaceholders */, nil /* typeHints */)
 
 	// Use a placeholder just to sub in the original type.
 	fromPlaceholder, err := (&tree.Placeholder{Idx: 0}).TypeCheck(ctx, &semaCtx, oldType)
@@ -227,4 +224,50 @@ func ClassifyConversion(
 
 	return ColumnConversionImpossible,
 		pgerror.Newf(pgcode.CannotCoerce, "cannot convert %s to %s", oldType.SQLString(), newType.SQLString())
+}
+
+// ClassifyConversionFromTree is a wrapper for ClassifyConversion when we want
+// to take into account the parsed AST for ALTER TABLE .. ALTER COLUMN.
+func ClassifyConversionFromTree(
+	ctx context.Context, t *tree.AlterTableAlterColumnType, oldType *types.T, newType *types.T,
+) (ColumnConversionKind, error) {
+	if t.Using != nil {
+		// If an expression is provided, we always need to try a general conversion.
+		// We have to follow the process to create a new column and backfill it
+		// using the expression.
+		return ColumnConversionGeneral, nil
+	}
+	return ClassifyConversion(ctx, oldType, newType)
+}
+
+// ValidateAlterColumnTypeChecks performs validation checks on the proposed type
+// change. This function is common to both legacy schema change and the
+// declarative schema change. As such, it cannot reference the state system of
+// either: catalog for legacy, and elements for dsc.
+func ValidateAlterColumnTypeChecks(
+	ctx context.Context,
+	t *tree.AlterTableAlterColumnType,
+	settions *cluster.Settings,
+	origTyp *types.T,
+	isGeneratedAsIdentity bool,
+) (*types.T, error) {
+	typ := origTyp
+	// Special handling for STRING COLLATE xy to verify that we recognize the language.
+	if t.Collation != "" {
+		if types.IsStringType(typ) {
+			typ = types.MakeCollatedString(typ, t.Collation)
+		} else {
+			return typ, pgerror.New(pgcode.Syntax, "COLLATE can only be used with string types")
+		}
+	}
+
+	// Special handling for IDENTITY column to make sure it cannot be altered into
+	// a non-integer type.
+	if isGeneratedAsIdentity {
+		if typ.InternalType.Family != types.IntFamily {
+			return typ, sqlerrors.NewIdentityColumnTypeError()
+		}
+	}
+
+	return typ, colinfo.ValidateColumnDefType(ctx, settions, typ)
 }

@@ -153,18 +153,18 @@ ALTER INDEX _._._ UNSPLIT AT VALUES (2) -- identifiers removed
 parse
 ALTER INDEX d.i EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 2)
 ----
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 2) -- normalized!
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE VOTERS VALUES ((ARRAY[(1)]), (2)) -- fully parenthesized
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
-ALTER INDEX _._ EXPERIMENTAL_RELOCATE VOTERS VALUES (ARRAY[1], 2) -- identifiers removed
+ALTER INDEX d.i RELOCATE VOTERS VALUES (ARRAY[1], 2) -- normalized!
+ALTER INDEX d.i RELOCATE VOTERS VALUES ((ARRAY[(1)]), (2)) -- fully parenthesized
+ALTER INDEX d.i RELOCATE VOTERS VALUES (ARRAY[_], _) -- literals removed
+ALTER INDEX _._ RELOCATE VOTERS VALUES (ARRAY[1], 2) -- identifiers removed
 
 parse
 ALTER INDEX d.i EXPERIMENTAL_RELOCATE LEASE VALUES (1, 2)
 ----
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE LEASE VALUES (1, 2)
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE LEASE VALUES ((1), (2)) -- fully parenthesized
-ALTER INDEX d.i EXPERIMENTAL_RELOCATE LEASE VALUES (_, _) -- literals removed
-ALTER INDEX _._ EXPERIMENTAL_RELOCATE LEASE VALUES (1, 2) -- identifiers removed
+ALTER INDEX d.i RELOCATE LEASE VALUES (1, 2) -- normalized!
+ALTER INDEX d.i RELOCATE LEASE VALUES ((1), (2)) -- fully parenthesized
+ALTER INDEX d.i RELOCATE LEASE VALUES (_, _) -- literals removed
+ALTER INDEX _._ RELOCATE LEASE VALUES (1, 2) -- identifiers removed
 
 parse
 ALTER INDEX d.i SCATTER FROM (1) TO (2)
@@ -221,6 +221,14 @@ EXPLAIN ALTER PARTITION p OF INDEX db.t@idx CONFIGURE ZONE = 'foo'
 EXPLAIN ALTER PARTITION p OF INDEX db.t@idx CONFIGURE ZONE = ('foo') -- fully parenthesized
 EXPLAIN ALTER PARTITION p OF INDEX db.t@idx CONFIGURE ZONE = '_' -- literals removed
 EXPLAIN ALTER PARTITION _ OF INDEX _._@_ CONFIGURE ZONE = 'foo' -- identifiers removed
+
+parse
+ALTER PARTITION p1 OF INDEX foobar@* CONFIGURE ZONE USING num_replicas = 1;
+----
+ALTER PARTITION p1 OF INDEX foobar@* CONFIGURE ZONE USING num_replicas = 1 -- normalized!
+ALTER PARTITION p1 OF INDEX foobar@* CONFIGURE ZONE USING num_replicas = (1) -- fully parenthesized
+ALTER PARTITION p1 OF INDEX foobar@* CONFIGURE ZONE USING num_replicas = _ -- literals removed
+ALTER PARTITION _ OF INDEX _@* CONFIGURE ZONE USING _ = 1 -- identifiers removed
 
 parse
 ALTER INDEX db.t@i CONFIGURE ZONE USING foo = bar, baz = yay
@@ -359,3 +367,83 @@ ALTER INDEX i CONFIGURE ZONE USING DEFAULT
 ALTER INDEX i CONFIGURE ZONE USING DEFAULT -- fully parenthesized
 ALTER INDEX i CONFIGURE ZONE USING DEFAULT -- literals removed
 ALTER INDEX _ CONFIGURE ZONE USING DEFAULT -- identifiers removed
+
+parse
+ALTER INDEX i VISIBLE
+----
+ALTER INDEX i VISIBLE
+ALTER INDEX i VISIBLE -- fully parenthesized
+ALTER INDEX i VISIBLE -- literals removed
+ALTER INDEX _ VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX i INVISIBLE
+----
+ALTER INDEX i NOT VISIBLE -- normalized!
+ALTER INDEX i NOT VISIBLE -- fully parenthesized
+ALTER INDEX i NOT VISIBLE -- literals removed
+ALTER INDEX _ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX i NOT VISIBLE
+----
+ALTER INDEX i NOT VISIBLE
+ALTER INDEX i NOT VISIBLE -- fully parenthesized
+ALTER INDEX i NOT VISIBLE -- literals removed
+ALTER INDEX _ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX IF EXISTS i VISIBLE
+----
+ALTER INDEX IF EXISTS i VISIBLE
+ALTER INDEX IF EXISTS i VISIBLE -- fully parenthesized
+ALTER INDEX IF EXISTS i VISIBLE -- literals removed
+ALTER INDEX IF EXISTS _ VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX IF EXISTS i NOT VISIBLE
+----
+ALTER INDEX IF EXISTS i NOT VISIBLE
+ALTER INDEX IF EXISTS i NOT VISIBLE -- fully parenthesized
+ALTER INDEX IF EXISTS i NOT VISIBLE -- literals removed
+ALTER INDEX IF EXISTS _ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX d.i NOT VISIBLE
+----
+ALTER INDEX d.i NOT VISIBLE
+ALTER INDEX d.i NOT VISIBLE -- fully parenthesized
+ALTER INDEX d.i NOT VISIBLE -- literals removed
+ALTER INDEX _._ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX t@i NOT VISIBLE
+----
+ALTER INDEX t@i NOT VISIBLE
+ALTER INDEX t@i NOT VISIBLE -- fully parenthesized
+ALTER INDEX t@i NOT VISIBLE -- literals removed
+ALTER INDEX _@_ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX db.t@i NOT VISIBLE
+----
+ALTER INDEX db.t@i NOT VISIBLE
+ALTER INDEX db.t@i NOT VISIBLE -- fully parenthesized
+ALTER INDEX db.t@i NOT VISIBLE -- literals removed
+ALTER INDEX _._@_ NOT VISIBLE -- identifiers removed
+
+parse
+ALTER INDEX db.t@i VISIBILITY 0.2
+----
+ALTER INDEX db.t@i VISIBILITY 0.20 -- normalized!
+ALTER INDEX db.t@i VISIBILITY 0.20 -- fully parenthesized
+ALTER INDEX db.t@i VISIBILITY 0.20 -- literals removed
+ALTER INDEX _._@_ VISIBILITY 0.20 -- identifiers removed
+
+parse
+ALTER INDEX i VISIBILITY 7.379652426127388e-12
+----
+ALTER INDEX i VISIBILITY 0.00 -- normalized!
+ALTER INDEX i VISIBILITY 0.00 -- fully parenthesized
+ALTER INDEX i VISIBILITY 0.00 -- literals removed
+ALTER INDEX _ VISIBILITY 0.00 -- identifiers removed

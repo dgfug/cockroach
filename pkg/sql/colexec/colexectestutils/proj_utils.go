@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexectestutils
 
@@ -19,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -30,22 +25,16 @@ type MockTypeContext struct {
 	Typs []*types.T
 }
 
-var _ tree.IndexedVarContainer = &MockTypeContext{}
+var _ eval.IndexedVarContainer = &MockTypeContext{}
 
-// IndexedVarEval implements the tree.IndexedVarContainer interface.
-func (p *MockTypeContext) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	return tree.DNull.Eval(ctx)
+// IndexedVarEval implements the eval.IndexedVarContainer interface.
+func (p *MockTypeContext) IndexedVarEval(idx int) (tree.Datum, error) {
+	return tree.DNull, nil
 }
 
 // IndexedVarResolvedType implements the tree.IndexedVarContainer interface.
 func (p *MockTypeContext) IndexedVarResolvedType(idx int) *types.T {
 	return p.Typs[idx]
-}
-
-// IndexedVarNodeFormatter implements the tree.IndexedVarContainer interface.
-func (p *MockTypeContext) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	n := tree.Name(fmt.Sprintf("$%d", idx))
-	return &n
 }
 
 // CreateTestProjectingOperator creates a projecting operator that performs
@@ -54,10 +43,6 @@ func (p *MockTypeContext) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 // through all input columns and renders an additional column using
 // projectingExpr to create the render; then, the processor core is used to
 // plan all necessary infrastructure using NewColOperator call.
-// - canFallbackToRowexec determines whether NewColOperator will be able to use
-// rowexec.NewProcessor to instantiate a wrapped rowexec processor. This should
-// be false unless we expect that for some unit tests we will not be able to
-// plan the "pure" vectorized operators.
 //
 // Note: colexecargs.TestNewColOperator must have been injected into the package
 // in which the tests are running.
@@ -67,7 +52,6 @@ func CreateTestProjectingOperator(
 	input colexecop.Operator,
 	inputTypes []*types.T,
 	projectingExpr string,
-	canFallbackToRowexec bool,
 	testMemAcc *mon.BoundAccount,
 ) (colexecop.Operator, error) {
 	expr, err := parser.ParseExpr(projectingExpr)
@@ -75,7 +59,7 @@ func CreateTestProjectingOperator(
 		return nil, err
 	}
 	p := &MockTypeContext{Typs: inputTypes}
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	semaCtx.IVarContainer = p
 	typedExpr, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 	if err != nil {
@@ -100,9 +84,6 @@ func CreateTestProjectingOperator(
 		Spec:                spec,
 		Inputs:              []colexecargs.OpWithMetaInfo{{Root: input}},
 		StreamingMemAccount: testMemAcc,
-	}
-	if canFallbackToRowexec {
-		args.ProcessorConstructor = rowexec.NewProcessor
 	}
 	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 	if err != nil {

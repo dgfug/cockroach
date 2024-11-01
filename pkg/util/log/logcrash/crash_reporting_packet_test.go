@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logcrash_test
 
@@ -26,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/redact"
-	"github.com/cockroachdb/sentry-go"
+	sentry "github.com/getsentry/sentry-go"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 )
@@ -56,6 +51,7 @@ func (it interceptingTransport) Configure(sentry.ClientOptions) {}
 
 func TestCrashReportingPacket(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var packets []*sentry.Event
@@ -93,55 +89,51 @@ func TestCrashReportingPacket(t *testing.T) {
 	func() {
 		defer expectPanic("before server start")
 		defer logcrash.RecoverAndReportPanic(ctx, &st.SV)
-		panic(log.Safe(panicPre))
+		panic(redact.Safe(panicPre))
 	}()
 
 	func() {
 		defer expectPanic("after server start")
 		defer logcrash.RecoverAndReportPanic(ctx, &st.SV)
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{DefaultTestTenant: base.TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs})
 		s.Stopper().Stop(ctx)
-		panic(log.Safe(panicPost))
+		panic(redact.Safe(panicPost))
 	}()
 
 	const prefix = "crash_reporting_packet_test.go:"
 
-	type extraPair struct {
-		key   string
-		reVal string
-	}
 	expectations := []struct {
 		serverID *regexp.Regexp
 		tagCount int
-		message  string
-		extra    []extraPair
+		title    string
+		message  *regexp.Regexp
 	}{
-		{regexp.MustCompile(`^$`), 7, func() string {
+		{regexp.MustCompile(`^$`), 9, func() string {
 			message := prefix
 			// gccgo stack traces are different in the presence of function literals.
 			if runtime.Compiler == "gccgo" {
 				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "1058"
+				message += "1059"
 			}
 			message += " (TestCrashReportingPacket)"
 			return message
-		}(), []extraPair{
-			{"1: details", "panic: " + panicPre},
-		}},
-		{regexp.MustCompile(`^[a-z0-9]{8}-1$`), 12, func() string {
+		}(),
+			regexp.MustCompile(`crash_reporting_packet_test.go:\d+: panic: boom`),
+		},
+		{regexp.MustCompile(`^[a-z0-9]{8}-1$`), 14, func() string {
 			message := prefix
 			// gccgo stack traces are different in the presence of function literals.
 			if runtime.Compiler == "gccgo" {
 				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "1066"
+				message += "1067"
 			}
 			message += " (TestCrashReportingPacket)"
 			return message
-		}(), []extraPair{
-			{"1: details", "panic: " + panicPost},
-		}},
+		}(),
+			regexp.MustCompile(`crash_reporting_packet_test.go:\d+: panic: baam`),
+		},
 	}
 
 	if e, a := len(expectations), len(packets); e != a {
@@ -152,6 +144,8 @@ func TestCrashReportingPacket(t *testing.T) {
 		p := packets[0]
 		packets = packets[1:]
 		t.Run("", func(t *testing.T) {
+			t.Logf("message: %q", p.Message)
+
 			if !logcrash.ReportSensitiveDetails {
 				e, a := "<redacted>", p.ServerName
 				if e != a {
@@ -168,12 +162,14 @@ func TestCrashReportingPacket(t *testing.T) {
 				t.Errorf("expected server_id '%s' to match %s", serverID, exp.serverID)
 			}
 
+			assert.Regexp(t, exp.message, p.Message)
+
 			if len(p.Exception) < 1 {
 				t.Error("expected some exception in packet, got none")
 			} else {
-				if p.Exception[0].Type != exp.message {
+				if p.Exception[0].Type != exp.title {
 					t.Errorf("expected %q in exception type, got %q",
-						exp.message, p.Exception[0].Type)
+						exp.title, p.Exception[0].Type)
 				}
 
 				lastFrame := p.Exception[0].Stacktrace.Frames[len(p.Exception[0].Stacktrace.Frames)-1]
@@ -184,26 +180,13 @@ func TestCrashReportingPacket(t *testing.T) {
 					t.Errorf("last frame filename: expected crash_reporting_packet_test.go, got %q", lastFrame.Filename)
 				}
 			}
-
-			for _, ex := range exp.extra {
-				data, ok := p.Extra[ex.key]
-				if !ok {
-					t.Errorf("expected detail %q in extras, was not found", ex.key)
-					continue
-				}
-				sdata, ok := data.(string)
-				if !ok {
-					t.Errorf("expected detail %q of type string, found %T (%q)", ex.key, data, data)
-					continue
-				}
-				assert.Regexp(t, ex.reVal, sdata)
-			}
 		})
 	}
 }
 
 func TestInternalErrorReporting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var packets []*sentry.Event
@@ -229,6 +212,10 @@ func TestInternalErrorReporting(t *testing.T) {
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = true;`)
+	if err != nil {
+		t.Errorf("failed to enable plan collection due to %s", err.Error())
+	}
 
 	if _, err := sqlDB.Exec("SELECT crdb_internal.force_assertion_error('woo')"); !testutils.IsError(err, "internal error") {
 		t.Fatalf("expected internal error, got %v", err)
@@ -249,41 +236,37 @@ func TestInternalErrorReporting(t *testing.T) {
 	// the redaction markers are removed.
 	rm := string(redact.RedactableBytes(redact.RedactedMarker()).StripMarkers())
 
-	assert.Regexp(t, `builtins\.go:\d+: crdb_internal.force_assertion_error\(\): `+rm+`\n`+
-		`--\n`+
-		`\*errutil.leafError: `+rm+` \(1\)\n`+
-		`builtins.go:\d+: \*withstack.withStack \(top exception\)\n`+
-		`\*assert.withAssertionFailure\n`+
-		`\*errutil.withPrefix: crdb_internal.force_assertion_error\(\) \(2\)\n`+
-		`eval.go:\d+: \*withstack.withStack \(3\)\n`+
-		`\*telemetrykeys.withTelemetry: crdb_internal.force_assertion_error\(\) \(4\)\n`+
-		`\*colexecerror.notInternalError\n`+
-		`\(check the extra data payloads\)`, p.Message)
-
-	expectedExtra := []struct {
-		key   string
-		reVal string
-	}{
-		{"1: details", rm},
-		{"2: details", `crdb_internal\.force_assertion_error\(\)`},
-		{"4: details", `crdb_internal\.force_assertion_error\(\)`},
-	}
-	for _, ex := range expectedExtra {
-		data, ok := p.Extra[ex.key]
-		if !ok {
-			t.Errorf("expected detail %q in extras, was not found", ex.key)
-			continue
-		}
-		sdata, ok := data.(string)
-		if !ok {
-			t.Errorf("expected detail %q of type string, found %T (%q)", ex.key, data, data)
-			continue
-		}
-		assert.Regexp(t, ex.reVal, sdata)
+	assert.Regexp(t, `builtins\.go:\d+: crdb_internal.force_assertion_error\(\): `+rm+`\n`, p.Message)
+	idx := strings.Index(p.Message, "-- report composition:\n")
+	assert.GreaterOrEqual(t, idx, 1)
+	if idx > 0 {
+		assert.Regexp(t,
+			`-- report composition:\n`+
+				`\*errutil.leafError: `+rm+`\n`+
+				`builtins.go:\d+: \*withstack.withStack \(top exception\)\n`+
+				`\*assert.withAssertionFailure\n`+
+				`\*errutil.withPrefix: crdb_internal.force_assertion_error\(\)\n`+
+				`eval.go:\d+: \*withstack.withStack \(1\)\n`+
+				`\*telemetrykeys.withTelemetry: crdb_internal.force_assertion_error\(\)\n`+
+				`\*colexecerror.notInternalError\n`+
+				`\(check the extra data payloads\)`, p.Message[idx:])
 	}
 
 	if len(p.Exception) < 2 {
 		t.Fatalf("expected 2 stacktraces, got %d", len(p.Exception))
+	}
+
+	extra, ok := p.Extra["error types"]
+	assert.True(t, ok)
+	if ok {
+		assert.Equal(t, "github.com/cockroachdb/errors/errutil/*errutil.leafError (*::)\n"+
+			"github.com/cockroachdb/errors/withstack/*withstack.withStack (*::)\n"+
+			"github.com/cockroachdb/errors/assert/*assert.withAssertionFailure (*::)\n"+
+			"github.com/cockroachdb/errors/errutil/*errutil.withPrefix (*::)\n"+
+			"github.com/cockroachdb/errors/withstack/*withstack.withStack (*::)\n"+
+			"github.com/cockroachdb/errors/telemetrykeys/*telemetrykeys.withTelemetry (*::)\n"+
+			"github.com/cockroachdb/cockroach/pkg/sql/colexecerror/*colexecerror.notInternalError (*::)\n",
+			extra)
 	}
 
 	// The innermost stack trace (and main exception object) is the last
@@ -292,9 +275,9 @@ func TestInternalErrorReporting(t *testing.T) {
 	assert.Regexp(t, `^\*errutil\.leafError: crdb_internal\.force_assertion_error\(\): `+rm, p.Exception[1].Value)
 	fr := p.Exception[1].Stacktrace.Frames
 	assert.Regexp(t, `.*/builtins.go`, fr[len(fr)-1].Filename)
-	assert.Regexp(t, `.*/eval.go`, fr[len(fr)-2].Filename)
+	assert.Regexp(t, `.*/expr.go`, fr[len(fr)-2].Filename)
 
-	assert.Regexp(t, `^\(3\) eval.go:\d+ \(MaybeWrapError\)$`, p.Exception[0].Type)
+	assert.Regexp(t, `^\(1\) eval.go:\d+ \(MaybeWrapError\)$`, p.Exception[0].Type)
 	assert.Regexp(t, `^\*withstack\.withStack$`, p.Exception[0].Value)
 	fr = p.Exception[0].Stacktrace.Frames
 	assert.Regexp(t, `.*/eval.go`, fr[len(fr)-1].Filename)

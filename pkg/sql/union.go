@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -53,11 +48,12 @@ import (
 // 1
 // There are three 1s on the left and two 1s on the right, so we emit 1, 1.
 // Nothing else is in both.
-//  emitRight: For each row, increment the map entry.
-//  emitLeft: For each row, if the row is not present in the map, it was not in
-//    both, don't emit. Otherwise, if the count for the row was > 0, emit and
-//    decrement the entry. Otherwise, the row was on the right, but we've
-//    already emitted as many as were on the right, don't emit.
+//
+//	emitRight: For each row, increment the map entry.
+//	emitLeft: For each row, if the row is not present in the map, it was not in
+//	  both, don't emit. Otherwise, if the count for the row was > 0, emit and
+//	  decrement the entry. Otherwise, the row was on the right, but we've
+//	  already emitted as many as were on the right, don't emit.
 type unionNode struct {
 	// right and left are the data source operands.
 	// right is read first, to populate the `emit` field.
@@ -92,6 +88,14 @@ type unionNode struct {
 	// the limit is reached before executing the right node. The limit is
 	// guaranteed but the short-circuit behavior is not.
 	hardLimit uint64
+
+	// enforceHomeRegion is true if this UNION ALL is a locality-optimized search
+	// and the session setting `enforce_home_region` is true, indicating the
+	// operation should error out if the query cannot be satisfied by accessing
+	// only rows in the local region. The left branch of the UNION ALL is set up
+	// to only read rows in the local region when this flag is true, and the
+	// right branch reads rows in remote regions.
+	enforceHomeRegion bool
 }
 
 func (p *planner) newUnionNode(
@@ -101,6 +105,7 @@ func (p *planner) newUnionNode(
 	streamingOrdering colinfo.ColumnOrdering,
 	reqOrdering ReqOrdering,
 	hardLimit uint64,
+	enforceHomeRegion bool,
 ) (planNode, error) {
 	emitAll := false
 	switch typ {
@@ -161,6 +166,7 @@ func (p *planner) newUnionNode(
 		streamingOrdering: streamingOrdering,
 		reqOrdering:       reqOrdering,
 		hardLimit:         hardLimit,
+		enforceHomeRegion: enforceHomeRegion,
 	}
 	return node, nil
 }

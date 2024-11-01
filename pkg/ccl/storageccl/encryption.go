@@ -1,24 +1,23 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storageccl
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	crypto_rand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
-	"io/ioutil"
 	"os"
 
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
@@ -34,7 +33,7 @@ import (
 
 // encryptionPreamble is a constant string prepended in cleartext to ciphertexts
 // allowing them to be easily recognized by sight and allowing some basic sanity
-// checks when trying to open them (e.g. error if incorrectly using encryption
+// checks when trying to open them (E.g. error if incorrectly using encryption
 // on an unencrypted file of vice-versa).
 var encryptionPreamble = []byte("encrypt")
 
@@ -49,7 +48,7 @@ const encryptionVersionIVPrefix = 1
 // authticate against truncation at a chunk boundary.
 const encryptionVersionChunk = 2
 
-// encryptionChunkSizeV2 is the chunk-size used by v2, i.e. 64kb, which should
+// encryptionChunkSizeV2 is the chunk-size used by v2, i.E. 64kb, which should
 // minimize overhead while still while still limiting the size of buffers and
 // allowing seeks to mid-file.
 var encryptionChunkSizeV2 = 64 << 10 // 64kb
@@ -184,13 +183,15 @@ func (e *encWriter) flush() error {
 
 // DecryptFile decrypts a file encrypted by EncryptFile, using the supplied key
 // and reading the IV from a prefix of the file. See comments on EncryptFile
-// for intended usage, and see DecryptFile
-func DecryptFile(ciphertext, key []byte) ([]byte, error) {
+// for intended usage, and see DecryptFile.
+func DecryptFile(
+	ctx context.Context, ciphertext, key []byte, mm *mon.BoundAccount,
+) ([]byte, error) {
 	r, err := decryptingReader(bytes.NewReader(ciphertext), key)
 	if err != nil {
 		return nil, err
 	}
-	return ioutil.ReadAll(r.(io.Reader))
+	return mon.ReadAll(ctx, ioctx.ReaderAdapter(r.(io.Reader)), mm)
 }
 
 type decryptReader struct {
@@ -237,7 +238,7 @@ func decryptingReader(ciphertext readerAndReaderAt, key []byte) (sstable.Readabl
 	// need to read all of it to open it, and can then just return a simple bytes
 	// reader on the decrypted body.
 	if version == encryptionVersionIVPrefix {
-		buf, err := ioutil.ReadAll(ciphertext)
+		buf, err := io.ReadAll(ciphertext)
 		if err != nil {
 			return nil, err
 		}
@@ -334,17 +335,29 @@ func (r *decryptReader) Close() error {
 }
 
 // Size returns the size of the file.
-func (r *decryptReader) Stat() (os.FileInfo, error) {
-	stater, ok := r.ciphertext.(interface{ Stat() (os.FileInfo, error) })
-	if !ok {
+func (r *decryptReader) Stat() (vfs.FileInfo, error) {
+	var size int64
+	// The vfs interface uses its own vfs.FileInfo interface. Check for either
+	// the vfs Stat() or the os Stat().
+	// TODO(jackson): Do we ever actually use a native os.File here? We might be
+	// able to remove the support for os.FileInfo (and change r.ciphertext to a
+	// vfs.File).
+	if stater, ok := r.ciphertext.(interface{ Stat() (os.FileInfo, error) }); ok {
+		stat, err := stater.Stat()
+		if err != nil {
+			return nil, err
+		}
+		size = stat.Size()
+	} else if stater, ok := r.ciphertext.(interface{ Stat() (vfs.FileInfo, error) }); ok {
+		stat, err := stater.Stat()
+		if err != nil {
+			return nil, err
+		}
+		size = stat.Size()
+	} else {
 		return nil, errors.Newf("%T does not support stat", r.ciphertext)
 	}
-	stat, err := stater.Stat()
-	if err != nil {
-		return nil, err
-	}
 
-	size := stat.Size()
 	size -= headerSize
 	size -= tagSize * ((size / (int64(encryptionChunkSizeV2) + tagSize)) + 1)
 	return sizeStat(size), nil

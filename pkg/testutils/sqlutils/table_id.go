@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlutils
 
@@ -28,6 +23,26 @@ func QueryDatabaseID(t testing.TB, sqlDB DBHandle, dbName string) uint32 {
 		t.Fatal(err)
 	}
 	return dbID
+}
+
+// QuerySchemaID returns the schema ID of the specified database.schema
+// using the system.namespace table.
+func QuerySchemaID(t testing.TB, sqlDB DBHandle, dbName, schemaName string) uint32 {
+	tableIDQuery := `
+ SELECT schemas.id FROM system.namespace schemas
+   JOIN system.namespace dbs ON dbs.id = schemas."parentID"
+   WHERE dbs.name = $1 AND schemas.name = $2
+ `
+	var schemaID uint32
+	result := sqlDB.QueryRowContext(
+		context.Background(),
+		tableIDQuery, dbName,
+		schemaName,
+	)
+	if err := result.Scan(&schemaID); err != nil {
+		t.Fatal(err)
+	}
+	return schemaID
 }
 
 // QueryTableID returns the table ID of the specified database.table

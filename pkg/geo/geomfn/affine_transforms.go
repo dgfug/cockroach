@@ -1,37 +1,38 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
-	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	"github.com/twpayne/go-geom"
 )
 
 // AffineMatrix defines an affine transformation matrix for a geom object.
 // It is expected to be of the form:
-//     a  b  c  x_off
-//     d  e  f  y_off
-//     g  h  i  z_off
-//     0  0  0  1
+//
+//	a  b  c  x_off
+//	d  e  f  y_off
+//	g  h  i  z_off
+//	0  0  0  1
+//
 // Which gets applies onto a coordinate of form:
-//     (x y z 0)^T
+//
+//	(x y z 0)^T
+//
 // With the following transformation:
-//   x' = a*x + b*y + c*z + x_off
-//   y' = d*x + e*y + f*z + y_off
-//   z' = g*x + h*y + i*z + z_off
+//
+//	x' = a*x + b*y + c*z + x_off
+//	y' = d*x + e*y + f*z + y_off
+//	z' = g*x + h*y + i*z + z_off
 type AffineMatrix [][]float64
 
 // Affine applies a 3D affine transformation onto the given geometry.
@@ -100,7 +101,10 @@ func translate(t geom.T, deltas []float64) (geom.T, error) {
 			Got:  len(deltas),
 			Want: t.Layout().Stride(),
 		}
-		return nil, errors.Wrap(err, "translating coordinates")
+		return nil, pgerror.WithCandidateCode(
+			errors.Wrap(err, "translating coordinates"),
+			pgcode.InvalidParameterValue,
+		)
 	}
 	var zOff float64
 	if t.Layout().ZIndex() != -1 {
@@ -156,7 +160,7 @@ func ScaleRelativeToOrigin(
 
 	factorPointG, ok := factorG.(*geom.Point)
 	if !ok {
-		return geo.Geometry{}, errors.Newf("the scaling factor must be a Point")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "the scaling factor must be a Point")
 	}
 
 	originG, err := origin.AsGeomT()
@@ -166,7 +170,7 @@ func ScaleRelativeToOrigin(
 
 	originPointG, ok := originG.(*geom.Point)
 	if !ok {
-		return geo.Geometry{}, errors.Newf("the false origin must be a Point")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "the false origin must be a Point")
 	}
 
 	if factorG.Stride() != originG.Stride() {
@@ -174,14 +178,17 @@ func ScaleRelativeToOrigin(
 			Got:  factorG.Stride(),
 			Want: originG.Stride(),
 		}
-		return geo.Geometry{}, errors.Wrap(err, "number of dimensions for the scaling factor and origin must be equal")
+		return geo.Geometry{}, pgerror.WithCandidateCode(
+			errors.Wrap(err, "number of dimensions for the scaling factor and origin must be equal"),
+			pgcode.InvalidParameterValue,
+		)
 	}
 
 	// This is inconsistent with PostGIS, which allows a POINT EMPTY, but whose
 	// behavior seems to depend on previous queries in the session, and not
 	// desirable to reproduce.
 	if len(originPointG.FlatCoords()) < 2 {
-		return geo.Geometry{}, errors.Newf("the origin must have at least 2 coordinates")
+		return geo.Geometry{}, pgerror.Newf(pgcode.InvalidParameterValue, "the origin must have at least 2 coordinates")
 	}
 
 	// Offset by the origin, scale, and translate it back to the origin.
@@ -246,7 +253,7 @@ func Rotate(g geo.Geometry, rotRadians float64) (geo.Geometry, error) {
 }
 
 // ErrPointOriginEmpty is an error to compare point origin is empty.
-var ErrPointOriginEmpty = fmt.Errorf("origin is an empty point")
+var ErrPointOriginEmpty = pgerror.Newf(pgcode.InvalidParameterValue, "origin is an empty point")
 
 // RotateWithPointOrigin returns a modified Geometry whose coordinates are rotated
 // around the pointOrigin by a rotRadians.
@@ -254,7 +261,7 @@ func RotateWithPointOrigin(
 	g geo.Geometry, rotRadians float64, pointOrigin geo.Geometry,
 ) (geo.Geometry, error) {
 	if pointOrigin.ShapeType() != geopb.ShapeType_Point {
-		return g, errors.New("origin is not a POINT")
+		return g, pgerror.Newf(pgcode.InvalidParameterValue, "origin is not a POINT")
 	}
 	t, err := pointOrigin.AsGeomT()
 	if err != nil {

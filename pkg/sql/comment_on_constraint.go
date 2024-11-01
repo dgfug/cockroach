@@ -1,41 +1,32 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnConstraintNode struct {
 	n         *tree.CommentOnConstraint
 	tableDesc catalog.TableDescriptor
-	oid       *tree.DOid
 }
 
-//CommentOnConstraint add comment on a constraint
-//Privileges: CREATE on table
+// CommentOnConstraint add comment on a constraint
+// Privileges: CREATE on table
 func (p *planner) CommentOnConstraint(
 	ctx context.Context, n *tree.CommentOnConstraint,
 ) (planNode, error) {
+	// Block comments on constraint until cluster is updated.
 	if err := checkSchemaChangeEnabled(
 		ctx,
 		p.ExecCfg(),
@@ -52,74 +43,32 @@ func (p *planner) CommentOnConstraint(
 		return nil, err
 	}
 
-	return &commentOnConstraintNode{n: n, tableDesc: tableDesc}, nil
+	return &commentOnConstraintNode{
+		n:         n,
+		tableDesc: tableDesc,
+	}, nil
 
 }
 
 func (n *commentOnConstraintNode) startExec(params runParams) error {
-	info, err := n.tableDesc.GetConstraintInfo()
-	if err != nil {
-		return err
-	}
-	schema, err := params.p.Descriptors().GetImmutableSchemaByID(
-		params.ctx, params.extendedEvalCtx.Txn, n.tableDesc.GetParentSchemaID(), tree.SchemaLookupFlags{},
-	)
-	if err != nil {
-		return err
-	}
-
 	constraintName := string(n.n.Constraint)
-	constraint, ok := info[constraintName]
-	if !ok {
-		return pgerror.Newf(pgcode.UndefinedObject,
-			"constraint %q of relation %q does not exist", constraintName, n.tableDesc.GetName())
+	constraint := catalog.FindConstraintByName(n.tableDesc, constraintName)
+	if constraint == nil {
+		return sqlerrors.NewUndefinedConstraintError(constraintName, n.tableDesc.GetName())
 	}
 
-	hasher := makeOidHasher()
-	switch kind := constraint.Kind; kind {
-	case descpb.ConstraintTypePK:
-		constraintDesc := constraint.Index
-		n.oid = hasher.PrimaryKeyConstraintOid(n.tableDesc.GetParentID(), schema.GetName(), n.tableDesc.GetID(), constraintDesc)
-	case descpb.ConstraintTypeFK:
-		constraintDesc := constraint.FK
-		n.oid = hasher.ForeignKeyConstraintOid(n.tableDesc.GetParentID(), schema.GetName(), n.tableDesc.GetID(), constraintDesc)
-	case descpb.ConstraintTypeUnique:
-		constraintDesc := constraint.Index.ID
-		n.oid = hasher.UniqueConstraintOid(n.tableDesc.GetParentID(), schema.GetName(), n.tableDesc.GetID(), constraintDesc)
-	case descpb.ConstraintTypeCheck:
-		constraintDesc := constraint.CheckConstraint
-		n.oid = hasher.CheckConstraintOid(n.tableDesc.GetParentID(), schema.GetName(), n.tableDesc.GetID(), constraintDesc)
-
-	}
-	// Setting the comment to NULL is the
-	// equivalent of deleting the comment.
-	if n.n.Comment != nil {
-		_, err := params.p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			"set-constraint-comment",
-			params.p.Txn(),
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
-			keys.ConstraintCommentType,
-			n.oid.DInt,
-			*n.n.Comment,
+	var err error
+	if n.n.Comment == nil {
+		err = params.p.deleteComment(
+			params.ctx, n.tableDesc.GetID(), uint32(constraint.GetConstraintID()), catalogkeys.ConstraintCommentType,
 		)
-		if err != nil {
-			return err
-		}
 	} else {
-		_, err := params.p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			"delete-constraint-comment",
-			params.p.Txn(),
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
-			keys.ConstraintCommentType,
-			n.oid.DInt,
+		err = params.p.updateComment(
+			params.ctx, n.tableDesc.GetID(), uint32(constraint.GetConstraintID()), catalogkeys.ConstraintCommentType, *n.n.Comment,
 		)
-		if err != nil {
-			return err
-		}
+	}
+	if err != nil {
+		return err
 	}
 
 	comment := ""

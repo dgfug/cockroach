@@ -1,18 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package contentionpb
 
 import (
 	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 const singleIndentation = "  "
@@ -61,4 +61,51 @@ func (skc SingleNonSQLKeyContention) String() string {
 		b.WriteString(toString(skc.Txns[i], doubleIndentation))
 	}
 	return b.String()
+}
+
+// Valid returns if the ResolvedTxnID is valid.
+func (r *ResolvedTxnID) Valid() bool {
+	return !uuid.Nil.Equal(r.TxnID)
+}
+
+// Valid returns if the ExtendedContentionEvent is valid.
+func (e *ExtendedContentionEvent) Valid() bool {
+	return !uuid.Nil.Equal(e.BlockingEvent.TxnMeta.ID)
+}
+
+// Hash returns a hash that's unique to ExtendedContentionEvent using
+// blocking txn's txnID, waiting txn's txnID and the event waiting stmt id.
+func (e *ExtendedContentionEvent) Hash() uint64 {
+	hash := util.MakeFNV64()
+	hashUUID(e.BlockingEvent.TxnMeta.ID, &hash)
+	hashUUID(e.WaitingTxnID, &hash)
+	hashClusterUniqueID(e.WaitingStmtID, &hash)
+	return hash.Sum()
+}
+
+// hashClusterUniqueID adds the hash of the clusterunique.ID into the fnv.
+// A clusterunique.ID is an uint128. To hash we treat it as two uint64 integers,
+// since uint128 has a lo and hi uint64.
+func hashClusterUniqueID(id clusterunique.ID, hash *util.FNV64) {
+	hash.Add(id.Lo)
+	hash.Add(id.Hi)
+}
+
+// hashUUID adds the hash of the uuid into the fnv.
+// An uuid is a 16 byte array. To hash UUID, we treat it as two uint64 integers,
+// since uint64 is 8-byte. This is why we decode the byte array twice and add
+// the resulting uint64 into the fnv each time.
+func hashUUID(u uuid.UUID, fnv *util.FNV64) {
+	b := u.GetBytes()
+
+	b, val, err := encoding.DecodeUint64Descending(b)
+	if err != nil {
+		panic(err)
+	}
+	fnv.Add(val)
+	_, val, err = encoding.DecodeUint64Descending(b)
+	if err != nil {
+		panic(err)
+	}
+	fnv.Add(val)
 }

@@ -1,24 +1,21 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package humanizeutil
 
 import (
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/redact"
 )
 
 func TestDuration(t *testing.T) {
 	testCases := []struct {
 		val time.Duration
-		exp string
+		exp redact.SafeString
 	}{
 		{val: 0, exp: "0µs"},
 		{val: 12, exp: "0µs"},
@@ -56,7 +53,7 @@ func TestDuration(t *testing.T) {
 func TestLongDuration(t *testing.T) {
 	testCases := []struct {
 		val time.Duration
-		exp string
+		exp redact.SafeString
 	}{
 		{val: 0, exp: "0 seconds"},
 		{val: time.Second, exp: "1 second"},

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -18,7 +13,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -33,7 +30,7 @@ func (ir indexedRows) Len() int {
 	return len(ir.rows)
 }
 
-func (ir indexedRows) GetRow(_ context.Context, idx int) (tree.IndexedRow, error) {
+func (ir indexedRows) GetRow(_ context.Context, idx int) (eval.IndexedRow, error) {
 	return ir.rows[idx], nil
 }
 
@@ -55,14 +52,14 @@ func (ir indexedRow) GetDatums(firstColIdx, lastColIdx int) (tree.Datums, error)
 }
 
 func testSlidingWindow(t *testing.T, count int) {
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	wfr := makeTestWindowFrameRun(count)
 	wfr.Frame = &tree.WindowFrame{
-		Mode: tree.ROWS,
+		Mode: treewindow.ROWS,
 		Bounds: tree.WindowFrameBounds{
-			StartBound: &tree.WindowFrameBound{BoundType: tree.OffsetPreceding},
-			EndBound:   &tree.WindowFrameBound{BoundType: tree.OffsetFollowing},
+			StartBound: &tree.WindowFrameBound{BoundType: treewindow.OffsetPreceding},
+			EndBound:   &tree.WindowFrameBound{BoundType: treewindow.OffsetFollowing},
 		},
 	}
 	testMin(t, evalCtx, wfr)
@@ -70,16 +67,17 @@ func testSlidingWindow(t *testing.T, count int) {
 	testSumAndAvg(t, evalCtx, wfr)
 }
 
-func testMin(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) {
+func testMin(t *testing.T, evalCtx *eval.Context, wfr *eval.WindowFrameRun) {
 	for offset := 0; offset < maxOffset; offset += int(rand.Int31n(maxOffset / 10)) {
 		wfr.StartBoundOffset = tree.NewDInt(tree.DInt(offset))
 		wfr.EndBoundOffset = tree.NewDInt(tree.DInt(offset))
 		min := &slidingWindowFunc{}
-		min.sw = makeSlidingWindow(evalCtx, func(evalCtx *tree.EvalContext, a, b tree.Datum) int {
-			return -a.Compare(evalCtx, b)
+		min.sw = makeSlidingWindow(evalCtx, func(ctx context.Context, evalCtx *eval.Context, a, b tree.Datum) (int, error) {
+			cmp, err := a.Compare(ctx, evalCtx, b)
+			return -cmp, err
 		})
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			res, err := min.Compute(evalCtx.Ctx(), evalCtx, wfr)
+			res, err := min.Compute(context.Background(), evalCtx, wfr)
 			if err != nil {
 				t.Errorf("Unexpected error received when getting min from sliding window: %+v", err)
 			}
@@ -89,7 +87,7 @@ func testMin(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) 
 				if idx < 0 || idx >= wfr.PartitionSize() {
 					continue
 				}
-				row, err := wfr.Rows.GetRow(evalCtx.Ctx(), idx)
+				row, err := wfr.Rows.GetRow(context.Background(), idx)
 				if err != nil {
 					panic(err)
 				}
@@ -105,24 +103,24 @@ func testMin(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) 
 			if minResult != naiveMin {
 				t.Errorf("Min sliding window returned wrong result: expected %+v, found %+v", naiveMin, minResult)
 				t.Errorf("partitionSize: %+v idx: %+v offset: %+v", wfr.PartitionSize(), wfr.RowIdx, offset)
-				t.Errorf(min.sw.string())
-				t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+				t.Error(min.sw.string())
+				t.Error(partitionToString(context.Background(), wfr.Rows))
 				panic("")
 			}
 		}
 	}
 }
 
-func testMax(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) {
+func testMax(t *testing.T, evalCtx *eval.Context, wfr *eval.WindowFrameRun) {
 	for offset := 0; offset < maxOffset; offset += int(rand.Int31n(maxOffset / 10)) {
 		wfr.StartBoundOffset = tree.NewDInt(tree.DInt(offset))
 		wfr.EndBoundOffset = tree.NewDInt(tree.DInt(offset))
 		max := &slidingWindowFunc{}
-		max.sw = makeSlidingWindow(evalCtx, func(evalCtx *tree.EvalContext, a, b tree.Datum) int {
-			return a.Compare(evalCtx, b)
+		max.sw = makeSlidingWindow(evalCtx, func(ctx context.Context, evalCtx *eval.Context, a, b tree.Datum) (int, error) {
+			return a.Compare(ctx, evalCtx, b)
 		})
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			res, err := max.Compute(evalCtx.Ctx(), evalCtx, wfr)
+			res, err := max.Compute(context.Background(), evalCtx, wfr)
 			if err != nil {
 				t.Errorf("Unexpected error received when getting max from sliding window: %+v", err)
 			}
@@ -132,7 +130,7 @@ func testMax(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) 
 				if idx < 0 || idx >= wfr.PartitionSize() {
 					continue
 				}
-				row, err := wfr.Rows.GetRow(evalCtx.Ctx(), idx)
+				row, err := wfr.Rows.GetRow(context.Background(), idx)
 				if err != nil {
 					panic(err)
 				}
@@ -148,27 +146,27 @@ func testMax(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) 
 			if maxResult != naiveMax {
 				t.Errorf("Max sliding window returned wrong result: expected %+v, found %+v", naiveMax, maxResult)
 				t.Errorf("partitionSize: %+v idx: %+v offset: %+v", wfr.PartitionSize(), wfr.RowIdx, offset)
-				t.Errorf(max.sw.string())
-				t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+				t.Error(max.sw.string())
+				t.Error(partitionToString(context.Background(), wfr.Rows))
 				panic("")
 			}
 		}
 	}
 }
 
-func testSumAndAvg(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun) {
+func testSumAndAvg(t *testing.T, evalCtx *eval.Context, wfr *eval.WindowFrameRun) {
 	for offset := 0; offset < maxOffset; offset += int(rand.Int31n(maxOffset / 10)) {
 		wfr.StartBoundOffset = tree.NewDInt(tree.DInt(offset))
 		wfr.EndBoundOffset = tree.NewDInt(tree.DInt(offset))
 		sum := &slidingWindowSumFunc{agg: &intSumAggregate{}}
 		avg := &avgWindowFunc{sum: newSlidingWindowSumFunc(&intSumAggregate{})}
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
-			res, err := sum.Compute(evalCtx.Ctx(), evalCtx, wfr)
+			res, err := sum.Compute(context.Background(), evalCtx, wfr)
 			if err != nil {
 				t.Errorf("Unexpected error received when getting sum from sliding window: %+v", err)
 			}
 			sumResult := tree.DDecimal{Decimal: res.(*tree.DDecimal).Decimal}
-			res, err = avg.Compute(evalCtx.Ctx(), evalCtx, wfr)
+			res, err = avg.Compute(context.Background(), evalCtx, wfr)
 			if err != nil {
 				t.Errorf("Unexpected error received when getting avg from sliding window: %+v", err)
 			}
@@ -178,7 +176,7 @@ func testSumAndAvg(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFram
 				if idx < 0 || idx >= wfr.PartitionSize() {
 					continue
 				}
-				row, err := wfr.Rows.GetRow(evalCtx.Ctx(), idx)
+				row, err := wfr.Rows.GetRow(context.Background(), idx)
 				if err != nil {
 					panic(err)
 				}
@@ -196,36 +194,36 @@ func testSumAndAvg(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFram
 			if s != naiveSum {
 				t.Errorf("Sum sliding window returned wrong result: expected %+v, found %+v", naiveSum, s)
 				t.Errorf("partitionSize: %+v idx: %+v offset: %+v", wfr.PartitionSize(), wfr.RowIdx, offset)
-				t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+				t.Error(partitionToString(context.Background(), wfr.Rows))
 				panic("")
 			}
 			a, err := avgResult.Float64()
 			if err != nil {
 				t.Errorf("Unexpected error received when converting avg from DDecimal to float64: %+v", err)
 			}
-			frameSize, err := wfr.FrameSize(evalCtx.Ctx(), evalCtx)
+			frameSize, err := wfr.FrameSize(context.Background(), evalCtx)
 			if err != nil {
 				t.Errorf("Unexpected error when getting FrameSize: %+v", err)
 			}
 			if a != float64(naiveSum)/float64(frameSize) {
 				t.Errorf("Sum sliding window returned wrong result: expected %+v, found %+v", float64(naiveSum)/float64(frameSize), a)
 				t.Errorf("partitionSize: %+v idx: %+v offset: %+v", wfr.PartitionSize(), wfr.RowIdx, offset)
-				t.Errorf(partitionToString(evalCtx.Ctx(), wfr.Rows))
+				t.Error(partitionToString(context.Background(), wfr.Rows))
 				panic("")
 			}
 		}
 	}
 }
 
-func makeTestWindowFrameRun(count int) *tree.WindowFrameRun {
-	return &tree.WindowFrameRun{
+func makeTestWindowFrameRun(count int) *eval.WindowFrameRun {
+	return &eval.WindowFrameRun{
 		Rows:         makeTestPartition(count),
 		ArgsIdxs:     []uint32{0},
 		FilterColIdx: tree.NoColumnIdx,
 	}
 }
 
-func makeTestPartition(count int) tree.IndexedRows {
+func makeTestPartition(count int) eval.IndexedRows {
 	partition := indexedRows{rows: make([]indexedRow, count)}
 	for idx := 0; idx < count; idx++ {
 		partition.rows[idx] = indexedRow{idx: idx, row: tree.Datums{tree.NewDInt(tree.DInt(rand.Int31n(maxInt)))}}
@@ -233,10 +231,10 @@ func makeTestPartition(count int) tree.IndexedRows {
 	return partition
 }
 
-func partitionToString(ctx context.Context, partition tree.IndexedRows) string {
+func partitionToString(ctx context.Context, partition eval.IndexedRows) string {
 	var buf bytes.Buffer
 	var err error
-	var row tree.IndexedRow
+	var row eval.IndexedRow
 	buf.WriteString("\n=====Partition=====\n")
 	for idx := 0; idx < partition.Len(); idx++ {
 		if row, err = partition.GetRow(ctx, idx); err != nil {

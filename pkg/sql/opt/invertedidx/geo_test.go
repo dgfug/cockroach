@@ -1,16 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedidx_test
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"testing"
@@ -25,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -32,9 +29,9 @@ import (
 )
 
 func TestTryJoinGeoIndex(t *testing.T) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
 
@@ -55,7 +52,7 @@ func TestTryJoinGeoIndex(t *testing.T) {
 	}
 
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn1 := tree.NewUnqualifiedTableName("t1")
 	tn2 := tree.NewUnqualifiedTableName("t2")
@@ -291,7 +288,7 @@ func TestTryJoinGeoIndex(t *testing.T) {
 		}
 
 		actInvertedExpr := invertedidx.TryJoinInvertedIndex(
-			evalCtx.Context, &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
+			context.Background(), &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
 		)
 
 		if actInvertedExpr == nil {
@@ -313,9 +310,9 @@ func TestTryJoinGeoIndex(t *testing.T) {
 }
 
 func TestTryFilterGeoIndex(t *testing.T) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
 	if _, err := tc.ExecuteDDL(
@@ -324,7 +321,7 @@ func TestTryFilterGeoIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn := tree.NewUnqualifiedTableName("t")
 	tab := md.AddTable(tc.Table(tn), tn)
@@ -494,13 +491,15 @@ func TestTryFilterGeoIndex(t *testing.T) {
 		// that is tested elsewhere. This is just testing that we are constraining
 		// the index when we expect to.
 		spanExpr, _, remainingFilters, pfState, ok := invertedidx.TryFilterInvertedIndex(
+			context.Background(),
 			evalCtx,
 			&f,
 			filters,
 			nil, /* optionalFilters */
 			tab,
 			md.Table(tab).Index(tc.indexOrd),
-			nil, /* computedColumns */
+			nil,       /* computedColumns */
+			func() {}, /* checkCancellation */
 		)
 		if tc.ok != ok {
 			t.Fatalf("expected %v, got %v", tc.ok, ok)

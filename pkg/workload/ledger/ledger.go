@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ledger
 
@@ -24,11 +19,12 @@ import (
 	"github.com/spf13/pflag"
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type ledger struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed              int64
 	customers         int
 	inlineArgs        bool
 	splits            int
@@ -52,11 +48,11 @@ var ledgerMeta = workload.Meta{
 	Name:        `ledger`,
 	Description: `Ledger simulates an accounting system using double-entry bookkeeping`,
 	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &ledger{}
 		g.flags.FlagSet = pflag.NewFlagSet(`ledger`, pflag.ContinueOnError)
 		g.connFlags = workload.NewConnFlags(&g.flags)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.customers, `customers`, 1000, `Number of customers`)
 		g.flags.BoolVar(&g.inlineArgs, `inline-args`, false, `Use inline query arguments`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
@@ -65,6 +61,7 @@ var ledgerMeta = workload.Meta{
 		g.flags.StringVar(&g.mix, `mix`,
 			`balance=50,withdrawal=37,deposit=12,reversal=0`,
 			`Weights for the transaction mix.`)
+		RandomSeed.AddFlag(&g.flags)
 		return g
 	},
 }
@@ -80,13 +77,16 @@ func (*ledger) Meta() workload.Meta { return ledgerMeta }
 // Flags implements the Flagser interface.
 func (w *ledger) Flags() workload.Flags { return w.flags }
 
+// ConnFlags implements the ConnFlagser interface.
+func (w *ledger) ConnFlags() *workload.ConnFlags { return w.connFlags }
+
 // Hooks implements the Hookser interface.
 func (w *ledger) Hooks() workload.Hooks {
 	return workload.Hooks{
 		Validate: func() error {
 			return initializeMix(w)
 		},
-		PostLoad: func(sqlDB *gosql.DB) error {
+		PostLoad: func(_ context.Context, sqlDB *gosql.DB) error {
 			if w.fks {
 				fkStmts := []string{
 					`create index entry_auto_index_fk_customer on entry (customer_id ASC)`,
@@ -177,10 +177,6 @@ func (w *ledger) Tables() []workload.Table {
 func (w *ledger) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -190,7 +186,7 @@ func (w *ledger) Ops(
 	db.SetMaxIdleConns(w.connFlags.Concurrency + 1)
 
 	w.reg = reg
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	now := timeutil.Now().UnixNano()
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		worker := &worker{

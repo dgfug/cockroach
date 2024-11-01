@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -19,7 +15,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	jsonb "github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -42,6 +40,7 @@ var tupleOfTwoInts = types.MakeTuple([]*types.T{types.Int, types.Int})
 var tupleOfTwoStrings = types.MakeTuple([]*types.T{types.String, types.String})
 var tupleOfTuples = types.MakeTuple([]*types.T{tupleOfTwoInts, tupleOfTwoStrings})
 var tupleComplex = types.MakeTuple([]*types.T{types.String, types.TimeTZ, types.Jsonb})
+var tupleOfTSVectorTSQuery = types.MakeTuple([]*types.T{types.TSVector, types.TSQuery})
 
 func TestParseTuple(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -53,6 +52,11 @@ func TestParseTuple(t *testing.T) {
 
 	escapedJsonString := `{"")N}."": [false], ""UA%t"": [""foobar""]}`
 	jsonVal, err := jsonb.ParseJSON(`{")N}.": [false], "UA%t": ["foobar"]}`)
+	require.NoError(t, err)
+
+	tsv, err := tree.ParseDTSVector("a b")
+	require.NoError(t, err)
+	tsq, err := tree.ParseDTSQuery("c")
 	require.NoError(t, err)
 
 	testData := []struct {
@@ -178,6 +182,16 @@ func TestParseTuple(t *testing.T) {
 			tree.NewDTuple(tupleOfStringAndInt, tree.NewDString("\\n"), tree.NewDInt(4)),
 		},
 		{
+			`(a b, c)`,
+			tupleOfTSVectorTSQuery,
+			tree.NewDTuple(tupleOfTSVectorTSQuery, tsv, tsq),
+		},
+		{
+			`("a b", c)`,
+			tupleOfTSVectorTSQuery,
+			tree.NewDTuple(tupleOfTSVectorTSQuery, tsv, tsq),
+		},
+		{
 			fmt.Sprintf(`(0s{mlRk#, %s, "%s")`, timeTZString, escapedJsonString),
 			tupleComplex,
 			tree.NewDTuple(
@@ -190,12 +204,14 @@ func TestParseTuple(t *testing.T) {
 	}
 	for _, td := range testData {
 		t.Run(td.str, func(t *testing.T) {
-			evalContext := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			evalContext := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			actual, _, err := tree.ParseDTupleFromString(evalContext, td.str, td.typ)
 			if err != nil {
 				t.Fatalf("tuple %s: got error %s, expected %s", td.str, err.Error(), td.expected)
 			}
-			if actual.Compare(evalContext, td.expected) != 0 {
+			if cmp, err := actual.Compare(context.Background(), evalContext, td.expected); err != nil {
+				t.Fatal(err)
+			} else if cmp != 0 {
 				t.Fatalf("tuple %s: got %s, expected %s", td.str, actual, td.expected)
 			}
 		})
@@ -242,7 +258,7 @@ func TestParseTupleRandomStrings(t *testing.T) {
 		buf.WriteByte(')')
 
 		parsed, _, err := tree.ParseDTupleFromString(
-			tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), buf.String(), types.MakeTuple(tupContents))
+			eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), buf.String(), types.MakeTuple(tupContents))
 		if err != nil {
 			t.Fatalf(`got error: "%s" for elem "%s"`, err, buf.String())
 		}
@@ -271,9 +287,12 @@ func TestParseTupleRandomDatums(t *testing.T) {
 		if tup == tree.DNull {
 			continue
 		}
-		tupString := tree.AsStringWithFlags(tup, tree.FmtPgwireText)
+		conv := sessiondatapb.DataConversionConfig{
+			ExtraFloatDigits: 1,
+		}
+		tupString := tree.AsStringWithFlags(tup, tree.FmtPgwireText, tree.FmtDataConversionConfig(conv), tree.FmtLocation(time.UTC))
 
-		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		parsed, _, err := tree.ParseDTupleFromString(
 			evalCtx, tupString, types.MakeTuple(tupContents))
 		if err != nil {
@@ -285,7 +304,9 @@ func TestParseTupleRandomDatums(t *testing.T) {
 				tupContents,
 			)
 		}
-		if tup.Compare(evalCtx, parsed) != 0 {
+		if cmp, err := tup.Compare(context.Background(), evalCtx, parsed); err != nil {
+			t.Fatal(err)
+		} else if cmp != 0 {
 			t.Fatalf(`iteration %d: tuple "%s", got %#v, expected %#v`, i, tupString, parsed, tup)
 		}
 	}
@@ -332,7 +353,7 @@ func TestParseTupleError(t *testing.T) {
 	for _, td := range testData {
 		t.Run(td.str, func(t *testing.T) {
 			_, _, err := tree.ParseDTupleFromString(
-				tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), td.str, td.typ)
+				eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), td.str, td.typ)
 			if err == nil {
 				t.Fatalf("expected %#v to error with message %#v", td.str, td.expectedError)
 			}

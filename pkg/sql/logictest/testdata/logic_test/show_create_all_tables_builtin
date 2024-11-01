@@ -41,7 +41,7 @@ CREATE SEQUENCE d.s
 # parent should come before full_test due to dependency ordering.
 # if dependency's aren't considered, full_test will appear first due to
 # lexicographical ordering.
-query T
+query T nosort
 SELECT crdb_internal.show_create_all_tables('d')
 ----
 CREATE TABLE public.parent (
@@ -55,15 +55,17 @@ CREATE TABLE public.parent (
     FAMILY f1 (x, y, z, rowid)
 );
 CREATE TABLE public.full_test (
-                                                                                                                                                                          x INT8 NULL,
-                                                                                                                                                                          y INT8 NULL,
-                                                                                                                                                                          z INT8 NULL,
-                                                                                                                                                                          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                                                                                                                                                                          CONSTRAINT full_test_pkey PRIMARY KEY (rowid ASC),
-                                                                                                                                                                          UNIQUE INDEX full_test_x_key (x ASC),
-                                                                                                                                                                          FAMILY f1 (x, y, z, rowid)
+    x INT8 NULL,
+    y INT8 NULL,
+    z INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT full_test_pkey PRIMARY KEY (rowid ASC),
+    UNIQUE INDEX full_test_x_key (x ASC),
+    FAMILY f1 (x, y, z, rowid)
 );
-CREATE VIEW public.vx ("?column?") AS SELECT 1;
+CREATE VIEW public.vx (
+                                                                                                                                                                          "?column?"
+) AS SELECT 1;
 CREATE SEQUENCE public.s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1;
 ALTER TABLE public.full_test ADD CONSTRAINT full_test_x_y_z_fkey FOREIGN KEY (x, y, z) REFERENCES public.parent(x, y, z) MATCH FULL ON DELETE CASCADE ON UPDATE CASCADE;
 ALTER TABLE public.full_test ADD CONSTRAINT test_fk FOREIGN KEY (x) REFERENCES public.parent(x) ON DELETE CASCADE;
@@ -87,7 +89,7 @@ GRANT CREATE on DATABASE d TO testuser
 # CREATE privilege on the database.
 # TODO(richardjcai): Replace this with CONNECT and
 # add CONNECT privilege required on the builtin description once #59676 is in.
-query T
+query T nosort
 SELECT crdb_internal.show_create_all_tables('d')
 ----
 CREATE TABLE public.parent (
@@ -101,15 +103,17 @@ CREATE TABLE public.parent (
     FAMILY f1 (x, y, z, rowid)
 );
 CREATE TABLE public.full_test (
-                                                                                                                                                                          x INT8 NULL,
-                                                                                                                                                                          y INT8 NULL,
-                                                                                                                                                                          z INT8 NULL,
-                                                                                                                                                                          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                                                                                                                                                                          CONSTRAINT full_test_pkey PRIMARY KEY (rowid ASC),
-                                                                                                                                                                          UNIQUE INDEX full_test_x_key (x ASC),
-                                                                                                                                                                          FAMILY f1 (x, y, z, rowid)
+    x INT8 NULL,
+    y INT8 NULL,
+    z INT8 NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT full_test_pkey PRIMARY KEY (rowid ASC),
+    UNIQUE INDEX full_test_x_key (x ASC),
+    FAMILY f1 (x, y, z, rowid)
 );
-CREATE VIEW public.vx ("?column?") AS SELECT 1;
+CREATE VIEW public.vx (
+                                                                                                                                                                          "?column?"
+) AS SELECT 1;
 CREATE SEQUENCE public.s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1;
 ALTER TABLE public.full_test ADD CONSTRAINT full_test_x_y_z_fkey FOREIGN KEY (x, y, z) REFERENCES public.parent(x, y, z) MATCH FULL ON DELETE CASCADE ON UPDATE CASCADE;
 ALTER TABLE public.full_test ADD CONSTRAINT test_fk FOREIGN KEY (x) REFERENCES public.parent(x) ON DELETE CASCADE;
@@ -138,6 +142,7 @@ SELECT crdb_internal.show_create_all_tables('temp_test')
 
 # Test that a database with foreign keys has the right order.
 statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 CREATE DATABASE test_fk_order;
 USE test_fk_order;
 -- B -> A
@@ -156,26 +161,24 @@ CREATE TABLE c (i int REFERENCES d);
 -- Test a table that uses a sequence to make sure the sequence is dumped first.
 CREATE SEQUENCE s;
 CREATE TABLE s_tbl (id INT PRIMARY KEY DEFAULT nextval('s'), v INT,  FAMILY f1 (id, v));
+COMMIT;
 
 # Table order should be B, A, E, G, F, D, C, sequence s, s_tbl.
-query T
+query T nosort
 SELECT crdb_internal.show_create_all_tables('test_fk_order')
 ----
 CREATE TABLE public.b (
     i INT8 NOT NULL,
-    CONSTRAINT b_pkey PRIMARY KEY (i ASC),
-    FAMILY "primary" (i)
+    CONSTRAINT b_pkey PRIMARY KEY (i ASC)
 );
 CREATE TABLE public.a (
     i INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT a_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (i, rowid)
+    CONSTRAINT a_pkey PRIMARY KEY (rowid ASC)
 );
 CREATE TABLE public.g (
     i INT8 NOT NULL,
-    CONSTRAINT g_pkey PRIMARY KEY (i ASC),
-    FAMILY "primary" (i)
+    CONSTRAINT g_pkey PRIMARY KEY (i ASC)
 );
 CREATE TABLE public.f (
     i INT8 NOT NULL,
@@ -185,8 +188,7 @@ CREATE TABLE public.f (
 );
 CREATE TABLE public.e (
     i INT8 NOT NULL,
-    CONSTRAINT e_pkey PRIMARY KEY (i ASC),
-    FAMILY "primary" (i)
+    CONSTRAINT e_pkey PRIMARY KEY (i ASC)
 );
 CREATE TABLE public.d (
     i INT8 NOT NULL,
@@ -198,8 +200,7 @@ CREATE TABLE public.d (
 CREATE TABLE public.c (
                                                                                        i INT8 NULL,
                                                                                        rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                                                                                       CONSTRAINT c_pkey PRIMARY KEY (rowid ASC),
-                                                                                       FAMILY "primary" (i, rowid)
+                                                                                       CONSTRAINT c_pkey PRIMARY KEY (rowid ASC)
 );
 CREATE SEQUENCE public.s MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1;
 CREATE TABLE public.s_tbl (
@@ -223,22 +224,30 @@ ALTER TABLE public.c VALIDATE CONSTRAINT c_i_fkey;
 # Test that a cycle between two tables is handled correctly.
 statement ok
 CREATE DATABASE test_cycle;
+
+statement ok
 USE test_cycle;
+
+statement ok
 CREATE TABLE loop_a (
   id INT PRIMARY KEY,
   b_id INT,
   INDEX(b_id),
   FAMILY f1 (id, b_id)
 );
+
+statement ok
 CREATE TABLE loop_b (
   id INT PRIMARY KEY,
   a_id INT REFERENCES loop_a ON DELETE CASCADE,
   FAMILY f1 (id, a_id)
 );
+
+statement ok
 ALTER TABLE loop_a ADD CONSTRAINT b_id_delete_constraint
 FOREIGN KEY (b_id) REFERENCES loop_b (id) ON DELETE CASCADE;
 
-query T
+query T nosort
 SELECT crdb_internal.show_create_all_tables('test_cycle')
 ----
 CREATE TABLE public.loop_b (
@@ -263,6 +272,8 @@ ALTER TABLE public.loop_a VALIDATE CONSTRAINT b_id_delete_constraint;
 # Test that a primary key with a non-default name works.
 statement ok
 CREATE DATABASE test_primary_key;
+
+statement ok
 CREATE TABLE test_primary_key.t (
 	i int,
 	CONSTRAINT pk_name PRIMARY KEY (i)
@@ -272,9 +283,8 @@ query T
 SELECT crdb_internal.show_create_all_tables('test_primary_key')
 ----
 CREATE TABLE public.t (
-  i INT8 NOT NULL,
-  CONSTRAINT pk_name PRIMARY KEY (i ASC),
-  FAMILY "primary" (i)
+    i INT8 NOT NULL,
+    CONSTRAINT pk_name PRIMARY KEY (i ASC)
 );
 
 # Test that computed columns are shown correctly.
@@ -310,8 +320,7 @@ CREATE TABLE public.";" (
     ";" INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
     CONSTRAINT ";_pkey" PRIMARY KEY (rowid ASC),
-    INDEX ";_;_idx" (";" ASC),
-    FAMILY "primary" (";", rowid)
+    INDEX ";_;_idx" (";" ASC)
 );
 
 # Ensure quotes in comments are properly escaped, also that the object names
@@ -328,8 +337,7 @@ SELECT crdb_internal.show_create_all_tables('test_comment')
 ----
 CREATE TABLE public."t   t" (
   "x'" INT8 NOT NULL,
-  CONSTRAINT "t   t_pkey" PRIMARY KEY ("x'" ASC),
-  FAMILY "primary" ("x'")
+  CONSTRAINT "t   t_pkey" PRIMARY KEY ("x'" ASC)
 );
 COMMENT ON TABLE public."t   t" IS e'has \' quotes';
 COMMENT ON COLUMN public."t   t"."x'" IS e'i \' just \' love \' quotes';
@@ -344,20 +352,18 @@ CREATE SCHEMA sc2;
 CREATE TABLE sc1.t (x int);
 CREATE TABLE sc2.t (x int);
 
-query T
+query T nosort
 SELECT crdb_internal.show_create_all_tables('test_schema')
 ----
 CREATE TABLE sc1.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
 CREATE TABLE sc2.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
 
 # Ensure sequences are shown correctly.
@@ -376,7 +382,7 @@ CREATE SEQUENCE public.s1 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 123 
 statement ok
 USE test_schema;
 
-query T
+query T nosort
 BEGIN;
 SELECT crdb_internal.show_create_all_tables('test_schema');
 COMMIT;
@@ -384,17 +390,15 @@ COMMIT;
 CREATE TABLE sc1.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
 CREATE TABLE sc2.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
 
-query T
+query T nosort
 BEGIN;
 SELECT * FROM sc1.t;
 SELECT crdb_internal.show_create_all_tables('test_schema');
@@ -403,12 +407,39 @@ COMMIT;
 CREATE TABLE sc1.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
 CREATE TABLE sc2.t (
     x INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC),
-    FAMILY "primary" (x, rowid)
+    CONSTRAINT t_pkey PRIMARY KEY (rowid ASC)
 );
+
+# Regression test for not closing the ValueGenerators when they are recreated
+# multiple times (#85418).
+statement ok
+CREATE DATABASE db_85418_1;
+USE db_85418_1;
+CREATE TABLE t_85418_1();
+CREATE TABLE t_85418_2();
+CREATE DATABASE db_85418_2;
+USE db_85418_2;
+CREATE TABLE t_85418_1();
+CREATE TABLE t_85418_2();
+CREATE TABLE dbs_85418(db STRING);
+INSERT INTO dbs_85418 VALUES ('db_85418_1'), ('db_85418_2');
+SELECT crdb_internal.show_create_all_tables(db) FROM dbs_85418;
+
+# Make sure database names with hyphens work well.
+statement ok
+CREATE DATABASE "d-d";
+USE "d-d";
+CREATE TABLE t();
+SELECT crdb_internal.show_create_all_tables('d-d');
+
+# Make sure database names with quotes work well.
+statement ok
+CREATE DATABASE "a""bc";
+USE "a""bc";
+CREATE TABLE t();
+SELECT crdb_internal.show_create_all_tables('a"bc');

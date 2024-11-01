@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
@@ -16,19 +11,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/raft/confchange"
+	"github.com/cockroachdb/cockroach/pkg/raft/quorum"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/confchange"
-	"go.etcd.io/etcd/raft/v3/quorum"
-	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
-func rd(typ *ReplicaType, id uint64) ReplicaDescriptor {
+func rd(typ ReplicaType, id uint64) ReplicaDescriptor {
 	return ReplicaDescriptor{
 		Type:      typ,
 		NodeID:    NodeID(100 * id),
@@ -37,34 +32,24 @@ func rd(typ *ReplicaType, id uint64) ReplicaDescriptor {
 	}
 }
 
-var vn = (*ReplicaType)(nil) // should be treated like VoterFull
-var v = ReplicaTypeVoterFull()
-var vi = ReplicaTypeVoterIncoming()
-var vo = ReplicaTypeVoterOutgoing()
-var vd = ReplicaTypeVoterDemotingLearner()
-var l = ReplicaTypeLearner()
-
 func TestVotersLearnersAll(t *testing.T) {
 
 	tests := [][]ReplicaDescriptor{
 		{},
-		{rd(v, 1)},
-		{rd(vn, 1)},
-		{rd(l, 1)},
-		{rd(v, 1), rd(l, 2), rd(v, 3)},
-		{rd(vn, 1), rd(l, 2), rd(v, 3)},
-		{rd(l, 1), rd(v, 2), rd(l, 3)},
-		{rd(l, 1), rd(vn, 2), rd(l, 3)},
-		{rd(vi, 1)},
-		{rd(vo, 1)},
-		{rd(l, 1), rd(vo, 2), rd(vi, 3), rd(vi, 4)},
+		{rd(VOTER_FULL, 1)},
+		{rd(LEARNER, 1)},
+		{rd(VOTER_FULL, 1), rd(LEARNER, 2), rd(VOTER_FULL, 3)},
+		{rd(LEARNER, 1), rd(VOTER_FULL, 2), rd(LEARNER, 3)},
+		{rd(VOTER_INCOMING, 1)},
+		{rd(VOTER_OUTGOING, 1)},
+		{rd(LEARNER, 1), rd(VOTER_OUTGOING, 2), rd(VOTER_INCOMING, 3), rd(VOTER_INCOMING, 4)},
 	}
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
 			r := MakeReplicaSet(test)
 			seen := map[ReplicaDescriptor]struct{}{}
 			for _, voter := range r.VoterDescriptors() {
-				typ := voter.GetType()
+				typ := voter.Type
 				switch typ {
 				case VOTER_FULL, VOTER_INCOMING:
 					seen[voter] = struct{}{}
@@ -74,18 +59,17 @@ func TestVotersLearnersAll(t *testing.T) {
 			}
 			for _, learner := range r.LearnerDescriptors() {
 				seen[learner] = struct{}{}
-				assert.Equal(t, LEARNER, learner.GetType())
+				assert.Equal(t, LEARNER, learner.Type)
 			}
 
 			all := r.Descriptors()
 			// Make sure that VOTER_OUTGOING is the only type that is skipped both
 			// by LearnerDescriptors() and VoterDescriptors()
 			for _, rd := range all {
-				typ := rd.GetType()
 				if _, seen := seen[rd]; !seen {
-					assert.Equal(t, VOTER_OUTGOING, typ)
+					assert.Equal(t, VOTER_OUTGOING, rd.Type)
 				} else {
-					assert.NotEqual(t, VOTER_OUTGOING, typ)
+					assert.NotEqual(t, VOTER_OUTGOING, rd.Type)
 				}
 			}
 			assert.Equal(t, len(test), len(all))
@@ -119,7 +103,7 @@ func TestReplicaDescriptorsRemove(t *testing.T) {
 				{NodeID: 1, StoreID: 1},
 				{NodeID: 2, StoreID: 2},
 				{NodeID: 3, StoreID: 3},
-				{NodeID: 4, StoreID: 4, Type: ReplicaTypeLearner()},
+				{NodeID: 4, StoreID: 4, Type: LEARNER},
 			},
 			remove:   ReplicationTarget{NodeID: 2, StoreID: 2},
 			expected: true,
@@ -138,10 +122,10 @@ func TestReplicaDescriptorsRemove(t *testing.T) {
 			assert.Equal(t, lenBefore, len(r.Descriptors()), "testcase %d", i)
 		}
 		for _, voter := range r.VoterDescriptors() {
-			assert.Equal(t, VOTER_FULL, voter.GetType(), "testcase %d", i)
+			assert.Equal(t, VOTER_FULL, voter.Type, "testcase %d", i)
 		}
 		for _, learner := range r.LearnerDescriptors() {
-			assert.Equal(t, LEARNER, learner.GetType(), "testcase %d", i)
+			assert.Equal(t, LEARNER, learner.Type, "testcase %d", i)
 		}
 	}
 }
@@ -152,16 +136,11 @@ func TestReplicaDescriptorsConfState(t *testing.T) {
 		out string
 	}{
 		{
-			[]ReplicaDescriptor{rd(v, 1)},
-			"Voters:[1] VotersOutgoing:[] Learners:[] LearnersNext:[] AutoLeave:false",
-		},
-		// Make sure nil is treated like VoterFull.
-		{
-			[]ReplicaDescriptor{rd(vn, 1)},
+			[]ReplicaDescriptor{rd(VOTER_FULL, 1)},
 			"Voters:[1] VotersOutgoing:[] Learners:[] LearnersNext:[] AutoLeave:false",
 		},
 		{
-			[]ReplicaDescriptor{rd(l, 1), rd(vn, 2)},
+			[]ReplicaDescriptor{rd(LEARNER, 1), rd(VOTER_FULL, 2)},
 			"Voters:[2] VotersOutgoing:[] Learners:[1] LearnersNext:[] AutoLeave:false",
 		},
 		// First joint case. We're adding n3 (via atomic replication changes), so the outgoing
@@ -169,33 +148,33 @@ func TestReplicaDescriptorsConfState(t *testing.T) {
 		// Note that we could simplify this config so that it's not joint, but raft expects
 		// the config exactly as described by the descriptor so we don't try.
 		{
-			[]ReplicaDescriptor{rd(l, 1), rd(v, 2), rd(vi, 3)},
+			[]ReplicaDescriptor{rd(LEARNER, 1), rd(VOTER_FULL, 2), rd(VOTER_INCOMING, 3)},
 			"Voters:[2 3] VotersOutgoing:[2] Learners:[1] LearnersNext:[] AutoLeave:false",
 		},
 		// More complex joint change: a replica swap, switching out n4 for n3 from the initial
 		// set of voters n2, n4 (plus learner n1 before and after).
 		{
-			[]ReplicaDescriptor{rd(l, 1), rd(v, 2), rd(vi, 3), rd(vo, 4)},
+			[]ReplicaDescriptor{rd(LEARNER, 1), rd(VOTER_FULL, 2), rd(VOTER_INCOMING, 3), rd(VOTER_OUTGOING, 4)},
 			"Voters:[2 3] VotersOutgoing:[2 4] Learners:[1] LearnersNext:[] AutoLeave:false",
 		},
 		// Upreplicating from n1,n2 to n1,n2,n3,n4.
 		{
-			[]ReplicaDescriptor{rd(v, 1), rd(v, 2), rd(vi, 3), rd(vi, 4)},
+			[]ReplicaDescriptor{rd(VOTER_FULL, 1), rd(VOTER_FULL, 2), rd(VOTER_INCOMING, 3), rd(VOTER_INCOMING, 4)},
 			"Voters:[1 2 3 4] VotersOutgoing:[1 2] Learners:[] LearnersNext:[] AutoLeave:false",
 		},
 		// Downreplicating from n1,n2,n3,n4 to n1,n2.
 		{
-			[]ReplicaDescriptor{rd(v, 1), rd(v, 2), rd(vo, 3), rd(vo, 4)},
+			[]ReplicaDescriptor{rd(VOTER_FULL, 1), rd(VOTER_FULL, 2), rd(VOTER_OUTGOING, 3), rd(VOTER_OUTGOING, 4)},
 			"Voters:[1 2] VotersOutgoing:[1 2 3 4] Learners:[] LearnersNext:[] AutoLeave:false",
 		},
 		// Completely switching to a new set of replicas: n1,n2 to n4,n5. Throw a learner in for fun.
 		{
-			[]ReplicaDescriptor{rd(vo, 1), rd(vo, 2), rd(vi, 3), rd(vi, 4), rd(l, 5)},
+			[]ReplicaDescriptor{rd(VOTER_OUTGOING, 1), rd(VOTER_OUTGOING, 2), rd(VOTER_INCOMING, 3), rd(VOTER_INCOMING, 4), rd(LEARNER, 5)},
 			"Voters:[3 4] VotersOutgoing:[1 2] Learners:[5] LearnersNext:[] AutoLeave:false",
 		},
 		// Throw in a voter demotion. The demoting voter should be treated as Outgoing and LearnersNext.
 		{
-			[]ReplicaDescriptor{rd(vo, 1), rd(vd, 2), rd(vi, 3), rd(vi, 4), rd(l, 5)},
+			[]ReplicaDescriptor{rd(VOTER_OUTGOING, 1), rd(VOTER_DEMOTING_LEARNER, 2), rd(VOTER_INCOMING, 3), rd(VOTER_INCOMING, 4), rd(LEARNER, 5)},
 			"Voters:[3 4] VotersOutgoing:[1 2] Learners:[5] LearnersNext:[2] AutoLeave:false",
 		},
 	}
@@ -203,8 +182,8 @@ func TestReplicaDescriptorsConfState(t *testing.T) {
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
 			r := MakeReplicaSet(test.in)
-			cs := r.ConfState()
-			require.Equal(t, test.out, raft.DescribeConfState(cs))
+			cs := r.ConfState().Describe()
+			require.Equal(t, test.out, cs)
 		})
 	}
 }
@@ -222,84 +201,84 @@ func TestReplicaDescriptorsCanMakeProgress(t *testing.T) {
 		exp bool
 	}{
 		// One out of one voter dead.
-		{[]descWithLiveness{{false, rd(v, 1)}}, false},
+		{[]descWithLiveness{{false, rd(VOTER_FULL, 1)}}, false},
 		// Three out of three voters dead.
 		{[]descWithLiveness{
-			{false, rd(v, 1)},
-			{false, rd(v, 2)},
-			{false, rd(v, 3)},
+			{false, rd(VOTER_FULL, 1)},
+			{false, rd(VOTER_FULL, 2)},
+			{false, rd(VOTER_FULL, 3)},
 		}, false},
 		// Two out of three voters dead.
 		{[]descWithLiveness{
-			{false, rd(v, 1)},
-			{true, rd(v, 2)},
-			{false, rd(v, 3)},
+			{false, rd(VOTER_FULL, 1)},
+			{true, rd(VOTER_FULL, 2)},
+			{false, rd(VOTER_FULL, 3)},
 		}, false},
 		// Two out of three voters alive.
 		{[]descWithLiveness{
-			{true, rd(v, 1)},
-			{false, rd(v, 2)},
-			{true, rd(v, 3)},
+			{true, rd(VOTER_FULL, 1)},
+			{false, rd(VOTER_FULL, 2)},
+			{true, rd(VOTER_FULL, 3)},
 		}, true},
 		// Two out of three voters alive, but one is an incoming voter. The outgoing
 		// group doesn't have quorum.
 		{[]descWithLiveness{
-			{true, rd(v, 1)},
-			{false, rd(v, 2)},
-			{true, rd(vi, 3)},
+			{true, rd(VOTER_FULL, 1)},
+			{false, rd(VOTER_FULL, 2)},
+			{true, rd(VOTER_INCOMING, 3)},
 		}, false},
 		// Two out of three voters alive, but one is an outgoing voter. The incoming
 		// group doesn't have quorum.
 		{[]descWithLiveness{
-			{true, rd(v, 1)},
-			{false, rd(v, 2)},
-			{true, rd(vd, 3)},
+			{true, rd(VOTER_FULL, 1)},
+			{false, rd(VOTER_FULL, 2)},
+			{true, rd(VOTER_DEMOTING_LEARNER, 3)},
 		}, false},
 		// Two out of three voters dead, and they're all incoming voters. (This
 		// can't happen in practice because it means there were zero voters prior
 		// to the conf change, but still this result is correct, similar to others
 		// below).
 		{[]descWithLiveness{
-			{false, rd(vi, 1)},
-			{false, rd(vi, 2)},
-			{true, rd(vi, 3)},
+			{false, rd(VOTER_INCOMING, 2)},
+			{false, rd(VOTER_INCOMING, 1)},
+			{true, rd(VOTER_INCOMING, 3)},
 		}, false},
 		// Two out of three voters dead, and two are outgoing, one incoming.
 		{[]descWithLiveness{
-			{false, rd(vi, 1)},
-			{false, rd(vo, 2)},
-			{true, rd(vo, 3)},
+			{false, rd(VOTER_INCOMING, 1)},
+			{false, rd(VOTER_OUTGOING, 2)},
+			{true, rd(VOTER_OUTGOING, 3)},
 		}, false},
 		// 1 and 3 are alive, but that's not a quorum for (1 3)&&(2 3) which is
 		// the config here.
 		{[]descWithLiveness{
-			{true, rd(vi, 1)},
-			{false, rd(vo, 2)},
-			{true, rd(v, 3)},
+			{true, rd(VOTER_INCOMING, 1)},
+			{false, rd(VOTER_OUTGOING, 2)},
+			{true, rd(VOTER_FULL, 3)},
 		}, false},
 		// Same as above, but all three alive.
 		{[]descWithLiveness{
-			{true, rd(vi, 1)},
-			{true, rd(vo, 2)},
-			{true, rd(v, 3)},
+			{true, rd(VOTER_INCOMING, 1)},
+			{true, rd(VOTER_OUTGOING, 2)},
+			{true, rd(VOTER_FULL, 3)},
 		}, true},
 		// Same, but there are a few learners that should not matter.
 		{[]descWithLiveness{
-			{true, rd(vi, 1)},
-			{true, rd(vo, 2)},
-			{true, rd(v, 3)},
-			{false, rd(l, 4)},
-			{false, rd(l, 5)},
-			{false, rd(l, 6)},
-			{false, rd(l, 7)},
+			{true, rd(VOTER_INCOMING, 1)},
+			{true, rd(VOTER_OUTGOING, 2)},
+			{true, rd(VOTER_FULL, 3)},
+			{false, rd(LEARNER, 4)},
+			{false, rd(LEARNER, 5)},
+			{false, rd(LEARNER, 6)},
+			{false, rd(LEARNER, 7)},
 		}, true},
 		// Non-joint case that should be live unless the learner is somehow taken
 		// into account.
 		{[]descWithLiveness{
-			{true, rd(v, 1)},
-			{true, rd(v, 2)},
-			{false, rd(v, 4)},
-			{false, rd(l, 4)},
+			{true, rd(VOTER_FULL, 1)},
+			{true, rd(VOTER_FULL, 2)},
+			{false, rd(VOTER_FULL, 4)},
+			{false, rd(LEARNER, 4)},
 		}, true},
 	} {
 		t.Run("", func(t *testing.T) {
@@ -341,8 +320,7 @@ func TestReplicaDescriptorsCanMakeProgressRandom(t *testing.T) {
 		livenessBits := rand.Int31()
 		for i := range rds {
 			rds[i].ReplicaID = ReplicaID(i + 1)
-			typ := ReplicaType(rand.Intn(len(ReplicaType_name)))
-			rds[i].Type = &typ
+			rds[i].Type = ReplicaType(rand.Intn(len(ReplicaType_name)))
 			liveness[i] = (livenessBits >> i & 1) == 0
 		}
 
@@ -354,7 +332,12 @@ func TestReplicaDescriptorsCanMakeProgressRandom(t *testing.T) {
 
 		raftCanMakeProgress, skip := func() (res bool, skip bool) {
 			cfg, _, err := confchange.Restore(
-				confchange.Changer{Tracker: tracker.MakeProgressTracker(1)},
+				confchange.Changer{
+					Config:           quorum.MakeEmptyConfig(),
+					ProgressMap:      tracker.MakeEmptyProgressMap(),
+					MaxInflight:      1,
+					MaxInflightBytes: 0,
+				},
 				rng.ConfState(),
 			)
 			if err != nil {
@@ -363,10 +346,10 @@ func TestReplicaDescriptorsCanMakeProgressRandom(t *testing.T) {
 				}
 				return false, true
 			}
-			votes := make(map[uint64]bool, len(rng.wrapped))
+			votes := make(map[raftpb.PeerID]bool, len(rng.wrapped))
 			for _, rDesc := range rng.wrapped {
 				if liveness[rDesc.ReplicaID-1] {
-					votes[uint64(rDesc.ReplicaID)] = true
+					votes[raftpb.PeerID(rDesc.ReplicaID)] = true
 				}
 			}
 			return cfg.Voters.VoteResult(votes) == quorum.VoteWon, false
@@ -387,4 +370,44 @@ func TestReplicaDescriptorsCanMakeProgressRandom(t *testing.T) {
 	}
 	log.Infof(ctx, "progress: %d cases. no progress: %d cases. skipped: %d cases.",
 		progress, noProgress, skipped)
+}
+
+func TestReplicaSetOperations(t *testing.T) {
+	rs := func(ids ...uint64) ReplicaSet {
+		replicas := make([]ReplicaDescriptor, 0, len(ids))
+		for _, id := range ids {
+			replicas = append(replicas, rd(VOTER_FULL, id))
+		}
+		return MakeReplicaSet(replicas)
+	}
+	var empty []ReplicaDescriptor
+	t.Run("subtract", func(t *testing.T) {
+		require.Equal(t, rs(1, 2, 3).Subtract(rs(2, 3)), rs(1).Descriptors())
+		require.Equal(t, rs(1, 2, 3).Subtract(rs()), rs(1, 2, 3).Descriptors())
+		require.Equal(t, rs(1, 2, 3).Subtract(rs(4, 5, 6)), rs(1, 2, 3).Descriptors())
+		require.Equal(t, rs(1, 2).Subtract(rs(6, 1)), rs(2).Descriptors())
+		require.Equal(t, rs().Subtract(rs(6, 1)), empty)
+	})
+	t.Run("difference", func(t *testing.T) {
+		{ // {1,2,3}.difference({2,3,4})
+			added, removed := rs(1, 2, 3).Difference(rs(2, 3, 4))
+			require.Equal(t, added, rs(4).Descriptors())
+			require.Equal(t, removed, rs(1).Descriptors())
+		}
+		{ // {1,2,3}.difference({1,2,3})
+			added, removed := rs(1, 2, 3).Difference(rs(1, 2, 3))
+			require.Equal(t, added, empty)
+			require.Equal(t, removed, empty)
+		}
+		{ // {}.difference({1,2,3})
+			added, removed := rs().Difference(rs(1, 2, 3))
+			require.Equal(t, added, rs(1, 2, 3).Descriptors())
+			require.Equal(t, removed, empty)
+		}
+		{ // {1,2,3}.difference({})
+			added, removed := rs(1, 2, 3).Difference(rs())
+			require.Equal(t, added, empty)
+			require.Equal(t, removed, rs(1, 2, 3).Descriptors())
+		}
+	})
 }

@@ -1,26 +1,26 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/time/rate"
 )
 
@@ -31,6 +31,10 @@ type SSTSnapshotStorage struct {
 	engine  storage.Engine
 	limiter *rate.Limiter
 	dir     string
+	mu      struct {
+		syncutil.Mutex
+		rangeRefCount map[roachpb.RangeID]int
+	}
 }
 
 // NewSSTSnapshotStorage creates a new SST snapshot storage.
@@ -39,6 +43,10 @@ func NewSSTSnapshotStorage(engine storage.Engine, limiter *rate.Limiter) SSTSnap
 		engine:  engine,
 		limiter: limiter,
 		dir:     filepath.Join(engine.GetAuxiliaryDir(), "sstsnapshot"),
+		mu: struct {
+			syncutil.Mutex
+			rangeRefCount map[roachpb.RangeID]int
+		}{rangeRefCount: make(map[roachpb.RangeID]int)},
 	}
 }
 
@@ -47,16 +55,42 @@ func NewSSTSnapshotStorage(engine storage.Engine, limiter *rate.Limiter) SSTSnap
 func (s *SSTSnapshotStorage) NewScratchSpace(
 	rangeID roachpb.RangeID, snapUUID uuid.UUID,
 ) *SSTSnapshotStorageScratch {
+	s.mu.Lock()
+	s.mu.rangeRefCount[rangeID]++
+	s.mu.Unlock()
 	snapDir := filepath.Join(s.dir, strconv.Itoa(int(rangeID)), snapUUID.String())
 	return &SSTSnapshotStorageScratch{
 		storage: s,
+		rangeID: rangeID,
 		snapDir: snapDir,
 	}
 }
 
 // Clear removes all created directories and SSTs.
 func (s *SSTSnapshotStorage) Clear() error {
-	return s.engine.RemoveAll(s.dir)
+	return s.engine.Env().RemoveAll(s.dir)
+}
+
+// scratchClosed is called when an SSTSnapshotStorageScratch created by this
+// SSTSnapshotStorage is closed. This method handles any cleanup of range
+// directories if all SSTSnapshotStorageScratches corresponding to a range
+// have closed.
+func (s *SSTSnapshotStorage) scratchClosed(rangeID roachpb.RangeID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	val := s.mu.rangeRefCount[rangeID]
+	if val <= 0 {
+		panic("inconsistent scratch ref count")
+	}
+	val--
+	s.mu.rangeRefCount[rangeID] = val
+	if val == 0 {
+		delete(s.mu.rangeRefCount, rangeID)
+		// Suppressing an error here is okay, as orphaned directories are at worst
+		// a performance issue when we later walk directories in pebble.Capacity()
+		// but not a correctness issue.
+		_ = s.engine.Env().RemoveAll(filepath.Join(s.dir, strconv.Itoa(int(rangeID))))
+	}
 }
 
 // SSTSnapshotStorageScratch keeps track of the SST files incrementally created
@@ -64,9 +98,11 @@ func (s *SSTSnapshotStorage) Clear() error {
 // snapshot.
 type SSTSnapshotStorageScratch struct {
 	storage    *SSTSnapshotStorage
+	rangeID    roachpb.RangeID
 	ssts       []string
 	snapDir    string
 	dirCreated bool
+	closed     bool
 }
 
 func (s *SSTSnapshotStorageScratch) filename(id int) string {
@@ -74,7 +110,7 @@ func (s *SSTSnapshotStorageScratch) filename(id int) string {
 }
 
 func (s *SSTSnapshotStorageScratch) createDir() error {
-	err := s.storage.engine.MkdirAll(s.snapDir)
+	err := s.storage.engine.Env().MkdirAll(s.snapDir, os.ModePerm)
 	s.dirCreated = s.dirCreated || err == nil
 	return err
 }
@@ -87,6 +123,9 @@ func (s *SSTSnapshotStorageScratch) createDir() error {
 func (s *SSTSnapshotStorageScratch) NewFile(
 	ctx context.Context, bytesPerSync int64,
 ) (*SSTSnapshotStorageFile, error) {
+	if s.closed {
+		return nil, errors.AssertionFailedf("SSTSnapshotStorageScratch closed")
+	}
 	id := len(s.ssts)
 	filename := s.filename(id)
 	s.ssts = append(s.ssts, filename)
@@ -103,6 +142,9 @@ func (s *SSTSnapshotStorageScratch) NewFile(
 // the provided SST when it is finished using it. If the provided SST is empty,
 // then no file will be created and nothing will be written.
 func (s *SSTSnapshotStorageScratch) WriteSST(ctx context.Context, data []byte) error {
+	if s.closed {
+		return errors.AssertionFailedf("SSTSnapshotStorageScratch closed")
+	}
 	if len(data) == 0 {
 		return nil
 	}
@@ -110,18 +152,11 @@ func (s *SSTSnapshotStorageScratch) WriteSST(ctx context.Context, data []byte) e
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// Closing an SSTSnapshotStorageFile multiple times is idempotent. Nothing
-		// actionable if closing fails.
-		_ = f.Close()
-	}()
-	if _, err := f.Write(data); err != nil {
+	if err := f.Write(data); err != nil {
+		f.Abort()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	return f.Close()
+	return f.Finish()
 }
 
 // SSTs returns the names of the files created.
@@ -129,9 +164,14 @@ func (s *SSTSnapshotStorageScratch) SSTs() []string {
 	return s.ssts
 }
 
-// Clear removes the directory and SSTs created for a particular snapshot.
-func (s *SSTSnapshotStorageScratch) Clear() error {
-	return s.storage.engine.RemoveAll(s.snapDir)
+// Close removes the directory and SSTs created for a particular snapshot.
+func (s *SSTSnapshotStorageScratch) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	defer s.storage.scratchClosed(s.rangeID)
+	return s.storage.engine.Env().RemoveAll(s.snapDir)
 }
 
 // SSTSnapshotStorageFile is an SST file managed by a
@@ -139,11 +179,13 @@ func (s *SSTSnapshotStorageScratch) Clear() error {
 type SSTSnapshotStorageFile struct {
 	scratch      *SSTSnapshotStorageScratch
 	created      bool
-	file         fs.File
+	file         vfs.File
 	filename     string
 	ctx          context.Context
 	bytesPerSync int64
 }
+
+var _ objstorage.Writable = (*SSTSnapshotStorageFile)(nil)
 
 func (f *SSTSnapshotStorageFile) ensureFile() error {
 	if f.created {
@@ -157,11 +199,14 @@ func (f *SSTSnapshotStorageFile) ensureFile() error {
 			return err
 		}
 	}
+	if f.scratch.closed {
+		return errors.AssertionFailedf("SSTSnapshotStorageScratch closed")
+	}
 	var err error
 	if f.bytesPerSync > 0 {
-		f.file, err = f.scratch.storage.engine.CreateWithSync(f.filename, int(f.bytesPerSync))
+		f.file, err = fs.CreateWithSync(f.scratch.storage.engine.Env(), f.filename, int(f.bytesPerSync), fs.RaftSnapshotWriteCategory)
 	} else {
-		f.file, err = f.scratch.storage.engine.Create(f.filename)
+		f.file, err = f.scratch.storage.engine.Env().Create(f.filename, fs.RaftSnapshotWriteCategory)
 	}
 	if err != nil {
 		return err
@@ -170,39 +215,45 @@ func (f *SSTSnapshotStorageFile) ensureFile() error {
 	return nil
 }
 
-// Write writes contents to the file while respecting the limiter passed into
-// SSTSnapshotStorageScratch. Writing empty contents is okay and is treated as
-// a noop. The file must have not been closed.
-func (f *SSTSnapshotStorageFile) Write(contents []byte) (int, error) {
+// Write is part of objstorage.Writable; it writes contents to the file while
+// respecting the limiter passed into SSTSnapshotStorageScratch. Writing empty
+// contents is okay and is treated as a noop.
+// Cannot be called after Finish or Abort.
+func (f *SSTSnapshotStorageFile) Write(contents []byte) error {
 	if len(contents) == 0 {
-		return 0, nil
+		return nil
 	}
 	if err := f.ensureFile(); err != nil {
-		return 0, err
+		return err
 	}
-	limitBulkIOWrite(f.ctx, f.scratch.storage.limiter, len(contents))
-	return f.file.Write(contents)
+	if err := kvserverbase.LimitBulkIOWrite(f.ctx, f.scratch.storage.limiter, len(contents)); err != nil {
+		return err
+	}
+	// Write always returns an error if it can't write all the contents.
+	_, err := f.file.Write(contents)
+	return err
 }
 
-// Close closes the file. Calling this function multiple times is idempotent.
-// The file must have been written to before being closed.
-func (f *SSTSnapshotStorageFile) Close() error {
+// Finish is part of the objstorage.Writable interface.
+func (f *SSTSnapshotStorageFile) Finish() error {
 	// We throw an error for empty files because it would be an error to ingest
 	// an empty SST so catch this error earlier.
 	if !f.created {
 		return errors.New("file is empty")
 	}
-	if f.file == nil {
-		return nil
-	}
-	if err := f.file.Close(); err != nil {
-		return err
-	}
+	errSync := f.file.Sync()
+	errClose := f.file.Close()
 	f.file = nil
-	return nil
+	if errSync != nil {
+		return errSync
+	}
+	return errClose
 }
 
-// Sync syncs the file to disk. Implements writeCloseSyncer in engine.
-func (f *SSTSnapshotStorageFile) Sync() error {
-	return f.file.Sync()
+// Abort is part of the objstorage.Writable interface.
+func (f *SSTSnapshotStorageFile) Abort() {
+	if f.file != nil {
+		_ = f.file.Close()
+		f.file = nil
+	}
 }

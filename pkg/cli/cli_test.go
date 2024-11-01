@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -34,12 +29,12 @@ func TestCLITimeout(t *testing.T) {
 	// the timeout a chance to have an effect. We specify --all to include some
 	// slower to access virtual tables in the query.
 	testutils.SucceedsSoon(t, func() error {
-		out, err := c.RunWithCapture("node status 1 --all --timeout 1ns")
+		out, err := c.RunWithCapture("node status 1 --all --timeout 1ms")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		const exp = `node status 1 --all --timeout 1ns
+		const exp = `node status 1 --all --timeout 1ms
 ERROR: query execution canceled due to statement timeout
 SQLSTATE: 57014
 `

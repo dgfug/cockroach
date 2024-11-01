@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jsonload
 
@@ -37,19 +32,23 @@ const (
 	jsonSchemaWithComputed      = `(k BIGINT AS (v->>'key')::BIGINT STORED PRIMARY KEY, v JSONB NOT NULL)`
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type jsonLoad struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	batchSize      int
-	cycleLength    int64
-	readPercent    int
-	writeSeq, seed int64
-	sequential     bool
-	splits         int
-	complexity     int
-	inverted       bool
-	computed       bool
+	batchSize   int
+	cycleLength int64
+	readPercent int
+	writeSeq    int64
+	sequential  bool
+	splits      int
+	complexity  int
+	inverted    bool
+	computed    bool
+
+	writeSeqAtomic *atomic.Int64
 }
 
 func init() {
@@ -60,7 +59,8 @@ var jsonLoadMeta = workload.Meta{
 	Name: `json`,
 	Description: `JSON reads and writes to keys spread (by default, uniformly` +
 		` at random) across the cluster`,
-	Version: `1.0.0`,
+	Version:    `1.0.0`,
+	RandomSeed: RandomSeed,
 	New: func() workload.Generator {
 		g := &jsonLoad{}
 		g.flags.FlagSet = pflag.NewFlagSet(`json`, pflag.ContinueOnError)
@@ -71,12 +71,12 @@ var jsonLoadMeta = workload.Meta{
 		g.flags.Int64Var(&g.cycleLength, `cycle-length`, math.MaxInt64, `Number of keys repeatedly accessed by each writer`)
 		g.flags.IntVar(&g.readPercent, `read-percent`, 0, `Percent (0-100) of operations that are reads of existing keys`)
 		g.flags.Int64Var(&g.writeSeq, `write-seq`, 0, `Initial write sequence value.`)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.BoolVar(&g.sequential, `sequential`, false, `Pick keys sequentially instead of randomly`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
 		g.flags.IntVar(&g.complexity, `complexity`, 20, `Complexity of generated JSON data`)
 		g.flags.BoolVar(&g.inverted, `inverted`, false, `Whether to include an inverted index`)
 		g.flags.BoolVar(&g.computed, `computed`, false, `Whether to use a computed primary key`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -87,6 +87,9 @@ func (*jsonLoad) Meta() workload.Meta { return jsonLoadMeta }
 
 // Flags implements the Flagser interface.
 func (w *jsonLoad) Flags() workload.Flags { return w.flags }
+
+// ConnFlags implements the ConnFlagser interface.
+func (w *jsonLoad) ConnFlags() *workload.ConnFlags { return w.connFlags }
 
 // Hooks implements the Hookser interface.
 func (w *jsonLoad) Hooks() workload.Hooks {
@@ -114,8 +117,8 @@ func (w *jsonLoad) Tables() []workload.Table {
 		Splits: workload.Tuples(
 			w.splits,
 			func(splitIdx int) []interface{} {
-				rng := rand.New(rand.NewSource(w.seed + int64(splitIdx)))
-				g := newHashGenerator(&sequence{config: w, val: w.writeSeq})
+				rng := rand.New(rand.NewSource(RandomSeed.Seed() + int64(splitIdx)))
+				g := newHashGenerator(&sequence{config: w, val: w.writeSeqAtomic})
 				return []interface{}{
 					int(g.hash(rng.Int63())),
 				}
@@ -129,10 +132,6 @@ func (w *jsonLoad) Tables() []workload.Table {
 func (w *jsonLoad) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -140,6 +139,10 @@ func (w *jsonLoad) Ops(
 	// Allow a maximum of concurrency+1 connections to the database.
 	db.SetMaxOpenConns(w.connFlags.Concurrency + 1)
 	db.SetMaxIdleConns(w.connFlags.Concurrency + 1)
+
+	var writeSeqAtomic atomic.Int64
+	writeSeqAtomic.Store(w.writeSeq)
+	w.writeSeqAtomic = &writeSeqAtomic
 
 	var buf bytes.Buffer
 	buf.WriteString(`SELECT k, v FROM j WHERE k IN (`)
@@ -179,7 +182,7 @@ func (w *jsonLoad) Ops(
 		return workload.QueryLoad{}, err
 	}
 
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		op := jsonOp{
 			config:    w,
@@ -188,7 +191,7 @@ func (w *jsonLoad) Ops(
 			readStmt:  readStmt,
 			writeStmt: writeStmt,
 		}
-		seq := &sequence{config: w, val: w.writeSeq}
+		seq := &sequence{config: w, val: w.writeSeqAtomic}
 		if w.sequential {
 			op.g = newSequentialGenerator(seq)
 		} else {
@@ -257,18 +260,18 @@ func (o *jsonOp) run(ctx context.Context) error {
 
 type sequence struct {
 	config *jsonLoad
-	val    int64
+	val    *atomic.Int64
 }
 
 func (s *sequence) write() int64 {
-	return (atomic.AddInt64(&s.val, 1) - 1) % s.config.cycleLength
+	return (s.val.Add(1) - 1) % s.config.cycleLength
 }
 
 // read returns the last key index that has been written. Note that the returned
 // index might not actually have been written yet, so a read operation cannot
 // require that the key is present.
 func (s *sequence) read() int64 {
-	return atomic.LoadInt64(&s.val) % s.config.cycleLength
+	return s.val.Load() % s.config.cycleLength
 }
 
 // keyGenerator generates read and write keys. Read keys may not yet exist and
@@ -289,14 +292,14 @@ type hashGenerator struct {
 func newHashGenerator(seq *sequence) *hashGenerator {
 	return &hashGenerator{
 		seq:    seq,
-		random: rand.New(rand.NewSource(seq.config.seed)),
+		random: rand.New(rand.NewSource(RandomSeed.Seed())),
 		hasher: sha1.New(),
 	}
 }
 
 func (g *hashGenerator) hash(v int64) int64 {
 	binary.BigEndian.PutUint64(g.buf[:8], uint64(v))
-	binary.BigEndian.PutUint64(g.buf[8:16], uint64(g.seq.config.seed))
+	binary.BigEndian.PutUint64(g.buf[8:16], uint64(RandomSeed.Seed()))
 	g.hasher.Reset()
 	_, _ = g.hasher.Write(g.buf[:16])
 	g.hasher.Sum(g.buf[:0])
@@ -327,7 +330,7 @@ type sequentialGenerator struct {
 func newSequentialGenerator(seq *sequence) *sequentialGenerator {
 	return &sequentialGenerator{
 		seq:    seq,
-		random: rand.New(rand.NewSource(seq.config.seed)),
+		random: rand.New(rand.NewSource(RandomSeed.Seed())),
 	}
 }
 

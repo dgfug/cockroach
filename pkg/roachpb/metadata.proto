@@ -1,19 +1,15 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto2";
 package cockroach.roachpb;
-option go_package = "roachpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/roachpb";
 
 import "util/unresolved_addr.proto";
 import "util/hlc/timestamp.proto";
+import "util/admission/admissionpb/io_threshold.proto";
 import "gogoproto/gogo.proto";
 
 // Attributes specifies a list of arbitrary strings describing
@@ -125,27 +121,28 @@ enum ReplicaType {
 // ReplicaDescriptor describes a replica location by node ID
 // (corresponds to a host:port via lookup on gossip network) and store
 // ID (identifies the device).
-// TODO(jeffreyxiao): All nullable fields in ReplicaDescriptor can be made
-// non-nullable if #38302 is guaranteed to be on all nodes (I.E. 20.1).
 message ReplicaDescriptor {
   option (gogoproto.goproto_stringer) = false;
   option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   optional int32 node_id = 1 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
+      (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID",
+      (gogoproto.moretags) = "yaml:\"NodeID\""];
   optional int32 store_id = 2 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID"];
+      (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID",
+      (gogoproto.moretags) = "yaml:\"StoreID\""];
 
   // replica_id uniquely identifies a replica instance. If a range is removed from
   // a store and then re-added to the same store, the new instance will have a
   // higher replica_id.
   optional int32 replica_id = 3 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "ReplicaID", (gogoproto.casttype) = "ReplicaID"];
+      (gogoproto.customname) = "ReplicaID", (gogoproto.casttype) = "ReplicaID",
+      (gogoproto.moretags) = "yaml:\"ReplicaID\""];
 
-  // Type indicates which raft activities a replica participates in. A nil type
-  // is equivalent to VOTER.
-  optional ReplicaType type = 4;
+  // Type indicates which raft activities a replica participates in.
+  optional ReplicaType type = 4 [(gogoproto.nullable) = false,
+    (gogoproto.moretags) = "yaml:\"ReplicaType,omitempty\""];
 }
 
 // ReplicaIdent uniquely identifies a specific replica.
@@ -159,23 +156,17 @@ message ReplicaIdent {
 // A range is described using an inclusive start key, a non-inclusive end key,
 // and a list of replicas where the range is stored.
 //
-// NOTE: Care must be taken when adding or removing fields from this proto
-// because we have code relies on the descriptor comparing Equal() after
-// round-tripping through a previous/next version node (i.e. in mixed-version
-// clusters). Note that we don't need to proto encoding to be stable since, when
-// doing CPuts we use the raw bytes we've read from the DB as the expected value
-// (instead of re-marshaling the proto), but unfortunately we also need the
-// Equal() method to work. Also note that we configure our protos to not
-// maintain unrecognized fields.
-//
-// TODO(jeffreyxiao): All nullable fields in RangeDescriptor can be made
-// non-nullable if #38302 is guaranteed to be on all nodes (I.E. 20.1).
+// NOTE: Care must be taken when making changes to this proto because we have
+// code that relies on the descriptor comparing Equal() after round-tripping
+// through a previous/next version node (i.e. in mixed-version clusters). Note
+// that we don't need the proto encoding to be stable since, when doing CPuts we
+// use the raw bytes we've read from the DB as the expected value (instead of
+// re-marshaling the proto), but unfortunately we also need the Equal() method
+// to work. Also note that we configure our protos to not maintain unrecognized
+// fields.
 message RangeDescriptor {
   option (gogoproto.goproto_stringer) = false;
-  // We implement the Equal method by hand so that it can ignore deprecated
-  // fields. This can be reverted in 21.1 once the "previous version" no longer
-  // populates deprecated_generation_comparable.
-  option (gogoproto.equal) = false;
+  option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   optional int64 range_id = 1 [(gogoproto.nullable) = false,
@@ -261,20 +252,13 @@ message RangeDescriptor {
   // replica applying the merge is.
   optional int64 generation = 6 [(gogoproto.nullable) = false, (gogoproto.casttype) = "RangeGeneration"];
 
-  // This field is not used any more, but we need to maintain it in 20.2 because
-  // 20.1 nodes need descriptors to round-trip through 20.2 nodes and compare
-  // Equal() when they come back. 20.2 nodes know to ignore this field when
-  // comparing, so the field can be removed in 21.1.
-  optional bool deprecated_generation_comparable = 8;
-
   // The presence of the sticky_bit indicates that the range should not be
   // automatically merged by the merge queue with the range to its left. It is
   // set during a split operation and unset during an unsplit operation. Note
   // that the unsplit operation is a different operation from the merge
   // operation. Unsplit only unsets sticky_bit. It is represented by a
   // timestamp that indicates when it expires. After the expiration time has
-  // passed, the split is eligible for automatic merging. A nil sticky bit is
-  // equivalent to hlc.Timestamp{}.
+  // passed, the split is eligible for automatic merging.
   //
   // The reason the sticky_bit exists is because when the merge queue is
   // enabled and a manual split happens, the split ranges would immediately be
@@ -282,7 +266,9 @@ message RangeDescriptor {
   // attempted to execute ALTER TABLE/INDEX ... SPLIT AT ... when the merge
   // queue is enabled. With sticky_bit, users can manually split ranges without
   // disabling the merge queue.
-  optional util.hlc.Timestamp sticky_bit = 7;
+  optional util.hlc.Timestamp sticky_bit = 7 [(gogoproto.nullable) = false];
+
+  reserved 8;
 }
 
 // Percentiles contains a handful of hard-coded percentiles meant to summarize
@@ -327,11 +313,21 @@ message StoreCapacity {
   // by ranges in the store. The stat is tracked over the time period defined
   // in storage/replica_stats.go, which as of July 2018 is 30 minutes.
   optional double writes_per_second = 5 [(gogoproto.nullable) = false];
+  // cpu_per_second tracks the average store cpu use (ns) per second.
+  // This is the sum of all the replica's cpu time on this store, which is
+  // tracked in replica stats.
+  optional double cpu_per_second = 14 [(gogoproto.nullable) = false, (gogoproto.customname) = "CPUPerSecond"];
+  optional cockroach.util.admission.admissionpb.IOThreshold io_threshold = 13 [(gogoproto.nullable) = false, (gogoproto.customname) = "IOThreshold" ];
+  // io_threshold_max tracks the maximum io overload values the store has had
+  // over the last 5 minutes.
+  optional cockroach.util.admission.admissionpb.IOThreshold io_threshold_max = 15 [(gogoproto.nullable) = false, (gogoproto.customname) = "IOThresholdMax" ];
   // bytes_per_replica and writes_per_replica contain percentiles for the
   // number of bytes and writes-per-second to each replica in the store.
   // This information can be used for rebalancing decisions.
   optional Percentiles bytes_per_replica = 6 [(gogoproto.nullable) = false];
   optional Percentiles writes_per_replica = 7 [(gogoproto.nullable) = false];
+  reserved 11;
+  reserved 12;
 }
 
 // StoreProperties contains configuration and OS-level details for a storage device.
@@ -340,6 +336,11 @@ message StoreProperties {
   optional bool encrypted = 1 [(gogoproto.nullable) = false];
   // read_only indicates whether the store is attached read_only.
   optional bool read_only = 2 [(gogoproto.nullable) = false];
+  // dir is the path to the store's data directory on the node.
+  optional string dir = 4 [(gogoproto.nullable) = false];
+  // wal_failover_path encodes the path to the secondary WAL directory used for
+  // failover in the event of high write latency to the primary WAL.
+  optional string wal_failover_path = 5;
 
   // disk_properties reports details about the underlying filesystem,
   // when the store is supported by a file store. Unset otherwise.
@@ -367,6 +368,8 @@ message NodeDescriptor {
   option (gogoproto.equal) = true;
   optional int32 node_id = 1 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
+  // Address can not be used directly for dialing a node. It doesn't take into
+  // account the locality addresses. Use gossip.GetNodeIDAddress instead.
   optional util.UnresolvedAddr address = 2 [(gogoproto.nullable) = false];
   optional Attributes attrs = 3 [(gogoproto.nullable) = false];
   optional Locality locality = 4 [(gogoproto.nullable) = false];
@@ -377,8 +380,12 @@ message NodeDescriptor {
   optional string cluster_name = 9 [(gogoproto.nullable) = false];
   // The SQL address. If empty, indicates that the base address field
   // is also used to accept SQL connections.
-  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false, 
+  optional util.UnresolvedAddr sql_address = 10 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "SQLAddress"];
+  // The HTTP address. If empty, will prevent nodes from proxying HTTP
+  // requests to each other.
+  optional util.UnresolvedAddr http_address = 11 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "HTTPAddress"];
 }
 
 // LocalityAddress holds the private address accessible only from other nodes
@@ -398,15 +405,6 @@ message StoreDescriptor {
   optional NodeDescriptor node = 3 [(gogoproto.nullable) = false];
   optional StoreCapacity capacity = 4 [(gogoproto.nullable) = false];
   optional StoreProperties properties = 5 [(gogoproto.nullable) = false];
-}
-
-// StoreDeadReplicas holds a storeID and a list of dead replicas on that store.
-// Used to let the range lease holder know about corrupted or otherwise
-// destroyed replicas that should be transferred to a different store.
-message StoreDeadReplicas {
-  optional int32 store_id = 1 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID"];
-  repeated ReplicaIdent replicas = 2 [(gogoproto.nullable) = false];
 }
 
 // Locality is an ordered set of key value Tiers that describe a node's
@@ -429,6 +427,22 @@ message Tier {
   optional string value = 2 [(gogoproto.nullable) = false];
 }
 
+// LocalityComparisonType represents different types of comparison results that
+// indicate the relationship between two localities.
+enum LocalityComparisonType {
+  // UNDEFINED represents an undefined comparison result, indicating error
+  // behavior.
+  UNDEFINED = 0;
+  // CROSS_REGION indicates that the two localities have different region tiers.
+  CROSS_REGION = 1;
+  // SAME_REGION_CROSS_ZONE indicates that the two localities have the same
+  // region tiers but different zone tiers.
+  SAME_REGION_CROSS_ZONE = 2;
+  // SAME_REGION_SAME_ZONE indicates that the two localities have same region
+  // and same zone tiers.
+  SAME_REGION_SAME_ZONE = 3;
+}
+
 message Version {
   option (gogoproto.equal) = true;
   option (gogoproto.goproto_stringer) = false;
@@ -436,13 +450,113 @@ message Version {
   // The names "major" and "minor" are reserved in C in
   // some platforms (e.g. FreeBSD).
 
-  optional int32 major_val = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "Major"];
-  optional int32 minor_val = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "Minor"];
+  optional int32 major_val = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "Major", (gogoproto.jsontag) = "major"];
+  optional int32 minor_val = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "Minor", (gogoproto.jsontag) = "minor"];
   // Note that patch is a placeholder and will always be zero.
   optional int32 patch = 3 [(gogoproto.nullable) = false];
   // The internal version is used to introduce migrations during the development
   // cycle. They are subversions that are never the end versions of a release,
   // i.e. users of stable, public release will only use binaries with the
   // internal version set to 0.
+  // This field will be odd for fence versions, which allow the upgrades
+  // infrastructure to safely step through consecutive cluster versions. Note
+  // that -1 is a legal value, as that is the fence version for all final
+  // releases, which have an internal version of 0.
   optional int32 internal = 4 [(gogoproto.nullable) = false];
+}
+
+// GCHint contains information that MVCC GC could use to optimize data deletion.
+message GCHint {
+  option (gogoproto.equal) = true;
+
+  // LatestRangeDeleteTimestamp is a timestamp at which the *entire* key span of
+  // the range was deleted using MVCC range tombstones. This hint is maintained
+  // with best effort, and may have false positives and negatives.
+  //
+  // It helps the cases when large key spans are deleted, e.g. table/index drops
+  // in SQL. In such cases it is likely that there will be no writes to the
+  // keyspace of this Range at timestamps above LatestRangeDeleteTimestamp. GC
+  // can then delete this data using the efficient ClearRange operation.
+  //
+  // Generally, we can't guarantee no writes above LatestRangeDeleteTimestamp,
+  // so we don't rely on this hint for correctness. When GC uses this hint, it
+  // double-checks while holding a latch that the range hasn't had any writes
+  // above this timestamp.
+  //
+  // Initially, when a large key span is deleted, this hint is accurate for all
+  // the affected ranges. As the time goes, more data can be written to these
+  // ranges, or they may be split/merged with other ranges. We do best effort to
+  // remove this hint as soon as we know the optimization won't be effective.
+  //
+  // For example, we don't propagate this hint when merging two ranges one of
+  // which doesn't carry this hint, because we know that the entire span is
+  // probably not covered by range tombstones.
+  //
+  // TODO(pavelkalinnikov): this is used for one other purpose, factor it out.
+  //
+  // When this hint is set, it is likely that adjacent ranges have it too,
+  // especially in bulk deletion situations. Once the GC queue sees this hint,
+  // it scans all the local leaseholder replicas to find the one with this hint
+  // too, and GC them with higher priority / lower delay. Ultimately, this
+  // reduces the cost of Pebble compactions that can be triggered by writing
+  // range tombstones.
+  optional util.hlc.Timestamp latest_range_delete_timestamp = 1 [(gogoproto.nullable) = false];
+
+  // GCTimestamp is the lowest "pending" timestamp for which some data in the
+  // range must be garbage collected.
+  //
+  // Typically, this is left up to the MVCC GC job to decide when to delete
+  // data. Because of the way the GC scoring works, it may take a long time
+  // until such a decision is made. Some upper layer jobs require a more timely
+  // deletion. For example, when a SQL table/index is dropped, there is a schema
+  // change job waiting on the GC.
+  //
+  // We carry this hint to help expedite GC in such cases. Garbage collection is
+  // triggered shortly after the time is past GCTimestamp + TTL.
+  //
+  // It is possible that there are multiple timestamps for which some data must
+  // be deleted, e.g. if multiple SQL tables touching the same Range are
+  // dropped. We could carry all such timestamps in this GCHint for accuracy,
+  // but we would need extra measures to prevent uncontrollable growth of this
+  // list, and excessive number of GC runs it could cause.
+  //
+  // Instead, we compress this list of timestamps to a pair of GCTimestamp and
+  // GCTimestampNext, storing the min and max (if different from min) timestamp
+  // correspondingly.
+  //
+  // Since a GC run covers all timestamps <= threshold, preserving the max
+  // timestamp as a threshold guarantees that all pending timestamps <= max are
+  // covered. However, the max pending timestamp can always be bumped up by
+  // newer and newer writes, and never get below now() - TTL. To work around
+  // this race, we also preserve the min pending timestamp, and update it only
+  // when it has been garbage collected.
+  //
+  // With such a structure of the hint, we have a couple of guarantees:
+  //
+  //  1. The number of expedited GC runs on this range does not exceed 2 per TTL.
+  //
+  // Worst case: min < max < min+TTL = now. GC runs at time now = min+TTL, and
+  // maybe at max+TTL or later time. Since any new write is at timestamp >= now,
+  // the next GC run after these two is at least TTL away from now.
+  //
+  //  2. The max delay of expedited GC is close to one TTL, i.e. in the worst
+  //     case the GC will run at timestamp + 2*TTL.
+  //
+  // Worst case: now = max = min+TTL. GC runs at time now and clears the min
+  // timestamp. The only remaining timestamp (max) is min+TTL. The next possible
+  // expedited GC run is thus at min+2*TTL. We may have omitted some timestamps
+  // between min and max, and they are now <= 2*TTL away from the next GC run.
+  optional util.hlc.Timestamp gc_timestamp = 2 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "GCTimestamp"];
+  // GCTimestampNext is the largest "pending" timestamp for which some data in
+  // the range must be garbage collected. See GCTimestamp comment for more
+  // details.
+  //
+  // INVARIANT: if GCTimestamp is empty, then GCTimestampNext is empty.
+  // INVARIANT: if GCTimestampNext is set, it exceeds GCTimestamp.
+  //
+  // NB: if GCTimestamp is set and GCTimestampNext is empty, it means there is
+  // only one pending timestamp for garbage collection.
+  optional util.hlc.Timestamp gc_timestamp_next = 3 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "GCTimestampNext"];
 }

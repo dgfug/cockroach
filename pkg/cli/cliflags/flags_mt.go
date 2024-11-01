@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cliflags
 
@@ -16,6 +11,14 @@ var (
 		Name:        "tenant-id",
 		EnvVar:      "COCKROACH_TENANT_ID",
 		Description: `The tenant ID under which to start the SQL server.`,
+	}
+
+	TenantIDFile = FlagInfo{
+		Name: "tenant-id-file",
+		Description: `Allows sourcing the tenant id from a file. The tenant id
+will be expected to be by itself on the first line of the file. If the file does
+not exist, or if the tenant id is incomplete, the tenant server will block, and
+wait for the tenant id to be fully written to the file (with a newline character).`,
 	}
 
 	KVAddrs = FlagInfo{
@@ -29,9 +32,19 @@ var (
 		Description: "Denylist file to limit access to IP addresses and tenant ids.",
 	}
 
+	AllowList = FlagInfo{
+		Name:        "allowlist-file",
+		Description: "Allow file to limit access to tenants based on IP addresses.",
+	}
+
 	ProxyListenAddr = FlagInfo{
 		Name:        "listen-addr",
 		Description: "Listen address for incoming connections.",
+	}
+
+	ProxyProtocolListenAddr = FlagInfo{
+		Name:        "proxy-protocol-listen-addr",
+		Description: "Listen address for incoming connections which require proxy protocol headers.",
 	}
 
 	ThrottleBaseDelay = FlagInfo{
@@ -55,15 +68,13 @@ var (
 	}
 
 	RoutingRule = FlagInfo{
-		Name: "routing-rule",
-		Description: `
-Routing rule for incoming connections. Use '{{clusterName}}' for substitution.
-This rule must include the port of the SQL pod.`,
+		Name:        "routing-rule",
+		Description: "Routing rule for incoming connections. This rule must include the port of the SQL pod.",
 	}
 
 	DirectoryAddr = FlagInfo{
 		Name:        "directory",
-		Description: "Directory address of the service doing resolution from backend id to IP.",
+		Description: "Directory address of the service doing resolution of tenants to their IP addresses.",
 	}
 
 	// TODO(chrisseto): Remove skip-verify as a CLI option. It should only be
@@ -76,6 +87,22 @@ This rule must include the port of the SQL pod.`,
 	InsecureBackend = FlagInfo{
 		Name:        "insecure",
 		Description: "If true, use insecure connection to the backend.",
+	}
+
+	DisableConnectionRebalancing = FlagInfo{
+		Name:        "disable-connection-rebalancing",
+		Description: "If true, proxy will not attempt to rebalance connections.",
+	}
+
+	// TODO(joel): Remove this flag, and use --listen-addr for a non-proxy
+	// protocol listener, and use --proxy-protocol-listen-addr for a proxy
+	// protocol listener.
+	RequireProxyProtocol = FlagInfo{
+		Name: "require-proxy-protocol",
+		Description: `Requires PROXY protocol on the SQL listener. The HTTP
+listener will support the protocol on a best-effort basis. If this is set to
+true, the PROXY info from upstream will be trusted on both SQL and HTTP
+listeners, if the headers are allowed.`,
 	}
 
 	RatelimitBaseDelay = FlagInfo{
@@ -93,13 +120,27 @@ This rule must include the port of the SQL pod.`,
 		Description: "Polling interval changes in config file.",
 	}
 
-	DrainTimeout = FlagInfo{
-		Name:        "drain-timeout",
-		Description: "Close DRAINING connections idle for this duration.",
-	}
-
 	TestDirectoryListenPort = FlagInfo{
 		Name:        "port",
 		Description: "Test directory server binds and listens on this port.",
+	}
+
+	TestDirectoryTenantCertsDir = FlagInfo{
+		Name:        "certs-dir",
+		Description: CertsDir.Description,
+	}
+
+	TestDirectoryTenantBaseDir = FlagInfo{
+		Name:        "base-dir",
+		Description: "If set, the tenant processes will use it as a store location.",
+	}
+
+	Virtualized = FlagInfo{
+		Name:        "virtualized",
+		Description: "If set, the cluster will be initialized as a virtualized cluster.",
+	}
+	VirtualizedEmpty = FlagInfo{
+		Name:        "virtualized-empty",
+		Description: "If set, the cluster will be initialized as a virtualized cluster without main virtual cluster.",
 	}
 )

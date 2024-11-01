@@ -1,16 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package protoutil
 
-import "github.com/gogo/protobuf/proto"
+import (
+	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/gogo/protobuf/proto"
+	gproto "google.golang.org/protobuf/proto"
+)
 
 // Message extends the proto.Message interface with the MarshalTo and Size
 // methods we tell gogoproto to generate for us.
@@ -22,12 +23,7 @@ type Message interface {
 	Size() int
 }
 
-// Interceptor will be called with every proto before it is marshaled.
-// Interceptor is not safe to modify concurrently with calls to Marshal.
-var Interceptor = func(_ Message) {}
-
-// Marshal encodes pb into the wire format. It is used throughout the code base
-// to intercept calls to proto.Marshal.
+// Marshal encodes pb into the wire format and returns the resulting byte slice.
 func Marshal(pb Message) ([]byte, error) {
 	dest := make([]byte, pb.Size())
 	if _, err := MarshalToSizedBuffer(pb, dest); err != nil {
@@ -36,17 +32,31 @@ func Marshal(pb Message) ([]byte, error) {
 	return dest, nil
 }
 
-// MarshalTo encodes pb into the wire format. It is used throughout the code
-// base to intercept calls to pb.MarshalTo.
+// MarshalTo encodes pb into the wire format and writes the result into the
+// provided byte slice, returning the number of bytes written.
+//
+// dest is required to have a capacity of at least pb.Size() bytes.
 func MarshalTo(pb Message, dest []byte) (int, error) {
-	Interceptor(pb)
+	if buildutil.CrdbTestBuild {
+		if pb.Size() > cap(dest) {
+			panic(fmt.Sprintf("MarshalTo called for %T with slice with insufficient "+
+				"capacity: pb.Size()=%d, cap(dest)=%d", pb, pb.Size(), cap(dest)))
+		}
+	}
 	return pb.MarshalTo(dest)
 }
 
-// MarshalToSizedBuffer encodes pb into the wire format. It is used
-// throughout the code base to intercept calls to pb.MarshalToSizedBuffer.
+// MarshalToSizedBuffer encodes pb into the wire format and writes the result
+// into the provided byte slice, returning the number of bytes written.
+//
+// dest is required to have a length of exactly pb.Size() bytes.
 func MarshalToSizedBuffer(pb Message, dest []byte) (int, error) {
-	Interceptor(pb)
+	if buildutil.CrdbTestBuild {
+		if pb.Size() != len(dest) {
+			panic(fmt.Sprintf("MarshalToSizedBuffer called for %T with slice with "+
+				"incorrect length: pb.Size()=%d, len(dest)=%d", pb, pb.Size(), len(dest)))
+		}
+	}
 	return pb.MarshalToSizedBuffer(dest)
 }
 
@@ -59,4 +69,14 @@ func MarshalToSizedBuffer(pb Message, dest []byte) (int, error) {
 func Unmarshal(data []byte, pb Message) error {
 	pb.Reset()
 	return pb.Unmarshal(data)
+}
+
+// TODOMarshal is a short-term workaround for the linter in order to use the latest protobuf package
+func TODOMarshal(pb gproto.Message) ([]byte, error) {
+	return gproto.Marshal(pb)
+}
+
+// TODOUnmarshal is a short-term workaround for the linter in order to use the latest protobuf package
+func TODOUnmarshal(data []byte, pb gproto.Message) error {
+	return gproto.Unmarshal(data, pb)
 }

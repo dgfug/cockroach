@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This connects to a postgres server and crafts postgres-protocol message
 // to encode its arguments into postgres' text and binary encodings. The
@@ -17,9 +12,22 @@
 // The target postgres server must accept plaintext (non-ssl) connections from
 // the postgres:postgres account. A suitable server can be started with:
 //
-// `docker run -p 127.0.0.1:5432:5432 postgres:11`
+// Start a postgres14 server with postgis extension:
 //
-// The output of this file generates pkg/sql/pgwire/testdata/encodings.json.
+//	docker run --name postgres \
+//	  -e POSTGRES_DB=db \
+//	  -e POSTGRES_HOST_AUTH_METHOD=trust \
+//	  -p	127.0.0.1:5432:5432 \
+//	  postgis/postgis:14-3.4
+//
+//	docker exec -it postgres psql -U postgres -c "CREATE EXTENSION postgis;"
+//
+// TODO(xiaochen): figure out where the `"Text": "9E+4"` in encodings.json comes from
+// and fix it. (postgres 9 ~ 14 all return "90000" for `SELECT '9E+4'::decimal;`)
+//
+// Generate file "encodings.json":
+//
+//	bazel run pkg/cmd/generate-binary > pkg/sql/pgwire/testdata/encodings.json
 package main
 
 import (
@@ -32,9 +40,11 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/cmp-protocol/pgconnect"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 )
 
@@ -58,7 +68,7 @@ func main() {
 	var data []entry
 	ctx := context.Background()
 
-	stmts := os.Args[1:]
+	stmts := flag.Args()
 
 	if len(stmts) == 0 {
 		// Sort hard coded inputs by key name.
@@ -91,6 +101,13 @@ func main() {
 		id, err := pgconnect.Connect(ctx, sql, *postgresAddr, *postgresUser, pgwirebase.FormatText)
 		if err != nil {
 			log.Fatalf("oid: %s: %v", sql, err)
+		}
+		// Hardcode OIDs for geometry and geography.
+		if strings.HasSuffix(expr, "::geometry") {
+			id = []byte(fmt.Sprintf("%d", oidext.T_geometry))
+		}
+		if strings.HasSuffix(expr, "::geography") {
+			id = []byte(fmt.Sprintf("%d", oidext.T_geography))
 		}
 		data = append(data, entry{
 			SQL:          expr,
@@ -304,6 +321,8 @@ var inputs = map[string][]string{
 		"0004-10-19 10:23:54 BC",
 		"4004-10-19 10:23:54",
 		"9004-10-19 10:23:54",
+		"infinity",
+		"-infinity",
 	},
 
 	"'%s'::timestamptz": {
@@ -358,10 +377,23 @@ var inputs = map[string][]string{
 		"epoch",
 	},
 
+	"'%s'::pg_lsn": {
+		"010011F/1ABCDEF0",
+	},
+
 	"'%s'::time": {
 		"00:00:00",
 		"12:00:00.000001",
 		"23:59:59.999999",
+	},
+
+	"'%s'::geometry": {
+		"SRID=4326;POINT EMPTY",
+		"GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(1 1, 2 2))",
+	},
+	"'%s'::geography": {
+		"SRID=4326;POINT EMPTY",
+		"GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(1 1, 2 2))",
 	},
 
 	"'%s'::interval": {
@@ -566,5 +598,31 @@ var inputs = map[string][]string{
 
 	`%s::text`: {
 		`''`,
+	},
+	`%s::tsvector`: {
+		`'hi'`,
+		`'hi"'`,
+		`'hi bye'`,
+		`'hi bye'`,
+		`'hi:1'`,
+		`'hi:2,1000'`,
+		`'hi:10A'`,
+		`'hi:1A,2B,3C,4D bye:5,6,10 foo'`,
+	},
+	`%s::tsquery`: {
+		`'hi'`,
+		`'hi:B'`,
+		`'hi:AB*'`,
+		`'hi:ABCD'`,
+		`'hi:ABCD*'`,
+		`'hi:*'`,
+		`'hi"'`,
+		`'!hi'`,
+		`'hi | bye'`,
+		`'hi & !bye'`,
+		`'hi & (!bye | foo <-> bar)'`,
+		`'hi & (!bye | foo <10> bar)'`,
+		`'hi & (!bye | foo <0> bar)'`,
+		`'hi & (!bye:A | foo:B <1> bar:C* )'`,
 	},
 }

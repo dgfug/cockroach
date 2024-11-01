@@ -1,36 +1,41 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.QueryTxn, declareKeysQueryTransaction, QueryTxn)
+	RegisterReadOnlyCommand(kvpb.QueryTxn, declareKeysQueryTransaction, QueryTxn)
 }
 
 func declareKeysQueryTransaction(
-	_ ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
-) {
-	qr := req.(*roachpb.QueryTxnRequest)
+	_ ImmutableRangeState,
+	_ *kvpb.Header,
+	req kvpb.Request,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
+	_ time.Duration,
+) error {
+	qr := req.(*kvpb.QueryTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.TransactionKey(qr.Txn.Key, qr.Txn.ID)})
+	return nil
 }
 
 // QueryTxn fetches the current state of a transaction.
@@ -41,11 +46,11 @@ func declareKeysQueryTransaction(
 // other txns which are waiting on this transaction in order
 // to find dependency cycles.
 func QueryTxn(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.QueryTxnRequest)
+	args := cArgs.Args.(*kvpb.QueryTxnRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.QueryTxnResponse)
+	reply := resp.(*kvpb.QueryTxnResponse)
 
 	if h.Txn != nil {
 		return result.Result{}, ErrTransactionUnsupported
@@ -64,7 +69,8 @@ func QueryTxn(
 
 	// Fetch transaction record; if missing, attempt to synthesize one.
 	ok, err := storage.MVCCGetProto(
-		ctx, reader, key, hlc.Timestamp{}, &reply.QueriedTxn, storage.MVCCGetOptions{},
+		ctx, reader, key, hlc.Timestamp{}, &reply.QueriedTxn,
+		storage.MVCCGetOptions{ReadCategory: fs.BatchEvalReadCategory},
 	)
 	if err != nil {
 		return result.Result{}, err

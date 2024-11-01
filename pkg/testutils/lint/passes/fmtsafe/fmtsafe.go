@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package fmtsafe
 
@@ -245,13 +240,13 @@ func checkCallExpr(pass *analysis.Pass, enclosingFnName string, call *ast.CallEx
 		return
 	}
 
-	pass.Reportf(call.Lparen, escNl("%s(): %s argument is not a constant expression"+Tip),
-		enclosingFnName, argType)
+	pass.Reportf(call.Lparen, escNl("%s(): %s argument is not a constant expression"+Tip), enclosingFnName, argType)
 }
 
 // Tip is exported for use in tests.
 var Tip = `
-Tip: use YourFuncf("descriptive prefix %%s", ...) or list new formatting wrappers in pkg/testutils/lint/passes/fmtsafe/functions.go.`
+Tip: use YourFuncf("descriptive prefix %%s", ...) or list new formatting wrappers in pkg/testutils/lint/passes/fmtsafe/functions.go.
+N.B. additional entry is required functions in the main package. See functions.go#requireConstFmt`
 
 func hasNoLintComment(pass *analysis.Pass, call *ast.CallExpr, idx int) bool {
 	fPos, f := findContainingFile(pass, call)

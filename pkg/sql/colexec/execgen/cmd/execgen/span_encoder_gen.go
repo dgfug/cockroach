@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -44,11 +39,7 @@ func genSpanEncoder(inputFileContents string, wr io.Writer) error {
 	for _, asc := range []bool{true, false} {
 		info := spanEncoderDirectionInfo{Asc: asc}
 		for _, family := range supportedCanonicalTypeFamilies {
-			if family == types.JsonFamily {
-				// We are currently unable to encode JSON as a table key.
-				continue
-			}
-			familyInfo := spanEncoderTypeFamilyInfo{TypeFamily: toString(family)}
+			familyInfo := spanEncoderTypeFamilyInfo{TypeFamily: familyToString(family)}
 			for _, width := range supportedWidthsByCanonicalTypeFamily[family] {
 				overload := spanEncoderTmplInfo{
 					Asc:        asc,
@@ -145,6 +136,18 @@ func (info spanEncoderTmplInfo) AssignSpanEncoding(appendTo, valToEncode string)
 				colexecerror.ExpectedError(err)
 			}
     `, appendTo, funcName, valToEncode)
+	case types.JsonFamily:
+		dir := "encoding.Ascending"
+		if !info.Asc {
+			dir = "encoding.Descending"
+		}
+		return fmt.Sprintf(`
+			var err error
+			%[1]s, err = %[2]s.EncodeForwardIndex(%[1]s, %[3]s)
+			if err != nil {
+				colexecerror.ExpectedError(err)
+			}
+    `, appendTo, valToEncode, dir)
 	case typeconv.DatumVecCanonicalTypeFamily:
 		dir := "encoding.Ascending"
 		if !info.Asc {
@@ -153,7 +156,7 @@ func (info spanEncoderTmplInfo) AssignSpanEncoding(appendTo, valToEncode string)
 		valToEncode += ".(tree.Datum)"
 		return fmt.Sprintf(`
 			var err error
-			%[1]s, err = rowenc.EncodeTableKey(%[1]s, %[2]s, %[3]s)
+			%[1]s, err = keyside.Encode(%[1]s, %[2]s, %[3]s)
 			if err != nil {
 				colexecerror.ExpectedError(err)
 			}

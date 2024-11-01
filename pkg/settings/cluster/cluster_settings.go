@@ -1,18 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cluster
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -20,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -45,21 +40,32 @@ type Settings struct {
 	// is useful.
 	cpuProfiling int32 // atomic
 
-	// Version provides the interface through which which callers read/write to
-	// the active cluster version, and access this binary's version details.
-	// Setting the active cluster version has a very specific, intended usage
-	// pattern. Look towards the interface itself for more commentary.
+	// Version provides the interface through which callers read/write to the
+	// active cluster version, and access this binary's version details. Setting
+	// the active cluster version has a very specific, intended usage pattern.
+	// Look towards the interface itself for more commentary.
 	Version clusterversion.Handle
 
 	// Cache can be used for arbitrary caching, e.g. to cache decoded
 	// enterprises licenses for utilccl.CheckEnterpriseEnabled().
-	Cache sync.Map
+	Cache syncutil.Map[any, any]
+
+	// OverridesInformer can be nil.
+	OverridesInformer OverridesInformer
 }
 
-// TelemetryOptOut is a place for controlling whether to opt out of telemetry or not.
-func TelemetryOptOut() bool {
-	return envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
+// OverridesInformer is an interface that can be used to figure out if a setting
+// is currently being overridden by the host cluster (only possible for
+// secondary tenants).
+//
+// TODO(radu): move this functionality into settings.Values, provide a way to
+// obtain it along with the current value consistently.
+type OverridesInformer interface {
+	IsOverridden(settingKey settings.InternalKey) bool
 }
+
+// TelemetryOptOut controls whether to opt out of telemetry (including Sentry) or not.
+var TelemetryOptOut = envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
 
 // NoSettings is used when a func requires a Settings but none is available
 // (for example, a CLI subcommand that does not connect to a cluster).
@@ -112,52 +118,68 @@ func (s *Settings) MakeUpdater() settings.Updater {
 	return settings.NewUpdater(&s.SV)
 }
 
-// MakeClusterSettings returns a Settings object that has its binary and
-// minimum supported versions set to this binary's build and it's minimum
-// supported versions respectively. The cluster version setting is not
-// initialized.
+// MakeClusterSettings returns a Settings object. The cluster version setting is
+// not initialized.
 func MakeClusterSettings() *Settings {
+	return MakeClusterSettingsWithVersions(clusterversion.Latest.Version(), clusterversion.MinSupported.Version())
+}
+
+// MakeClusterSettingsWithVersions returns a Settings object that has the given
+// latest and minimum supported versions. The cluster version setting is not
+// initialized.
+func MakeClusterSettingsWithVersions(latest, minSupported roachpb.Version) *Settings {
 	s := &Settings{}
 
 	sv := &s.SV
-	s.Version = clusterversion.MakeVersionHandle(&s.SV)
+	s.Version = clusterversion.MakeVersionHandle(&s.SV, latest, minSupported)
 	sv.Init(context.TODO(), s.Version)
 	return s
 }
 
-// MakeTestingClusterSettings returns a Settings object that has its binary and
-// minimum supported versions set to the baked in binary version. It also
-// initializes the cluster version setting to the binary version.
+// MakeTestingClusterSettings returns a Settings object that is initialized with
+// the latest version.
 //
 // It is typically used for testing or one-off situations in which a Settings
 // object is needed, but cluster settings don't play a crucial role.
 func MakeTestingClusterSettings() *Settings {
 	return MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryVersion, true /* initializeVersion */)
+		clusterversion.Latest.Version(),
+		clusterversion.Latest.Version(),
+		true /* initializeVersion */)
 }
 
 // MakeTestingClusterSettingsWithVersions returns a Settings object that has its
-// binary and minimum supported versions set to the provided versions.
-// It also can also initialize the cluster version setting to the specified
-// binaryVersion.
+// latest and minimum supported versions set to the provided versions.
 //
-// It is typically used in tests that want to override the default binary and
+// It can optionally initialize the cluster version setting to the specified
+// latestVersion.
+//
+// It is typically used in tests that want to override the binary's latest and
 // minimum supported versions.
 func MakeTestingClusterSettingsWithVersions(
-	binaryVersion, binaryMinSupportedVersion roachpb.Version, initializeVersion bool,
+	latestVersion, minSupportedVersion roachpb.Version, initializeVersion bool,
 ) *Settings {
-	s := &Settings{}
-
-	sv := &s.SV
-	s.Version = clusterversion.MakeVersionHandleWithOverride(
-		&s.SV, binaryVersion, binaryMinSupportedVersion)
-	sv.Init(context.TODO(), s.Version)
+	s := MakeClusterSettingsWithVersions(latestVersion, minSupportedVersion)
 
 	if initializeVersion {
-		// Initialize cluster version to specified binaryVersion.
-		if err := clusterversion.Initialize(context.TODO(), binaryVersion, &s.SV); err != nil {
+		// Initialize cluster version to specified latestVersion.
+		if err := clusterversion.Initialize(context.TODO(), latestVersion, &s.SV); err != nil {
 			log.Fatalf(context.TODO(), "unable to initialize version: %s", err)
 		}
 	}
 	return s
+}
+
+// TestingCloneClusterSettings makes a clone of the Settings object. This is to
+// be used for settings objects that are passed as initial parameters for test
+// clusters; the given Settings object should not be in use by any server.
+func TestingCloneClusterSettings(st *Settings) *Settings {
+	result := &Settings{
+		ExternalIODir: st.ExternalIODir,
+	}
+	result.Version = clusterversion.MakeVersionHandle(
+		&result.SV, st.Version.LatestVersion(), st.Version.MinSupportedVersion(),
+	)
+	result.SV.TestingCopyForServer(&st.SV, result.Version)
+	return result
 }

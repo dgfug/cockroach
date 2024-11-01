@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colrpc
 
@@ -70,7 +65,7 @@ func TestInboxCancellation(t *testing.T) {
 		err = colexecerror.CatchVectorizedRuntimeError(func() { inbox.Init(ctx) })
 		require.True(t, testutils.IsError(err, "context canceled"), err)
 		// Now, the remote stream arrives.
-		err = inbox.RunWithStream(context.Background(), mockFlowStreamServer{}, make(<-chan struct{}))
+		err = inbox.RunWithStream(context.Background(), mockFlowStreamServer{})
 		// We expect no error from the stream handler since we canceled it
 		// ourselves (a graceful termination).
 		require.Nil(t, err)
@@ -139,8 +134,10 @@ func TestInboxNextPanicDoesntLeakGoroutines(t *testing.T) {
 	m := &execinfrapb.ProducerMessage{}
 	m.Data.RawBytes = []byte("garbage")
 
+	// Simulate the client (outbox) that sends only a single piece of metadata.
 	go func() {
 		_ = rpcLayer.client.Send(m)
+		_ = rpcLayer.client.CloseSend()
 	}()
 
 	// inbox.Next should panic given that the deserializer will encounter garbage
@@ -149,6 +146,10 @@ func TestInboxNextPanicDoesntLeakGoroutines(t *testing.T) {
 		inbox.Init(context.Background())
 		inbox.Next()
 	})
+
+	// Upon catching the panic and converting it into an error, the caller
+	// transitions to draining.
+	inbox.DrainMeta()
 
 	// We require no error from the stream handler as nothing was canceled. The
 	// panic is bubbled up through the Next chain on the Inbox's host.
@@ -195,9 +196,9 @@ func TestInboxTimeout(t *testing.T) {
 // These goroutines race against each other and the
 // desired state is that everything is cleaned up at the end. Examples of
 // scenarios that are tested by this test include but are not limited to:
-//  - DrainMeta called before Next and before a stream arrives.
-//  - DrainMeta called with an active stream.
-//  - A forceful cancellation of Next but no call to DrainMeta.
+//   - DrainMeta called before Next and before a stream arrives.
+//   - DrainMeta called with an active stream.
+//   - A forceful cancellation of Next but no call to DrainMeta.
 func TestInboxShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -213,7 +214,8 @@ func TestInboxShutdown(t *testing.T) {
 		nextSleep          = time.Millisecond * time.Duration(rng.Intn(10))
 		runWithStreamSleep = time.Millisecond * time.Duration(rng.Intn(10))
 		typs               = []*types.T{types.Int}
-		batch              = coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
+		args               = coldatatestutils.RandomVecArgs{Rand: rng, NullProbability: rng.Float64()}
+		batch              = coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), 0 /* length */)
 	)
 
 	// drainMetaScenario specifies when DrainMeta should be called in the Next
@@ -268,7 +270,7 @@ func TestInboxShutdown(t *testing.T) {
 					defer inboxMemAccount.Close(inboxCtx)
 					inbox, err := NewInbox(colmem.NewAllocator(inboxCtx, &inboxMemAccount, coldata.StandardColumnFactory), typs, execinfrapb.StreamID(0))
 					require.NoError(t, err)
-					c, err := colserde.NewArrowBatchConverter(typs)
+					c, err := colserde.NewArrowBatchConverter(typs, colserde.BatchToArrowOnly, testMemAcc)
 					require.NoError(t, err)
 					r, err := colserde.NewRecordBatchSerializer(typs)
 					require.NoError(t, err)
@@ -298,7 +300,8 @@ func TestInboxShutdown(t *testing.T) {
 									wg.Add(1)
 									go func() {
 										defer wg.Done()
-										arrowData, err := c.BatchToArrow(batch)
+										defer c.Close(context.Background())
+										arrowData, err := c.BatchToArrow(context.Background(), batch)
 										if err != nil {
 											errCh <- err
 											return

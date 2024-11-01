@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,8 +12,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -26,10 +24,14 @@ func registerQueue(r registry.Registry) {
 	// One node runs the workload generator, all other nodes host CockroachDB.
 	const numNodes = 2
 	r.Add(registry.TestSpec{
-		Skip:    "https://github.com/cockroachdb/cockroach/issues/17229",
-		Name:    fmt.Sprintf("queue/nodes=%d", numNodes-1),
-		Owner:   registry.OwnerKV,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Skip:                       "https://github.com/cockroachdb/cockroach/issues/17229",
+		Name:                       fmt.Sprintf("queue/nodes=%d", numNodes-1),
+		Owner:                      registry.OwnerKV,
+		Cluster:                    r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		CompatibleClouds:           registry.AllExceptAWS,
+		Suites:                     registry.Suites(registry.Nightly),
+		Leases:                     registry.MetamorphicLeases,
+		RequiresDeprecatedWorkload: true, // uses queue
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runQueue(ctx, t, c)
 		},
@@ -38,15 +40,11 @@ func registerQueue(r registry.Registry) {
 
 func runQueue(ctx context.Context, t test.Test, c cluster.Cluster) {
 	dbNodeCount := c.Spec().NodeCount - 1
-	workloadNode := c.Spec().NodeCount
-
 	// Distribute programs to the correct nodes and start CockroachDB.
-	c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, dbNodeCount))
-	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(workloadNode))
-	c.Start(ctx, c.Range(1, dbNodeCount))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
 
 	runQueueWorkload := func(duration time.Duration, initTables bool) {
-		m := c.NewMonitor(ctx, c.Range(1, dbNodeCount))
+		m := c.NewMonitor(ctx, c.CRDBNodes())
 		m.Go(func(ctx context.Context) error {
 			concurrency := ifLocal(c, "", " --concurrency="+fmt.Sprint(dbNodeCount*64))
 			duration := fmt.Sprintf(" --duration=%s", duration.String())
@@ -61,10 +59,10 @@ func runQueue(ctx context.Context, t test.Test, c cluster.Cluster) {
 					concurrency+
 					duration+
 					batch+
-					" {pgurl:1-%d}",
-				dbNodeCount,
+					" {pgurl%s}",
+				c.CRDBNodes(),
 			)
-			c.Run(ctx, c.Node(workloadNode), cmd)
+			c.Run(ctx, option.WithNodes(c.WorkloadNode()), cmd)
 			return nil
 		})
 		m.Wait()
@@ -73,7 +71,7 @@ func runQueue(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// getQueueScanTime samples the time to run a statement that scans the queue
 	// table.
 	getQueueScanTime := func() time.Duration {
-		db := c.Conn(ctx, 1)
+		db := c.Conn(ctx, t.L(), 1)
 		sampleCount := 5
 		samples := make([]time.Duration, sampleCount)
 		for i := 0; i < sampleCount; i++ {
@@ -100,7 +98,7 @@ func runQueue(ctx context.Context, t test.Test, c cluster.Cluster) {
 	scanTimeBefore := getQueueScanTime()
 
 	// Set TTL on table queue.queue to 0, so that rows are deleted immediately
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	_, err := db.ExecContext(ctx, `ALTER TABLE queue.queue CONFIGURE ZONE USING gc.ttlseconds = 30`)
 	if err != nil && strings.Contains(err.Error(), "syntax error") {
 		// Pre-2.1 was EXPERIMENTAL.

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -59,27 +54,33 @@ var (
 // instead of a method so that other packages can iterate over the map directly.
 // Note that additional elements for the array Oid types are added in init().
 var OidToType = map[oid.Oid]*T{
-	oid.T_anyelement:   Any,
-	oid.T_bit:          typeBit,
-	oid.T_bool:         Bool,
-	oid.T_bpchar:       typeBpChar,
-	oid.T_bytea:        Bytes,
-	oid.T_char:         QChar,
-	oid.T_date:         Date,
-	oid.T_float4:       Float4,
-	oid.T_float8:       Float,
-	oid.T_int2:         Int2,
-	oid.T_int2vector:   Int2Vector,
-	oid.T_int4:         Int4,
-	oid.T_int8:         Int,
-	oid.T_inet:         INet,
-	oid.T_interval:     Interval,
+	oid.T_anyelement: Any,
+	oid.T_bit:        typeBit,
+	oid.T_bool:       Bool,
+	oid.T_bpchar:     typeBpChar,
+	oid.T_bytea:      Bytes,
+	oid.T_char:       QChar,
+	oid.T_date:       Date,
+	oid.T_float4:     Float4,
+	oid.T_float8:     Float,
+	oid.T_int2:       Int2,
+	oid.T_int2vector: Int2Vector,
+	oid.T_int4:       Int4,
+	oid.T_int8:       Int,
+	oid.T_inet:       INet,
+	oid.T_interval:   Interval,
+	// NOTE(sql-exp): Uncomment the line below if we support the JSON type.
+	// This would potentially require us to convert the type descriptors of
+	// existing tables.
+	// oid.T_json:      Json,
 	oid.T_jsonb:        Jsonb,
 	oid.T_name:         Name,
 	oid.T_numeric:      Decimal,
 	oid.T_oid:          Oid,
 	oid.T_oidvector:    OidVector,
+	oid.T_pg_lsn:       PGLSN,
 	oid.T_record:       AnyTuple,
+	oid.T_refcursor:    RefCursor,
 	oid.T_regclass:     RegClass,
 	oid.T_regnamespace: RegNamespace,
 	oid.T_regproc:      RegProc,
@@ -91,14 +92,19 @@ var OidToType = map[oid.Oid]*T{
 	oid.T_timetz:       TimeTZ,
 	oid.T_timestamp:    Timestamp,
 	oid.T_timestamptz:  TimestampTZ,
+	oid.T_trigger:      Trigger,
+	oid.T_tsquery:      TSQuery,
+	oid.T_tsvector:     TSVector,
 	oid.T_unknown:      Unknown,
 	oid.T_uuid:         Uuid,
 	oid.T_varbit:       VarBit,
 	oid.T_varchar:      VarChar,
+	oid.T_void:         Void,
 
 	oidext.T_geometry:  Geometry,
 	oidext.T_geography: Geography,
 	oidext.T_box2d:     Box2D,
+	oidext.T_pgvector:  PGVector,
 }
 
 // oidToArrayOid maps scalar type Oids to their corresponding array type Oid.
@@ -123,7 +129,9 @@ var oidToArrayOid = map[oid.Oid]oid.Oid{
 	oid.T_numeric:      oid.T__numeric,
 	oid.T_oid:          oid.T__oid,
 	oid.T_oidvector:    oid.T__oidvector,
+	oid.T_pg_lsn:       oid.T__pg_lsn,
 	oid.T_record:       oid.T__record,
+	oid.T_refcursor:    oid.T__refcursor,
 	oid.T_regclass:     oid.T__regclass,
 	oid.T_regnamespace: oid.T__regnamespace,
 	oid.T_regproc:      oid.T__regproc,
@@ -135,6 +143,8 @@ var oidToArrayOid = map[oid.Oid]oid.Oid{
 	oid.T_timetz:       oid.T__timetz,
 	oid.T_timestamp:    oid.T__timestamp,
 	oid.T_timestamptz:  oid.T__timestamptz,
+	oid.T_tsquery:      oid.T__tsquery,
+	oid.T_tsvector:     oid.T__tsvector,
 	oid.T_uuid:         oid.T__uuid,
 	oid.T_varbit:       oid.T__varbit,
 	oid.T_varchar:      oid.T__varchar,
@@ -142,6 +152,7 @@ var oidToArrayOid = map[oid.Oid]oid.Oid{
 	oidext.T_geometry:  oidext.T__geometry,
 	oidext.T_geography: oidext.T__geography,
 	oidext.T_box2d:     oidext.T__box2d,
+	oidext.T_pgvector:  oidext.T__pgvector,
 }
 
 // familyToOid maps each type family to a default OID value that is used when
@@ -160,6 +171,8 @@ var familyToOid = map[Family]oid.Oid{
 	TimestampTZFamily:    oid.T_timestamptz,
 	CollatedStringFamily: oid.T_text,
 	OidFamily:            oid.T_oid,
+	PGLSNFamily:          oid.T_pg_lsn,
+	RefCursorFamily:      oid.T_refcursor,
 	UnknownFamily:        oid.T_unknown,
 	UuidFamily:           oid.T_uuid,
 	ArrayFamily:          oid.T_anyarray,
@@ -167,6 +180,8 @@ var familyToOid = map[Family]oid.Oid{
 	TimeFamily:           oid.T_time,
 	TimeTZFamily:         oid.T_timetz,
 	JsonFamily:           oid.T_jsonb,
+	TSQueryFamily:        oid.T_tsquery,
+	TSVectorFamily:       oid.T_tsvector,
 	TupleFamily:          oid.T_record,
 	BitFamily:            oid.T_bit,
 	AnyFamily:            oid.T_anyelement,
@@ -174,6 +189,7 @@ var familyToOid = map[Family]oid.Oid{
 	GeometryFamily:  oidext.T_geometry,
 	GeographyFamily: oidext.T_geography,
 	Box2DFamily:     oidext.T_box2d,
+	PGVectorFamily:  oidext.T_pgvector,
 }
 
 // ArrayOids is a set of all oids which correspond to an array type.
@@ -214,19 +230,26 @@ func CalcArrayOid(elemTyp *T) oid.Oid {
 
 	case TupleFamily:
 		if elemTyp.UserDefined() {
-			// We're currently not creating array types for implicitly-defined
-			// per-table record types. So, we cheat a little, and return, as the OID
-			// for an array of these things, the OID for a generic array of records.
-			return oid.T__record
+			if elemTyp.TypeMeta.ImplicitRecordType {
+				// We're currently not creating array types for implicitly-defined
+				// per-table record types. So, we cheat a little, and return, as the OID
+				// for an array of these things, the OID for a generic array of records.
+				return oid.T__record
+			}
+			return elemTyp.UserDefinedArrayOID()
 		}
 	}
 
 	// Map the OID of the array element type to the corresponding array OID.
 	// This should always be possible for all other OIDs (checked in oid.go
 	// init method).
-	o = oidToArrayOid[o]
+	if o == oid.T_json {
+		o = oid.T__json
+	} else {
+		o = oidToArrayOid[o]
+	}
 	if o == 0 {
-		panic(errors.AssertionFailedf("oid %d couldn't be mapped to array oid", o))
+		panic(errors.AssertionFailedf("oid %d couldn't be mapped to array oid", elemTyp.Oid()))
 	}
 	return o
 }

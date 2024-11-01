@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { Spinner, InlineAlert } from "@cockroachlabs/ui-components";
 import { assert } from "chai";
 import { mount } from "enzyme";
-import { Spinner, InlineAlert } from "@cockroachlabs/ui-components";
+import React from "react";
+
 import { Loading } from "./loading";
 
 const SomeComponent = () => <div>Hello, world!</div>;
@@ -24,6 +20,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={false}
+            page={"Test"}
             error={null}
             render={() => <SomeComponent />}
           />,
@@ -37,6 +34,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={true}
+            page={"Test"}
             error={null}
             render={() => <SomeComponent />}
           />,
@@ -53,6 +51,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={false}
+            page={"Test"}
             error={Error("some error message")}
             render={() => <SomeComponent />}
           />,
@@ -68,6 +67,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={true}
+            page={"Test"}
             error={Error("some error message")}
             render={() => <SomeComponent />}
           />,
@@ -82,6 +82,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={true}
+            page={"Test"}
             error={Error("some error message")}
             render={() => <SomeComponent />}
             renderError={() => <SomeCustomErrorComponent />}
@@ -101,6 +102,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={false}
+            page={"Test"}
             error={errors}
             render={() => <SomeComponent />}
           />,
@@ -109,12 +111,7 @@ describe("<Loading>", () => {
         assert.isFalse(wrapper.find(Spinner).exists());
         assert.isTrue(wrapper.find(InlineAlert).exists());
         errors.forEach(e =>
-          assert.isTrue(
-            wrapper
-              .find(InlineAlert)
-              .text()
-              .includes(e.message),
-          ),
+          assert.isTrue(wrapper.find(InlineAlert).text().includes(e.message)),
         );
       });
     });
@@ -132,6 +129,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={false}
+            page={"Test"}
             error={errors}
             render={() => <SomeComponent />}
           />,
@@ -142,12 +140,7 @@ describe("<Loading>", () => {
         errors
           .filter(e => !!e)
           .forEach(e =>
-            assert.isTrue(
-              wrapper
-                .find(InlineAlert)
-                .text()
-                .includes(e.message),
-            ),
+            assert.isTrue(wrapper.find(InlineAlert).text().includes(e.message)),
           );
       });
     });
@@ -157,6 +150,7 @@ describe("<Loading>", () => {
         const wrapper = mount(
           <Loading
             loading={false}
+            page={"Test"}
             error={[null, null, null]}
             render={() => <SomeComponent />}
           />,

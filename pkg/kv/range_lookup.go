@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -15,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -45,19 +41,18 @@ import (
 // The "Range Metadata Key" for a range is built by appending the end key of the
 // range to the respective meta prefix.
 //
-//
 // It is often useful to think of Cockroach's ranges as existing in a three
 // level tree:
 //
-//            [/meta1/,/meta1/max)   <-- always one range, gossipped, start here!
-//                     |
-//          -----------------------
-//          |                     |
-//  [/meta2/,/meta2/m)   [/meta2/m,/meta2/max)
-//          |                     |
-//      ---------             ---------
-//      |       |             |       |
-//    [a,g)   [g,m)         [m,s)   [s,max)   <- user data
+//	          [/meta1/,/meta1/max)   <-- always one range, gossipped, start here!
+//	                   |
+//	        -----------------------
+//	        |                     |
+//	[/meta2/,/meta2/m)   [/meta2/m,/meta2/max)
+//	        |                     |
+//	    ---------             ---------
+//	    |       |             |       |
+//	  [a,g)   [g,m)         [m,s)   [s,max)   <- user data
 //
 // In this analogy, each node (range) contains a number of RangeDescriptors, and
 // these descriptors act as pointers to the location of its children. So given a
@@ -68,83 +63,87 @@ import (
 // its parent range, we know that the descriptor we want is the first descriptor
 // to the right of this meta key in the parent's ordered set of keys.
 //
-//
 // Let's look at a few examples that demonstrate how RangeLookup performs this
 // task of finding a user RangeDescriptors from cached meta2 descriptors:
 //
 // Ex. 1:
-//  Meta2 Ranges: [/meta2/a,  /meta2/z)
-//  User  Ranges: [a, f) [f, p), [p, z)
-//  1.a: RangeLookup(key=f)
-//   In this case, we want to look up the range descriptor for the range [f, p)
-//   because "f" is in that range. Remember that this descriptor will be stored
-//   at "/meta2/p". Of course, when we're performing the RangeLookup, we don't
-//   actually know what the bounds of this range are or where exactly it's
-//   stored (that's what we're looking up!), so all we have to go off of is the
-//   lookup key. So, we first determine the meta key for the lookup key using
-//   RangeMetaKey, which is simply "/meta2/f". We then construct the scan bounds
-//   for this key using MetaScanBounds. This scan bound will be
-//   [/meta2/f.Next(),/meta2/max). The reason that this scan doesn't start at
-//   "/meta2/f" is because if this key is the start key of a range (like it is
-//   in this example!), the previous range descriptor will be stored at that
-//   key. We then issue a forward ScanRequest over this range. Since we're
-//   assuming we already cached the meta2 range that contains this span of keys,
-//   we send the request directly to that range's replica (if we didn't have
-//   this cached, the process would recurse to lookup the meta2 range
-//   descriptor). We then find that the first KV pair we see during the scan is
-//   at "/meta2/p". This is our desired range descriptor.
-//  1.b: RangeLookup(key=m)
-//   This case is similar. We construct a scan for this key "m" from
-//   [/meta2/m.Next(),/meta2/max) and everything works the same as before.
-//  1.b: RangeLookup(key=p)
-//   Here, we're looking for the descriptor for the range [p, z), because key "p"
-//   is included in that range, but not [f, p). We scan with bounds of
-//   [/meta2/p.Next(),/meta2/max) and everything works as expected.
+//
+//	Meta2 Ranges: [/meta2/a,  /meta2/z)
+//	User  Ranges: [a, f) [f, p), [p, z)
+//	1.a: RangeLookup(key=f)
+//	 In this case, we want to look up the range descriptor for the range [f, p)
+//	 because "f" is in that range. Remember that this descriptor will be stored
+//	 at "/meta2/p". Of course, when we're performing the RangeLookup, we don't
+//	 actually know what the bounds of this range are or where exactly it's
+//	 stored (that's what we're looking up!), so all we have to go off of is the
+//	 lookup key. So, we first determine the meta key for the lookup key using
+//	 RangeMetaKey, which is simply "/meta2/f". We then construct the scan bounds
+//	 for this key using MetaScanBounds. This scan bound will be
+//	 [/meta2/f.Next(),/meta2/max). The reason that this scan doesn't start at
+//	 "/meta2/f" is because if this key is the start key of a range (like it is
+//	 in this example!), the previous range descriptor will be stored at that
+//	 key. We then issue a forward ScanRequest over this range. Since we're
+//	 assuming we already cached the meta2 range that contains this span of keys,
+//	 we send the request directly to that range's replica (if we didn't have
+//	 this cached, the process would recurse to lookup the meta2 range
+//	 descriptor). We then find that the first KV pair we see during the scan is
+//	 at "/meta2/p". This is our desired range descriptor.
+//	1.b: RangeLookup(key=m)
+//	 This case is similar. We construct a scan for this key "m" from
+//	 [/meta2/m.Next(),/meta2/max) and everything works the same as before.
+//	1.b: RangeLookup(key=p)
+//	 Here, we're looking for the descriptor for the range [p, z), because key "p"
+//	 is included in that range, but not [f, p). We scan with bounds of
+//	 [/meta2/p.Next(),/meta2/max) and everything works as expected.
 //
 // Ex. 2:
-//  Meta2 Ranges: [/meta2/a, /meta2/m) [/meta2/m, /meta2/z)
-//  User  Ranges: [a, f)           [f, p),           [p, z)
-//  2.a: RangeLookup(key=n)
-//   In this case, we want to look up the range descriptor for the range [f, p)
-//   because "n" is in that range. Remember that this descriptor will be stored
-//   at "/meta2/p", which in this case is on the second meta2 range. So, we
-//   construct the scan bounds of [/meta2/n.Next(),/meta2/max), send this scan
-//   to the second meta2 range, and find that the first descriptor found is the
-//   desired descriptor.
-//  2.b: RangeLookup(key=g)
-//   This is where things get a little tricky. As usual, we construct scan
-//   bounds of [/meta2/g.Next(),/meta2/max). However, this scan will be routed
-//   to the first meta2 range. It will scan forward and notice that no
-//   descriptors are stored between [/meta2/g.Next(),/meta2/m). We then rely on
-//   DistSender to continue this scan onto the next meta2 range since the result
-//   from the first meta2 range will be empty. Once on the next meta2 range,
-//   we'll find the desired descriptor at "/meta2/p".
+//
+//	Meta2 Ranges: [/meta2/a, /meta2/m) [/meta2/m, /meta2/z)
+//	User  Ranges: [a, f)           [f, p),           [p, z)
+//	2.a: RangeLookup(key=n)
+//	 In this case, we want to look up the range descriptor for the range [f, p)
+//	 because "n" is in that range. Remember that this descriptor will be stored
+//	 at "/meta2/p", which in this case is on the second meta2 range. So, we
+//	 construct the scan bounds of [/meta2/n.Next(),/meta2/max), send this scan
+//	 to the second meta2 range, and find that the first descriptor found is the
+//	 desired descriptor.
+//	2.b: RangeLookup(key=g)
+//	 This is where things get a little tricky. As usual, we construct scan
+//	 bounds of [/meta2/g.Next(),/meta2/max). However, this scan will be routed
+//	 to the first meta2 range. It will scan forward and notice that no
+//	 descriptors are stored between [/meta2/g.Next(),/meta2/m). We then rely on
+//	 DistSender to continue this scan onto the next meta2 range since the result
+//	 from the first meta2 range will be empty. Once on the next meta2 range,
+//	 we'll find the desired descriptor at "/meta2/p".
 //
 // Ex. 3:
-//  Meta2 Ranges: [/meta2/a, /meta2/m)  [/meta2/m, /meta2/z)
-//  User  Ranges: [a, f)        [f, m), [m,s)         [p, z)
-//  3.a: RangeLookup(key=g)
-//   This is a little confusing, but actually behaves the exact same way at 2.b.
-//   Notice that the descriptor for [f, m) is actually stored on the second
-//   meta2 range! So the lookup scan will start on the first meta2 range and
-//   continue onto the second before finding the desired descriptor at /meta2/m.
-//   This is an unfortunate result of us storing RangeDescriptors at
-//   RangeMetaKey(desc.EndKey) instead of RangeMetaKey(desc.StartKey) even
-//   though our ranges are [inclusive,exclusive). Still everything works if we
-//   let DistSender do its job when scanning over the meta2 range.
 //
-//   See #16266 and #17565 for further discussion. Notably, it is not possible
-//   to pick meta2 boundaries such that we will never run into this issue. The
-//   only way to avoid this completely would be to store RangeDescriptors at
-//   RangeMetaKey(desc.StartKey) and only allow meta2 split boundaries at
-//   RangeMetaKey(existingSplitBoundary)
+//	Meta2 Ranges: [/meta2/a, /meta2/m)  [/meta2/m, /meta2/z)
+//	User  Ranges: [a, f)        [f, m), [m,s)         [p, z)
+//	3.a: RangeLookup(key=g)
+//	 This is a little confusing, but actually behaves the exact same way at 2.b.
+//	 Notice that the descriptor for [f, m) is actually stored on the second
+//	 meta2 range! So the lookup scan will start on the first meta2 range and
+//	 continue onto the second before finding the desired descriptor at /meta2/m.
+//	 This is an unfortunate result of us storing RangeDescriptors at
+//	 RangeMetaKey(desc.EndKey) instead of RangeMetaKey(desc.StartKey) even
+//	 though our ranges are [inclusive,exclusive). Still everything works if we
+//	 let DistSender do its job when scanning over the meta2 range.
 //
+//	 See #16266 and #17565 for further discussion. Notably, it is not possible
+//	 to pick meta2 boundaries such that we will never run into this issue. The
+//	 only way to avoid this completely would be to store RangeDescriptors at
+//	 RangeMetaKey(desc.StartKey) and only allow meta2 split boundaries at
+//	 RangeMetaKey(existingSplitBoundary)
 //
-// Lookups for range metadata keys usually want to perform reads at the
-// READ_UNCOMMITTED read consistency level read in order to observe intents as
-// well. However, some callers need a consistent result; both are supported be
-// specifying the ReadConsistencyType. If the lookup is consistent, the Sender
-// provided should be a TxnCoordSender.
+// Lookups for range metadata keys may perform reads at the
+// READ_UNCOMMITTED or the INCONSISTENT ReadConsistencyType. The former will be
+// routed to the leaseholder, and the latter will be routed to any replica,
+// meaning it may return arbitrarily stale results. READ_UNCOMMITTED will
+// return intents whereas INCONSISTENT will not. Some callers need
+// a consistent result; both are supported be specifying the
+// ReadConsistencyType. If the lookup is consistent, the Sender provided
+// should be a TxnCoordSender.
 //
 // This method has an important optimization if the prefetchNum arg is larger
 // than 0: instead of just returning the request RangeDescriptor, it also
@@ -154,11 +153,16 @@ import (
 // likely to be desired by their current workload. The prefetchReverse flag
 // specifies whether descriptors are prefetched in descending or ascending
 // order.
+//
+// TODO(ajwerner): Rationalize the consistency, isolation, and routing policy
+// arguments in KV to make it such that the requests which want to opt into
+// stale reads and to be routed to followers can still get intents, if they
+// exist.
 func RangeLookup(
 	ctx context.Context,
 	sender Sender,
 	key roachpb.Key,
-	rc roachpb.ReadConsistencyType,
+	rc kvpb.ReadConsistencyType,
 	prefetchNum int64,
 	prefetchReverse bool,
 ) (rs, preRs []roachpb.RangeDescriptor, err error) {
@@ -239,7 +243,12 @@ func RangeLookup(
 		if len(matchingRanges) > 0 {
 			return matchingRanges, prefetchedRanges, nil
 		}
-
+		// If we're doing an inconsistent scan and do not find any matching
+		// descriptors, return to the caller so that it can retry by reading
+		// from the leaseholder.
+		if rc == kvpb.INCONSISTENT {
+			return nil, nil, nil
+		}
 		log.Warningf(ctx, "range lookup of key %s found only non-matching ranges %v; retrying",
 			key, prefetchedRanges)
 	}
@@ -255,7 +264,7 @@ func lookupRangeFwdScan(
 	ctx context.Context,
 	sender Sender,
 	key roachpb.RKey,
-	rc roachpb.ReadConsistencyType,
+	rc kvpb.ReadConsistencyType,
 	prefetchNum int64,
 	prefetchReverse bool,
 ) (rs, preRs []roachpb.RangeDescriptor, err error) {
@@ -275,8 +284,13 @@ func lookupRangeFwdScan(
 		return nil, nil, errors.Wrap(err, "could not create scan bounds for range lookup")
 	}
 
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.ReadConsistency = rc
+	// If the caller is asking for a potentially stale result, we want to route
+	// the request to the nearest replica rather than the leaseholder.
+	if rc == kvpb.INCONSISTENT {
+		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
+	}
 	if prefetchReverse {
 		// Even if we're prefetching in the reverse direction, we still scan
 		// forward first to get the first range. There are two cases, which we
@@ -302,8 +316,8 @@ func lookupRangeFwdScan(
 	} else {
 		ba.MaxSpanRequestKeys = prefetchNum + 1
 	}
-	ba.Add(&roachpb.ScanRequest{
-		RequestHeader: roachpb.RequestHeaderFromSpan(bounds.AsRawSpanWithNoLocals()),
+	ba.Add(&kvpb.ScanRequest{
+		RequestHeader: kvpb.RequestHeaderFromSpan(bounds.AsRawSpanWithNoLocals()),
 	})
 	if !TestingIsRangeLookup(ba) {
 		log.Fatalf(ctx, "BatchRequest %v not detectable as RangeLookup", ba)
@@ -313,7 +327,7 @@ func lookupRangeFwdScan(
 	if pErr != nil {
 		return nil, nil, pErr.GoError()
 	}
-	scanRes := br.Responses[0].GetInner().(*roachpb.ScanResponse)
+	scanRes := br.Responses[0].GetInner().(*kvpb.ScanResponse)
 
 	descs, err := kvsToRangeDescriptors(scanRes.Rows)
 	if err != nil {
@@ -343,7 +357,7 @@ func lookupRangeRevScan(
 	ctx context.Context,
 	sender Sender,
 	key roachpb.RKey,
-	rc roachpb.ReadConsistencyType,
+	rc kvpb.ReadConsistencyType,
 	prefetchNum int64,
 	prefetchReverse bool,
 	fwdDescs, fwdIntentDescs []roachpb.RangeDescriptor,
@@ -368,11 +382,16 @@ func lookupRangeRevScan(
 		return nil, nil, errors.Wrap(err, "could not create scan bounds for reverse range lookup")
 	}
 
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.ReadConsistency = rc
+	// If the caller is asking for a potentially stale result, we want to route
+	// the request to the nearest replica rather than the leaseholder.
+	if rc == kvpb.INCONSISTENT {
+		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
+	}
 	ba.MaxSpanRequestKeys = maxKeys
-	ba.Add(&roachpb.ReverseScanRequest{
-		RequestHeader: roachpb.RequestHeaderFromSpan(revBounds.AsRawSpanWithNoLocals()),
+	ba.Add(&kvpb.ReverseScanRequest{
+		RequestHeader: kvpb.RequestHeaderFromSpan(revBounds.AsRawSpanWithNoLocals()),
 	})
 	if !TestingIsRangeLookup(ba) {
 		log.Fatalf(ctx, "BatchRequest %v not detectable as RangeLookup", ba)
@@ -382,7 +401,7 @@ func lookupRangeRevScan(
 	if pErr != nil {
 		return nil, nil, pErr.GoError()
 	}
-	revScanRes := br.Responses[0].GetInner().(*roachpb.ReverseScanResponse)
+	revScanRes := br.Responses[0].GetInner().(*kvpb.ReverseScanResponse)
 
 	revDescs, err := kvsToRangeDescriptors(revScanRes.Rows)
 	if err != nil {
@@ -430,7 +449,7 @@ func kvsToRangeDescriptors(kvs []roachpb.KeyValue) ([]roachpb.RangeDescriptor, e
 // TestingIsRangeLookup returns if the provided BatchRequest looks like a single
 // RangeLookup scan. It can return false positives and should only be used in
 // tests.
-func TestingIsRangeLookup(ba roachpb.BatchRequest) bool {
+func TestingIsRangeLookup(ba *kvpb.BatchRequest) bool {
 	if ba.IsSingleRequest() {
 		return TestingIsRangeLookupRequest(ba.Requests[0].GetInner())
 	}
@@ -452,10 +471,10 @@ var rangeLookupEndKeyBounds = roachpb.Span{
 // TestingIsRangeLookupRequest returns if the provided Request looks like a single
 // RangeLookup scan. It can return false positives and should only be used in
 // tests.
-func TestingIsRangeLookupRequest(req roachpb.Request) bool {
+func TestingIsRangeLookupRequest(req kvpb.Request) bool {
 	switch req.(type) {
-	case *roachpb.ScanRequest:
-	case *roachpb.ReverseScanRequest:
+	case *kvpb.ScanRequest:
+	case *kvpb.ReverseScanRequest:
 	default:
 		return false
 	}

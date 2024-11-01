@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package httpsink
 
@@ -16,7 +11,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,12 +25,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudtestutils"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/stretchr/testify/require"
@@ -51,7 +47,7 @@ func TestPutHttp(t *testing.T) {
 	testSettings := cluster.MakeTestingClusterSettings()
 
 	const badHeadResponse = "bad-head-response"
-	user := security.RootUserName()
+	user := username.RootUserName()
 	ctx := context.Background()
 
 	makeServer := func() (*url.URL, func() int, func()) {
@@ -90,13 +86,19 @@ func TestPutHttp(t *testing.T) {
 		}))
 
 		u := testSettings.MakeUpdater()
-		if err := u.Set(ctx, "cloudstorage.http.custom_ca", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})), "s"); err != nil {
+		if err := u.Set(ctx, "cloudstorage.http.custom_ca", settings.EncodedValue{
+			Value: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})),
+			Type:  "s",
+		}); err != nil {
 			t.Fatal(err)
 		}
 
 		cleanup := func() {
 			srv.Close()
-			if err := u.Set(ctx, "cloudstorage.http.custom_ca", "", "s"); err != nil {
+			if err := u.Set(ctx, "cloudstorage.http.custom_ca", settings.EncodedValue{
+				Value: "",
+				Type:  "s",
+			}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -114,7 +116,10 @@ func TestPutHttp(t *testing.T) {
 	t.Run("singleHost", func(t *testing.T) {
 		srv, files, cleanup := makeServer()
 		defer cleanup()
-		cloudtestutils.CheckExportStore(t, srv.String(), false, user, nil, nil, testSettings)
+		cloudtestutils.CheckExportStore(t, srv.String(), false, user,
+			nil, /* db */
+			testSettings,
+		)
 		if expected, actual := 14, files(); expected != actual {
 			t.Fatalf("expected %d files to be written to single http store, got %d", expected, actual)
 		}
@@ -131,7 +136,10 @@ func TestPutHttp(t *testing.T) {
 		combined := *srv1
 		combined.Host = strings.Join([]string{srv1.Host, srv2.Host, srv3.Host}, ",")
 
-		cloudtestutils.CheckExportStore(t, combined.String(), true, user, nil, nil, testSettings)
+		cloudtestutils.CheckExportStore(t, combined.String(), true, user,
+			nil, /* db */
+			testSettings,
+		)
 		if expected, actual := 3, files1(); expected != actual {
 			t.Fatalf("expected %d files written to http host 1, got %d", expected, actual)
 		}
@@ -154,8 +162,11 @@ func TestPutHttp(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{},
-			testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
+		s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings, blobs.TestEmptyBlobClientFactory,
+			nil, /* db */
+			nil, /* limiters */
+			cloud.NilMetrics,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -208,33 +219,7 @@ func TestHttpGet(t *testing.T) {
 	for _, tc := range []int{1, 2, 5, 16, 32, len(data) - 1, len(data)} {
 		t.Run(fmt.Sprintf("read-%d", tc), func(t *testing.T) {
 			limit := tc
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				start, err := rangeStart(r.Header.Get("Range"))
-				if start < 0 || start >= len(data) {
-					t.Errorf("invalid start offset %d in range header %s",
-						start, r.Header.Get("Range"))
-				}
-				end := start + limit
-				if end > len(data) {
-					end = len(data)
-				}
-
-				w.Header().Add("Accept-Ranges", "bytes")
-				w.Header().Add("Content-Length", strconv.Itoa(len(data)-start))
-
-				if start > 0 {
-					w.Header().Add(
-						"Content-Range",
-						fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-				}
-
-				if err == nil {
-					_, err = w.Write(data[start:end])
-				}
-				if err != nil {
-					w.WriteHeader(http.StatusInternalServerError)
-				}
-			}))
+			s := httptest.NewServer(http.HandlerFunc(newTestingRangeHandler(t, data, limit)))
 
 			// Start antagonist function that aggressively closes client connections.
 			ctx, cancelAntagonist := context.WithCancel(context.Background())
@@ -250,11 +235,11 @@ func TestHttpGet(t *testing.T) {
 				return nil
 			})
 
-			conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: s.URL}}
-			store, err := MakeHTTPStorage(ctx, cloud.ExternalStorageContext{Settings: testSettings}, conf)
+			conf := cloudpb.ExternalStorage{HttpPath: cloudpb.ExternalStorage_Http{BaseUri: s.URL}}
+			store, err := MakeHTTPStorage(ctx, cloud.EarlyBootExternalStorageContext{Settings: testSettings}, conf)
 			require.NoError(t, err)
 
-			var file io.ReadCloser
+			var file ioctx.ReadCloserCtx
 
 			// Cleanup.
 			defer func() {
@@ -263,17 +248,17 @@ func TestHttpGet(t *testing.T) {
 					require.NoError(t, store.Close())
 				}
 				if file != nil {
-					require.NoError(t, file.Close())
+					require.NoError(t, file.Close(ctx))
 				}
 				cancelAntagonist()
 				_ = g.Wait()
 			}()
 
 			// Read the file and verify results.
-			file, err = store.ReadFile(ctx, "/something")
+			file, _, err = store.ReadFile(ctx, "/something", cloud.ReadOptions{NoFileSize: true})
 			require.NoError(t, err)
 
-			b, err := ioutil.ReadAll(file)
+			b, err := ioctx.ReadAll(ctx, file)
 			require.NoError(t, err)
 			require.EqualValues(t, data, b)
 		})
@@ -287,8 +272,9 @@ func TestHttpGetWithCancelledContext(t *testing.T) {
 	defer s.Close()
 	testSettings := cluster.MakeTestingClusterSettings()
 
-	conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: s.URL}}
-	store, err := MakeHTTPStorage(context.Background(), cloud.ExternalStorageContext{Settings: testSettings}, conf)
+	conf := cloudpb.ExternalStorage{HttpPath: cloudpb.ExternalStorage_Http{BaseUri: s.URL}}
+	store, err := MakeHTTPStorage(context.Background(),
+		cloud.EarlyBootExternalStorageContext{Settings: testSettings}, conf)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, store.Close())
@@ -297,7 +283,7 @@ func TestHttpGetWithCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err = store.ReadFile(ctx, "/something")
+	_, _, err = store.ReadFile(ctx, "/something", cloud.ReadOptions{NoFileSize: true})
 	require.Error(t, context.Canceled, err)
 }
 
@@ -308,10 +294,11 @@ func TestCanDisableHttp(t *testing.T) {
 	}
 	testSettings := cluster.MakeTestingClusterSettings()
 
-	s, err := cloud.MakeExternalStorage(
-		context.Background(),
-		roachpb.ExternalStorage{Provider: roachpb.ExternalStorageProvider_http},
-		conf, testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
+	s, err := cloud.MakeExternalStorage(context.Background(), cloudpb.ExternalStorage{Provider: cloudpb.ExternalStorageProvider_http}, conf, testSettings, blobs.TestEmptyBlobClientFactory,
+		nil, /* db */
+		nil, /* limiters */
+		cloud.NilMetrics,
+	)
 	require.Nil(t, s)
 	require.Error(t, err)
 }
@@ -323,16 +310,17 @@ func TestCanDisableOutbound(t *testing.T) {
 	}
 	testSettings := cluster.MakeTestingClusterSettings()
 
-	for _, provider := range []roachpb.ExternalStorageProvider{
-		roachpb.ExternalStorageProvider_http,
-		roachpb.ExternalStorageProvider_s3,
-		roachpb.ExternalStorageProvider_gs,
-		roachpb.ExternalStorageProvider_nodelocal,
+	for _, provider := range []cloudpb.ExternalStorageProvider{
+		cloudpb.ExternalStorageProvider_http,
+		cloudpb.ExternalStorageProvider_s3,
+		cloudpb.ExternalStorageProvider_gs,
+		cloudpb.ExternalStorageProvider_nodelocal,
 	} {
-		s, err := cloud.MakeExternalStorage(
-			context.Background(),
-			roachpb.ExternalStorage{Provider: provider},
-			conf, testSettings, blobs.TestEmptyBlobClientFactory, nil, nil)
+		s, err := cloud.MakeExternalStorage(context.Background(), cloudpb.ExternalStorage{Provider: provider}, conf, testSettings, blobs.TestEmptyBlobClientFactory,
+			nil, /* db */
+			nil, /* limiters */
+			cloud.NilMetrics,
+		)
 		require.Nil(t, s)
 		require.Error(t, err)
 	}
@@ -340,6 +328,7 @@ func TestCanDisableOutbound(t *testing.T) {
 
 func TestExternalStorageCanUseHTTPProxy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(fmt.Sprintf("proxied-%s", r.URL)))
 	}))
@@ -358,16 +347,18 @@ func TestExternalStorageCanUseHTTPProxy(t *testing.T) {
 		http.DefaultTransport.(*http.Transport).Proxy = nil
 	}()
 
-	conf, err := cloud.ExternalStorageConfFromURI("http://my-server", security.RootUserName())
+	conf, err := cloud.ExternalStorageConfFromURI("http://my-server", username.RootUserName())
 	require.NoError(t, err)
-	s, err := cloud.MakeExternalStorage(
-		context.Background(), conf, base.ExternalIODirConfig{}, testSettings, nil,
-		nil, nil)
+	s, err := cloud.MakeExternalStorage(context.Background(), conf, base.ExternalIODirConfig{}, testSettings, nil,
+		nil, /* db */
+		nil, /* limiters */
+		cloud.NilMetrics,
+	)
 	require.NoError(t, err)
-	stream, err := s.ReadFile(context.Background(), "file")
+	stream, _, err := s.ReadFile(context.Background(), "file", cloud.ReadOptions{NoFileSize: true})
 	require.NoError(t, err)
-	defer stream.Close()
-	data, err := ioutil.ReadAll(stream)
+	defer stream.Close(ctx)
+	data, err := ioctx.ReadAll(ctx, stream)
 	require.NoError(t, err)
 
 	require.EqualValues(t, "proxied-http://my-server/file", string(data))
@@ -411,13 +402,86 @@ func TestExhaustRetries(t *testing.T) {
 	cloud.HTTPRetryOptions.MaxBackoff = 10 * time.Millisecond
 	cloud.HTTPRetryOptions.MaxRetries = 10
 
-	conf := roachpb.ExternalStorage{HttpPath: roachpb.ExternalStorage_Http{BaseUri: "http://does.not.matter"}}
-	store, err := MakeHTTPStorage(context.Background(), cloud.ExternalStorageContext{Settings: testSettings}, conf)
+	conf := cloudpb.ExternalStorage{HttpPath: cloudpb.ExternalStorage_Http{BaseUri: "http://does.not.matter"}}
+	store, err := MakeHTTPStorage(context.Background(), cloud.EarlyBootExternalStorageContext{Settings: testSettings}, conf)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, store.Close())
 	}()
 
-	_, err = store.ReadFile(context.Background(), "/something")
+	_, _, err = store.ReadFile(context.Background(), "/something", cloud.ReadOptions{NoFileSize: true})
 	require.Error(t, err)
+}
+
+func newTestingRangeHandler(
+	t *testing.T, data []byte, maxReadLen int,
+) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start, err := rangeStart(r.Header.Get("Range"))
+		if start < 0 || start >= len(data) {
+			t.Errorf("invalid start offset %d in range header %s",
+				start, r.Header.Get("Range"))
+		}
+		end := start + maxReadLen
+		if end > len(data) {
+			end = len(data)
+		}
+
+		w.Header().Add("Accept-Ranges", "bytes")
+		w.Header().Add("Content-Length", strconv.Itoa(len(data)-start))
+
+		if start > 0 {
+			w.Header().Add(
+				"Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		}
+
+		if err == nil {
+			_, err = w.Write(data[start:end])
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}
+
+}
+
+// TestReadFileAtReturnsSize tests that ReadFileAt returns
+// a cloud.ResumingReader that contains the size of the file.
+func TestReadFileAtReturnsSize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	testSettings := cluster.MakeTestingClusterSettings()
+	file := "testfile"
+	data := []byte("hello world")
+
+	server := httptest.NewServer(http.HandlerFunc(newTestingRangeHandler(t, data, 2)))
+	defer server.Close()
+
+	conf := cloudpb.ExternalStorage{HttpPath: cloudpb.ExternalStorage_Http{BaseUri: server.URL}}
+	args := cloud.EarlyBootExternalStorageContext{
+		IOConf:   base.ExternalIODirConfig{},
+		Settings: testSettings,
+		Options:  nil,
+		Limiters: nil,
+	}
+	s, err := MakeHTTPStorage(ctx, args, conf)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, s.Close())
+	}()
+
+	w, err := s.Writer(ctx, file)
+	require.NoError(t, err)
+
+	_, err = w.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	reader, _, err := s.ReadFile(ctx, file, cloud.ReadOptions{})
+	require.NoError(t, err)
+
+	rr, ok := reader.(*cloud.ResumingReader)
+	require.True(t, ok)
+	require.Equal(t, int64(len(data)), rr.Size)
 }

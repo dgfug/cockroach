@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,11 +10,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -33,11 +31,12 @@ type scatterNode struct {
 // (`ALTER TABLE/INDEX ... SCATTER ...` statement)
 // Privileges: INSERT on table.
 func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error) {
-	if !p.ExecCfg().Codec.ForSystemTenant() {
-		return nil, errorutil.UnsupportedWithMultiTenancy(54255)
+
+	if err := sqlclustersettings.RequireSystemTenantOrClusterSetting(p.ExecCfg().Codec, p.ExecCfg().Settings, SecondaryTenantScatterEnabled); err != nil {
+		return nil, err
 	}
 
-	tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT)
+	_, tableDesc, index, err := p.getTableAndIndex(ctx, &n.TableOrIndex, privilege.INSERT, true /* skipCache */)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +63,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		desiredTypes := make([]*types.T, index.NumKeyColumns())
 		for i := 0; i < index.NumKeyColumns(); i++ {
 			colID := index.GetKeyColumnID(i)
-			c, err := tableDesc.FindColumnWithID(colID)
+			c, err := catalog.MustFindColumnByID(tableDesc, colID)
 			if err != nil {
 				return nil, err
 			}
@@ -73,12 +72,12 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		fromVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.From {
 			typedExpr, err := p.analyzeExpr(
-				ctx, expr, nil, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
+				ctx, expr, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
 			)
 			if err != nil {
 				return nil, err
 			}
-			fromVals[i], err = typedExpr.Eval(p.EvalContext())
+			fromVals[i], err = eval.Expr(ctx, p.EvalContext(), typedExpr)
 			if err != nil {
 				return nil, err
 			}
@@ -86,12 +85,12 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		toVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.To {
 			typedExpr, err := p.analyzeExpr(
-				ctx, expr, nil, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
+				ctx, expr, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
 			)
 			if err != nil {
 				return nil, err
 			}
-			toVals[i], err = typedExpr.Eval(p.EvalContext())
+			toVals[i], err = eval.Expr(ctx, p.EvalContext(), typedExpr)
 			if err != nil {
 				return nil, err
 			}
@@ -132,16 +131,15 @@ type scatterRun struct {
 }
 
 func (n *scatterNode) startExec(params runParams) error {
-	db := params.p.ExecCfg().DB
-	req := &roachpb.AdminScatterRequest{
-		RequestHeader:   roachpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
+	req := &kvpb.AdminScatterRequest{
+		RequestHeader:   kvpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
 		RandomizeLeases: true,
 	}
-	res, pErr := kv.SendWrapped(params.ctx, db.NonTransactionalSender(), req)
+	res, pErr := kv.SendWrapped(params.ctx, params.ExecCfg().DB.NonTransactionalSender(), req)
 	if pErr != nil {
 		return pErr.GoError()
 	}
-	scatterRes := res.(*roachpb.AdminScatterResponse)
+	scatterRes := res.(*kvpb.AdminScatterResponse)
 	n.run.rangeIdx = -1
 	n.run.ranges = make([]roachpb.Span, len(scatterRes.RangeInfos))
 	for i, rangeInfo := range scatterRes.RangeInfos {

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -19,11 +14,23 @@ import (
 	"github.com/cockroachdb/ttycolor"
 )
 
+// tenantIDLogTagKey is the log tag key used when tagging
+// log entries with a tenant ID.
+const tenantIDLogTagKey = 'T'
+
+// tenantNameLogTagKey is the log tag key used when tagging
+// log entries with a tenant name.
+const tenantNameLogTagKey = 'V'
+
 const severityChar = "IWEF"
 
 // MessageTimeFormat is the format of the timestamp in log message headers of crdb formatted logs.
 // as used in time.Parse and time.Format.
 const MessageTimeFormat = "060102 15:04:05.999999"
+
+// MessageTimeFormatWithTZ is like MessageTimeFormat but with a numeric
+// time zone included.
+const MessageTimeFormatWithTZ = "060102 15:04:05.999999-070000"
 
 // FormatLegacyEntry writes the contents of the legacy log entry struct to the specified writer.
 func FormatLegacyEntry(e logpb.Entry, w io.Writer) error {
@@ -33,7 +40,7 @@ func FormatLegacyEntry(e logpb.Entry, w io.Writer) error {
 // FormatLegacyEntryWithOptionalColors is like FormatLegacyEntry but the caller can specify
 // a color profile.
 func FormatLegacyEntryWithOptionalColors(e logpb.Entry, w io.Writer, cp ttycolor.Profile) error {
-	buf := formatLogEntryInternalV1(e, false /* isHeader */, true /* showCounter */, cp)
+	buf := formatLogEntryInternalV1(e, false /* isHeader */, true /* showCounter */, cp, nil /* loc */)
 	defer putBuffer(buf)
 	_, err := w.Write(buf.Bytes())
 	return err

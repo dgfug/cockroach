@@ -1,66 +1,44 @@
-// Copyright 2021 The Cockroach Authors.
+// Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantdirsvr
 
 import (
-	"bytes"
 	"container/list"
 	"context"
-	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/logtags"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Make sure that TestDirectoryServer implements the DirectoryServer interface.
 var _ tenant.DirectoryServer = (*TestDirectoryServer)(nil)
 
-// Process stores information about a running tenant process.
-type Process struct {
-	Stopper  *stop.Stopper
-	Cmd      *exec.Cmd
-	SQL      net.Addr
-	FakeLoad float32
-}
-
 // NewSubStopper creates a new stopper that will be stopped when either the
-// parent is stopped or its own Stop is called. The code is slightly more
-// complicated that simply calling NewStopper followed by AddCloser since there
-// is a possibility that between the two calls, the parent stopper completes a
-// stop and then the leak detection may find a leaked stopper.
+// parent is stopped or its own Stop is called.
 func NewSubStopper(parentStopper *stop.Stopper) *stop.Stopper {
-	mu := &syncutil.Mutex{}
-	var subStopper *stop.Stopper
+	subStopper := stop.NewStopper(stop.WithTracer(parentStopper.Tracer()))
 	parentStopper.AddCloser(stop.CloserFn(func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if subStopper == nil {
-			subStopper = stop.NewStopper()
-		}
 		subStopper.Stop(context.Background())
 	}))
-	mu.Lock()
-	defer mu.Unlock()
-	if subStopper == nil {
-		subStopper = stop.NewStopper()
-	}
 	return subStopper
+}
+
+// Process stores information about a running tenant process.
+type Process struct {
+	Stopper *stop.Stopper
+	SQLAddr string
 }
 
 // TestDirectoryServer is a directory server implementation that is used for
@@ -69,23 +47,21 @@ type TestDirectoryServer struct {
 	stopper             *stop.Stopper
 	grpcServer          *grpc.Server
 	cockroachExecutable string
-	// TenantStarterFunc will be used to launch a new tenant process.
-	TenantStarterFunc func(ctx context.Context, tenantID uint64) (*Process, error)
+	// tenantStarterFunc will be used to launch a new tenant process.
+	tenantStarterFunc TenantStarterFunc
 
-	// When both mutexes need to be held, the locking should always be proc
-	// first and listen second.
-	proc struct {
-		syncutil.RWMutex
-		processByAddrByTenantID map[uint64]map[net.Addr]*Process
-	}
-	listen struct {
-		syncutil.RWMutex
-		eventListeners *list.List
+	mu struct {
+		syncutil.Mutex
+		// A map of tenantIDs to sql server addresses
+		processByAddrByTenantID map[uint64][]Process
+		eventListeners          *list.List
 	}
 }
 
+type TenantStarterFunc func(ctx context.Context, stopper *stop.Stopper, tenantID uint64) (string, error)
+
 // New will create a new server.
-func New(stopper *stop.Stopper) (*TestDirectoryServer, error) {
+func New(stopper *stop.Stopper, createTenant TenantStarterFunc) (*TestDirectoryServer, error) {
 	// Determine the path to cockroach executable.
 	cockroachExecutable, err := os.Executable()
 	if err != nil {
@@ -96,10 +72,10 @@ func New(stopper *stop.Stopper) (*TestDirectoryServer, error) {
 		stopper:             stopper,
 		cockroachExecutable: cockroachExecutable,
 	}
-	dir.TenantStarterFunc = dir.startTenantLocked
-	dir.proc.processByAddrByTenantID = map[uint64]map[net.Addr]*Process{}
-	dir.listen.eventListeners = list.New()
-	stopper.AddCloser(stop.CloserFn(func() { dir.grpcServer.GracefulStop() }))
+	dir.tenantStarterFunc = createTenant
+	dir.mu.processByAddrByTenantID = map[uint64][]Process{}
+	dir.mu.eventListeners = list.New()
+	stopper.AddCloser(stop.CloserFn(dir.grpcServer.GracefulStop))
 	tenant.RegisterDirectoryServer(dir.grpcServer, dir)
 	return dir, nil
 }
@@ -111,18 +87,16 @@ func (s *TestDirectoryServer) Stopper() *stop.Stopper {
 }
 
 // Get a tenant's list of pods and the process information for each pod.
-func (s *TestDirectoryServer) Get(id roachpb.TenantID) (result map[net.Addr]*Process) {
-	result = make(map[net.Addr]*Process)
-	s.proc.RLock()
-	defer s.proc.RUnlock()
-	processes, ok := s.proc.processByAddrByTenantID[id.ToUint64()]
-	if ok {
-		for k, v := range processes {
-			result[k] = v
-		}
-	}
+func (s *TestDirectoryServer) Get(id roachpb.TenantID) (result []Process) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result = append(result, s.mu.processByAddrByTenantID[id.ToUint64()]...)
 	return
 }
+
+// serverShutdownErr is returned when TestDirectoryServer is no longer accepting
+// new requests.
+var serverShutdownErr = status.Error(codes.Unavailable, "server shutting down")
 
 // StartTenant will forcefully start a new tenant pod
 // instance. This may be useful to test the behavior when more
@@ -136,54 +110,40 @@ func (s *TestDirectoryServer) StartTenant(ctx context.Context, id roachpb.Tenant
 
 	ctx = logtags.AddTag(ctx, "tenant", id)
 
-	s.proc.Lock()
-	defer s.proc.Unlock()
+	tenantStopper := NewSubStopper(s.stopper)
 
-	process, err := s.TenantStarterFunc(ctx, id.ToUint64())
+	sqlAddr, err := s.tenantStarterFunc(ctx, tenantStopper, id.ToUint64())
 	if err != nil {
 		return err
 	}
 
-	s.registerInstanceLocked(id.ToUint64(), process)
-	process.Stopper.AddCloser(stop.CloserFn(func() {
-		s.deregisterInstance(id.ToUint64(), process.SQL)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.registerInstanceLocked(id.ToUint64(), Process{
+			Stopper: tenantStopper,
+			SQLAddr: sqlAddr,
+		})
+	}()
+
+	tenantStopper.AddCloser(stop.CloserFn(func() {
+		s.deregisterInstance(id.ToUint64(), sqlAddr)
 	}))
 
 	return nil
 }
 
-// SetFakeLoad artificially sets the load reported by a specific tenant pod. If
-// the id or addr is not found, a load update event is still generated.
-func (s *TestDirectoryServer) SetFakeLoad(id roachpb.TenantID, addr net.Addr, fakeLoad float32) {
-	s.proc.RLock()
-	defer s.proc.RUnlock()
-
-	// Only set FakeLoad if an entry exists.
-	if processes, ok := s.proc.processByAddrByTenantID[id.ToUint64()]; ok {
-		if process, ok := processes[addr]; ok {
-			process.FakeLoad = fakeLoad
-		}
-	}
-
-	s.listen.RLock()
-	defer s.listen.RUnlock()
-	s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
-		Pod: &tenant.Pod{
-			Addr:     addr.String(),
-			TenantID: id.ToUint64(),
-			Load:     fakeLoad,
-			State:    tenant.UNKNOWN,
-		},
-	})
-}
-
 // GetTenant returns tenant metadata for a given ID. Hard coded to return every
 // tenant's cluster name as "tenant-cluster"
 func (s *TestDirectoryServer) GetTenant(
-	_ context.Context, _ *tenant.GetTenantRequest,
+	_ context.Context, req *tenant.GetTenantRequest,
 ) (*tenant.GetTenantResponse, error) {
 	return &tenant.GetTenantResponse{
-		ClusterName: "tenant-cluster",
+		Tenant: &tenant.Tenant{
+			TenantID:          req.TenantID,
+			ClusterName:       "tenant-cluster",
+			AllowedCIDRRanges: []string{"0.0.0.0/0"},
+		},
 	}, nil
 }
 
@@ -193,8 +153,8 @@ func (s *TestDirectoryServer) ListPods(
 	ctx context.Context, req *tenant.ListPodsRequest,
 ) (*tenant.ListPodsResponse, error) {
 	ctx = logtags.AddTag(ctx, "tenant", req.TenantID)
-	s.proc.RLock()
-	defer s.proc.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.listLocked(ctx, req)
 }
 
@@ -205,15 +165,18 @@ func (s *TestDirectoryServer) WatchPods(
 ) error {
 	select {
 	case <-s.stopper.ShouldQuiesce():
-		return context.Canceled
+		return serverShutdownErr
 	default:
 	}
 	// Make the channel with a small buffer to allow for a burst of notifications
 	// and a slow receiver.
 	c := make(chan *tenant.WatchPodsResponse, 10)
-	s.listen.Lock()
-	elem := s.listen.eventListeners.PushBack(c)
-	s.listen.Unlock()
+
+	elem := func() *list.Element {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.mu.eventListeners.PushBack(c)
+	}()
 	err := s.stopper.RunTask(context.Background(), "watch-pods-server",
 		func(ctx context.Context) {
 		out:
@@ -224,17 +187,11 @@ func (s *TestDirectoryServer) WatchPods(
 						break out
 					}
 					if err := server.Send(e); err != nil {
-						s.listen.Lock()
-						s.listen.eventListeners.Remove(elem)
-						close(c)
-						s.listen.Unlock()
+						s.removeEventListenerAndCloseChan(elem, c)
 						break out
 					}
 				case <-s.stopper.ShouldQuiesce():
-					s.listen.Lock()
-					s.listen.eventListeners.Remove(elem)
-					close(c)
-					s.listen.Unlock()
+					s.removeEventListenerAndCloseChan(elem, c)
 					break out
 				}
 			}
@@ -242,22 +199,34 @@ func (s *TestDirectoryServer) WatchPods(
 	return err
 }
 
+// WatchTenants returns a new stream, that can be used to monitor server
+// activity. This is a no-op since this directory's implementation has been
+// deprecated.
+func (s *TestDirectoryServer) WatchTenants(
+	_ *tenant.WatchTenantsRequest, server tenant.Directory_WatchTenantsServer,
+) error {
+	// Insted of returning right away, we block until context is done.
+	// This prevents the proxy server from constantly trying to establish
+	// a watch in test environments, causing spammy logs.
+	<-server.Context().Done()
+	return nil
+}
+
 // Drain sends out DRAINING pod notifications for each process managed by the
 // test directory. This causes the proxy to start enforcing short idle
 // connection timeouts in order to drain the connections to the pod.
 func (s *TestDirectoryServer) Drain() {
-	s.proc.RLock()
-	defer s.proc.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for tenantID, processByAddr := range s.proc.processByAddrByTenantID {
-		for addr := range processByAddr {
-			s.listen.RLock()
-			defer s.listen.RUnlock()
+	for tenantID, processByAddr := range s.mu.processByAddrByTenantID {
+		for _, process := range processByAddr {
 			s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
 				Pod: &tenant.Pod{
-					TenantID: tenantID,
-					Addr:     addr.String(),
-					State:    tenant.DRAINING,
+					TenantID:       tenantID,
+					Addr:           process.SQLAddr,
+					State:          tenant.DRAINING,
+					StateTimestamp: timeutil.Now(),
 				},
 			})
 		}
@@ -265,7 +234,7 @@ func (s *TestDirectoryServer) Drain() {
 }
 
 func (s *TestDirectoryServer) notifyEventListenersLocked(req *tenant.WatchPodsResponse) {
-	for e := s.listen.eventListeners.Front(); e != nil; {
+	for e := s.mu.eventListeners.Front(); e != nil; {
 		select {
 		case e.Value.(chan *tenant.WatchPodsResponse) <- req:
 			e = e.Next()
@@ -275,7 +244,7 @@ func (s *TestDirectoryServer) notifyEventListenersLocked(req *tenant.WatchPodsRe
 			eToClose := e
 			e = e.Next()
 			close(eToClose.Value.(chan *tenant.WatchPodsResponse))
-			s.listen.eventListeners.Remove(eToClose)
+			s.mu.eventListeners.Remove(eToClose)
 		}
 	}
 }
@@ -294,21 +263,36 @@ func (s *TestDirectoryServer) EnsurePod(
 
 	ctx = logtags.AddTag(ctx, "tenant", req.TenantID)
 
-	s.proc.Lock()
-	defer s.proc.Unlock()
-
-	lst, err := s.listLocked(ctx, &tenant.ListPodsRequest{TenantID: req.TenantID})
+	tenantStopper, sqlAddr, err := func() (*stop.Stopper, string, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		lst, err := s.listLocked(ctx, &tenant.ListPodsRequest{TenantID: req.TenantID})
+		if err != nil {
+			return nil, "", err
+		}
+		if len(lst.Pods) != 0 {
+			return nil, "", nil
+		}
+		tenantStopper := NewSubStopper(s.stopper)
+		sqlAddr, err := s.tenantStarterFunc(ctx, tenantStopper, req.TenantID)
+		if err != nil {
+			return nil, "", err
+		}
+		s.registerInstanceLocked(req.TenantID, Process{
+			Stopper: tenantStopper,
+			SQLAddr: sqlAddr,
+		})
+		return tenantStopper, sqlAddr, nil
+	}()
 	if err != nil {
 		return nil, err
 	}
-	if len(lst.Pods) == 0 {
-		process, err := s.TenantStarterFunc(ctx, req.TenantID)
-		if err != nil {
-			return nil, err
-		}
-		s.registerInstanceLocked(req.TenantID, process)
-		process.Stopper.AddCloser(stop.CloserFn(func() {
-			s.deregisterInstance(req.TenantID, process.SQL)
+
+	if tenantStopper != nil {
+		// Registering a stopper closer that removes the instance must occur
+		// outside of the mutex.
+		tenantStopper.AddCloser(stop.CloserFn(func() {
+			s.deregisterInstance(req.TenantID, sqlAddr)
 		}))
 	}
 
@@ -323,132 +307,67 @@ func (s *TestDirectoryServer) Serve(listener net.Listener) error {
 func (s *TestDirectoryServer) listLocked(
 	_ context.Context, req *tenant.ListPodsRequest,
 ) (*tenant.ListPodsResponse, error) {
-	processByAddr, ok := s.proc.processByAddrByTenantID[req.TenantID]
+	processByAddr, ok := s.mu.processByAddrByTenantID[req.TenantID]
 	if !ok {
 		return &tenant.ListPodsResponse{}, nil
 	}
 	resp := tenant.ListPodsResponse{}
-	for addr, proc := range processByAddr {
+	for _, process := range processByAddr {
 		resp.Pods = append(resp.Pods, &tenant.Pod{
-			TenantID: req.TenantID,
-			Addr:     addr.String(),
-			State:    tenant.RUNNING,
-			Load:     proc.FakeLoad,
+			TenantID:       req.TenantID,
+			Addr:           process.SQLAddr,
+			State:          tenant.RUNNING,
+			StateTimestamp: timeutil.Now(),
 		})
 	}
 	return &resp, nil
 }
 
-func (s *TestDirectoryServer) registerInstanceLocked(tenantID uint64, process *Process) {
-	processByAddr, ok := s.proc.processByAddrByTenantID[tenantID]
-	if !ok {
-		processByAddr = map[net.Addr]*Process{}
-		s.proc.processByAddrByTenantID[tenantID] = processByAddr
-	}
-	processByAddr[process.SQL] = process
-
-	s.listen.RLock()
-	defer s.listen.RUnlock()
+func (s *TestDirectoryServer) registerInstanceLocked(tenantID uint64, process Process) {
+	s.mu.processByAddrByTenantID[tenantID] = append(s.mu.processByAddrByTenantID[tenantID], process)
 	s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
 		Pod: &tenant.Pod{
-			TenantID: tenantID,
-			Addr:     process.SQL.String(),
-			State:    tenant.RUNNING,
-			Load:     process.FakeLoad,
+			TenantID:       tenantID,
+			Addr:           process.SQLAddr,
+			State:          tenant.RUNNING,
+			StateTimestamp: timeutil.Now(),
 		},
 	})
 }
 
-func (s *TestDirectoryServer) deregisterInstance(tenantID uint64, sql net.Addr) {
-	s.proc.Lock()
-	defer s.proc.Unlock()
-	processByAddr, ok := s.proc.processByAddrByTenantID[tenantID]
-	if !ok {
-		return
+func (s *TestDirectoryServer) deregisterInstance(tenantID uint64, sqlAddr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	processByAddr := s.mu.processByAddrByTenantID[tenantID]
+
+	var remaining []Process
+	for _, process := range processByAddr {
+		if sqlAddr == process.SQLAddr {
+			s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
+				Pod: &tenant.Pod{
+					TenantID:       tenantID,
+					Addr:           sqlAddr,
+					State:          tenant.DELETING,
+					StateTimestamp: timeutil.Now(),
+				},
+			})
+		} else {
+			remaining = append(remaining, process)
+		}
 	}
 
-	if _, ok = processByAddr[sql]; ok {
-		delete(processByAddr, sql)
-
-		s.listen.RLock()
-		defer s.listen.RUnlock()
-		s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
-			Pod: &tenant.Pod{
-				TenantID: tenantID,
-				Addr:     sql.String(),
-				State:    tenant.DELETING,
-			},
-		})
+	if len(remaining) == 0 {
+		delete(s.mu.processByAddrByTenantID, tenantID)
+	} else {
+		s.mu.processByAddrByTenantID[tenantID] = remaining
 	}
 }
 
-// startTenantLocked is the default tenant process startup logic that runs the
-// cockroach db executable out of process.
-func (s *TestDirectoryServer) startTenantLocked(
-	ctx context.Context, tenantID uint64,
-) (*Process, error) {
-	// A hackish way to have the sql tenant process listen on known ports.
-	sql, err := net.Listen("tcp", "")
-	if err != nil {
-		return nil, err
-	}
-	http, err := net.Listen("tcp", "")
-	if err != nil {
-		return nil, err
-	}
-	process := &Process{SQL: sql.Addr(), FakeLoad: 0.01}
-	args := []string{
-		"mt", "start-sql", "--kv-addrs=127.0.0.1:26257", "--idle-exit-after=30s",
-		fmt.Sprintf("--sql-addr=%s", sql.Addr().String()),
-		fmt.Sprintf("--http-addr=%s", http.Addr().String()),
-		fmt.Sprintf("--tenant-id=%d", tenantID),
-		"--insecure",
-	}
-	if err = sql.Close(); err != nil {
-		return nil, err
-	}
-	if err = http.Close(); err != nil {
-		return nil, err
-	}
-
-	c := exec.Command(s.cockroachExecutable, args...)
-	process.Cmd = c
-	c.Env = append(os.Environ(), "COCKROACH_TRUST_CLIENT_PROVIDED_SQL_REMOTE_ADDR=true")
-
-	if c.Stdout != nil {
-		return nil, errors.New("exec: Stdout already set")
-	}
-	if c.Stderr != nil {
-		return nil, errors.New("exec: Stderr already set")
-	}
-	var b bytes.Buffer
-	c.Stdout = &b
-	c.Stderr = &b
-	err = c.Start()
-	if err != nil {
-		return nil, err
-	}
-	process.Stopper = NewSubStopper(s.stopper)
-	process.Stopper.AddCloser(stop.CloserFn(func() {
-		_ = c.Process.Kill()
-		s.deregisterInstance(tenantID, process.SQL)
-	}))
-	err = s.stopper.RunAsyncTask(ctx, "cmd-wait", func(ctx context.Context) {
-		if err := c.Wait(); err != nil {
-			log.Infof(ctx, "finished %s with err %s", process.Cmd.Args, err)
-			log.Infof(ctx, "output %s", b.Bytes())
-			return
-		}
-		log.Infof(ctx, "finished %s with success", process.Cmd.Args)
-		process.Stopper.Stop(ctx)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Need to wait here for the spawned cockroach tenant process to get ready.
-	// Ideally - we want to check that it is up and connected to the KV host
-	// before we return.
-	time.Sleep(500 * time.Millisecond)
-	return process, nil
+func (s *TestDirectoryServer) removeEventListenerAndCloseChan(
+	elem *list.Element, c chan *tenant.WatchPodsResponse,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.eventListeners.Remove(elem)
+	close(c)
 }

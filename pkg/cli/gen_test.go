@@ -1,17 +1,11 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,22 +21,14 @@ func TestGenMan(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Generate man pages in a temp directory.
-	manpath, err := ioutil.TempDir("", "TestGenMan")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := os.RemoveAll(manpath); err != nil {
-			t.Errorf("couldn't remove temporary directory %s: %s", manpath, err)
-		}
-	}()
+	manpath := t.TempDir()
 	if err := Run([]string{"gen", "man", "--path=" + manpath}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Ensure we have a sane number of man pages.
 	count := 0
-	err = filepath.Walk(manpath, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(manpath, func(path string, info os.FileInfo, err error) error {
 		if strings.HasSuffix(path, ".1") && !info.IsDir() {
 			count++
 		}
@@ -61,15 +47,7 @@ func TestGenAutocomplete(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Get a unique path to which we can write our autocomplete files.
-	acdir, err := ioutil.TempDir("", "TestGenAutoComplete")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := os.RemoveAll(acdir); err != nil {
-			t.Errorf("couldn't remove temporary directory %s: %s", acdir, err)
-		}
-	}()
+	acdir := t.TempDir()
 
 	for _, tc := range []struct {
 		shell  string

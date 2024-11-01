@@ -1,3 +1,8 @@
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 # Common helpers for teamcity-*.sh scripts.
 
 # root is the absolute path to the root directory of the repository.
@@ -44,8 +49,6 @@ run_counter=-1
 function run_json_test() {
   run_counter=$((run_counter+1))
   tc_start_block "prep"
-  # TODO(tbg): better to go through builder for all of this.
-  go install github.com/cockroachdb/cockroach/pkg/cmd/github-post
   mkdir -p artifacts
   tmpfile="artifacts/raw.${run_counter}.json.txt"
   tc_end_block "prep"
@@ -59,29 +62,6 @@ function run_json_test() {
   status=$?
   set -e
   tc_end_block "run"
-
-  # Post issues, if on a release branch. Note that we're feeding github-post all
-  # of the build output; it also does some slow test analysis.
-  if tc_release_branch; then
-    if [ -z "${GITHUB_API_TOKEN-}" ]; then
-      # GITHUB_API_TOKEN must be in the env or github-post will barf if it's
-      # ever asked to post, so enforce that on all runs.
-      # The way this env var is made available here is quite tricky. The build
-      # calling this method is usually a build that is invoked from PRs, so it
-      # can't have secrets available to it (for the PR could modify
-      # build/teamcity-* to leak the secret). Instead, we provide the secrets
-      # to a higher-level job (Publish Bleeding Edge) and use TeamCity magic to
-      # pass that env var through when it's there. This means we won't have the
-      # env var on PR builds, but we'll have it for builds that are triggered
-      # from the release branches.
-      echo "GITHUB_API_TOKEN must be set"
-      exit 1
-    else
-      tc_start_block "post issues"
-      github-post < "${tmpfile}"
-      tc_end_block "post issues"
-    fi
-  fi
 
   tc_start_block "artifacts"
   # Create (or append to) failures.txt artifact and delete stripped.txt.
@@ -128,23 +108,6 @@ function would_stress() {
   else
     return 0
   fi
-}
-
-function maybe_stress() {
-   # NB: This code doesn't know about posting Github issues as we don't stress on
-   # the release branches.
-  if ! would_stress; then
-    return 0
-  fi
-
-  target=$1
-  shift
-
-  block="Maybe ${target} pull request"
-  tc_start_block "${block}"
-  run build/builder.sh go install ./pkg/cmd/github-pull-request-make
-  run_json_test build/builder.sh env BUILD_VCS_NUMBER="$BUILD_VCS_NUMBER" TARGET="${target}" github-pull-request-make
-  tc_end_block "${block}"
 }
 
 # Returns the list of release branches from origin (origin/release-*), ordered
@@ -270,21 +233,42 @@ get_upstream_branch() {
 }
 
 changed_go_pkgs() {
-  git fetch --quiet origin
+  n=0
+  until git fetch --quiet origin; do
+    n=$((n+1))
+    if [ "$n" -ge 3 ]; then
+      echo "Could not fetch from GitHub"
+      exit 1
+    fi
+    sleep 5
+  done
   upstream_branch=$(get_upstream_branch)
   # Find changed packages, minus those that have been removed entirely. Note
   # that the three-dot notation means we are diffing against the merge-base of
   # the two branches, not against the tip of the upstream branch.
-  git diff --name-only "$upstream_branch..." -- "pkg/**/*.go" ":!*/testdata/*" \
+  git diff --name-only "$upstream_branch..." -- "pkg/**/*.go" ":!*/testdata/*" ":!pkg/acceptance/compose/gss/psql/**" \
     | xargs -rn1 dirname \
     | sort -u \
     | { while read path; do if ls "$path"/*.go &>/dev/null; then echo -n "./$path "; fi; done; }
 }
 
-tc_release_branch() {
-  [[ "$TC_BUILD_BRANCH" == master || "$TC_BUILD_BRANCH" == release-* || "$TC_BUILD_BRANCH" == provisional_* ]]
+# tc_build_branch returns $TC_BUILD_BRANCH but with the optional refs/heads/
+# prefix stripped.
+tc_build_branch() {
+    echo "${TC_BUILD_BRANCH#refs/heads/}"
 }
 
+# NB: Update _tc_release_branch in teamcity-bazel-support.sh if you update this
+# function.
+tc_release_branch() {
+  branch=$(tc_build_branch)
+  [[ "$branch" == master || "$branch" == release-* || "$branch" == provisional_*  || "$branch" == "staging-"* ]]
+}
+
+tc_bors_branch() {
+  branch=$(tc_build_branch)
+  [[ "$branch" == staging ]]
+}
 
 if_tc() {
   if [[ "${TC_BUILD_ID-}" ]]; then
@@ -304,4 +288,38 @@ generate_ssh_key() {
   if [[ ! -f ~/.ssh/id_rsa.pub ]]; then
     ssh-keygen -q -N "" -f ~/.ssh/id_rsa
   fi
+}
+
+begin_check_generated_code_tests() {
+    echo "##teamcity[testSuiteStarted name='CheckGeneratedCode']"
+}
+
+end_check_generated_code_tests() {
+    echo "##teamcity[testSuiteFinished name='CheckGeneratedCode']"
+}
+
+# Call this function with two arguments: the name of the "test" that will be
+# reported to teamcity and the error message to print if the workspace is dirty.
+check_workspace_clean() {
+  echo "##teamcity[testStarted name='CheckGeneratedCode/$1' captureStandardOutput='true']"
+  # The workspace is clean iff `git status --porcelain` produces no output. Any
+  # output is either an error message or a listing of an untracked/dirty file.
+  if [[ "$(git status --porcelain 2>&1)" != "" ]]; then
+    git status >&2 || true
+    git diff -a >&2 || true
+    echo "====================================================" >&2
+    echo "Some automatically generated code is not up to date." >&2
+    echo $2 >&2
+    echo "##teamcity[testFailed name='CheckGeneratedCode/$1']"
+    echo "##teamcity[testFinished name='CheckGeneratedCode/$1']"
+    exit 1
+  fi
+  echo "##teamcity[testFinished name='CheckGeneratedCode/$1']"
+}
+
+# Check if a given GCS path exists
+function check_gcs_path_exists() {
+  local path=$1
+  gsutil ls "$path" &>/dev/null
+  return
 }

@@ -5,89 +5,6 @@
 only crdb
 ----
 
-# More behavior that differs from postgres. Try executing a new query
-# when a portal is suspended. Cockroach errors.
-
-send
-Query {"String": "BEGIN"}
-Parse {"Query": "SELECT * FROM generate_series(1, 2)"}
-Bind
-Execute {"MaxRows": 1}
-Query {"String": "SELECT 1"}
-Sync
-----
-
-until keepErrMessage
-ReadyForQuery
-ErrorResponse
-ReadyForQuery
-ReadyForQuery
-----
-{"Type":"CommandComplete","CommandTag":"BEGIN"}
-{"Type":"ReadyForQuery","TxStatus":"T"}
-{"Type":"ParseComplete"}
-{"Type":"BindComplete"}
-{"Type":"DataRow","Values":[{"text":"1"}]}
-{"Type":"PortalSuspended"}
-{"Type":"ErrorResponse","Code":"0A000","Message":"unimplemented: multiple active portals not supported"}
-{"Type":"ReadyForQuery","TxStatus":"E"}
-{"Type":"ReadyForQuery","TxStatus":"E"}
-
-send
-Query {"String": "ROLLBACK"}
-Query {"String": "SELECT 'here'"}
-----
-
-until ignore=RowDescription
-ReadyForQuery
-ReadyForQuery
-----
-{"Type":"CommandComplete","CommandTag":"ROLLBACK"}
-{"Type":"ReadyForQuery","TxStatus":"I"}
-{"Type":"DataRow","Values":[{"text":"here"}]}
-{"Type":"CommandComplete","CommandTag":"SELECT 1"}
-{"Type":"ReadyForQuery","TxStatus":"I"}
-
-# Also try binding another portal during suspension.
-
-send
-Query {"String": "BEGIN"}
-Parse {"Query": "SELECT * FROM generate_series(1, 2)"}
-Bind
-Execute {"MaxRows": 1}
-Bind
-Sync
-----
-
-until keepErrMessage
-ReadyForQuery
-ErrorResponse
-ReadyForQuery
-----
-{"Type":"CommandComplete","CommandTag":"BEGIN"}
-{"Type":"ReadyForQuery","TxStatus":"T"}
-{"Type":"ParseComplete"}
-{"Type":"BindComplete"}
-{"Type":"DataRow","Values":[{"text":"1"}]}
-{"Type":"PortalSuspended"}
-{"Type":"ErrorResponse","Code":"0A000","Message":"unimplemented: multiple active portals not supported"}
-{"Type":"ReadyForQuery","TxStatus":"E"}
-
-send
-Query {"String": "ROLLBACK"}
-Query {"String": "SELECT 'here'"}
-----
-
-until ignore=RowDescription
-ReadyForQuery
-ReadyForQuery
-----
-{"Type":"CommandComplete","CommandTag":"ROLLBACK"}
-{"Type":"ReadyForQuery","TxStatus":"I"}
-{"Type":"DataRow","Values":[{"text":"here"}]}
-{"Type":"CommandComplete","CommandTag":"SELECT 1"}
-{"Type":"ReadyForQuery","TxStatus":"I"}
-
 ##############################################################################
 # Deviations from Postgres in how we handle portals' suspension and attempts #
 # to execute exhausted portals.                                              #
@@ -243,7 +160,9 @@ ReadyForQuery
 # an UPDATE twice and will confirm that it was executed only once.
 
 send
-Query {"String": "DROP TABLE IF EXISTS foo; CREATE TABLE foo (id INT8); INSERT INTO foo (id) VALUES (1), (2), (3)"}
+Query {"String": "DROP TABLE IF EXISTS foo"}
+Query {"String": "CREATE TABLE foo (id INT8)"}
+Query {"String": "INSERT INTO foo (id) VALUES (1), (2), (3)"}
 Query {"String": "BEGIN"}
 Parse {"Name": "rows_affected_stmt", "Query": "UPDATE foo SET id = id * 10 WHERE true"}
 Bind {"DestinationPortal": "rows_affected_portal", "PreparedStatement": "rows_affected_stmt"}
@@ -255,9 +174,13 @@ until
 ReadyForQuery
 ReadyForQuery
 ReadyForQuery
+ReadyForQuery
+ReadyForQuery
 ----
 {"Type":"CommandComplete","CommandTag":"DROP TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CommandComplete","CommandTag":"INSERT 0 3"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
 {"Type":"CommandComplete","CommandTag":"BEGIN"}
@@ -287,6 +210,7 @@ Sync
 until ignore=RowDescription
 ReadyForQuery
 ReadyForQuery
+ReadyForQuery
 ----
 {"Type":"DataRow","Values":[{"text":"10"}]}
 {"Type":"DataRow","Values":[{"text":"20"}]}
@@ -295,3 +219,154 @@ ReadyForQuery
 {"Type":"ReadyForQuery","TxStatus":"T"}
 {"Type":"CommandComplete","CommandTag":"COMMIT"}
 {"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+
+subtest bind_before_update
+# In pg13.3, for portal bind before the update, the execution of the portal gives
+# value before the update. While CRDB gives the updated value. This may means we
+# need to modify the how the bind statement's execution.
+
+send
+Query {"String": "BEGIN"}
+Query {"String": "CREATE TABLE mytable (x int)"}
+Query {"String": "INSERT INTO mytable VALUES (1),(2),(3)"}
+Parse {"Name": "q3", "Query": "SELECT * FROM mytable"}
+Bind {"DestinationPortal": "p3", "PreparedStatement": "q3"}
+Query {"String": "UPDATE mytable SET x = 10"}
+----
+
+until
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"BEGIN"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+{"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+{"Type":"CommandComplete","CommandTag":"INSERT 0 3"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"CommandComplete","CommandTag":"UPDATE 3"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+
+send
+Execute {"Portal": "p3", "MaxRows": 2}
+Close {"ObjectType": "P", "Name": "p3"}
+Sync
+----
+
+# PG shows DataRow 1 and 2 here.
+
+until
+ReadyForQuery
+----
+{"Type":"DataRow","Values":[{"text":"10"}]}
+{"Type":"DataRow","Values":[{"text":"10"}]}
+{"Type":"PortalSuspended"}
+{"Type":"CloseComplete"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+
+
+send
+Parse {"Name": "q4", "Query": "SELECT * FROM mytable"}
+Bind {"DestinationPortal": "p4", "PreparedStatement": "q4"}
+Execute {"Portal": "p4", "MaxRows": 2}
+Sync
+----
+
+
+until
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"DataRow","Values":[{"text":"10"}]}
+{"Type":"DataRow","Values":[{"text":"10"}]}
+{"Type":"PortalSuspended"}
+{"Type":"ReadyForQuery","TxStatus":"T"}
+
+send
+Query {"String": "COMMIT"}
+Sync
+----
+
+until
+ReadyForQuery
+----
+{"Type":"CommandComplete","CommandTag":"COMMIT"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+
+subtest end
+
+subtest functions_not_supported
+
+# We don't support UDFs in pausable portals since we don't allow mutations, and
+# UDFs may contain mutations. The following test results in a duplicate key
+# violation in postgres.
+
+send
+Query {"String": "SET multiple_active_portals_enabled = true"}
+----
+
+send
+Query {"String": "DROP TABLE IF EXISTS xy;"}
+Query {"String": "DROP FUNCTION IF EXISTS f;"}
+Query {"String": "DROP FUNCTION IF EXISTS g;"}
+Query {"String": "DEALLOCATE ALL;"}
+Query {"String": "CREATE TABLE xy (x INT PRIMARY KEY, y INT);"}
+Query {"String": "CREATE FUNCTION f() RETURNS SETOF RECORD LANGUAGE SQL AS $$ INSERT INTO xy VALUES (1, 1), (2, 2) RETURNING *; $$"}
+Query {"String": "CREATE FUNCTION g() RETURNS SETOF RECORD LANGUAGE SQL AS $$ INSERT INTO xy VALUES (2, 1), (3, 3) RETURNING *; $$"}
+Parse {"Name": "q1", "Query": "SELECT f();"}
+Parse {"Name": "q2", "Query": "SELECT g();"}
+Bind {"DestinationPortal": "p1", "PreparedStatement": "q1"}
+Bind {"DestinationPortal": "p2", "PreparedStatement": "q2"}
+Execute {"Portal": "p1", "MaxRows": 1}
+Execute {"Portal": "p2", "MaxRows": 1}
+Execute {"Portal": "p1", "MaxRows": 1}
+Execute {"Portal": "p2", "MaxRows": 1}
+Sync
+----
+
+until keepErrMessage
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ReadyForQuery
+ErrorResponse
+----
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"SET"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"DROP TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"DROP FUNCTION"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"DROP FUNCTION"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"DEALLOCATE ALL"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"CREATE TABLE"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"CREATE FUNCTION"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"CommandComplete","CommandTag":"CREATE FUNCTION"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+{"Type":"ParseComplete"}
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"BindComplete"}
+{"Type":"DataRow","Values":[{"text":"(1,1)"}]}
+{"Type":"PortalSuspended"}
+{"Type":"ErrorResponse","Code":"0A000","Message":"unimplemented: the statement for a pausable portal must be a read-only SELECT query with no sub-queries or post-queries","Detail":"cannot execute a portal while a different one is open","Hint":"You have attempted to use a feature that is not yet implemented.\nSee: https://go.crdb.dev/issue-v/98911/v24.3"}
+
+subtest end

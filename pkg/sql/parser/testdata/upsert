@@ -23,6 +23,14 @@ UPSERT INTO a.b VALUES (_) -- literals removed
 UPSERT INTO _._ VALUES (1) -- identifiers removed
 
 parse
+UPSERT INTO a.b@c VALUES (1)
+----
+UPSERT INTO a.b@c VALUES (1)
+UPSERT INTO a.b@c VALUES ((1)) -- fully parenthesized
+UPSERT INTO a.b@c VALUES (_) -- literals removed
+UPSERT INTO _._@_ VALUES (1) -- identifiers removed
+
+parse
 UPSERT INTO a VALUES (1, 2)
 ----
 UPSERT INTO a VALUES (1, 2)
@@ -43,7 +51,7 @@ UPSERT INTO a VALUES (1, 2), (3, 4)
 ----
 UPSERT INTO a VALUES (1, 2), (3, 4)
 UPSERT INTO a VALUES ((1), (2)), ((3), (4)) -- fully parenthesized
-UPSERT INTO a VALUES (_, _), (__more1__) -- literals removed
+UPSERT INTO a VALUES (_, _), (__more1_10__) -- literals removed
 UPSERT INTO _ VALUES (1, 2), (3, 4) -- identifiers removed
 
 parse
@@ -221,3 +229,19 @@ INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2) RE
 INSERT INTO a VALUES ((1)) ON CONFLICT (a) DO UPDATE SET (a, b) = ((SELECT (1), (2))) RETURNING NOTHING -- fully parenthesized
 INSERT INTO a VALUES (_) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT _, _) RETURNING NOTHING -- literals removed
 INSERT INTO _ VALUES (1) ON CONFLICT (_) DO UPDATE SET (_, _) = (SELECT 1, 2) RETURNING NOTHING -- identifiers removed
+
+parse
+INSERT INTO a VALUES (1) ON CONFLICT ON CONSTRAINT "foo" DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING NOTHING
+----
+INSERT INTO a VALUES (1) ON CONFLICT ON CONSTRAINT foo DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING NOTHING -- normalized!
+INSERT INTO a VALUES ((1)) ON CONFLICT ON CONSTRAINT foo DO UPDATE SET (a, b) = ((SELECT (1), (2))) RETURNING NOTHING -- fully parenthesized
+INSERT INTO a VALUES (_) ON CONFLICT ON CONSTRAINT foo DO UPDATE SET (a, b) = (SELECT _, _) RETURNING NOTHING -- literals removed
+INSERT INTO _ VALUES (1) ON CONFLICT ON CONSTRAINT _ DO UPDATE SET (_, _) = (SELECT 1, 2) RETURNING NOTHING -- identifiers removed
+
+parse
+INSERT INTO a VALUES (1) ON CONFLICT ON CONSTRAINT "foo" DO NOTHING
+----
+INSERT INTO a VALUES (1) ON CONFLICT ON CONSTRAINT foo DO NOTHING -- normalized!
+INSERT INTO a VALUES ((1)) ON CONFLICT ON CONSTRAINT foo DO NOTHING -- fully parenthesized
+INSERT INTO a VALUES (_) ON CONFLICT ON CONSTRAINT foo DO NOTHING -- literals removed
+INSERT INTO _ VALUES (1) ON CONFLICT ON CONSTRAINT _ DO NOTHING -- identifiers removed

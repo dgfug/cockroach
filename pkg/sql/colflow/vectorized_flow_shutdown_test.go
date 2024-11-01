@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow_test
 
@@ -17,7 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
@@ -32,17 +26,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -58,16 +52,6 @@ var (
 	testScenarios    = []testScenario{consumerDone, consumerClosed, useBatchReceiver}
 )
 
-type callbackCloser struct {
-	closeCb func() error
-}
-
-var _ colexecop.Closer = callbackCloser{}
-
-func (c callbackCloser) Close() error {
-	return c.closeCb()
-}
-
 // TestVectorizedFlowShutdown tests that closing the FlowCoordinator correctly
 // closes all the infrastructure corresponding to the flow ending in that
 // FlowCoordinator. Namely:
@@ -77,37 +61,37 @@ func (c callbackCloser) Close() error {
 // synchronizer which then outputs all the data into a materializer.
 // The resulting scheme looks as follows:
 //
-//            Remote Node             |                  Local Node
-//                                    |
-//             -> output -> Outbox -> | -> Inbox -> |
-//            |                       |
-// Hash Router -> output -> Outbox -> | -> Inbox -> |
-//            |                       |
-//             -> output -> Outbox -> | -> Inbox -> |
-//                                    |              -> Synchronizer -> materializer -> FlowCoordinator
-//                          Outbox -> | -> Inbox -> |
-//                                    |
-//                          Outbox -> | -> Inbox -> |
-//                                    |
-//                          Outbox -> | -> Inbox -> |
+// |            Remote Node             |                  Local Node
+// |                                    |
+// |             -> output -> Outbox -> | -> Inbox -> |
+// |            |                       |
+// | Hash Router -> output -> Outbox -> | -> Inbox -> |
+// |            |                       |
+// |             -> output -> Outbox -> | -> Inbox -> |
+// |                                    |              -> Synchronizer -> materializer -> FlowCoordinator
+// |                          Outbox -> | -> Inbox -> |
+// |                                    |
+// |                          Outbox -> | -> Inbox -> |
+// |                                    |
+// |                          Outbox -> | -> Inbox -> |
 //
 // Also, with 50% probability, another remote node with the chain of an Outbox
 // and Inbox is placed between the synchronizer and materializer. The resulting
 // scheme then looks as follows:
 //
-//            Remote Node             |            Another Remote Node             |         Local Node
-//                                    |                                            |
-//             -> output -> Outbox -> | -> Inbox ->                                |
-//            |                       |             |                              |
-// Hash Router -> output -> Outbox -> | -> Inbox ->                                |
-//            |                       |             |                              |
-//             -> output -> Outbox -> | -> Inbox ->                                |
-//                                    |             | -> Synchronizer -> Outbox -> | -> Inbox -> materializer -> FlowCoordinator
-//                          Outbox -> | -> Inbox ->                                |
-//                                    |             |                              |
-//                          Outbox -> | -> Inbox ->                                |
-//                                    |             |                              |
-//                          Outbox -> | -> Inbox ->                                |
+// |            Remote Node             |            Another Remote Node             |         Local Node
+// |                                    |                                            |
+// |             -> output -> Outbox -> | -> Inbox ->                                |
+// |            |                       |             |                              |
+// | Hash Router -> output -> Outbox -> | -> Inbox ->                                |
+// |            |                       |             |                              |
+// |             -> output -> Outbox -> | -> Inbox ->                                |
+// |                                    |             | -> Synchronizer -> Outbox -> | -> Inbox -> materializer -> FlowCoordinator
+// |                          Outbox -> | -> Inbox ->                                |
+// |                                    |             |                              |
+// |                          Outbox -> | -> Inbox ->                                |
+// |                                    |             |                              |
+// |                          Outbox -> | -> Inbox ->                                |
 //
 // Remote nodes are simulated by having separate contexts and separate outbox
 // registries.
@@ -120,14 +104,16 @@ func (c callbackCloser) Close() error {
 // propagated from all of the metadata sources.
 func TestVectorizedFlowShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+	defer stopper.Stop(ctx)
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
-	dialer := &execinfrapb.MockDialer{Addr: addr}
+	dialer := &flowinfra.MockDialer{Addr: addr}
 	defer dialer.Close()
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
@@ -136,8 +122,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 	for run := 0; run < 10; run++ {
 		for _, scenario := range testScenarios {
 			t.Run(fmt.Sprintf("testScenario=%s", scenario.string), func(t *testing.T) {
-				ctxLocal, cancelLocal := context.WithCancel(context.Background())
-				ctxRemote, cancelRemote := context.WithCancel(context.Background())
+				ctxLocal, cancelLocal := context.WithCancel(ctx)
+				ctxRemote, cancelRemote := context.WithCancel(ctx)
 				// Linter says there is a possibility of "context leak" because
 				// cancelRemote variable may not be used, so we defer the call to it.
 				// This does not change anything about the test since we're blocking on
@@ -145,18 +131,19 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				// is actually a noop.
 				defer cancelRemote()
 				st := cluster.MakeTestingClusterSettings()
-				evalCtx := tree.MakeTestingEvalContext(st)
+				evalCtx := eval.MakeTestingEvalContext(st)
 				defer evalCtx.Stop(ctxLocal)
 				flowCtx := &execinfra.FlowCtx{
 					EvalCtx: &evalCtx,
+					Mon:     evalCtx.TestingMon,
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 				}
 				rng, _ := randutil.NewTestRand()
 				var (
-					err             error
-					wg              sync.WaitGroup
-					typs            = []*types.T{types.Int}
-					hashRouterInput = coldatatestutils.NewRandomDataOp(
+					err                error
+					wg                 sync.WaitGroup
+					typs               = []*types.T{types.Int}
+					hashRouterInput, _ = coldatatestutils.NewRandomDataOp(
 						testAllocator,
 						rng,
 						coldatatestutils.RandomDataOpArgs{
@@ -179,6 +166,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				// Create an allocator for each output.
 				allocators := make([]*colmem.Allocator, numHashRouterOutputs)
 				diskAccounts := make([]*mon.BoundAccount, numHashRouterOutputs)
+				diskQueueMemAccounts := make([]*mon.BoundAccount, numHashRouterOutputs)
 				for i := range allocators {
 					acc := testMemMonitor.MakeBoundAccount()
 					defer acc.Close(ctxRemote)
@@ -186,6 +174,9 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					diskAcc := testDiskMonitor.MakeBoundAccount()
 					diskAccounts[i] = &diskAcc
 					defer diskAcc.Close(ctxRemote)
+					diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+					diskQueueMemAccounts[i] = &diskQueueMemAcc
+					defer diskQueueMemAcc.Close(ctx)
 				}
 				createMetadataSourceForID := func(id int) colexecop.MetadataSource {
 					return colexectestutils.CallbackMetadataSource{
@@ -203,6 +194,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					toDrain[i] = createMetadataSourceForID(i)
 				}
 				hashRouter, hashRouterOutputs := colflow.NewHashRouter(
+					&execinfra.FlowCtx{Gateway: false},
+					0, /* processorID */
 					allocators,
 					colexecargs.OpWithMetaInfo{
 						Root:            hashRouterInput,
@@ -210,10 +203,11 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					},
 					typs,
 					[]uint32{0}, /* hashCols */
-					64<<20,      /* memoryLimit */
+					execinfra.DefaultMemoryLimit,
 					queueCfg,
 					&colexecop.TestingSemaphore{},
 					diskAccounts,
+					diskQueueMemAccounts,
 				)
 				for i := 0; i < numInboxes; i++ {
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
@@ -229,39 +223,28 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						},
 					)
 				}
-				synchronizer := colexec.NewParallelUnorderedSynchronizer(synchronizerInputs, &wg)
+				syncFlowCtx := &execinfra.FlowCtx{Local: false, Gateway: !addAnotherRemote}
+				synchronizer := colexec.NewParallelUnorderedSynchronizer(syncFlowCtx, 0 /* processorID */, testMemAcc, synchronizerInputs, &wg)
 				inputMetadataSource := colexecop.MetadataSource(synchronizer)
-				flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
-				// idToClosed keeps track of whether Close was called for a given id.
-				idToClosed := struct {
-					syncutil.Mutex
-					mapping map[int]bool
-				}{}
-				idToClosed.mapping = make(map[int]bool)
 				runOutboxInbox := func(
 					outboxCtx context.Context,
 					flowCtxCancel context.CancelFunc,
 					outboxMemAcc *mon.BoundAccount,
+					outboxConverterMemAcc *mon.BoundAccount,
 					outboxInput colexecop.Operator,
 					inbox *colrpc.Inbox,
 					id int,
 					outboxMetadataSources []colexecop.MetadataSource,
 				) {
-					idToClosed.Lock()
-					idToClosed.mapping[id] = false
-					idToClosed.Unlock()
 					outbox, err := colrpc.NewOutbox(
+						&execinfra.FlowCtx{Gateway: false},
+						0, /* processorID */
 						colmem.NewAllocator(outboxCtx, outboxMemAcc, testColumnFactory),
+						outboxConverterMemAcc,
 						colexecargs.OpWithMetaInfo{
 							Root:            outboxInput,
 							MetadataSources: outboxMetadataSources,
-							ToClose: []colexecop.Closer{callbackCloser{closeCb: func() error {
-								idToClosed.Lock()
-								idToClosed.mapping[id] = true
-								idToClosed.Unlock()
-								return nil
-							}}},
 						},
 						typs,
 						nil, /* getStats */
@@ -273,8 +256,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						outbox.Run(
 							outboxCtx,
 							dialer,
-							execinfra.StaticNodeID,
-							flowID,
+							execinfra.StaticSQLInstanceID,
 							execinfrapb.StreamID(id),
 							flowCtxCancel,
 							0, /* connectionTimeout */
@@ -289,7 +271,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					doneFn := func() { close(serverStreamNotification.Donec) }
 					wg.Add(1)
 					go func(id int, stream execinfrapb.DistSQL_FlowStreamServer, doneFn func()) {
-						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream, make(<-chan struct{}))
+						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream)
 						doneFn()
 						wg.Done()
 					}(id, serverStream, doneFn)
@@ -303,8 +285,19 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				for i := 0; i < numInboxes; i++ {
 					outboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer outboxMemAccount.Close(ctxRemote)
+					outboxConverterMemAcc := testMemMonitor.MakeBoundAccount()
+					defer outboxConverterMemAcc.Close(ctxRemote)
 					if i < numHashRouterOutputs {
-						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, hashRouterOutputs[i], inboxes[i], streamID, []colexecop.MetadataSource{hashRouterOutputs[i]})
+						runOutboxInbox(
+							ctxRemote,
+							cancelRemote,
+							&outboxMemAccount,
+							&outboxConverterMemAcc,
+							hashRouterOutputs[i],
+							inboxes[i],
+							streamID,
+							[]colexecop.MetadataSource{hashRouterOutputs[i]},
+						)
 					} else {
 						sourceMemAccount := testMemMonitor.MakeBoundAccount()
 						defer sourceMemAccount.Close(ctxRemote)
@@ -315,6 +308,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 							ctxRemote,
 							cancelRemote,
 							&outboxMemAccount,
+							&outboxConverterMemAcc,
 							colexecop.NewRepeatableBatchSource(remoteAllocator, batch, typs),
 							inboxes[i],
 							streamID,
@@ -325,7 +319,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 
 				var input colexecop.Operator
-				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(context.Background())
+				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(ctx)
 				if addAnotherRemote {
 					// Add another "remote" node to the flow.
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
@@ -335,10 +329,13 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					inboxes = append(inboxes, inbox)
 					outboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer outboxMemAccount.Close(ctxAnotherRemote)
+					outboxConverterMemAcc := testMemMonitor.MakeBoundAccount()
+					defer outboxConverterMemAcc.Close(ctxRemote)
 					runOutboxInbox(
 						ctxAnotherRemote,
 						cancelAnotherRemote,
 						&outboxMemAccount,
+						&outboxConverterMemAcc,
 						synchronizer,
 						inbox,
 						streamID,
@@ -353,14 +350,9 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					input = synchronizer
 				}
 
-				closeCalled := false
 				inputInfo := colexecargs.OpWithMetaInfo{
 					Root:            input,
 					MetadataSources: colexecop.MetadataSources{inputMetadataSource},
-					ToClose: colexecop.Closers{callbackCloser{closeCb: func() error {
-						closeCalled = true
-						return nil
-					}}},
 				}
 
 				// runFlowCoordinator creates a pair of a materializer and a
@@ -368,6 +360,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				// coordinator.
 				runFlowCoordinator := func() *colflow.FlowCoordinator {
 					materializer := colexec.NewMaterializer(
+						nil, /* streamingMemAcc */
 						flowCtx,
 						1, /* processorID */
 						inputInfo,
@@ -377,7 +370,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						flowCtx,
 						1, /* processorID */
 						materializer,
-						nil, /* output */
 						cancelLocal,
 					)
 					coordinator.Start(ctxLocal)
@@ -455,11 +447,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					}
 				}
 				wg.Wait()
-				// Ensure all the outboxes called Close.
-				for id, closed := range idToClosed.mapping {
-					require.True(t, closed, "outbox with ID %d did not call Close on closers", id)
-				}
-				require.True(t, closeCalled)
 			})
 		}
 	}

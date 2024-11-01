@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -17,10 +12,11 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
@@ -49,13 +45,9 @@ const foreignKeyValidationWarning = "-- Validate foreign key constraints. These 
 // the table that uses the sequence).
 // The tables are sorted by table id first to guarantee stable ordering.
 func getTopologicallySortedTableIDs(
-	ctx context.Context,
-	ie sqlutil.InternalExecutor,
-	txn *kv.Txn,
-	dbName string,
-	acc *mon.BoundAccount,
+	ctx context.Context, evalPlanner eval.Planner, txn *kv.Txn, dbName string, acc *mon.BoundAccount,
 ) ([]int64, error) {
-	ids, err := getTableIDs(ctx, ie, txn, dbName, acc)
+	ids, err := getTableIDs(ctx, evalPlanner, txn, dbName, acc)
 	if err != nil {
 		return nil, err
 	}
@@ -74,11 +66,10 @@ func getTopologicallySortedTableIDs(
 		SELECT dependson_id
 		FROM %s.crdb_internal.backward_dependencies
 		WHERE descriptor_id = $1
-		`, dbName)
-		it, err := ie.QueryIteratorEx(
+		`, lexbase.EscapeSQLIdent(dbName))
+		it, err := evalPlanner.QueryIteratorEx(
 			ctx,
 			"crdb_internal.show_create_all_tables",
-			txn,
 			sessiondata.NoSessionDataOverride,
 			query,
 			tid,
@@ -105,6 +96,9 @@ func getTopologicallySortedTableIDs(
 		}
 
 		dependsOnIDs[tid] = refs
+		if err := it.Close(); err != nil {
+			return nil, err
+		}
 	}
 
 	// First sort by ids to guarantee stable output.
@@ -153,23 +147,18 @@ func getTopologicallySortedTableIDs(
 // getTableIDs returns the set of table ids from
 // crdb_internal.show_create_all_tables for a specified database.
 func getTableIDs(
-	ctx context.Context,
-	ie sqlutil.InternalExecutor,
-	txn *kv.Txn,
-	dbName string,
-	acc *mon.BoundAccount,
-) ([]int64, error) {
+	ctx context.Context, evalPlanner eval.Planner, txn *kv.Txn, dbName string, acc *mon.BoundAccount,
+) (tableIDs []int64, retErr error) {
 	query := fmt.Sprintf(`
 		SELECT descriptor_id
 		FROM %s.crdb_internal.create_statements
 		WHERE database_name = $1 
 		AND is_virtual = FALSE
 		AND is_temporary = FALSE
-		`, dbName)
-	it, err := ie.QueryIteratorEx(
+		`, lexbase.EscapeSQLIdent(dbName))
+	it, err := evalPlanner.QueryIteratorEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",
-		txn,
 		sessiondata.NoSessionDataOverride,
 		query,
 		dbName,
@@ -177,8 +166,9 @@ func getTableIDs(
 	if err != nil {
 		return nil, err
 	}
-
-	var tableIDs []int64
+	defer func() {
+		retErr = errors.CombineErrors(retErr, it.Close())
+	}()
 
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
@@ -218,6 +208,11 @@ func topologicalSort(
 		return nil
 	}
 
+	// Skip IDs that are not in the dependsOn set.
+	if _, exists := dependsOnIDs[tid]; !exists {
+		return nil
+	}
+
 	// Account for memory of map.
 	// The key value entry into the map is only the memory of an int64 since
 	// the value stuct{}{} uses no memory.
@@ -242,18 +237,17 @@ func topologicalSort(
 // getCreateStatement gets the create statement to recreate a table (ignoring fks)
 // for a given table id in a database.
 func getCreateStatement(
-	ctx context.Context, ie sqlutil.InternalExecutor, txn *kv.Txn, id int64, dbName string,
+	ctx context.Context, evalPlanner eval.Planner, txn *kv.Txn, id int64, dbName string,
 ) (tree.Datum, error) {
 	query := fmt.Sprintf(`
 		SELECT
 			create_nofks
 		FROM %s.crdb_internal.create_statements
 		WHERE descriptor_id = $1
-	`, dbName)
-	row, err := ie.QueryRowEx(
+	`, lexbase.EscapeSQLIdent(dbName))
+	row, err := evalPlanner.QueryRowEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",
-		txn,
 		sessiondata.NoSessionDataOverride,
 		query,
 		id,
@@ -269,7 +263,7 @@ func getCreateStatement(
 // foreign keys for a given table id in a database.
 func getAlterStatements(
 	ctx context.Context,
-	ie sqlutil.InternalExecutor,
+	evalPlanner eval.Planner,
 	txn *kv.Txn,
 	id int64,
 	dbName string,
@@ -280,11 +274,10 @@ func getAlterStatements(
 			%s
 		FROM %s.crdb_internal.create_statements
 		WHERE descriptor_id = $1
-	`, statementType, dbName)
-	row, err := ie.QueryRowEx(
+	`, statementType, lexbase.EscapeSQLIdent(dbName))
+	row, err := evalPlanner.QueryRowEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",
-		txn,
 		sessiondata.NoSessionDataOverride,
 		query,
 		id,

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -18,7 +13,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgrepl/pgreplparser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 )
 
 // delegateShowSyntax implements SHOW SYNTAX. This statement is usually handled
@@ -27,19 +24,29 @@ import (
 func (d *delegator) delegateShowSyntax(n *tree.ShowSyntax) (tree.Statement, error) {
 	// Construct an equivalent SELECT query that produces the results:
 	//
-	// SELECT @1 AS field, @2 AS message
+	// SELECT f AS field, m AS message
 	//   FROM (VALUES
 	//           ('file',     'foo.go'),
 	//           ('line',     '123'),
 	//           ('function', 'blix()'),
 	//           ('detail',   'some details'),
-	//           ('hint',     'some hints'))
+	//           ('hint',     'some hints')) v(f, m)
 	//
 	var query bytes.Buffer
 	fmt.Fprintf(
-		&query, "SELECT @1 AS %s, @2 AS %s FROM (VALUES ",
+		&query, "SELECT f AS %s, m AS %s FROM (VALUES ",
 		colinfo.ShowSyntaxColumns[0].Name, colinfo.ShowSyntaxColumns[1].Name,
 	)
+
+	// For replication based statements, return nothing for now.
+	if d.evalCtx.SessionData().ReplicationMode != sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED &&
+		pgreplparser.IsReplicationProtocolCommand(n.Statement) {
+		return d.parse(fmt.Sprintf(
+			`SELECT '' AS %s, '' AS %s FROM generate_series(0, -1) x`,
+			colinfo.ShowSyntaxColumns[0].Name,
+			colinfo.ShowSyntaxColumns[1].Name,
+		))
+	}
 
 	comma := ""
 	// TODO(knz): in the call below, reportErr is nil although we might
@@ -64,6 +71,7 @@ func (d *delegator) delegateShowSyntax(n *tree.ShowSyntax) (tree.Statement, erro
 		},
 		nil, /* reportErr */
 	)
-	query.WriteByte(')')
-	return parse(query.String())
+	query.WriteString(") v(f, m)")
+
+	return d.parse(query.String())
 }

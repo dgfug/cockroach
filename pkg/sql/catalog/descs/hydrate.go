@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
@@ -14,186 +9,310 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 )
 
-// hydrateTypesInTableDesc installs user defined type metadata in all types.T
-// present in the input TableDescriptor. It always returns the same type of
-// TableDescriptor that was passed in. It ensures that ImmutableTableDescriptors
-// are not modified during the process of metadata installation. Dropped tables
-// do not get hydrated.
+// hydrateDescriptors installs user defined type metadata in all types.T present
+// in the descriptors slice.
 //
-// TODO(ajwerner): This should accept flags to indicate whether we can resolve
-// offline descriptors.
-func (tc *Collection) hydrateTypesInTableDesc(
-	ctx context.Context, txn *kv.Txn, desc catalog.TableDescriptor,
-) (catalog.TableDescriptor, error) {
-	if desc.Dropped() {
-		return desc, nil
+// Hydration is not thread-safe while immutable descriptors are, therefore this
+// method will replace un-hydrated immutable descriptors in the slice with
+// hydrated copies. Mutable descriptors are not thread-safe and so are hydrated
+// in-place. Dropped descriptors do not get hydrated.
+//
+// Optionally, when hydrating we can include offline descriptors and avoid
+// leasing depending on the context. This is set via the flags.
+//
+// Collection method callers expect the descriptors to come back hydrated.
+// In practice, array types here are not hydrated, and that's a bummer.
+// Nobody presently is upset about it, but it's not a good thing.
+// Ideally we'd have a clearer contract regarding hydration and the values
+// stored in the various maps inside the collection. One might want to
+// store only hydrated values in the various maps. This turns out to be
+// somewhat tricky because we'd need to make sure to properly re-hydrate
+// all the relevant descriptors when a type descriptor change. Leased
+// descriptors are at least as tricky, plus, there we have a cache that
+// works relatively well.
+//
+// TODO(ajwerner): Sort out the hydration mess; define clearly what is
+// hydrated where and test the API boundary accordingly.
+func (tc *Collection) hydrateDescriptors(
+	ctx context.Context, txn *kv.Txn, flags getterFlags, descs []catalog.Descriptor,
+) error {
+	if flags.layerFilters.withoutHydration {
+		return nil
 	}
-	switch t := desc.(type) {
-	case *tabledesc.Mutable:
-		// It is safe to hydrate directly into Mutable since it is
-		// not shared. When hydrating mutable descriptors, use the mutable access
-		// method to access types.
-		getType := func(ctx context.Context, id descpb.ID) (tree.TypeName, catalog.TypeDescriptor, error) {
-			desc, err := tc.GetMutableTypeVersionByID(ctx, txn, id)
-			if err != nil {
-				return tree.TypeName{}, nil, err
-			}
-			dbDesc, err := tc.GetMutableDescriptorByID(ctx, desc.ParentID, txn)
-			if err != nil {
-				return tree.TypeName{}, nil, err
-			}
-			sc, err := tc.getSchemaByID(
-				ctx, txn, desc.ParentSchemaID,
-				tree.SchemaLookupFlags{
-					IncludeOffline: true,
-					RequireMutable: true,
-				},
-			)
-			if err != nil {
-				return tree.TypeName{}, nil, err
-			}
-			name := tree.MakeQualifiedTypeName(dbDesc.GetName(), sc.GetName(), desc.Name)
-			return name, desc, nil
+	var hydratableMutableIndexes, hydratableImmutableIndexes intsets.Fast
+	for i, desc := range descs {
+		if desc == nil || !isHydratable(desc) {
+			continue
 		}
-
-		return desc, typedesc.HydrateTypesInTableDescriptor(ctx, t.TableDesc(), typedesc.TypeLookupFunc(getType))
-	case catalog.TableDescriptor:
-		// ImmutableTableDescriptors need to be copied before hydration, because
-		// they are potentially read by multiple threads. If there aren't any user
-		// defined types in the descriptor, then return early.
-		if !t.ContainsUserDefinedTypes() {
-			return desc, nil
+		if _, ok := desc.(catalog.MutableDescriptor); ok {
+			hydratableMutableIndexes.Add(i)
+		} else {
+			hydratableImmutableIndexes.Add(i)
 		}
+	}
 
-		getType := typedesc.TypeLookupFunc(func(
-			ctx context.Context, id descpb.ID,
-		) (tree.TypeName, catalog.TypeDescriptor, error) {
-			desc, err := tc.GetImmutableTypeByID(ctx, txn, id, tree.ObjectLookupFlags{})
-			if err != nil {
-				return tree.TypeName{}, nil, err
+	// hydrate mutable hydratable descriptors of the slice in-place.
+	if !hydratableMutableIndexes.Empty() {
+		typeFn := makeMutableTypeLookupFunc(tc, txn, descs)
+		for _, i := range hydratableMutableIndexes.Ordered() {
+			if err := hydrate(ctx, descs[i], typeFn); err != nil {
+				return err
 			}
-			_, dbDesc, err := tc.GetImmutableDatabaseByID(ctx, txn, desc.GetParentID(),
-				tree.DatabaseLookupFlags{Required: true})
-			if err != nil {
-				return tree.TypeName{}, nil, err
-			}
-			sc, err := tc.GetImmutableSchemaByID(
-				ctx, txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{})
-			if err != nil {
-				return tree.TypeName{}, nil, err
-			}
-			name := tree.MakeQualifiedTypeName(dbDesc.GetName(), sc.GetName(), desc.GetName())
-			return name, desc, nil
-		})
+		}
+	}
 
-		// Utilize the cache of hydrated tables if we have one.
-		if tc.hydratedTables != nil {
-			hydrated, err := tc.hydratedTables.GetHydratedTableDescriptor(ctx, t, getType)
-			if err != nil {
-				return nil, err
-			}
-			if hydrated != nil {
-				return hydrated, nil
+	// Replace immutable hydratable descriptors in the slice with hydrated copies
+	// from the cache, or otherwise by creating a copy and hydrating it.
+	if !hydratableImmutableIndexes.Empty() {
+		typeFn := makeImmutableTypeLookupFunc(tc, txn, flags, descs)
+		for _, i := range hydratableImmutableIndexes.Ordered() {
+			desc := descs[i]
+			// Utilize the cache of hydrated tables if we have one and this descriptor
+			// was leased.
+			// TODO(ajwerner): Consider surfacing the mechanism used to retrieve the
+			// descriptor up to this layer.
+			if tc.canUseHydratedDescriptorCache(desc.GetID()) {
+				if cached, err := tc.hydrated.GetHydratedDescriptor(ctx, desc, typeFn); err != nil {
+					return err
+				} else if cached != nil {
+					descs[i] = cached
+					continue
+				}
 			}
 			// The cache decided not to give back a hydrated descriptor, likely
 			// because either we've modified the table or one of the types or because
 			// this transaction has a stale view of one of the relevant descriptors.
 			// Proceed to hydrating a fresh copy.
-		}
-
-		// Make a copy of the underlying descriptor before hydration.
-		descBase := protoutil.Clone(t.TableDesc()).(*descpb.TableDescriptor)
-		if err := typedesc.HydrateTypesInTableDescriptor(ctx, descBase, getType); err != nil {
-			return nil, err
-		}
-		if t.IsUncommittedVersion() {
-			return tabledesc.NewBuilderForUncommittedVersion(descBase).BuildImmutableTable(), nil
-		}
-		return tabledesc.NewBuilder(descBase).BuildImmutableTable(), nil
-	default:
-		return desc, nil
-	}
-}
-
-// HydrateGivenDescriptors installs type metadata in the types present for all
-// table descriptors in the slice of descriptors. It is exported so resolution
-// on sets of descriptors can hydrate a set of descriptors (i.e. on BACKUPs).
-func HydrateGivenDescriptors(ctx context.Context, descs []catalog.Descriptor) error {
-	// Collect the needed information to set up metadata in those types.
-	dbDescs := make(map[descpb.ID]catalog.DatabaseDescriptor)
-	typDescs := make(map[descpb.ID]catalog.TypeDescriptor)
-	schemaDescs := make(map[descpb.ID]catalog.SchemaDescriptor)
-	for _, desc := range descs {
-		switch desc := desc.(type) {
-		case catalog.DatabaseDescriptor:
-			dbDescs[desc.GetID()] = desc
-		case catalog.TypeDescriptor:
-			typDescs[desc.GetID()] = desc
-		case catalog.SchemaDescriptor:
-			schemaDescs[desc.GetID()] = desc
-		}
-	}
-	// If we found any type descriptors, that means that some of the tables we
-	// scanned might have types that need hydrating.
-	if len(typDescs) > 0 {
-		// Since we just scanned all the descriptors, we already have everything
-		// we need to hydrate our types. Set up an accessor for the type hydration
-		// method to look into the scanned set of descriptors.
-		typeLookup := func(ctx context.Context, id descpb.ID) (tree.TypeName, catalog.TypeDescriptor, error) {
-			typDesc, ok := typDescs[id]
-			if !ok {
-				n := tree.MakeUnresolvedName(fmt.Sprintf("[%d]", id))
-				return tree.TypeName{}, nil, sqlerrors.NewUndefinedObjectError(&n,
-					tree.TypeObject)
+			desc = desc.NewBuilder().BuildImmutable()
+			if err := hydrate(ctx, desc, typeFn); err != nil {
+				return err
 			}
-			dbDesc, ok := dbDescs[typDesc.GetParentID()]
-			if !ok {
-				n := fmt.Sprintf("[%d]", typDesc.GetParentID())
-				return tree.TypeName{}, nil, sqlerrors.NewUndefinedDatabaseError(n)
-			}
-			// We don't use the collection's ResolveSchemaByID method here because
-			// we already have all of the descriptors. User defined types are only
-			// members of the public schema or a user defined schema, so those are
-			// the only cases we have to consider here.
-			var scName string
-			switch typDesc.GetParentSchemaID() {
-			case keys.PublicSchemaID:
-				scName = tree.PublicSchema
-			default:
-				scName = schemaDescs[typDesc.GetParentSchemaID()].GetName()
-			}
-			name := tree.MakeQualifiedTypeName(dbDesc.GetName(), scName, typDesc.GetName())
-			return name, typDesc, nil
-		}
-		// Now hydrate all table descriptors.
-		for i := range descs {
-			desc := descs[i]
-			// Never hydrate dropped descriptors.
-			if desc.Dropped() {
-				continue
-			}
-			tblDesc, ok := desc.(catalog.TableDescriptor)
-			if ok {
-				if err := typedesc.HydrateTypesInTableDescriptor(
-					ctx,
-					tblDesc.TableDesc(),
-					typedesc.TypeLookupFunc(typeLookup),
-				); err != nil {
-					return err
-				}
-			}
+			descs[i] = desc
 		}
 	}
 	return nil
+}
+
+func makeMutableTypeLookupFunc(
+	tc *Collection, txn *kv.Txn, descs []catalog.Descriptor,
+) typedesc.TypeLookupFunc {
+	var mc nstree.MutableCatalog
+	for _, desc := range descs {
+		if desc == nil {
+			continue
+		}
+		if _, ok := desc.(catalog.MutableDescriptor); !ok {
+			continue
+		}
+		mc.UpsertDescriptor(desc)
+	}
+	mutableLookupFunc := func(ctx context.Context, id descpb.ID, skipHydration bool) (catalog.Descriptor, error) {
+		// This special case exists to deal with the desire to use enums in the
+		// system database, and the fact that the hydration contract is such that
+		// when we resolve types mutably, we resolve the mutable type descriptors
+		// they reference, which may have in-memory changes. The problem with this
+		// is that one is not permitted to mutably resolve the public schema
+		// descriptor for the system database. We only want it for the name, so
+		// let the caller have the immutable copy.
+		if id == catconstants.PublicSchemaID {
+			return schemadesc.GetPublicSchema(), nil
+		}
+		flags := getterFlags{
+			contextFlags: contextFlags{
+				isMutable: true,
+			},
+			layerFilters: layerFilters{
+				withoutSynthetic: true,
+				withoutLeased:    true,
+				withoutHydration: skipHydration,
+			},
+		}
+		g := ByIDGetter(makeGetterBase(txn, tc, flags))
+		return g.Desc(ctx, id)
+	}
+	return makeTypeLookupFuncForHydration(mc, mutableLookupFunc)
+}
+
+func makeImmutableTypeLookupFunc(
+	tc *Collection, txn *kv.Txn, flags getterFlags, descs []catalog.Descriptor,
+) typedesc.TypeLookupFunc {
+	var mc nstree.MutableCatalog
+	for _, desc := range descs {
+		if desc == nil {
+			continue
+		}
+		if _, ok := desc.(catalog.MutableDescriptor); ok {
+			continue
+		}
+		mc.UpsertDescriptor(desc)
+	}
+	immutableLookupFunc := func(ctx context.Context, id descpb.ID, skipHydration bool) (catalog.Descriptor, error) {
+		f := getterFlags{
+			layerFilters: layerFilters{
+				withoutSynthetic: true,
+				withoutLeased:    flags.layerFilters.withoutLeased,
+				withoutHydration: skipHydration,
+			},
+			descFilters: descFilters{
+				withoutDropped: true,
+				withoutOffline: flags.descFilters.withoutOffline,
+			},
+		}
+		g := ByIDGetter(makeGetterBase(txn, tc, f))
+		return g.Desc(ctx, id)
+	}
+	return makeTypeLookupFuncForHydration(mc, immutableLookupFunc)
+}
+
+// HydrateCatalog installs type metadata in the type.T objects present for all
+// objects referencing them in the catalog.
+func HydrateCatalog(ctx context.Context, c nstree.MutableCatalog) error {
+	ctx, sp := tracing.ChildSpan(ctx, "descs.HydrateCatalog")
+	defer sp.Finish()
+
+	fakeLookupFunc := func(_ context.Context, id descpb.ID, skipHydration bool) (catalog.Descriptor, error) {
+		return nil, catalog.NewDescriptorNotFoundError(id)
+	}
+	typeLookupFunc := makeTypeLookupFuncForHydration(c, fakeLookupFunc)
+	var hydratable []catalog.Descriptor
+	_ = c.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if isHydratable(desc) {
+			hydratable = append(hydratable, desc)
+		}
+		return nil
+	})
+	for _, desc := range hydratable {
+		if _, isMutable := desc.(catalog.MutableDescriptor); !isMutable {
+			// Deep-copy the immutable descriptor and overwrite the catalog entry.
+			desc = desc.NewBuilder().BuildImmutable()
+			c.UpsertDescriptor(desc)
+		}
+		if err := hydrate(ctx, desc, typeLookupFunc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tc *Collection) canUseHydratedDescriptorCache(id descpb.ID) bool {
+	return tc.hydrated != nil &&
+		!tc.cr.IsIDInCache(id) &&
+		tc.uncommitted.getUncommittedByID(id) == nil &&
+		tc.synthetic.getSyntheticByID(id) == nil
+}
+
+// hydrationLookupFunc is the type of function required to look up type
+// descriptors and their parent schemas and databases when hydrating an object.
+type hydrationLookupFunc func(ctx context.Context, id descpb.ID, skipHydration bool) (catalog.Descriptor, error)
+
+// isHydratable returns false iff the descriptor definitely does not require
+// hydration
+func isHydratable(desc catalog.Descriptor) bool {
+	if desc.Dropped() {
+		// Don't hydrate dropped descriptors.
+		return false
+	}
+	return desc.MaybeRequiresTypeHydration()
+}
+
+// hydrate ensures that type metadata is present in any type.T objects
+// referenced by the descriptor. Beware when calling on immutable descriptors:
+// this is not thread-safe.
+func hydrate(
+	ctx context.Context, desc catalog.Descriptor, typeLookupFunc typedesc.TypeLookupFunc,
+) error {
+	if !isHydratable(desc) {
+		return nil
+	}
+	return typedesc.HydrateTypesInDescriptor(ctx, desc, typeLookupFunc)
+}
+
+// makeTypeLookupFuncForHydration builds a typedesc.TypeLookupFunc for the
+// use with hydrate. Type descriptors and their parent schema and database are
+// looked up in the nstree.Catalog object before being looked up via the
+// hydrationLookupFunc.
+func makeTypeLookupFuncForHydration(
+	c nstree.MutableCatalog, lookupFn hydrationLookupFunc,
+) typedesc.TypeLookupFunc {
+	var typeLookupFunc func(ctx context.Context, id descpb.ID) (tn tree.TypeName, typ catalog.TypeDescriptor, err error)
+
+	typeLookupFunc = func(ctx context.Context, id descpb.ID) (tn tree.TypeName, typ catalog.TypeDescriptor, err error) {
+		typDesc := c.LookupDescriptor(id)
+		if typDesc == nil {
+			typDesc, err = lookupFn(ctx, id, false /* skipHydration */)
+			if err != nil {
+				if errors.Is(err, catalog.ErrDescriptorNotFound) {
+					n := tree.Name(fmt.Sprintf("[%d]", id))
+					return tree.TypeName{}, nil, sqlerrors.NewUndefinedTypeError(&n)
+				}
+				return tree.TypeName{}, nil, err
+			}
+			c.UpsertDescriptor(typDesc)
+		}
+		switch t := typDesc.(type) {
+		case catalog.TypeDescriptor:
+			typ = t
+		case catalog.TableDescriptor:
+			if isHydratable(t) {
+				if err := hydrate(ctx, t, typeLookupFunc); err != nil {
+					return tree.TypeName{}, nil, err
+				}
+				c.UpsertDescriptor(t)
+			}
+			typ, err = typedesc.CreateImplicitRecordTypeFromTableDesc(t)
+		default:
+			typ, err = catalog.AsTypeDescriptor(typDesc)
+		}
+		if err != nil {
+			return tree.TypeName{}, nil, err
+		}
+		dbDesc := c.LookupDescriptor(typ.GetParentID())
+		if dbDesc == nil {
+			dbDesc, err = lookupFn(ctx, typ.GetParentID(), true /* skipHydration */)
+			if err != nil {
+				if errors.Is(err, catalog.ErrDescriptorNotFound) {
+					n := fmt.Sprintf("[%d]", typ.GetParentID())
+					return tree.TypeName{}, nil, sqlerrors.NewUndefinedDatabaseError(n)
+				}
+				return tree.TypeName{}, nil, err
+			}
+			c.UpsertDescriptor(dbDesc)
+		}
+		if _, err = catalog.AsDatabaseDescriptor(dbDesc); err != nil {
+			return tree.TypeName{}, nil, err
+		}
+		scDesc := c.LookupDescriptor(typ.GetParentSchemaID())
+		if scDesc == nil {
+			scDesc, err = lookupFn(ctx, typ.GetParentSchemaID(), true /* skipHydration */)
+			if err != nil {
+				if errors.Is(err, catalog.ErrDescriptorNotFound) {
+					n := fmt.Sprintf("[%d]", typ.GetParentSchemaID())
+					return tree.TypeName{}, nil, sqlerrors.NewUndefinedSchemaError(n)
+				}
+				return tree.TypeName{}, nil, err
+			}
+			c.UpsertDescriptor(scDesc)
+		}
+		if _, err = catalog.AsSchemaDescriptor(scDesc); err != nil {
+			return tree.TypeName{}, nil, err
+		}
+		tn = tree.MakeQualifiedTypeName(dbDesc.GetName(), scDesc.GetName(), typ.GetName())
+		return tn, typ, nil
+	}
+
+	return typeLookupFunc
 }

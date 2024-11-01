@@ -1,321 +1,173 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
 	"bytes"
 	"flag"
-	"fmt"
-	"go/build"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/cockroachdb/cockroach/pkg/release"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/kr/pretty"
 )
 
 const (
-	awsAccessKeyIDKey      = "AWS_ACCESS_KEY_ID"
-	awsSecretAccessKeyKey  = "AWS_SECRET_ACCESS_KEY"
 	teamcityBuildBranchKey = "TC_BUILD_BRANCH"
 )
 
-type s3putter interface {
-	PutObject(*s3.PutObjectInput) (*s3.PutObjectOutput, error)
-}
-
-// Overridden in testing.
-var testableS3 = func() (s3putter, error) {
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String("us-east-1"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return s3.New(sess), nil
-}
-
-var isRelease = flag.Bool("release", false, "build in release mode instead of bleeding-edge mode")
-var destBucket = flag.String("bucket", "", "override default bucket")
-
-var (
-	// TODO(tamird,benesch,bdarnell): make "latest" a website-redirect
-	// rather than a full key. This means that the actual artifact will no
-	// longer be named "-latest".
-	latestStr = "latest"
-)
-
 func main() {
+	var gcsBucket string
+	var platforms release.Platforms
+	flag.StringVar(&gcsBucket, "gcs-bucket", "", "GCS bucket")
+	flag.Var(&platforms, "platform", "platforms to build")
 	flag.Parse()
+	if len(platforms) == 0 {
+		platforms = release.DefaultPlatforms()
+	}
 
-	if _, ok := os.LookupEnv(awsAccessKeyIDKey); !ok {
-		log.Fatalf("AWS access key ID environment variable %s is not set", awsAccessKeyIDKey)
+	if gcsBucket == "" {
+		log.Fatal("GCS bucket is not set")
 	}
-	if _, ok := os.LookupEnv(awsSecretAccessKeyKey); !ok {
-		log.Fatalf("AWS secret access key environment variable %s is not set", awsSecretAccessKeyKey)
+	if _, ok := os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS"); !ok {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS environment variable is not set")
 	}
+	gcs, err := release.NewGCS(gcsBucket)
+	if err != nil {
+		log.Fatalf("Creating GCS session: %s", err)
+	}
+	providers := []release.ObjectPutGetter{gcs}
 
 	branch, ok := os.LookupEnv(teamcityBuildBranchKey)
 	if !ok {
 		log.Fatalf("VCS branch environment variable %s is not set", teamcityBuildBranchKey)
 	}
-	pkg, err := build.Import("github.com/cockroachdb/cockroach", "", build.FindOnly)
+	pkg, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("unable to locate CRDB directory: %s", err)
+	}
+	// Make sure the WORKSPACE file is in the current working directory.
+	_, err = os.Stat(filepath.Join(pkg, "WORKSPACE"))
 	if err != nil {
 		log.Fatalf("unable to locate CRDB directory: %s", err)
 	}
 
-	var versionStr string
-	var isStableRelease bool
-	if *isRelease {
-		ver, err := version.Parse(branch)
-		if err != nil {
-			log.Fatalf("refusing to build release with invalid version name '%s' (err: %s)", branch, err)
-		}
-
-		// Prerelease returns anything after the `-` and before metadata. eg: `beta` for `1.0.1-beta+metadata`
-		if ver.PreRelease() == "" {
-			isStableRelease = true
-		}
-		versionStr = branch
-	} else {
-		cmd := exec.Command("git", "rev-parse", "HEAD")
-		cmd.Dir = pkg.Dir
-		log.Printf("%s %s", cmd.Env, cmd.Args)
-		out, err := cmd.Output()
-		if err != nil {
-			log.Fatalf("%s: out=%q err=%s", cmd.Args, out, err)
-		}
-		versionStr = string(bytes.TrimSpace(out))
-	}
-
-	svc, err := testableS3()
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = pkg
+	log.Printf("%s %s", cmd.Env, cmd.Args)
+	out, err := cmd.Output()
 	if err != nil {
-		log.Fatalf("Creating AWS S3 session: %s", err)
+		log.Fatalf("%s: out=%q err=%s", cmd.Args, out, err)
 	}
+	versionStr := string(bytes.TrimSpace(out))
 
-	var bucketName string
-	if len(*destBucket) > 0 {
-		bucketName = *destBucket
-	} else if *isRelease {
-		bucketName = "binaries.cockroachdb.com"
-	} else {
-		bucketName = "cockroach"
-	}
-	log.Printf("Using S3 bucket: %s", bucketName)
+	run(providers, platforms, runFlags{
+		pkgDir: pkg,
+		branch: branch,
+		sha:    versionStr,
+	}, release.ExecFn{})
+}
 
-	releaseVersionStrs := []string{versionStr}
-	// Only build `latest` tarballs for stable releases.
-	if isStableRelease {
-		releaseVersionStrs = append(releaseVersionStrs, latestStr)
-	}
+type runFlags struct {
+	branch string
+	sha    string
+	pkgDir string
+}
 
-	if *isRelease {
-		buildArchive(svc, opts{
-			PkgDir:             pkg.Dir,
-			BucketName:         bucketName,
-			ReleaseVersionStrs: releaseVersionStrs,
-		})
-	}
+func run(
+	providers []release.ObjectPutGetter,
+	platforms release.Platforms,
+	flags runFlags,
+	execFn release.ExecFn,
+) {
+	for _, platform := range platforms {
+		var o opts
+		o.Platform = platform
+		o.ReleaseVersions = []string{flags.sha}
+		o.PkgDir = flags.pkgDir
+		o.Branch = flags.branch
+		o.VersionStr = flags.sha
+		o.AbsolutePath = filepath.Join(flags.pkgDir, "cockroach"+release.SuffixFromPlatform(platform))
+		o.CockroachSQLAbsolutePath = filepath.Join(flags.pkgDir, "cockroach-sql"+release.SuffixFromPlatform(platform))
+		o.Channel = release.ChannelFromPlatform(platform)
 
-	for _, target := range release.SupportedTargets {
-		for i, extraArgs := range []struct {
-			goflags string
-			suffix  string
-			tags    string
-		}{
-			{},
-			// TODO(tamird): re-enable deadlock builds. This really wants its
-			// own install suffix; it currently pollutes the normal release
-			// build cache.
-			//
-			// {suffix: ".deadlock", tags: "deadlock"},
-			{suffix: ".race", goflags: "-race"},
-		} {
+		log.Printf("building %s", pretty.Sprint(o))
+		buildOneCockroach(providers, o, execFn)
+
+		// We build workload only for Linux.
+		if platform == release.PlatformLinux || platform == release.PlatformLinuxArm {
 			var o opts
-			o.ReleaseVersionStrs = releaseVersionStrs
-			o.PkgDir = pkg.Dir
-			o.Branch = branch
-			o.VersionStr = versionStr
-			o.BucketName = bucketName
-			o.Branch = branch
-			o.BuildType = target.BuildType
-			o.GoFlags = extraArgs.goflags
-			o.Suffix = extraArgs.suffix + target.Suffix
-			o.Tags = extraArgs.tags
-
-			log.Printf("building %s", pretty.Sprint(o))
-
-			// TODO(tamird): build deadlock,race binaries for all targets?
-			if i > 0 && (*isRelease || !strings.HasSuffix(o.BuildType, "linux-gnu")) {
-				log.Printf("skipping auxiliary build")
-				continue
-			}
-
-			buildOneCockroach(svc, o)
-		}
-	}
-
-	if !*isRelease {
-		buildOneWorkload(svc, opts{
-			PkgDir:     pkg.Dir,
-			BucketName: bucketName,
-			Branch:     branch,
-			VersionStr: versionStr,
-		})
-	}
-}
-
-func buildArchive(svc s3putter, o opts) {
-	for _, releaseVersionStr := range o.ReleaseVersionStrs {
-		archiveBase := fmt.Sprintf("cockroach-%s", releaseVersionStr)
-		srcArchive := fmt.Sprintf("%s.%s", archiveBase, "src.tgz")
-		cmd := exec.Command(
-			"make",
-			"archive",
-			fmt.Sprintf("ARCHIVE_BASE=%s", archiveBase),
-			fmt.Sprintf("ARCHIVE=%s", srcArchive),
-		)
-		cmd.Dir = o.PkgDir
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		log.Printf("%s %s", cmd.Env, cmd.Args)
-		if err := cmd.Run(); err != nil {
-			log.Fatalf("%s: %s", cmd.Args, err)
-		}
-
-		absoluteSrcArchivePath := filepath.Join(o.PkgDir, srcArchive)
-		f, err := os.Open(absoluteSrcArchivePath)
-		if err != nil {
-			log.Fatalf("os.Open(%s): %s", absoluteSrcArchivePath, err)
-		}
-		putObjectInput := s3.PutObjectInput{
-			Bucket: &o.BucketName,
-			Key:    &srcArchive,
-			Body:   f,
-		}
-		if releaseVersionStr == latestStr {
-			putObjectInput.CacheControl = &release.NoCache
-		}
-		if _, err := svc.PutObject(&putObjectInput); err != nil {
-			log.Fatalf("s3 upload %s: %s", absoluteSrcArchivePath, err)
-		}
-		if err := f.Close(); err != nil {
-			log.Fatal(err)
+			o.Platform = platform
+			o.PkgDir = flags.pkgDir
+			o.Branch = flags.branch
+			o.VersionStr = flags.sha
+			buildAndPublishWorkload(providers, o, execFn)
 		}
 	}
 }
 
-func buildOneCockroach(svc s3putter, o opts) {
+func buildOneCockroach(providers []release.ObjectPutGetter, o opts, execFn release.ExecFn) {
 	log.Printf("building cockroach %s", pretty.Sprint(o))
-	defer func() {
-		log.Printf("done building cockroach: %s", pretty.Sprint(o))
-	}()
-
-	opts := []release.MakeReleaseOption{
-		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "GOFLAGS", o.GoFlags)),
-		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "TAGS", o.Tags)),
-		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "BUILDCHANNEL", "official-binary")),
+	buildOpts := release.BuildOptions{
+		ExecFn:  execFn,
+		Channel: o.Channel,
 	}
-	if *isRelease {
-		opts = append(opts, release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "BUILD_TAGGED_RELEASE", "true")))
-	}
-
-	if err := release.MakeRelease(
-		release.SupportedTarget{
-			BuildType: o.BuildType,
-			Suffix:    o.Suffix,
-		},
-		o.PkgDir,
-		opts...,
-	); err != nil {
+	if err := release.MakeRelease(o.Platform, buildOpts, o.PkgDir); err != nil {
 		log.Fatal(err)
 	}
-
-	o.Base = "cockroach" + o.Suffix
-	o.AbsolutePath = filepath.Join(o.PkgDir, o.Base)
-
-	if !*isRelease {
-		putNonRelease(svc, o, release.MakeCRDBLibraryNonReleaseFiles(o.PkgDir, o.BuildType, o.VersionStr, o.Suffix)...)
-	} else {
-		putRelease(svc, o)
+	for _, provider := range providers {
+		release.PutNonRelease(
+			provider,
+			release.PutNonReleaseOptions{
+				Branch: o.Branch,
+				Files: append(
+					[]release.NonReleaseFile{
+						release.MakeCRDBBinaryNonReleaseFile(o.AbsolutePath, o.VersionStr),
+						release.MakeCRDBBinaryNonReleaseFile(o.CockroachSQLAbsolutePath, o.VersionStr),
+					},
+					release.MakeCRDBLibraryNonReleaseFiles(o.PkgDir, o.Platform, o.VersionStr)...,
+				),
+			},
+		)
 	}
+	log.Printf("done building cockroach: %s", pretty.Sprint(o))
 }
 
-func buildOneWorkload(svc s3putter, o opts) {
-	defer func() {
-		log.Printf("done building workload: %s", pretty.Sprint(o))
-	}()
-
-	if *isRelease {
-		log.Fatalf("refusing to build workload in release mode")
-	}
-
-	if err := release.MakeWorkload(o.PkgDir); err != nil {
+func buildAndPublishWorkload(providers []release.ObjectPutGetter, o opts, execFn release.ExecFn) {
+	log.Printf("building workload %s", pretty.Sprint(o))
+	if err := release.MakeWorkload(o.Platform, release.BuildOptions{ExecFn: execFn}, o.PkgDir); err != nil {
 		log.Fatal(err)
 	}
-
-	o.Base = "workload"
-	o.AbsolutePath = filepath.Join(o.PkgDir, "bin", o.Base)
-	putNonRelease(svc, o)
+	o.AbsolutePath = filepath.Join(o.PkgDir, "bin", "workload")
+	if o.Platform == release.PlatformLinuxArm {
+		o.AbsolutePath += release.SuffixFromPlatform(o.Platform)
+	}
+	for _, provider := range providers {
+		release.PutNonRelease(
+			provider,
+			release.PutNonReleaseOptions{
+				Branch: o.Branch,
+				Files: []release.NonReleaseFile{
+					release.MakeCRDBBinaryNonReleaseFile(o.AbsolutePath, o.VersionStr),
+				},
+			},
+		)
+	}
+	log.Printf("done building workload: %s", pretty.Sprint(o))
 }
 
 type opts struct {
-	VersionStr         string
-	Branch             string
-	ReleaseVersionStrs []string
-
-	BuildType string
-	GoFlags   string
-	Suffix    string
-	Tags      string
-
-	Base         string
-	BucketName   string
-	AbsolutePath string
-	PkgDir       string
-}
-
-func putNonRelease(svc s3putter, o opts, additionalNonReleaseFiles ...release.NonReleaseFile) {
-	release.PutNonRelease(
-		svc,
-		release.PutNonReleaseOptions{
-			Branch:     o.Branch,
-			BucketName: o.BucketName,
-			Files: append(
-				[]release.NonReleaseFile{release.MakeCRDBBinaryNonReleaseFile(o.Base, o.AbsolutePath, o.VersionStr)},
-				additionalNonReleaseFiles...,
-			),
-		},
-	)
-}
-
-func putRelease(svc s3putter, o opts) {
-	for _, releaseVersionStr := range o.ReleaseVersionStrs {
-		release.PutRelease(svc, release.PutReleaseOptions{
-			BucketName: o.BucketName,
-			NoCache:    releaseVersionStr == latestStr,
-			Suffix:     o.Suffix,
-			BuildType:  o.BuildType,
-			VersionStr: releaseVersionStr,
-			Files: append(
-				[]release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.Base, o.AbsolutePath)},
-				release.MakeCRDBLibraryArchiveFiles(o.PkgDir, o.BuildType)...,
-			),
-		})
-	}
+	VersionStr               string
+	Branch                   string
+	ReleaseVersions          []string
+	Platform                 release.Platform
+	AbsolutePath             string
+	CockroachSQLAbsolutePath string
+	PkgDir                   string
+	Channel                  string
 }

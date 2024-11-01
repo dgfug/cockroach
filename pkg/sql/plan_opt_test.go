@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -20,11 +15,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -112,11 +109,17 @@ func TestQueryCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	parallel := func(t *testing.T) {
+		if !skip.Stress() {
+			t.Parallel() // SAFE FOR TESTING
+		}
+	}
+
 	// Grouping the parallel subtests into a non-parallel subtest allows the defer
 	// call above to work as expected.
 	t.Run("group", func(t *testing.T) {
 		t.Run("simple", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -132,7 +135,7 @@ func TestQueryCache(t *testing.T) {
 		})
 
 		t.Run("simple-prepare", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -158,7 +161,7 @@ func TestQueryCache(t *testing.T) {
 		})
 
 		t.Run("simple-prepare-with-args", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -191,7 +194,7 @@ func TestQueryCache(t *testing.T) {
 		// Verify that using a relative timestamp literal interacts correctly with
 		// the query cache (#48717).
 		t.Run("relative-timestamp", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 1 /* numConns */)
 			defer h.Stop()
 
@@ -205,7 +208,7 @@ func TestQueryCache(t *testing.T) {
 		})
 
 		t.Run("parallel", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -236,7 +239,7 @@ func TestQueryCache(t *testing.T) {
 		})
 
 		t.Run("parallel-prepare", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -279,7 +282,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 
 		// Test connections running the same statement but under different databases.
 		t.Run("multidb", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -308,7 +311,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 		})
 
 		t.Run("multidb-prepare", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 			h := makeQueryCacheTestHelper(t, numConns)
 			defer h.Stop()
@@ -339,7 +342,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 
 		// Test that a schema change triggers cache invalidation.
 		t.Run("schemachange", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 2 /* numConns */)
 			defer h.Stop()
 			r0, r1 := h.runners[0], h.runners[1]
@@ -355,7 +358,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 
 		// Test that creating new statistics triggers cache invalidation.
 		t.Run("statschange", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 2 /* numConns */)
 			defer h.Stop()
 			r0, r1 := h.runners[0], h.runners[1]
@@ -380,7 +383,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 
 		// Test that a schema change triggers cache invalidation.
 		t.Run("schemachange-prepare", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 2 /* numConns */)
 			defer h.Stop()
 			r0, r1 := h.runners[0], h.runners[1]
@@ -395,7 +398,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 		// Test a schema change where the other connections are running the query in
 		// parallel.
 		t.Run("schemachange-parallel", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			const numConns = 4
 
 			h := makeQueryCacheTestHelper(t, numConns)
@@ -477,7 +480,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 		// Verify the case where a PREPARE encounters a query cache entry that was
 		// created by a direct execution (and hence has no PrepareMetadata).
 		t.Run("exec-and-prepare", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 1 /* numConns */)
 			defer h.Stop()
 
@@ -500,7 +503,7 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 
 		// Verify the case where we PREPARE the same statement with different hints.
 		t.Run("prepare-hints", func(t *testing.T) {
-			t.Parallel() // SAFE FOR TESTING
+			parallel(t)
 			h := makeQueryCacheTestHelper(t, 1 /* numConns */)
 			defer h.Stop()
 
@@ -622,6 +625,7 @@ func BenchmarkQueryCache(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+		b.StopTimer()
 	}
 
 	for workload, workloadName := range workloads {
@@ -656,22 +660,24 @@ func TestPlanGistControl(t *testing.T) {
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	sd := NewInternalSessionData(ctx, execCfg.Settings, "test")
 	internalPlanner, cleanup := NewInternalPlanner(
 		"test",
 		kv.NewTxn(ctx, db, s.NodeID()),
-		security.RootUserName(),
+		username.NodeUserName(),
 		&MemoryMetrics{},
 		&execCfg,
-		sessiondatapb.SessionData{},
+		sd,
 	)
 	defer cleanup()
 
+	fmtFingerprintMask := tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&s.ClusterSettings().SV))
 	p := internalPlanner.(*planner)
 	stmt, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.stmt = makeStatement(stmt, ClusterWideID{})
+	p.stmt = makeStatement(stmt, clusterunique.ID{}, fmtFingerprintMask)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -687,17 +693,17 @@ func TestPlanGistControl(t *testing.T) {
 	internalPlanner, cleanup = NewInternalPlanner(
 		"test",
 		kv.NewTxn(ctx, db, s.NodeID()),
-		security.RootUserName(),
+		username.NodeUserName(),
 		&MemoryMetrics{},
 		&execCfg,
-		sessiondatapb.SessionData{},
+		sd,
 	)
 	defer cleanup()
 
 	p = internalPlanner.(*planner)
 	p.SessionData().DisablePlanGists = true
 
-	p.stmt = makeStatement(stmt, ClusterWideID{})
+	p.stmt = makeStatement(stmt, clusterunique.ID{}, fmtFingerprintMask)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		t.Fatal(err)
 	}

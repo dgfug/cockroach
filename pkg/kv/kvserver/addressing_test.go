@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -56,9 +52,10 @@ func meta2Key(key roachpb.RKey) []byte {
 func TestUpdateRangeAddressing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	store, _ := createTestStore(t, testStoreOpts{createSystemRanges: false}, stopper)
+	defer stopper.Stop(ctx)
+	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: false}, stopper)
 	// When split is false, merging treats the right range as the merged
 	// range. With merging, expNewLeft indicates the addressing keys we
 	// expect to be removed.
@@ -134,7 +131,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		// interface without sending through a TxnCoordSender (which initializes a
 		// transaction id). Also, we need the TxnCoordSender to clean up the
 		// intents, otherwise the MVCCScan that the test does below fails.
-		actx := testutils.MakeAmbientCtx()
+		actx := log.MakeTestingAmbientCtxWithNewTracer()
 		tcsf := kvcoord.NewTxnCoordSenderFactory(
 			kvcoord.TxnCoordSenderFactoryConfig{
 				AmbientCtx: actx,
@@ -167,11 +164,11 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		//   to RocksDB will be asynchronous.
 		var kvs []roachpb.KeyValue
 		testutils.SucceedsSoon(t, func() error {
-			res, err := storage.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax,
+			res, err := storage.MVCCScan(ctx, store.TODOEngine(), keys.MetaMin, keys.MetaMax,
 				hlc.MaxTimestamp, storage.MVCCScanOptions{})
 			if err != nil {
 				// Wait for the intent to be resolved.
-				if errors.HasType(err, (*roachpb.WriteIntentError)(nil)) {
+				if errors.HasType(err, (*kvpb.LockConflictError)(nil)) {
 					return err
 				}
 				t.Fatal(err)

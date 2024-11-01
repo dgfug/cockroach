@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pretty
 
@@ -38,9 +33,12 @@ func JoinDoc(s Doc, d ...Doc) Doc {
 // For example:
 // aaaa
 // <sep> bbb
-//       bbb
+//
+//	bbb
+//
 // <sep> ccc
-//       ccc
+//
+//	ccc
 func JoinNestedRight(sep Doc, nested ...Doc) Doc {
 	switch len(nested) {
 	case 0:
@@ -216,16 +214,16 @@ const (
 )
 
 // Table defines a document that formats a list of pairs of items either:
-//  - as a 2-column table, with the two columns aligned for example:
-//       SELECT aaa
-//              bbb
-//         FROM ccc
-//  - as sections, for example:
-//       SELECT
-//           aaa
-//           bbb
-//       FROM
-//           ccc
+//   - as a 2-column table, with the two columns aligned for example:
+//     SELECT aaa
+//     bbb
+//     FROM ccc
+//   - as sections, for example:
+//     SELECT
+//     aaa
+//     bbb
+//     FROM
+//     ccc
 //
 // We restrict the left value in each list item to be a one-line string
 // to make the width computation efficient.

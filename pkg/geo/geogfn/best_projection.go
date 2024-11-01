@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
@@ -25,11 +20,12 @@ import (
 // geometry-type projection.
 //
 // The algorithm is described by ST_Buffer/ST_Intersection documentation (paraphrased):
-//   It first determines the best SRID that fits the bounding box of the 2 geography objects (ST_Intersection only).
-//   It favors a north/south pole projection, then UTM, then LAEA for smaller zones, otherwise falling back
-//   to web mercator.
-//   If geography objects are within one half zone UTM but not the same UTM it will pick one of those.
-//   After the calculation is complete, it will fall back to WGS84 Geography.
+//
+//	It first determines the best SRID that fits the bounding box of the 2 geography objects (ST_Intersection only).
+//	It favors a north/south pole projection, then UTM, then LAEA for smaller zones, otherwise falling back
+//	to web mercator.
+//	If geography objects are within one half zone UTM but not the same UTM it will pick one of those.
+//	After the calculation is complete, it will fall back to WGS84 Geography.
 func BestGeomProjection(boundingRect s2.Rect) (geoprojbase.Proj4Text, error) {
 	center := boundingRect.Center()
 

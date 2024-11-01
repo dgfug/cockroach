@@ -15,13 +15,13 @@ GRANT ALL ON TABLE testuser.testuser_table TO testuser
 statement error role name "public" is reserved
 CREATE ROLE public
 
-statement error pgcode 22023 role public does not exist
+statement error pgcode 42704 role/user \"public\" does not exist
 SET ROLE public
 
 statement error role name "node" is reserved
 CREATE ROLE node
 
-statement error pgcode 22023 role node does not exist
+statement error pgcode 42704 role/user \"node\" does not exist
 SET ROLE node
 
 # Check root can reset and become itself.
@@ -38,7 +38,7 @@ none
 statement ok
 RESET ROLE
 
-statement error pgcode 22023 role non_existent_user does not exist
+statement error pgcode 42704 role/user \"non_existent_user\" does not exist
 SET ROLE non_existent_user
 
 query TTTT
@@ -332,6 +332,8 @@ user root
 
 statement ok
 GRANT ADMIN TO testuser;
+
+statement ok
 BEGIN;
 SET LOCAL ROLE testuser
 
@@ -357,11 +359,26 @@ root  root  root  root
 statement ok
 SET ROLE testuser
 
+# Verify that RESET ALL does *not* affect role.
+statement ok
+RESET ALL
+
+query TTTT
+SELECT current_user(), current_user, session_user(), session_user
+----
+testuser  testuser  root  root
+
 query T
 SELECT user_name FROM crdb_internal.node_sessions
 WHERE active_queries LIKE 'SELECT user_name%'
 ----
 root
 
+# Verify that SET SESSION AUTHORIZATION *does* reset the role.
 statement ok
-RESET ROLE
+SET SESSION AUTHORIZATION DEFAULT
+
+query TTTT
+SELECT current_user(), current_user, session_user(), session_user
+----
+root  root  root  root

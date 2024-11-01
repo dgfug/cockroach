@@ -1,24 +1,21 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 package cli
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -55,10 +52,10 @@ func runImportCLICommand(
 	case err := <-errCh:
 		t.Fatalf("import command returned before expected: output: %v, error: %v", out, err)
 	}
-	data, err := ioutil.ReadFile(dumpFilePath)
+	data, err := os.ReadFile(dumpFilePath)
 	require.NoError(t, err)
-	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", security.RootUserName())
-	checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(), userfileURI, data)
+	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", username.RootUserName())
+	checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(), userfileURI, data)
 	select {
 	case knobs.pauseAfterUpload <- struct{}{}:
 	case err := <-errCh:
@@ -71,10 +68,10 @@ func runImportCLICommand(
 
 	// Check that the dump file has been cleaned up after the import CLI command
 	// has completed.
-	store, err := c.ExecutorConfig().(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
-		userfileURI, security.RootUserName())
+	store, err := c.Server.ExecutorConfig().(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
+		userfileURI, username.RootUserName())
 	require.NoError(t, err)
-	_, err = store.ReadFile(ctx, "")
+	_, _, err = store.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 	testutils.IsError(err, "file doesn't exist")
 
 	var output []string
@@ -106,7 +103,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump",
 			"PGDUMP",
-			"testdata/import/db.sql",
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH max_row_size='524288'",
@@ -117,7 +114,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump-with-options",
 			"PGDUMP",
-			"testdata/import/db.sql",
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--max-row-size=1000 --skip-foreign-keys=true --row-limit=10 " +
 				"--ignore-unsupported-statements=true --log-ignored-statements='foo://bar'",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
@@ -131,7 +128,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump-to-target-database",
 			"PGDUMP",
-			"testdata/import/db.sql",
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--ignore-unsupported-statements=true --url=postgresql:///baz",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH max_row_size='524288', ignore_unsupported_statements",
@@ -142,7 +139,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"mysql",
 			"MYSQLDUMP",
-			"testdata/import/db.sql",
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"",
 			"IMPORT MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db.sql'",
 			"IMPORT TABLE foo FROM MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db.sql'",
@@ -151,7 +148,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"mysql-with-options",
 			"MYSQLDUMP",
-			"testdata/import/db.sql",
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--skip-foreign-keys=true --row-limit=10",
 			"IMPORT MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH skip_foreign_keys, row_limit='10'",

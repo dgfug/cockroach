@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -14,13 +9,14 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"gopkg.in/yaml.v2"
 )
 
 // SetZoneConfig is a partial implementation of the ALTER TABLE ... CONFIGURE
 // ZONE USING statement.
-func (tc *Catalog) SetZoneConfig(stmt *tree.SetZoneConfig) *zonepb.ZoneConfig {
+func (tc *Catalog) SetZoneConfig(stmt *tree.SetZoneConfig) cat.Zone {
 	// Update the table name to include catalog and schema if not provided.
 	tabName := stmt.TableOrIndex.Table
 	tc.qualifyTableName(&tabName)
@@ -74,7 +70,7 @@ func (tc *Catalog) SetZoneConfig(stmt *tree.SetZoneConfig) *zonepb.ZoneConfig {
 
 // makeZoneConfig constructs a ZoneConfig from options provided to the CONFIGURE
 // ZONE USING statement.
-func makeZoneConfig(options tree.KVOptions) *zonepb.ZoneConfig {
+func makeZoneConfig(options tree.KVOptions) cat.Zone {
 	zone := &zonepb.ZoneConfig{}
 	for i := range options {
 		switch options[i].Key {
@@ -102,5 +98,5 @@ func makeZoneConfig(options tree.KVOptions) *zonepb.ZoneConfig {
 			}
 		}
 	}
-	return zone
+	return cat.AsZone(zone)
 }

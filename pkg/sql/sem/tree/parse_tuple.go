@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -95,7 +90,7 @@ func (p *tupleParseState) gobbleString() (out string, err error) {
 type tupleParseState struct {
 	s                string
 	tupleIdx         int
-	ctx              ParseTimeContext
+	ctx              ParseContext
 	dependsOnContext bool
 	result           *DTuple
 	t                *types.T
@@ -174,9 +169,9 @@ func (p *tupleParseState) parseElement() error {
 // tuple to parse.
 //
 // The dependsOnContext return value indicates if we had to consult the
-// ParseTimeContext (either for the time or the local timezone).
+// ParseContext (either for the time or the local timezone).
 func ParseDTupleFromString(
-	ctx ParseTimeContext, s string, t *types.T,
+	ctx ParseContext, s string, t *types.T,
 ) (_ *DTuple, dependsOnContext bool, _ error) {
 	ret, dependsOnContext, err := doParseDTupleFromString(ctx, s, t)
 	if err != nil {
@@ -189,14 +184,14 @@ func ParseDTupleFromString(
 // except the error it returns isn't prettified as a parsing error.
 //
 // The dependsOnContext return value indicates if we had to consult the
-// ParseTimeContext (either for the time or the local timezone).
+// ParseContext (either for the time or the local timezone).
 func doParseDTupleFromString(
-	ctx ParseTimeContext, s string, t *types.T,
+	ctx ParseContext, s string, t *types.T,
 ) (_ *DTuple, dependsOnContext bool, _ error) {
 	if t.TupleContents() == nil {
-		return nil, false, errors.AssertionFailedf("not a tuple type %s (%T)", t, t)
+		return nil, false, errors.AssertionFailedf("not a tuple type %s", t.SQLStringForError())
 	}
-	if t == types.AnyTuple {
+	if t.Identical(types.AnyTuple) {
 		return nil, false, unsupportedRecordError
 	}
 	parser := tupleParseState{

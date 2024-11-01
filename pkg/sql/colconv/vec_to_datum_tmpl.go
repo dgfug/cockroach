@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -27,8 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -66,10 +60,10 @@ var (
 type VecToDatumConverter struct {
 	convertedVecs    []tree.Datums
 	vecIdxsToConvert []int
-	da               rowenc.DatumAlloc
+	da               tree.DatumAlloc
 }
 
-var _ execinfra.Releasable = &VecToDatumConverter{}
+var _ execreleasable.Releasable = &VecToDatumConverter{}
 
 var vecToDatumConverterPool = sync.Pool{
 	New: func() interface{} {
@@ -105,10 +99,10 @@ func getNewVecToDatumConverter(batchWidth int, willRelease bool) *VecToDatumConv
 }
 
 // NewVecToDatumConverter creates a new VecToDatumConverter.
-// - batchWidth determines the width of the batches that it will be converting.
-// - vecIdxsToConvert determines which vectors need to be converted.
-// - willRelease indicates whether the caller intends to call Release() on the
-//   converter.
+//   - batchWidth determines the width of the batches that it will be converting.
+//   - vecIdxsToConvert determines which vectors need to be converted.
+//   - willRelease indicates whether the caller intends to call Release() on the
+//     converter.
 func NewVecToDatumConverter(
 	batchWidth int, vecIdxsToConvert []int, willRelease bool,
 ) *VecToDatumConverter {
@@ -177,13 +171,19 @@ func (c *VecToDatumConverter) ConvertBatchAndDeselect(batch coldata.Batch) {
 			c.convertedVecs[vecIdx] = c.convertedVecs[vecIdx][:batchLength]
 		}
 	}
-	if c.da.AllocSize < batchLength {
+	if c.da.DefaultAllocSize < batchLength {
 		// Adjust the datum alloc according to the length of the batch since
 		// this batch is the longest we've seen so far.
-		c.da.AllocSize = batchLength
+		c.da.DefaultAllocSize = batchLength
+	}
+	vecs := batch.ColVecs()
+	c.da.ResetTypeAllocSizes()
+	for _, vecIdx := range c.vecIdxsToConvert {
+		// Provide the datum allocator with hints about the number of
+		// allocations for each type.
+		c.da.AddTypeAllocSize(batchLength, vecs[vecIdx].Type().Family())
 	}
 	sel := batch.Selection()
-	vecs := batch.ColVecs()
 	for _, vecIdx := range c.vecIdxsToConvert {
 		ColVecToDatumAndDeselect(
 			c.convertedVecs[vecIdx], vecs[vecIdx], batchLength, sel, &c.da,
@@ -215,7 +215,7 @@ func (c *VecToDatumConverter) ConvertBatch(batch coldata.Batch) {
 // Note that this method is equivalent to ConvertBatch with the only difference
 // being the fact that it takes in a "disassembled" batch and not coldata.Batch.
 // Consider whether you should be using ConvertBatch instead.
-func (c *VecToDatumConverter) ConvertVecs(vecs []coldata.Vec, inputLen int, sel []int) {
+func (c *VecToDatumConverter) ConvertVecs(vecs []*coldata.Vec, inputLen int, sel []int) {
 	if len(c.vecIdxsToConvert) == 0 || inputLen == 0 {
 		// No vectors were selected for conversion or there are no tuples to
 		// convert, so there is nothing to do.
@@ -236,10 +236,16 @@ func (c *VecToDatumConverter) ConvertVecs(vecs []coldata.Vec, inputLen int, sel 
 			c.convertedVecs[vecIdx] = c.convertedVecs[vecIdx][:requiredLength]
 		}
 	}
-	if c.da.AllocSize < requiredLength {
+	if c.da.DefaultAllocSize < requiredLength {
 		// Adjust the datum alloc according to the length of the batch since
 		// this batch is the longest we've seen so far.
-		c.da.AllocSize = requiredLength
+		c.da.DefaultAllocSize = requiredLength
+	}
+	c.da.ResetTypeAllocSizes()
+	for _, vecIdx := range c.vecIdxsToConvert {
+		// Provide the datum allocator with hints about the number of
+		// allocations for each type.
+		c.da.AddTypeAllocSize(inputLen, vecs[vecIdx].Type().Family())
 	}
 	for _, vecIdx := range c.vecIdxsToConvert {
 		ColVecToDatum(
@@ -260,7 +266,7 @@ func (c *VecToDatumConverter) GetDatumColumn(colIdx int) tree.Datums {
 // selection vector. It doesn't account for the memory used by the newly
 // created tree.Datums, so it is up to the caller to do the memory accounting.
 func ColVecToDatumAndDeselect(
-	converted []tree.Datum, col coldata.Vec, length int, sel []int, da *rowenc.DatumAlloc,
+	converted []tree.Datum, col *coldata.Vec, length int, sel []int, da *tree.DatumAlloc,
 ) {
 	if length == 0 {
 		return
@@ -282,7 +288,7 @@ func ColVecToDatumAndDeselect(
 // doesn't account for the memory used by the newly created tree.Datums, so it
 // is up to the caller to do the memory accounting.
 func ColVecToDatum(
-	converted []tree.Datum, col coldata.Vec, length int, sel []int, da *rowenc.DatumAlloc,
+	converted []tree.Datum, col *coldata.Vec, length int, sel []int, da *tree.DatumAlloc,
 ) {
 	if length == 0 {
 		return
@@ -339,10 +345,10 @@ func setSrcIdx(srcIdx int, idx int, sel []int, hasSel bool) {
 // execgen:template<hasNulls, hasSel, deselect>
 func vecToDatum(
 	converted []tree.Datum,
-	col coldata.Vec,
+	col *coldata.Vec,
 	length int,
 	sel []int,
-	da *rowenc.DatumAlloc,
+	da *tree.DatumAlloc,
 	hasNulls bool,
 	hasSel bool,
 	deselect bool,

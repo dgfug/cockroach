@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 	"text/tabwriter"
@@ -42,15 +38,15 @@ diagnostics activation requests.`,
 
 func runStmtDiagList(cmd *cobra.Command, args []string) (resErr error) {
 	const timeFmt = "2006-01-02 15:04:05 MST"
-
-	conn, err := makeSQLClient("cockroach statement-diag", useSystemDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach statement-diag", useSystemDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
 	// -- List bundles --
-	bundles, err := clisqlclient.StmtDiagListBundles(conn)
+	bundles, err := clisqlclient.StmtDiagListBundles(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -71,7 +67,7 @@ func runStmtDiagList(cmd *cobra.Command, args []string) (resErr error) {
 	}
 
 	// -- List outstanding activation requests --
-	reqs, err := clisqlclient.StmtDiagListOutstandingRequests(conn)
+	reqs, err := clisqlclient.StmtDiagListOutstandingRequests(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -82,9 +78,27 @@ func runStmtDiagList(cmd *cobra.Command, args []string) (resErr error) {
 	} else {
 		fmt.Printf("Outstanding activation requests:\n")
 		w := tabwriter.NewWriter(&buf, 4, 0, 2, ' ', 0)
-		fmt.Fprint(w, "  ID\tActivation time\tStatement\n")
+		fmt.Fprint(w, "  ID\tActivation time\tStatement\tPlan gist\tAnti plan gist\tSampling probability\tMin execution latency\tExpires at\tRedacted\n")
 		for _, r := range reqs {
-			fmt.Fprintf(w, "  %d\t%s\t%s\n", r.ID, r.RequestedAt.UTC().Format(timeFmt), r.Statement)
+			minExecLatency := "N/A"
+			if r.MinExecutionLatency != 0 {
+				minExecLatency = r.MinExecutionLatency.String()
+			}
+			expiresAt := "never"
+			if !r.ExpiresAt.IsZero() {
+				expiresAt = r.ExpiresAt.String()
+			}
+			var samplingProbability string
+			if r.SamplingProbability == 0 {
+				samplingProbability = fmt.Sprintf("%0.4f", 1.0)
+			} else {
+				samplingProbability = fmt.Sprintf("%0.4f", r.SamplingProbability)
+			}
+			fmt.Fprintf(
+				w, "  %d\t%s\t%s\t%s\t%t\t%s\t%s\t%s\t%t\n",
+				r.ID, r.RequestedAt.UTC().Format(timeFmt), r.Statement, r.PlanGist, r.AntiPlanGist,
+				samplingProbability, minExecLatency, expiresAt, r.Redacted,
+			)
 		}
 		_ = w.Flush()
 		fmt.Print(buf.String())
@@ -113,14 +127,15 @@ func runStmtDiagDownload(cmd *cobra.Command, args []string) (resErr error) {
 	} else {
 		filename = fmt.Sprintf("stmt-bundle-%d.zip", id)
 	}
-
-	conn, err := makeSQLClient("cockroach statement-diag", useSystemDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach statement-diag", useSystemDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
-	if err := clisqlclient.StmtDiagDownloadBundle(conn, id, filename); err != nil {
+	if err := clisqlclient.StmtDiagDownloadBundle(
+		ctx, conn, id, filename); err != nil {
 		return err
 	}
 	fmt.Printf("Bundle saved to %q\n", filename)
@@ -137,7 +152,8 @@ command, or delete all bundles.`,
 }
 
 func runStmtDiagDelete(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach statement-diag", useSystemDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach statement-diag", useSystemDb)
 	if err != nil {
 		return err
 	}
@@ -147,7 +163,7 @@ func runStmtDiagDelete(cmd *cobra.Command, args []string) (resErr error) {
 		if len(args) > 0 {
 			return errors.New("extra arguments with --all")
 		}
-		return clisqlclient.StmtDiagDeleteAllBundles(conn)
+		return clisqlclient.StmtDiagDeleteAllBundles(ctx, conn)
 	}
 	if len(args) != 1 {
 		return fmt.Errorf("accepts 1 arg, received %d", len(args))
@@ -158,7 +174,7 @@ func runStmtDiagDelete(cmd *cobra.Command, args []string) (resErr error) {
 		return errors.New("invalid ID")
 	}
 
-	return clisqlclient.StmtDiagDeleteBundle(conn, id)
+	return clisqlclient.StmtDiagDeleteBundle(ctx, conn, id)
 }
 
 var stmtDiagCancelCmd = &cobra.Command{
@@ -171,7 +187,8 @@ list command, or cancel all outstanding requests.`,
 }
 
 func runStmtDiagCancel(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach statement-diag", useSystemDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach statement-diag", useSystemDb)
 	if err != nil {
 		return err
 	}
@@ -181,7 +198,7 @@ func runStmtDiagCancel(cmd *cobra.Command, args []string) (resErr error) {
 		if len(args) > 0 {
 			return errors.New("extra arguments with --all")
 		}
-		return clisqlclient.StmtDiagCancelAllOutstandingRequests(conn)
+		return clisqlclient.StmtDiagCancelAllOutstandingRequests(ctx, conn)
 	}
 	if len(args) != 1 {
 		return fmt.Errorf("accepts 1 arg, received %d", len(args))
@@ -192,7 +209,7 @@ func runStmtDiagCancel(cmd *cobra.Command, args []string) (resErr error) {
 		return errors.New("invalid ID")
 	}
 
-	return clisqlclient.StmtDiagCancelOutstandingRequest(conn, id)
+	return clisqlclient.StmtDiagCancelOutstandingRequest(ctx, conn, id)
 }
 
 var stmtDiagCmds = []*cobra.Command{

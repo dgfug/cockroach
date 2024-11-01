@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed_test
 
@@ -18,21 +13,25 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/stretchr/testify/require"
 )
 
-func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) {
+func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) (numEvents int) {
 	eng, _ := setupData(context.Background(), b, emk, opts.dataOpts)
 	defer eng.Close()
 	startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(0)))
@@ -42,33 +41,43 @@ func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) {
 		EndKey: endKey,
 	}
 
+	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		func() {
-			iter := rangefeed.NewCatchUpIterator(eng, &roachpb.RangeFeedRequest{
-				Header: roachpb.Header{
-					Timestamp: opts.ts,
-				},
-				WithDiff: opts.withDiff,
-				Span:     span,
-			}, opts.useTBI, func() {})
+			iter, err := rangefeed.NewCatchUpIterator(ctx, eng, span, opts.ts, nil, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
 			defer iter.Close()
 			counter := 0
-			err := iter.CatchUpScan(storage.MakeMVCCMetadataKey(startKey), storage.MakeMVCCMetadataKey(endKey), opts.ts, opts.withDiff, func(*roachpb.RangeFeedEvent) error {
+			err = iter.CatchUpScan(ctx, func(*kvpb.RangeFeedEvent) error {
 				counter++
 				return nil
-			})
+			}, opts.withDiff, false /* withFiltering */, false /* withOmitRemote */)
 			if err != nil {
 				b.Fatalf("failed catchUp scan: %+v", err)
 			}
 			if counter < 1 {
 				b.Fatalf("didn't emit any events!")
 			}
+			if numEvents == 0 {
+				// Preserve number of events so that caller can compare it between
+				// different invocations that it knows should not affect number of
+				// events.
+				numEvents = counter
+			}
+			// Number of events can't change between iterations.
+			require.Equal(b, numEvents, counter)
 		}()
 	}
+	return numEvents
 }
 
 func BenchmarkCatchUpScan(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	skip.UnderShort(b)
+
 	numKeys := 1_000_000
 	valueBytes := 64
 
@@ -82,6 +91,7 @@ func BenchmarkCatchUpScan(b *testing.B) {
 		"linear-keys": {
 			numKeys:    numKeys,
 			valueBytes: valueBytes,
+			rwMode:     fs.ReadWrite,
 		},
 		// random-keys is our worst case. We write keys in
 		// random order but with timestamps that keep marching
@@ -94,6 +104,7 @@ func BenchmarkCatchUpScan(b *testing.B) {
 			randomKeyOrder: true,
 			numKeys:        numKeys,
 			valueBytes:     valueBytes,
+			rwMode:         fs.ReadWrite,
 		},
 		// mixed-case is a middling case.
 		//
@@ -126,28 +137,35 @@ func BenchmarkCatchUpScan(b *testing.B) {
 			randomKeyOrder: true,
 			numKeys:        numKeys,
 			valueBytes:     valueBytes,
-			readOnlyEngine: true,
+			rwMode:         fs.ReadOnly,
 			lBaseMaxBytes:  256,
 		},
 	}
 
 	for name, do := range dataOpts {
 		b.Run(name, func(b *testing.B) {
-			for _, useTBI := range []bool{true, false} {
-				b.Run(fmt.Sprintf("useTBI=%v", useTBI), func(b *testing.B) {
-					// TODO(ssd): withDiff isn't currently supported by the TBI optimization.
-					for _, withDiff := range []bool{false} {
-						b.Run(fmt.Sprintf("withDiff=%v", withDiff), func(b *testing.B) {
-							for _, tsExcludePercent := range []float64{0.0, 0.50, 0.75, 0.95, 0.99} {
-								wallTime := int64((5 * (float64(numKeys)*tsExcludePercent + 1)))
-								ts := hlc.Timestamp{WallTime: wallTime}
-								b.Run(fmt.Sprintf("perc=%2.2f", tsExcludePercent*100), func(b *testing.B) {
-									runCatchUpBenchmark(b, setupMVCCPebble, benchOptions{
+			for _, withDiff := range []bool{true, false} {
+				b.Run(fmt.Sprintf("withDiff=%v", withDiff), func(b *testing.B) {
+					for _, tsExcludePercent := range []float64{0.0, 0.50, 0.75, 0.95, 0.99} {
+						wallTime := int64((5 * (float64(numKeys)*tsExcludePercent + 1)))
+						ts := hlc.Timestamp{WallTime: wallTime}
+						b.Run(fmt.Sprintf("perc=%2.2f", tsExcludePercent*100), func(b *testing.B) {
+							for _, numRangeKeys := range []int{0, 1, 100} {
+								b.Run(fmt.Sprintf("numRangeKeys=%d", numRangeKeys), func(b *testing.B) {
+									do := do
+									do.numRangeKeys = numRangeKeys
+									n := runCatchUpBenchmark(b, setupMVCCPebble, benchOptions{
 										dataOpts: do,
 										ts:       ts,
-										useTBI:   useTBI,
 										withDiff: withDiff,
 									})
+									// We shouldn't be seeing the range deletions returned in this
+									// benchmark since they are at timestamp 1 and we catch up at
+									// a timestamp >= 5 (which corresponds to tsExcludePercent ==
+									// 0). Note that the oldest key is always excluded, since the
+									// floor for wallTime is 5 and that's the oldest key's
+									// timestamp but the start timestamp is exclusive.
+									require.EqualValues(b, int64(numKeys)-wallTime/5, n)
 								})
 							}
 						})
@@ -162,13 +180,13 @@ type benchDataOptions struct {
 	numKeys        int
 	valueBytes     int
 	randomKeyOrder bool
-	readOnlyEngine bool
+	rwMode         fs.RWMode
 	lBaseMaxBytes  int64
+	numRangeKeys   int
 }
 
 type benchOptions struct {
 	ts       hlc.Timestamp
-	useTBI   bool
 	withDiff bool
 	dataOpts benchDataOptions
 }
@@ -178,23 +196,22 @@ type benchOptions struct {
 // code in pkg/storage.
 //
 
-type engineMaker func(testing.TB, string, int64, bool) storage.Engine
+type engineMaker func(testing.TB, string, int64, fs.RWMode) storage.Engine
 
-func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly bool) storage.Engine {
-	opts := storage.DefaultPebbleOptions()
-	opts.FS = vfs.Default
-	opts.LBaseMaxBytes = lBaseMaxBytes
-	opts.ReadOnly = readOnly
-	peb, err := storage.NewPebble(
+func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, rw fs.RWMode) storage.Engine {
+	env, err := fs.InitEnv(context.Background(), vfs.Default, dir, fs.EnvConfig{RW: rw}, nil /* statsCollector */)
+	if err != nil {
+		b.Fatalf("could not initialize new fs env at %s: %+v", dir, err)
+	}
+	eng, err := storage.Open(
 		context.Background(),
-		storage.PebbleConfig{
-			StorageConfig: base.StorageConfig{Dir: dir, Settings: cluster.MakeTestingClusterSettings()},
-			Opts:          opts,
-		})
+		env,
+		cluster.MakeTestingClusterSettings(),
+		storage.LBaseMaxBytes(lBaseMaxBytes))
 	if err != nil {
 		b.Fatalf("could not create new pebble instance at %s: %+v", dir, err)
 	}
-	return peb
+	return eng
 }
 
 // setupData data writes numKeys keys. One version of each key
@@ -203,9 +220,9 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 // and continuing to t=5ns*(numKeys+1). The goal of this is to
 // approximate an append-only type workload.
 //
-// A read-only engin can be returned if opts.readOnlyEngine is
-// set. The goal of this is to prevent read-triggered compactions that
-// might change the distribution of data across levels.
+// A read-only engine is returned if opts.rwMode is set to fs.ReadOnly. The goal
+// of this is to prevent read-triggered compactions that might change the
+// distribution of data across levels.
 //
 // The creation of the database is time consuming, especially for
 // larger numbers of versions. The database is persisted between runs
@@ -213,16 +230,17 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 func setupData(
 	ctx context.Context, b *testing.B, emk engineMaker, opts benchDataOptions,
 ) (storage.Engine, string) {
+	verStr := fmt.Sprintf("v%s", clusterversion.Latest.String())
 	orderStr := "linear"
 	if opts.randomKeyOrder {
 		orderStr = "random"
 	}
 	readOnlyStr := ""
-	if opts.readOnlyEngine {
+	if opts.rwMode == fs.ReadOnly {
 		readOnlyStr = "_readonly"
 	}
-	loc := fmt.Sprintf("rangefeed_bench_data_%s%s_%d_%d_%d",
-		orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes)
+	loc := fmt.Sprintf("rangefeed_bench_data_%s_%s%s_%d_%d_%d_%d",
+		verStr, orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes, opts.numRangeKeys)
 	exists := true
 	if _, err := os.Stat(loc); oserror.IsNotExist(err) {
 		exists = false
@@ -230,13 +248,18 @@ func setupData(
 		b.Fatal(err)
 	}
 
+	absPath, err := filepath.Abs(loc)
+	if err != nil {
+		absPath = loc
+	}
 	if exists {
+		log.Infof(ctx, "using existing refresh range benchmark data: %s", absPath)
 		testutils.ReadAllFiles(filepath.Join(loc, "*"))
-		return emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine), loc
+		return emk(b, loc, opts.lBaseMaxBytes, opts.rwMode), loc
 	}
 
-	eng := emk(b, loc, opts.lBaseMaxBytes, false)
-	log.Infof(ctx, "creating rangefeed benchmark data: %s", loc)
+	eng := emk(b, loc, opts.lBaseMaxBytes, fs.ReadWrite)
+	log.Infof(ctx, "creating rangefeed benchmark data: %s", absPath)
 
 	// Generate the same data every time.
 	rng := rand.New(rand.NewSource(1449168817))
@@ -254,12 +277,36 @@ func setupData(
 		})
 	}
 
+	writeRangeKeys := func(b testing.TB, wallTime int) {
+		batch := eng.NewBatch()
+		defer batch.Close()
+		for i := 0; i < opts.numRangeKeys; i++ {
+			// NB: regular keys are written at ts 5+, so this is below any of the
+			// regular writes and thus won't delete anything.
+			ts := hlc.Timestamp{WallTime: int64(wallTime), Logical: int32(i + 1)}
+			start := rng.Intn(opts.numKeys)
+			end := start + rng.Intn(opts.numKeys-start) + 1
+			// As a special case, if we're only writing one range key, write it across
+			// the entire span.
+			if opts.numRangeKeys == 1 {
+				start = 0
+				end = opts.numKeys + 1
+			}
+			startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(start)))
+			endKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(end)))
+			require.NoError(b, storage.MVCCDeleteRangeUsingTombstone(
+				ctx, batch, nil, startKey, endKey, ts, hlc.ClockTimestamp{}, nil, nil, false, 0, 0, nil))
+		}
+		require.NoError(b, batch.Commit(false /* sync */))
+	}
+	writeRangeKeys(b, 1 /* wallTime */)
+
 	writeKey := func(batch storage.Batch, idx int, pos int) {
 		key := keys[idx]
 		value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, opts.valueBytes))
 		value.InitChecksum(key)
 		ts := hlc.Timestamp{WallTime: int64((pos + 1) * 5)}
-		if err := storage.MVCCPut(ctx, batch, nil /* ms */, key, ts, value, nil); err != nil {
+		if _, err := storage.MVCCPut(ctx, batch, key, ts, value, storage.MVCCWriteOptions{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -293,9 +340,9 @@ func setupData(
 		b.Fatal(err)
 	}
 
-	if opts.readOnlyEngine {
+	if opts.rwMode == fs.ReadOnly {
 		eng.Close()
-		eng = emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine)
+		eng = emk(b, loc, opts.lBaseMaxBytes, opts.rwMode)
 	}
 	return eng, loc
 }

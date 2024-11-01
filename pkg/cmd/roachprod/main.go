@@ -1,42 +1,45 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/user"
 	"path"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/update"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/roachprodutil"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ui"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	_ "github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
-	_ "github.com/cockroachdb/cockroach/pkg/roachprod/vm/azure"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
-	_ "github.com/cockroachdb/cockroach/pkg/roachprod/vm/local"
-	"github.com/cockroachdb/cockroach/pkg/util/flagutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/exp/maps"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 var rootCmd = &cobra.Command{
@@ -59,58 +62,9 @@ The above commands will create a "local" 3 node cluster, start a cockroach
 cluster on these nodes, run a sql command on the 2nd node, stop, wipe and
 destroy the cluster.
 `,
-	Version: "details:\n" + build.GetInfo().Long(),
+	Version:          "details:\n" + build.GetInfo().Long(),
+	PersistentPreRun: validateAndConfigure,
 }
-
-var (
-	numNodes          int
-	numRacks          int
-	username          string
-	dryrun            bool
-	destroyAllMine    bool
-	destroyAllLocal   bool
-	extendLifetime    time.Duration
-	wipePreserveCerts bool
-	listDetails       bool
-	listJSON          bool
-	listMine          bool
-	listPattern       string
-	secure            = false
-	extraSSHOptions   = ""
-	nodeEnv           = []string{
-		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
-		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
-	}
-	nodeArgs          []string
-	tag               string
-	external          = false
-	certsDir          string
-	adminurlOpen      = false
-	adminurlPath      = ""
-	adminurlIPs       = false
-	useTreeDist       = true
-	encrypt           = false
-	skipInit          = false
-	quiet             = false
-	sig               = 9
-	waitFlag          = false
-	createVMOpts      = vm.DefaultCreateOpts()
-	startOpts         = install.StartOptsType{}
-	stageOS           string
-	stageDir          string
-	logsDir           string
-	logsFilter        string
-	logsProgramFilter string
-	logsFrom          time.Time
-	logsTo            time.Time
-	logsInterval      time.Duration
-	maxConcurrency    int
-
-	monitorIgnoreEmptyNodes bool
-	monitorOneShot          bool
-
-	cachedHostsCluster string
-)
 
 // Provide `cobra.Command` functions with a standard return code handler.
 // Exit codes come from rperrors.Error.ExitCode().
@@ -120,7 +74,14 @@ var (
 // rperrors.Unclassified.
 func wrap(f func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
-		err := f(cmd, args)
+		var err error
+		isSecure, err = isSecureCluster(cmd)
+		if err != nil {
+			cmd.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		err = f(cmd, args)
 		if err != nil {
 			roachprodError, ok := rperrors.AsError(err)
 			if !ok {
@@ -132,21 +93,6 @@ func wrap(f func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Comma
 
 			os.Exit(roachprodError.ExitCode())
 		}
-	}
-}
-
-// clusterOpts returns the ClusterSettings according to the command-line flags.
-func clusterOpts() install.ClusterSettings {
-	return install.ClusterSettings{
-		Tag:            tag,
-		CertsDir:       certsDir,
-		Secure:         secure,
-		Quiet:          quiet || !term.IsTerminal(int(os.Stdout.Fd())),
-		UseTreeDist:    useTreeDist,
-		Args:           nodeArgs,
-		Env:            nodeEnv,
-		NumRacks:       numRacks,
-		MaxConcurrency: maxConcurrency,
 	}
 }
 
@@ -195,7 +141,51 @@ Local Clusters
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
-		return roachprod.Create(numNodes, username, createVMOpts, args[0], clusterOpts())
+		createVMOpts.ClusterName = args[0]
+		opts := cloud.ClusterCreateOpts{Nodes: numNodes, CreateOpts: createVMOpts, ProviderOptsContainer: providerOptsContainer}
+		return roachprod.Create(context.Background(), config.Logger, username, &opts)
+	}),
+}
+
+var growCmd = &cobra.Command{
+	Use:   `grow <cluster> <num-nodes>`,
+	Short: `grow a cluster by adding nodes`,
+	Long: `grow a cluster by adding the specified number of nodes to it.
+
+Only Google Cloud and local clusters currently support adding nodes. The Google
+Cloud cluster has to be a managed cluster (i.e., a cluster created with the
+gce-managed flag). The new nodes will use the instance template that was used to
+create the cluster originally (Nodes will be created in the same zone as the
+existing nodes, or if the cluster is geographically distributed, the nodes will
+be fairly distributed across the zones of the cluster).
+`,
+	Args: cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		count, err := strconv.ParseInt(args[1], 10, 8)
+		if err != nil || count < 1 {
+			return errors.Wrapf(err, "invalid num-nodes argument")
+		}
+		return roachprod.Grow(context.Background(), config.Logger, args[0], isSecure, int(count))
+	}),
+}
+
+var shrinkCmd = &cobra.Command{
+	Use:   `shrink <cluster> <num-nodes>`,
+	Short: `shrink a cluster by removing nodes`,
+	Long: `shrink a cluster by removing the specified number of nodes.
+
+Only Google Cloud and local clusters currently support removing nodes. The
+Google Cloud cluster has to be a managed cluster (i.e., a cluster created with
+the gce-managed flag). Nodes are removed from the tail end of the cluster.
+Removing nodes from the middle of the cluster is not supported yet.
+`,
+	Args: cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		count, err := strconv.ParseInt(args[1], 10, 8)
+		if err != nil || count < 1 {
+			return errors.Wrapf(err, "invalid num-nodes argument")
+		}
+		return roachprod.Shrink(context.Background(), config.Logger, args[0], int(count))
 	}),
 }
 
@@ -214,7 +204,7 @@ if the user would like to update the keys on the remote hosts.
 
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
-		return roachprod.SetupSSH(args[0], clusterOpts(), username)
+		return roachprod.SetupSSH(context.Background(), config.Logger, args[0])
 	}),
 }
 
@@ -235,7 +225,7 @@ directories inside ${HOME}/local directory are removed.
 `,
 	Args: cobra.ArbitraryArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Destroy(args, clusterOpts(), destroyAllMine, destroyAllLocal, username)
+		return roachprod.Destroy(config.Logger, username, destroyAllMine, destroyAllLocal, args...)
 	}),
 }
 
@@ -312,20 +302,30 @@ hosts file.
 		if listJSON && listDetails {
 			return errors.New("'json' option cannot be combined with 'details' option")
 		}
-		filteredCloud, err := roachprod.List(quiet, listMine, listPattern)
+		filteredCloud, err := roachprod.List(config.Logger, listMine, listPattern,
+			vm.ListOptions{
+				Username:             username,
+				ComputeEstimatedCost: listCost,
+			})
+
 		if err != nil {
 			return err
 		}
 
 		// sort by cluster names for stable output.
 		names := make([]string, len(filteredCloud.Clusters))
+		maxClusterName := 0
 		i := 0
 		for name := range filteredCloud.Clusters {
 			names[i] = name
+			if len(name) > maxClusterName {
+				maxClusterName = len(name)
+			}
 			i++
 		}
 		sort.Strings(names)
 
+		p := message.NewPrinter(language.English)
 		if listJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -333,16 +333,95 @@ hosts file.
 				return err
 			}
 		} else {
-			// Align columns left and separate with at least two spaces.
-			tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+			machineType := func(clusterVMs vm.List) string {
+				return clusterVMs[0].MachineType
+			}
+			cpuArch := func(clusterVMs vm.List) string {
+				// Display CPU architecture and family.
+				if clusterVMs[0].CPUArch == "" {
+					// N.B. Either a local cluster or unsupported cloud provider.
+					return ""
+				}
+				if clusterVMs[0].CPUFamily != "" {
+					return clusterVMs[0].CPUFamily
+				}
+				if clusterVMs[0].CPUArch != vm.ArchAMD64 {
+					return string(clusterVMs[0].CPUArch)
+				}
+				// AMD64 is the default, so don't display it.
+				return ""
+			}
+			// Align columns right and separate with at least two spaces.
+			tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', tabwriter.AlignRight)
+			// N.B. colors use escape codes which don't play nice with tabwriter [1].
+			// We use a hacky workaround below to color the empty string.
+			// [1] https://github.com/golang/go/issues/12073
+
+			if !listDetails {
+				// Print header only if we are not printing cluster details.
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
+					"Cluster", "Clouds", "Size", "VM", "Arch",
+					color.HiWhiteString("$/hour"), color.HiWhiteString("$ Spent"),
+					color.HiWhiteString("Uptime"), color.HiWhiteString("TTL"),
+					color.HiWhiteString("$/TTL"))
+				// Print separator.
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
+					"", "", "", "",
+					color.HiWhiteString(""), color.HiWhiteString(""),
+					color.HiWhiteString(""), color.HiWhiteString(""),
+					color.HiWhiteString(""))
+			}
+			totalCostPerHour := 0.0
 			for _, name := range names {
 				c := filteredCloud.Clusters[name]
 				if listDetails {
-					c.PrintDetails()
+					if err = c.PrintDetails(config.Logger); err != nil {
+						return err
+					}
 				} else {
-					fmt.Fprintf(tw, "%s\t%s\t%d", c.Name, c.Clouds(), len(c.VMs))
+					// N.B. Tabwriter doesn't support per-column alignment. It looks odd to have the cluster names right-aligned,
+					// so we make it left-aligned.
+					fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s", name+strings.Repeat(" ", maxClusterName-len(name)), c.Clouds(),
+						len(c.VMs), machineType(c.VMs), cpuArch(c.VMs))
 					if !c.IsLocal() {
-						fmt.Fprintf(tw, "\t(%s)", c.LifetimeRemaining().Round(time.Second))
+						colorByCostBucket := func(cost float64) func(string, ...interface{}) string {
+							switch {
+							case cost <= 100:
+								return color.HiGreenString
+							case cost <= 1000:
+								return color.HiBlueString
+							default:
+								return color.HiRedString
+							}
+						}
+						timeRemaining := c.LifetimeRemaining().Round(time.Second)
+						formatTTL := func(ttl time.Duration) string {
+							if c.VMs[0].Preemptible {
+								return color.HiMagentaString(ttl.String())
+							} else {
+								return color.HiBlueString(ttl.String())
+							}
+						}
+						cost := c.CostPerHour
+						totalCostPerHour += cost
+						alive := timeutil.Since(c.CreatedAt).Round(time.Minute)
+						costSinceCreation := cost * float64(alive) / float64(time.Hour)
+						costRemaining := cost * float64(timeRemaining) / float64(time.Hour)
+						if cost > 0 {
+							fmt.Fprintf(tw, "\t%s\t%s\t%s\t%s\t%s\t",
+								color.HiGreenString(p.Sprintf("$%.2f", cost)),
+								colorByCostBucket(costSinceCreation)(p.Sprintf("$%.2f", costSinceCreation)),
+								color.HiWhiteString(alive.String()),
+								formatTTL(timeRemaining),
+								colorByCostBucket(costRemaining)(p.Sprintf("$%.2f", costRemaining)))
+						} else {
+							fmt.Fprintf(tw, "\t%s\t%s\t%s\t%s\t%s\t",
+								color.HiGreenString(""),
+								color.HiGreenString(""),
+								color.HiWhiteString(alive.String()),
+								formatTTL(timeRemaining),
+								color.HiGreenString(""))
+						}
 					} else {
 						fmt.Fprintf(tw, "\t(-)")
 					}
@@ -351,6 +430,10 @@ hosts file.
 			}
 			if err := tw.Flush(); err != nil {
 				return err
+			}
+
+			if totalCostPerHour > 0 {
+				_, _ = p.Printf("\nTotal cost per hour: $%.2f\n", totalCostPerHour)
 			}
 
 			// Optionally print any dangling instances with errors
@@ -379,12 +462,12 @@ var bashCompletion = os.ExpandEnv("$HOME/.roachprod/bash-completion.sh")
 // a side-effect. If you don't care about the list output, just "roachprod list
 // &>/dev/null".
 var syncCmd = &cobra.Command{
-	Use:   "sync",
+	Use:   "sync [flags]",
 	Short: "sync ssh keys/config and hosts files",
 	Long:  ``,
 	Args:  cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		_, err := roachprod.Sync(quiet)
+		_, err := roachprod.Sync(config.Logger, listOpts)
 		_ = rootCmd.GenBashCompletionFile(bashCompletion)
 		return err
 	}),
@@ -400,7 +483,7 @@ hourly by a cronjob so it is not necessary to run manually.
 `,
 	Args: cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.GC(dryrun, config.SlackToken)
+		return roachprod.GC(config.Logger, dryrun)
 	}),
 }
 
@@ -414,7 +497,81 @@ destroyed:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Extend(args[0], clusterOpts(), extendLifetime)
+		return roachprod.Extend(config.Logger, args[0], extendLifetime)
+	}),
+}
+
+var loadBalancerCmd = &cobra.Command{
+	Use:   "load-balancer [command]",
+	Short: "manage and query load balancers",
+	Long:  `create load balancers for specific services, query the IP or postgres URL of a load balancer`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.CreateLoadBalancer(context.Background(), config.Logger,
+			args[0], isSecure, virtualClusterName, sqlInstance,
+		)
+	}),
+}
+
+var createLoadBalancerCmd = &cobra.Command{
+	Use:   "create <cluster>",
+	Short: "create a load balancer for a cluster",
+	Long: `Create a load balancer for a specific service (port), system by default, for the given cluster.
+
+The load balancer is created using the cloud provider's load balancer service.
+Currently only Google Cloud is supported, and the cluster must have been created
+with the --gce-managed flag. On Google Cloud a load balancer consists of various
+components that include backend services, health checks and forwarding rules.
+These resources will automatically be destroyed when the cluster is destroyed.
+`,
+
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.CreateLoadBalancer(context.Background(), config.Logger,
+			args[0], isSecure, virtualClusterName, sqlInstance,
+		)
+	}),
+}
+
+var loadBalancerPGUrl = &cobra.Command{
+	Use:   "pgurl <cluster>",
+	Short: "get the postgres URL of a load balancer",
+	Long: fmt.Sprintf(`Get the postgres URL of a load balancer.
+%[1]s`, strings.TrimSpace(AuthModeHelp)),
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		auth, err := install.ResolveAuthMode(authMode)
+		if err != nil {
+			return err
+		}
+		url, err := roachprod.LoadBalancerPgURL(context.Background(), config.Logger, args[0], pgurlCertsDir, roachprod.PGURLOptions{
+			Database:           database,
+			External:           external,
+			Secure:             isSecure,
+			VirtualClusterName: virtualClusterName,
+			SQLInstance:        sqlInstance,
+			Auth:               auth,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(url)
+		return nil
+	}),
+}
+
+var loadBalancerIP = &cobra.Command{
+	Use:   "ip <cluster>",
+	Short: "get the IP address of a load balancer",
+	Long:  "Get the IP address of a load balancer.",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		ip, err := roachprod.LoadBalancerIP(context.Background(), config.Logger, args[0], virtualClusterName, sqlInstance)
+		if err != nil {
+			return err
+		}
+		fmt.Println(ip)
+		return nil
 	}),
 }
 
@@ -432,13 +589,11 @@ var startCmd = &cobra.Command{
 	Short: "start nodes on a cluster",
 	Long: `Start nodes on a cluster.
 
-The --secure flag can be used to start nodes in secure mode (i.e. using
-certs). When specified, there is a one time initialization for the cluster to
-create and distribute the certs. Note that running some modes in secure mode
-and others in insecure mode is not a supported Cockroach configuration.
-
-As a debugging aid, the --sequential flag starts the nodes sequentially so node
-IDs match hostnames. Otherwise nodes are started are parallel.
+Nodes are started in secure mode by default and there is a one time
+initialization for the cluster to create and distribute the certs.
+Note that running some modes in secure mode and others in insecure
+mode is not a supported Cockroach configuration. To start nodes in
+insecure mode, use the --insecure flag.
 
 The --binary flag specifies the remote binary to run. It is up to the roachprod
 user to ensure this binary exists, usually via "roachprod put". Note that no
@@ -458,7 +613,37 @@ cluster setting will be set to its value.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Start(args[0], clusterOpts(), startOpts)
+		clusterSettingsOpts := []install.ClusterSettingOption{
+			install.TagOption(tag),
+			install.PGUrlCertsDirOption(pgurlCertsDir),
+			install.SecureOption(isSecure),
+			install.UseTreeDistOption(useTreeDist),
+			install.EnvOption(nodeEnv),
+			install.NumRacksOption(numRacks),
+		}
+		return roachprod.Start(context.Background(), config.Logger, args[0], startOpts, clusterSettingsOpts...)
+	}),
+}
+
+var updateTargetsCmd = &cobra.Command{
+	Use:   "update-targets <cluster>",
+	Short: "update prometheus target configurations for a cluster",
+	Long: `Update prometheus target configurations of each node of a cluster.
+
+The "start" command updates the prometheus target configuration every time. But, in case of any
+failure, this command can be used to update the configurations.
+
+The default prometheus url is https://grafana.testeng.crdb.io/. This can be overwritten by using the
+environment variable COCKROACH_PROM_HOST_URL
+
+Note that if the cluster is started in insecure mode, set the insecure mode here as well by using the --insecure flag.
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		clusterSettingsOpts := []install.ClusterSettingOption{
+			install.SecureOption(isSecure),
+		}
+		return roachprod.UpdateTargets(context.Background(), config.Logger, args[0], clusterSettingsOpts...)
 	}),
 }
 
@@ -477,8 +662,9 @@ The --sig flag will pass a signal to kill to allow us finer control over how we
 shutdown cockroach. The --wait flag causes stop to loop waiting for all
 processes with the right ROACHPROD environment variable to exit. Note that stop
 will wait forever if you specify --wait with a non-terminating signal (e.g.
-SIGHUP). --wait defaults to true for signal 9 (SIGKILL) and false for all other
-signals.
+SIGHUP), unless you also configure --max-wait.
+
+--wait defaults to true for signal 9 (SIGKILL) and false for all other signals.
 ` + tagHelp + `
 `,
 	Args: cobra.ExactArgs(1),
@@ -487,7 +673,144 @@ signals.
 		if sig == 9 /* SIGKILL */ && !cmd.Flags().Changed("wait") {
 			wait = true
 		}
-		return roachprod.Stop(args[0], clusterOpts(), sig, wait)
+		stopOpts := roachprod.StopOpts{Wait: wait, GracePeriod: gracePeriod, ProcessTag: tag, Sig: sig}
+		return roachprod.Stop(context.Background(), config.Logger, args[0], stopOpts)
+	}),
+}
+
+var startInstanceCmd = &cobra.Command{
+	Use:   "start-sql <name> --storage-cluster <storage-cluster> [--external-nodes <virtual-cluster-nodes>]",
+	Short: "start the SQL/HTTP service for a virtual cluster as a separate process",
+	Long: `Start SQL/HTTP instances for a virtual cluster as separate processes.
+
+The --storage-cluster flag must be used to specify a storage cluster
+(with optional node selector) which is already running. The command
+will create the virtual cluster on the storage cluster if it does not
+exist already.  If creating multiple virtual clusters on the same
+node, the --sql-instance flag must be passed to differentiate them.
+
+The instance is started in shared process (in memory) mode by
+default. To start an external process instance, pass the
+--external-cluster flag indicating where the SQL server processes
+should be started.
+
+Nodes are started in secure mode by default and there is a one time
+initialization for the cluster to create and distribute the certs.
+Note that running some modes in secure mode and others in insecure
+mode is not a supported Cockroach configuration. To start nodes in
+insecure mode, use the --insecure flag.
+
+The --binary flag specifies the remote binary to run, if starting
+external services. It is up to the roachprod user to ensure this
+binary exists, usually via "roachprod put". Note that no cockroach
+software is installed by default on a newly created cluster.
+
+The --args and --env flags can be used to pass arbitrary command line flags and
+environment variables to the cockroach process.
+` + tagHelp + `
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		clusterSettingsOpts := []install.ClusterSettingOption{
+			install.TagOption(tag),
+			install.PGUrlCertsDirOption(pgurlCertsDir),
+			install.SecureOption(isSecure),
+			install.UseTreeDistOption(useTreeDist),
+			install.EnvOption(nodeEnv),
+			install.NumRacksOption(numRacks),
+		}
+
+		startOpts.Target = install.StartSharedProcessForVirtualCluster
+		// If the user passed an `--external-nodes` option, we are
+		// starting a separate process virtual cluster.
+		if startOpts.VirtualClusterLocation != "" {
+			startOpts.Target = install.StartServiceForVirtualCluster
+		}
+
+		startOpts.VirtualClusterName = args[0]
+		return roachprod.StartServiceForVirtualCluster(
+			context.Background(), config.Logger, storageCluster, startOpts, clusterSettingsOpts...,
+		)
+	}),
+}
+
+var stopInstanceCmd = &cobra.Command{
+	Use:   "stop-sql <cluster> --cluster <name> --sql-instance <instance> [--sig] [--wait]",
+	Short: "stop sql instances on a cluster",
+	Long: `Stop sql instances on a cluster.
+
+Stop roachprod created virtual clusters (shared or separate process). By default,
+separate processes are killed with signal 9 (SIGKILL) giving them no chance for a
+graceful exit.
+
+The --sig flag will pass a signal to kill to allow us finer control over how we
+shutdown processes. The --wait flag causes stop to loop waiting for all
+processes to exit. Note that stop will wait forever if you specify --wait with a
+non-terminating signal (e.g. SIGHUP), unless you also configure --max-wait.
+
+--wait defaults to true for signal 9 (SIGKILL) and false for all other signals.
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		wait := waitFlag
+		if sig == 9 /* SIGKILL */ && !cmd.Flags().Changed("wait") {
+			wait = true
+		}
+		stopOpts := roachprod.StopOpts{
+			Wait:               wait,
+			GracePeriod:        gracePeriod,
+			Sig:                sig,
+			VirtualClusterName: virtualClusterName,
+			SQLInstance:        sqlInstance,
+		}
+		clusterName := args[0]
+		return roachprod.StopServiceForVirtualCluster(context.Background(), config.Logger, clusterName, isSecure, stopOpts)
+	}),
+}
+
+const (
+	cockroachApp = `
+  cockroach  - Cockroach nightly builds. Can provide an optional SHA, otherwise
+               latest build version is used.`
+	releaseApp = `
+  release    - Official CockroachDB Release. Must provide a specific release
+               version.`
+	customizedApp = `
+  customized - Cockroach customized builds, usually generated by running
+               ./scripts/tag-custom-build.sh. Must provide a specific tag.`
+	localApp = `
+  local      - Use a provided local binary, must provide the path to the binary.`
+	workloadApp = `
+  workload   - Cockroach workload application.`
+)
+
+var deployCmd = &cobra.Command{
+	Use:   "deploy <cluster> <application> <version>|<pathToBinary>",
+	Short: "deploy a new version of cockroach",
+	Long: fmt.Sprintf(`Performs a rolling upgrade of cockroach.
+
+The deploy command currently only supports redeploying the storage cluster
+(system tenant). It should be run on a cluster that is already running
+cockroach. The command will download the specified version of cockroach and
+stage it on the cluster. It will then perform a rolling upgrade of the cluster,
+one node at a time, to the new version.
+
+Currently available application options are:
+  %s`, strings.TrimSpace(cockroachApp+releaseApp+customizedApp+localApp)),
+	Args: cobra.RangeArgs(2, 3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		versionArg := ""
+		pathToBinary := ""
+		if args[1] == "local" {
+			if len(args) < 3 {
+				return errors.New("local application requires a path to the binary: deploy <cluster> local <pathToBinary>")
+			}
+			pathToBinary = args[2]
+		} else if len(args) == 3 {
+			versionArg = args[2]
+		}
+		return roachprod.Deploy(context.Background(), config.Logger, args[0], args[1],
+			versionArg, pathToBinary, pause, deploySig, deployWaitFlag, deployGracePeriod, secure)
 	}),
 }
 
@@ -502,7 +825,7 @@ default cluster settings. It's intended to be used in conjunction with
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Init(args[0], clusterOpts(), username)
+		return roachprod.Init(context.Background(), config.Logger, args[0], startOpts)
 	}),
 }
 
@@ -522,7 +845,21 @@ The "status" command outputs the binary and PID for the specified nodes:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Status(args[0], clusterOpts())
+		statuses, err := roachprod.Status(context.Background(), config.Logger, args[0], tag)
+		if err != nil {
+			return err
+		}
+		for _, status := range statuses {
+			if status.Err != nil {
+				config.Logger.Printf("  %2d: %s %s\n", status.NodeID, status.Err.Error())
+			} else if !status.Running {
+				// TODO(irfansharif): Surface the staged version here?
+				config.Logger.Printf("  %2d: not running\n", status.NodeID)
+			} else {
+				config.Logger.Printf("  %2d: %s %s\n", status.NodeID, status.Version, status.Pid)
+			}
+		}
+		return nil
 	}),
 }
 
@@ -547,7 +884,7 @@ into a single stream.
 		} else {
 			dest = args[0] + ".logs"
 		}
-		return roachprod.Logs(logsOpts, args[0], clusterOpts(), dest, username)
+		return roachprod.Logs(config.Logger, args[0], dest, logsOpts)
 	}),
 }
 
@@ -570,7 +907,29 @@ of nodes, outputting a line whenever a change is detected:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Monitor(args[0], clusterOpts(), monitorIgnoreEmptyNodes, monitorOneShot)
+		eventChan, err := roachprod.Monitor(context.Background(), config.Logger, args[0], monitorOpts)
+		if err != nil {
+			return err
+		}
+		for info := range eventChan {
+			fmt.Println(info.String())
+		}
+
+		return nil
+	}),
+}
+
+var signalCmd = &cobra.Command{
+	Use:   "signal <cluster> <signal>",
+	Short: "send signal to cluster",
+	Long:  "Send a POSIX signal, specified by its integer code, to every process started via roachprod in a cluster.",
+	Args:  cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		sig, err := strconv.ParseInt(args[1], 10, 8)
+		if err != nil {
+			return errors.Wrapf(err, "invalid signal argument")
+		}
+		return roachprod.Signal(context.Background(), config.Logger, args[0], int(sig))
 	}),
 }
 
@@ -585,7 +944,7 @@ nodes.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Wipe(args[0], clusterOpts(), wipePreserveCerts)
+		return roachprod.Wipe(context.Background(), config.Logger, args[0], wipePreserveCerts)
 	}),
 }
 
@@ -615,7 +974,7 @@ the 'zfs rollback' command:
 
 	Args: cobra.ExactArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Reformat(args[0], clusterOpts(), args[1])
+		return roachprod.Reformat(context.Background(), config.Logger, args[0], args[1])
 	}),
 }
 
@@ -627,18 +986,18 @@ var runCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: wrap(func(_ *cobra.Command, args []string) error {
-		return roachprod.Run(args[0], clusterOpts(), extraSSHOptions, args[1:])
+		return roachprod.Run(context.Background(), config.Logger, args[0], extraSSHOptions, tag,
+			isSecure, os.Stdout, os.Stderr, args[1:], install.RunOptions{FailOption: install.FailSlow})
 	}),
 }
 
 var resetCmd = &cobra.Command{
 	Use:   "reset <cluster>",
 	Short: "reset *all* VMs in a cluster",
-	Long: `Reset a cloud VM. This may not be implemented for all
-environments and will fall back to a no-op.`,
-	Args: cobra.ExactArgs(1),
+	Long:  `Reset a cloud VM.`,
+	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
-		return roachprod.Reset(args[0], clusterOpts(), numNodes, username)
+		return roachprod.Reset(config.Logger, args[0])
 	}),
 }
 
@@ -651,7 +1010,7 @@ var installCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Install(args[0], clusterOpts(), args[1:])
+		return roachprod.Install(context.Background(), config.Logger, args[0], args[1:])
 	}),
 }
 
@@ -666,7 +1025,7 @@ var downloadCmd = &cobra.Command{
 		if len(args) == 4 {
 			dest = args[3]
 		}
-		return roachprod.Download(args[0], clusterOpts(), src, sha, dest)
+		return roachprod.Download(context.Background(), config.Logger, args[0], src, sha, dest)
 	}),
 }
 
@@ -676,11 +1035,13 @@ var stageURLCmd = &cobra.Command{
 	Long: `Prints URL for release and edge binaries.
 
 Currently available application options are:
-  cockroach - Cockroach Unofficial. Can provide an optional SHA, otherwise
-              latest build version is used.
-  workload  - Cockroach workload application.
-  release   - Official CockroachDB Release. Must provide a specific release
-              version.
+  cockroach  - Cockroach nightly builds. Can provide an optional SHA, otherwise
+               latest build version is used.
+  workload   - Cockroach workload application.
+  release    - Official CockroachDB Release. Must provide a specific release
+               version.
+  customized - Cockroach customized builds, usually generated by running
+               ./scripts/tag-custom-build.sh. Must provide a specific tag.
 `,
 	Args: cobra.RangeArgs(1, 2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
@@ -688,7 +1049,7 @@ Currently available application options are:
 		if len(args) == 2 {
 			versionArg = args[1]
 		}
-		urls, err := roachprod.StageURL(args[0], versionArg, stageOS)
+		urls, err := roachprod.StageURL(config.Logger, args[0], versionArg, stageOS, stageArch)
 		if err != nil {
 			return err
 		}
@@ -702,14 +1063,10 @@ Currently available application options are:
 var stageCmd = &cobra.Command{
 	Use:   "stage <cluster> <application> [<sha/version>]",
 	Short: "stage cockroach binaries",
-	Long: `Stages release and edge binaries to the cluster.
+	Long: fmt.Sprintf(`Stages release and edge binaries to the cluster.
 
 Currently available application options are:
-  cockroach - Cockroach Unofficial. Can provide an optional SHA, otherwise
-              latest build version is used.
-  workload  - Cockroach workload application.
-  release   - Official CockroachDB Release. Must provide a specific release
-              version.
+  %s
 
 Some examples of usage:
   -- stage edge build of cockroach build at a specific SHA:
@@ -720,14 +1077,17 @@ Some examples of usage:
 
   -- Stage the official release binary of CockroachDB at version 2.0.5
   roachprod stage my-cluster release v2.0.5
-`,
+
+  -- Stage customized binary of CockroachDB at version v23.2.0-alpha.2-4375-g7cd2b76ed00
+  roachprod stage my-cluster customized v23.2.0-alpha.2-4375-g7cd2b76ed00
+`, strings.TrimSpace(cockroachApp+workloadApp+releaseApp+customizedApp)),
 	Args: cobra.RangeArgs(2, 3),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		versionArg := ""
 		if len(args) == 3 {
 			versionArg = args[2]
 		}
-		return roachprod.Stage(args[0], clusterOpts(), stageOS, stageDir, args[1], versionArg)
+		return roachprod.Stage(context.Background(), config.Logger, args[0], stageOS, stageArch, stageDir, args[1], versionArg)
 	}),
 }
 
@@ -741,7 +1101,7 @@ start."
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.DistributeCerts(args[0], clusterOpts())
+		return roachprod.DistributeCerts(context.Background(), config.Logger, args[0])
 	}),
 }
 
@@ -757,7 +1117,7 @@ var putCmd = &cobra.Command{
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		return roachprod.Put(args[0], clusterOpts(), src, dest)
+		return roachprod.Put(context.Background(), config.Logger, args[0], src, dest, useTreeDist)
 	}),
 }
 
@@ -774,7 +1134,7 @@ multiple nodes the destination file name will be prefixed with the node number.
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		return roachprod.Get(args[0], clusterOpts(), src, dest)
+		return roachprod.Get(context.Background(), config.Logger, args[0], src, dest)
 	}),
 }
 
@@ -784,27 +1144,53 @@ var sqlCmd = &cobra.Command{
 	Long:  "Run `cockroach sql` on a remote cluster.\n",
 	Args:  cobra.MinimumNArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.SQL(args[0], clusterOpts(), args[1:])
+		auth, ok := install.PGAuthModes[authMode]
+		if !ok {
+			return errors.Newf("unsupported auth-mode %s, valid auth-modes: %v", authMode, maps.Keys(install.PGAuthModes))
+		}
+
+		return roachprod.SQL(context.Background(), config.Logger, args[0], isSecure, virtualClusterName, sqlInstance, auth, database, args[1:])
 	}),
 }
 
 var pgurlCmd = &cobra.Command{
-	Use:   "pgurl <cluster>",
+	Use:   "pgurl <cluster> --auth-mode <auth-mode>",
 	Short: "generate pgurls for the nodes in a cluster",
-	Long: `Generate pgurls for the nodes in a cluster.
-`,
+	Long: fmt.Sprintf(`Generate pgurls for the nodes in a cluster.
+
+%[1]s
+`, strings.TrimSpace(AuthModeHelp)),
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.PgURL(args[0], clusterOpts(), external)
+		auth, err := install.ResolveAuthMode(authMode)
+		if err != nil {
+			return err
+		}
+		urls, err := roachprod.PgURL(context.Background(), config.Logger, args[0], pgurlCertsDir, roachprod.PGURLOptions{
+			Database:           database,
+			External:           external,
+			Secure:             isSecure,
+			VirtualClusterName: virtualClusterName,
+			SQLInstance:        sqlInstance,
+			Auth:               auth,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(strings.Join(urls, " "))
+		return nil
 	}),
 }
 
-var pprofOptions = struct {
-	heap         bool
-	open         bool
-	startingPort int
-	duration     time.Duration
-}{}
+const AuthModeHelp = `
+--auth-mode specifies the method of authentication unless --insecure is passed.
+Defaults to root if not passed. Available auth-modes are:
+
+	root: authenticates with the root user and root certificates
+
+	user-password: authenticates with the default roachprod user and password
+
+	user-cert: authenticates with the default roachprod user and certificates`
 
 var pprofCmd = &cobra.Command{
 	Use:     "pprof <cluster>",
@@ -826,9 +1212,9 @@ Examples:
 `,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		if cmd.CalledAs() == "pprof-heap" {
-			pprofOptions.heap = true
+			pprofOpts.Heap = true
 		}
-		return roachprod.Pprof(args[0], clusterOpts(), pprofOptions.duration, pprofOptions.heap, pprofOptions.open, pprofOptions.startingPort)
+		return roachprod.Pprof(context.Background(), config.Logger, args[0], pprofOpts)
 	}),
 }
 
@@ -840,7 +1226,16 @@ var adminurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.AdminURL(args[0], clusterOpts(), adminurlIPs, adminurlOpen, adminurlPath)
+		urls, err := roachprod.AdminURL(
+			context.Background(), config.Logger, args[0], virtualClusterName, sqlInstance, adminurlPath, adminurlIPs, urlOpen, isSecure,
+		)
+		if err != nil {
+			return err
+		}
+		for _, url := range urls {
+			fmt.Println(url)
+		}
+		return nil
 	}),
 }
 
@@ -851,7 +1246,7 @@ var ipCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		ips, err := roachprod.IP(args[0], clusterOpts(), external)
+		ips, err := roachprod.IP(config.Logger, args[0], external)
 		if err != nil {
 			return err
 		}
@@ -866,38 +1261,733 @@ var versionCmd = &cobra.Command{
 	Use:   `version`,
 	Short: `print version information`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println(roachprod.Version())
+		fmt.Println(roachprod.Version(config.Logger))
 		return nil
 	},
 }
 
-func main() {
-	roachprod.InitProviders()
+var getProvidersCmd = &cobra.Command{
+	Use:   `get-providers`,
+	Short: `print providers state (active/inactive)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		providers := roachprod.InitProviders()
+		for provider, state := range providers {
+			fmt.Printf("%s: %s\n", provider, state)
+		}
+		return nil
+	},
+}
 
+var grafanaStartCmd = &cobra.Command{
+	Use:   `grafana-start <cluster>`,
+	Short: `spins up a prometheus and grafana instance on the last node in the cluster; NOTE: for arm64 clusters, use --arch arm64`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		var grafanaDashboardJSONs []string
+		var grafanaConfigURL string
+		if grafanaConfig != "" {
+			url, err := url.Parse(grafanaConfig)
+			if err != nil {
+				return err
+			}
+			switch url.Scheme {
+			case "http", "https":
+				grafanaConfigURL = grafanaConfig
+			case "file", "":
+				if data, err := grafana.GetDashboardJSONFromFile(url.Path); err != nil {
+					return err
+				} else {
+					grafanaDashboardJSONs = []string{data}
+				}
+			default:
+				return errors.Newf("unsupported scheme %s", url.Scheme)
+			}
+		} else {
+			var err error
+			if grafanaDashboardJSONs, err = grafana.GetDefaultDashboardJSONs(); err != nil {
+				return err
+			}
+		}
+		arch := vm.ArchAMD64
+		if grafanaArch == "arm64" {
+			arch = vm.ArchARM64
+		}
+		return roachprod.StartGrafana(context.Background(), config.Logger, args[0], arch,
+			grafanaConfigURL, grafanaDashboardJSONs, nil)
+	}),
+}
+
+var grafanaStopCmd = &cobra.Command{
+	Use:   `grafana-stop <cluster>`,
+	Short: `spins down prometheus and grafana instances on the last node in the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StopGrafana(context.Background(), config.Logger, args[0], "")
+	}),
+}
+
+var grafanaDumpCmd = &cobra.Command{
+	Use:   `grafana-dump <cluster>`,
+	Short: `dump prometheus data to the specified directory`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		if grafanaDumpDir == "" {
+			return errors.New("--dump-dir unspecified")
+		}
+		return roachprod.PrometheusSnapshot(context.Background(), config.Logger, args[0], grafanaDumpDir)
+	}),
+}
+
+var grafanaURLCmd = &cobra.Command{
+	Use:   `grafanaurl <cluster>`,
+	Short: `returns a url to the grafana dashboard`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		url, err := roachprod.GrafanaURL(context.Background(), config.Logger, args[0],
+			urlOpen)
+		if err != nil {
+			return err
+		}
+		fmt.Println(url)
+		return nil
+	}),
+}
+
+var grafanaAnnotationCmd = &cobra.Command{
+	Use:   `grafana-annotation <host> <text> --tags [<tag1>, ...] --dashboard-uid <dashboard-uid> --time-range [<start-time>, <end-time>]`,
+	Short: `adds an annotation to the specified grafana instance`,
+	Long: fmt.Sprintf(`Adds an annotation to the specified grafana instance
+
+By default, we assume the grafana instance needs an authentication token to connect
+to. A service account json and audience will be read in from the environment
+variables %s and %s to attempt authentication through google IDP. Use the --insecure
+option when a token is not necessary.
+
+--tags specifies the tags the annotation should have.
+
+--dashboard-uid specifies the dashboard you want the annotation to be created in. If
+left empty, creates the annotation in the organization instead.
+
+--time-range can be used to specify in epoch millisecond time the annotation's timestamp.
+If left empty, creates the annotation at the current time. If only start-time is specified,
+creates an annotation at start-time. If both start-time and end-time are specified,
+creates an annotation over time range.
+
+Example:
+# Create an annotation over time range 1-100 on the centralized grafana instance, which needs authentication.
+roachprod grafana-annotation grafana.testeng.crdb.io example-annotation-event --tags my-cluster --tags test-run-1 --dashboard-uid overview --time-range 1,100
+`, roachprodutil.ServiceAccountJson, roachprodutil.ServiceAccountAudience),
+	Args: cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		req := grafana.AddAnnotationRequest{
+			Text:         args[1],
+			Tags:         grafanaTags,
+			DashboardUID: grafanaDashboardUID,
+		}
+
+		switch len(grafanaTimeRange) {
+		case 0:
+			// Grafana API will default to adding annotation at current time.
+		case 1:
+			// Okay to only specify the start time.
+			req.StartTime = grafanaTimeRange[0]
+		case 2:
+			req.StartTime = grafanaTimeRange[0]
+			req.EndTime = grafanaTimeRange[1]
+		default:
+			return errors.Newf("Too many arguments for --time-range, expected 1 or 2, got: %d", len(grafanaTimeRange))
+		}
+
+		return roachprod.AddGrafanaAnnotation(context.Background(), args[0] /* host */, isSecure, req)
+	}),
+}
+
+var jaegerStartCmd = &cobra.Command{
+	Use:   `jaeger-start <cluster>`,
+	Short: `starts a jaeger container on the last node in the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StartJaeger(context.Background(), config.Logger, args[0],
+			virtualClusterName, isSecure, jaegerConfigNodes)
+	}),
+}
+
+var jaegerStopCmd = &cobra.Command{
+	Use:   `jaeger-stop <cluster>`,
+	Short: `stops a running jaeger container on the last node in the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StopJaeger(context.Background(), config.Logger, args[0])
+	}),
+}
+
+var jaegerURLCmd = &cobra.Command{
+	Use:   `jaegerurl <cluster>`,
+	Short: `returns the URL of the cluster's jaeger UI`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		url, err := roachprod.JaegerURL(context.Background(), config.Logger, args[0],
+			urlOpen)
+		if err != nil {
+			return err
+		}
+		fmt.Println(url)
+		return nil
+	}),
+}
+
+var destroyDNSCmd = &cobra.Command{
+	Use:   `destroy-dns <cluster>`,
+	Short: `cleans up DNS entries for the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.DestroyDNS(context.Background(), config.Logger, args[0])
+	}),
+}
+
+var snapshotCmd = &cobra.Command{
+	Use:   `snapshot`,
+	Short: "snapshot enables creating/listing/deleting/applying cluster snapshots",
+	Args:  cobra.MinimumNArgs(1),
+}
+
+var snapshotCreateCmd = &cobra.Command{
+	Use:   `create <cluster> <name> <description>`,
+	Short: "snapshot a named cluster, using the given snapshot name and description",
+	Args:  cobra.ExactArgs(3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		name := args[1]
+		desc := args[2]
+		snapshots, err := roachprod.CreateSnapshot(context.Background(), config.Logger, cluster, vm.VolumeSnapshotCreateOpts{
+			Name:        name,
+			Description: desc,
+		})
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("created snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		return nil
+	}),
+}
+
+var snapshotListCmd = &cobra.Command{
+	Use:   `list <provider> [<name>]`,
+	Short: "list all snapshots for the given cloud provider, optionally filtering by the given name",
+	Args:  cobra.RangeArgs(1, 2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		provider := args[0]
+		var name string
+		if len(args) == 2 {
+			name = args[1]
+		}
+		snapshots, err := roachprod.ListSnapshots(context.Background(), config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("found snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		return nil
+	}),
+}
+
+var snapshotDeleteCmd = &cobra.Command{
+	Use:   `delete <provider> <name>`,
+	Short: "delete all snapshots for the given cloud provider optionally filtering by the given name",
+	Args:  cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+		provider, name := args[0], args[1]
+		snapshots, err := roachprod.ListSnapshots(ctx, config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("deleting snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		if !dryrun {
+			if err := roachprod.DeleteSnapshots(ctx, config.Logger, provider, snapshots...); err != nil {
+				return err
+			}
+		}
+		config.Logger.Printf("done")
+		return nil
+	}),
+}
+
+var snapshotApplyCmd = &cobra.Command{
+	Use:   `apply <provider> <name> <cluster> `,
+	Short: "apply the named snapshots from the given cloud provider to the named cluster",
+	Args:  cobra.ExactArgs(3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+		provider, name, cluster := args[0], args[1], args[2]
+		snapshots, err := roachprod.ListSnapshots(ctx, config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		return roachprod.ApplySnapshots(ctx, config.Logger, cluster, snapshots, vm.VolumeCreateOpts{
+			Size: 500, // TODO(irfansharif): Make this configurable?
+			Labels: map[string]string{
+				vm.TagUsage: "roachprod",
+			},
+		})
+	}),
+}
+
+var rootStorageCmd = &cobra.Command{
+	Use:   `storage`,
+	Short: "storage enables administering storage related commands and configurations",
+	Args:  cobra.MinimumNArgs(1),
+}
+
+var rootStorageCollectionCmd = &cobra.Command{
+	Use: `collection`,
+	Short: "the collection command allows for enable or disabling the storage workload " +
+		"collector for a provided cluster (including a subset of nodes). The storage workload " +
+		"collection is defined in pebble replay/workload_capture.go.",
+	Args: cobra.MinimumNArgs(1),
+}
+
+var collectionStartCmd = &cobra.Command{
+	Use:   `start <cluster>`,
+	Short: "start the workload collector for a provided cluster (including a subset of nodes)",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		return roachprod.StorageCollectionPerformAction(
+			context.Background(),
+			config.Logger,
+			cluster,
+			"start",
+			volumeCreateOpts,
+		)
+	}),
+}
+
+var collectionStopCmd = &cobra.Command{
+	Use:   `stop <cluster>`,
+	Short: "stop the workload collector for a provided cluster (including a subset of nodes)",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		return roachprod.StorageCollectionPerformAction(
+			context.Background(),
+			config.Logger,
+			cluster,
+			"stop",
+			volumeCreateOpts,
+		)
+	}),
+}
+
+var collectionListVolumes = &cobra.Command{
+	Use:   `list-volumes <cluster>`,
+	Short: "list the nodes and their attached collector volumes",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		return roachprod.StorageCollectionPerformAction(
+			context.Background(),
+			config.Logger,
+			cluster,
+			"list-volumes",
+			volumeCreateOpts,
+		)
+	}),
+}
+
+var storageSnapshotCmd = &cobra.Command{
+	Use:   `snapshot <cluster> <name> <description>`,
+	Short: "snapshot a clusters workload collector volume",
+	Args:  cobra.ExactArgs(3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		name := args[1]
+		desc := args[2]
+		_, err := roachprod.CreateSnapshot(context.Background(), config.Logger, cluster, vm.VolumeSnapshotCreateOpts{
+			Name:        name,
+			Description: desc,
+		})
+		return err
+	}),
+}
+
+var sideEyeRootCmd = &cobra.Command{
+	Use:   "side-eye",
+	Short: "interact with side-eye.io functionality",
+	Long: `Interact with side-eye.io functionality
+
+Side-Eye (app.side-eye.io) is a distributed debugger that can be used to capture
+snapshots of a CockroachDB cluster.
+`,
+	Args: cobra.MinimumNArgs(1),
+}
+
+var sideEyeInstallCmd = &cobra.Command{
+	Use:   "install <cluster>",
+	Short: "install and start the Side-Eye agents on all nodes in the cluster",
+	Long: `Install and start the Side-Eye agents on all nodes in the cluster
+
+` + "`roachprod side-eye snapshot <cluster>`" + ` can then be used to capture cluster snapshots.
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+
+		ctx := context.Background()
+		l := config.Logger
+		sideEyeToken, ok := roachprod.GetSideEyeTokenFromEnv()
+		if !ok {
+			return errors.New("Side-Eye token is not configured via SIDE_EYE_API_TOKEN or gcloud secret")
+		}
+
+		return roachprod.StartSideEyeAgents(ctx, l, cluster, cluster /* envName */, sideEyeToken)
+	}),
+}
+
+var sideEyeSnapCmd = &cobra.Command{
+	Use:     "snapshot <cluster/Side-Eye environment>",
+	Aliases: []string{"snap"},
+	Short:   "capture a cluster snapshot",
+	Long: `Capture a cluster snapshot using Side-Eye
+
+The command will print an app.side-eye.io URL where the snapshot can be viewed.
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		ctx := context.Background()
+		l := config.Logger
+		l.PrintfCtx(ctx, "capturing snapshot of the cluster with Side-Eye...")
+		snapURL, ok := roachprod.CaptureSideEyeSnapshot(context.Background(), config.Logger, cluster, nil /* client */)
+		if ok {
+			l.PrintfCtx(ctx, "captured Side-Eye snapshot: %s", snapURL)
+		}
+		return nil
+	}),
+}
+
+// Before executing any command, validate and canonicalize args.
+func validateAndConfigure(cmd *cobra.Command, args []string) {
+	// Skip validation for commands that are self-sufficient.
+	switch cmd.Name() {
+	case "help", "version", "list":
+		return
+	}
+
+	printErrAndExit := func(err error) {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Validate architecture flag, if set.
+	if archOpt := cmd.Flags().Lookup("arch"); archOpt != nil && archOpt.Changed {
+		arch := vm.CPUArch(strings.ToLower(archOpt.Value.String()))
+
+		if arch != vm.ArchAMD64 && arch != vm.ArchARM64 && arch != vm.ArchFIPS {
+			printErrAndExit(fmt.Errorf("unsupported architecture %q", arch))
+		}
+		if string(arch) != archOpt.Value.String() {
+			// Set the canonical value.
+			_ = cmd.Flags().Set("arch", string(arch))
+		}
+	}
+
+	// Validate cloud providers, if set.
+	providersSet := make(map[string]struct{})
+	for _, p := range createVMOpts.VMProviders {
+		if _, ok := vm.Providers[p]; !ok {
+			printErrAndExit(fmt.Errorf("unknown cloud provider %q", p))
+		}
+		if _, ok := providersSet[p]; ok {
+			printErrAndExit(fmt.Errorf("duplicate cloud provider specified %q", p))
+		}
+		providersSet[p] = struct{}{}
+	}
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "check gs://cockroach-nightly for a new roachprod binary; update if available",
+	Long: "Attempts to download the latest roachprod binary (on master) from gs://cockroach-nightly. " +
+		" Swaps the current binary with it. The current roachprod binary will be backed up" +
+		" and can be restored via `roachprod update --revert`.",
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		// We only have prebuilt binaries for Linux. See #120750.
+		if runtime.GOOS != "linux" {
+			return errors.New("this command is only available on Linux at this time")
+		}
+
+		currentBinary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+
+		if roachprodUpdateRevert {
+			if update.PromptYesNo("Revert to previous version? Note: this will replace the"+
+				" current roachprod binary with a previous roachprod.bak binary.", true /* defaultYes */) {
+				if err := update.SwapBinary(currentBinary, currentBinary+".bak"); err != nil {
+					return err
+				}
+				fmt.Println("roachprod successfully reverted, run `roachprod -v` to confirm.")
+			}
+			return nil
+		}
+
+		newBinary := currentBinary + ".new"
+		if err := update.DownloadLatestRoachprod(newBinary, roachprodUpdateBranch, roachprodUpdateOS, roachprodUpdateArch); err != nil {
+			return err
+		}
+
+		if update.PromptYesNo("Continue with update? This will overwrite any existing roachprod.bak binary.", true /* defaultYes */) {
+			if err := update.SwapBinary(currentBinary, newBinary); err != nil {
+				return errors.WithDetail(err, "unable to update binary")
+			}
+
+			fmt.Println("Update successful: run `roachprod -v` to confirm.")
+		}
+		return nil
+	}),
+}
+
+func printPublicKeyTable(keys gce.AuthorizedKeys, includeSize bool) error {
+	// Align columns left and separate with at least two spaces.
+	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+
+	fmt.Fprintf(tw, "%s\t%s\n", "User", "Key")
+	for _, ak := range keys {
+		fmt.Fprintf(tw, "%s\t%s\n", ak.User, ak.Format(64 /* maxLen */))
+	}
+
+	err := tw.Flush()
+	if !includeSize {
+		return err
+	}
+
+	const maxProjectMetadataBytes = 262144 /* 256 KiB */
+	metadataLen := len(keys.AsProjectMetadata())
+
+	usage := int(float64(metadataLen*100) / float64(maxProjectMetadataBytes))
+	_, err = fmt.Printf("\nTOTAL: %d bytes (usage: %d%%)\n", metadataLen, usage)
+	return err
+}
+
+var sshKeysCmd = &cobra.Command{
+	Use:   "ssh-keys",
+	Short: "manage SSH public keys added to clusters created by roachprod",
+}
+
+var sshKeysListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "list every SSH public key installed on clusters managed by roachprod",
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		authorizedKeys, err := gce.GetUserAuthorizedKeys()
+		if err != nil {
+			return err
+		}
+
+		return printPublicKeyTable(authorizedKeys, true /* includeSize */)
+	}),
+}
+
+var sshKeysAddCmd = &cobra.Command{
+	Use:   "add <public-key-path> [--user user]",
+	Short: "add a new SSH public key to the set of keys installed on clusters managed by roachprod",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		sshKeyPath := args[0]
+		pkBytes, err := os.ReadFile(sshKeyPath)
+		if err != nil {
+			return fmt.Errorf("error reading public key file: %w", err)
+		}
+
+		pubkey, comment, _, _, err := ssh.ParseAuthorizedKey(pkBytes)
+		if err != nil {
+			return fmt.Errorf("error parsing public key: %w", err)
+		}
+
+		ak := gce.AuthorizedKey{
+			User:    sshKeyUser,
+			Key:     pubkey,
+			Comment: comment,
+		}
+
+		fmt.Printf("Adding new public key for user %s...\n", ak.User)
+		return gce.AddUserAuthorizedKey(ak)
+	}),
+}
+
+var sshKeysRemoveCmd = &cobra.Command{
+	Use:   "remove <user>",
+	Short: "remove public keys belonging to a user from the set of keys installed on clusters managed by roachprod",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		user := args[0]
+
+		existingKeys, err := gce.GetUserAuthorizedKeys()
+		if err != nil {
+			return fmt.Errorf("failed to fetch existing keys: %w", err)
+		}
+
+		var toBeDeleted gce.AuthorizedKeys
+		var newKeys gce.AuthorizedKeys
+		for _, existing := range existingKeys {
+			if existing.User == user {
+				toBeDeleted = append(toBeDeleted, existing)
+			} else {
+				newKeys = append(newKeys, existing)
+			}
+		}
+
+		if len(toBeDeleted) == 0 {
+			fmt.Printf("No keys deleted.\n")
+			return nil
+		}
+
+		fmt.Printf("The following keys are going to be deleted:\n")
+		if err := printPublicKeyTable(toBeDeleted, false /* includeSize */); err != nil {
+			return err
+		}
+
+		if update.PromptYesNo("Are you sure?", false /* defaultYes */) {
+			fmt.Printf("Deleting %d keys belonging to %s...\n", len(toBeDeleted), user)
+			return gce.SetUserAuthorizedKeys(newKeys)
+		} else {
+			fmt.Printf("Aborted.\n")
+			return nil
+		}
+	}),
+}
+
+func isSecureCluster(cmd *cobra.Command) (bool, error) {
+	hasSecureFlag := cmd.Flags().Changed("secure")
+	hasInsecureFlag := cmd.Flags().Changed("insecure")
+
+	switch {
+	case hasSecureFlag && hasInsecureFlag:
+		// Disallow passing both flags, even if they are consistent.
+		return false, fmt.Errorf("cannot pass both --secure and --insecure flags")
+
+	case hasSecureFlag:
+		desc := "Clusters are secure by default"
+		if !secure {
+			desc = "Use the --insecure flag to create insecure clusters"
+		}
+
+		fmt.Printf("WARNING: --secure flag is deprecated. %s.\n", desc)
+		return secure, nil
+
+	default:
+		return !insecure, nil
+	}
+}
+
+var _ = func() struct{} {
+	sshKeysCmd.AddCommand(
+		sshKeysListCmd,
+		sshKeysAddCmd,
+		sshKeysRemoveCmd,
+	)
+
+	return struct{}{}
+}()
+
+var fluentBitStartCmd = &cobra.Command{
+	Use:   "fluent-bit-start <cluster>",
+	Short: "Install and start Fluent Bit",
+	Long:  "Install and start Fluent Bit",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StartFluentBit(context.Background(), config.Logger, args[0], fluentBitConfig)
+	}),
+}
+
+var fluentBitStopCmd = &cobra.Command{
+	Use:   "fluent-bit-stop <cluster>",
+	Short: "Stop Fluent Bit",
+	Long:  "Stop Fluent Bit",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StopFluentBit(context.Background(), config.Logger, args[0])
+	}),
+}
+
+var opentelemetryStartCmd = &cobra.Command{
+	Use:   "opentelemetry-start <cluster>",
+	Short: "Install and start the OpenTelemetry Collector",
+	Long:  "Install and start the OpenTelemetry Collector",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StartOpenTelemetry(context.Background(), config.Logger, args[0], opentelemetryConfig)
+	}),
+}
+
+var opentelemetryStopCmd = &cobra.Command{
+	Use:   "opentelemetry-stop <cluster>",
+	Short: "Stop the OpenTelemetry Collector",
+	Long:  "Stop the OpenTelemetry Collector",
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StopOpenTelemetry(context.Background(), config.Logger, args[0])
+	}),
+}
+
+func main() {
+	_ = roachprod.InitProviders()
+	providerOptsContainer = vm.CreateProviderOptionsContainer()
 	// The commands are displayed in the order they are added to rootCmd. Note
 	// that gcCmd and adminurlCmd contain a trailing \n in their Short help in
 	// order to separate the commands into logical groups.
 	cobra.EnableCommandSorting = false
 	rootCmd.AddCommand(
 		createCmd,
+		growCmd,
+		shrinkCmd,
 		resetCmd,
 		destroyCmd,
 		extendCmd,
+		loadBalancerCmd,
 		listCmd,
 		syncCmd,
 		gcCmd,
 		setupSSHCmd,
-
 		statusCmd,
 		monitorCmd,
 		startCmd,
+		updateTargetsCmd,
 		stopCmd,
+		startInstanceCmd,
+		stopInstanceCmd,
+		deployCmd,
 		initCmd,
 		runCmd,
+		signalCmd,
 		wipeCmd,
+		destroyDNSCmd,
 		reformatCmd,
 		installCmd,
 		distributeCertsCmd,
+		sshKeysCmd,
 		putCmd,
 		getCmd,
 		stageCmd,
@@ -911,226 +2001,35 @@ func main() {
 		pprofCmd,
 		cachedHostsCmd,
 		versionCmd,
+		getProvidersCmd,
+		grafanaStartCmd,
+		grafanaStopCmd,
+		grafanaDumpCmd,
+		grafanaURLCmd,
+		grafanaAnnotationCmd,
+		rootStorageCmd,
+		snapshotCmd,
+		updateCmd,
+		jaegerStartCmd,
+		jaegerStopCmd,
+		jaegerURLCmd,
+		sideEyeRootCmd,
+		fluentBitStartCmd,
+		fluentBitStopCmd,
+		opentelemetryStartCmd,
+		opentelemetryStopCmd,
+		fetchLogsCmd,
 	)
-	rootCmd.BashCompletionFunction = fmt.Sprintf(`__custom_func()
-	{
-		# only complete the 2nd arg, e.g. adminurl <foo>
-		if ! [ $c -eq 2 ]; then
-			return
-		fi
+	loadBalancerCmd.AddCommand(createLoadBalancerCmd)
+	loadBalancerCmd.AddCommand(loadBalancerPGUrl)
+	loadBalancerCmd.AddCommand(loadBalancerIP)
+	setBashCompletionFunction()
 
-		# don't complete commands which do not accept a cluster/host arg
-		case ${last_command} in
-			%s)
-				return
-				;;
-		esac
-
-		local hosts_out
-		if hosts_out=$(roachprod cached-hosts --cluster="${cur}" 2>/dev/null); then
-				COMPREPLY=( $( compgen -W "${hosts_out[*]}" -- "$cur" ) )
-		fi
-
-	}`,
-		strings.Join(func(cmds ...*cobra.Command) (s []string) {
-			for _, cmd := range cmds {
-				s = append(s, fmt.Sprintf("%s_%s", rootCmd.Name(), cmd.Name()))
-			}
-			return s
-		}(createCmd, listCmd, syncCmd, gcCmd), " | "),
-	)
-
-	rootCmd.PersistentFlags().BoolVarP(
-		&quiet, "quiet", "q", false, "disable fancy progress output")
-	rootCmd.PersistentFlags().IntVarP(
-		&maxConcurrency, "max-concurrency", "", 32,
-		"maximum number of operations to execute on nodes concurrently, set to zero for infinite")
-	for _, cmd := range []*cobra.Command{createCmd, destroyCmd, extendCmd, logsCmd} {
-		cmd.Flags().StringVarP(&username, "username", "u", os.Getenv("ROACHPROD_USER"),
-			"Username to run under, detect if blank")
-	}
-
-	for _, cmd := range []*cobra.Command{statusCmd, monitorCmd, startCmd,
-		stopCmd, runCmd, wipeCmd, reformatCmd, installCmd, putCmd, getCmd,
-		sqlCmd, pgurlCmd, adminurlCmd, ipCmd,
-	} {
-		cmd.Flags().BoolVar(
-			&ssh.InsecureIgnoreHostKey, "insecure-ignore-host-key", true, "don't check ssh host keys")
-	}
-
-	createCmd.Flags().DurationVarP(&createVMOpts.Lifetime,
-		"lifetime", "l", 12*time.Hour, "Lifetime of the cluster")
-	createCmd.Flags().BoolVar(&createVMOpts.SSDOpts.UseLocalSSD,
-		"local-ssd", true, "Use local SSD")
-	createCmd.Flags().StringVar(&createVMOpts.SSDOpts.FileSystem,
-		"filesystem", vm.Ext4, "The underlying file system(ext4/zfs). ext4 is used by default.")
-	createCmd.Flags().BoolVar(&createVMOpts.SSDOpts.NoExt4Barrier,
-		"local-ssd-no-ext4-barrier", true,
-		`Mount the local SSD with the "-o nobarrier" flag. `+
-			`Ignored if --local-ssd=false is specified.`)
-	createCmd.Flags().IntVarP(&numNodes,
-		"nodes", "n", 4, "Total number of nodes, distributed across all clouds")
-
-	createCmd.Flags().IntVarP(&createVMOpts.OsVolumeSize,
-		"os-volume-size", "", 10, "OS disk volume size in GB")
-
-	createCmd.Flags().StringSliceVarP(&createVMOpts.VMProviders,
-		"clouds", "c", []string{gce.ProviderName},
-		fmt.Sprintf("The cloud provider(s) to use when creating new vm instances: %s", vm.AllProviderNames()))
-	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
-		"geo", false, "Create geo-distributed cluster")
-	// Allow each Provider to inject additional configuration flags
-	for _, p := range vm.Providers {
-		p.Flags().ConfigureCreateFlags(createCmd.Flags())
-
-		for _, cmd := range []*cobra.Command{
-			destroyCmd, extendCmd, listCmd, syncCmd, gcCmd,
-		} {
-			p.Flags().ConfigureClusterFlags(cmd.Flags(), vm.AcceptMultipleProjects)
-		}
-		// createCmd only accepts a single GCE project, as opposed to all the other
-		// commands.
-		p.Flags().ConfigureClusterFlags(createCmd.Flags(), vm.SingleProject)
-	}
-
-	destroyCmd.Flags().BoolVarP(&destroyAllMine,
-		"all-mine", "m", false, "Destroy all non-local clusters belonging to the current user")
-	destroyCmd.Flags().BoolVarP(&destroyAllLocal,
-		"all-local", "l", false, "Destroy all local clusters")
-
-	extendCmd.Flags().DurationVarP(&extendLifetime,
-		"lifetime", "l", 12*time.Hour, "Lifetime of the cluster")
-
-	listCmd.Flags().BoolVarP(&listDetails,
-		"details", "d", false, "Show cluster details")
-	listCmd.Flags().BoolVar(&listJSON,
-		"json", false, "Show cluster specs in a json format")
-	listCmd.Flags().BoolVarP(&listMine,
-		"mine", "m", false, "Show only clusters belonging to the current user")
-	listCmd.Flags().StringVar(&listPattern,
-		"pattern", "", "Show only clusters matching the regex pattern. Empty string matches everything.")
-
-	adminurlCmd.Flags().BoolVar(
-		&adminurlOpen, `open`, false, `Open the url in a browser`)
-	adminurlCmd.Flags().StringVar(
-		&adminurlPath, `path`, "/", `Path to add to URL (e.g. to open a same page on each node)`)
-	adminurlCmd.Flags().BoolVar(
-		&adminurlIPs, `ips`, false, `Use Public IPs instead of DNS names in URL`)
-
-	gcCmd.Flags().BoolVarP(
-		&dryrun, "dry-run", "n", dryrun, "dry run (don't perform any actions)")
-	gcCmd.Flags().StringVar(&config.SlackToken, "slack-token", "", "Slack bot token")
-
-	pgurlCmd.Flags().BoolVar(
-		&external, "external", false, "return pgurls for external connections")
-	pgurlCmd.Flags().StringVar(
-		&certsDir, "certs-dir", "./certs", "cert dir to use for secure connections")
-
-	pprofCmd.Flags().DurationVar(
-		&pprofOptions.duration, "duration", 30*time.Second, "Duration of profile to capture")
-	pprofCmd.Flags().BoolVar(
-		&pprofOptions.heap, "heap", false, "Capture a heap profile instead of a CPU profile")
-	pprofCmd.Flags().BoolVar(
-		&pprofOptions.open, "open", false, "Open the profile using `go tool pprof -http`")
-	pprofCmd.Flags().IntVar(
-		&pprofOptions.startingPort, "starting-port", 9000, "Initial port to use when opening pprof's HTTP interface")
-
-	ipCmd.Flags().BoolVar(
-		&external, "external", false, "return external IP addresses")
-
-	runCmd.Flags().BoolVar(
-		&secure, "secure", false, "use a secure cluster")
-	runCmd.Flags().StringVarP(
-		&extraSSHOptions, "ssh-options", "O", "", "extra args to pass to ssh")
-
-	startCmd.Flags().IntVarP(&numRacks,
-		"racks", "r", 0, "the number of racks to partition the nodes into")
-
-	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
-	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
-
-	wipeCmd.Flags().BoolVar(&wipePreserveCerts, "preserve-certs", false, "do not wipe certificates")
-
+	// Add help about specifying nodes
 	for _, cmd := range []*cobra.Command{
-		startCmd, statusCmd, stopCmd, runCmd,
-	} {
-		cmd.Flags().StringVar(
-			&tag, "tag", "", "the process tag")
-	}
-
-	for _, cmd := range []*cobra.Command{
-		startCmd, putCmd, getCmd,
-	} {
-		cmd.Flags().BoolVar(new(bool), "scp", false, "DEPRECATED")
-		_ = cmd.Flags().MarkDeprecated("scp", "always true")
-	}
-
-	putCmd.Flags().BoolVar(&useTreeDist, "treedist", useTreeDist, "use treedist copy algorithm")
-
-	stageCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
-	stageCmd.Flags().StringVar(&stageDir, "dir", "", "destination for staged binaries")
-
-	stageURLCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
-
-	logsCmd.Flags().StringVar(
-		&logsFilter, "filter", "", "re to filter log messages")
-	logsCmd.Flags().Var(
-		flagutil.Time(&logsFrom), "from", "time from which to stream logs")
-	logsCmd.Flags().Var(
-		flagutil.Time(&logsTo), "to", "time to which to stream logs")
-	logsCmd.Flags().DurationVar(
-		&logsInterval, "interval", 200*time.Millisecond, "interval to poll logs from host")
-	logsCmd.Flags().StringVar(
-		&logsDir, "logs-dir", "logs", "path to the logs dir, if remote, relative to username's home dir, ignored if local")
-	logsCmd.Flags().StringVar(
-		&logsProgramFilter, "logs-program", "^cockroach$", "regular expression of the name of program in log files to search")
-
-	monitorCmd.Flags().BoolVar(
-		&monitorIgnoreEmptyNodes,
-		"ignore-empty-nodes",
-		false,
-		"Automatically detect the (subset of the given) nodes which to monitor "+
-			"based on the presence of a nontrivial data directory.")
-
-	monitorCmd.Flags().BoolVar(
-		&monitorOneShot,
-		"oneshot",
-		false,
-		"Report the status of all targeted nodes once, then exit. The exit "+
-			"status is nonzero if (and only if) any node was found not running.")
-
-	cachedHostsCmd.Flags().StringVar(&cachedHostsCluster, "cluster", "", "print hosts matching cluster")
-
-	for _, cmd := range []*cobra.Command{
-		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd,
+		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd, signalCmd,
 		wipeCmd, pgurlCmd, adminurlCmd, sqlCmd, installCmd,
 	} {
-		switch cmd {
-		case startCmd:
-			cmd.Flags().BoolVar(
-				&startOpts.Sequential, "sequential", true,
-				"start nodes sequentially so node IDs match hostnames")
-			cmd.Flags().StringArrayVarP(
-				&nodeArgs, "args", "a", nil, "node arguments")
-			cmd.Flags().StringArrayVarP(
-				&nodeEnv, "env", "e", nodeEnv, "node environment variables")
-			cmd.Flags().BoolVar(
-				&startOpts.Encrypt, "encrypt", encrypt, "start nodes with encryption at rest turned on")
-			cmd.Flags().BoolVar(
-				&startOpts.SkipInit, "skip-init", skipInit, "skip initializing the cluster")
-			cmd.Flags().IntVar(
-				&startOpts.StoreCount, "store-count", 1, "number of stores to start each node with")
-			fallthrough
-		case sqlCmd:
-			cmd.Flags().StringVarP(
-				&config.Binary, "binary", "b", config.Binary,
-				"the remote cockroach binary to use")
-			fallthrough
-		case pgurlCmd, adminurlCmd:
-			cmd.Flags().BoolVar(
-				&secure, "secure", false, "use a secure cluster")
-		}
-
 		if cmd.Long == "" {
 			cmd.Long = cmd.Short
 		}
@@ -1154,6 +2053,8 @@ Node specification
 `, cmd.Name())
 	}
 
+	initFlags()
+
 	var err error
 	config.OSUser, err = user.Current()
 	if err != nil {
@@ -1171,8 +2072,48 @@ Node specification
 		fmt.Printf("problem loading clusters: %s\n", err)
 	}
 
+	updateTime, sha, err := update.CheckLatest(roachprodUpdateBranch, roachprodUpdateOS, roachprodUpdateArch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: failed to check if a more recent 'roachprod' binary exists: %s\n", err)
+	} else {
+		age, err := update.TimeSinceUpdate(updateTime)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: unable to check mtime of 'roachprod' binary: %s\n", err)
+		} else if age.Hours() >= 14*24 {
+			fmt.Fprintf(os.Stderr, "WARN: roachprod binary is >= 2 weeks old (%s); latest sha: %q\nWARN: Consider updating the binary: `roachprod update`\n\n", age, sha)
+		}
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		// Cobra has already printed the error message.
 		os.Exit(1)
 	}
+}
+
+var fetchLogsCmd = &cobra.Command{
+	Use:     "fetchlogs <cluster> <destination (optional)> [flags]",
+	Aliases: []string{"getlogs"},
+	Short:   "download the logs from the cluster",
+	Long: `Download the logs from the cluster using "roachprod get".
+
+The logs will be placed in the directory if specified or in the directory named as <clustername>_logs.
+`,
+	Args: cobra.RangeArgs(1, 2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		ctx := context.Background()
+		var dest string
+		if len(args) == 2 {
+			dest = args[1]
+		} else {
+			// trim the node number and keep only the cluster name as prefix of the directory
+			dest = fmt.Sprintf("%s_logs", strings.Split(args[0], ":")[0])
+			fmt.Printf("Placing logs at %s\n", dest)
+		}
+		if err := os.Mkdir(dest, 0755); err != nil {
+			return err
+		}
+		return roachprod.FetchLogs(ctx, config.Logger, cluster, dest,
+			fetchLogsTimeout)
+	}),
 }

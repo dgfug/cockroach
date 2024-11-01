@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra_test
 
@@ -62,6 +57,7 @@ func testRowStream(tb testing.TB, rng *rand.Rand, types []*types.T, records []ro
 	numMeta := 0
 
 	se.Init(types)
+	sd.Init(types)
 
 	for rowIdx := 0; rowIdx <= len(records); rowIdx++ {
 		if rowIdx < len(records) {
@@ -109,7 +105,7 @@ func TestStreamEncodeDecode(t *testing.T) {
 	rng, _ := randutil.NewTestRand()
 	for test := 0; test < 100; test++ {
 		rowLen := rng.Intn(20)
-		types := randgen.RandEncodableColumnTypes(rng, rowLen)
+		types := randgen.RandColumnTypes(rng, rowLen)
 		info := make([]execinfrapb.DatumInfo, rowLen)
 		for i := range info {
 			info[i].Type = types[i]
@@ -220,6 +216,7 @@ func BenchmarkStreamDecoder(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				var sd flowinfra.StreamDecoder
+				sd.Init(colTypes)
 				if err := sd.AddMessage(ctx, msg); err != nil {
 					b.Fatal(err)
 				}

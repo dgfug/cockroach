@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -36,11 +32,11 @@ type timeSeriesResolutionInfo struct {
 // pair will only be identified once, even if the range contains keys for that
 // name/resolution pair at multiple timestamps or from multiple sources.
 //
-// An engine snapshot is used, rather than a client, because this function is
+// A local engine is used, rather than a client, because this function is
 // intended to be called by a storage queue which can inspect the local data for
 // a single range without the need for expensive network calls.
 func (tsdb *DB) findTimeSeries(
-	snapshot storage.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
+	ctx context.Context, reader storage.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
 ) ([]timeSeriesResolutionInfo, error) {
 	var results []timeSeriesResolutionInfo
 
@@ -63,7 +59,11 @@ func (tsdb *DB) findTimeSeries(
 	thresholds := tsdb.computeThresholds(now.WallTime)
 
 	// NB: timeseries don't have intents.
-	iter := snapshot.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: endKey.AsRawKey()})
+	iter, err := reader.NewMVCCIterator(
+		ctx, storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: endKey.AsRawKey()})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 
 	for iter.SeekGE(next); ; iter.SeekGE(next) {
@@ -72,7 +72,7 @@ func (tsdb *DB) findTimeSeries(
 		} else if !ok || !iter.UnsafeKey().Less(end) {
 			break
 		}
-		foundKey := iter.Key().Key
+		foundKey := iter.UnsafeKey().Key.Clone()
 
 		// Extract the name and resolution from the discovered key.
 		name, _, res, tsNanos, err := DecodeDataKey(foundKey)
@@ -135,8 +135,8 @@ func (tsdb *DB) pruneTimeSeries(
 			end = start.PrefixEnd()
 		}
 
-		b.AddRawRequest(&roachpb.DeleteRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		b.AddRawRequest(&kvpb.DeleteRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    start,
 				EndKey: end,
 			},

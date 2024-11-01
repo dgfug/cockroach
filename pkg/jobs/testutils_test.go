@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -18,13 +13,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -32,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type execSchedulesFn func(ctx context.Context, maxSchedules int64, txn *kv.Txn) error
+type execSchedulesFn func(ctx context.Context, maxSchedules int64) error
 type testHelper struct {
 	env           *jobstest.JobSchedulerTestEnv
 	server        serverutils.TestServerInterface
@@ -70,7 +63,7 @@ func newTestHelperForTables(
 	env := jobstest.NewJobSchedulerTestEnv(envTableType, timeutil.Now())
 	knobs := &TestingKnobs{
 		JobSchedulerEnv: env,
-		TakeOverJobsScheduling: func(daemon func(ctx context.Context, maxSchedules int64, txn *kv.Txn) error) {
+		TakeOverJobsScheduling: func(daemon func(ctx context.Context, maxSchedules int64) error) {
 			execSchedules = daemon
 		},
 	}
@@ -82,24 +75,23 @@ func newTestHelperForTables(
 		argsFn(&args)
 	}
 
-	s, db, kvDB := serverutils.StartServer(t, args)
+	s, db, _ := serverutils.StartServer(t, args)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "CREATE USER testuser")
 
 	if envTableType == jobstest.UseTestTables {
 		sqlDB.Exec(t, jobstest.GetScheduledJobsTableSchema(env))
 		sqlDB.Exec(t, jobstest.GetJobsTableSchema(env))
 	}
 
-	restoreRegistry := settings.TestingSaveRegistry()
 	return &testHelper{
 			env:    env,
 			server: s,
 			cfg: &scheduledjobs.JobExecutionConfig{
-				Settings:         s.ClusterSettings(),
-				InternalExecutor: s.InternalExecutor().(sqlutil.InternalExecutor),
-				DB:               kvDB,
-				TestingKnobs:     knobs,
+				Settings:     s.ClusterSettings(),
+				DB:           s.InternalDB().(isql.DB),
+				TestingKnobs: knobs,
 			},
 			sqlDB:         sqlDB,
 			execSchedules: execSchedules,
@@ -109,7 +101,6 @@ func newTestHelperForTables(
 				sqlDB.Exec(t, "DROP TABLE "+env.ScheduledJobsTableName())
 			}
 			s.Stopper().Stop(context.Background())
-			restoreRegistry()
 		}
 }
 
@@ -117,9 +108,10 @@ func newTestHelperForTables(
 func (h *testHelper) newScheduledJob(t *testing.T, scheduleLabel, sql string) *ScheduledJob {
 	j := NewScheduledJob(h.env)
 	j.SetScheduleLabel(scheduleLabel)
-	j.SetOwner(security.TestUserName())
+	j.SetOwner(username.TestUserName())
 	any, err := types.MarshalAny(&jobspb.SqlStatementExecutionArg{Statement: sql})
 	require.NoError(t, err)
+	j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	j.SetExecutionDetails(InlineExecutorName, jobspb.ExecutionArguments{Args: any})
 	return j
 }
@@ -131,17 +123,18 @@ func (h *testHelper) newScheduledJobForExecutor(
 ) *ScheduledJob {
 	j := NewScheduledJob(h.env)
 	j.SetScheduleLabel(scheduleLabel)
-	j.SetOwner(security.TestUserName())
+	j.SetOwner(username.TestUserName())
 	j.SetExecutionDetails(executorName, jobspb.ExecutionArguments{Args: executorArgs})
+	j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	return j
 }
 
 // loadSchedule loads  all columns for the specified scheduled job.
-func (h *testHelper) loadSchedule(t *testing.T, id int64) *ScheduledJob {
+func (h *testHelper) loadSchedule(t *testing.T, id jobspb.ScheduleID) *ScheduledJob {
 	j := NewScheduledJob(h.env)
-	row, cols, err := h.cfg.InternalExecutor.QueryRowExWithCols(
+	row, cols, err := h.cfg.DB.Executor().QueryRowExWithCols(
 		context.Background(), "sched-load", nil,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(
 			"SELECT * FROM %s WHERE schedule_id = %d",
 			h.env.ScheduledJobsTableName(), id),
@@ -171,18 +164,17 @@ func registerScopedScheduledJobExecutor(name string, ex ScheduledJobExecutor) fu
 // addFakeJob adds a fake job associated with the specified scheduleID.
 // Returns the id of the newly created job.
 func addFakeJob(
-	t *testing.T, h *testHelper, scheduleID int64, status Status, txn *kv.Txn,
+	t *testing.T, h *testHelper, scheduleID jobspb.ScheduleID, status Status, txn isql.Txn,
 ) jobspb.JobID {
-	payload := []byte("fake payload")
-	datums, err := h.cfg.InternalExecutor.QueryRowEx(context.Background(), "fake-job", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+	datums, err := txn.QueryRowEx(context.Background(), "fake-job", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(`
-INSERT INTO %s (created_by_type, created_by_id, status, payload)
-VALUES ($1, $2, $3, $4)
+INSERT INTO %s (created_by_type, created_by_id, status)
+VALUES ($1, $2, $3)
 RETURNING id`,
 			h.env.SystemJobsTableName(),
 		),
-		CreatedByScheduledJobs, scheduleID, status, payload,
+		CreatedByScheduledJobs, scheduleID, status,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, datums)

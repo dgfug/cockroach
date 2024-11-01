@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
@@ -23,7 +18,10 @@ type systemAttribute int8
 //go:generate stringer -type systemAttribute
 
 const (
-	_ systemAttribute = 64 - iota
+	// Note that the value of the system attribute here is not relevant because
+	// inside a given schema, each attribute is mapped internally to an ordinal
+	// independently.
+	_ systemAttribute = iota
 
 	// Type is an attribute which stores a value's type.
 	Type
@@ -31,12 +29,18 @@ const (
 	// Self is an attribute which stores the variable itself.
 	Self
 
-	maxUserAttribute ordinal = 64 - iota
+	// sliceSource is the attribute used internally when building
+	// slice member entities to reference the source entity of the slice member.
+	sliceSource
+	// sliceIndex is the attributed used internally when building
+	// slice member entities to reference the index of the slice member in the
+	// slice. It is used to give slice member entities unique identities and to
+	// order slice entries according to their index. At time of writing, there
+	// is no way to access this property in queries.
+	sliceIndex
 )
 
-func isSystemAttribute(a Attr) bool {
-	_, isSystemAttr := a.(systemAttribute)
-	return isSystemAttr
-}
-
 var _ Attr = systemAttribute(0)
+
+// maxOrdinal is the maximum ordinal value an attribute in a schema may use.
+const maxOrdinal = ordinalSetMaxOrdinal

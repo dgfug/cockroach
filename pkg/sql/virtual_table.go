@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -34,7 +29,7 @@ import (
 type virtualTableGenerator func() (tree.Datums, error)
 
 // cleanupFunc is a function to cleanup resources created by the generator.
-type cleanupFunc func()
+type cleanupFunc func(ctx context.Context)
 
 // rowPusher is an interface for lazy generators to push rows into
 // and then suspend until the next row has been requested.
@@ -62,17 +57,19 @@ type virtualTableGeneratorResponse struct {
 
 // setupGenerator takes in a worker that generates rows eagerly and transforms
 // it into a lazy row generator. It returns two functions:
-// * next: A handle that can be called to generate a row from the worker. Next
-//   cannot be called once cleanup has been called.
-// * cleanup: Performs all cleanup. This function must be called exactly once
-//   to ensure that resources are cleaned up.
+//   - next: A handle that can be called to generate a row from the worker. Next
+//     cannot be called once cleanup has been called.
+//   - cleanup: Performs all cleanup. This function must be called exactly once
+//     to ensure that resources are cleaned up.
 func setupGenerator(
-	ctx context.Context, worker func(pusher rowPusher) error, stopper *stop.Stopper,
+	ctx context.Context,
+	worker func(ctx context.Context, pusher rowPusher) error,
+	stopper *stop.Stopper,
 ) (next virtualTableGenerator, cleanup cleanupFunc, setupError error) {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	cleanup = func() {
+	cleanup = func(context.Context) {
 		cancel()
 		wg.Wait()
 	}
@@ -105,31 +102,31 @@ func setupGenerator(
 	}
 
 	wg.Add(1)
-	if setupError = stopper.RunAsyncTask(ctx, "sql.rowPusher: send rows", func(ctx context.Context) {
-		defer wg.Done()
-		// We wait until a call to next before starting the worker. This prevents
-		// concurrent transaction usage during the startup phase. We also have to
-		// wait on done here if cleanup is called before any calls to next() to
-		// avoid leaking this goroutine. Lastly, we check if the context has
-		// been canceled before any rows are even requested.
-		select {
-		case <-ctx.Done():
-			return
-		case <-comm:
-		}
-		err := worker(funcRowPusher(addRow))
-		// If the query was canceled, next() will already return a
-		// QueryCanceledError, so just exit here.
-		if errors.Is(err, cancelchecker.QueryCanceledError) {
-			return
-		}
-		// Notify that we are done sending rows.
-		select {
-		case <-ctx.Done():
-			return
-		case comm <- virtualTableGeneratorResponse{err: err}:
-		}
-	}); setupError != nil {
+	if setupError = stopper.RunAsyncTaskEx(ctx,
+		stop.TaskOpts{
+			TaskName: "sql.rowPusher: send rows",
+			SpanOpt:  stop.ChildSpan,
+		},
+		func(ctx context.Context) {
+			defer wg.Done()
+			// We wait until a call to next before starting the worker. This prevents
+			// concurrent transaction usage during the startup phase. We also have to
+			// wait on done here if cleanup is called before any calls to next() to
+			// avoid leaking this goroutine. Lastly, we check if the context has
+			// been canceled before any rows are even requested.
+			select {
+			case <-ctx.Done():
+				return
+			case <-comm:
+			}
+			err := worker(ctx, funcRowPusher(addRow))
+			// Notify that we are done sending rows.
+			select {
+			case <-ctx.Done():
+				return
+			case comm <- virtualTableGeneratorResponse{err: err}:
+			}
+		}); setupError != nil {
 		// The presence of an error means the goroutine never started,
 		// thus wg.Done() is never called, which can result in
 		// cleanup() being blocked indefinitely on wg.Wait(). We call
@@ -160,12 +157,12 @@ func setupGenerator(
 type virtualTableNode struct {
 	columns    colinfo.ResultColumns
 	next       virtualTableGenerator
-	cleanup    func()
+	cleanup    func(ctx context.Context)
 	currentRow tree.Datums
 }
 
 func (p *planner) newVirtualTableNode(
-	columns colinfo.ResultColumns, next virtualTableGenerator, cleanup func(),
+	columns colinfo.ResultColumns, next virtualTableGenerator, cleanup func(ctx context.Context),
 ) *virtualTableNode {
 	return &virtualTableNode{
 		columns: columns,
@@ -193,7 +190,7 @@ func (n *virtualTableNode) Values() tree.Datums {
 
 func (n *virtualTableNode) Close(ctx context.Context) {
 	if n.cleanup != nil {
-		n.cleanup()
+		n.cleanup(ctx)
 	}
 }
 
@@ -228,9 +225,13 @@ type vTableLookupJoinNode struct {
 
 	// run contains the runtime state of this planNode.
 	run struct {
+		// matched indicates whether the current input row had at least one
+		// match.
+		matched bool
 		// row contains the next row to output.
 		row tree.Datums
-		// rows contains the next rows to output, except for row.
+		// rows contains the next rows to output, except for row. Only allocated
+		// for inner and left outer joins.
 		rows   *rowcontainer.RowContainer
 		keyCtx constraint.KeyContext
 
@@ -249,21 +250,18 @@ var _ rowPusher = &vTableLookupJoinNode{}
 
 // startExec implements the planNode interface.
 func (v *vTableLookupJoinNode) startExec(params runParams) error {
-	v.run.keyCtx = constraint.KeyContext{EvalCtx: params.EvalContext()}
-	v.run.rows = rowcontainer.NewRowContainer(
-		params.EvalContext().Mon.MakeBoundAccount(),
-		colinfo.ColTypeInfoFromResCols(v.columns),
-	)
+	v.run.keyCtx = constraint.KeyContext{Ctx: params.ctx, EvalCtx: params.EvalContext()}
+	if v.joinType == descpb.InnerJoin || v.joinType == descpb.LeftOuterJoin {
+		v.run.rows = rowcontainer.NewRowContainer(
+			params.p.Mon().MakeBoundAccount(),
+			colinfo.ColTypeInfoFromResCols(v.columns),
+		)
+	} else if v.joinType != descpb.LeftSemiJoin && v.joinType != descpb.LeftAntiJoin {
+		return errors.AssertionFailedf("unexpected join type for virtual lookup join: %s", v.joinType.String())
+	}
 	v.run.indexKeyDatums = make(tree.Datums, len(v.columns))
 	var err error
-	db, err := params.p.Descriptors().GetImmutableDatabaseByName(
-		params.ctx,
-		params.p.txn,
-		v.dbName,
-		tree.DatabaseLookupFlags{
-			Required: true, AvoidCached: params.p.avoidCachedDescriptors,
-		},
-	)
+	db, err := params.p.byNameGetterBuilder().Get().Database(params.ctx, v.dbName)
 	if err != nil {
 		return err
 	}
@@ -278,7 +276,7 @@ func (v *vTableLookupJoinNode) Next(params runParams) (bool, error) {
 	v.run.params = &params
 	for {
 		// Check if there are any rows left to emit from the last input row.
-		if v.run.rows.Len() > 0 {
+		if v.run.rows != nil && v.run.rows.Len() > 0 {
 			copy(v.run.row, v.run.rows.At(0))
 			v.run.rows.PopFirst(params.ctx)
 			return true, nil
@@ -299,7 +297,7 @@ func (v *vTableLookupJoinNode) Next(params runParams) (bool, error) {
 		idxConstraint.InitSingleSpan(&v.run.keyCtx, &span)
 
 		// Create the generation function for the index constraint.
-		genFunc := v.virtualTableEntry.makeConstrainedRowsGenerator(params.ctx,
+		genFunc := v.virtualTableEntry.makeConstrainedRowsGenerator(
 			params.p, v.db, v.index,
 			v.run.indexKeyDatums,
 			catalog.ColumnIDToOrdinalMap(v.table.PublicColumns()),
@@ -308,18 +306,38 @@ func (v *vTableLookupJoinNode) Next(params runParams) (bool, error) {
 		)
 		// Add the input row to the left of the scratch row.
 		v.run.row = append(v.run.row[:0], inputRow...)
+		v.run.matched = false
 		// Finally, we're ready to do the lookup. This invocation will push all of
 		// the looked-up rows into v.run.rows.
-		if err := genFunc(v); err != nil {
+		if err := genFunc(params.ctx, v); err != nil {
 			return false, err
 		}
-		if v.run.rows.Len() == 0 && v.joinType == descpb.LeftOuterJoin {
-			// No matches - construct an outer match.
-			v.run.row = v.run.row[:len(v.inputCols)]
-			for i := len(inputRow); i < len(v.columns); i++ {
-				v.run.row = append(v.run.row, tree.DNull)
+		switch v.joinType {
+		case descpb.LeftOuterJoin:
+			if !v.run.matched {
+				// No matches - construct an outer match.
+				v.run.row = v.run.row[:len(v.inputCols)]
+				for i := len(inputRow); i < len(v.columns); i++ {
+					v.run.row = append(v.run.row, tree.DNull)
+				}
+				return true, nil
 			}
-			return true, nil
+		case descpb.LeftSemiJoin:
+			if v.run.matched {
+				// This input row had a match, so it should be emitted.
+				//
+				// Reset our output row to just the contents of the input row.
+				v.run.row = v.run.row[:len(v.inputCols)]
+				return true, nil
+			}
+		case descpb.LeftAntiJoin:
+			if !v.run.matched {
+				// This input row didn't have a match, so it should be emitted.
+				//
+				// Reset our output row to just the contents of the input row.
+				v.run.row = v.run.row[:len(v.inputCols)]
+				return true, nil
+			}
 		}
 	}
 }
@@ -335,10 +353,19 @@ func (v *vTableLookupJoinNode) pushRow(lookedUpRow ...tree.Datum) error {
 		v.run.row = append(v.run.row, lookedUpRow[i-1])
 	}
 	// Run the predicate and exit if we don't match, or if there was an error.
-	if ok, err := v.pred.eval(v.run.params.EvalContext(),
+	if ok, err := v.pred.eval(
+		v.run.params.ctx,
+		v.run.params.EvalContext(),
 		v.run.row[:len(v.inputCols)],
-		v.run.row[len(v.inputCols):]); !ok || err != nil {
+		v.run.row[len(v.inputCols):],
+	); !ok || err != nil {
 		return err
+	}
+	v.run.matched = true
+	if v.joinType == descpb.LeftSemiJoin || v.joinType == descpb.LeftAntiJoin {
+		// Avoid adding the row into the container since for left semi and left
+		// anti joins we only care to know whether there was a match or not.
+		return nil
 	}
 	_, err := v.run.rows.AddRow(v.run.params.ctx, v.run.row)
 	return err
@@ -352,5 +379,7 @@ func (v *vTableLookupJoinNode) Values() tree.Datums {
 // Close implements the planNode interface.
 func (v *vTableLookupJoinNode) Close(ctx context.Context) {
 	v.input.Close(ctx)
-	v.run.rows.Close(ctx)
+	if v.run.rows != nil {
+		v.run.rows.Close(ctx)
+	}
 }

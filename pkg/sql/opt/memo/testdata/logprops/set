@@ -10,6 +10,10 @@ exec-ddl
 CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 ----
 
+exec-ddl
+CREATE TABLE mn (m INT, n INT, PRIMARY KEY (m, n))
+----
+
 build
 SELECT * FROM xy UNION SELECT * FROM uv
 ----
@@ -585,3 +589,83 @@ except-all
            └── eq [type=bool, outer=(6,7), constraints=(/6: (/NULL - ]; /7: (/NULL - ]), fd=(6)==(7), (7)==(6)]
                 ├── variable: a:6 [type=int]
                 └── variable: b:7 [type=int]
+
+# Regression test for #89101. EXCEPT can have cardinality 0 even if left side
+# has more rows than the right.
+norm
+VALUES (1), (1) EXCEPT VALUES (1)
+----
+except
+ ├── columns: column1:1(int!null)
+ ├── left columns: column1:1(int!null)
+ ├── right columns: column1:2(int)
+ ├── cardinality: [0 - 2]
+ ├── key: (1)
+ ├── values
+ │    ├── columns: column1:1(int!null)
+ │    ├── cardinality: [2 - 2]
+ │    ├── prune: (1)
+ │    ├── tuple [type=tuple{int}]
+ │    │    └── const: 1 [type=int]
+ │    └── tuple [type=tuple{int}]
+ │         └── const: 1 [type=int]
+ └── values
+      ├── columns: column1:2(int!null)
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(2)
+      ├── prune: (2)
+      └── tuple [type=tuple{int}]
+           └── const: 1 [type=int]
+
+# EXCEPT ALL cannot have cardinality lower than min left - max right.
+norm
+VALUES (1), (1) EXCEPT ALL VALUES (1)
+----
+except-all
+ ├── columns: column1:1(int!null)
+ ├── left columns: column1:1(int!null)
+ ├── right columns: column1:2(int)
+ ├── cardinality: [1 - 2]
+ ├── values
+ │    ├── columns: column1:1(int!null)
+ │    ├── cardinality: [2 - 2]
+ │    ├── prune: (1)
+ │    ├── tuple [type=tuple{int}]
+ │    │    └── const: 1 [type=int]
+ │    └── tuple [type=tuple{int}]
+ │         └── const: 1 [type=int]
+ └── values
+      ├── columns: column1:2(int!null)
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(2)
+      ├── prune: (2)
+      └── tuple [type=tuple{int}]
+           └── const: 1 [type=int]
+
+# Regression test for #113817. The key from the LHS of the intersection should
+# be reduced after adding the FDs from the RHS.
+norm
+SELECT m, n FROM mn
+INTERSECT
+SELECT x, y FROM xy
+----
+intersect-all
+ ├── columns: m:1(int!null) n:2(int)
+ ├── left columns: m:1(int!null) n:2(int)
+ ├── right columns: x:5(int) y:6(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── interesting orderings: (+1,+2)
+ ├── scan mn
+ │    ├── columns: m:1(int!null) n:2(int!null)
+ │    ├── key: (1,2)
+ │    ├── prune: (1,2)
+ │    └── interesting orderings: (+1,+2)
+ └── scan xy
+      ├── columns: x:5(int!null) y:6(int)
+      ├── key: (5)
+      ├── fd: (5)-->(6)
+      ├── prune: (5,6)
+      └── interesting orderings: (+5)

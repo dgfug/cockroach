@@ -1,18 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachprod
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path"
@@ -20,10 +14,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/local"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 // The code in this file deals with storing cluster metadata in the
@@ -36,21 +32,38 @@ import (
 
 // syncedClusters stores the synced clusters metadata, populated from the
 // clusters cache.
-var syncedClusters cloud.Clusters
+
+type syncedClustersWithMutex struct {
+	clusters cloud.Clusters
+	mu       syncutil.Mutex
+}
+
+var syncedClusters syncedClustersWithMutex
+
+func readSyncedClusters(key string) (*cloud.Cluster, bool) {
+	syncedClusters.mu.Lock()
+	defer syncedClusters.mu.Unlock()
+	if cluster, ok := syncedClusters.clusters[key]; ok {
+		return cluster, ok
+	}
+	return nil, false
+}
 
 // InitDirs initializes the directories for storing cluster metadata and debug
 // logs.
 func InitDirs() error {
-	cd := os.ExpandEnv(config.ClustersDir)
-	if err := os.MkdirAll(cd, 0755); err != nil {
-		return err
+	dirs := []string{config.ClustersDir, config.DefaultDebugDir, config.DNSDir}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(os.ExpandEnv(dir), 0755); err != nil {
+			return err
+		}
 	}
-	return os.MkdirAll(os.ExpandEnv(config.DefaultDebugDir), 0755)
+	return nil
 }
 
 // saveCluster creates (or overwrites) the file in config.ClusterDir storing the
 // given metadata.
-func saveCluster(c *cloud.Cluster) error {
+func saveCluster(l *logger.Logger, c *cloud.Cluster) error {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetIndent("", "  ")
@@ -117,7 +130,9 @@ func shouldIgnoreCluster(c *cloud.Cluster) bool {
 // populates syncedClusters. It is assumed that this is called when the process
 // starts, before any roachprod operations.
 func LoadClusters() error {
-	syncedClusters = make(cloud.Clusters)
+	syncedClusters.mu.Lock()
+	defer syncedClusters.mu.Unlock()
+	syncedClusters.clusters = make(cloud.Clusters)
 
 	clusterNames, err := listClustersInCache()
 	if err != nil {
@@ -127,6 +142,11 @@ func LoadClusters() error {
 	for _, name := range clusterNames {
 		c, err := loadCluster(name)
 		if err != nil {
+			if oserror.IsNotExist(err) {
+				// It is possible that another process is syncing the cache and just
+				// removed the file. Ignore the error.
+				continue
+			}
 			return errors.Wrapf(err, "could not load info for cluster %s", name)
 		}
 
@@ -137,7 +157,7 @@ func LoadClusters() error {
 			continue
 		}
 
-		syncedClusters[c.Name] = c
+		syncedClusters.clusters[c.Name] = c
 
 		if config.IsLocalClusterName(c.Name) {
 			// Add the local cluster to the local provider.
@@ -152,12 +172,24 @@ func LoadClusters() error {
 // (across all providers, including any local cluster).
 //
 // A file in ClustersDir is created for each cluster; other files are removed.
-func syncClustersCache(cloud *cloud.Cloud) error {
+//
+// This function assumes the caller took a lock on a file to ensure that
+// multiple processes don't run through this code at the same time. However, it
+// is allowed for LoadClusters to run in another process at the same time.
+//
+// overwriteMissingClusters indicates if clusters should be removed from the cache
+// if not present in cloud This is used when we have a potentially incomplete list
+// of all clusters due to a transient provider error.
+func syncClustersCache(l *logger.Logger, cloud *cloud.Cloud, overwriteMissingClusters bool) error {
 	// Write all cluster files.
 	for _, c := range cloud.Clusters {
-		if err := saveCluster(c); err != nil {
+		if err := saveCluster(l, c); err != nil {
 			return err
 		}
+	}
+
+	if !overwriteMissingClusters {
+		return nil
 	}
 
 	// Remove any other files.
@@ -176,7 +208,7 @@ func syncClustersCache(cloud *cloud.Cloud) error {
 			if !shouldIgnoreCluster(c) {
 				filename := clusterFilename(name)
 				if err := os.Remove(filename); err != nil {
-					log.Infof(context.Background(), "failed to remove file %s", filename)
+					l.Printf("failed to remove file %s", filename)
 				}
 			}
 		}
@@ -219,11 +251,12 @@ type localVMStorage struct{}
 var _ local.VMStorage = localVMStorage{}
 
 // SaveCluster is part of the local.VMStorage interface.
-func (localVMStorage) SaveCluster(cluster *cloud.Cluster) error {
-	return saveCluster(cluster)
+func (localVMStorage) SaveCluster(l *logger.Logger, cluster *cloud.Cluster) error {
+	return saveCluster(l, cluster)
 }
 
 // DeleteCluster is part of the local.VMStorage interface.
-func (localVMStorage) DeleteCluster(name string) error {
-	return os.Remove(clusterFilename(name))
+func (localVMStorage) DeleteCluster(l *logger.Logger, name string) error {
+	path := clusterFilename(name)
+	return os.Remove(path)
 }

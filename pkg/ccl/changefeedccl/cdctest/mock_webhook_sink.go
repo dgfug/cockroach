@@ -1,16 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdctest
 
 import (
 	"crypto/tls"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 
@@ -29,6 +26,7 @@ type MockWebhookSink struct {
 		statusCodes      []int
 		statusCodesIndex int
 		rows             []string
+		notify           chan struct{}
 	}
 }
 
@@ -48,6 +46,23 @@ func StartMockWebhookSink(certificate *tls.Certificate) (*MockWebhookSink, error
 	s.server.TLS = &tls.Config{
 		Certificates: []tls.Certificate{*certificate},
 	}
+	s.server.StartTLS()
+	return s, nil
+}
+
+// StartMockWebhookSinkSecure creates and starts a mock webhook sink server that
+// requires clients to provide client certificates for authentication
+func StartMockWebhookSinkSecure(certificate *tls.Certificate) (*MockWebhookSink, error) {
+	s := makeMockWebhookSink()
+	if certificate == nil {
+		return nil, errors.Errorf("Must pass a CA cert when creating a mock webhook sink.")
+	}
+
+	s.server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{*certificate},
+		ClientAuth:   tls.RequireAnyClientCert,
+	}
+
 	s.server.StartTLS()
 	return s, nil
 }
@@ -96,6 +111,7 @@ func (s *MockWebhookSink) SetStatusCodes(statusCodes []int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.mu.statusCodes = statusCodes
+	s.mu.statusCodesIndex = 0
 }
 
 // Close closes the mock Webhook sink.
@@ -127,6 +143,19 @@ func (s *MockWebhookSink) Pop() string {
 	return ""
 }
 
+// NotifyMessage arranges for channel to be closed when message arrives.
+func (s *MockWebhookSink) NotifyMessage() chan struct{} {
+	c := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.mu.rows) > 0 {
+		close(c)
+	} else {
+		s.mu.notify = c
+	}
+	return c
+}
+
 func (s *MockWebhookSink) requestHandler(hw http.ResponseWriter, hr *http.Request) {
 	method := hr.Method
 
@@ -152,17 +181,22 @@ func (s *MockWebhookSink) requestHandler(hw http.ResponseWriter, hr *http.Reques
 
 func (s *MockWebhookSink) publish(hw http.ResponseWriter, hr *http.Request) error {
 	defer hr.Body.Close()
-	row, err := ioutil.ReadAll(hr.Body)
+	row, err := io.ReadAll(hr.Body)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.mu.numCalls++
 	if s.mu.statusCodes[s.mu.statusCodesIndex] >= http.StatusOK && s.mu.statusCodes[s.mu.statusCodesIndex] < http.StatusMultipleChoices {
 		s.mu.rows = append(s.mu.rows, string(row))
+		if s.mu.notify != nil {
+			close(s.mu.notify)
+			s.mu.notify = nil
+		}
 	}
+
 	hw.WriteHeader(s.mu.statusCodes[s.mu.statusCodesIndex])
 	s.mu.statusCodesIndex = (s.mu.statusCodesIndex + 1) % len(s.mu.statusCodes)
-	s.mu.Unlock()
 	return nil
 }

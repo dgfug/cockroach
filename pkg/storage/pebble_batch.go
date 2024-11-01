@@ -1,34 +1,473 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
 import (
 	"context"
-	"io"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/rangekey"
 )
+
+var (
+	writeBatchPool = sync.Pool{
+		New: func() interface{} {
+			return &writeBatch{}
+		},
+	}
+	readWriteBatchPool = sync.Pool{
+		New: func() interface{} {
+			return &pebbleBatch{}
+		},
+	}
+)
+
+// Instantiates a new writeBatch.
+func newWriteBatch(
+	db *pebble.DB,
+	batch *pebble.Batch,
+	settings *cluster.Settings,
+	parent *Pebble,
+	batchStatsReporter batchStatsReporter,
+) *writeBatch {
+	wb := writeBatchPool.Get().(*writeBatch)
+	*wb = writeBatch{
+		db:                 db,
+		batch:              batch,
+		buf:                wb.buf,
+		parent:             parent,
+		batchStatsReporter: batchStatsReporter,
+		settings:           settings,
+	}
+	return wb
+}
+
+// A writeBatch wraps a pebble.Batch, omitting any facilities for reading. It's
+// used when only a WriteBatch is needed.
+type writeBatch struct {
+	db                               *pebble.DB
+	batch                            *pebble.Batch
+	buf                              []byte
+	parent                           *Pebble
+	batchStatsReporter               batchStatsReporter
+	settings                         *cluster.Settings
+	closed                           bool
+	shouldWriteLocalTimestamps       bool
+	shouldWriteLocalTimestampsCached bool
+}
+
+var _ WriteBatch = (*writeBatch)(nil)
+
+type batchStatsReporter interface {
+	aggregateBatchCommitStats(stats BatchCommitStats)
+}
+
+// ApplyBatchRepr implements the Writer interface.
+func (wb *writeBatch) ApplyBatchRepr(repr []byte, sync bool) error {
+	var batch pebble.Batch
+	if err := batch.SetRepr(repr); err != nil {
+		return err
+	}
+	return wb.batch.Apply(&batch, nil)
+}
+
+// ClearMVCC implements the Writer interface.
+func (wb *writeBatch) ClearMVCC(key MVCCKey, opts ClearOptions) error {
+	if key.Timestamp.IsEmpty() {
+		panic("ClearMVCC timestamp is empty")
+	}
+	return wb.clear(key, opts)
+}
+
+// ClearUnversioned implements the Writer interface.
+func (wb *writeBatch) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
+	return wb.clear(MVCCKey{Key: key}, opts)
+}
+
+// ClearEngineKey implements the Writer interface.
+func (wb *writeBatch) ClearEngineKey(key EngineKey, opts ClearOptions) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+	wb.buf = key.EncodeToBuf(wb.buf[:0])
+	if !opts.ValueSizeKnown {
+		return wb.batch.Delete(wb.buf, nil)
+	}
+	return wb.batch.DeleteSized(wb.buf, opts.ValueSize, nil)
+}
+
+// ClearMVCCIteratorRange implements the Batch interface.
+func (wb *writeBatch) ClearMVCCIteratorRange(
+	start, end roachpb.Key, pointKeys, rangeKeys bool,
+) error {
+	// TODO(jackson): Remove this method. See the TODO in its definition within
+	// the Writer interface.
+	panic("batch is write-only")
+}
+
+func (wb *writeBatch) clear(key MVCCKey, opts ClearOptions) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+
+	wb.buf = EncodeMVCCKeyToBuf(wb.buf[:0], key)
+	if !opts.ValueSizeKnown {
+		return wb.batch.Delete(wb.buf, nil)
+	}
+	return wb.batch.DeleteSized(wb.buf, opts.ValueSize, nil)
+}
+
+// SingleClearEngineKey implements the Writer interface.
+func (wb *writeBatch) SingleClearEngineKey(key EngineKey) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+	wb.buf = key.EncodeToBuf(wb.buf[:0])
+	return wb.batch.SingleDelete(wb.buf, nil)
+}
+
+// ClearRawRange implements the Writer interface.
+func (wb *writeBatch) ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error {
+	wb.buf = EngineKey{Key: start}.EncodeToBuf(wb.buf[:0])
+	endRaw := EngineKey{Key: end}.Encode()
+	if pointKeys {
+		if err := wb.batch.DeleteRange(wb.buf, endRaw, pebble.Sync); err != nil {
+			return err
+		}
+	}
+	if rangeKeys {
+		if err := wb.batch.RangeKeyDelete(wb.buf, endRaw, pebble.Sync); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ClearMVCCRange implements the Writer interface.
+func (wb *writeBatch) ClearMVCCRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error {
+	if err := wb.ClearRawRange(start, end, pointKeys, rangeKeys); err != nil {
+		return err
+	}
+	// The lock table only contains point keys, so only clear it when point keys
+	// are requested, and don't clear range keys in it.
+	if !pointKeys {
+		return nil
+	}
+	lstart, _ := keys.LockTableSingleKey(start, nil)
+	lend, _ := keys.LockTableSingleKey(end, nil)
+	return wb.ClearRawRange(lstart, lend, true /* pointKeys */, false /* rangeKeys */)
+}
+
+// ClearMVCCVersions implements the Writer interface.
+func (wb *writeBatch) ClearMVCCVersions(start, end MVCCKey) error {
+	wb.buf = EncodeMVCCKeyToBuf(wb.buf[:0], start)
+	return wb.batch.DeleteRange(wb.buf, EncodeMVCCKey(end), nil)
+}
+
+// ClearMVCCRangeKey implements the Writer interface.
+func (wb *writeBatch) ClearMVCCRangeKey(rangeKey MVCCRangeKey) error {
+	if err := rangeKey.Validate(); err != nil {
+		return err
+	}
+	// If the range key holds an encoded timestamp as it was read from storage,
+	// write the tombstone to clear it using the same encoding of the timestamp.
+	// See #129592.
+	if len(rangeKey.EncodedTimestampSuffix) > 0 {
+		return wb.ClearEngineRangeKey(
+			rangeKey.StartKey, rangeKey.EndKey, rangeKey.EncodedTimestampSuffix)
+	}
+	return wb.ClearEngineRangeKey(
+		rangeKey.StartKey, rangeKey.EndKey, EncodeMVCCTimestampSuffix(rangeKey.Timestamp))
+}
+
+// BufferedSize implements the Writer interface.
+func (wb *writeBatch) BufferedSize() int {
+	return wb.Len()
+}
+
+// PutMVCCRangeKey implements the Writer interface.
+func (wb *writeBatch) PutMVCCRangeKey(rangeKey MVCCRangeKey, value MVCCValue) error {
+	// NB: all MVCC APIs currently assume all range keys are range tombstones.
+	if !value.IsTombstone() {
+		return errors.New("range keys can only be MVCC range tombstones")
+	}
+	valueRaw, err := EncodeMVCCValue(value)
+	if err != nil {
+		return errors.Wrapf(err, "failed to encode MVCC value for range key %s", rangeKey)
+	}
+	return wb.PutRawMVCCRangeKey(rangeKey, valueRaw)
+}
+
+// PutRawMVCCRangeKey implements the Writer interface.
+func (wb *writeBatch) PutRawMVCCRangeKey(rangeKey MVCCRangeKey, value []byte) error {
+	if err := rangeKey.Validate(); err != nil {
+		return err
+	}
+	// NB: We deliberately do not use rangeKey.EncodedTimestampSuffix even if
+	// it's present, because we explicitly do NOT want to write range keys with
+	// the synthetic bit set.
+	return wb.PutEngineRangeKey(
+		rangeKey.StartKey, rangeKey.EndKey, EncodeMVCCTimestampSuffix(rangeKey.Timestamp), value)
+}
+
+// PutEngineRangeKey implements the Writer interface.
+func (wb *writeBatch) PutEngineRangeKey(start, end roachpb.Key, suffix, value []byte) error {
+	return wb.batch.RangeKeySet(
+		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, value, nil)
+}
+
+// ClearRawEncodedRange implements the InternalWriter interface.
+func (wb *writeBatch) ClearRawEncodedRange(start, end []byte) error {
+	return wb.batch.DeleteRange(start, end, pebble.Sync)
+}
+
+// PutInternalRangeKey implements the InternalWriter interface.
+func (wb *writeBatch) PutInternalRangeKey(start, end []byte, key rangekey.Key) error {
+	switch key.Kind() {
+	case pebble.InternalKeyKindRangeKeyUnset:
+		return wb.batch.RangeKeyUnset(start, end, key.Suffix, nil /* writeOptions */)
+	case pebble.InternalKeyKindRangeKeySet:
+		return wb.batch.RangeKeySet(start, end, key.Suffix, key.Value, nil /* writeOptions */)
+	case pebble.InternalKeyKindRangeKeyDelete:
+		return wb.batch.RangeKeyDelete(start, end, nil /* writeOptions */)
+	default:
+		panic("unexpected range key kind")
+	}
+}
+
+// PutInternalPointKey implements the InternalWriter interface.
+func (wb *writeBatch) PutInternalPointKey(key *pebble.InternalKey, value []byte) error {
+	if len(key.UserKey) == 0 {
+		return emptyKeyError()
+	}
+	return wb.batch.AddInternalKey(key, value, nil /* writeOptions */)
+}
+
+// ClearEngineRangeKey implements the Engine interface.
+func (wb *writeBatch) ClearEngineRangeKey(start, end roachpb.Key, suffix []byte) error {
+	return wb.batch.RangeKeyUnset(
+		EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix, nil)
+}
+
+// Merge implements the Writer interface.
+func (wb *writeBatch) Merge(key MVCCKey, value []byte) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+	wb.buf = EncodeMVCCKeyToBuf(wb.buf[:0], key)
+	return wb.batch.Merge(wb.buf, value, nil)
+}
+
+// PutMVCC implements the Writer interface.
+func (wb *writeBatch) PutMVCC(key MVCCKey, value MVCCValue) error {
+	if key.Timestamp.IsEmpty() {
+		panic("PutMVCC timestamp is empty")
+	}
+	return wb.putMVCC(key, value)
+}
+
+// PutRawMVCC implements the Writer interface.
+func (wb *writeBatch) PutRawMVCC(key MVCCKey, value []byte) error {
+	if key.Timestamp.IsEmpty() {
+		panic("PutRawMVCC timestamp is empty")
+	}
+	return wb.put(key, value)
+}
+
+// PutUnversioned implements the Writer interface.
+func (wb *writeBatch) PutUnversioned(key roachpb.Key, value []byte) error {
+	return wb.put(MVCCKey{Key: key}, value)
+}
+
+// PutEngineKey implements the Writer interface.
+func (wb *writeBatch) PutEngineKey(key EngineKey, value []byte) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+	wb.buf = key.EncodeToBuf(wb.buf[:0])
+	return wb.batch.Set(wb.buf, value, nil)
+}
+
+func (wb *writeBatch) putMVCC(key MVCCKey, value MVCCValue) error {
+	// For performance, this method uses the pebble Batch's deferred operation
+	// API to avoid an extra memcpy. We:
+	// - determine the length of the encoded MVCC key and MVCC value
+	// - reserve space in the pebble Batch using SetDeferred
+	// - encode the MVCC key and MVCC value directly into the Batch
+	// - call Finish on the deferred operation (which will index the key if
+	//   wb.batch is indexed)
+	valueLen, isExtended := mvccValueSize(value)
+	keyLen := encodedMVCCKeyLength(key)
+	o := wb.batch.SetDeferred(keyLen, valueLen)
+	encodeMVCCKeyToBuf(o.Key, key, keyLen)
+	if !isExtended {
+		// Fast path; we don't need to use the extended encoding and can copy
+		// RawBytes in verbatim.
+		copy(o.Value, value.Value.RawBytes)
+	} else {
+		// Slow path; we need the MVCC value header.
+		err := encodeExtendedMVCCValueToSizedBuf(value, o.Value)
+		if err != nil {
+			return err
+		}
+	}
+	return o.Finish()
+}
+
+func (wb *writeBatch) put(key MVCCKey, value []byte) error {
+	if len(key.Key) == 0 {
+		return emptyKeyError()
+	}
+	keyLen := encodedMVCCKeyLength(key)
+	o := wb.batch.SetDeferred(keyLen, len(value))
+	encodeMVCCKeyToBuf(o.Key, key, keyLen)
+	copy(o.Value, value)
+	return o.Finish()
+}
+
+// LogData implements the Writer interface.
+func (wb *writeBatch) LogData(data []byte) error {
+	return wb.batch.LogData(data, nil)
+}
+
+func (wb *writeBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
+	// No-op.
+}
+
+// Commit implements the WriteBatch interface.
+func (wb *writeBatch) Commit(sync bool) error {
+	opts := pebble.NoSync
+	if sync {
+		opts = pebble.Sync
+	}
+	if wb.batch == nil {
+		panic("called with nil batch")
+	}
+	err := wb.batch.Commit(opts)
+	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
+		panic(err)
+	}
+	wb.batchStatsReporter.aggregateBatchCommitStats(
+		BatchCommitStats{wb.batch.CommitStats()})
+	return err
+}
+
+// CommitNoSyncWait implements the WriteBatch interface.
+func (wb *writeBatch) CommitNoSyncWait() error {
+	if wb.batch == nil {
+		panic("called with nil batch")
+	}
+	err := wb.db.ApplyNoSyncWait(wb.batch, pebble.Sync)
+	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
+		panic(err)
+	}
+	return err
+}
+
+// SyncWait implements the WriteBatch interface.
+func (wb *writeBatch) SyncWait() error {
+	if wb.batch == nil {
+		panic("called with nil batch")
+	}
+	err := wb.batch.SyncWait()
+	if err != nil {
+		// TODO(storage): ensure that these errors are only ever due to invariant
+		// violations and never due to unrecoverable Pebble states. Then switch to
+		// returning the error instead of panicking.
+		//
+		// Once we do that, document on the storage.Batch interface the meaning of
+		// an error returned from this method and the guarantees that callers have
+		// or don't have after they receive an error from this method.
+		panic(err)
+	}
+	wb.batchStatsReporter.aggregateBatchCommitStats(
+		BatchCommitStats{wb.batch.CommitStats()})
+	return err
+}
+
+// Empty implements the WriteBatch interface.
+func (wb *writeBatch) Empty() bool {
+	return wb.batch.Count() == 0
+}
+
+// Count implements the WriteBatch interface.
+func (wb *writeBatch) Count() uint32 {
+	return wb.batch.Count()
+}
+
+// Len implements the WriteBatch interface.
+func (wb *writeBatch) Len() int {
+	return len(wb.batch.Repr())
+}
+
+// Repr implements the WriteBatch interface.
+func (wb *writeBatch) Repr() []byte {
+	// Repr expects a "safe" byte slice as its output. The return value of
+	// p.batch.Repr() is an unsafe byte slice owned by p.batch. Since we could be
+	// sending this slice over the wire, we need to make a copy.
+	repr := wb.batch.Repr()
+	reprCopy := make([]byte, len(repr))
+	copy(reprCopy, repr)
+	return reprCopy
+}
+
+// CommitStats implements the WriteBatch interface.
+func (wb *writeBatch) CommitStats() BatchCommitStats {
+	return BatchCommitStats{BatchCommitStats: wb.batch.CommitStats()}
+}
+
+// ShouldWriteLocalTimestamps implements the WriteBatch interface.
+func (wb *writeBatch) ShouldWriteLocalTimestamps(ctx context.Context) bool {
+	// pebbleBatch is short-lived, so cache the value for performance.
+	if !wb.shouldWriteLocalTimestampsCached {
+		wb.shouldWriteLocalTimestamps = shouldWriteLocalTimestamps(ctx, wb.settings)
+		wb.shouldWriteLocalTimestampsCached = true
+	}
+	return wb.shouldWriteLocalTimestamps
+}
+
+// Close implements the WriteBatch interface.
+func (wb *writeBatch) Close() {
+	wb.close()
+	writeBatchPool.Put(wb)
+}
+
+func (wb *writeBatch) close() {
+	if wb.closed {
+		panic("closing an already-closed writeBatch")
+	}
+	wb.closed = true
+	_ = wb.batch.Close()
+	wb.batch = nil
+}
 
 // Wrapper struct around a pebble.Batch.
 type pebbleBatch struct {
-	db    *pebble.DB
-	batch *pebble.Batch
-	buf   []byte
+	writeBatch
 	// The iterator reuse optimization in pebbleBatch is for servicing a
 	// BatchRequest, such that the iterators get reused across different
 	// requests in the batch.
@@ -43,41 +482,35 @@ type pebbleBatch struct {
 	// engine state. This relies on the fact that all pebbleIterators created
 	// here are marked as reusable, which causes pebbleIterator.Close to not
 	// close iter. iter will be closed when pebbleBatch.Close is called.
-	prefixIter                         pebbleIterator
-	normalIter                         pebbleIterator
-	prefixEngineIter                   pebbleIterator
-	normalEngineIter                   pebbleIterator
-	iter                               cloneableIter
-	writeOnly                          bool
-	closed                             bool
-	overrideTxnDidNotUpdateMetaToFalse bool
+	prefixIter       pebbleIterator
+	normalIter       pebbleIterator
+	prefixEngineIter pebbleIterator
+	normalEngineIter pebbleIterator
 
-	wrappedIntentWriter intentDemuxWriter
-	// scratch space for wrappedIntentWriter.
-	scratch []byte
+	iter     pebbleiter.Iterator
+	iterUsed bool // avoids cloning after PinEngineStateForIterators()
 }
 
-var _ Batch = &pebbleBatch{}
-
-var pebbleBatchPool = sync.Pool{
-	New: func() interface{} {
-		return &pebbleBatch{}
-	},
-}
+var _ Batch = (*pebbleBatch)(nil)
 
 // Instantiates a new pebbleBatch.
 func newPebbleBatch(
 	db *pebble.DB,
 	batch *pebble.Batch,
-	writeOnly bool,
-	disableSeparatedIntents bool,
-	overrideTxnDidNotUpdateMetaToFalse bool,
+	settings *cluster.Settings,
+	parent *Pebble,
+	batchStatsReporter batchStatsReporter,
 ) *pebbleBatch {
-	pb := pebbleBatchPool.Get().(*pebbleBatch)
+	pb := readWriteBatchPool.Get().(*pebbleBatch)
 	*pb = pebbleBatch{
-		db:    db,
-		batch: batch,
-		buf:   pb.buf,
+		writeBatch: writeBatch{
+			db:                 db,
+			batch:              batch,
+			buf:                pb.buf,
+			parent:             parent,
+			batchStatsReporter: batchStatsReporter,
+			settings:           settings,
+		},
 		prefixIter: pebbleIterator{
 			lowerBoundBuf: pb.prefixIter.lowerBoundBuf,
 			upperBoundBuf: pb.prefixIter.upperBoundBuf,
@@ -98,22 +531,17 @@ func newPebbleBatch(
 			upperBoundBuf: pb.normalEngineIter.upperBoundBuf,
 			reusable:      true,
 		},
-		writeOnly: writeOnly,
-		// A batch is not long-lived, so using the same value (which could be
-		// slightly stale) is fine for the lifetime of the batch. Staleness is not
-		// a correctness issue.
-		overrideTxnDidNotUpdateMetaToFalse: overrideTxnDidNotUpdateMetaToFalse,
 	}
-	pb.wrappedIntentWriter = wrapIntentWriter(context.Background(), pb, disableSeparatedIntents)
 	return pb
 }
 
 // Close implements the Batch interface.
 func (p *pebbleBatch) Close() {
-	if p.closed {
-		panic("closing an already-closed pebbleBatch")
+	if p.iter != nil && !p.iterUsed {
+		if err := p.iter.Close(); err != nil {
+			panic(err)
+		}
 	}
-	p.closed = true
 
 	// Setting iter to nil is sufficient since it will be closed by one of the
 	// subsequent destroy calls.
@@ -123,11 +551,8 @@ func (p *pebbleBatch) Close() {
 	p.normalIter.destroy()
 	p.prefixEngineIter.destroy()
 	p.normalEngineIter.destroy()
-
-	_ = p.batch.Close()
-	p.batch = nil
-
-	pebbleBatchPool.Put(p)
+	p.writeBatch.close()
+	readWriteBatchPool.Put(p)
 }
 
 // Closed implements the Batch interface.
@@ -135,166 +560,141 @@ func (p *pebbleBatch) Closed() bool {
 	return p.closed
 }
 
-// ExportMVCCToSst is part of the engine.Reader interface.
-func (p *pebbleBatch) ExportMVCCToSst(
-	ctx context.Context, exportOptions ExportOptions, dest io.Writer,
-) (roachpb.BulkOpSummary, roachpb.Key, hlc.Timestamp, error) {
-	panic("unimplemented")
-}
-
-// Get implements the Batch interface.
-func (p *pebbleBatch) MVCCGet(key MVCCKey) ([]byte, error) {
-	if len(key.Key) == 0 {
-		return nil, emptyKeyError()
-	}
-	r := wrapReader(p)
-	// Doing defer r.Free() does not inline.
-	v, err := r.MVCCGet(key)
-	r.Free()
-	return v, err
-}
-
-func (p *pebbleBatch) rawGet(key []byte) ([]byte, error) {
-	r := pebble.Reader(p.batch)
-	if p.writeOnly {
-		panic("write-only batch")
-	}
-	if !p.batch.Indexed() {
-		r = p.db
-	}
-
-	ret, closer, err := r.Get(key)
-	if closer != nil {
-		retCopy := make([]byte, len(ret))
-		copy(retCopy, ret)
-		ret = retCopy
-		closer.Close()
-	}
-	if errors.Is(err, pebble.ErrNotFound) || len(ret) == 0 {
-		return nil, nil
-	}
-	return ret, err
-}
-
-// MVCCGetProto implements the Batch interface.
-func (p *pebbleBatch) MVCCGetProto(
-	key MVCCKey, msg protoutil.Message,
-) (ok bool, keyBytes, valBytes int64, err error) {
-	return pebbleGetProto(p, key, msg)
-}
-
 // MVCCIterate implements the Batch interface.
 func (p *pebbleBatch) MVCCIterate(
-	start, end roachpb.Key, iterKind MVCCIterKind, f func(MVCCKeyValue) error,
+	ctx context.Context,
+	start, end roachpb.Key,
+	iterKind MVCCIterKind,
+	keyTypes IterKeyType,
+	readCategory fs.ReadCategory,
+	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
 ) error {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		err := iterateOnReader(r, start, end, iterKind, f)
+		err := iterateOnReader(ctx, r, start, end, iterKind, keyTypes, readCategory, f)
 		r.Free()
 		return err
 	}
-	return iterateOnReader(p, start, end, iterKind, f)
+	return iterateOnReader(ctx, p, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 // NewMVCCIterator implements the Batch interface.
-func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIterator {
-	if !opts.Prefix && len(opts.UpperBound) == 0 && len(opts.LowerBound) == 0 {
-		panic("iterator must set prefix or upper bound or lower bound")
-	}
-
-	if p.writeOnly {
-		panic("write-only batch")
-	}
-
+func (p *pebbleBatch) NewMVCCIterator(
+	ctx context.Context, iterKind MVCCIterKind, opts IterOptions,
+) (MVCCIterator, error) {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		iter := r.NewMVCCIterator(iterKind, opts)
+		iter, err := r.NewMVCCIterator(ctx, iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
+		if err != nil {
+			return nil, err
 		}
-		return iter
-	}
-
-	if !opts.MinTimestampHint.IsEmpty() {
-		// MVCCIterators that specify timestamp bounds cannot be cached.
-		iter := MVCCIterator(newPebbleIterator(p.batch, nil, opts))
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter), nil
 	}
 
 	iter := &p.normalIter
 	if opts.Prefix {
 		iter = &p.prefixIter
 	}
-	if iter.inuse {
-		panic("iterator already in use")
+	handle := pebble.Reader(p.batch)
+	if !p.batch.Indexed() {
+		handle = p.db
 	}
-	// Ensures no timestamp hints etc.
-	checkOptionsForIterReuse(opts)
+	if iter.inuse {
+		return newPebbleIteratorByCloning(ctx, CloneContext{
+			rawIter: p.iter,
+			engine:  p.parent,
+		}, opts, StandardDurability), nil
+	}
 
 	if iter.iter != nil {
-		iter.setBounds(opts.LowerBound, opts.UpperBound)
+		iter.setOptions(ctx, opts, StandardDurability)
 	} else {
-		if p.batch.Indexed() {
-			iter.init(p.batch, p.iter, opts)
-		} else {
-			iter.init(p.db, p.iter, opts)
+		if err := iter.initReuseOrCreate(
+			ctx, handle, p.iter, p.iterUsed, opts, StandardDurability, p.parent); err != nil {
+			return nil, err
 		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
 		}
+		p.iterUsed = true
 	}
 
 	iter.inuse = true
-	var rv MVCCIterator = iter
-	if util.RaceEnabled {
-		rv = wrapInUnsafeIter(rv)
+	return maybeWrapInUnsafeIter(iter), nil
+}
+
+// NewBatchOnlyMVCCIterator implements the Batch interface.
+func (p *pebbleBatch) NewBatchOnlyMVCCIterator(
+	ctx context.Context, opts IterOptions,
+) (MVCCIterator, error) {
+	if !p.batch.Indexed() {
+		panic("unindexed batch")
 	}
-	return rv
+	var err error
+	iter := pebbleIterPool.Get().(*pebbleIterator)
+	iter.reusable = false // defensive
+	iter.init(ctx, nil, opts, StandardDurability, p.parent)
+	boIter, err := p.batch.NewBatchOnlyIter(ctx, &iter.options)
+	if err != nil {
+		iter.Close()
+		panic(err)
+	}
+	iter.iter = pebbleiter.MaybeWrap(boIter)
+	return iter, nil
 }
 
 // NewEngineIterator implements the Batch interface.
-func (p *pebbleBatch) NewEngineIterator(opts IterOptions) EngineIterator {
-	if !opts.Prefix && len(opts.UpperBound) == 0 && len(opts.LowerBound) == 0 {
-		panic("iterator must set prefix or upper bound or lower bound")
-	}
-
-	if p.writeOnly {
-		panic("write-only batch")
-	}
-
+func (p *pebbleBatch) NewEngineIterator(
+	ctx context.Context, opts IterOptions,
+) (EngineIterator, error) {
 	iter := &p.normalEngineIter
 	if opts.Prefix {
 		iter = &p.prefixEngineIter
 	}
-	if iter.inuse {
-		panic("iterator already in use")
+	handle := pebble.Reader(p.batch)
+	if !p.batch.Indexed() {
+		handle = p.db
 	}
-	// Ensures no timestamp hints etc.
-	checkOptionsForIterReuse(opts)
+	if iter.inuse {
+		return newPebbleIteratorByCloning(ctx, CloneContext{
+			rawIter: p.iter,
+			engine:  p.parent,
+		}, opts, StandardDurability), nil
+	}
 
 	if iter.iter != nil {
-		iter.setBounds(opts.LowerBound, opts.UpperBound)
+		iter.setOptions(ctx, opts, StandardDurability)
 	} else {
-		if p.batch.Indexed() {
-			iter.init(p.batch, p.iter, opts)
-		} else {
-			iter.init(p.db, p.iter, opts)
+		if err := iter.initReuseOrCreate(
+			ctx, handle, p.iter, p.iterUsed, opts, StandardDurability, p.parent); err != nil {
+			return nil, err
 		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
 		}
+		p.iterUsed = true
 	}
 
 	iter.inuse = true
-	return iter
+	return iter, nil
+}
+
+// ScanInternal implements the Reader interface.
+func (p *pebbleBatch) ScanInternal(
+	ctx context.Context,
+	lower, upper roachpb.Key,
+	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
+	visitRangeDel func(start []byte, end []byte, seqNum pebble.SeqNum) error,
+	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
+	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+	visitExternalFile func(sst *pebble.ExternalFile) error,
+) error {
+	panic("ScanInternal only supported on Engine and Snapshot.")
 }
 
 // ConsistentIterators implements the Batch interface.
@@ -303,239 +703,95 @@ func (p *pebbleBatch) ConsistentIterators() bool {
 }
 
 // PinEngineStateForIterators implements the Batch interface.
-func (p *pebbleBatch) PinEngineStateForIterators() error {
+func (p *pebbleBatch) PinEngineStateForIterators(readCategory fs.ReadCategory) error {
+	var err error
 	if p.iter == nil {
+		var iter *pebble.Iterator
+		o := &pebble.IterOptions{CategoryAndQoS: fs.GetCategoryAndQoS(readCategory)}
 		if p.batch.Indexed() {
-			p.iter = p.batch.NewIter(nil)
+			iter, err = p.batch.NewIter(o)
 		} else {
-			p.iter = p.db.NewIter(nil)
+			iter, err = p.db.NewIter(o)
 		}
+		if err != nil {
+			return err
+		}
+		p.iter = pebbleiter.MaybeWrap(iter)
+		// NB: p.iterUsed == false avoids cloning this in NewMVCCIterator(). We've
+		// just created it, so cloning it would just be overhead.
 	}
 	return nil
 }
 
-// NewMVCCIterator implements the Batch interface.
-func (p *pebbleBatch) ApplyBatchRepr(repr []byte, sync bool) error {
-	var batch pebble.Batch
-	if err := batch.SetRepr(repr); err != nil {
-		return err
-	}
-
-	return p.batch.Apply(&batch, nil)
-}
-
-// ClearMVCC implements the Batch interface.
-func (p *pebbleBatch) ClearMVCC(key MVCCKey) error {
-	if key.Timestamp.IsEmpty() {
-		panic("ClearMVCC timestamp is empty")
-	}
-	return p.clear(key)
-}
-
-// ClearUnversioned implements the Batch interface.
-func (p *pebbleBatch) ClearUnversioned(key roachpb.Key) error {
-	return p.clear(MVCCKey{Key: key})
-}
-
-// ClearIntent implements the Batch interface.
-func (p *pebbleBatch) ClearIntent(
-	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) (int, error) {
-	var err error
-	var separatedIntentCountDelta int
-	p.scratch, separatedIntentCountDelta, err =
-		p.wrappedIntentWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
-	return separatedIntentCountDelta, err
-}
-
-// ClearEngineKey implements the Batch interface.
-func (p *pebbleBatch) ClearEngineKey(key EngineKey) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-	p.buf = key.EncodeToBuf(p.buf[:0])
-	return p.batch.Delete(p.buf, nil)
-}
-
-func (p *pebbleBatch) clear(key MVCCKey) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
-	return p.batch.Delete(p.buf, nil)
-}
-
-// SingleClearEngineKey implements the Batch interface.
-func (p *pebbleBatch) SingleClearEngineKey(key EngineKey) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-
-	p.buf = key.EncodeToBuf(p.buf[:0])
-	return p.batch.SingleDelete(p.buf, nil)
-}
-
-// ClearRawRange implements the Batch interface.
-func (p *pebbleBatch) ClearRawRange(start, end roachpb.Key) error {
-	return p.clearRange(MVCCKey{Key: start}, MVCCKey{Key: end})
-}
-
-// ClearMVCCRangeAndIntents implements the Batch interface.
-func (p *pebbleBatch) ClearMVCCRangeAndIntents(start, end roachpb.Key) error {
-	var err error
-	p.scratch, err = p.wrappedIntentWriter.ClearMVCCRangeAndIntents(start, end, p.scratch)
-	return err
-}
-
-// ClearMVCCRange implements the Batch interface.
-func (p *pebbleBatch) ClearMVCCRange(start, end MVCCKey) error {
-	return p.clearRange(start, end)
-}
-
-func (p *pebbleBatch) clearRange(start, end MVCCKey) error {
-	p.buf = EncodeKeyToBuf(p.buf[:0], start)
-	buf2 := EncodeKey(end)
-	return p.batch.DeleteRange(p.buf, buf2, nil)
-}
-
-// Clear implements the Batch interface.
-func (p *pebbleBatch) ClearIterRange(iter MVCCIterator, start, end roachpb.Key) error {
-	// Note that this method has the side effect of modifying iter's bounds.
-	// Since all calls to `ClearIterRange` are on new throwaway iterators with no
-	// lower bounds, calling SetUpperBound should be sufficient and safe.
-	// Furthermore, the start and end keys are always metadata keys (i.e.
-	// have zero timestamps), so we can ignore the bounds' MVCC timestamps.
-	iter.SetUpperBound(end)
-	iter.SeekGE(MakeMVCCMetadataKey(start))
-
-	for ; ; iter.Next() {
-		valid, err := iter.Valid()
+// ClearMVCCIteratorRange implements the Batch interface.
+func (p *pebbleBatch) ClearMVCCIteratorRange(
+	start, end roachpb.Key, pointKeys, rangeKeys bool,
+) error {
+	clearPointKeys := func(start, end roachpb.Key) error {
+		iter, err := p.NewMVCCIterator(context.Background(), MVCCKeyAndIntentsIterKind, IterOptions{
+			KeyTypes:   IterKeyTypePointsOnly,
+			LowerBound: start,
+			UpperBound: end,
+		})
 		if err != nil {
 			return err
-		} else if !valid {
-			break
 		}
-		// NB: UnsafeRawKey could be a serialized lock table key, and not just an
-		// MVCCKey.
-		err = p.batch.Delete(iter.UnsafeRawKey(), nil)
+		defer iter.Close()
+		for iter.SeekGE(MVCCKey{Key: start}); ; iter.Next() {
+			if valid, err := iter.Valid(); err != nil {
+				return err
+			} else if !valid {
+				break
+			}
+			// NB: UnsafeRawKey could be a serialized lock table key, and not just an
+			// MVCCKey.
+			if err := p.batch.Delete(iter.UnsafeRawKey(), nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if pointKeys {
+		if err := clearPointKeys(start, end); err != nil {
+			return err
+		}
+	}
+
+	clearRangeKeys := func(start, end roachpb.Key) error {
+		iter, err := p.NewMVCCIterator(context.Background(), MVCCKeyIterKind, IterOptions{
+			KeyTypes:   IterKeyTypeRangesOnly,
+			LowerBound: start,
+			UpperBound: end,
+		})
 		if err != nil {
+			return err
+		}
+		defer iter.Close()
+		for iter.SeekGE(MVCCKey{Key: start}); ; iter.Next() {
+			if valid, err := iter.Valid(); err != nil {
+				return err
+			} else if !valid {
+				break
+			}
+			// TODO(erikgrinaker): We should consider reusing a buffer for the
+			// encoding here, but we don't expect to see many range keys.
+			rangeKeys := iter.RangeKeys()
+			startRaw := EncodeMVCCKey(MVCCKey{Key: rangeKeys.Bounds.Key})
+			endRaw := EncodeMVCCKey(MVCCKey{Key: rangeKeys.Bounds.EndKey})
+			for _, v := range rangeKeys.Versions {
+				if err := p.batch.RangeKeyUnset(startRaw, endRaw, v.EncodedTimestampSuffix, nil); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	if rangeKeys {
+		if err := clearRangeKeys(start, end); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// Merge implements the Batch interface.
-func (p *pebbleBatch) Merge(key MVCCKey, value []byte) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
-	return p.batch.Merge(p.buf, value, nil)
-}
-
-// PutMVCC implements the Batch interface.
-func (p *pebbleBatch) PutMVCC(key MVCCKey, value []byte) error {
-	if key.Timestamp.IsEmpty() {
-		panic("PutMVCC timestamp is empty")
-	}
-	return p.put(key, value)
-}
-
-// PutUnversioned implements the Batch interface.
-func (p *pebbleBatch) PutUnversioned(key roachpb.Key, value []byte) error {
-	return p.put(MVCCKey{Key: key}, value)
-}
-
-// PutIntent implements the Batch interface.
-func (p *pebbleBatch) PutIntent(
-	ctx context.Context,
-	key roachpb.Key,
-	value []byte,
-	state PrecedingIntentState,
-	txnDidNotUpdateMeta bool,
-	txnUUID uuid.UUID,
-) (int, error) {
-	var err error
-	var separatedIntentCountDelta int
-	p.scratch, separatedIntentCountDelta, err =
-		p.wrappedIntentWriter.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
-	return separatedIntentCountDelta, err
-}
-
-// PutEngineKey implements the Batch interface.
-func (p *pebbleBatch) PutEngineKey(key EngineKey, value []byte) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-
-	p.buf = key.EncodeToBuf(p.buf[:0])
-	return p.batch.Set(p.buf, value, nil)
-}
-
-// OverrideTxnDidNotUpdateMetaToFalse implements the Batch interface.
-func (p *pebbleBatch) OverrideTxnDidNotUpdateMetaToFalse(_ context.Context) bool {
-	return p.overrideTxnDidNotUpdateMetaToFalse
-}
-
-func (p *pebbleBatch) put(key MVCCKey, value []byte) error {
-	if len(key.Key) == 0 {
-		return emptyKeyError()
-	}
-
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
-	return p.batch.Set(p.buf, value, nil)
-}
-
-// LogData implements the Batch interface.
-func (p *pebbleBatch) LogData(data []byte) error {
-	return p.batch.LogData(data, nil)
-}
-
-func (p *pebbleBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
-	// No-op.
-}
-
-// Commit implements the Batch interface.
-func (p *pebbleBatch) Commit(sync bool) error {
-	opts := pebble.NoSync
-	if sync {
-		opts = pebble.Sync
-	}
-	if p.batch == nil {
-		panic("called with nil batch")
-	}
-	err := p.batch.Commit(opts)
-	if err != nil {
-		panic(err)
-	}
-	return err
-}
-
-// Empty implements the Batch interface.
-func (p *pebbleBatch) Empty() bool {
-	return p.batch.Count() == 0
-}
-
-// Count implements the Batch interface.
-func (p *pebbleBatch) Count() uint32 {
-	return p.batch.Count()
-}
-
-// Len implements the Batch interface.
-func (p *pebbleBatch) Len() int {
-	return len(p.batch.Repr())
-}
-
-// Repr implements the Batch interface.
-func (p *pebbleBatch) Repr() []byte {
-	// Repr expects a "safe" byte slice as its output. The return value of
-	// p.batch.Repr() is an unsafe byte slice owned by p.batch. Since we could be
-	// sending this slice over the wire, we need to make a copy.
-	repr := p.batch.Repr()
-	reprCopy := make([]byte, len(repr))
-	copy(reprCopy, repr)
-	return reprCopy
 }

@@ -1,27 +1,25 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { RouteComponentProps, withRouter } from "react-router-dom";
-import { connect } from "react-redux";
+import { Loading } from "@cockroachlabs/cluster-ui";
 import cn from "classnames";
+import React from "react";
+import { connect } from "react-redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
 
+import { Dropdown } from "src/components/dropdown";
+import { refreshCluster } from "src/redux/apiReducers";
+import { selectEnterpriseEnabled } from "src/redux/license";
+import { AdminUIState } from "src/redux/state";
+import { parseLocalityRoute } from "src/util/localities";
+import { parseSplatParams } from "src/util/parseSplatParams";
+import TimeScaleDropdown from "src/views/cluster/containers/timeScaleDropdownWithSearchParams";
 import { Breadcrumbs } from "src/views/clusterviz/containers/map/breadcrumbs";
 import NeedEnterpriseLicense from "src/views/clusterviz/containers/map/needEnterpriseLicense";
 import NodeCanvasContainer from "src/views/clusterviz/containers/map/nodeCanvasContainer";
-import TimeScaleDropdown from "src/views/cluster/containers/timescale";
 import swapByLicense from "src/views/shared/containers/licenseSwap";
-import { parseLocalityRoute } from "src/util/localities";
-import { Loading } from "@cockroachlabs/cluster-ui";
-import { AdminUIState } from "src/redux/state";
-import { selectEnterpriseEnabled } from "src/redux/license";
-import { Dropdown } from "src/components/dropdown";
-import { parseSplatParams } from "src/util/parseSplatParams";
 
 const NodeCanvasContent = swapByLicense(
   NeedEnterpriseLicense,
@@ -32,6 +30,7 @@ interface ClusterVisualizationProps {
   licenseDataExists: boolean;
   enterpriseEnabled: boolean;
   clusterDataError: Error | null;
+  refreshCluster: typeof refreshCluster;
 }
 
 export class ClusterVisualization extends React.Component<
@@ -52,6 +51,14 @@ export class ClusterVisualization extends React.Component<
     return parseLocalityRoute(splat);
   }
 
+  componentDidMount() {
+    this.props.refreshCluster();
+  }
+
+  componentDidUpdate() {
+    this.props.refreshCluster();
+  }
+
   render() {
     const tiers = this.getTiers();
 
@@ -66,7 +73,8 @@ export class ClusterVisualization extends React.Component<
     const contentItemClasses = cn(
       "cluster-visualization-layout__content-item",
       {
-        "cluster-visualization-layout__content-item--show-license": showingLicensePage,
+        "cluster-visualization-layout__content-item--show-license":
+          showingLicensePage,
       },
     );
 
@@ -88,6 +96,7 @@ export class ClusterVisualization extends React.Component<
         </div>
         <Loading
           loading={!this.props.licenseDataExists}
+          page={"containers"}
           error={this.props.clusterDataError}
           render={() => <NodeCanvasContent tiers={tiers} />}
         />
@@ -104,4 +113,8 @@ function mapStateToProps(state: AdminUIState) {
   };
 }
 
-export default withRouter(connect(mapStateToProps)(ClusterVisualization));
+export default withRouter(
+  connect(mapStateToProps, {
+    refreshCluster,
+  })(ClusterVisualization),
+);

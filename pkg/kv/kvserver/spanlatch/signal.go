@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanlatch
 
@@ -28,22 +23,29 @@ const (
 //
 // The type has three benefits over using a channel directly and
 // closing the channel when the operation completes:
-// 1. signaled() uses atomics to provide a fast-path for checking
-//    whether the operation has completed. It is ~75x faster than
-//    using a channel for this purpose.
-// 2. the receiver's channel is lazily initialized when signalChan()
-//    is called, avoiding the allocation when one is not needed.
-// 3. because of 2, the type's zero value can be used directly.
-//
+//  1. signaled() uses atomics to provide a fast-path for checking
+//     whether the operation has completed. It is ~75x faster than
+//     using a channel for this purpose.
+//  2. the receiver's channel is lazily initialized when signalChan()
+//     is called, avoiding the allocation when one is not needed.
+//  3. because of 2, the type's zero value can be used directly.
 type signal struct {
 	a int32
 	c unsafe.Pointer // chan struct{}, lazily initialized
 }
 
 func (s *signal) signal() {
+	s.signalWithChoice(false /* idempotent */)
+}
+
+func (s *signal) signalWithChoice(idempotent bool) {
 	if !atomic.CompareAndSwapInt32(&s.a, noSig, sig) {
+		if idempotent {
+			return
+		}
 		panic("signaled twice")
 	}
+
 	// Close the channel if it was ever initialized.
 	if cPtr := atomic.LoadPointer(&s.c); cPtr != nil {
 		// Coordinate with signalChan to avoid double-closing.
@@ -80,6 +82,19 @@ func (s *signal) signalChan() <-chan struct{} {
 		close(c)
 	}
 	return c
+}
+
+// idempotentSignal is like signal, but its signal method is idempotent.
+type idempotentSignal struct {
+	sig signal
+}
+
+func (s *idempotentSignal) signal() {
+	s.sig.signalWithChoice(true /* idempotent */)
+}
+
+func (s *idempotentSignal) signalChan() <-chan struct{} {
+	return s.sig.signalChan()
 }
 
 func chanToPtr(c chan struct{}) unsafe.Pointer {

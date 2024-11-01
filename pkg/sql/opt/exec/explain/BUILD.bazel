@@ -16,7 +16,10 @@ go_library(
     visibility = ["//visibility:public"],
     # Pin the dependencies used in auto-generated code.
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/geo/geopb",
+        "//pkg/kv/kvserver/concurrency/isolation",
+        "//pkg/roachpb",
+        "//pkg/sql/appstatspb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/inverted",  # keep
@@ -25,14 +28,21 @@ go_library(
         "//pkg/sql/opt/constraint",
         "//pkg/sql/opt/exec",
         "//pkg/sql/opt/invertedexpr",  # keep
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/errorutil",
         "//pkg/util/humanizeutil",
+        "//pkg/util/intsets",
         "//pkg/util/timeutil",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_dustin_go_humanize//:go-humanize",
     ],
 )
@@ -52,20 +62,29 @@ go_test(
     embed = [":explain"],
     deps = [
         "//pkg/base",
+        "//pkg/multitenant/tenantcapabilities",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/catalog/colinfo",
-        "//pkg/sql/execinfra",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/exec",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
+        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
+        "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
-        "//pkg/util",
         "//pkg/util/encoding",
+        "//pkg/util/grunning",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_stretchr_testify//assert",
@@ -85,7 +104,11 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execexplain $(locations //pkg/sql/opt/exec:defs)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 # Define a generator for gist factory code.
@@ -99,5 +122,9 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execplangist $(locations //pkg/sql/opt/exec:defs)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )

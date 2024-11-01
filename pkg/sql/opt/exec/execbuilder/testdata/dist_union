@@ -68,7 +68,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a)
-│ ordering: +a
 │ estimated row count: 100 (missing stats)
 │ order: +a
 │
@@ -103,7 +102,6 @@ vectorized: true
 ·
 • project
 │ columns: (a)
-│ estimated row count: 1
 │
 └── • except all
     │ columns: (a, a)
@@ -134,7 +132,6 @@ vectorized: true
 ·
 • render
 │ columns: ("?column?", "?column?", "?column?")
-│ estimated row count: 1
 │ render ?column?: column1
 │ render ?column?: column2
 │ render ?column?: column3

@@ -61,14 +61,32 @@ false
 =>
 true
 ----
+true
+└── remaining filters: false
+
+predtest
+NULL
+=>
+true
+----
+true
+└── remaining filters: false
+
+predtest
 false
+=>
+false
+----
+true
+└── remaining filters: none
 
 predtest
 1 = 3
 =>
 2 = 2
 ----
-false
+true
+└── remaining filters: false
 
 # Boolean filters
 
@@ -133,6 +151,14 @@ a
 false
 ----
 false
+
+predtest vars=(a bool)
+a
+=>
+true
+----
+true
+└── remaining filters: a
 
 predtest vars=(a bool)
 a
@@ -425,6 +451,46 @@ predtest vars=(a int)
 a IS NULL
 =>
 a IS NOT NULL
+----
+false
+
+predtest vars=(a int, b int)
+a = b
+=>
+a IS NOT NULL
+----
+true
+└── remaining filters: a = b
+
+predtest vars=(a int, b int)
+a > b
+=>
+a IS NOT NULL
+----
+true
+└── remaining filters: a > b
+
+predtest vars=(a int, b int)
+a > b
+=>
+b IS NOT NULL
+----
+true
+└── remaining filters: a > b
+
+# TODO(mgartner): We could prove implication in this case if we constructed a
+# (/NULL - ] constraint for a.
+predtest vars=(a int, b int, c int)
+a IN (b, c)
+=>
+a IS NOT NULL
+----
+false
+
+predtest vars=(a int, b int, c int)
+a IN (b, c)
+=>
+b IS NOT NULL
 ----
 false
 

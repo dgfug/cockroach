@@ -1,5 +1,7 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
+# gazelle:resolve go go github.com/cockroachdb/cockroach/pkg/sql/protoreflect/test //pkg/sql/protoreflect/test
+
 go_library(
     name = "protoreflect",
     srcs = [
@@ -14,6 +16,10 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//jsonpb",
         "@com_github_gogo_protobuf//proto",
+        "@org_golang_google_protobuf//encoding/protojson",
+        "@org_golang_google_protobuf//reflect/protodesc",
+        "@org_golang_google_protobuf//reflect/protoreflect",
+        "@org_golang_google_protobuf//types/dynamicpb",
     ],
 )
 
@@ -26,10 +32,12 @@ go_test(
     ],
     embed = [":protoreflect"],
     deps = [
-        "//pkg/geo/geoindex",
-        "//pkg/security",
+        "//pkg/geo/geopb",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/protoreflect/gprototest",
         "//pkg/sql/protoreflect/test",
         "//pkg/sql/types",
         "//pkg/util/json",

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 )
@@ -68,8 +64,7 @@ const (
 	// EXPLAIN ANALYZE.
 	ExplainDebug
 
-	// ExplainDDL generates a DDL plan diagram for the statement. Not allowed with
-	//
+	// ExplainDDL generates a DDL plan diagram for the statement.
 	ExplainDDL
 
 	// ExplainGist generates a plan "gist".
@@ -103,6 +98,11 @@ func (m ExplainMode) String() string {
 	return explainModeStrings[m]
 }
 
+// ExplainModes returns a map from EXPLAIN mode strings to ExplainMode.
+func ExplainModes() map[string]ExplainMode {
+	return explainModeStringMap
+}
+
 // ExplainFlag is a modifier in an EXPLAIN statement (like VERBOSE).
 type ExplainFlag uint8
 
@@ -113,10 +113,10 @@ const (
 	ExplainFlagEnv
 	ExplainFlagCatalog
 	ExplainFlagJSON
-	ExplainFlagStages
-	ExplainFlagDeps
 	ExplainFlagMemo
 	ExplainFlagShape
+	ExplainFlagViz
+	ExplainFlagRedact
 	numExplainFlags = iota
 )
 
@@ -126,10 +126,10 @@ var explainFlagStrings = [...]string{
 	ExplainFlagEnv:     "ENV",
 	ExplainFlagCatalog: "CATALOG",
 	ExplainFlagJSON:    "JSON",
-	ExplainFlagStages:  "STAGES",
-	ExplainFlagDeps:    "DEPS",
 	ExplainFlagMemo:    "MEMO",
 	ExplainFlagShape:   "SHAPE",
+	ExplainFlagViz:     "VIZ",
+	ExplainFlagRedact:  "REDACT",
 }
 
 var explainFlagStringMap = func() map[string]ExplainFlag {
@@ -145,6 +145,11 @@ func (f ExplainFlag) String() string {
 		panic(errors.AssertionFailedf("invalid ExplainFlag %d", f))
 	}
 	return explainFlagStrings[f]
+}
+
+// ExplainFlags returns a map from EXPLAIN flag strings to ExplainFlag.
+func ExplainFlags() map[string]ExplainFlag {
+	return explainFlagStringMap
 }
 
 // Format implements the NodeFormatter interface.
@@ -260,6 +265,32 @@ func MakeExplain(options []string, stmt Statement) (Statement, error) {
 		}
 		if analyze {
 			return nil, pgerror.Newf(pgcode.Syntax, "the JSON flag cannot be used with ANALYZE")
+		}
+	}
+
+	if opts.Flags[ExplainFlagEnv] {
+		if opts.Mode != ExplainOpt {
+			return nil, pgerror.Newf(pgcode.Syntax, "the ENV flag can only be used with OPT")
+		}
+	}
+
+	if opts.Flags[ExplainFlagRedact] {
+		// TODO(michae2): Support redaction of other EXPLAIN modes.
+		switch opts.Mode {
+		case ExplainPlan:
+		case ExplainOpt:
+		case ExplainVec:
+		case ExplainDebug:
+		default:
+			return nil, unimplemented.Newf(
+				"EXPLAIN (REDACT)", "the REDACT flag cannot be used with %s", opts.Mode,
+			)
+		}
+
+		if opts.Flags[ExplainFlagEnv] {
+			return nil, unimplemented.Newf(
+				"EXPLAIN (REDACT)", "the REDACT flag cannot be used with %s, ENV", opts.Mode,
+			)
 		}
 	}
 

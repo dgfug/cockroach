@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,11 +12,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -29,41 +25,44 @@ import (
 func registerSchemaChangeDuringKV(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    `schemachange/during/kv`,
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(5),
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds: registry.Clouds(spec.GCE, spec.Local),
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup?AUTH=implicit`
+			const fixturePath = `gs://cockroach-fixtures-us-east1/workload/tpch/scalefactor=10/backup?AUTH=implicit`
 
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-
-			c.Start(ctx, c.All())
-			db := c.Conn(ctx, 1)
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
 
 			m := c.NewMonitor(ctx, c.All())
 			m.Go(func(ctx context.Context) error {
 				t.Status("loading fixture")
-				if _, err := db.Exec(`RESTORE DATABASE tpch FROM $1`, fixturePath); err != nil {
+				if _, err := db.Exec(
+					`RESTORE DATABASE tpch FROM $1 WITH unsafe_restore_incompatible_version`, fixturePath); err != nil {
 					t.Fatal(err)
 				}
 				return nil
 			})
 			m.Wait()
 
-			c.Run(ctx, c.Node(1), `./workload init kv --drop --db=test`)
+			c.Run(ctx, option.WithNodes(c.Node(1)), `./cockroach workload init kv --drop --db=test {pgurl:1}`)
 			for node := 1; node <= c.Spec().NodeCount; node++ {
 				node := node
 				// TODO(dan): Ideally, the test would fail if this queryload failed,
 				// but we can't put it in monitor as-is because the test deadlocks.
 				go func() {
-					const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127 --db=test`
+					const cmd = `./cockroach workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127 --db=test {pgurl%s}`
 					l, err := t.L().ChildLogger(fmt.Sprintf(`kv-%d`, node))
 					if err != nil {
 						t.Fatal(err)
 					}
 					defer l.Close()
-					_ = c.RunE(ctx, c.Node(node), cmd)
+					_ = c.RunE(ctx, option.WithNodes(c.Node(node)), fmt.Sprintf(cmd, c.Nodes(node)))
 				}()
 			}
 
@@ -292,24 +291,28 @@ func findIndexProblem(
 	return nil
 }
 
-func registerSchemaChangeIndexTPCC1000(r registry.Registry) {
-	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5, spec.CPU(16)), 1000, time.Hour*2))
+func registerSchemaChangeIndexTPCC800(r registry.Registry) {
+	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5, spec.CPU(16), spec.WorkloadNode()), 800, time.Hour*2))
 }
 
 func registerSchemaChangeIndexTPCC100(r registry.Registry) {
-	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5), 100, time.Minute*15))
+	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5, spec.WorkloadNode()), 100, time.Minute*15))
 }
 
 func makeIndexAddTpccTest(
 	spec spec.ClusterSpec, warehouses int, length time.Duration,
 ) registry.TestSpec {
 	return registry.TestSpec{
-		Name:    fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: spec,
-		Timeout: length * 3,
+		Name:             fmt.Sprintf("schemachange/indexschemachange/index/tpcc/w=%d", warehouses),
+		Owner:            registry.OwnerSQLFoundations,
+		Benchmark:        true,
+		Cluster:          spec,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
+		Timeout:          length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCC(ctx, t, c, tpccOptions{
+			runTPCC(ctx, t, t.L(), c, tpccOptions{
 				Warehouses: warehouses,
 				// We limit the number of workers because the default results in a lot
 				// of connections which can lead to OOM issues (see #40566).
@@ -329,17 +332,22 @@ func makeIndexAddTpccTest(
 }
 
 func registerSchemaChangeBulkIngest(r registry.Registry) {
-	r.Add(makeSchemaChangeBulkIngestTest(r, 5, 100000000, time.Minute*20))
+	// Allow a long running time to account for runs that use a
+	// cockroach build with runtime assertions enabled.
+	r.Add(makeSchemaChangeBulkIngestTest(r, 5, 100000000, time.Minute*60))
 }
 
 func makeSchemaChangeBulkIngestTest(
 	r registry.Registry, numNodes, numRows int, length time.Duration,
 ) registry.TestSpec {
 	return registry.TestSpec{
-		Name:    "schemachange/bulkingest",
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: r.MakeClusterSpec(numNodes),
-		Timeout: length * 2,
+		Name:             "schemachange/bulkingest",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
+		Timeout:          length * 2,
 		// `fixtures import` (with the workload paths) is not supported in 2.1
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// Configure column a to have sequential ascending values, and columns b and c to be constant.
@@ -352,13 +360,9 @@ func makeSchemaChangeBulkIngestTest(
 			cNum := 1
 			payloadBytes := 4
 
-			crdbNodes := c.Range(1, c.Spec().NodeCount-1)
-			workloadNode := c.Node(c.Spec().NodeCount)
-
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
 			// TODO (lucy): Remove flag once the faster import is enabled by default
-			c.Start(ctx, crdbNodes, option.StartArgs("--env=COCKROACH_IMPORT_WORKLOAD_FASTER=true"))
+			settings := install.MakeClusterSettings(install.EnvOption([]string{"COCKROACH_IMPORT_WORKLOAD_FASTER=true"}))
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.CRDBNodes())
 
 			// Don't add another index when importing.
 			cmdWrite := fmt.Sprintf(
@@ -368,25 +372,25 @@ func makeSchemaChangeBulkIngestTest(
 				aNum, bNum, cNum, payloadBytes,
 			)
 
-			c.Run(ctx, workloadNode, cmdWrite)
+			c.Run(ctx, option.WithNodes(c.WorkloadNode()), cmdWrite)
 
-			m := c.NewMonitor(ctx, crdbNodes)
+			m := c.NewMonitor(ctx, c.CRDBNodes())
 
 			indexDuration := length
 			if c.IsLocal() {
 				indexDuration = time.Second * 30
 			}
 			cmdWriteAndRead := fmt.Sprintf(
-				"./workload run bulkingest --duration %s {pgurl:1-%d} --a %d --b %d --c %d --payload-bytes %d",
+				"./cockroach workload run bulkingest --duration %s {pgurl:1-%d} --a %d --b %d --c %d --payload-bytes %d",
 				indexDuration.String(), c.Spec().NodeCount-1, aNum, bNum, cNum, payloadBytes,
 			)
 			m.Go(func(ctx context.Context) error {
-				c.Run(ctx, workloadNode, cmdWriteAndRead)
+				c.Run(ctx, option.WithNodes(c.WorkloadNode()), cmdWriteAndRead)
 				return nil
 			})
 
 			m.Go(func(ctx context.Context) error {
-				db := c.Conn(ctx, 1)
+				db := c.Conn(ctx, t.L(), 1)
 				defer db.Close()
 
 				if !c.IsLocal() {
@@ -413,20 +417,24 @@ func makeSchemaChangeBulkIngestTest(
 	}
 }
 
-func registerSchemaChangeDuringTPCC1000(r registry.Registry) {
-	r.Add(makeSchemaChangeDuringTPCC(r.MakeClusterSpec(5, spec.CPU(16)), 1000, time.Hour*3))
+func registerSchemaChangeDuringTPCC800(r registry.Registry) {
+	r.Add(makeSchemaChangeDuringTPCC(r.MakeClusterSpec(5, spec.CPU(16), spec.WorkloadNode()), 800, time.Hour*3))
 }
 
 func makeSchemaChangeDuringTPCC(
 	spec spec.ClusterSpec, warehouses int, length time.Duration,
 ) registry.TestSpec {
 	return registry.TestSpec{
-		Name:    "schemachange/during/tpcc",
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: spec,
-		Timeout: length * 3,
+		Name:             "schemachange/during/tpcc",
+		Owner:            registry.OwnerSQLFoundations,
+		Benchmark:        true,
+		Cluster:          spec,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
+		Timeout:          length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCC(ctx, t, c, tpccOptions{
+			runTPCC(ctx, t, t.L(), c, tpccOptions{
 				Warehouses: warehouses,
 				// We limit the number of workers because the default results in a lot
 				// of connections which can lead to OOM issues (see #40566).
@@ -478,7 +486,7 @@ func makeSchemaChangeDuringTPCC(
 func runAndLogStmts(
 	ctx context.Context, t test.Test, c cluster.Cluster, prefix string, stmts []string,
 ) error {
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 	t.L().Printf("%s: running %d statements\n", prefix, len(stmts))
 	start := timeutil.Now()

@@ -1,18 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/twpayne/go-geom"
 )
 
@@ -105,7 +101,7 @@ func LineCrossingDirection(geometry1, geometry2 geo.Geometry) (LineCrossingDirec
 	g2, ok2 := t2.(*geom.LineString)
 
 	if !ok1 || !ok2 {
-		return 0, errors.New("arguments must be LINESTRING")
+		return 0, pgerror.Newf(pgcode.InvalidParameterValue, "arguments must be LINESTRING")
 	}
 
 	line1, line2 := g1.Coords(), g2.Coords()

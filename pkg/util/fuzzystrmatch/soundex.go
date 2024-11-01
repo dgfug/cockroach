@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package fuzzystrmatch
 
@@ -18,8 +13,13 @@ import (
 // The soundex code consists of four characters.
 const soundexLen = 4
 
-//                    ABCDEFGHIJKLMNOPQRSTUVWXYZ
+// ABCDEFGHIJKLMNOPQRSTUVWXYZ
 const soundexTable = "01230120022455012623010202"
+
+func IsAlpha(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z')
+}
 
 func soundexCode(r rune) byte {
 	letter := byte(unicode.ToUpper(r))
@@ -32,10 +32,7 @@ func soundexCode(r rune) byte {
 func soundex(source string) string {
 	// Skip leading non-alphabetic characters
 	source = strings.TrimLeftFunc(source, func(r rune) bool {
-		if r <= unicode.MaxASCII {
-			return !(unicode.IsUpper(r) || unicode.IsLower(r))
-		}
-		return false
+		return !IsAlpha(r)
 	})
 	code := make([]byte, soundexLen)
 	// No string left
@@ -48,20 +45,16 @@ func soundex(source string) string {
 		code[0] = byte(unicode.ToUpper(runes[0]))
 	}
 	j := 1
-	for i := 1; i < len(runes); i++ {
-		if runes[i] > unicode.MaxASCII {
-			j++
+	for i := 1; i < len(runes) && j < soundexLen; i++ {
+		if !IsAlpha(runes[i]) {
+			continue
 		}
-		if (unicode.IsUpper(runes[i]) || unicode.IsLower(runes[i])) &&
-			soundexCode(runes[i]) != soundexCode(runes[i-1]) {
+		if soundexCode(runes[i]) != soundexCode(runes[i-1]) {
 			c := soundexCode(runes[i])
 			if c != '0' {
 				code[j] = c
 				j++
 			}
-		}
-		if j == soundexLen {
-			break
 		}
 	}
 	// Fill with 0's at the end

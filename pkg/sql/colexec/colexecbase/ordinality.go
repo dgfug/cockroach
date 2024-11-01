@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase
 
@@ -54,11 +49,6 @@ func (c *ordinalityOp) Next() coldata.Batch {
 	}
 
 	outputVec := bat.ColVec(c.outputIdx)
-	if outputVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		outputVec.Nulls().UnsetNulls()
-	}
 	col := outputVec.Int64()
 	sel := bat.Selection()
 

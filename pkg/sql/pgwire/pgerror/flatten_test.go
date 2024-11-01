@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgerror_test
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -21,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/testutils"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,14 +82,14 @@ func TestFlatten(t *testing.T) {
 			},
 		},
 		{
-			errors.Wrap(&roachpb.TransactionRetryWithProtoRefreshError{Msg: "woo"}, ""),
+			errors.Wrap(&kvpb.TransactionRetryWithProtoRefreshError{MsgRedactable: "woo"}, ""),
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckRegexpEqual(e.Message, "restart transaction: .* woo")
 				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.SerializationFailure)
 			},
 		},
 		{
-			errors.Wrap(&roachpb.AmbiguousResultError{Message: "woo"}, ""),
+			errors.Wrap(kvpb.NewAmbiguousResultErrorf("woo"), ""),
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckRegexpEqual(e.Message, "result is ambiguous.*woo")
 				t.CheckEqual(pgcode.MakeCode(e.Code), pgcode.StatementCompletionUnknown)
@@ -100,9 +97,10 @@ func TestFlatten(t *testing.T) {
 		},
 		{
 			errors.Wrap(
-				roachpb.NewTransactionRetryWithProtoRefreshError(
+				kvpb.NewTransactionRetryWithProtoRefreshError(
 					"test",
 					uuid.MakeV4(),
+					0,
 					roachpb.Transaction{},
 				),
 				"",
@@ -113,9 +111,10 @@ func TestFlatten(t *testing.T) {
 		},
 		{
 			errors.Wrap(
-				roachpb.NewTransactionRetryWithProtoRefreshError(
-					roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil).Error(),
+				kvpb.NewTransactionRetryWithProtoRefreshError(
+					redact.Sprint(kvpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, hlc.Timestamp{}, hlc.ClockTimestamp{})),
 					uuid.MakeV4(),
+					0,
 					roachpb.Transaction{},
 				),
 				"",
@@ -126,9 +125,10 @@ func TestFlatten(t *testing.T) {
 		},
 		{
 			errors.Wrap(
-				roachpb.NewTransactionRetryWithProtoRefreshError(
-					roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "").Error(),
+				kvpb.NewTransactionRetryWithProtoRefreshError(
+					redact.Sprint(kvpb.NewTransactionRetryError(kvpb.RETRY_SERIALIZABLE, "")),
 					uuid.MakeV4(),
+					0,
 					roachpb.Transaction{},
 				),
 				"",
@@ -139,9 +139,10 @@ func TestFlatten(t *testing.T) {
 		},
 		{
 			errors.Wrap(
-				roachpb.NewTransactionRetryWithProtoRefreshError(
-					roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED).Error(),
+				kvpb.NewTransactionRetryWithProtoRefreshError(
+					redact.Sprint(kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_PUSHER_ABORTED)),
 					uuid.MakeV4(),
+					0,
 					roachpb.Transaction{},
 				),
 				"",

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -36,7 +32,7 @@ func TestRecoverTxn(t *testing.T) {
 	ctx := context.Background()
 	k, k2 := roachpb.Key("a"), roachpb.Key("b")
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1, 0, false /* omitInRangefeeds */)
 	txn.Status = roachpb.STAGING
 	txn.LockSpans = []roachpb.Span{{Key: k}}
 	txn.InFlightWrites = []roachpb.SequencedWrite{{Key: k2, Sequence: 0}}
@@ -48,19 +44,19 @@ func TestRecoverTxn(t *testing.T) {
 		// Write the transaction record.
 		txnKey := keys.TransactionKey(txn.Key, txn.ID)
 		txnRecord := txn.AsRecord()
-		if err := storage.MVCCPutProto(ctx, db, nil, txnKey, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+		if err := storage.MVCCPutProto(ctx, db, txnKey, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{}); err != nil {
 			t.Fatal(err)
 		}
 
 		// Issue a RecoverTxn request.
-		var resp roachpb.RecoverTxnResponse
+		var resp kvpb.RecoverTxnResponse
 		if _, err := RecoverTxn(ctx, db, CommandArgs{
-			Args: &roachpb.RecoverTxnRequest{
-				RequestHeader:       roachpb.RequestHeader{Key: txn.Key},
+			Args: &kvpb.RecoverTxnRequest{
+				RequestHeader:       kvpb.RequestHeader{Key: txn.Key},
 				Txn:                 txn.TxnMeta,
 				ImplicitlyCommitted: !missingWrite,
 			},
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Timestamp: ts,
 			},
 		}, &resp); err != nil {
@@ -103,7 +99,7 @@ func TestRecoverTxnRecordChanged(t *testing.T) {
 	ctx := context.Background()
 	k := roachpb.Key("a")
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1, 0, false /* omitInRangefeeds */)
 	txn.Status = roachpb.STAGING
 
 	testCases := []struct {
@@ -224,19 +220,19 @@ func TestRecoverTxnRecordChanged(t *testing.T) {
 			// request is evaluated.
 			txnKey := keys.TransactionKey(txn.Key, txn.ID)
 			txnRecord := c.changedTxn.AsRecord()
-			if err := storage.MVCCPutProto(ctx, db, nil, txnKey, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+			if err := storage.MVCCPutProto(ctx, db, txnKey, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{}); err != nil {
 				t.Fatal(err)
 			}
 
 			// Issue a RecoverTxn request.
-			var resp roachpb.RecoverTxnResponse
+			var resp kvpb.RecoverTxnResponse
 			_, err := RecoverTxn(ctx, db, CommandArgs{
-				Args: &roachpb.RecoverTxnRequest{
-					RequestHeader:       roachpb.RequestHeader{Key: txn.Key},
+				Args: &kvpb.RecoverTxnRequest{
+					RequestHeader:       kvpb.RequestHeader{Key: txn.Key},
 					Txn:                 txn.TxnMeta,
 					ImplicitlyCommitted: c.implicitlyCommitted,
 				},
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Timestamp: ts,
 				},
 			}, &resp)

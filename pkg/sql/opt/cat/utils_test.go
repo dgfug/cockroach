@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat_test
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -41,12 +37,12 @@ func TestExpandDataSourceGlob(t *testing.T) {
 		expectedError string
 	}{
 		{
-			pattern:       tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "a"),
+			pattern:       tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "a"),
 			expectedNames: `[t.public.a]`,
 			expectedIDs:   `[53]`,
 		},
 		{
-			pattern:       tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "z"),
+			pattern:       tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "z"),
 			expectedError: `error: no data source matches prefix: "t.public.z"`,
 		},
 		{
@@ -94,114 +90,6 @@ func TestExpandDataSourceGlob(t *testing.T) {
 		}
 		if len(tc.expectedIDs) > 0 && IDsRes != tc.expectedIDs {
 			t.Errorf("pattern: %v  expectedIDs: %s  got: %s", tc.pattern, tc.expectedIDs, IDsRes)
-		}
-	}
-}
-
-func TestResolveTableIndex(t *testing.T) {
-	testcat := testcat.New()
-	ctx := context.Background()
-
-	exec := func(sql string) {
-		if _, err := testcat.ExecuteDDL(sql); err != nil {
-			t.Fatal(err)
-		}
-	}
-	exec("CREATE TABLE a (x INT, INDEX idx1(x))")
-	exec("CREATE TABLE b (x INT, INDEX idx2(x))")
-	exec("CREATE TABLE c (x INT, INDEX idx2(x))")
-
-	testCases := []struct {
-		name     tree.TableIndexName
-		expected string
-	}{
-		// Both table name and index are set.
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("t", tree.PublicSchemaName, "a"),
-				Index: "idx1",
-			},
-			expected: `t.public.a@idx1`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("t", tree.PublicSchemaName, "a"),
-				Index: "idx2",
-			},
-			expected: `error: index "idx2" does not exist`,
-		},
-
-		// Only table name is set.
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("t", tree.PublicSchemaName, "a"),
-			},
-			expected: `t.public.a@a_pkey`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("z", tree.PublicSchemaName, "a"),
-			},
-			expected: `error: no data source matches prefix: "z.public.a"`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("t", tree.PublicSchemaName, "z"),
-			},
-			expected: `error: no data source matches prefix: "t.public.z"`,
-		},
-
-		// Only index name is set.
-		{
-			name: tree.TableIndexName{
-				Index: "idx1",
-			},
-			expected: `t.public.a@idx1`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("t", tree.PublicSchemaName, ""),
-				Index: "idx1",
-			},
-			expected: `t.public.a@idx1`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: func() tree.TableName {
-					var t tree.TableName
-					t.SchemaName = "public"
-					t.ExplicitSchema = true
-					return t
-				}(),
-				Index: "idx1",
-			},
-			expected: `t.public.a@idx1`,
-		},
-		{
-			name: tree.TableIndexName{
-				Table: tree.MakeTableNameWithSchema("z", tree.PublicSchemaName, ""),
-				Index: "idx1",
-			},
-			expected: `error: target database or schema does not exist`,
-		},
-		{
-			name: tree.TableIndexName{
-				Index: "idx2",
-			},
-			expected: `error: index name "idx2" is ambiguous (found in t.public.c and t.public.b)`,
-		},
-	}
-
-	for _, tc := range testCases {
-		var res string
-		idx, tn, err := cat.ResolveTableIndex(ctx, testcat, cat.Flags{}, &tc.name)
-		if err != nil {
-			res = fmt.Sprintf("error: %v", err)
-		} else {
-			res = fmt.Sprintf("%s@%s", tn.FQString(), idx.Name())
-		}
-		if res != tc.expected {
-			t.Errorf("pattern: %v  expected: %s  got: %s", tc.name.String(), tc.expected, res)
 		}
 	}
 }

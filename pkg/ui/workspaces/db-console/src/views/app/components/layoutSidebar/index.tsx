@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React from "react";
 import { connect } from "react-redux";
@@ -14,8 +9,8 @@ import { Link, withRouter, RouteComponentProps } from "react-router-dom";
 
 import { SideNavigation } from "src/components";
 import "./navigation-bar.styl";
-import { AdminUIState } from "src/redux/state";
 import { isSingleNodeCluster } from "src/redux/nodes";
+import { AdminUIState } from "src/redux/state";
 
 interface RouteParam {
   path: string;
@@ -45,18 +40,29 @@ export class Sidebar extends React.Component<SidebarProps> {
       activeFor: ["/sql-activity", "/session", "/transaction", "/statement"],
     },
     {
+      path: "/insights",
+      text: "Insights",
+      activeFor: ["/insights"],
+    },
+    {
       path: "/reports/network",
-      text: "Network Latency",
+      text: "Network",
       activeFor: ["/reports/network"],
-      // Do not show Network Latency for single node cluster.
+      // Do not show Network for single node cluster.
       isHidden: () => this.props.isSingleNodeCluster,
     },
+    {
+      path: "/hotranges",
+      text: "Hot Ranges",
+      activeFor: ["/hotranges", "/reports/range"],
+    },
     { path: "/jobs", text: "Jobs", activeFor: [] },
+    { path: "/schedules", text: "Schedules", activeFor: [] },
     {
       path: "/debug",
       text: "Advanced Debug",
-      activeFor: ["/reports", "/data-distribution", "/raft"],
-      ignoreFor: ["/reports/network"],
+      activeFor: ["/reports", "/data-distribution", "/raft", "/keyvisualizer"],
+      ignoreFor: ["/reports/network", "/reports/range"],
     },
   ];
 

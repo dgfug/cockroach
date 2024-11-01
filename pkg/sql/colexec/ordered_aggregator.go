@@ -1,18 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
@@ -23,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -84,6 +78,7 @@ const (
 type orderedAggregator struct {
 	colexecop.OneInputNode
 	colexecop.InitHelper
+	colexecop.CloserHelper
 
 	state orderedAggregatorState
 
@@ -133,15 +128,18 @@ type orderedAggregator struct {
 	// seenNonEmptyBatch indicates whether a non-empty input batch has been
 	// observed.
 	seenNonEmptyBatch bool
-	datumAlloc        rowenc.DatumAlloc
+	datumAlloc        tree.DatumAlloc
 	toClose           colexecop.Closers
+	cancelChecker     colexecutils.CancelChecker
 }
 
 var _ colexecop.ResettableOperator = &orderedAggregator{}
 var _ colexecop.ClosableOperator = &orderedAggregator{}
 
 // NewOrderedAggregator creates an ordered aggregator.
-func NewOrderedAggregator(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+func NewOrderedAggregator(
+	ctx context.Context, args *colexecagg.NewAggregatorArgs,
+) colexecop.ResettableOperator {
 	for _, aggFn := range args.Spec.Aggregations {
 		if aggFn.FilterColIdx != nil {
 			colexecerror.InternalError(errors.AssertionFailedf("filtering ordered aggregation is not supported"))
@@ -154,7 +152,8 @@ func NewOrderedAggregator(args *colexecagg.NewAggregatorArgs) colexecop.Resettab
 	// We will be reusing the same aggregate functions, so we use 1 as the
 	// allocation size.
 	funcsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		args, args.Spec.Aggregations, 1 /* allocSize */, colexecagg.OrderedAggKind,
+		ctx, args, args.Spec.Aggregations, 1, /* initialAllocSize */
+		1 /* maxAllocSize */, colexecagg.OrderedAggKind,
 	)
 	if err != nil {
 		colexecerror.InternalError(err)
@@ -180,11 +179,13 @@ func (a *orderedAggregator) Init(ctx context.Context) {
 	}
 	a.Input.Init(a.Ctx)
 	a.bucket.init(a.bucket.fns, a.aggHelper.makeSeenMaps(), a.groupCol)
+	a.cancelChecker.Init(ctx)
 }
 
 func (a *orderedAggregator) Next() coldata.Batch {
 	stateAfterOutputting := orderedAggregatorUnknown
 	for {
+		a.cancelChecker.CheckEveryCall()
 		switch a.state {
 		case orderedAggregatorAggregating:
 			if a.scratch.shouldResetInternalBatch {
@@ -253,7 +254,18 @@ func (a *orderedAggregator) Next() coldata.Batch {
 						}
 					})
 				}
-				a.scratch.resumeIdx = a.bucket.fns[0].CurrentOutputIndex()
+				if len(a.bucket.fns) > 0 {
+					a.scratch.resumeIdx = a.bucket.fns[0].CurrentOutputIndex()
+				} else {
+					// When there are no aggregate functions to compute, we
+					// simply need to output the same number of empty rows as
+					// the number of groups.
+					for _, newGroup := range a.groupCol[:batchLength] {
+						if newGroup {
+							a.scratch.resumeIdx++
+						}
+					}
+				}
 			}
 			if batchLength == 0 {
 				a.state = orderedAggregatorOutputting
@@ -268,15 +280,15 @@ func (a *orderedAggregator) Next() coldata.Batch {
 		case orderedAggregatorReallocating:
 			// The ordered aggregator *cannot* limit the capacities of its
 			// internal batches because it works under the assumption that any
-			// input batch can be handled in a single pass, so we don't use a
-			// memory limit here. It is up to the input to limit the size of
-			// batches based on the memory footprint.
-			const maxBatchMemSize = math.MaxInt64
+			// input batch can be handled in a single pass, so we use
+			// ResetMaybeReallocateNoMemLimit. It is up to the input to limit
+			// the size of batches based on the memory footprint.
+			//
 			// Twice the batchSize is allocated to avoid having to check for
 			// overflow when outputting.
 			newMinCapacity := 2 * a.lastReadBatch.Length()
 			if newMinCapacity > coldata.BatchSize() {
-				// ResetMaybeReallocate truncates the capacity to
+				// ResetMaybeReallocateNoMemLimit truncates the capacity to
 				// coldata.BatchSize(), but we actually want a batch with larger
 				// capacity, so we choose to instantiate the batch with fixed
 				// maximal capacity that can be needed by the aggregator.
@@ -284,15 +296,15 @@ func (a *orderedAggregator) Next() coldata.Batch {
 				newMinCapacity = 2 * coldata.BatchSize()
 				a.scratch.Batch = a.allocator.NewMemBatchWithFixedCapacity(a.outputTypes, newMinCapacity)
 			} else {
-				a.scratch.Batch, _ = a.allocator.ResetMaybeReallocate(
-					a.outputTypes, a.scratch.Batch, newMinCapacity, maxBatchMemSize,
+				a.scratch.Batch, _ = a.allocator.ResetMaybeReallocateNoMemLimit(
+					a.outputTypes, a.scratch.Batch, newMinCapacity,
 				)
 			}
 			// We will never copy more than coldata.BatchSize() into the
 			// temporary buffer, so a half of the scratch's capacity will always
 			// be sufficient.
-			a.scratch.tempBuffer, _ = a.allocator.ResetMaybeReallocate(
-				a.outputTypes, a.scratch.tempBuffer, newMinCapacity/2, maxBatchMemSize,
+			a.scratch.tempBuffer, _ = a.allocator.ResetMaybeReallocateNoMemLimit(
+				a.outputTypes, a.scratch.tempBuffer, newMinCapacity/2,
 			)
 			for fnIdx, fn := range a.bucket.fns {
 				fn.SetOutput(a.scratch.ColVec(fnIdx))
@@ -399,6 +411,15 @@ func (a *orderedAggregator) Reset(ctx context.Context) {
 	}
 }
 
-func (a *orderedAggregator) Close() error {
-	return a.toClose.Close()
+func (a *orderedAggregator) Close(ctx context.Context) error {
+	if !a.CloserHelper.Close() {
+		return nil
+	}
+	retErr := a.toClose.Close(ctx)
+	if c, ok := a.Input.(colexecop.Closer); ok {
+		if err := c.Close(ctx); err != nil {
+			retErr = err
+		}
+	}
+	return retErr
 }

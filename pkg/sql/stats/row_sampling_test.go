@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
@@ -20,9 +15,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -31,14 +27,14 @@ import (
 // of a given size and verifies the results are correct.
 func runSampleTest(
 	t *testing.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	numSamples, expectedNumSamples int,
 	ranks []int,
 	memAcc *mon.BoundAccount,
 ) {
 	ctx := context.Background()
 	var sr SampleReservoir
-	sr.Init(numSamples, 1, []*types.T{types.Int}, memAcc, util.MakeFastIntSet(0))
+	sr.Init(numSamples, 1, []*types.T{types.Int}, memAcc, intsets.MakeFast(0))
 	for _, r := range ranks {
 		d := rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(r)))
 		prevCapacity := sr.Cap()
@@ -93,7 +89,7 @@ func runSampleTest(
 func TestSampleReservoir(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 
 	for _, n := range []int{10, 100, 1000, 10000} {
 		rng, _ := randutil.NewTestRand()
@@ -107,17 +103,13 @@ func TestSampleReservoir(t *testing.T) {
 			})
 			for _, mem := range []int64{1 << 8, 1 << 10, 1 << 12} {
 				t.Run(fmt.Sprintf("n=%d/k=%d/mem=%d", n, k, mem), func(t *testing.T) {
-					monitor := mon.NewMonitorWithLimit(
-						"test-monitor",
-						mon.MemoryResource,
-						mem,
-						nil,
-						nil,
-						1,
-						math.MaxInt64,
-						st,
-					)
-					monitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+					monitor := mon.NewMonitor(mon.Options{
+						Name:      "test-monitor",
+						Limit:     mem,
+						Increment: 1,
+						Settings:  st,
+					})
+					monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 					memAcc := monitor.MakeBoundAccount()
 					expectedK := k
 					if mem == 1<<8 && n > 1 && k > 1 {
@@ -135,10 +127,13 @@ func TestSampleReservoir(t *testing.T) {
 }
 
 func TestTruncateDatum(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	runTest := func(d, expected tree.Datum) {
 		actual := truncateDatum(&evalCtx, d, 10 /* maxBytes */)
-		if actual.Compare(&evalCtx, expected) != 0 {
+		if cmp, err := actual.Compare(ctx, &evalCtx, expected); err != nil {
+			t.Fatal(err)
+		} else if cmp != 0 {
 			t.Fatalf("expected %s but found %s", expected.String(), actual.String())
 		}
 	}

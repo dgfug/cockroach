@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package explain
 
@@ -16,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -26,7 +22,7 @@ import (
 // TestFactory is a general API test for Factory. It is not intended as an
 // exhaustive test of all factory Construct methods.
 func TestFactory(t *testing.T) {
-	f := NewFactory(exec.StubFactory{})
+	f := NewFactory(exec.StubFactory{}, &tree.SemaContext{}, &eval.Context{})
 
 	n, err := f.ConstructValues(
 		[][]tree.TypedExpr{
@@ -52,7 +48,10 @@ func TestFactory(t *testing.T) {
 		Cost:     1500.0,
 	})
 
-	plan, err := f.ConstructPlan(n, nil /* subqueries */, nil /* cascades */, nil /* checks */, -1 /* rootRowCount */)
+	plan, err := f.ConstructPlan(
+		n, nil /* subqueries */, nil /* cascades */, nil /* triggers */, nil, /* checks */
+		-1 /* rootRowCount */, 0, /* planFlags */
+	)
 	require.NoError(t, err)
 	p := plan.(*Plan)
 

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package gcjobnotifier provides a mechanism to share a SystemConfigDeltaFilter
 // among all gc jobs.
@@ -60,6 +55,12 @@ func New(
 	return n
 }
 
+// SystemConfigProvider provides access to the notifier's underlying
+// SystemConfigProvider.
+func (n *Notifier) SystemConfigProvider() config.SystemConfigProvider {
+	return n.provider
+}
+
 func noopFunc() {}
 
 // AddNotifyee should be called prior to the first reading of the system config.
@@ -86,8 +87,11 @@ func (n *Notifier) AddNotifyee(ctx context.Context) (onChange <-chan struct{}, c
 	if n.mu.deltaFilter == nil {
 		zoneCfgFilter := gossip.MakeSystemConfigDeltaFilter(n.prefix)
 		n.mu.deltaFilter = &zoneCfgFilter
-		// Initialize the filter with the current values.
-		n.mu.deltaFilter.ForModified(n.provider.GetSystemConfig(), func(kv roachpb.KeyValue) {})
+		// Initialize the filter with the current values, if they exist.
+		cfg := n.provider.GetSystemConfig()
+		if cfg != nil {
+			n.mu.deltaFilter.ForModified(cfg, func(kv roachpb.KeyValue) {})
+		}
 	}
 	c := make(chan struct{}, 1)
 	n.mu.notifyees[c] = struct{}{}
@@ -131,12 +135,12 @@ func (n *Notifier) Start(ctx context.Context) {
 
 func (n *Notifier) run(_ context.Context) {
 	defer n.markStopped()
-	gossipUpdateCh := n.provider.RegisterSystemConfigChannel()
+	systemConfigUpdateCh, _ := n.provider.RegisterSystemConfigChannel()
 	for {
 		select {
 		case <-n.stopper.ShouldQuiesce():
 			return
-		case <-gossipUpdateCh:
+		case <-systemConfigUpdateCh:
 			n.maybeNotify()
 		}
 	}
@@ -161,7 +165,10 @@ func (n *Notifier) maybeNotify() {
 	if !zoneConfigUpdated {
 		return
 	}
+	n.notifyLocked()
+}
 
+func (n *Notifier) notifyLocked() {
 	for c := range n.mu.notifyees {
 		select {
 		case c <- struct{}{}:

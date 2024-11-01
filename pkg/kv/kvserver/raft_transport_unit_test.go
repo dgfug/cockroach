@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -18,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/node_rac2"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -29,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRaftTransportStartNewQueue(t *testing.T) {
@@ -43,35 +39,44 @@ func TestRaftTransportStartNewQueue(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	st := cluster.MakeTestingClusterSettings()
-	rpcC := rpc.NewContext(rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   &base.Config{Insecure: true},
-		Clock:    hlc.NewClock(hlc.UnixNano, 500*time.Millisecond),
-		Stopper:  stopper,
-		Settings: st,
-	})
-	rpcC.ClusterID.Set(context.Background(), uuid.MakeV4())
+	opts := rpc.DefaultContextOptions()
+	opts.Insecure = true
+	opts.ToleratedOffset = 500 * time.Millisecond
+	opts.Stopper = stopper
+	opts.Settings = st
+
+	rpcC := rpc.NewContext(ctx, opts)
+
+	rpcC.StorageClusterID.Set(context.Background(), uuid.MakeV4())
 
 	// mrs := &dummyMultiRaftServer{}
 
-	grpcServer := rpc.NewServer(rpcC)
+	grpcServer, err := rpc.NewServer(ctx, rpcC)
+	require.NoError(t, err)
 	// RegisterMultiRaftServer(grpcServer, mrs)
 
 	var addr net.Addr
 
-	resolver := func(roachpb.NodeID) (net.Addr, error) {
+	resolver := func(roachpb.NodeID) (net.Addr, roachpb.Locality, error) {
 		if addr == nil {
-			return nil, errors.New("no addr yet") // should not happen in this test
+			return nil, roachpb.Locality{}, errors.New("no addr yet") // should not happen in this test
 		}
-		return addr, nil
+		return addr, roachpb.Locality{}, nil
 	}
 
 	tp := NewRaftTransport(
-		log.AmbientContext{Tracer: tracing.NewTracer()},
+		log.MakeTestingAmbientCtxWithNewTracer(),
 		cluster.MakeTestingClusterSettings(),
+		stopper,
+		hlc.NewClockForTesting(nil),
 		nodedialer.New(rpcC, resolver),
 		grpcServer,
-		stopper,
+		kvflowdispatch.NewDummyDispatch(),
+		NoopStoresFlowControlIntegration{},
+		NoopRaftTransportDisconnectListener{},
+		(*node_rac2.AdmittedPiggybacker)(nil),
+		nil, /* PiggybackedAdmittedResponseScheduler */
+		nil, /* knobs */
 	)
 
 	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "localhost:0"})
@@ -87,8 +92,7 @@ func TestRaftTransportStartNewQueue(t *testing.T) {
 		}
 	}()
 
-	_, existingQueue := tp.getQueue(1, rpc.SystemClass)
-	if existingQueue {
+	if _, existingQueue := tp.getQueue(1, rpc.SystemClass); existingQueue {
 		t.Fatal("queue already exists")
 	}
 	timeout := time.Duration(rand.Int63n(int64(5 * time.Millisecond)))
@@ -104,8 +108,7 @@ func TestRaftTransportStartNewQueue(t *testing.T) {
 		ln = nil
 		wg.Done()
 	}()
-	var stats raftTransportStats
-	tp.startProcessNewQueue(ctxBoom, 1, rpc.SystemClass, &stats)
+	tp.startProcessNewQueue(ctxBoom, 1, rpc.SystemClass)
 
 	wg.Wait()
 }

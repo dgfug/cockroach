@@ -1,19 +1,16 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys
 
 import (
 	"bytes"
 	"fmt"
+	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -60,8 +57,11 @@ func StoreGossipKey() roachpb.Key {
 	return MakeStoreKey(localStoreGossipSuffix, nil)
 }
 
-// StoreClusterVersionKey returns a store-local key for the cluster version.
-func StoreClusterVersionKey() roachpb.Key {
+// DeprecatedStoreClusterVersionKey returns a store-local key for the cluster version.
+//
+// We no longer use this key, but still write it out for interoperability with
+// older versions.
+func DeprecatedStoreClusterVersionKey() roachpb.Key {
 	return MakeStoreKey(localStoreClusterVersionSuffix, nil)
 }
 
@@ -97,6 +97,49 @@ func DecodeNodeTombstoneKey(key roachpb.Key) (roachpb.NodeID, error) {
 	return roachpb.NodeID(nodeID), err
 }
 
+// StoreLivenessRequesterMetaKey returns the key for the local store's Store
+// Liveness requester metadata.
+func StoreLivenessRequesterMetaKey() roachpb.Key {
+	return MakeStoreKey(localStoreLivenessRequesterMeta, nil)
+}
+
+// StoreLivenessSupporterMetaKey returns the key for the local store's Store
+// Liveness supporter metadata.
+func StoreLivenessSupporterMetaKey() roachpb.Key {
+	return MakeStoreKey(localStoreLivenessSupporterMeta, nil)
+}
+
+// StoreLivenessSupportForKey returns the key for the Store Liveness support
+// by the local store for a given store identified by nodeID and storeID.
+func StoreLivenessSupportForKey(nodeID roachpb.NodeID, storeID roachpb.StoreID) roachpb.Key {
+	nodeIDAndStoreID := uint64(nodeID)<<32 | uint64(storeID)
+	return MakeStoreKey(
+		localStoreLivenessSupportFor, encoding.EncodeUint64Ascending(nil, nodeIDAndStoreID),
+	)
+}
+
+// DecodeStoreLivenessSupportForKey returns the node ID and store ID of a given
+// localStoreLivenessSupportFor key.
+func DecodeStoreLivenessSupportForKey(key roachpb.Key) (roachpb.NodeID, roachpb.StoreID, error) {
+	suffix, detail, err := DecodeStoreKey(key)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !suffix.Equal(localStoreLivenessSupportFor) {
+		return 0, 0, errors.Errorf("key with suffix %q != %q", suffix, localStoreLivenessSupportFor)
+	}
+	detail, nodeIDAndStoreID, err := encoding.DecodeUint64Ascending(detail)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(detail) != 0 {
+		return 0, 0, errors.Errorf("invalid key has trailing garbage: %q", detail)
+	}
+	nodeID := roachpb.NodeID(nodeIDAndStoreID >> 32)
+	storeID := roachpb.StoreID(nodeIDAndStoreID & math.MaxUint32)
+	return nodeID, storeID, nil
+}
+
 // StoreCachedSettingsKey returns a store-local key for store's cached settings.
 func StoreCachedSettingsKey(settingKey roachpb.Key) roachpb.Key {
 	return MakeStoreKey(localStoreCachedSettingsSuffix, encoding.EncodeBytesAscending(nil, settingKey))
@@ -121,6 +164,46 @@ func DecodeStoreCachedSettingsKey(key roachpb.Key) (settingKey roachpb.Key, err 
 		return nil, errors.Errorf("invalid key has trailing garbage: %q", detail)
 	}
 	return
+}
+
+// StoreLossOfQuorumRecoveryStatusKey is a key used for storing results of loss
+// of quorum recovery plan application.
+func StoreLossOfQuorumRecoveryStatusKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryStatusSuffix, nil)
+}
+
+// StoreLossOfQuorumRecoveryCleanupActionsKey is a key used for storing data for
+// post recovery cleanup actions node would perform after restart if plan was
+// applied.
+func StoreLossOfQuorumRecoveryCleanupActionsKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryCleanupActionsSuffix, nil)
+}
+
+// StoreUnsafeReplicaRecoveryKey creates a key for loss of quorum replica
+// recovery entry. Those keys are written by `debug recover apply-plan` command
+// on the store while node is stopped. Once node boots up, entries are
+// translated into structured log events to leave audit trail of recovery
+// operation.
+func StoreUnsafeReplicaRecoveryKey(uuid uuid.UUID) roachpb.Key {
+	key := make(roachpb.Key, 0, len(LocalStoreUnsafeReplicaRecoveryKeyMin)+len(uuid))
+	key = append(key, LocalStoreUnsafeReplicaRecoveryKeyMin...)
+	key = append(key, uuid.GetBytes()...)
+	return key
+}
+
+// DecodeStoreUnsafeReplicaRecoveryKey decodes uuid key used to create record
+// key for unsafe replica recovery record.
+func DecodeStoreUnsafeReplicaRecoveryKey(key roachpb.Key) (uuid.UUID, error) {
+	if !bytes.HasPrefix(key, LocalStoreUnsafeReplicaRecoveryKeyMin) {
+		return uuid.UUID{},
+			errors.Errorf("key %q does not have %q prefix", string(key), LocalRangeIDPrefix)
+	}
+	remainder := key[len(LocalStoreUnsafeReplicaRecoveryKeyMin):]
+	entryID, err := uuid.FromBytes(remainder)
+	if err != nil {
+		return entryID, errors.Wrap(err, "failed to get uuid from unsafe replica recovery key")
+	}
+	return entryID, nil
 }
 
 // NodeLivenessKey returns the key for the node liveness record.
@@ -206,6 +289,16 @@ func AbortSpanKey(rangeID roachpb.RangeID, txnID uuid.UUID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).AbortSpanKey(txnID)
 }
 
+// ReplicatedSharedLocksTransactionLatchingKey returns a range-local key, based
+// on the provided range ID and transaction ID, that all replicated shared
+// locking requests from the specified transaction should use to serialize on
+// latches.
+func ReplicatedSharedLocksTransactionLatchingKey(
+	rangeID roachpb.RangeID, txnID uuid.UUID,
+) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).ReplicatedSharedLocksTransactionLatchingKey(txnID)
+}
+
 // DecodeAbortSpanKey decodes the provided AbortSpan entry,
 // returning the transaction ID.
 func DecodeAbortSpanKey(key roachpb.Key, dest []byte) (uuid.UUID, error) {
@@ -249,6 +342,18 @@ func RangePriorReadSummaryKey(rangeID roachpb.RangeID) roachpb.Key {
 // user keyspace. Reads and writes <= this timestamp will not be served.
 func RangeGCThresholdKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeGCThresholdKey()
+}
+
+// RangeGCHintKey returns a system-local key for GC hint data. This data is used
+// by GC queue to adjust how replicas are being queued for GC.
+func RangeGCHintKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RangeGCHintKey()
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func MVCCRangeKeyGCKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).MVCCRangeKeyGCKey()
 }
 
 // RangeVersionKey returns a system-local for the range version.
@@ -299,8 +404,26 @@ func RaftLogPrefix(rangeID roachpb.RangeID) roachpb.Key {
 }
 
 // RaftLogKey returns a system-local key for a Raft log entry.
-func RaftLogKey(rangeID roachpb.RangeID, logIndex uint64) roachpb.Key {
+func RaftLogKey(rangeID roachpb.RangeID, logIndex kvpb.RaftIndex) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RaftLogKey(logIndex)
+}
+
+// RaftLogKeyFromPrefix returns a system-local key for a Raft log entry, using
+// the provided Raft log prefix.
+func RaftLogKeyFromPrefix(raftLogPrefix []byte, logIndex kvpb.RaftIndex) roachpb.Key {
+	return encoding.EncodeUint64Ascending(raftLogPrefix, uint64(logIndex))
+}
+
+// DecodeRaftLogKeyFromSuffix parses the suffix of a system-local key for a Raft
+// log entry and returns the entry's log index.
+func DecodeRaftLogKeyFromSuffix(raftLogSuffix []byte) (kvpb.RaftIndex, error) {
+	_, logIndex, err := encoding.DecodeUint64Ascending(raftLogSuffix)
+	return kvpb.RaftIndex(logIndex), err
+}
+
+// RaftReplicaIDKey returns a system-local key for a RaftReplicaID.
+func RaftReplicaIDKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RaftReplicaIDKey()
 }
 
 // RangeLastReplicaGCTimestampKey returns a range-local key for
@@ -316,7 +439,7 @@ func MakeRangeKey(key, suffix, detail roachpb.RKey) roachpb.Key {
 	if len(suffix) != localSuffixLength {
 		panic(fmt.Sprintf("suffix len(%q) != %d", suffix, localSuffixLength))
 	}
-	buf := MakeRangeKeyPrefix(key)
+	buf := makeRangeKeyPrefixWithExtraCapacity(key, len(suffix)+len(detail))
 	buf = append(buf, suffix...)
 	buf = append(buf, detail...)
 	return buf
@@ -324,8 +447,14 @@ func MakeRangeKey(key, suffix, detail roachpb.RKey) roachpb.Key {
 
 // MakeRangeKeyPrefix creates a key prefix under which all range-local keys
 // can be found.
+// gcassert:inline
 func MakeRangeKeyPrefix(key roachpb.RKey) roachpb.Key {
-	buf := make(roachpb.Key, 0, len(LocalRangePrefix)+len(key)+1)
+	return makeRangeKeyPrefixWithExtraCapacity(key, 0)
+}
+
+func makeRangeKeyPrefixWithExtraCapacity(key roachpb.RKey, extra int) roachpb.Key {
+	keyLen := len(LocalRangePrefix) + encoding.EncodeBytesSize(key)
+	buf := make(roachpb.Key, 0, keyLen+extra)
 	buf = append(buf, LocalRangePrefix...)
 	buf = encoding.EncodeBytesAscending(buf, key)
 	return buf
@@ -364,11 +493,7 @@ func RangeDescriptorKey(key roachpb.RKey) roachpb.Key {
 // transaction key and ID. The base key is encoded in order to
 // guarantee that all transaction records for a range sort together.
 func TransactionKey(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
-	rk, err := Addr(key)
-	if err != nil {
-		panic(err)
-	}
-	return MakeRangeKey(rk, LocalTransactionSuffix, roachpb.RKey(txnID.GetBytes()))
+	return MakeRangeKey(MustAddr(key), LocalTransactionSuffix, txnID.GetBytes())
 }
 
 // QueueLastProcessedKey returns a range-local key for last processed
@@ -395,10 +520,7 @@ func RangeProbeKey(key roachpb.RKey) roachpb.Key {
 // For a scan [start, end) the corresponding lock table scan is
 // [LTSK(start), LTSK(end)).
 func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
-	// The +3 accounts for the bytesMarker and terminator. Note that this is a
-	// lower-bound, since the escaping done by EncodeBytesAscending depends on
-	// what bytes are in the key. But we expect this to be usually accurate.
-	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + len(key) + 3
+	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + encoding.EncodeBytesSize(key)
 	if cap(buf) < keyLen {
 		buf = make([]byte, 0, keyLen)
 	} else {
@@ -413,8 +535,26 @@ func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
 	return buf, buf
 }
 
+// LockTableSingleNextKey is equivalent to LockTableSingleKey(key.Next(), buf)
+// but avoids an extra allocation in cases where key.Next() must allocate.
+func LockTableSingleNextKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
+	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + encoding.EncodeNextBytesSize(key)
+	if cap(buf) < keyLen {
+		buf = make([]byte, 0, keyLen)
+	} else {
+		buf = buf[:0]
+	}
+	// Don't unwrap any local prefix on key using Addr(key). This allow for
+	// doubly-local lock table keys. For example, local range descriptor keys can
+	// be locked during split and merge transactions.
+	buf = append(buf, LocalRangeLockTablePrefix...)
+	buf = append(buf, LockTableSingleKeyInfix...)
+	buf = encoding.EncodeNextBytesAscending(buf, key)
+	return buf, buf
+}
+
 // DecodeLockTableSingleKey decodes the single-key lock table key to return the key
-// that was locked..
+// that was locked.
 func DecodeLockTableSingleKey(key roachpb.Key) (lockedKey roachpb.Key, err error) {
 	if !bytes.HasPrefix(key, LocalRangeLockTablePrefix) {
 		return nil, errors.Errorf("key %q does not have %q prefix",
@@ -439,6 +579,34 @@ func DecodeLockTableSingleKey(key roachpb.Key) (lockedKey roachpb.Key, err error
 			key, len(b))
 	}
 	return lockedKey, err
+}
+
+// ValidateLockTableSingleKey is like DecodeLockTableSingleKey, except that it
+// discards the decoded key. It returns nil iff the provided key is a valid
+// single-key lock table key.
+func ValidateLockTableSingleKey(key roachpb.Key) error {
+	if !bytes.HasPrefix(key, LocalRangeLockTablePrefix) {
+		return errors.Errorf("key %q does not have %q prefix",
+			key, LocalRangeLockTablePrefix)
+	}
+	// Cut the prefix.
+	b := key[len(LocalRangeLockTablePrefix):]
+	// Check that it's a single-key lock.
+	if !bytes.HasPrefix(b, LockTableSingleKeyInfix) {
+		return errors.Errorf("key %q is not for a single-key lock", key)
+	}
+	// Cut the prefix.
+	b = b[len(LockTableSingleKeyInfix):]
+	var err error
+	b, err = encoding.ValidateDecodeBytesAscending(b)
+	if err != nil {
+		return err
+	}
+	if len(b) != 0 {
+		return errors.Errorf("key %q has left-over bytes %d after decoding",
+			key, len(b))
+	}
+	return nil
 }
 
 // IsLocal performs a cheap check that returns true iff a range-local key is
@@ -749,6 +917,26 @@ func MakeFamilyKey(key []byte, famID uint32) []byte {
 	return encoding.EncodeUvarintAscending(key, uint64(len(key)-size))
 }
 
+// DecodeFamilyKey returns the family ID in the given row key. Returns an error
+// if the key does not contain a family ID.
+func DecodeFamilyKey(key []byte) (uint32, error) {
+	n, err := GetRowPrefixLength(key)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 || n >= len(key) {
+		return 0, errors.Errorf("invalid row prefix, got prefix length %d for key %s", n, key)
+	}
+	_, colFamilyID, err := encoding.DecodeUvarintAscending(key[n:])
+	if err != nil {
+		return 0, err
+	}
+	if colFamilyID > math.MaxUint32 {
+		return 0, errors.Errorf("column family ID overflow, got %d", colFamilyID)
+	}
+	return uint32(colFamilyID), nil
+}
+
 // DecodeTableIDIndexID decodes a table id followed by an index id from the
 // provided key. The input key must already have its tenant id removed.
 func DecodeTableIDIndexID(key []byte) ([]byte, uint32, uint32, error) {
@@ -782,10 +970,30 @@ func GetRowPrefixLength(key roachpb.Key) (int, error) {
 	}
 	sqlN := len(sqlKey)
 
+	// Check that the prefix contains a valid TableID.
 	if encoding.PeekType(sqlKey) != encoding.Int {
 		// Not a table key, so the row prefix is the entire key.
 		return n, nil
 	}
+	tableIDLen, err := encoding.GetUvarintLen(sqlKey)
+	if err != nil {
+		return 0, err
+	}
+
+	// Check whether the prefix contains a valid IndexID after the TableID. Not
+	// all keys contain an index ID.
+	if encoding.PeekType(sqlKey[tableIDLen:]) != encoding.Int {
+		return n, nil
+	}
+	indexIDLen, err := encoding.GetUvarintLen(sqlKey[tableIDLen:])
+	if err != nil {
+		return 0, err
+	}
+	// If the IndexID is the last part of the key, the entire key is the prefix.
+	if tableIDLen+indexIDLen == sqlN {
+		return n, nil
+	}
+
 	// The column family ID length is encoded as a varint and we take advantage
 	// of the fact that the column family ID itself will be encoded in 0-9 bytes
 	// and thus the length of the column family ID data will fit in a single
@@ -793,7 +1001,7 @@ func GetRowPrefixLength(key roachpb.Key) (int, error) {
 	colFamIDLenByte := sqlKey[sqlN-1:]
 	if encoding.PeekType(colFamIDLenByte) != encoding.Int {
 		// The last byte is not a valid column family ID suffix.
-		return 0, errors.Errorf("%s: not a valid table key", key)
+		return 0, errors.Errorf("%s: not a valid column family ID suffix", key)
 	}
 
 	// Strip off the column family ID suffix from the buf. The last byte of the
@@ -802,7 +1010,7 @@ func GetRowPrefixLength(key roachpb.Key) (int, error) {
 	// 0 (see the optimization in MakeFamilyKey).
 	_, colFamIDLen, err := encoding.DecodeUvarintAscending(colFamIDLenByte)
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrapf(err, "could not decode column family ID length")
 	}
 	// Note how this next comparison (and by extension the code after it) is
 	// overflow-safe. There are more intuitive ways of writing this that aren't
@@ -836,13 +1044,13 @@ func EnsureSafeSplitKey(key roachpb.Key) (roachpb.Key, error) {
 }
 
 // Range returns a key range encompassing the key ranges of all requests.
-func Range(reqs []roachpb.RequestUnion) (roachpb.RSpan, error) {
+func Range(reqs []kvpb.RequestUnion) (roachpb.RSpan, error) {
 	from := roachpb.RKeyMax
 	to := roachpb.RKeyMin
 	for _, arg := range reqs {
 		req := arg.GetInner()
 		h := req.Header()
-		if !roachpb.IsRange(req) && len(h.EndKey) != 0 {
+		if !kvpb.IsRange(req) && len(h.EndKey) != 0 {
 			return roachpb.RSpan{}, errors.Errorf("end key specified for non-range operation: %s", req)
 		}
 
@@ -906,6 +1114,15 @@ func (b RangeIDPrefixBuf) AbortSpanKey(txnID uuid.UUID) roachpb.Key {
 	return encoding.EncodeBytesAscending(key, txnID.GetBytes())
 }
 
+// ReplicatedSharedLocksTransactionLatchingKey returns a range-local key, by
+// range ID, for a key on which all replicated shared locking requests from a
+// specific transaction should serialize on latches. The per-transaction bit is
+// achieved by encoding the supplied transaction ID into the key.
+func (b RangeIDPrefixBuf) ReplicatedSharedLocksTransactionLatchingKey(txnID uuid.UUID) roachpb.Key {
+	key := append(b.replicatedPrefix(), LocalReplicatedSharedLocksTransactionLatchingKeySuffix...)
+	return encoding.EncodeBytesAscending(key, txnID.GetBytes())
+}
+
 // RangeAppliedStateKey returns a system-local key for the range applied state key.
 // See comment on RangeAppliedStateKey function.
 func (b RangeIDPrefixBuf) RangeAppliedStateKey() roachpb.Key {
@@ -926,6 +1143,11 @@ func (b RangeIDPrefixBuf) RangePriorReadSummaryKey() roachpb.Key {
 // RangeGCThresholdKey returns a system-local key for the GC threshold.
 func (b RangeIDPrefixBuf) RangeGCThresholdKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeGCThresholdSuffix...)
+}
+
+// RangeGCHintKey returns a range-local key for the GC hint data.
+func (b RangeIDPrefixBuf) RangeGCHintKey() roachpb.Key {
+	return append(b.replicatedPrefix(), LocalRangeGCHintSuffix...)
 }
 
 // RangeVersionKey returns a system-local key for the range version.
@@ -955,12 +1177,23 @@ func (b RangeIDPrefixBuf) RaftLogPrefix() roachpb.Key {
 }
 
 // RaftLogKey returns a system-local key for a Raft log entry.
-func (b RangeIDPrefixBuf) RaftLogKey(logIndex uint64) roachpb.Key {
-	return encoding.EncodeUint64Ascending(b.RaftLogPrefix(), logIndex)
+func (b RangeIDPrefixBuf) RaftLogKey(logIndex kvpb.RaftIndex) roachpb.Key {
+	return RaftLogKeyFromPrefix(b.RaftLogPrefix(), logIndex)
+}
+
+// RaftReplicaIDKey returns a system-local key for a RaftReplicaID.
+func (b RangeIDPrefixBuf) RaftReplicaIDKey() roachpb.Key {
+	return append(b.unreplicatedPrefix(), LocalRaftReplicaIDSuffix...)
 }
 
 // RangeLastReplicaGCTimestampKey returns a range-local key for
 // the range's last replica GC timestamp.
 func (b RangeIDPrefixBuf) RangeLastReplicaGCTimestampKey() roachpb.Key {
 	return append(b.unreplicatedPrefix(), LocalRangeLastReplicaGCTimestampSuffix...)
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func (b RangeIDPrefixBuf) MVCCRangeKeyGCKey() roachpb.Key {
+	return append(b.unreplicatedPrefix(), LocalRangeMVCCRangeKeyGCLockSuffix...)
 }

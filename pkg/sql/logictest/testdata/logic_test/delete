@@ -61,7 +61,7 @@ SELECT * FROM kv
 statement count 0
 DELETE FROM kv WHERE k=5
 
-query II
+query II rowsort
 DELETE FROM kv RETURNING k, v
 ----
 1 2
@@ -83,7 +83,7 @@ SELECT * FROM unindexed
 1 2
 7 8
 
-query II
+query II rowsort
 DELETE FROM unindexed RETURNING k, v
 ----
 1 2
@@ -96,14 +96,14 @@ SELECT * FROM unindexed
 statement count 4
 INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
 
-query II colnames
+query II colnames,rowsort
 DELETE FROM unindexed WHERE k=3 or v=6 RETURNING *
 ----
 k v
 3 4
 5 6
 
-query II colnames
+query II colnames,rowsort
 DELETE FROM unindexed RETURNING unindexed.*
 ----
 k v
@@ -231,16 +231,16 @@ statement ok
 CREATE TABLE t29494(x INT PRIMARY KEY); INSERT INTO t29494 VALUES (12)
 
 statement ok
-BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 # Check that the new column is not visible
 query T
 SELECT create_statement FROM [SHOW CREATE t29494]
 ----
 CREATE TABLE public.t29494 (
-   x INT8 NOT NULL,
-   CONSTRAINT t29494_pkey PRIMARY KEY (x ASC),
-   FAMILY "primary" (x)
+  x INT8 NOT NULL,
+  CONSTRAINT t29494_pkey PRIMARY KEY (x ASC)
 )
 
 # Check that the new column is not usable in RETURNING
@@ -251,7 +251,8 @@ statement ok
 ROLLBACK
 
 statement ok
-BEGIN; ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t29494 ADD COLUMN y INT NOT NULL DEFAULT 123
 
 query I
 DELETE FROM t29494 RETURNING *
@@ -263,15 +264,12 @@ COMMIT
 
 subtest regression_33361
 
-# Disable automatic stats to avoid flakiness (sometimes causes retry errors).
-statement ok
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
-
 statement ok
 CREATE TABLE t33361(x INT PRIMARY KEY, y INT UNIQUE, z INT); INSERT INTO t33361 VALUES (1, 2, 3)
 
 statement ok
-BEGIN; ALTER TABLE t33361 DROP COLUMN y
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t33361 DROP COLUMN y
 
 statement error column "y" does not exist
 DELETE FROM t33361 RETURNING y
@@ -280,7 +278,8 @@ statement ok
 ROLLBACK
 
 statement ok
-BEGIN; ALTER TABLE t33361 DROP COLUMN y
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE t33361 DROP COLUMN y
 
 query II
 DELETE FROM t33361 RETURNING *; COMMIT
@@ -298,7 +297,8 @@ CREATE TABLE family (
 INSERT INTO family VALUES (1, 1), (2, 2), (3, 3)
 
 statement ok
-BEGIN; ALTER TABLE family ADD COLUMN z INT CREATE FAMILY
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+ALTER TABLE family ADD COLUMN z INT CREATE FAMILY
 
 statement ok
 DELETE FROM family WHERE x=2
@@ -312,9 +312,6 @@ SELECT x, y, z FROM family
 1  1  NULL
 3  3  NULL
 
-statement error at or near "where": syntax error: unimplemented: this syntax
-DELETE FROM family USING family, other_table WHERE x=2
-
 # Verify that the fast path does its deletes at the expected timestamp.
 statement ok
 CREATE TABLE a (a INT PRIMARY KEY)
@@ -322,8 +319,15 @@ CREATE TABLE a (a INT PRIMARY KEY)
 statement ok
 INSERT INTO a SELECT generate_series(1,5)
 
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+
 let $ts
 SELECT cluster_logical_timestamp()
+
+statement ok
+COMMIT
 
 statement ok
 DELETE FROM a WHERE a <= 3
@@ -342,3 +346,257 @@ SELECT * FROM a AS OF SYSTEM TIME $ts
 3
 4
 5
+
+# Test that USING works.
+
+subtest delete_using
+
+statement ok
+CREATE TABLE u_a (
+    a INT NOT NULL PRIMARY KEY,
+    b STRING,
+    c INT
+)
+
+statement ok
+CREATE TABLE u_b (
+  a INT NOT NULL PRIMARY KEY,
+  b STRING
+)
+
+statement ok
+CREATE TABLE u_c (
+  a INT NOT NULL PRIMARY KEY,
+  b STRING,
+  c INT
+)
+
+statement ok
+CREATE TABLE u_d (
+  a INT,
+  b INT
+)
+
+statement ok
+INSERT INTO u_a VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40)
+
+statement ok
+INSERT INTO u_b VALUES (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd')
+
+statement ok
+INSERT INTO u_c VALUES (1, 'a', 10), (2, 'b', 50), (3, 'c', 50), (4, 'd', 40)
+
+# Test a join with a filter.
+statement ok
+DELETE FROM u_a USING u_b WHERE c = u_b.a AND u_b.b = 'd'
+
+query ITI rowsort
+SELECT * FROM u_a;
+----
+1  a  10
+2  b  20
+3  c  30
+
+# Test a self join.
+statement ok
+INSERT INTO u_a VALUES (5, 'd', 5), (6, 'e', 6)
+
+statement ok
+DELETE FROM u_a USING u_a u_a2 WHERE u_a.a = u_a2.c
+
+query ITI rowsort
+SELECT * FROM u_a;
+----
+1  a  10
+2  b  20
+3  c  30
+
+# Test when USING uses multiple tables.
+
+statement ok
+INSERT INTO u_c VALUES (30, 'a', 1)
+
+statement ok
+DELETE FROM u_a USING u_b, u_c WHERE u_a.c = u_b.a AND u_a.c = u_c.a
+
+query ITI rowsort
+SELECT * FROM u_a;
+----
+1  a  10
+2  b  20
+
+# Test if USING works well with RETURNING expressions that reference
+# the USING table and target table.
+query ITIT colnames,rowsort
+DELETE FROM u_a USING u_b WHERE u_a.c = u_b.a RETURNING u_b.a, u_b.b, u_a.a, u_a.b;
+----
+a   b  a  b
+10  a  1  a
+20  b  2  b
+
+query ITI rowsort
+SELECT * FROM u_a;
+----
+
+statement ok
+INSERT INTO u_a VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40);
+
+# Test if RETURNING * returns everything.
+query ITIITI colnames,rowsort
+DELETE FROM u_a USING u_c WHERE u_a.c = u_c.c RETURNING *;
+----
+a  b  c   a  b  c
+1  a  10  1  a  10
+4  d  40  4  d  40
+
+# Clean u_a to input a new set of data, and to improve test readability.
+statement ok
+TRUNCATE u_a
+
+statement ok
+INSERT INTO u_a VALUES (1, 'a', 5), (2, 'b', 10), (3, 'c', 15), (4, 'd', 20), (5, 'd', 25), (6, 'd', 30), (7, 'd', 35), (8, 'd', 40), (9, 'd', 45)
+
+# Using ORDER BY and LIMIT with a `DELETE ... USING` where ORDER BY and LIMIT references the USING
+# table is not supported.
+# TODO(#89817): Add support in DELETE ... USING for ORDER BY clauses to reference the USING
+# table. This is not supported in UPDATE ... FROM either: #89817.
+statement error SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+DELETE FROM u_a AS foo USING u_b AS bar WHERE bar.a > foo.c ORDER BY bar.a DESC LIMIT 3 RETURNING *;
+
+# Test aliased table names, ORDER BY and LIMIT where ORDER BY references the target
+# table.
+query ITI
+DELETE FROM u_a AS foo USING u_b AS bar WHERE bar.a > foo.c ORDER BY foo.a DESC LIMIT 3 RETURNING foo.*;
+----
+7  d  35
+6  d  30
+5  d  25
+
+query ITI rowsort
+SELECT * FROM u_a;
+----
+1  a  5
+2  b  10
+3  c  15
+4  d  20
+8  d  40
+9  d  45
+
+statement ok
+INSERT INTO u_d VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+query IT rowsort
+SELECT * FROM u_b;
+----
+10  a
+20  b
+30  c
+40  d
+
+query ITI rowsort
+SELECT * FROM u_c;
+----
+1   a  10
+2   b  50
+3   c  50
+4   d  40
+30  a  1
+
+# Test if DELETE FROM ... USING works with LATERAL.
+
+statement ok
+DELETE FROM u_a USING u_b, LATERAL (SELECT u_c.a, u_c.b, u_c.c FROM u_c WHERE u_b.b = u_c.b) AS other WHERE other.c = 1 AND u_a.c = 35
+
+query ITI rowsort
+SELECT * FROM u_a
+----
+1  a  5
+2  b  10
+3  c  15
+4  d  20
+8  d  40
+9  d  45
+
+# Test if DELETE FROM ... USING works with partial indexes.
+
+statement ok
+CREATE TABLE pindex (
+  a DECIMAL(10, 2),
+  INDEX (a) WHERE a > 3
+)
+
+statement ok
+INSERT INTO pindex VALUES (1.0), (2.0), (3.0), (4.0), (5.0), (8.0)
+
+statement ok
+DELETE FROM pindex USING (VALUES (5.0), (6.0)) v(b) WHERE pindex.a = v.b
+
+query F rowsort
+SELECT * FROM pindex;
+----
+1.00
+2.00
+3.00
+4.00
+8.00
+
+query F rowsort
+SELECT a FROM pindex@pindex_a_idx WHERE a > 3
+----
+4.00
+8.00
+
+statement ok
+DELETE FROM pindex USING (VALUES (2.0), (4.0)) v(b) WHERE pindex.a = v.b RETURNING v.b
+
+query F rowsort
+SELECT * FROM pindex;
+----
+1.00
+3.00
+8.00
+
+query F rowsort
+SELECT a FROM pindex@pindex_a_idx WHERE a > 3
+----
+8.00
+
+# Regression test for #99630. Partial index DEL columns should come after
+# passthrough columns in the delete node's column list.
+statement ok
+CREATE TABLE t99630a (a INT, INDEX idx (a) WHERE a > 0);
+CREATE TABLE t99630b (b BOOL);
+INSERT INTO t99630a VALUES (11);
+INSERT INTO t99630b VALUES (false);
+
+query B
+DELETE FROM t99630a USING t99630b RETURNING b
+----
+false
+
+query I
+SELECT a FROM t99630a@idx WHERE a > 0
+----
+
+# Regression test for #107634. Do not allow aggregate functions in ORDER BY.
+subtest regression_107634
+
+statement ok
+CREATE TABLE t107634 (a INT)
+
+statement error pgcode 42803 sum\(\): aggregate functions are not allowed in ORDER BY in DELETE
+DELETE FROM t107634 ORDER BY sum(a) LIMIT 1;
+
+subtest end
+
+# Regression test for #108166. Do not allow aggregate functions in ORDER BY when
+# the function is wrapped by a conditional expression.
+subtest regression_108166
+
+statement ok
+CREATE TABLE t108166 (a INT)
+
+statement error pgcode 42803 sum\(\): aggregate functions are not allowed in ORDER BY in DELETE
+DELETE FROM t108166 ORDER BY COALESCE(sum(a), 1) LIMIT 1;
+
+subtest end

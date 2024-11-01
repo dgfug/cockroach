@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package quotapool
 
@@ -85,9 +80,9 @@ func (ia *IntAlloc) Merge(other *IntAlloc) {
 // negative. Imagine the case where the capacity of an IntPool is initially 10.
 // An allocation of 10 is acquired. Then, while it is held, the pool's capacity
 // is updated to be 9. Then the outstanding allocation is frozen. This would
-// make the total capacity of the IntPool negative which is not allowed and will
-// lead to a panic. In general it's a bad idea to freeze allocated quota from a
-// pool which will ever have its capacity decreased.
+// make the total capacity of the IntPool negative which is not allowed and
+// will lead to a panic. In general, it's a bad idea to freeze allocated quota
+// from a pool which will ever have its capacity decreased.
 //
 // AcquireFunc() requests will be woken up with an updated Capacity, and Alloc()
 // requests will be trimmed accordingly.
@@ -404,7 +399,7 @@ func (p *IntPool) UpdateCapacity(newCapacity uint64) {
 	// If was reordered to:
 	//   99, 99, -99, -99
 	// Then we'd effectively ignore the additions at the beginning because they
-	// would push the alloc above the capacity and then we'd make the
+	// would push the alloc above the capacity, and then we'd make the
 	// corresponding subtractions, leading to a final state of -98 even though
 	// we'd like it to be 1.
 	p.updateCapacityMu.Lock()
@@ -511,20 +506,6 @@ func (r *intFuncRequest) Acquire(
 	r.took = took
 	ia.alloc -= int64(took)
 	return true, 0
-}
-
-func min(a, b int64) (v int64) {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int64) (v int64) {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func (r *intFuncRequest) ShouldWait() bool { return true }

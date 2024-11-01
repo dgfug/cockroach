@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package telemetry
 
@@ -126,6 +121,13 @@ func NewCounterWithMetric(metadata metric.Metadata) CounterWithMetric {
 func (c CounterWithMetric) Inc() {
 	Inc(c.telemetry)
 	c.metric.Inc(1)
+}
+
+// Count returns the value of the metric, not the telemetry. Note that the
+// telemetry value may reset to zero when, for example, GetFeatureCounts() is
+// called with ResetCounts to generate a report.
+func (c CounterWithMetric) Count() int64 {
+	return c.metric.Count()
 }
 
 // Forward the metric.Iterable interface to the metric counter. We

@@ -1,17 +1,11 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
-	"bytes"
 	"context"
 	"reflect"
 	"testing"
@@ -20,11 +14,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSpanSetBatchBoundaries(t *testing.T) {
@@ -71,67 +69,54 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	}
 
 	t.Run("writes before range", func(t *testing.T) {
-		if err := batch.ClearUnversioned(outsideKey.Key); !isWriteSpanErr(err) {
-			t.Errorf("Clear: unexpected error %v", err)
+		if err := batch.ClearUnversioned(outsideKey.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
+			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
-		if err := batch.ClearRawRange(outsideKey.Key, outsideKey2.Key); !isWriteSpanErr(err) {
-			t.Errorf("ClearRange: unexpected error %v", err)
+		if err := batch.ClearRawRange(outsideKey.Key, outsideKey2.Key, true, true); !isWriteSpanErr(err) {
+			t.Errorf("ClearRawRange: unexpected error %v", err)
 		}
 		{
-			iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
-			err := batch.ClearIterRange(iter, outsideKey.Key, outsideKey2.Key)
-			iter.Close()
+			err := batch.ClearMVCCIteratorRange(outsideKey.Key, outsideKey2.Key, true, true)
 			if !isWriteSpanErr(err) {
-				t.Errorf("ClearIterRange: unexpected error %v", err)
+				t.Errorf("ClearMVCCIteratorRange: unexpected error %v", err)
 			}
 		}
 		if err := batch.Merge(outsideKey, nil); !isWriteSpanErr(err) {
 			t.Errorf("Merge: unexpected error %v", err)
 		}
 		if err := batch.PutUnversioned(outsideKey.Key, nil); !isWriteSpanErr(err) {
-			t.Errorf("Put: unexpected error %v", err)
+			t.Errorf("PutUnversioned: unexpected error %v", err)
 		}
 	})
 
 	t.Run("writes after range", func(t *testing.T) {
-		if err := batch.ClearUnversioned(outsideKey3.Key); !isWriteSpanErr(err) {
-			t.Errorf("Clear: unexpected error %v", err)
+		if err := batch.ClearUnversioned(outsideKey3.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
+			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
-		if err := batch.ClearRawRange(insideKey2.Key, outsideKey4.Key); !isWriteSpanErr(err) {
-			t.Errorf("ClearRange: unexpected error %v", err)
+		if err := batch.ClearRawRange(insideKey2.Key, outsideKey4.Key, true, true); !isWriteSpanErr(err) {
+			t.Errorf("ClearRawRange: unexpected error %v", err)
 		}
 		{
-			iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
-			err := batch.ClearIterRange(iter, insideKey2.Key, outsideKey4.Key)
-			iter.Close()
+			err := batch.ClearMVCCIteratorRange(outsideKey2.Key, outsideKey4.Key, true, true)
 			if !isWriteSpanErr(err) {
-				t.Errorf("ClearIterRange: unexpected error %v", err)
+				t.Errorf("ClearMVCCIteratorRange: unexpected error %v", err)
 			}
 		}
 		if err := batch.Merge(outsideKey3, nil); !isWriteSpanErr(err) {
 			t.Errorf("Merge: unexpected error %v", err)
 		}
 		if err := batch.PutUnversioned(outsideKey3.Key, nil); !isWriteSpanErr(err) {
-			t.Errorf("Put: unexpected error %v", err)
+			t.Errorf("PutUnversioned: unexpected error %v", err)
 		}
 	})
 
 	t.Run("reads inside range", func(t *testing.T) {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if value, err := batch.MVCCGet(insideKey); err != nil {
-			t.Errorf("failed to read inside the range: %+v", err)
-		} else if !bytes.Equal(value, []byte("value")) {
-			t.Errorf("failed to read previously written value, got %q", value)
-		}
-		//lint:ignore SA1019 historical usage of deprecated batch.MVCCGetProto is OK
-		if _, _, _, err := batch.MVCCGetProto(insideKey, nil); err != nil {
-			t.Errorf("MVCCGetProto: unexpected error %v", err)
-		}
-		if err := batch.MVCCIterate(insideKey.Key, insideKey2.Key, storage.MVCCKeyAndIntentsIterKind, func(v storage.MVCCKeyValue) error {
-			return nil
-		}); err != nil {
-			t.Errorf("MVCCIterate: unexpected error %v", err)
-		}
+		require.Equal(t, []byte("value"), storageutils.MVCCGetRaw(t, batch, insideKey))
+		require.NoError(t, batch.MVCCIterate(context.Background(), insideKey.Key, insideKey2.Key,
+			storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+			fs.UnknownReadCategory, func(v storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+				return nil
+			}))
 	})
 
 	// Reads outside the range fail.
@@ -140,39 +125,36 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	}
 
 	t.Run("reads before range", func(t *testing.T) {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if _, err := batch.MVCCGet(outsideKey); !isReadSpanErr(err) {
-			t.Errorf("Get: unexpected error %v", err)
+		if _, err := storageutils.MVCCGetRawWithError(t, batch, outsideKey); !isReadSpanErr(err) {
+			t.Errorf("MVCCGet: unexpected error %v", err)
 		}
-		//lint:ignore SA1019 historical usage of deprecated batch.MVCCGetProto is OK
-		if _, _, _, err := batch.MVCCGetProto(outsideKey, nil); !isReadSpanErr(err) {
-			t.Errorf("MVCCGetProto: unexpected error %v", err)
-		}
-		if err := batch.MVCCIterate(outsideKey.Key, insideKey2.Key, storage.MVCCKeyAndIntentsIterKind, func(v storage.MVCCKeyValue) error {
-			return errors.Errorf("unexpected callback: %v", v)
-		}); !isReadSpanErr(err) {
+		if err := batch.MVCCIterate(context.Background(), outsideKey.Key, insideKey2.Key,
+			storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+			fs.UnknownReadCategory, func(v storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+				return errors.Errorf("unexpected callback: %v", v)
+			}); !isReadSpanErr(err) {
 			t.Errorf("MVCCIterate: unexpected error %v", err)
 		}
 	})
 
 	t.Run("reads after range", func(t *testing.T) {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if _, err := batch.MVCCGet(outsideKey3); !isReadSpanErr(err) {
-			t.Errorf("Get: unexpected error %v", err)
+		if _, err := storageutils.MVCCGetRawWithError(t, batch, outsideKey3); !isReadSpanErr(err) {
+			t.Errorf("MVCCGet: unexpected error %v", err)
 		}
-		//lint:ignore SA1019 historical usage of deprecated batch.MVCCGetProto is OK
-		if _, _, _, err := batch.MVCCGetProto(outsideKey3, nil); !isReadSpanErr(err) {
-			t.Errorf("MVCCGetProto: unexpected error %v", err)
-		}
-		if err := batch.MVCCIterate(insideKey2.Key, outsideKey4.Key, storage.MVCCKeyAndIntentsIterKind, func(v storage.MVCCKeyValue) error {
-			return errors.Errorf("unexpected callback: %v", v)
-		}); !isReadSpanErr(err) {
+		if err := batch.MVCCIterate(context.Background(), insideKey2.Key, outsideKey4.Key,
+			storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+			fs.UnknownReadCategory, func(v storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+				return errors.Errorf("unexpected callback: %v", v)
+			}); !isReadSpanErr(err) {
 			t.Errorf("MVCCIterate: unexpected error %v", err)
 		}
 	})
 
 	t.Run("forward scans", func(t *testing.T) {
-		iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batch.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		// MVCCIterators check boundaries on seek and next/prev
@@ -189,20 +171,20 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey) {
-			t.Fatalf("expected key %s, got %s", insideKey, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey) {
+			t.Fatalf("expected key %s, got %s", insideKey, iter.UnsafeKey())
 		}
 		iter.Next()
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey2) {
-			t.Fatalf("expected key %s, got %s", insideKey2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey2) {
+			t.Fatalf("expected key %s, got %s", insideKey2, iter.UnsafeKey())
 		}
 		// Scan out of bounds.
 		iter.Next()
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if err != nil {
 			// Scanning out of bounds sets Valid() to false but is not an error.
 			t.Errorf("unexpected error on iterator: %+v", err)
@@ -217,7 +199,12 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	}
 
 	t.Run("reverse scans", func(t *testing.T) {
-		iter := spanset.NewIterator(eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax}), &ss)
+		innerIter, err := eng.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := spanset.NewIterator(innerIter, &ss)
+
 		defer iter.Close()
 		iter.SeekLT(outsideKey4)
 		if _, err := iter.Valid(); !isReadSpanErr(err) {
@@ -228,20 +215,20 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey2) {
-			t.Fatalf("expected key %s, got %s", insideKey2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey2) {
+			t.Fatalf("expected key %s, got %s", insideKey2, iter.UnsafeKey())
 		}
 		iter.Prev()
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey) {
-			t.Fatalf("expected key %s, got %s", insideKey, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey) {
+			t.Fatalf("expected key %s, got %s", insideKey, iter.UnsafeKey())
 		}
 		// Scan out of bounds.
 		iter.Prev()
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if err != nil {
 			t.Errorf("unexpected error on iterator: %+v", err)
 		}
@@ -254,7 +241,7 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		// SeekLT to the lower bound is invalid.
 		iter.SeekLT(insideKey)
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if !isReadSpanErr(err) {
 			t.Fatalf("SeekLT: unexpected error %v", err)
 		}
@@ -321,33 +308,26 @@ func TestSpanSetBatchTimestamps(t *testing.T) {
 	}
 
 	for _, batch := range []storage.Batch{batchBefore, batchNonMVCC} {
-		if err := batch.ClearUnversioned(wkey.Key); !isWriteSpanErr(err) {
-			t.Errorf("Clear: unexpected error %v", err)
+		if err := batch.ClearUnversioned(wkey.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
+			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
 		{
-			iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
-			err := batch.ClearIterRange(iter, wkey.Key, wkey.Key)
-			iter.Close()
+			err := batch.ClearMVCCIteratorRange(wkey.Key, wkey.Key, true, true)
 			if !isWriteSpanErr(err) {
-				t.Errorf("ClearIterRange: unexpected error %v", err)
+				t.Errorf("ClearMVCCIteratorRange: unexpected error %v", err)
 			}
 		}
 		if err := batch.Merge(wkey, nil); !isWriteSpanErr(err) {
 			t.Errorf("Merge: unexpected error %v", err)
 		}
 		if err := batch.PutUnversioned(wkey.Key, nil); !isWriteSpanErr(err) {
-			t.Errorf("Put: unexpected error %v", err)
+			t.Errorf("PutUnversioned: unexpected error %v", err)
 		}
 	}
 
 	// Reads.
 	for _, batch := range []storage.Batch{batchBefore, batchDuring} {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if res, err := batch.MVCCGet(rkey); err != nil {
-			t.Errorf("failed to read inside the range: %+v", err)
-		} else if !bytes.Equal(res, value) {
-			t.Errorf("failed to read previously written value, got %q", res)
-		}
+		require.Equal(t, value, storageutils.MVCCGetRaw(t, batch, rkey))
 	}
 
 	isReadSpanErr := func(err error) bool {
@@ -355,18 +335,15 @@ func TestSpanSetBatchTimestamps(t *testing.T) {
 	}
 
 	for _, batch := range []storage.Batch{batchAfter, batchNonMVCC} {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if _, err := batch.MVCCGet(rkey); !isReadSpanErr(err) {
+		if _, err := storageutils.MVCCGetRawWithError(t, batch, rkey); !isReadSpanErr(err) {
 			t.Errorf("Get: unexpected error %v", err)
 		}
 
-		//lint:ignore SA1019 historical usage of deprecated batch.MVCCGetProto is OK
-		if _, _, _, err := batch.MVCCGetProto(rkey, nil); !isReadSpanErr(err) {
-			t.Errorf("MVCCGetProto: unexpected error %v", err)
-		}
-		if err := batch.MVCCIterate(rkey.Key, rkey.Key, storage.MVCCKeyAndIntentsIterKind, func(v storage.MVCCKeyValue) error {
-			return errors.Errorf("unexpected callback: %v", v)
-		}); !isReadSpanErr(err) {
+		if err := batch.MVCCIterate(context.Background(), rkey.Key, rkey.Key,
+			storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+			fs.UnknownReadCategory, func(v storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+				return errors.Errorf("unexpected callback: %v", v)
+			}); !isReadSpanErr(err) {
 			t.Errorf("MVCCIterate: unexpected error %v", err)
 		}
 	}
@@ -411,66 +388,78 @@ func TestSpanSetIteratorTimestamps(t *testing.T) {
 
 	func() {
 		// When accessing at t=1, we're able to read through latches declared at t=1 and t=2.
-		iter := batchAt1.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt1.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k1) {
-			t.Fatalf("expected key %s, got %s", k1, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k1) {
+			t.Fatalf("expected key %s, got %s", k1, iter.UnsafeKey())
 		}
 
 		iter.Next()
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k2) {
-			t.Fatalf("expected key %s, got %s", k2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+			t.Fatalf("expected key %s, got %s", k2, iter.UnsafeKey())
 		}
 	}()
 
 	func() {
 		// When accessing at t=2, we're only able to read through the latch declared at t=2.
-		iter := batchAt2.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt2.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 
 		iter.SeekGE(k2)
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k2) {
-			t.Fatalf("expected key %s, got %s", k2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+			t.Fatalf("expected key %s, got %s", k2, iter.UnsafeKey())
 		}
 	}()
 
 	for _, batch := range []storage.Batch{batchAt3, batchNonMVCC} {
 		// When accessing at t=3, we're unable to read through any of the declared latches.
 		// Same is true when accessing without a timestamp.
-		iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batch.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 
 		iter.SeekGE(k2)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 	}
 
 	// The behavior is the same as above for an EngineIterator.
 	func() {
 		// When accessing at t=1, we're able to read through latches declared at t=1 and t=2.
-		iter := batchAt1.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt1.NewEngineIterator(context.Background(), storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		if ok, err := iter.SeekEngineKeyGE(k1e); !ok {
@@ -498,7 +487,10 @@ func TestSpanSetIteratorTimestamps(t *testing.T) {
 
 	func() {
 		// When accessing at t=2, we're only able to read through the latch declared at t=2.
-		iter := batchAt2.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt2.NewEngineIterator(context.Background(), storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		if ok, _ := iter.SeekEngineKeyGE(k1e); ok {
@@ -554,12 +546,7 @@ func TestSpanSetNonMVCCBatch(t *testing.T) {
 
 	// Reads.
 	for _, batch := range []storage.Batch{batchNonMVCC, batchMVCC} {
-		//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
-		if res, err := batch.MVCCGet(rkey); err != nil {
-			t.Errorf("read disallowed through non-MVCC latch: %+v", err)
-		} else if !bytes.Equal(res, value) {
-			t.Errorf("failed to read previously written value, got %q", res)
-		}
+		require.Equal(t, value, storageutils.MVCCGetRaw(t, batch, rkey))
 	}
 }
 
@@ -575,14 +562,13 @@ func TestSpanSetMVCCResolveWriteIntentRange(t *testing.T) {
 	defer eng.Close()
 	ctx := context.Background()
 	value := roachpb.MakeValueFromString("irrelevant")
-	if err := storage.MVCCPut(
+	if _, err := storage.MVCCPut(
 		ctx,
 		eng,
-		nil, // ms
 		roachpb.Key("b"),
 		hlc.Timestamp{WallTime: 10}, // irrelevant
 		value,
-		nil, // txn
+		storage.MVCCWriteOptions{}, // irrelevant
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -592,11 +578,11 @@ func TestSpanSetMVCCResolveWriteIntentRange(t *testing.T) {
 	defer batch.Close()
 	intent := roachpb.LockUpdate{
 		Span:   roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b\x00")},
-		Txn:    enginepb.TxnMeta{}, // unused
+		Txn:    enginepb.TxnMeta{ID: uuid.MakeV4()}, // unused
 		Status: roachpb.PENDING,
 	}
-	if _, _, err := storage.MVCCResolveWriteIntentRange(
-		ctx, batch, nil /* ms */, intent, 0, eng.IsSeparatedIntentsEnabledForTesting(ctx),
+	if _, _, _, _, _, err := storage.MVCCResolveWriteIntentRange(
+		ctx, batch, nil /* ms */, intent, storage.MVCCResolveWriteIntentRangeOptions{},
 	); err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,10 @@ CREATE TABLE xy (x INT PRIMARY KEY, y INT)
 ----
 
 exec-ddl
+CREATE TABLE xyz (x INT PRIMARY KEY, y INT, z INT)
+----
+
+exec-ddl
 CREATE TABLE uv (u INT PRIMARY KEY, v INT)
 ----
 
@@ -553,37 +557,26 @@ project
  │    │    ├── columns: exists:22!null
  │    │    ├── outer: (4)
  │    │    ├── group-by (hash)
- │    │    │    ├── columns: ref_1.k:7!null true_agg:21
+ │    │    │    ├── columns: ref_1.k:7!null canary_agg:21
  │    │    │    ├── grouping columns: ref_1.k:7!null
  │    │    │    ├── outer: (4)
  │    │    │    ├── key: (7)
  │    │    │    ├── fd: (7)-->(21)
  │    │    │    ├── left-join (cross)
- │    │    │    │    ├── columns: ref_1.k:7!null true:20
+ │    │    │    │    ├── columns: ref_1.k:7!null a.s:16
  │    │    │    │    ├── outer: (4)
  │    │    │    │    ├── scan a [as=ref_1]
  │    │    │    │    │    ├── columns: ref_1.k:7!null
  │    │    │    │    │    └── key: (7)
- │    │    │    │    ├── project
- │    │    │    │    │    ├── columns: true:20!null
- │    │    │    │    │    ├── outer: (4)
- │    │    │    │    │    ├── fd: ()-->(20)
- │    │    │    │    │    ├── select
- │    │    │    │    │    │    ├── columns: a.s:16!null
- │    │    │    │    │    │    ├── outer: (4)
- │    │    │    │    │    │    ├── fd: ()-->(16)
- │    │    │    │    │    │    ├── scan a
- │    │    │    │    │    │    │    └── columns: a.s:16
- │    │    │    │    │    │    └── filters
- │    │    │    │    │    │         └── a.s:16 = ref_0.s:4 [outer=(4,16), constraints=(/4: (/NULL - ]; /16: (/NULL - ]), fd=(4)==(16), (16)==(4)]
- │    │    │    │    │    └── projections
- │    │    │    │    │         └── true [as=true:20]
- │    │    │    │    └── filters (true)
+ │    │    │    │    ├── scan a
+ │    │    │    │    │    └── columns: a.s:16
+ │    │    │    │    └── filters
+ │    │    │    │         └── a.s:16 = ref_0.s:4 [outer=(4,16), constraints=(/4: (/NULL - ]; /16: (/NULL - ]), fd=(4)==(16), (16)==(4)]
  │    │    │    └── aggregations
- │    │    │         └── const-not-null-agg [as=true_agg:21, outer=(20)]
- │    │    │              └── true:20
+ │    │    │         └── const-not-null-agg [as=canary_agg:21, outer=(16)]
+ │    │    │              └── a.s:16
  │    │    └── projections
- │    │         └── true_agg:21 IS NOT NULL [as=exists:22, outer=(21)]
+ │    │         └── canary_agg:21 IS NOT NULL [as=exists:22, outer=(21)]
  │    └── filters
  │         └── exists:22 [outer=(22), constraints=(/22: [/true - /true]; tight), fd=()-->(22)]
  └── projections
@@ -1480,40 +1473,74 @@ select
 norm expect=RejectNullsProject
 SELECT * FROM
 (
-  SELECT x*2, (x IS NULL) FROM a
-  LEFT JOIN xy ON i = y
+  SELECT x*2, (z IS NULL) FROM a
+  LEFT JOIN xyz ON i = y
 ) f(p1, p2)
 WHERE p1 > 5 AND p2
 ----
 project
- ├── columns: p1:11!null p2:12!null
+ ├── columns: p1:12!null p2:13!null
  ├── immutable
- ├── fd: ()-->(11,12)
+ ├── fd: ()-->(13)
  ├── inner-join (hash)
- │    ├── columns: i:2!null x:7!null y:8!null
- │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+ │    ├── columns: i:2!null x:7!null y:8!null z:9
  │    ├── immutable
- │    ├── fd: ()-->(2,7,8), (2)==(8), (8)==(2)
+ │    ├── fd: ()-->(9), (7)-->(8), (2)==(8), (8)==(2)
  │    ├── scan a
  │    │    └── columns: i:2
  │    ├── select
- │    │    ├── columns: x:7!null y:8
- │    │    ├── cardinality: [0 - 1]
+ │    │    ├── columns: x:7!null y:8 z:9
  │    │    ├── immutable
- │    │    ├── key: ()
- │    │    ├── fd: ()-->(7,8)
- │    │    ├── scan xy
- │    │    │    ├── columns: x:7!null y:8
+ │    │    ├── key: (7)
+ │    │    ├── fd: ()-->(9), (7)-->(8)
+ │    │    ├── scan xyz
+ │    │    │    ├── columns: x:7!null y:8 z:9
  │    │    │    ├── key: (7)
- │    │    │    └── fd: (7)-->(8)
+ │    │    │    └── fd: (7)-->(8,9)
  │    │    └── filters
  │    │         ├── (x:7 * 2) > 5 [outer=(7), immutable]
- │    │         └── x:7 IS NULL [outer=(7), constraints=(/7: [/NULL - /NULL]; tight), fd=()-->(7)]
+ │    │         └── z:9 IS NULL [outer=(9), constraints=(/9: [/NULL - /NULL]; tight), fd=()-->(9)]
  │    └── filters
  │         └── i:2 = y:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
  └── projections
-      ├── x:7 * 2 [as="?column?":11, outer=(7), immutable]
-      └── x:7 IS NULL [as="?column?":12, outer=(7)]
+      ├── x:7 * 2 [as="?column?":12, outer=(7), immutable]
+      └── z:9 IS NULL [as="?column?":13, outer=(9)]
+
+# Case where the outer filter null-rejects one projected column, but not another
+# column.
+norm expect=RejectNullsProject
+SELECT * FROM (
+  SELECT xyz.z + 1 AS m, xyz.y + 1 AS n
+  FROM a FULL OUTER JOIN xyz ON true
+) tmp, xyz
+WHERE tmp.n = xyz.y
+----
+inner-join (hash)
+ ├── columns: m:12 n:13!null x:14!null y:15!null z:16
+ ├── immutable
+ ├── fd: (14)-->(15,16), (13)==(15), (15)==(13)
+ ├── project
+ │    ├── columns: m:12 n:13!null
+ │    ├── immutable
+ │    ├── left-join (cross)
+ │    │    ├── columns: y:8!null z:9
+ │    │    ├── select
+ │    │    │    ├── columns: y:8!null z:9
+ │    │    │    ├── scan xyz
+ │    │    │    │    └── columns: y:8 z:9
+ │    │    │    └── filters
+ │    │    │         └── y:8 IS NOT NULL [outer=(8), constraints=(/8: (/NULL - ]; tight)]
+ │    │    ├── scan a
+ │    │    └── filters (true)
+ │    └── projections
+ │         ├── z:9 + 1 [as=m:12, outer=(9), immutable]
+ │         └── y:8 + 1 [as=n:13, outer=(8), immutable]
+ ├── scan xyz
+ │    ├── columns: x:14!null y:15 z:16
+ │    ├── key: (14)
+ │    └── fd: (14)-->(15,16)
+ └── filters
+      └── n:13 = y:15 [outer=(13,15), constraints=(/13: (/NULL - ]; /15: (/NULL - ]), fd=(13)==(15), (15)==(13)]
 
 # No-op case because null-rejection is not requested for column k.
 norm expect-not=RejectNullsProject
@@ -1580,3 +1607,169 @@ select
  │         └── COALESCE(x:7, 0) * 5 [as="?column?":11, outer=(7), immutable]
  └── filters
       └── "?column?":11 > 5 [outer=(11), constraints=(/11: [/6 - ]; tight)]
+
+# Regression test for #89986 - don't cause a rule cycle with disabled filter
+# push-down rules.
+exec-ddl
+CREATE TABLE table1_89986 (
+  col1_0 FLOAT8,
+  col1_1 FLOAT4 NOT NULL,
+  col1_2 BOX2D[] NULL,
+  col1_3 "char" NOT NULL,
+  col1_4 BOOL NULL,
+  col1_5 INT2 NOT NULL,
+  col1_6 OID,
+  col1_7 INT4 NULL,
+  col1_8 INT8 NULL AS (col1_7 + col1_5) STORED,
+  col1_9 FLOAT8 AS (col1_0 + col1_1) VIRTUAL,
+  INDEX (col1_7 DESC),
+  FAMILY (col1_8, col1_0),
+  FAMILY (col1_6),
+  FAMILY (col1_5, col1_7),
+  FAMILY (col1_4, col1_1, col1_3),
+  FAMILY (col1_2)
+)
+----
+
+exec-ddl
+CREATE TABLE table2_89986 (
+  col2_0  INT4,
+  col2_3  BIT(5),
+  col2_4  VARCHAR,
+  col2_5  REGCLASS,
+  col2_6  TIME NOT NULL,
+  col2_9  TIMESTAMP,
+  col2_10 REGPROCEDURE,
+  col2_11 INT8,
+  col2_12 STRING
+)
+----
+
+norm disable=(TryDecorrelateProject, MergeSelectInnerJoin, MapFilterIntoJoinLeft)
+SELECT tab_3663.col2_3,
+       0,
+       '23:43:20-08:00:00',
+       '2026-09-17 11:54:13.000946' AS col_12038,
+       tab_3663.col2_6,
+       0
+  FROM table2_89986@[0] AS tab_3663
+ WHERE EXISTS(
+        SELECT tab_3668.col_12032
+          FROM table2_89986@[0] AS tab_3664
+          JOIN table1_89986@[0] AS tab_3665
+               RIGHT JOIN table2_89986@[0] AS tab_3666 ON tab_3665.col1_8 = tab_3666.col2_11
+          JOIN (
+                SELECT tab_3663.col2_9, 0, tab_3663.col2_10, tab_3667.col2_3, -872818994
+                  FROM table2_89986@[0] AS tab_3667
+               ) AS tab_3668 (col_12029, col_12030, col_12031, col_12032, col_12033) ON
+                tab_3666.col2_9 = tab_3668.col_12029 ON tab_3664.col2_12 = tab_3665.col1_3
+       )
+ ORDER BY tab_3663.crdb_internal_mvcc_timestamp DESC, tab_3663.tableoid DESC, tab_3663.col2_5
+----
+project
+ ├── columns: col2_3:2 "?column?":67!null "?column?":68!null col_12038:69!null col2_6:5!null "?column?":67!null  [hidden: tab_3663.col2_5:4 tab_3663.crdb_internal_mvcc_timestamp:11 tab_3663.tableoid:12]
+ ├── fd: ()-->(67-69)
+ ├── ordering: -11,-12,+4 opt(67-69) [actual: -11,-12,+4]
+ ├── sort
+ │    ├── columns: tab_3663.col2_3:2 tab_3663.col2_5:4 tab_3663.col2_6:5!null tab_3663.col2_9:6 tab_3663.crdb_internal_mvcc_timestamp:11 tab_3663.tableoid:12
+ │    ├── ordering: -11,-12,+4
+ │    └── semi-join-apply
+ │         ├── columns: tab_3663.col2_3:2 tab_3663.col2_5:4 tab_3663.col2_6:5!null tab_3663.col2_9:6 tab_3663.crdb_internal_mvcc_timestamp:11 tab_3663.tableoid:12
+ │         ├── scan table2_89986 [as=tab_3663]
+ │         │    └── columns: tab_3663.col2_3:2 tab_3663.col2_5:4 tab_3663.col2_6:5!null tab_3663.col2_9:6 tab_3663.crdb_internal_mvcc_timestamp:11 tab_3663.tableoid:12
+ │         ├── inner-join (hash)
+ │         │    ├── columns: tab_3664.col2_12:21!null col1_3:28!null col1_8:33 tab_3666.col2_9:43!null tab_3666.col2_11:45 col2_9:62!null
+ │         │    ├── outer: (6)
+ │         │    ├── fd: ()-->(43,62), (43)==(62), (62)==(43), (21)==(28), (28)==(21)
+ │         │    ├── scan table2_89986 [as=tab_3664]
+ │         │    │    └── columns: tab_3664.col2_12:21
+ │         │    ├── inner-join (hash)
+ │         │    │    ├── columns: col1_3:28 col1_8:33 tab_3666.col2_9:43!null tab_3666.col2_11:45 col2_9:62!null
+ │         │    │    ├── outer: (6)
+ │         │    │    ├── fd: ()-->(43,62), (43)==(62), (62)==(43)
+ │         │    │    ├── left-join (hash)
+ │         │    │    │    ├── columns: col1_3:28 col1_8:33 tab_3666.col2_9:43 tab_3666.col2_11:45
+ │         │    │    │    ├── scan table2_89986 [as=tab_3666]
+ │         │    │    │    │    └── columns: tab_3666.col2_9:43 tab_3666.col2_11:45
+ │         │    │    │    ├── scan table1_89986
+ │         │    │    │    │    ├── columns: col1_3:28!null col1_8:33
+ │         │    │    │    │    └── computed column expressions
+ │         │    │    │    │         ├── col1_8:33
+ │         │    │    │    │         │    └── col1_7:32 + col1_5:30
+ │         │    │    │    │         └── col1_9:34
+ │         │    │    │    │              └── col1_0:25 + col1_1:26
+ │         │    │    │    └── filters
+ │         │    │    │         └── col1_8:33 = tab_3666.col2_11:45 [outer=(33,45), constraints=(/33: (/NULL - ]; /45: (/NULL - ]), fd=(33)==(45), (45)==(33)]
+ │         │    │    ├── project
+ │         │    │    │    ├── columns: col2_9:62
+ │         │    │    │    ├── outer: (6)
+ │         │    │    │    ├── fd: ()-->(62)
+ │         │    │    │    ├── scan table2_89986 [as=tab_3667]
+ │         │    │    │    └── projections
+ │         │    │    │         └── tab_3663.col2_9:6 [as=col2_9:62, outer=(6)]
+ │         │    │    └── filters
+ │         │    │         └── tab_3666.col2_9:43 = col2_9:62 [outer=(43,62), constraints=(/43: (/NULL - ]; /62: (/NULL - ]), fd=(43)==(62), (62)==(43)]
+ │         │    └── filters
+ │         │         └── tab_3664.col2_12:21 = col1_3:28 [outer=(21,28), constraints=(/21: (/NULL - ]; /28: (/NULL - ]), fd=(21)==(28), (28)==(21)]
+ │         └── filters (true)
+ └── projections
+      ├── 0 [as="?column?":67]
+      ├── '23:43:20-08:00:00' [as="?column?":68]
+      └── '2026-09-17 11:54:13.000946' [as=col_12038:69]
+
+# Regression test for #100559 - don't panic when exploration uncovers possible
+# null-rejection that normalization failed to find.
+exec-ddl
+CREATE TABLE t0_100559 (c0 INTERVAL);
+----
+
+exec-ddl
+CREATE TABLE t1_100559 (c0 INTERVAL);
+----
+
+exec-ddl
+CREATE TABLE t2_100559 (c0 FLOAT);
+----
+
+opt
+SELECT t1_100559.c0 AS c0 FROM t0_100559, t2_100559
+FULL OUTER JOIN t1_100559 ON true
+WHERE (
+  ((t0_100559.c0) IN (t1_100559.c0))
+  AND ((t2_100559.c0) IN (SELECT stddev(t2_100559.c0) FROM t2_100559))
+);
+----
+project
+ ├── columns: c0:9!null
+ └── inner-join (hash)
+      ├── columns: t0_100559.c0:1!null t2_100559.c0:5!null t1_100559.c0:9!null
+      ├── fd: (1)==(9), (9)==(1)
+      ├── right-join (cross)
+      │    ├── columns: t2_100559.c0:5!null t1_100559.c0:9
+      │    ├── scan t1_100559
+      │    │    └── columns: t1_100559.c0:9
+      │    ├── semi-join (hash)
+      │    │    ├── columns: t2_100559.c0:5!null
+      │    │    ├── select
+      │    │    │    ├── columns: t2_100559.c0:5!null
+      │    │    │    ├── scan t2_100559
+      │    │    │    │    └── columns: t2_100559.c0:5
+      │    │    │    └── filters
+      │    │    │         └── t2_100559.c0:5 IS NOT NULL [outer=(5), constraints=(/5: (/NULL - ]; tight)]
+      │    │    ├── scalar-group-by
+      │    │    │    ├── columns: stddev:17
+      │    │    │    ├── cardinality: [1 - 1]
+      │    │    │    ├── key: ()
+      │    │    │    ├── fd: ()-->(17)
+      │    │    │    ├── scan t2_100559
+      │    │    │    │    └── columns: t2_100559.c0:13
+      │    │    │    └── aggregations
+      │    │    │         └── std-dev [as=stddev:17, outer=(13)]
+      │    │    │              └── t2_100559.c0:13
+      │    │    └── filters
+      │    │         └── t2_100559.c0:5 = stddev:17 [outer=(5,17), constraints=(/5: (/NULL - ]; /17: (/NULL - ]), fd=(5)==(17), (17)==(5)]
+      │    └── filters (true)
+      ├── scan t0_100559
+      │    └── columns: t0_100559.c0:1
+      └── filters
+           └── t0_100559.c0:1 = t1_100559.c0:9 [outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]

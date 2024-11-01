@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
@@ -31,13 +26,14 @@ func makeNameCache() nameCache {
 // All methods are thread-safe.
 type nameCache struct {
 	mu          syncutil.RWMutex
-	descriptors nstree.Map
+	descriptors nstree.NameMap
 }
 
 // Resolves a (qualified) name to the descriptor's ID.
-// Returns a valid descriptorVersionState for descriptor with that name,
-// if the name had been previously cached and the cache has a descriptor
-// version that has not expired. Returns nil otherwise.
+// Returns a valid descriptorVersionState and expiration (hlc.Timestamp)
+// for descriptor with that name, if the name had been previously cached
+// and the cache has a descriptor version that has not expired.
+// Returns nil (and empty timestamp) otherwise.
 // This method handles normalizing the descriptor name.
 // The descriptor's refcount is incremented before returning, so the caller
 // is responsible for releasing it to the leaseManager.
@@ -47,14 +43,15 @@ func (c *nameCache) get(
 	parentSchemaID descpb.ID,
 	name string,
 	timestamp hlc.Timestamp,
-) *descriptorVersionState {
+) (desc *descriptorVersionState, expiration hlc.Timestamp) {
 	c.mu.RLock()
-	desc, ok := c.descriptors.GetByName(
+	var ok bool
+	desc, ok = c.descriptors.GetByName(
 		parentID, parentSchemaID, name,
 	).(*descriptorVersionState)
 	c.mu.RUnlock()
 	if !ok {
-		return nil
+		return nil, expiration
 	}
 	expensiveLogEnabled := log.ExpensiveLogEnabled(ctx, 2)
 	desc.mu.Lock()
@@ -63,7 +60,7 @@ func (c *nameCache) get(
 		// This get() raced with a release operation. Remove this cache
 		// entry if needed.
 		c.remove(desc)
-		return nil
+		return nil, hlc.Timestamp{}
 	}
 
 	defer desc.mu.Unlock()
@@ -78,24 +75,24 @@ func (c *nameCache) get(
 	}
 
 	// Expired descriptor. Don't hand it out.
-	if desc.hasExpiredLocked(timestamp) {
-		return nil
+	if desc.hasExpiredLocked(ctx, timestamp) {
+		return nil, hlc.Timestamp{}
 	}
 
 	desc.incRefCountLocked(ctx, expensiveLogEnabled)
-	return desc
+	return desc, desc.mu.expiration
 }
 
-func (c *nameCache) insert(desc *descriptorVersionState) {
+func (c *nameCache) insert(ctx context.Context, desc *descriptorVersionState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	got, ok := c.descriptors.GetByName(
 		desc.GetParentID(), desc.GetParentSchemaID(), desc.GetName(),
 	).(*descriptorVersionState)
-	if ok && desc.getExpiration().Less(got.getExpiration()) {
+	if ok && desc.getExpiration(ctx).Less(got.getExpiration(ctx)) {
 		return
 	}
-	c.descriptors.Upsert(desc)
+	c.descriptors.Upsert(desc, desc.SkipNamespace())
 }
 
 func (c *nameCache) remove(desc *descriptorVersionState) {

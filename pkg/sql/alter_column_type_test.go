@@ -1,28 +1,22 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -41,7 +35,7 @@ func TestInsertBeforeOldColumnIsDropped(t *testing.T) {
 	ctx := context.Background()
 
 	var s serverutils.TestServerInterface
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	childJobStartNotification := make(chan struct{})
 	waitBeforeContinuing := make(chan struct{})
 	var doOnce sync.Once
@@ -79,9 +73,12 @@ INSERT INTO test2 VALUES ('hello');`)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		sqlDB.Exec(t, `
-SET enable_experimental_alter_column_type_general = true;
-ALTER TABLE test ALTER COLUMN x TYPE STRING;`)
+		sqlDB.ExecMultiple(t,
+			`SET enable_experimental_alter_column_type_general = true;`,
+			// TODO(spilchen): This test is designed for the legacy schema changer.
+			// Update it for the declarative schema changer (DSC).
+			`SET use_declarative_schema_changer = 'off';`,
+			`ALTER TABLE test ALTER COLUMN x TYPE STRING;`)
 		wg.Done()
 	}()
 
@@ -116,7 +113,7 @@ func TestInsertBeforeOldColumnIsDroppedUsingExpr(t *testing.T) {
 	ctx := context.Background()
 
 	var s serverutils.TestServerInterface
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	childJobStartNotification := make(chan struct{})
 	waitBeforeContinuing := make(chan struct{})
 	var doOnce sync.Once
@@ -155,9 +152,12 @@ INSERT INTO test2 VALUES (true);
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		sqlDB.Exec(t, `
-SET enable_experimental_alter_column_type_general = true;
-ALTER TABLE test ALTER COLUMN x TYPE BOOL USING (x > 0);`)
+		sqlDB.ExecMultiple(t,
+			`SET enable_experimental_alter_column_type_general = true;`,
+			// TODO(spilchen): This test is designed for the legacy schema changer.
+			// Update it for the declarative schema changer (DSC).
+			`SET use_declarative_schema_changer = 'off';`,
+			`ALTER TABLE test ALTER COLUMN x TYPE BOOL USING (x > 0);`)
 		wg.Done()
 	}()
 
@@ -192,7 +192,7 @@ func TestVisibilityDuringAlterColumnType(t *testing.T) {
 	ctx := context.Background()
 	swapNotification := make(chan struct{})
 	waitBeforeContinuing := make(chan struct{})
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeComputedColumnSwap: func() {
@@ -209,7 +209,10 @@ func TestVisibilityDuringAlterColumnType(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	defer s.Stopper().Stop(ctx)
 
-	sqlDB.Exec(t, `SET enable_experimental_alter_column_type_general = true;`)
+	sqlDB.ExecMultiple(t, `SET enable_experimental_alter_column_type_general = true;`,
+		// TODO(spilchen): This test is designed for the legacy schema changer.
+		// Update it for the declarative schema changer (DSC).
+		`SET use_declarative_schema_changer = 'off'`)
 
 	sqlDB.Exec(t, `
 CREATE DATABASE t;
@@ -230,8 +233,7 @@ INSERT INTO t.test VALUES (1), (2), (3);
 		`CREATE TABLE public.test (
 	x INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC),
-	FAMILY "primary" (x, rowid)
+	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC)
 )`}}
 
 	sqlDB.CheckQueryResults(t, "SHOW CREATE TABLE t.test", expected)
@@ -244,8 +246,7 @@ INSERT INTO t.test VALUES (1), (2), (3);
 		`CREATE TABLE public.test (
 	x STRING NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC),
-	FAMILY "primary" (x, rowid)
+	CONSTRAINT test_pkey PRIMARY KEY (rowid ASC)
 )`}}
 
 	sqlDB.CheckQueryResults(t, "SHOW CREATE TABLE t.test", expected)
@@ -258,25 +259,21 @@ func TestAlterColumnTypeFailureRollback(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, db, kvDB := serverutils.StartServer(t, params)
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	defer s.Stopper().Stop(ctx)
 
 	sqlDB.Exec(t, `SET enable_experimental_alter_column_type_general = true;`)
+	sqlDB.Exec(t, `CREATE DATABASE t;`)
+	sqlDB.Exec(t, `CREATE TABLE t.test (x STRING);`)
+	sqlDB.Exec(t, `INSERT INTO t.test VALUES ('1'), ('2'), ('HELLO');`)
 
-	expected := "pq: could not parse \"HELLO\" as type int: strconv.ParseInt: parsing \"HELLO\": invalid syntax"
-
-	sqlDB.ExpectErr(t, expected, `
-CREATE DATABASE t;
-CREATE TABLE t.test (x STRING);
-INSERT INTO t.test VALUES ('1'), ('2'), ('HELLO');
-ALTER TABLE t.test ALTER COLUMN x TYPE INT;
-`)
+	expected := "pq: failed to construct index entries during backfill: could not parse \"HELLO\" as type int: strconv.ParseInt: parsing \"HELLO\": invalid syntax"
+	sqlDB.ExpectErr(t, expected, `ALTER TABLE t.test ALTER COLUMN x TYPE INT USING x::INT8;`)
 
 	// Ensure that the add column and column swap mutations are cleaned up.
 	testutils.SucceedsSoon(t, func() error {
-		desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.ApplicationLayer().Codec(), "t", "test")
 		if len(desc.AllMutations()) != 0 {
 			return errors.New("expected no mutations on TableDescriptor")
 		}
@@ -290,7 +287,7 @@ func TestQueryIntToString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	// Decrease the adopt loop interval so that retries happen quickly.
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 
@@ -301,12 +298,10 @@ func TestQueryIntToString(t *testing.T) {
 
 	sqlDB.Exec(t, `SET enable_experimental_alter_column_type_general = true;`)
 
-	sqlDB.Exec(t, `
-CREATE DATABASE t;
-CREATE TABLE t.test (x INT, y INT, z INT);
-INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2);
-ALTER TABLE t.test ALTER COLUMN y TYPE STRING;
-`)
+	sqlDB.Exec(t, `CREATE DATABASE t;`)
+	sqlDB.Exec(t, `CREATE TABLE t.test (x INT, y INT, z INT);`)
+	sqlDB.Exec(t, `INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2);`)
+	sqlDB.Exec(t, `ALTER TABLE t.test ALTER COLUMN y TYPE STRING;`)
 
 	sqlDB.ExecSucceedsSoon(t, `INSERT INTO t.test VALUES (3, 'HELLO', 3);`)
 
@@ -323,7 +318,7 @@ func TestSchemaChangeBeforeAlterColumnType(t *testing.T) {
 	swapNotification := make(chan struct{})
 	waitBeforeContinuing := make(chan struct{})
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforePrimaryKeySwap: func() {
@@ -332,11 +327,13 @@ func TestSchemaChangeBeforeAlterColumnType(t *testing.T) {
 			},
 		},
 	}
-
+	defer close(waitBeforeContinuing)
 	s, db, _ := serverutils.StartServer(t, params)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	defer s.Stopper().Stop(ctx)
-
+	sqlDB.ExecMultiple(t,
+		`SET use_declarative_schema_changer = 'off';`,
+		`SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';`)
 	sqlDB.Exec(t, `
 CREATE DATABASE t;
 CREATE TABLE t.test (x INT NOT NULL, y INT);
@@ -353,7 +350,8 @@ ALTER TABLE t.test ALTER PRIMARY KEY USING COLUMNS (x);
 
 	<-swapNotification
 
-	expected := "pq: unimplemented: table test is currently undergoing a schema change"
+	expected := "pq: unimplemented: ALTER COLUMN TYPE requiring rewrite of on-disk data is currently not " +
+		"supported for columns that are part of an index"
 	sqlDB.ExpectErr(t, expected, `
 SET enable_experimental_alter_column_type_general = true;
 ALTER TABLE t.test ALTER COLUMN y TYPE STRING;`)
@@ -367,7 +365,7 @@ func TestSchemaChangeWhileExecutingAlterColumnType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	childJobStartNotification := make(chan struct{})
 	waitBeforeContinuing := make(chan struct{})
 	var doOnce sync.Once
@@ -392,20 +390,24 @@ CREATE DATABASE t;
 CREATE TABLE t.test (x INT);
 `)
 
+	tableID := sqlutils.QueryTableID(t, db, "t", "public", "test")
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		sqlDB.Exec(t, `
-SET enable_experimental_alter_column_type_general = true;
-ALTER TABLE t.test ALTER COLUMN x TYPE STRING;
-`)
+		sqlDB.ExecMultiple(t,
+			`SET enable_experimental_alter_column_type_general = true;`,
+			`SET use_declarative_schema_changer = off;`,
+			`ALTER TABLE t.test ALTER COLUMN x TYPE STRING;`,
+		)
 		wg.Done()
 	}()
 
 	<-childJobStartNotification
 
-	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress`
+	expected := fmt.Sprintf(`pq: relation "test" \(%d\): unimplemented: cannot perform a schema change operation while an ALTER COLUMN TYPE schema change is in progress`, tableID)
 	sqlDB.ExpectErr(t, expected, `
+SET use_declarative_schema_changer = off;
 ALTER TABLE t.test ADD COLUMN y INT;
 	`)
 

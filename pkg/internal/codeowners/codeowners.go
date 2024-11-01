@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package codeowners
 
@@ -17,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/internal/reporoot"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
 	"github.com/cockroachdb/errors"
@@ -35,6 +31,11 @@ type CodeOwners struct {
 	teams map[team.Alias]team.Team
 }
 
+// GetTeamForAlias returns the team matching the given Alias.
+func (co *CodeOwners) GetTeamForAlias(alias team.Alias) team.Team {
+	return co.teams[alias]
+}
+
 // LoadCodeOwners parses a CODEOWNERS file and returns the CodeOwners struct.
 func LoadCodeOwners(r io.Reader, teams map[team.Alias]team.Team) (*CodeOwners, error) {
 	s := bufio.NewScanner(r)
@@ -47,7 +48,7 @@ func LoadCodeOwners(r io.Reader, teams map[team.Alias]team.Team) (*CodeOwners, e
 		if s.Err() != nil {
 			return nil, s.Err()
 		}
-		t := s.Text()
+		t := strings.Replace(s.Text(), "#!", "", -1)
 		if strings.HasPrefix(t, "#") {
 			continue
 		}
@@ -79,11 +80,21 @@ func DefaultLoadCodeOwners() (*CodeOwners, error) {
 	if err != nil {
 		return nil, err
 	}
-	path := reporoot.GetFor(".", ".github/CODEOWNERS")
-	if path == "" {
+	var dirPath string
+	if os.Getenv("BAZEL_TEST") != "" {
+		// NB: The test needs to depend on the CODEOWNERS file.
+		var err error
+		dirPath, err = bazel.RunfilesPath()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		dirPath = reporoot.GetFor(".", ".github/CODEOWNERS")
+	}
+	if dirPath == "" {
 		return nil, errors.Errorf("CODEOWNERS not found")
 	}
-	path = filepath.Join(path, ".github/CODEOWNERS")
+	path := filepath.Join(dirPath, ".github", "CODEOWNERS")
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

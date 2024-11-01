@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execstats_test
 
@@ -18,10 +13,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -33,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,8 +38,8 @@ import (
 // enabling tracing, capturing the physical plan of a test statement, and
 // constructing a TraceAnalyzer from the resulting trace and physical plan.
 func TestTraceAnalyzer(t *testing.T) {
-	defer log.Scope(t).Close(t)
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	const (
 		testStmt = "SELECT * FROM test.foo ORDER BY v"
@@ -53,17 +48,19 @@ func TestTraceAnalyzer(t *testing.T) {
 
 	ctx := context.Background()
 	analyzerChan := make(chan *execstats.TraceAnalyzer, 1)
-	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					TestingSaveFlows: func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error {
+					TestingSaveFlows: func(stmt string) sql.SaveFlowsFunc {
 						if stmt != testStmt {
-							return func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error { return nil }
+							return func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains, []execinfra.LocalProcessor, bool) error {
+								return nil
+							}
 						}
-						return func(flows map[roachpb.NodeID]*execinfrapb.FlowSpec, _ execinfra.OpChains) error {
+						return func(flows map[base.SQLInstanceID]*execinfrapb.FlowSpec, _ execopnode.OpChains, _ []execinfra.LocalProcessor, _ bool) error {
 							flowsMetadata := execstats.NewFlowsMetadata(flows)
 							analyzer := execstats.NewTraceAnalyzer(flowsMetadata)
 							analyzerChan <- analyzer
@@ -79,7 +76,16 @@ func TestTraceAnalyzer(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	const gatewayNode = 0
-	db := tc.ServerConn(gatewayNode)
+	srv, s := tc.Server(gatewayNode), tc.ApplicationLayer(gatewayNode)
+	if srv.TenantController().StartedDefaultTestTenant() {
+		systemSqlDB := srv.SystemLayer().SQLConn(t, serverutils.DBName("system"))
+		_, err := systemSqlDB.Exec(`ALTER TENANT [$1] GRANT CAPABILITY can_admin_relocate_range=true`, serverutils.TestTenantID().ToUint64())
+		require.NoError(t, err)
+		serverutils.WaitForTenantCapabilities(t, srv, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
+			tenantcapabilities.CanAdminRelocateRange: "true",
+		}, "")
+	}
+	db := s.SQLConn(t)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlutils.CreateTable(
@@ -99,39 +105,35 @@ func TestTraceAnalyzer(t *testing.T) {
 		),
 	)
 
-	execCfg := tc.Server(gatewayNode).ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 
 	var (
 		rowexecTraceAnalyzer *execstats.TraceAnalyzer
 		colexecTraceAnalyzer *execstats.TraceAnalyzer
 	)
 	for _, vectorizeMode := range []sessiondatapb.VectorizeExecMode{sessiondatapb.VectorizeOff, sessiondatapb.VectorizeOn} {
-		var sp *tracing.Span
-		ctx, sp = tracing.StartVerboseTrace(ctx, execCfg.AmbientCtx.Tracer, t.Name())
-		ie := execCfg.InternalExecutor
-		ie.SetSessionData(
-			&sessiondata.SessionData{
-				SessionData: sessiondatapb.SessionData{
-					VectorizeMode: vectorizeMode,
-				},
-				LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-					DistSQLMode: sessiondatapb.DistSQLOn,
-				},
+		execCtx, finishAndCollect := tracing.ContextWithRecordingSpan(ctx, execCfg.AmbientCtx.Tracer, t.Name())
+		defer finishAndCollect()
+		ie := execCfg.InternalDB.NewInternalExecutor(&sessiondata.SessionData{
+			SessionData: sessiondatapb.SessionData{
+				VectorizeMode: vectorizeMode,
 			},
-		)
+			LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
+				DistSQLMode: sessiondatapb.DistSQLOn,
+			},
+		})
 		_, err := ie.ExecEx(
-			ctx,
+			execCtx,
 			t.Name(),
 			nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.NodeUserSessionDataOverride,
 			testStmt,
 		)
-		sp.Finish()
 		require.NoError(t, err)
-		trace := sp.GetRecording(tracing.RecordingVerbose)
+		trace := finishAndCollect()
 		analyzer := <-analyzerChan
 		require.NoError(t, analyzer.AddTrace(trace, true /* makeDeterministic */))
-		require.NoError(t, analyzer.ProcessStats())
+		analyzer.ProcessStats()
 		switch vectorizeMode {
 		case sessiondatapb.VectorizeOff:
 			rowexecTraceAnalyzer = analyzer
@@ -156,17 +158,6 @@ func TestTraceAnalyzer(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			nodeLevelStats := tc.analyzer.GetNodeLevelStats()
-			require.Equal(
-				t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
-			)
-			require.Equal(
-				t, numNodes, len(nodeLevelStats.MaxMemoryUsageGroupedByNode), "expected all nodes to have specified maximum memory usage",
-			)
-			require.Equal(
-				t, numNodes, len(nodeLevelStats.MaxDiskUsageGroupedByNode), "expected all nodes to have specified maximum disk usage",
-			)
-
 			queryLevelStats := tc.analyzer.GetQueryLevelStats()
 
 			// The stats don't count the actual bytes, but they are a synthetic value
@@ -237,48 +228,117 @@ func TestTraceAnalyzerProcessStats(t *testing.T) {
 		ContentionTime: cumulativeContentionTime,
 	}
 
-	assert.NoError(t, a.ProcessStats())
-	if got := a.GetQueryLevelStats(); !reflect.DeepEqual(got, expected) {
-		t.Errorf("ProcessStats() = %v, want %v", got, expected)
-	}
+	a.ProcessStats()
+	require.Equal(t, a.GetQueryLevelStats(), expected)
 }
 
 func TestQueryLevelStatsAccumulate(t *testing.T) {
+	aEvent := kvpb.ContentionEvent{Duration: 7 * time.Second}
 	a := execstats.QueryLevelStats{
-		NetworkBytesSent: 1,
-		MaxMemUsage:      2,
-		KVBytesRead:      3,
-		KVRowsRead:       4,
-		KVTime:           5 * time.Second,
-		NetworkMessages:  6,
-		ContentionTime:   7 * time.Second,
-		MaxDiskUsage:     8,
-		Regions:          []string{"gcp-us-east1"},
+		NetworkBytesSent:                   1,
+		MaxMemUsage:                        2,
+		KVBytesRead:                        3,
+		KVPairsRead:                        4,
+		KVRowsRead:                         4,
+		KVBatchRequestsIssued:              4,
+		KVTime:                             5 * time.Second,
+		NetworkMessages:                    6,
+		ContentionTime:                     7 * time.Second,
+		ContentionEvents:                   []kvpb.ContentionEvent{aEvent},
+		MaxDiskUsage:                       8,
+		RUEstimate:                         9,
+		CPUTime:                            10 * time.Second,
+		MvccSteps:                          11,
+		MvccStepsInternal:                  12,
+		MvccSeeks:                          13,
+		MvccSeeksInternal:                  14,
+		MvccBlockBytes:                     15,
+		MvccBlockBytesInCache:              16,
+		MvccKeyBytes:                       17,
+		MvccValueBytes:                     18,
+		MvccPointCount:                     19,
+		MvccPointsCoveredByRangeTombstones: 20,
+		MvccRangeKeyCount:                  21,
+		MvccRangeKeyContainedPoints:        22,
+		MvccRangeKeySkippedPoints:          23,
+		SQLInstanceIDs:                     []int32{1},
+		KVNodeIDs:                          []int32{1, 2},
+		Regions:                            []string{"east-usA"},
+		UsedFollowerRead:                   false,
+		ClientTime:                         time.Second,
 	}
+	bEvent := kvpb.ContentionEvent{Duration: 14 * time.Second}
 	b := execstats.QueryLevelStats{
-		NetworkBytesSent: 8,
-		MaxMemUsage:      9,
-		KVBytesRead:      10,
-		KVRowsRead:       11,
-		KVTime:           12 * time.Second,
-		NetworkMessages:  13,
-		ContentionTime:   14 * time.Second,
-		MaxDiskUsage:     15,
-		Regions:          []string{"gcp-us-west1"},
+		NetworkBytesSent:                   8,
+		MaxMemUsage:                        9,
+		KVBytesRead:                        10,
+		KVPairsRead:                        11,
+		KVRowsRead:                         11,
+		KVBatchRequestsIssued:              11,
+		KVTime:                             12 * time.Second,
+		NetworkMessages:                    13,
+		ContentionTime:                     14 * time.Second,
+		ContentionEvents:                   []kvpb.ContentionEvent{bEvent},
+		MaxDiskUsage:                       15,
+		RUEstimate:                         16,
+		CPUTime:                            17 * time.Second,
+		MvccSteps:                          18,
+		MvccStepsInternal:                  19,
+		MvccSeeks:                          20,
+		MvccSeeksInternal:                  21,
+		MvccBlockBytes:                     22,
+		MvccBlockBytesInCache:              23,
+		MvccKeyBytes:                       24,
+		MvccValueBytes:                     25,
+		MvccPointCount:                     26,
+		MvccPointsCoveredByRangeTombstones: 27,
+		MvccRangeKeyCount:                  28,
+		MvccRangeKeyContainedPoints:        29,
+		MvccRangeKeySkippedPoints:          30,
+		SQLInstanceIDs:                     []int32{2},
+		KVNodeIDs:                          []int32{1, 3},
+		Regions:                            []string{"east-usB"},
+		UsedFollowerRead:                   true,
+		ClientTime:                         2 * time.Second,
 	}
 	expected := execstats.QueryLevelStats{
-		NetworkBytesSent: 9,
-		MaxMemUsage:      9,
-		KVBytesRead:      13,
-		KVRowsRead:       15,
-		KVTime:           17 * time.Second,
-		NetworkMessages:  19,
-		ContentionTime:   21 * time.Second,
-		MaxDiskUsage:     15,
-		Regions:          []string{"gcp-us-east1", "gcp-us-west1"},
+		NetworkBytesSent:                   9,
+		MaxMemUsage:                        9,
+		KVBytesRead:                        13,
+		KVPairsRead:                        15,
+		KVRowsRead:                         15,
+		KVBatchRequestsIssued:              15,
+		KVTime:                             17 * time.Second,
+		NetworkMessages:                    19,
+		ContentionTime:                     21 * time.Second,
+		ContentionEvents:                   []kvpb.ContentionEvent{aEvent, bEvent},
+		MaxDiskUsage:                       15,
+		RUEstimate:                         25,
+		CPUTime:                            27 * time.Second,
+		MvccSteps:                          29,
+		MvccStepsInternal:                  31,
+		MvccSeeks:                          33,
+		MvccSeeksInternal:                  35,
+		MvccBlockBytes:                     37,
+		MvccBlockBytesInCache:              39,
+		MvccKeyBytes:                       41,
+		MvccValueBytes:                     43,
+		MvccPointCount:                     45,
+		MvccPointsCoveredByRangeTombstones: 47,
+		MvccRangeKeyCount:                  49,
+		MvccRangeKeyContainedPoints:        51,
+		MvccRangeKeySkippedPoints:          53,
+		SQLInstanceIDs:                     []int32{1, 2},
+		KVNodeIDs:                          []int32{1, 2, 3},
+		Regions:                            []string{"east-usA", "east-usB"},
+		UsedFollowerRead:                   true,
+		ClientTime:                         3 * time.Second,
 	}
 
 	aCopy := a
+	// Copy will point to the same array.
+	aCopy.SQLInstanceIDs = []int32{1}
+	aCopy.KVNodeIDs = []int32{1, 2}
 	a.Accumulate(b)
 	require.Equal(t, expected, a)
 

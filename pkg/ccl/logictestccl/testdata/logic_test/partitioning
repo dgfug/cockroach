@@ -390,13 +390,26 @@ ok1  CREATE TABLE public.ok1 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok1_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok1_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a) (
   PARTITION p1 VALUES IN ((1)),
   PARTITION p2 VALUES IN ((2))
 )
 -- Warning: Partitioned table with no zone configurations.
+
+query TT
+SHOW CREATE TABLE ok1 WITH REDACT
+----
+ok1  CREATE TABLE public.ok1 (
+       a INT8 NOT NULL,
+       b INT8 NOT NULL,
+       c INT8 NULL,
+       CONSTRAINT ok1_pkey PRIMARY KEY (a ASC, b ASC)
+     ) PARTITION BY LIST (a) (
+       PARTITION p1 VALUES IN ((‹×›)),
+       PARTITION p2 VALUES IN ((‹×›))
+     )
+     -- Warning: Partitioned table with no zone configurations.
 
 query T
 SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name='sql.show.create' AND usage_count > 0
@@ -412,6 +425,8 @@ TABLE ok1
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok1_pkey
       ├── a int not null
       ├── b int not null
@@ -443,8 +458,7 @@ ok2  CREATE TABLE public.ok2 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok2_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok2_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a) (
   PARTITION p1 VALUES IN ((1)),
   PARTITION p2 VALUES IN ((2))
@@ -460,6 +474,8 @@ TABLE ok2
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok2_pkey
       ├── a int not null
       ├── b int not null
@@ -491,13 +507,26 @@ ok3  CREATE TABLE public.ok3 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok3_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok3_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a) (
   PARTITION p1 VALUES IN ((1)),
   PARTITION p2 VALUES IN ((DEFAULT))
 )
 -- Warning: Partitioned table with no zone configurations.
+
+query TT
+SHOW CREATE TABLE ok3 WITH REDACT
+----
+ok3  CREATE TABLE public.ok3 (
+       a INT8 NOT NULL,
+       b INT8 NOT NULL,
+       c INT8 NULL,
+       CONSTRAINT ok3_pkey PRIMARY KEY (a ASC, b ASC)
+     ) PARTITION BY LIST (a) (
+       PARTITION p1 VALUES IN ((‹×›)),
+       PARTITION p2 VALUES IN ((DEFAULT))
+     )
+     -- Warning: Partitioned table with no zone configurations.
 
 query T
 EXPLAIN (OPT, CATALOG) SELECT * from ok3
@@ -508,6 +537,8 @@ TABLE ok3
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok3_pkey
       ├── a int not null
       ├── b int not null
@@ -541,8 +572,7 @@ ok4  CREATE TABLE public.ok4 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok4_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok4_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a, b) (
   PARTITION p1 VALUES IN ((1, 1)),
   PARTITION p2 VALUES IN ((1, DEFAULT)),
@@ -560,6 +590,8 @@ TABLE ok4
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok4_pkey
       ├── a int not null
       ├── b int not null
@@ -609,6 +641,8 @@ TABLE ok5
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok5_pkey
       ├── a int not null
       ├── b int not null
@@ -631,8 +665,7 @@ ok5  CREATE TABLE public.ok5 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok5_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok5_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a) (
   PARTITION p1 VALUES IN ((1)) PARTITION BY LIST (b) (
     PARTITION p1_1 VALUES IN ((1)),
@@ -664,8 +697,7 @@ ok6  CREATE TABLE public.ok6 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok6_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok6_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY RANGE (a) (
   PARTITION p1 VALUES FROM (0) TO (1),
   PARTITION p2 VALUES FROM (1) TO (2)
@@ -681,6 +713,8 @@ TABLE ok6
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok6_pkey
       ├── a int not null
       └── b int not null
@@ -702,8 +736,7 @@ ok7  CREATE TABLE public.ok7 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok7_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok7_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY RANGE (a) (
   PARTITION p1 VALUES FROM (0) TO (1)
 )
@@ -718,6 +751,8 @@ TABLE ok7
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok7_pkey
       ├── a int not null
       └── b int not null
@@ -743,14 +778,28 @@ ok8  CREATE TABLE public.ok8 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok8_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok8_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY RANGE (a) (
   PARTITION p1 VALUES FROM (MINVALUE) TO (1),
   PARTITION p2 VALUES FROM (1) TO (2),
   PARTITION p3 VALUES FROM (2) TO (MAXVALUE)
 )
 -- Warning: Partitioned table with no zone configurations.
+
+query TT
+SHOW CREATE TABLE ok8 WITH REDACT
+----
+ok8  CREATE TABLE public.ok8 (
+       a INT8 NOT NULL,
+       b INT8 NOT NULL,
+       c INT8 NULL,
+       CONSTRAINT ok8_pkey PRIMARY KEY (a ASC, b ASC)
+     ) PARTITION BY RANGE (a) (
+       PARTITION p1 VALUES FROM (MINVALUE) TO (‹×›),
+       PARTITION p2 VALUES FROM (‹×›) TO (‹×›),
+       PARTITION p3 VALUES FROM (‹×›) TO (MAXVALUE)
+     )
+     -- Warning: Partitioned table with no zone configurations.
 
 query T
 EXPLAIN (OPT, CATALOG) SELECT * from ok8
@@ -761,6 +810,8 @@ TABLE ok8
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok8_pkey
       ├── a int not null
       └── b int not null
@@ -787,8 +838,7 @@ ok9  CREATE TABLE public.ok9 (
      a INT8 NOT NULL,
      b INT8 NOT NULL,
      c INT8 NULL,
-     CONSTRAINT ok9_pkey PRIMARY KEY (a ASC, b ASC),
-     FAMILY "primary" (a, b, c)
+     CONSTRAINT ok9_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY RANGE (a, b) (
   PARTITION p1 VALUES FROM (MINVALUE, MINVALUE) TO (1, MAXVALUE),
   PARTITION p2 VALUES FROM (1, MAXVALUE) TO (3, MINVALUE),
@@ -806,6 +856,8 @@ TABLE ok9
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok9_pkey
       ├── a int not null
       └── b int not null
@@ -833,8 +885,7 @@ ok10  CREATE TABLE public.ok10 (
       a INT8 NOT NULL,
       b INT8 NOT NULL,
       c INT8 NULL,
-      CONSTRAINT ok10_pkey PRIMARY KEY (a ASC, b ASC),
-      FAMILY "primary" (a, b, c)
+      CONSTRAINT ok10_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY RANGE (a, b) (
   PARTITION p1 VALUES FROM (MINVALUE, MINVALUE) TO (1, 1),
   PARTITION p2 VALUES FROM (1, 1) TO (1, MAXVALUE),
@@ -853,6 +904,8 @@ TABLE ok10
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok10_pkey
       ├── a int not null
       └── b int not null
@@ -885,8 +938,7 @@ ok11  CREATE TABLE public.ok11 (
       a INT8 NOT NULL,
       b INT8 NOT NULL,
       c INT8 NOT NULL,
-      CONSTRAINT ok11_pkey PRIMARY KEY (a ASC, b ASC, c ASC),
-      FAMILY "primary" (a, b, c)
+      CONSTRAINT ok11_pkey PRIMARY KEY (a ASC, b ASC, c ASC)
 ) PARTITION BY LIST (a) (
   PARTITION p1 VALUES IN ((1)) PARTITION BY LIST (b) (
     PARTITION p1_1 VALUES IN ((3)) PARTITION BY LIST (c) (
@@ -900,6 +952,27 @@ ok11  CREATE TABLE public.ok11 (
 )
 -- Warning: Partitioned table with no zone configurations.
 
+query TT
+SHOW CREATE TABLE ok11 WITH REDACT
+----
+ok11  CREATE TABLE public.ok11 (
+        a INT8 NOT NULL,
+        b INT8 NOT NULL,
+        c INT8 NOT NULL,
+        CONSTRAINT ok11_pkey PRIMARY KEY (a ASC, b ASC, c ASC)
+      ) PARTITION BY LIST (a) (
+        PARTITION p1 VALUES IN ((‹×›)) PARTITION BY LIST (b) (
+          PARTITION p1_1 VALUES IN ((‹×›)) PARTITION BY LIST (c) (
+            PARTITION p1_1_1 VALUES IN ((‹×›))
+          ),
+          PARTITION p1_2 VALUES IN ((‹×›))
+        ),
+        PARTITION p2 VALUES IN ((‹×›)) PARTITION BY RANGE (b) (
+          PARTITION p2_1 VALUES FROM (‹×›) TO (‹×›)
+        )
+      )
+      -- Warning: Partitioned table with no zone configurations.
+
 query T
 EXPLAIN (OPT, CATALOG) SELECT * from ok11
 ----
@@ -909,6 +982,8 @@ TABLE ok11
  ├── c int not null
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok11_pkey
       ├── a int not null
       ├── b int not null
@@ -942,8 +1017,7 @@ ok12  CREATE TABLE public.ok12 (
       a INT8 NOT NULL,
       b INT8 NOT NULL,
       c INT8 NULL,
-      CONSTRAINT ok12_pkey PRIMARY KEY (a ASC, b ASC),
-      FAMILY "primary" (a, b, c)
+      CONSTRAINT ok12_pkey PRIMARY KEY (a ASC, b ASC)
 ) PARTITION BY LIST (a) (
   PARTITION pu VALUES IN ((NULL)),
   PARTITION p1 VALUES IN ((1)),
@@ -960,6 +1034,8 @@ TABLE ok12
  ├── c int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  └── PRIMARY INDEX ok12_pkey
       ├── a int not null
       ├── b int not null
@@ -1011,31 +1087,31 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM DATABASE d_show_partitions
 ----
 d_show_partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                        range_max_bytes = 536870912,
+                                                        gc.ttlseconds = 14400,
+                                                        num_replicas = 3,
+                                                        constraints = '[]',
+                                                        lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE d_show_partitions.t
 ----
 d_show_partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                        range_max_bytes = 536870912,
+                                                        gc.ttlseconds = 14400,
+                                                        num_replicas = 3,
+                                                        constraints = '[]',
+                                                        lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM INDEX d_show_partitions.t@t_pkey
 ----
 d_show_partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                        range_max_bytes = 536870912,
+                                                        gc.ttlseconds = 14400,
+                                                        num_replicas = 3,
+                                                        constraints = '[]',
+                                                        lease_preferences = '[]'
 
 statement ok
 CREATE DATABASE "show partitions"
@@ -1047,31 +1123,31 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM DATABASE "show partitions"
 ----
 show partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                      range_max_bytes = 536870912,
+                                                      gc.ttlseconds = 14400,
+                                                      num_replicas = 3,
+                                                      constraints = '[]',
+                                                      lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE "show partitions".t
 ----
 show partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                      range_max_bytes = 536870912,
+                                                      gc.ttlseconds = 14400,
+                                                      num_replicas = 3,
+                                                      constraints = '[]',
+                                                      lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM INDEX "show partitions".t@t_pkey
 ----
 show partitions  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                      range_max_bytes = 536870912,
+                                                      gc.ttlseconds = 14400,
+                                                      num_replicas = 3,
+                                                      constraints = '[]',
+                                                      lease_preferences = '[]'
 
 statement ok
 CREATE DATABASE """"
@@ -1083,31 +1159,31 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM DATABASE """"
 ----
 "  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                        range_max_bytes = 536870912,
+                                        gc.ttlseconds = 14400,
+                                        num_replicas = 3,
+                                        constraints = '[]',
+                                        lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE """".t
 ----
 "  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                        range_max_bytes = 536870912,
+                                        gc.ttlseconds = 14400,
+                                        num_replicas = 3,
+                                        constraints = '[]',
+                                        lease_preferences = '[]'
 
 query TTTTTTTTT
 SHOW PARTITIONS FROM INDEX """".t@t_pkey
 ----
 "  t  p1  NULL  x  t@t_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                        range_max_bytes = 536870912,
+                                        gc.ttlseconds = 14400,
+                                        num_replicas = 3,
+                                        constraints = '[]',
+                                        lease_preferences = '[]'
 
 query T
 SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name='sql.show.partitions' AND usage_count > 0
@@ -1125,11 +1201,11 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE t_inherit
 ----
 test  t_inherit  p1  NULL  x  t_inherit@t_inherit_pkey  (1)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                                   range_max_bytes = 536870912,
+                                                                   gc.ttlseconds = 14400,
+                                                                   num_replicas = 3,
+                                                                   constraints = '[]',
+                                                                   lease_preferences = '[]'
 
 statement ok
 ALTER PARTITION p1 of TABLE t_inherit CONFIGURE ZONE USING num_replicas=5
@@ -1138,11 +1214,11 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE t_inherit
 ----
 test  t_inherit  p1  NULL  x  t_inherit@t_inherit_pkey  (1)  num_replicas = 5  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 5,
-constraints = '[]',
-lease_preferences = '[]'
+                                                                               range_max_bytes = 536870912,
+                                                                               gc.ttlseconds = 14400,
+                                                                               num_replicas = 5,
+                                                                               constraints = '[]',
+                                                                               lease_preferences = '[]'
 
 statement ok
 CREATE TABLE t_inherit_range (x INT PRIMARY KEY)
@@ -1154,11 +1230,11 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE t_inherit_range
 ----
 test  t_inherit_range  p1  NULL  x  t_inherit_range@t_inherit_range_pkey  (1) TO (2)  NULL  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 3,
-constraints = '[]',
-lease_preferences = '[]'
+                                                                                            range_max_bytes = 536870912,
+                                                                                            gc.ttlseconds = 14400,
+                                                                                            num_replicas = 3,
+                                                                                            constraints = '[]',
+                                                                                            lease_preferences = '[]'
 
 statement ok
 ALTER PARTITION p1 of TABLE t_inherit_range CONFIGURE ZONE USING num_replicas=5
@@ -1167,11 +1243,11 @@ query TTTTTTTTT
 SHOW PARTITIONS FROM TABLE t_inherit_range
 ----
 test  t_inherit_range  p1  NULL  x  t_inherit_range@t_inherit_range_pkey  (1) TO (2)  num_replicas = 5  range_min_bytes = 134217728,
-range_max_bytes = 536870912,
-gc.ttlseconds = 90000,
-num_replicas = 5,
-constraints = '[]',
-lease_preferences = '[]'
+                                                                                                        range_max_bytes = 536870912,
+                                                                                                        gc.ttlseconds = 14400,
+                                                                                                        num_replicas = 5,
+                                                                                                        constraints = '[]',
+                                                                                                        lease_preferences = '[]'
 
 statement ok
 CREATE TABLE partition_by_nothing (
@@ -1195,3 +1271,250 @@ CREATE TABLE public.partition_by_nothing (
    INDEX partition_by_nothing_b_idx (b ASC),
    FAMILY fam_0_pk_a_b (pk, a, b)
 )
+
+# Verify that it's not possible to partition tables by array columns (#91766).
+
+statement error unimplemented: partitioning by array column
+CREATE TABLE partition_array (
+  pk INT[] PRIMARY KEY
+) PARTITION BY LIST (pk) (PARTITION blah VALUES IN (ARRAY[1], ARRAY[2]))
+
+statement error unimplemented: partitioning by array column
+CREATE TABLE partition_array (
+  pk INT[] PRIMARY KEY
+) PARTITION BY RANGE (pk) (PARTITION blah VALUES FROM (ARRAY[1]) TO (ARRAY[2]))
+
+statement error unimplemented: partitioning by array column
+CREATE TABLE partition_array (
+  a INT[],
+  INDEX (a) PARTITION BY LIST (a) (PARTITION blah VALUES IN (ARRAY[1], ARRAY[2]))
+)
+
+statement error unimplemented: partitioning by array column
+CREATE TABLE partition_array (
+  a INT[],
+  INDEX (a) PARTITION BY RANGE (a) (PARTITION blah VALUES FROM (ARRAY[1]) TO (ARRAY[2]))
+)
+
+statement ok
+CREATE TABLE partition_array (
+  pk INT[] PRIMARY KEY,
+  a INT[]
+)
+
+statement error unimplemented: partitioning by array column
+ALTER TABLE partition_array PARTITION BY LIST (pk) (PARTITION blah VALUES IN (ARRAY[1], ARRAY[2]))
+
+statement error unimplemented: partitioning by array column
+ALTER TABLE partition_array PARTITION BY RANGE (pk) (PARTITION blah VALUES FROM (ARRAY[1]) TO (ARRAY[2]))
+
+statement error unimplemented: partitioning by array column
+CREATE INDEX ON partition_array (a) PARTITION BY LIST (a) (PARTITION blah VALUES IN (ARRAY[1], ARRAY[2]))
+
+statement error unimplemented: partitioning by array column
+CREATE INDEX ON partition_array (a) PARTITION BY RANGE (a) (PARTITION blah VALUES FROM (ARRAY[1]) TO (ARRAY[2]))
+
+subtest regression_95238
+
+statement ok
+CREATE TABLE "a.b" ("c.d" INT PRIMARY KEY)
+PARTITION BY LIST ("c.d") (PARTITION "e.f" VALUES IN (0));
+CREATE TABLE "g.h" ("i.j" INT PRIMARY KEY)
+PARTITION BY RANGE ("i.j") (PARTITION "k.l" VALUES FROM (0) TO (1));
+---
+
+# Check that the result of pretty-printing quotes the identifiers
+# in the partition list and the partition names properly.
+query TT
+SHOW CREATE TABLE "a.b"
+----
+"a.b"  CREATE TABLE public."a.b" (
+         "c.d" INT8 NOT NULL,
+         CONSTRAINT "a.b_pkey" PRIMARY KEY ("c.d" ASC)
+       ) PARTITION BY LIST ("c.d") (
+         PARTITION "e.f" VALUES IN ((0))
+       )
+       -- Warning: Partitioned table with no zone configurations.
+
+query TT
+SHOW CREATE TABLE "g.h"
+----
+"g.h"  CREATE TABLE public."g.h" (
+         "i.j" INT8 NOT NULL,
+         CONSTRAINT "g.h_pkey" PRIMARY KEY ("i.j" ASC)
+       ) PARTITION BY RANGE ("i.j") (
+         PARTITION "k.l" VALUES FROM (0) TO (1)
+       )
+       -- Warning: Partitioned table with no zone configurations.
+
+# Regression test for #104434
+statement ok
+CREATE TABLE t104434 (col1_1 TIME NOT NULL,
+                     col1_2 BOX2D NOT NULL,
+                     col1_6 TIMESTAMPTZ NOT NULL,
+                     col1_7 INT2 NOT NULL,
+UNIQUE (col1_2 DESC, col1_6 DESC, col1_7)
+PARTITION BY LIST (col1_2)
+   (PARTITION table1_part0 VALUES IN
+      (('BOX(-2.3656871231379673 0.08005935398376657,0.00006334567808685687 1.0507097476647371)':::BOX2D,),
+       ('BOX(-1.3331149540898428 -1.4498952031750436,0.31308919437999666 -0.31153093088911066)':::BOX2D,),
+       ('BOX(-0.33064792697069023 -2.0701189052575,0.6471498693776329 0.8051252471483337)':::BOX2D,),
+       ('BOX(-0.7984796084459761 -0.2518102280472908,-0.2548940662574293 0.8498141992637969)':::BOX2D,),
+       ('BOX(0.2539298524767869 -1.2364856222003202,0.7343459210111131 -0.6065110222757708)':::BOX2D,),
+       ('BOX(-10 -10,10 10)':::BOX2D,),
+       ('BOX(-0.668551051061592 1.0638635228486346,0.5158950404907572 1.329913121048527)':::BOX2D,)),
+    PARTITION table1_part1 VALUES IN
+      (('BOX(-0.4711807519088593 -0.09073417363922384,-0.12094248340421795 0.7847540491098399)':::BOX2D,),
+       ('BOX(0.8102585814674039 -0.6055208348537393,1.2525166924090267 0.4387570127404082)':::BOX2D,),
+       ('BOX(-1.9307528644194192 -0.5889089615103482,-0.797392728364479 0.2411775400088768)':::BOX2D,),
+       ('BOX(-0.3537041761053574 -0.7733396028635348,0.19857593034348553 -0.06521749155926582)':::BOX2D,),
+       ('BOX(-1.0797338052593481 -1.1367883141477577,-0.15387410798177314 -0.9747882620558662)':::BOX2D,),
+       ('BOX(-0.6874780070386425 0.02716172175611309,-0.6867544081486655 0.6687892997959871)':::BOX2D,),
+       ('BOX(-0.24482083483970896 -0.7254046007175894,0.05548774284115865 1.5206359839348833)':::BOX2D,)),
+    PARTITION table1_part2 VALUES IN
+      (('BOX(-0.10972658566999416 -0.7167318710978398,0.6789244952411726 0.24375681311830272)':::BOX2D,),
+       ('BOX(-0.5491493929813216 -0.9945835306518394,0.5497781192557917 -0.5336473887478679)':::BOX2D,),
+       ('BOX(-1.144631213036416 -1.6028533668143663,-0.2779085365465537 -0.4722759620686192)':::BOX2D,),
+       ('BOX(-1.790605095884903 -0.7872233803783435,0.5052427691317783 0.8905079516833693)':::BOX2D,),
+       ('BOX(0.5800044253150916 -0.631859538843543,2.166538271521436 -0.3936412129189529)':::BOX2D,)))
+    WHERE ((col1_7 > (-1):::INT8) AND (col1_1 = '00:00:00':::TIME)) OR
+           (col1_6 != '3000-01-01 00:00:00+00':::TIMESTAMPTZ)
+);
+
+statement ok
+ALTER TABLE t104434 INJECT STATISTICS
+e'[{
+      "avg_size":13,
+      "columns":[
+         "col1_6"
+      ],
+      "created_at":"2000-01-01 00:00:00+00:00",
+      "distinct_count":2875101719233781377,
+      "null_count":0,
+      "row_count":3408010909169188722
+   }
+  ]':::JSONB;
+
+# The spans created from the PARTITION *partition_name* VALUES IN clauses and
+# used in estimating row count with the partial index predicate should not
+# cause the row count to go to zero (which causes a panic).
+query T
+EXPLAIN SELECT 1
+WHERE
+	(NOT ('2012-05-14 07:37:50.000177+00':::TIMESTAMPTZ NOT IN (SELECT col1_6 FROM t104434)))
+;
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • render
+│   │
+│   └── • filter
+│       │ estimated row count: 0
+│       │ filter: COALESCE(@S1, false)
+│       │
+│       └── • emptyrow
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: (SELECT col1_6 FROM t104434)
+    │ exec mode: one row
+    │
+    └── • render
+        │
+        └── • limit
+            │ count: 1
+            │
+            └── • filter
+                │ estimated row count: 681,602,182
+                │ filter: col1_6 = '2012-05-14 07:37:50.000177+00'
+                │
+                └── • scan
+                      estimated row count: 555,555,557 - 378,667,879,137,377,664 (11% of the table; stats collected <hidden> ago)
+                      table: t104434@t104434_col1_2_col1_6_col1_7_key (partial index)
+                      spans: [ - /'BOX(0.8102585814674039 -0.6055208348537393,1.2525166924090267 0.4387570127404082)') [/'BOX(0.8102585814674039 -0.6055208348537393,1.2525166924090267 0.4387570127404082)'/'2012-05-14 07:37:50.000177+00' - /'BOX(0.8102585814674039 -0.6055208348537393,1.2525166924090267 0.4387570127404082)'/'2012-05-14 07:37:50.000177+00'] (/'BOX(0.8102585814674039 -0.6055208348537393,1.2525166924090267 0.4387570127404082)' - /'BOX(0.5800044253150916 -0.631859538843543,2.166538271521436 -0.3936412129189529)') [/'BOX(0.5800044253150916 -0.631859538843543,2.166538271521436 -0.3936412129189529)'/'2012-05-14 07:37:50.000177+00' - /'BOX(0.5800044253150916 -0.631859538843543,2.166538271521436 -0.3936412129189529)'/'2012-05-14 07:37:50.000177+00'] … (35 more)
+
+# Regression test for #94188 in which we did not copy over the zone config in
+# to the new indexes created after a truncate.
+subtest zone_config
+
+statement ok
+CREATE TABLE bar(a int primary key) PARTITION BY LIST (a) (PARTITION x VALUES IN (1), PARTITION y VALUES IN (2));
+
+statement ok
+ALTER PARTITION x OF TABLE bar CONFIGURE ZONE USING gc.ttlseconds=100;
+
+statement ok
+ALTER PARTITION y OF TABLE bar CONFIGURE ZONE USING gc.ttlseconds=150;
+
+query TT
+SHOW CREATE TABLE bar;
+----
+bar  CREATE TABLE public.bar (
+       a INT8 NOT NULL,
+       CONSTRAINT bar_pkey PRIMARY KEY (a ASC)
+     ) PARTITION BY LIST (a) (
+       PARTITION x VALUES IN ((1)),
+       PARTITION y VALUES IN ((2))
+     );
+     ALTER PARTITION x OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+       gc.ttlseconds = 100;
+     ALTER PARTITION y OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+       gc.ttlseconds = 150
+
+
+statement ok
+TRUNCATE bar;
+
+query TT
+SHOW CREATE TABLE bar;
+----
+bar  CREATE TABLE public.bar (
+       a INT8 NOT NULL,
+       CONSTRAINT bar_pkey PRIMARY KEY (a ASC)
+     ) PARTITION BY LIST (a) (
+       PARTITION x VALUES IN ((1)),
+       PARTITION y VALUES IN ((2))
+     );
+     ALTER PARTITION x OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+       gc.ttlseconds = 100;
+     ALTER PARTITION y OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+       gc.ttlseconds = 150
+
+query TT
+SHOW ZONE CONFIGURATION FOR PARTITION x OF INDEX test.public.bar@bar_pkey;
+----
+PARTITION x OF INDEX test.public.bar@bar_pkey  ALTER PARTITION x OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+                                                 range_min_bytes = 134217728,
+                                                 range_max_bytes = 536870912,
+                                                 gc.ttlseconds = 100,
+                                                 num_replicas = 3,
+                                                 constraints = '[]',
+                                                 lease_preferences = '[]'
+
+query TT
+SHOW ZONE CONFIGURATION FOR PARTITION y OF INDEX test.public.bar@bar_pkey;
+----
+PARTITION y OF INDEX test.public.bar@bar_pkey  ALTER PARTITION y OF INDEX test.public.bar@bar_pkey CONFIGURE ZONE USING
+                                                 range_min_bytes = 134217728,
+                                                 range_max_bytes = 536870912,
+                                                 gc.ttlseconds = 150,
+                                                 num_replicas = 3,
+                                                 constraints = '[]',
+                                                 lease_preferences = '[]'
+
+query T rowsort
+WITH subzone_spans AS (
+    SELECT json_array_elements(crdb_internal.pb_to_json('cockroach.config.zonepb.ZoneConfig', config) -> 'subzoneSpans') ->> 'key' AS key
+    FROM system.zones
+    WHERE id = 'bar'::REGCLASS::OID
+)
+SELECT crdb_internal.pretty_key(decode(key, 'base64'), 0) AS pretty_key
+FROM subzone_spans;
+----
+/2/1
+/2/2
+
+subtest end

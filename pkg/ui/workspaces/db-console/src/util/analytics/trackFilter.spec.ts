@@ -1,54 +1,42 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { get } from "lodash";
-import { assert } from "chai";
-import { createSandbox } from "sinon";
+import get from "lodash/get";
+
 import { track } from "./trackFilter";
-
-const sandbox = createSandbox();
 
 describe("trackFilter", () => {
   const filter = "Test";
   const filterValue = "test-value";
 
-  afterEach(() => {
-    sandbox.reset();
-  });
-
   it("should only call track once", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
     track(spy)(filter, filterValue);
-    assert.isTrue(spy.calledOnce);
+    expect(spy).toHaveBeenCalled();
   });
 
   it("should send a track call with the correct event", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
     const expected = "Test Filter";
 
     track(spy)(filter, filterValue);
 
-    const sent = spy.getCall(0).args[0];
+    const sent = spy.mock.calls[0][0];
     const event = get(sent, "event");
 
-    assert.isTrue(event === expected);
+    expect(event === expected).toBe(true);
   });
 
   it("send the correct payload", () => {
-    const spy = sandbox.spy();
+    const spy = jest.fn();
 
     track(spy)(filter, filterValue);
 
-    const sent = spy.getCall(0).args[0];
+    const sent = spy.mock.calls[0][0];
     const selectedFilter = get(sent, "properties.selectedFilter");
 
-    assert.isTrue(selectedFilter === filterValue);
+    expect(selectedFilter === filterValue).toBe(true);
   });
 });

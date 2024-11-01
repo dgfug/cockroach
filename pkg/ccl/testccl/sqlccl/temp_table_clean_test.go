@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlccl_test
 
@@ -16,8 +13,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -27,16 +25,11 @@ import (
 
 func TestTenantTempTableCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "May cause a conn executor race fixed by #114783")
 
 	ctx := context.Background()
 	t.Helper()
-	settings := cluster.MakeTestingClusterSettings()
-	sql.TempObjectCleanupInterval.Override(ctx, &settings.SV, time.Second)
-	sql.TempObjectWaitInterval.Override(ctx, &settings.SV, time.Second*0)
-	// Set up sessions to expire within 5 seconds of a
-	// nodes death.
-	slinstance.DefaultTTL.Override(ctx, &settings.SV, 5*time.Second)
-	slinstance.DefaultHeartBeat.Override(ctx, &settings.SV, time.Second)
 	// Knob state is used to track when temporary object clean up
 	// is executed.
 	var (
@@ -93,19 +86,30 @@ func TestTenantTempTableCleanup(t *testing.T) {
 			},
 		},
 	}
-	tc := serverutils.StartNewTestCluster(
+	tc := serverutils.StartCluster(
 		t, 3 /* numNodes */, base.TestClusterArgs{ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				Settings: settings,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			},
 		},
 	)
-	log.TestingClearServerIdentifiers()
 	tenantStoppers := []*stop.Stopper{stop.NewStopper(), stop.NewStopper()}
+
+	tenantSettings := func() *cluster.Settings {
+		st := cluster.MakeTestingClusterSettings()
+		sql.TempObjectCleanupInterval.Override(ctx, &st.SV, time.Second)
+		sql.TempObjectWaitInterval.Override(ctx, &st.SV, time.Second*0)
+		// Set up sessions to expire within 5 seconds of a
+		// nodes death.
+		slbase.DefaultTTL.Override(ctx, &st.SV, 5*time.Second)
+		slbase.DefaultHeartBeat.Override(ctx, &st.SV, time.Second)
+		return st
+	}
+
 	_, tenantPrimaryDB := serverutils.StartTenant(t, tc.Server(0),
 		base.TestTenantArgs{
 			TenantID:     serverutils.TestTenantID(),
-			Settings:     settings,
+			Settings:     tenantSettings(),
 			TestingKnobs: tenantTempKnobSettings,
 			Stopper:      tenantStoppers[0],
 		})
@@ -118,16 +122,13 @@ func TestTenantTempTableCleanup(t *testing.T) {
 	tenantSQL.Exec(t, "SET experimental_enable_temp_tables = 'on'")
 	tenantSQL.Exec(t, "set cluster setting sql.temp_object_cleaner.cleanup_interval='1 seconds'")
 	tenantSQL.Exec(t, "CREATE TEMP TABLE temp_table (x INT PRIMARY KEY, y INT);")
-	// Prevent a logging assertion that the server ID is initialized multiple times.
-	log.TestingClearServerIdentifiers()
+
 	_, tenantSecondDB := serverutils.StartTenant(t, tc.Server(1),
 		base.TestTenantArgs{
-			Existing: true,
 			TenantID: serverutils.TestTenantID(),
-			Settings: settings,
+			Settings: tenantSettings(),
 			Stopper:  tenantStoppers[1],
 		})
-	log.TestingClearServerIdentifiers()
 	tenantSecondSQL := sqlutils.MakeSQLRunner(tenantSecondDB)
 	tenantSecondSQL.CheckQueryResults(t, "SELECT table_name FROM [SHOW TABLES]",
 		[][]string{
@@ -147,7 +148,7 @@ func TestTenantTempTableCleanup(t *testing.T) {
 	// two clean up cycles just in case, so that we have
 	// stable timing.
 	waitForCleanup()
-	tenantSQL.CheckQueryResults(t, "SELECT table_name FROM [SHOW TABLES]",
+	tenantSQL.CheckQueryResultsRetry(t, "SELECT table_name FROM [SHOW TABLES]",
 		[][]string{
 			{"temp_table"},
 		})
@@ -160,16 +161,13 @@ func TestTenantTempTableCleanup(t *testing.T) {
 	// Enable our hook to allow the database to be
 	// brought up.
 	pause()
-	// Prevent a logging assertion that the server ID is initialized multiple times.
-	log.TestingClearServerIdentifiers()
 	// Once we restart the tenant, no sessions should exist
 	// so all temporary tables should be cleaned up.
 	tenantStoppers[0] = stop.NewStopper()
 	_, tenantPrimaryDB = serverutils.StartTenant(t, tc.Server(0),
 		base.TestTenantArgs{
-			Existing:     true,
 			TenantID:     serverutils.TestTenantID(),
-			Settings:     settings,
+			Settings:     tenantSettings(),
 			TestingKnobs: tenantTempKnobSettings,
 			Stopper:      tenantStoppers[0]})
 	tenantSQL = sqlutils.MakeSQLRunner(tenantPrimaryDB)

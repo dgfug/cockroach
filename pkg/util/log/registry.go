@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -81,8 +76,42 @@ func (r *sinkInfoRegistry) iter(fn func(l *sinkInfo) error) error {
 func (r *sinkInfoRegistry) iterFileSinks(fn func(l *fileSink) error) error {
 	return r.iter(func(si *sinkInfo) error {
 		if fs, ok := si.sink.(*fileSink); ok {
-			if err := fn(fs); err != nil {
+			return fn(fs)
+		}
+
+		if bs, ok := si.sink.(*bufferedSink); ok {
+			if fs, ok := bs.child.(*fileSink); ok {
+				return fn(fs)
+			}
+		}
+		return nil
+	})
+}
+
+// iterBufferedSinks iterates over all the buffered sinks and stops at the first
+// error encountered.
+func (r *sinkInfoRegistry) iterBufferedSinks(fn func(bs *bufferedSink) error) error {
+	return r.iter(func(si *sinkInfo) error {
+		if bs, ok := si.sink.(*bufferedSink); ok {
+			if err := fn(bs); err != nil {
 				return err
+			}
+		}
+		return nil
+	})
+}
+
+// iterHttpSink iterates over all the http sinks and stops at the first error
+// encountered.
+func (r *sinkInfoRegistry) iterHTTPSinks(fn func(hs *httpSink) error) error {
+	return r.iter(func(si *sinkInfo) error {
+		if hs, ok := si.sink.(*httpSink); ok {
+			return fn(hs)
+		}
+		// Many times we buffer HTTP sinks, so be sure to check that case as well.
+		if bs, isBuffered := si.sink.(*bufferedSink); isBuffered {
+			if ch, ok := bs.child.(*httpSink); ok {
+				return fn(ch)
 			}
 		}
 		return nil

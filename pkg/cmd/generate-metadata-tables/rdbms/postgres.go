@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // postgres.go has the implementations of DBMetadataConnection to
 // connect and retrieve schemas from postgres rdbms.
@@ -32,11 +27,11 @@ const getServerVersion = `SELECT current_setting('server_version');`
 var unimplementedEquivalencies = map[oid.Oid]oid.Oid{
 	// These types only exists in information_schema.
 	// cardinal_number in postgres is an INT4 but we already implemented columns as INT8.
-	oid.Oid(13438): oid.T_int8,        // cardinal_number
-	oid.Oid(13450): oid.T_text,        // yes_or_no
-	oid.Oid(13441): oid.T_text,        // character_data
-	oid.Oid(13443): oid.T_text,        // sql_identifier
-	oid.Oid(13448): oid.T_timestamptz, // time_stamp
+	oid.Oid(12653): oid.T_int8,        // cardinal_number
+	oid.Oid(12665): oid.T_text,        // yes_or_no
+	oid.Oid(12656): oid.T_text,        // character_data
+	oid.Oid(12658): oid.T_text,        // sql_identifier
+	oid.Oid(12663): oid.T_timestamptz, // time_stamp
 
 	// pg_catalog
 	oid.Oid(2277): oid.T__text, // anyarray

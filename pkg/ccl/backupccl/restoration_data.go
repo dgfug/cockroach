@@ -1,19 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backupccl
 
 import (
+	"bytes"
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // restorationData specifies the data that is to be restored in a restoration flow.
@@ -34,10 +35,14 @@ type restorationData interface {
 	// Peripheral data that is needed in the restoration flow relating to the data
 	// included in this bundle.
 	getRekeys() []execinfrapb.TableRekey
+	getTenantRekeys() []execinfrapb.TenantRekey
 	getPKIDs() map[uint64]bool
 
+	// isValidateOnly returns ture iff only validation should occur
+	isValidateOnly() bool
+
 	// addTenant extends the set of data needed to restore to include a new tenant.
-	addTenant(roachpb.TenantID)
+	addTenant(fromID, toID roachpb.TenantID)
 
 	// isEmpty returns true iff there is any data to be restored.
 	isEmpty() bool
@@ -62,8 +67,13 @@ func (*mainRestorationData) isMainBundle() bool { return true }
 type restorationDataBase struct {
 	// spans is the spans included in this bundle.
 	spans []roachpb.Span
+
 	// rekeys maps old table IDs to their new table descriptor.
-	rekeys []execinfrapb.TableRekey
+	tableRekeys []execinfrapb.TableRekey
+
+	// tenantRekeys maps tenants being restored to their new ID.
+	tenantRekeys []execinfrapb.TenantRekey
+
 	// pkIDs stores the ID of the primary keys for all of the tables that we're
 	// restoring for RowCount calculation.
 	pkIDs map[uint64]bool
@@ -71,6 +81,9 @@ type restorationDataBase struct {
 	// systemTables store the system tables that need to be restored for cluster
 	// backups. Should be nil otherwise.
 	systemTables []catalog.TableDescriptor
+
+	// validateOnly indicates this data should only get read from external storage, not written
+	validateOnly bool
 }
 
 // restorationDataBase implements restorationData.
@@ -78,7 +91,12 @@ var _ restorationData = &restorationDataBase{}
 
 // getRekeys implements restorationData.
 func (b *restorationDataBase) getRekeys() []execinfrapb.TableRekey {
-	return b.rekeys
+	return b.tableRekeys
+}
+
+// getRekeys implements restorationData.
+func (b *restorationDataBase) getTenantRekeys() []execinfrapb.TenantRekey {
+	return b.tenantRekeys
 }
 
 // getPKIDs implements restorationData.
@@ -97,14 +115,22 @@ func (b *restorationDataBase) getSystemTables() []catalog.TableDescriptor {
 }
 
 // addTenant implements restorationData.
-func (b *restorationDataBase) addTenant(tenantID roachpb.TenantID) {
-	prefix := keys.MakeTenantPrefix(tenantID)
-	b.spans = append(b.spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
+func (b *restorationDataBase) addTenant(fromTenantID, toTenantID roachpb.TenantID) {
+	prefix := keys.MakeTenantPrefix(fromTenantID)
+	b.spans = append(b.spans, backupTenantSpan(prefix))
+	b.tenantRekeys = append(b.tenantRekeys, execinfrapb.TenantRekey{
+		OldID: fromTenantID,
+		NewID: toTenantID,
+	})
 }
 
 // isEmpty implements restorationData.
 func (b *restorationDataBase) isEmpty() bool {
 	return len(b.spans) == 0
+}
+
+func (b *restorationDataBase) isValidateOnly() bool {
+	return b.validateOnly
 }
 
 // isMainBundle implements restorationData.
@@ -125,4 +151,30 @@ func checkForMigratedData(details jobspb.RestoreDetails, dataToRestore restorati
 	}
 
 	return false
+}
+
+// isFromSystemTenant inspects the tenant rekeying data to determine if the
+// system tenant is running  the restore.
+func isFromSystemTenant(tenants []execinfrapb.TenantRekey) bool {
+	for i := range tenants {
+		if tenants[i] == isBackupFromSystemTenantRekey {
+			return true
+		}
+	}
+	return false
+}
+
+// writeAtBatchTS determines if the span should be restored at the batch
+// timestamp.
+func writeAtBatchTS(ctx context.Context, span roachpb.Span, fromSystemTenant bool) bool {
+	// If the system tenant is restoring a guest tenant span, we don't want to
+	// forward all the restored data to now, as there may be importing tables in
+	// that span, that depend on the difference in timestamps on restored existing
+	// vs importing keys to rollback.
+	if fromSystemTenant &&
+		(bytes.HasPrefix(span.Key, keys.TenantPrefix) || bytes.HasPrefix(span.EndKey, keys.TenantPrefix)) {
+		log.Warningf(ctx, "restoring span %s at its original timestamps because it is a tenant span", span)
+		return false
+	}
+	return true
 }

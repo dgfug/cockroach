@@ -1,21 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,10 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -45,7 +42,7 @@ func init() {
 	for i, f := range floats {
 		_, err := decs[i].SetFloat64(f)
 		if err != nil {
-			colexecerror.InternalError(errors.AssertionFailedf("%v", err))
+			colexecerror.InternalError(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error"))
 		}
 	}
 }
@@ -974,13 +971,21 @@ func createSpecForHashJoiner(tc *joinTestCase) *execinfrapb.ProcessorSpec {
 
 // runHashJoinTestCase is a helper function that runs a single test case
 // against a hash join operator (either in-memory or disk-backed one) which is
-// created by the provided constructor.
+// created by the provided constructor. If rng argument is non-nil, then the
+// test case will be shuffled and the unordered verifier will be used; if rng is
+// nil, then the test case is not changed and the ordered verifier is used.
 func runHashJoinTestCase(
 	t *testing.T,
 	tc *joinTestCase,
+	rng *rand.Rand,
 	hjOpConstructor func(sources []colexecop.Operator) (colexecop.Operator, error),
 ) {
 	tc.init()
+	verifier := colexectestutils.OrderedVerifier
+	if rng != nil {
+		tc.shuffleInputTuples(rng)
+		verifier = colexectestutils.UnorderedVerifier
+	}
 	inputs := []colexectestutils.Tuples{tc.leftTuples, tc.rightTuples}
 	typs := [][]*types.T{tc.leftTypes, tc.rightTypes}
 	var runner colexectestutils.TestRunner
@@ -992,7 +997,7 @@ func runHashJoinTestCase(
 		runner = colexectestutils.RunTestsWithTyps
 	}
 	log.Infof(context.Background(), "%s", tc.description)
-	runner(t, testAllocator, inputs, typs, tc.expected, colexectestutils.UnorderedVerifier, hjOpConstructor)
+	runner(t, testAllocator, inputs, typs, tc.expected, verifier, hjOpConstructor)
 }
 
 func TestHashJoiner(t *testing.T) {
@@ -1001,24 +1006,28 @@ func TestHashJoiner(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 	}
+	var monitorRegistry colexecargs.MonitorRegistry
+	defer monitorRegistry.Close(ctx)
+	rng, _ := randutil.NewTestRand()
 
 	for _, tcs := range [][]*joinTestCase{getHJTestCases(), getMJTestCases()} {
 		for _, tc := range tcs {
 			for _, tc := range tc.mutateTypes() {
-				runHashJoinTestCase(t, tc, func(sources []colexecop.Operator) (colexecop.Operator, error) {
+				runHashJoinTestCase(t, tc, rng, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 					spec := createSpecForHashJoiner(tc)
 					args := &colexecargs.NewColOperatorArgs{
 						Spec:                spec,
+						StreamingMemAccount: monitorRegistry.NewStreamingMemAccount(flowCtx),
 						Inputs:              colexectestutils.MakeInputs(sources),
-						StreamingMemAccount: testMemAcc,
+						MonitorRegistry:     &monitorRegistry,
 					}
-					args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 					args.TestingKnobs.DiskSpillingDisabled = true
 					result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 					if err != nil {
@@ -1034,82 +1043,113 @@ func TestHashJoiner(t *testing.T) {
 func BenchmarkHashJoiner(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
-	nCols := 4
-	sourceTypes := make([]*types.T, nCols)
+	rng := randutil.NewTestRandWithSeed(42)
+	const nCols = 4
+	// Left input is usually larger, so we will make it twice as large as the
+	// right input.
+	const leftRowsMultiple = 2
 
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		sourceTypes[colIdx] = types.Int
-	}
-
-	batch := testAllocator.NewMemBatchWithMaxCapacity(sourceTypes)
-
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		col := batch.ColVec(colIdx).Int64()
-		for i := 0; i < coldata.BatchSize(); i++ {
-			col[i] = int64(i)
+	getCols := func(typ *types.T, length int, distinct bool, nullProb float64) []*coldata.Vec {
+		var cols []*coldata.Vec
+		dupCount := 1
+		if distinct {
+			// When the source contains non-distinct tuples, then each tuple
+			// will have 15 duplicates.
+			dupCount = 16
 		}
-	}
-
-	batch.SetLength(coldata.BatchSize())
-
-	for _, hasNulls := range []bool{false, true} {
-		b.Run(fmt.Sprintf("nulls=%v", hasNulls), func(b *testing.B) {
-
-			if hasNulls {
-				for colIdx := 0; colIdx < nCols; colIdx++ {
-					vec := batch.ColVec(colIdx)
-					vec.Nulls().SetNull(0)
-				}
-			} else {
-				for colIdx := 0; colIdx < nCols; colIdx++ {
-					vec := batch.ColVec(colIdx)
-					vec.Nulls().UnsetNulls()
-				}
-			}
-
-			for _, fullOuter := range []bool{false, true} {
-				b.Run(fmt.Sprintf("fullOuter=%v", fullOuter), func(b *testing.B) {
-					for _, rightDistinct := range []bool{true, false} {
-						b.Run(fmt.Sprintf("distinct=%v", rightDistinct), func(b *testing.B) {
-							for _, nBatches := range []int{1 << 1, 1 << 8, 1 << 12} {
-								b.Run(fmt.Sprintf("rows=%d", nBatches*coldata.BatchSize()), func(b *testing.B) {
-									// 8 (bytes / int64) * nBatches (number of batches) * col.BatchSize() (rows /
-									// batch) * nCols (number of columns / row) * 2 (number of sources).
-									b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols * 2))
-									b.ResetTimer()
-									for i := 0; i < b.N; i++ {
-										leftSource := colexecop.NewRepeatableBatchSource(testAllocator, batch, sourceTypes)
-										rightSource := colexectestutils.NewFiniteBatchSource(testAllocator, batch, sourceTypes, nBatches)
-										joinType := descpb.InnerJoin
-										if fullOuter {
-											joinType = descpb.FullOuterJoin
-										}
-										hjSpec := colexecjoin.MakeHashJoinerSpec(
-											joinType,
-											[]uint32{0, 1}, []uint32{2, 3},
-											sourceTypes, sourceTypes,
-											rightDistinct,
-										)
-										hj := colexecjoin.NewHashJoiner(
-											testAllocator, testAllocator, hjSpec,
-											leftSource, rightSource,
-											colexecjoin.HashJoinerInitialNumBuckets,
-										)
-										hj.Init(ctx)
-
-										for i := 0; i < nBatches; i++ {
-											// Technically, the non-distinct hash join will produce much more
-											// than nBatches of output.
-											hj.Next()
-										}
-									}
-								})
-							}
-						})
-					}
-				})
+		if typ.Identical(types.Int) {
+			cols = newIntColumns(nCols, length, dupCount)
+		} else {
+			cols = newBytesColumns(nCols, length, dupCount)
+		}
+		// The input was constructed in the ordered fashion, so let's shuffle
+		// it. Note that it matters only when dupCount is greater than 1.
+		rng.Shuffle(length, func(i, j int) {
+			for _, col := range cols {
+				l, r := coldata.GetValueAt(col, i), coldata.GetValueAt(col, j)
+				coldata.SetValueAt(col, l, j)
+				coldata.SetValueAt(col, r, i)
 			}
 		})
+		if nullProb != 0 {
+			for _, col := range cols {
+				for i := 0; i < length; i++ {
+					if rng.Float64() < nullProb {
+						col.Nulls().SetNull(i)
+					}
+				}
+			}
+		}
+		return cols
+	}
+	getSources := func(
+		sourceTypes []*types.T, nullProb float64, leftDistinct, rightDistinct bool, nRightRows int,
+	) (
+		left, right colexecop.ResettableOperator,
+	) {
+		nLeftRows := leftRowsMultiple * nRightRows
+		leftCols := getCols(sourceTypes[0], nLeftRows, leftDistinct, nullProb)
+		rightCols := getCols(sourceTypes[0], nRightRows, rightDistinct, nullProb)
+		left = colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, leftCols, nLeftRows)
+		right = colexectestutils.NewChunkingBatchSource(testAllocator, sourceTypes, rightCols, nRightRows)
+		return left, right
+	}
+
+	for _, typ := range []*types.T{types.Int, types.Bytes} {
+		sourceTypes := make([]*types.T, nCols)
+		for colIdx := 0; colIdx < nCols; colIdx++ {
+			sourceTypes[colIdx] = typ
+		}
+		for _, hasNulls := range []bool{false, true} {
+			var nullProb float64
+			if hasNulls {
+				nullProb = 0.1
+			}
+			for _, leftDistinct := range []bool{false, true} {
+				for _, rightDistinct := range []bool{false, true} {
+					for _, nRightRows := range []int{1 << 11, 1 << 15} {
+						leftSource, rightSource := getSources(
+							sourceTypes, nullProb, leftDistinct, rightDistinct, nRightRows,
+						)
+						for _, nEqCols := range []int{1, 3} {
+							eqCols := []uint32{0, 1, 2}[:nEqCols]
+							hjSpec := colexecjoin.MakeHashJoinerSpec(
+								descpb.InnerJoin, eqCols, eqCols,
+								sourceTypes, sourceTypes, rightDistinct,
+							)
+							name := fmt.Sprintf(
+								"%s/nulls=%t/ldistinct=%t/rdistinct=%t/rrows=%d/eqcols=%d",
+								typ, hasNulls, leftDistinct, rightDistinct, nRightRows, nEqCols,
+							)
+							b.Run(name, func(b *testing.B) {
+								// Measure the throughput relative to the inputs.
+								nInputRows := (leftRowsMultiple + 1) * nRightRows
+								b.SetBytes(int64(nInputRows * nCols * 8))
+								b.ResetTimer()
+								for i := 0; i < b.N; i++ {
+									hj := colexecjoin.NewHashJoiner(colexecjoin.NewHashJoinerArgs{
+										BuildSideAllocator:       testAllocator,
+										OutputUnlimitedAllocator: testAllocator,
+										Spec:                     hjSpec,
+										LeftSource:               leftSource,
+										RightSource:              rightSource,
+										InitialNumBuckets:        colexecjoin.HashJoinerInitialNumBuckets,
+									})
+									hj.Init(ctx)
+
+									b.StartTimer()
+									for hj.Next().Length() != 0 {
+									}
+									b.StopTimer()
+									leftSource.Reset(ctx)
+									rightSource.Reset(ctx)
+								}
+							})
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1124,14 +1164,17 @@ func TestHashJoinerProjection(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 	}
+	var monitorRegistry colexecargs.MonitorRegistry
+	defer monitorRegistry.Close(ctx)
 
 	leftTypes := []*types.T{types.Bool, types.Int, types.Bytes}
 	rightTypes := []*types.T{types.Int, types.Float, types.Decimal}
@@ -1163,11 +1206,10 @@ func TestHashJoinerProjection(t *testing.T) {
 	leftSource := colexectestutils.NewOpTestInput(testAllocator, 1, leftTuples, leftTypes)
 	rightSource := colexectestutils.NewOpTestInput(testAllocator, 1, rightTuples, rightTypes)
 	args := &colexecargs.NewColOperatorArgs{
-		Spec:                spec,
-		Inputs:              []colexecargs.OpWithMetaInfo{{Root: leftSource}, {Root: rightSource}},
-		StreamingMemAccount: testMemAcc,
+		Spec:            spec,
+		Inputs:          []colexecargs.OpWithMetaInfo{{Root: leftSource}, {Root: rightSource}},
+		MonitorRegistry: &monitorRegistry,
 	}
-	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 	args.TestingKnobs.DiskSpillingDisabled = true
 	hjOp, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 	require.NoError(t, err)

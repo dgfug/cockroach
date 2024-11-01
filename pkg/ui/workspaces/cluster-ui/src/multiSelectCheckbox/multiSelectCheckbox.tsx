@@ -1,17 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import classNames from "classnames/bind";
 import React from "react";
 import Select, { components, OptionsType } from "react-select";
+
+import { Filter } from "../queryFilter";
+
 import styles from "./multiSelectCheckbox.module.scss";
-import classNames from "classnames/bind";
 
 const cx = classNames.bind(styles);
 
@@ -24,7 +22,7 @@ export interface SelectOption {
 export interface MultiSelectCheckboxProps {
   field: string;
   options: SelectOption[];
-  parent: any;
+  parent: Filter;
   placeholder: string;
   value?: SelectOption[];
 }
@@ -36,7 +34,7 @@ export interface MultiSelectCheckboxProps {
  * @param props
  * @constructor
  */
-const CheckboxOption = (props: any) => {
+export const CheckboxOption = (props: any) => {
   return (
     <components.Option {...props}>
       <input
@@ -85,7 +83,6 @@ const customStyles = {
 
 /**
  * Creates the MultiSelectCheckbox from the props
- * @param props:
  * parent (any): the element creating this multiselect that will have its state
  * updated when a new value is selected
  * field (string): the name of the state's field on the parent that will be
@@ -95,18 +92,20 @@ const customStyles = {
  * placeholder (string): the placeholder for the multiselect
  * value (SelectOption[]): a list of the selected options (optional)
  * @constructor
+ * @param props
  */
 export const MultiSelectCheckbox = (props: MultiSelectCheckboxProps) => {
   const handleChange = (
     selectedOptions: OptionsType<SelectOption>,
     field: string,
-    parent: any,
+    parent: Filter,
   ) => {
-    const selected = selectedOptions
-      .map(function(option: SelectOption) {
-        return option.label;
-      })
-      .toString();
+    const selected =
+      selectedOptions
+        ?.map(function (option: SelectOption) {
+          return option.label;
+        })
+        .toString() || "";
     parent.setState({
       filters: {
         ...parent.state.filters,

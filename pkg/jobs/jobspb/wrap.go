@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobspb
 
@@ -16,55 +11,85 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 )
 
-// JobID is the ID of a job.
-type JobID int64
-
-// InvalidJobID is the zero value for JobID corresponding to no job.
-const InvalidJobID JobID = 0
-
-// SafeValue implements the redact.SafeValue interface.
-func (j JobID) SafeValue() {}
-
 // Details is a marker interface for job details proto structs.
 type Details interface{}
 
-var _ Details = BackupDetails{}
-var _ Details = RestoreDetails{}
-var _ Details = SchemaChangeDetails{}
-var _ Details = ChangefeedDetails{}
-var _ Details = CreateStatsDetails{}
-var _ Details = SchemaChangeGCDetails{}
-var _ Details = StreamIngestionDetails{}
-var _ Details = NewSchemaChangeDetails{}
-var _ Details = MigrationDetails{}
-var _ Details = AutoSpanConfigReconciliationDetails{}
-var _ Details = ImportDetails{}
-var _ Details = StreamReplicationDetails{}
+var (
+	_ Details = BackupDetails{}
+	_ Details = RestoreDetails{}
+	_ Details = SchemaChangeDetails{}
+	_ Details = ChangefeedDetails{}
+	_ Details = CreateStatsDetails{}
+	_ Details = SchemaChangeGCDetails{}
+	_ Details = StreamIngestionDetails{}
+	_ Details = NewSchemaChangeDetails{}
+	_ Details = MigrationDetails{}
+	_ Details = AutoSpanConfigReconciliationDetails{}
+	_ Details = ImportDetails{}
+	_ Details = StreamReplicationDetails{}
+	_ Details = RowLevelTTLDetails{}
+	_ Details = SchemaTelemetryDetails{}
+	_ Details = KeyVisualizerDetails{}
+	_ Details = AutoConfigRunnerDetails{}
+	_ Details = AutoConfigEnvRunnerDetails{}
+	_ Details = AutoConfigTaskDetails{}
+	_ Details = AutoUpdateSQLActivityDetails{}
+	_ Details = MVCCStatisticsJobDetails{}
+	_ Details = ImportRollbackDetails{}
+	_ Details = HistoryRetentionDetails{}
+	_ Details = LogicalReplicationDetails{}
+	_ Details = UpdateTableMetadataCacheDetails{}
+	_ Details = StandbyReadTSPollerDetails{}
+)
 
 // ProgressDetails is a marker interface for job progress details proto structs.
 type ProgressDetails interface{}
 
-var _ ProgressDetails = BackupProgress{}
-var _ ProgressDetails = RestoreProgress{}
-var _ ProgressDetails = SchemaChangeProgress{}
-var _ ProgressDetails = ChangefeedProgress{}
-var _ ProgressDetails = CreateStatsProgress{}
-var _ ProgressDetails = SchemaChangeGCProgress{}
-var _ ProgressDetails = StreamIngestionProgress{}
-var _ ProgressDetails = NewSchemaChangeProgress{}
-var _ ProgressDetails = MigrationProgress{}
-var _ ProgressDetails = AutoSpanConfigReconciliationDetails{}
-var _ ProgressDetails = StreamReplicationProgress{}
+var (
+	_ ProgressDetails = BackupProgress{}
+	_ ProgressDetails = RestoreProgress{}
+	_ ProgressDetails = SchemaChangeProgress{}
+	_ ProgressDetails = ChangefeedProgress{}
+	_ ProgressDetails = CreateStatsProgress{}
+	_ ProgressDetails = SchemaChangeGCProgress{}
+	_ ProgressDetails = StreamIngestionProgress{}
+	_ ProgressDetails = NewSchemaChangeProgress{}
+	_ ProgressDetails = MigrationProgress{}
+	_ ProgressDetails = AutoSpanConfigReconciliationDetails{}
+	_ ProgressDetails = StreamReplicationProgress{}
+	_ ProgressDetails = RowLevelTTLProgress{}
+	_ ProgressDetails = SchemaTelemetryProgress{}
+	_ ProgressDetails = KeyVisualizerProgress{}
+	_ ProgressDetails = AutoConfigRunnerProgress{}
+	_ ProgressDetails = AutoConfigEnvRunnerProgress{}
+	_ ProgressDetails = AutoConfigTaskProgress{}
+	_ ProgressDetails = AutoUpdateSQLActivityProgress{}
+	_ ProgressDetails = MVCCStatisticsJobProgress{}
+	_ ProgressDetails = ImportRollbackProgress{}
+	_ ProgressDetails = HistoryRetentionProgress{}
+	_ ProgressDetails = LogicalReplicationProgress{}
+	_ ProgressDetails = UpdateTableMetadataCacheProgress{}
+	_ ProgressDetails = StandbyReadTSPollerProgress{}
+)
 
-// Type returns the payload's job type.
+// Type returns the payload's job type and panics if the type is invalid.
 func (p *Payload) Type() Type {
+	typ, err := DetailsType(p.Details)
+	if err != nil {
+		panic(err)
+	}
+	return typ
+}
+
+// CheckType returns the payload's job type with an error
+// if the type is invalid.
+func (p *Payload) CheckType() (Type, error) {
 	return DetailsType(p.Details)
 }
 
@@ -72,60 +97,198 @@ func (p *Payload) Type() Type {
 // by bazel if it were not imported in a non-generated file.
 var _ base.SQLInstanceID
 
+// ReplicationStatus describes the status of the replication stream, and stored
+// on the stream ingestion job
+type ReplicationStatus uint8
+
+const (
+	InitializingReplication    ReplicationStatus = 0
+	CreatingInitialSplits      ReplicationStatus = 6
+	Replicating                ReplicationStatus = 1
+	ReplicationPaused          ReplicationStatus = 2
+	ReplicationPendingFailover ReplicationStatus = 3
+	ReplicationFailingOver     ReplicationStatus = 4
+	ReplicationError           ReplicationStatus = 5
+)
+
+// String implements fmt.Stringer.
+func (rs ReplicationStatus) String() string {
+	switch rs {
+	case InitializingReplication:
+		return "initializing replication"
+	case Replicating:
+		return "replicating"
+	case ReplicationPaused:
+		return "replication paused"
+	case ReplicationPendingFailover:
+		return "replication pending failover"
+	case ReplicationFailingOver:
+		return "replication failing over"
+	case ReplicationError:
+		return "replication error"
+	case CreatingInitialSplits:
+		return "creating initial splits"
+	default:
+		return fmt.Sprintf("unimplemented-%d", int(rs))
+	}
+}
+
 // AutoStatsName is the name to use for statistics created automatically.
 // The name is chosen to be something that users are unlikely to choose when
 // running CREATE STATISTICS manually.
 const AutoStatsName = "__auto__"
 
+// AutoPartialStatsName is the name to use for partial statistics created
+// automatically.
+const AutoPartialStatsName = "__auto_partial__"
+
 // ImportStatsName is the name to use for statistics created automatically
 // during import.
 const ImportStatsName = "__import__"
 
+// ForecastStatsName is the name to use for statistic forecasts.
+const ForecastStatsName = "__forecast__"
+
+// MergedStatsName is the name to use for a statistic that is
+// a merged combination between a partial statistic and a full
+// table statistic.
+const MergedStatsName = "__merged__"
+
 // AutomaticJobTypes is a list of automatic job types that currently exist.
 var AutomaticJobTypes = [...]Type{
 	TypeAutoCreateStats,
+	TypeAutoCreatePartialStats,
 	TypeAutoSpanConfigReconciliation,
 	TypeAutoSQLStatsCompaction,
+	TypeAutoSchemaTelemetry,
+	TypePollJobsStats,
+	TypeAutoConfigRunner,
+	TypeAutoConfigEnvRunner,
+	TypeAutoConfigTask,
+	TypeKeyVisualizer,
+	TypeAutoUpdateSQLActivity,
+	TypeMVCCStatisticsUpdate,
+	TypeUpdateTableMetadataCache,
 }
 
 // DetailsType returns the type for a payload detail.
-func DetailsType(d isPayload_Details) Type {
+func DetailsType(d isPayload_Details) (Type, error) {
 	switch d := d.(type) {
 	case *Payload_Backup:
-		return TypeBackup
+		return TypeBackup, nil
 	case *Payload_Restore:
-		return TypeRestore
+		return TypeRestore, nil
 	case *Payload_SchemaChange:
-		return TypeSchemaChange
+		return TypeSchemaChange, nil
 	case *Payload_Import:
-		return TypeImport
+		return TypeImport, nil
 	case *Payload_Changefeed:
-		return TypeChangefeed
+		return TypeChangefeed, nil
 	case *Payload_CreateStats:
 		createStatsName := d.CreateStats.Name
 		if createStatsName == AutoStatsName {
-			return TypeAutoCreateStats
+			return TypeAutoCreateStats, nil
+		} else if createStatsName == AutoPartialStatsName {
+			return TypeAutoCreatePartialStats, nil
 		}
-		return TypeCreateStats
+		return TypeCreateStats, nil
 	case *Payload_SchemaChangeGC:
-		return TypeSchemaChangeGC
+		return TypeSchemaChangeGC, nil
 	case *Payload_TypeSchemaChange:
-		return TypeTypeSchemaChange
+		return TypeTypeSchemaChange, nil
 	case *Payload_StreamIngestion:
-		return TypeStreamIngestion
+		return TypeReplicationStreamIngestion, nil
 	case *Payload_NewSchemaChange:
-		return TypeNewSchemaChange
+		return TypeNewSchemaChange, nil
 	case *Payload_Migration:
-		return TypeMigration
+		return TypeMigration, nil
 	case *Payload_AutoSpanConfigReconciliation:
-		return TypeAutoSpanConfigReconciliation
+		return TypeAutoSpanConfigReconciliation, nil
 	case *Payload_AutoSQLStatsCompaction:
-		return TypeAutoSQLStatsCompaction
+		return TypeAutoSQLStatsCompaction, nil
 	case *Payload_StreamReplication:
-		return TypeStreamReplication
+		return TypeReplicationStreamProducer, nil
+	case *Payload_RowLevelTTL:
+		return TypeRowLevelTTL, nil
+	case *Payload_SchemaTelemetry:
+		return TypeAutoSchemaTelemetry, nil
+	case *Payload_KeyVisualizerDetails:
+		return TypeKeyVisualizer, nil
+	case *Payload_PollJobsStats:
+		return TypePollJobsStats, nil
+	case *Payload_AutoConfigRunner:
+		return TypeAutoConfigRunner, nil
+	case *Payload_AutoConfigEnvRunner:
+		return TypeAutoConfigEnvRunner, nil
+	case *Payload_AutoConfigTask:
+		return TypeAutoConfigTask, nil
+	case *Payload_AutoUpdateSqlActivities:
+		return TypeAutoUpdateSQLActivity, nil
+	case *Payload_MvccStatisticsDetails:
+		return TypeMVCCStatisticsUpdate, nil
+	case *Payload_ImportRollbackDetails:
+		return TypeImportRollback, nil
+	case *Payload_HistoryRetentionDetails:
+		return TypeHistoryRetention, nil
+	case *Payload_LogicalReplicationDetails:
+		return TypeLogicalReplication, nil
+	case *Payload_UpdateTableMetadataCacheDetails:
+		return TypeUpdateTableMetadataCache, nil
+	case *Payload_StandbyReadTsPollerDetails:
+		return TypeStandbyReadTSPoller, nil
 	default:
-		panic(errors.AssertionFailedf("Payload.Type called on a payload with an unknown details type: %T", d))
+		return TypeUnspecified, errors.Newf("Payload.Type called on a payload with an unknown details type: %T", d)
 	}
+}
+
+// ForEachType executes f for each job Type.
+func ForEachType(f func(typ Type), includeTypeUnspecified bool) {
+	start := TypeBackup
+	if includeTypeUnspecified {
+		start = TypeUnspecified
+	}
+	for typ := start; typ < NumJobTypes; typ++ {
+		f(typ)
+	}
+}
+
+// JobDetailsForEveryJobType is an array of Details keyed by every job type,
+// except for jobspb.TypeUnspecified.
+var JobDetailsForEveryJobType = map[Type]Details{
+	TypeBackup:       BackupDetails{},
+	TypeRestore:      RestoreDetails{},
+	TypeSchemaChange: SchemaChangeDetails{},
+	TypeImport:       ImportDetails{},
+	TypeChangefeed:   ChangefeedDetails{},
+	TypeCreateStats:  CreateStatsDetails{},
+	TypeAutoCreateStats: CreateStatsDetails{
+		Name: AutoStatsName,
+	},
+	TypeAutoCreatePartialStats: CreateStatsDetails{
+		Name: AutoPartialStatsName,
+	},
+	TypeSchemaChangeGC:               SchemaChangeGCDetails{},
+	TypeTypeSchemaChange:             TypeSchemaChangeDetails{},
+	TypeReplicationStreamIngestion:   StreamIngestionDetails{},
+	TypeNewSchemaChange:              NewSchemaChangeDetails{},
+	TypeMigration:                    MigrationDetails{},
+	TypeAutoSpanConfigReconciliation: AutoSpanConfigReconciliationDetails{},
+	TypeAutoSQLStatsCompaction:       AutoSQLStatsCompactionDetails{},
+	TypeReplicationStreamProducer:    StreamReplicationDetails{},
+	TypeRowLevelTTL:                  RowLevelTTLDetails{},
+	TypeAutoSchemaTelemetry:          SchemaTelemetryDetails{},
+	TypeKeyVisualizer:                KeyVisualizerDetails{},
+	TypePollJobsStats:                PollJobsStatsDetails{},
+	TypeAutoConfigRunner:             AutoConfigRunnerDetails{},
+	TypeAutoConfigEnvRunner:          AutoConfigEnvRunnerDetails{},
+	TypeAutoConfigTask:               AutoConfigTaskDetails{},
+	TypeAutoUpdateSQLActivity:        AutoUpdateSQLActivityDetails{},
+	TypeMVCCStatisticsUpdate:         MVCCStatisticsJobDetails{},
+	TypeImportRollback:               ImportRollbackDetails{},
+	TypeHistoryRetention:             HistoryRetentionDetails{},
+	TypeLogicalReplication:           LogicalReplicationDetails{},
+	TypeUpdateTableMetadataCache:     UpdateTableMetadataCacheDetails{},
+	TypeStandbyReadTSPoller:          StandbyReadTSPollerDetails{},
 }
 
 // WrapProgressDetails wraps a ProgressDetails object in the protobuf wrapper
@@ -165,8 +328,36 @@ func WrapProgressDetails(details ProgressDetails) interface {
 		return &Progress_AutoSQLStatsCompaction{AutoSQLStatsCompaction: &d}
 	case StreamReplicationProgress:
 		return &Progress_StreamReplication{StreamReplication: &d}
+	case RowLevelTTLProgress:
+		return &Progress_RowLevelTTL{RowLevelTTL: &d}
+	case SchemaTelemetryProgress:
+		return &Progress_SchemaTelemetry{SchemaTelemetry: &d}
+	case KeyVisualizerProgress:
+		return &Progress_KeyVisualizerProgress{KeyVisualizerProgress: &d}
+	case PollJobsStatsProgress:
+		return &Progress_PollJobsStats{PollJobsStats: &d}
+	case AutoConfigRunnerProgress:
+		return &Progress_AutoConfigRunner{AutoConfigRunner: &d}
+	case AutoConfigEnvRunnerProgress:
+		return &Progress_AutoConfigEnvRunner{AutoConfigEnvRunner: &d}
+	case AutoConfigTaskProgress:
+		return &Progress_AutoConfigTask{AutoConfigTask: &d}
+	case AutoUpdateSQLActivityProgress:
+		return &Progress_UpdateSqlActivity{UpdateSqlActivity: &d}
+	case MVCCStatisticsJobProgress:
+		return &Progress_MvccStatisticsProgress{MvccStatisticsProgress: &d}
+	case ImportRollbackProgress:
+		return &Progress_ImportRollbackProgress{ImportRollbackProgress: &d}
+	case HistoryRetentionProgress:
+		return &Progress_HistoryRetentionProgress{HistoryRetentionProgress: &d}
+	case LogicalReplicationProgress:
+		return &Progress_LogicalReplication{LogicalReplication: &d}
+	case UpdateTableMetadataCacheProgress:
+		return &Progress_TableMetadataCache{TableMetadataCache: &d}
+	case StandbyReadTSPollerProgress:
+		return &Progress_StandbyReadTsPoller{StandbyReadTsPoller: &d}
 	default:
-		panic(errors.AssertionFailedf("WrapProgressDetails: unknown details type %T", d))
+		panic(errors.AssertionFailedf("WrapProgressDetails: unknown progress type %T", d))
 	}
 }
 
@@ -202,6 +393,34 @@ func (p *Payload) UnwrapDetails() Details {
 		return *d.AutoSQLStatsCompaction
 	case *Payload_StreamReplication:
 		return *d.StreamReplication
+	case *Payload_RowLevelTTL:
+		return *d.RowLevelTTL
+	case *Payload_SchemaTelemetry:
+		return *d.SchemaTelemetry
+	case *Payload_KeyVisualizerDetails:
+		return *d.KeyVisualizerDetails
+	case *Payload_PollJobsStats:
+		return *d.PollJobsStats
+	case *Payload_AutoConfigRunner:
+		return *d.AutoConfigRunner
+	case *Payload_AutoConfigEnvRunner:
+		return *d.AutoConfigEnvRunner
+	case *Payload_AutoConfigTask:
+		return *d.AutoConfigTask
+	case *Payload_AutoUpdateSqlActivities:
+		return *d.AutoUpdateSqlActivities
+	case *Payload_MvccStatisticsDetails:
+		return *d.MvccStatisticsDetails
+	case *Payload_ImportRollbackDetails:
+		return *d.ImportRollbackDetails
+	case *Payload_HistoryRetentionDetails:
+		return *d.HistoryRetentionDetails
+	case *Payload_LogicalReplicationDetails:
+		return *d.LogicalReplicationDetails
+	case *Payload_UpdateTableMetadataCacheDetails:
+		return *d.UpdateTableMetadataCacheDetails
+	case *Payload_StandbyReadTsPollerDetails:
+		return *d.StandbyReadTsPollerDetails
 	default:
 		return nil
 	}
@@ -239,6 +458,34 @@ func (p *Progress) UnwrapDetails() ProgressDetails {
 		return *d.AutoSQLStatsCompaction
 	case *Progress_StreamReplication:
 		return *d.StreamReplication
+	case *Progress_RowLevelTTL:
+		return *d.RowLevelTTL
+	case *Progress_SchemaTelemetry:
+		return *d.SchemaTelemetry
+	case *Progress_KeyVisualizerProgress:
+		return *d.KeyVisualizerProgress
+	case *Progress_PollJobsStats:
+		return *d.PollJobsStats
+	case *Progress_AutoConfigRunner:
+		return *d.AutoConfigRunner
+	case *Progress_AutoConfigEnvRunner:
+		return *d.AutoConfigEnvRunner
+	case *Progress_AutoConfigTask:
+		return *d.AutoConfigTask
+	case *Progress_UpdateSqlActivity:
+		return *d.UpdateSqlActivity
+	case *Progress_MvccStatisticsProgress:
+		return *d.MvccStatisticsProgress
+	case *Progress_ImportRollbackProgress:
+		return *d.ImportRollbackProgress
+	case *Progress_HistoryRetentionProgress:
+		return *d.HistoryRetentionProgress
+	case *Progress_LogicalReplication:
+		return *d.LogicalReplication
+	case *Progress_TableMetadataCache:
+		return *d.TableMetadataCache
+	case *Progress_StandbyReadTsPoller:
+		return *d.StandbyReadTsPoller
 	default:
 		return nil
 	}
@@ -250,6 +497,17 @@ func (t Type) String() string {
 	// simply swap underscores for spaces in the identifier for very SQL-esque
 	// names, like "BACKUP" and "SCHEMA CHANGE".
 	return strings.Replace(Type_name[int32(t)], "_", " ", -1)
+}
+
+// TypeFromString is used to get the type corresponding to the string s
+// where s := Type.String().
+func TypeFromString(s string) (Type, error) {
+	s = strings.Replace(s, " ", "_", -1)
+	t, ok := Type_value[s]
+	if !ok {
+		return TypeUnspecified, errors.New("invalid type string")
+	}
+	return Type(t), nil
 }
 
 // WrapPayloadDetails wraps a Details object in the protobuf wrapper struct
@@ -289,13 +547,41 @@ func WrapPayloadDetails(details Details) interface {
 		return &Payload_AutoSQLStatsCompaction{AutoSQLStatsCompaction: &d}
 	case StreamReplicationDetails:
 		return &Payload_StreamReplication{StreamReplication: &d}
+	case RowLevelTTLDetails:
+		return &Payload_RowLevelTTL{RowLevelTTL: &d}
+	case SchemaTelemetryDetails:
+		return &Payload_SchemaTelemetry{SchemaTelemetry: &d}
+	case KeyVisualizerDetails:
+		return &Payload_KeyVisualizerDetails{KeyVisualizerDetails: &d}
+	case PollJobsStatsDetails:
+		return &Payload_PollJobsStats{PollJobsStats: &d}
+	case AutoConfigRunnerDetails:
+		return &Payload_AutoConfigRunner{AutoConfigRunner: &d}
+	case AutoConfigEnvRunnerDetails:
+		return &Payload_AutoConfigEnvRunner{AutoConfigEnvRunner: &d}
+	case AutoConfigTaskDetails:
+		return &Payload_AutoConfigTask{AutoConfigTask: &d}
+	case AutoUpdateSQLActivityDetails:
+		return &Payload_AutoUpdateSqlActivities{AutoUpdateSqlActivities: &d}
+	case MVCCStatisticsJobDetails:
+		return &Payload_MvccStatisticsDetails{MvccStatisticsDetails: &d}
+	case ImportRollbackDetails:
+		return &Payload_ImportRollbackDetails{ImportRollbackDetails: &d}
+	case HistoryRetentionDetails:
+		return &Payload_HistoryRetentionDetails{HistoryRetentionDetails: &d}
+	case LogicalReplicationDetails:
+		return &Payload_LogicalReplicationDetails{LogicalReplicationDetails: &d}
+	case UpdateTableMetadataCacheDetails:
+		return &Payload_UpdateTableMetadataCacheDetails{UpdateTableMetadataCacheDetails: &d}
+	case StandbyReadTSPollerDetails:
+		return &Payload_StandbyReadTsPollerDetails{StandbyReadTsPollerDetails: &d}
 	default:
 		panic(errors.AssertionFailedf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
 }
 
 // ChangefeedTargets is a set of id targets with metadata.
-type ChangefeedTargets map[descpb.ID]ChangefeedTarget
+type ChangefeedTargets map[descpb.ID]ChangefeedTargetTable
 
 // SchemaChangeDetailsFormatVersion is the format version for
 // SchemaChangeDetails.
@@ -324,19 +610,43 @@ const (
 func (Type) SafeValue() {}
 
 // NumJobTypes is the number of jobs types.
-const NumJobTypes = 16
+const NumJobTypes = 31
 
-// MarshalJSONPB implements jsonpb.JSONPBMarshaller to  redact sensitive sink URI
+// ChangefeedDetailsMarshaler allows for dependency injection of
+// cloud.SanitizeExternalStorageURI to avoid the dependency from this
+// package on cloud. The value is injected in the changefeedccl package.
+var ChangefeedDetailsMarshaler func(*ChangefeedDetails, *jsonpb.Marshaler) ([]byte, error)
+
+// MarshalJSONPB implements jsonpb.JSONPBMarshaller to redact sensitive sink URI
 // parameters from ChangefeedDetails.
-func (m ChangefeedDetails) MarshalJSONPB(marshaller *jsonpb.Marshaler) ([]byte, error) {
-	if protoreflect.ShouldRedact(marshaller) {
-		var err error
-		m.SinkURI, err = cloud.SanitizeExternalStorageURI(m.SinkURI, nil)
-		if err != nil {
-			return nil, err
-		}
+func (m *ChangefeedDetails) MarshalJSONPB(marshaller *jsonpb.Marshaler) ([]byte, error) {
+	if ChangefeedDetailsMarshaler != nil {
+		return ChangefeedDetailsMarshaler(m, marshaller)
 	}
-	return json.Marshal(m)
+	// if we get here, there's no injected marshaller, i.e. this could be an oss
+	// binary looking at a ccl-made job, but we need to redact, so just redact
+	// the entire struct by rendering an empty one.
+	return json.Marshal(ChangefeedDetails{})
+}
+
+// DescRewriteMap maps old descriptor IDs to new descriptor and parent IDs.
+type DescRewriteMap map[descpb.ID]*DescriptorRewrite
+
+// assertDetailsMap asserts that the entries in JobDetailsForEveryJobType are correct.
+func assertDetailsMap() {
+	if len(JobDetailsForEveryJobType) != NumJobTypes-1 {
+		panic("JobDetailsForEveryJobType does not have an entry for each Type")
+	}
+	ForEachType(
+		func(typ Type) {
+			payload := Payload{
+				Details: WrapPayloadDetails(JobDetailsForEveryJobType[typ]),
+			}
+			if typ != payload.Type() {
+				panic(fmt.Errorf("JobDetailsForEveryJobType has the incorrect entry for type %s", typ))
+			}
+		}, false,
+	)
 }
 
 func init() {
@@ -344,4 +654,11 @@ func init() {
 		panic(fmt.Errorf("NumJobTypes (%d) does not match generated job type name map length (%d)",
 			NumJobTypes, len(Type_name)))
 	}
+
+	assertDetailsMap()
+
+	protoreflect.RegisterShorthands((*Progress)(nil), "progress")
+	protoreflect.RegisterShorthands((*Payload)(nil), "payload")
+	protoreflect.RegisterShorthands((*ScheduleDetails)(nil), "schedule", "schedule_details")
+	protoreflect.RegisterShorthands((*ExecutionArguments)(nil), "exec_args", "execution_args", "schedule_args")
 }

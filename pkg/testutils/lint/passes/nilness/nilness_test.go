@@ -7,13 +7,8 @@
 //
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package nilness_test
 
@@ -21,7 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/nilness"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
@@ -33,7 +28,7 @@ func init() {
 }
 
 func Test(t *testing.T) {
-	testdata := testutils.TestDataPath(t)
+	testdata := datapathutils.TestDataPath(t)
 	analysistest.TestData = func() string { return testdata }
-	analysistest.Run(t, testdata, nilness.Analyzer, "a")
+	analysistest.Run(t, testdata, nilness.TestAnalyzer, "a")
 }

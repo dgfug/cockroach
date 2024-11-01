@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
@@ -25,7 +21,7 @@ type ComputedColumnRewritesMap map[string]tree.Expr
 
 // ParseComputedColumnRewrites parses a string of the form:
 //
-//   (before expression) -> (after expression) [, (before expression) -> (after expression) ...]
+//	(before expression) -> (after expression) [, (before expression) -> (after expression) ...]
 //
 // into a ComputedColumnRewritesMap.
 //
@@ -45,7 +41,7 @@ func ParseComputedColumnRewrites(val string) (ComputedColumnRewritesMap, error) 
 	result := make(ComputedColumnRewritesMap, len(set.Values))
 	for _, v := range set.Values {
 		binExpr, ok := v.(*tree.BinaryExpr)
-		if !ok || binExpr.Operator.Symbol != tree.JSONFetchVal {
+		if !ok || binExpr.Operator.Symbol != treebin.JSONFetchVal {
 			return nil, errors.Newf("invalid column rewrites expression (expected -> operator)")
 		}
 		left, ok := binExpr.Left.(*tree.ParenExpr)

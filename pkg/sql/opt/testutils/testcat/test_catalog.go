@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -17,22 +12,29 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -48,6 +50,9 @@ type Catalog struct {
 	testSchema Schema
 	counter    int
 	enumTypes  map[string]*types.T
+
+	udfs           map[string]*tree.ResolvedFunctionDefinition
+	revokedUDFOids intsets.Fast
 }
 
 type dataSource interface {
@@ -64,13 +69,22 @@ func New() *Catalog {
 			SchemaID: 1,
 			SchemaName: cat.SchemaName{
 				CatalogName:     testDB,
-				SchemaName:      tree.PublicSchemaName,
+				SchemaName:      catconstants.PublicSchemaName,
 				ExplicitSchema:  true,
 				ExplicitCatalog: true,
 			},
 			dataSources: make(map[string]dataSource),
 		},
 	}
+}
+
+func (tc *Catalog) LookupDatabaseName(
+	_ context.Context, _ cat.Flags, name string,
+) (tree.Name, error) {
+	if name != testDB {
+		return "", sqlerrors.NewUndefinedDatabaseError(name)
+	}
+	return tree.Name(name), nil
 }
 
 // ResolveSchema is part of the cat.Catalog interface.
@@ -96,15 +110,30 @@ func (tc *Catalog) ResolveSchema(
 		// No luck so far. Compatibility with CockroachDB v1.1: use D.public
 		// instead.
 		toResolve.CatalogName = name.SchemaName
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		toResolve.ExplicitCatalog = true
 		return tc.resolveSchema(&toResolve)
 	}
 
 	// Neither schema or catalog was specified, so use t.public.
 	toResolve.CatalogName = tree.Name(testDB)
-	toResolve.SchemaName = tree.PublicSchemaName
+	toResolve.SchemaName = catconstants.PublicSchemaName
 	return tc.resolveSchema(&toResolve)
+}
+
+// GetAllSchemaNamesForDB is part of the cat.Catalog interface.
+func (tc *Catalog) GetAllSchemaNamesForDB(
+	ctx context.Context, dbName string,
+) ([]cat.SchemaName, error) {
+	var schemaNames []cat.SchemaName
+	var scName cat.SchemaName
+	scName.SchemaName = catconstants.PublicSchemaName
+	scName.ExplicitSchema = true
+	scName.CatalogName = tree.Name(dbName)
+	scName.ExplicitCatalog = true
+	schemaNames = append(schemaNames, scName)
+
+	return schemaNames, nil
 }
 
 // ResolveDataSource is part of the cat.Catalog interface.
@@ -133,7 +162,7 @@ func (tc *Catalog) ResolveDataSource(
 		// No luck so far. Compatibility with CockroachDB v1.1: try D.public.T
 		// instead.
 		toResolve.CatalogName = name.SchemaName
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		toResolve.ExplicitCatalog = true
 		ds, err = tc.resolveDataSource(&toResolve)
 		if err == nil {
@@ -142,7 +171,7 @@ func (tc *Catalog) ResolveDataSource(
 	} else {
 		// This is a naked data source name. Use the current database.
 		toResolve.CatalogName = tree.Name(testDB)
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		ds, err = tc.resolveDataSource(&toResolve)
 		if err == nil {
 			return ds, toResolve, nil
@@ -155,6 +184,11 @@ func (tc *Catalog) ResolveDataSource(
 		// We rely on the check in CreateTable against this table's schema to infer
 		// that this is a virtual table.
 		return tc.CreateTable(table), *name, nil
+	}
+	if view, ok := resolveVirtualView(name); ok {
+		// We rely on the check in CreateView against this table's schema to infer
+		// that this is a virtual table.
+		return tc.CreateView(view), *name, nil
 	}
 
 	// If this didn't end up being a virtual table, then return the original
@@ -175,8 +209,60 @@ func (tc *Catalog) ResolveDataSourceByID(
 		"relation [%d] does not exist", id)
 }
 
+// ResolveIndex is part of the cat.Catalog interface.
+func (tc *Catalog) ResolveIndex(
+	ctx context.Context, flags cat.Flags, name *tree.TableIndexName,
+) (cat.Index, cat.DataSourceName, error) {
+	if name.Table.Object() != "" {
+		ds, dsName, err := tc.ResolveDataSource(ctx, flags, &name.Table)
+		if err != nil {
+			return nil, cat.DataSourceName{}, err
+		}
+		table := ds.(cat.Table)
+		if name.Index == "" {
+			// Return primary index.
+			return table.Index(0), dsName, nil
+		}
+		for i := 0; i < table.IndexCount(); i++ {
+			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
+				return idx, dsName, nil
+			}
+		}
+
+		return nil, cat.DataSourceName{}, pgerror.Newf(
+			pgcode.UndefinedObject, "index %q does not exist", name.Index,
+		)
+	}
+
+	schema, _, err := tc.ResolveSchema(ctx, flags, &name.Table.ObjectNamePrefix)
+	if err != nil {
+		return nil, cat.DataSourceName{}, err
+	}
+	dsNames, _, err := schema.GetDataSourceNames(ctx)
+	if err != nil {
+		return nil, cat.DataSourceName{}, err
+	}
+	for i := range dsNames {
+		ds, tn, err := tc.ResolveDataSource(ctx, flags, &dsNames[i])
+		if err != nil {
+			return nil, cat.DataSourceName{}, err
+		}
+		table := ds.(cat.Table)
+		for i := 0; i < table.IndexCount(); i++ {
+			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
+				return idx, tn, nil
+			}
+		}
+	}
+	return nil, cat.DataSourceName{}, pgerror.Newf(
+		pgcode.UndefinedObject, "index %q does not exist", name.Index,
+	)
+}
+
 // CheckPrivilege is part of the cat.Catalog interface.
-func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
+func (tc *Catalog) CheckPrivilege(
+	ctx context.Context, o cat.Object, user username.SQLUsername, priv privilege.Kind,
+) error {
 	return tc.CheckAnyPrivilege(ctx, o)
 }
 
@@ -199,8 +285,20 @@ func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 		if t.Revoked {
 			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.SeqName)
 		}
+	case *syntheticprivilege.GlobalPrivilege:
+
 	default:
 		panic("invalid Object")
+	}
+	return nil
+}
+
+// CheckExecutionPrivilege is part of the cat.Catalog interface.
+func (tc *Catalog) CheckExecutionPrivilege(
+	ctx context.Context, oid oid.Oid, user username.SQLUsername,
+) error {
+	if tc.revokedUDFOids.Contains(int(oid)) {
+		return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to execute function with OID %d", oid)
 	}
 	return nil
 }
@@ -208,11 +306,6 @@ func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 // HasAdminRole is part of the cat.Catalog interface.
 func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
 	return true, nil
-}
-
-// RequireAdminRole is part of the cat.Catalog interface.
-func (tc *Catalog) RequireAdminRole(ctx context.Context, action string) error {
-	return nil
 }
 
 // HasRoleOption is part of the cat.Catalog interface.
@@ -227,9 +320,26 @@ func (tc *Catalog) FullyQualifiedName(
 	return ds.(dataSource).fqName(), nil
 }
 
-// RoleExists is part of the cat.Catalog interface.
-func (tc *Catalog) RoleExists(ctx context.Context, role security.SQLUsername) (bool, error) {
-	return true, nil
+// CheckRoleExists is part of the cat.Catalog interface.
+func (tc *Catalog) CheckRoleExists(ctx context.Context, role username.SQLUsername) error {
+	return nil
+}
+
+// Optimizer is part of the cat.Catalog interface.
+func (tc *Catalog) Optimizer() interface{} {
+	return nil
+}
+
+// GetCurrentUser is part of the cat.Catalog interface.
+func (tc *Catalog) GetCurrentUser() username.SQLUsername {
+	return username.EmptyRoleName()
+}
+
+// GetRoutineOwner is part of the cat.Catalog interface.
+func (tc *Catalog) GetRoutineOwner(
+	ctx context.Context, routineOid oid.Oid,
+) (username.SQLUsername, error) {
+	return tc.GetCurrentUser(), nil
 }
 
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
@@ -238,7 +348,7 @@ func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.Sch
 			"target database or schema does not exist")
 	}
 
-	if string(toResolve.SchemaName) != tree.PublicSchema {
+	if string(toResolve.SchemaName) != catconstants.PublicSchemaName {
 		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidName,
 			"schema cannot be modified: %q", tree.ErrString(toResolve))
 	}
@@ -264,7 +374,7 @@ func (tc *Catalog) Schema() *Schema {
 
 // Table returns the test table that was previously added with the given name.
 func (tc *Catalog) Table(name *tree.TableName) *Table {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
@@ -273,6 +383,20 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 	}
 	panic(pgerror.Newf(pgcode.WrongObjectType,
 		"\"%q\" is not a table", tree.ErrString(name)))
+}
+
+// LookupTable returns the test table that was previously added with the given
+// name but returns an error if the name does not exist instead of panicking.
+func (tc *Catalog) LookupTable(name *tree.TableName) (*Table, error) {
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
+	if err != nil {
+		return nil, err
+	}
+	if tab, ok := ds.(*Table); ok {
+		return tab, nil
+	}
+	return nil, pgerror.Newf(pgcode.WrongObjectType,
+		"\"%q\" is not a table", tree.ErrString(name))
 }
 
 // Tables returns a list of all tables added to the test catalog.
@@ -298,7 +422,7 @@ func (tc *Catalog) AddTable(tab *Table) {
 
 // View returns the test view that was previously added with the given name.
 func (tc *Catalog) View(name *cat.DataSourceName) *View {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
@@ -350,7 +474,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.StrictIndexColumnIDGuaranteesVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.LatestIndexDescriptorVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -367,6 +491,21 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 	if err != nil {
 		return "", err
 	}
+	return tc.executeDDLStmtWithIndexVersion(stmt, indexVersion)
+}
+
+// ExecuteDDLStmtWithIndexVersion statement and creates objects in the test
+// catalog from the given statement. This is used to test without spinning up a
+// cluster.
+func (tc *Catalog) ExecuteDDLStmt(stmt statements.Statement[tree.Statement]) (string, error) {
+	return tc.executeDDLStmtWithIndexVersion(stmt, descpb.LatestIndexDescriptorVersion)
+}
+
+// executeDDLStmtWithIndexVersion statement and creates objects in the test
+// catalog from the given statement.
+func (tc *Catalog) executeDDLStmtWithIndexVersion(
+	stmt statements.Statement[tree.Statement], indexVersion descpb.IndexDescriptorVersion,
+) (string, error) {
 
 	switch stmt := stmt.AST.(type) {
 	case *tree.CreateTable:
@@ -401,6 +540,10 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 		tc.CreateType(stmt)
 		return "", nil
 
+	case *tree.CreateRoutine:
+		tc.CreateRoutine(stmt)
+		return "", nil
+
 	case *tree.SetZoneConfig:
 		tc.SetZoneConfig(stmt)
 		return "", nil
@@ -412,6 +555,22 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 			return "", err
 		}
 		return ds.(fmt.Stringer).String(), nil
+
+	case *tree.ShowCreateRoutine:
+		fn := tree.MakeUnresolvedFunctionName(stmt.Name.FunctionReference.(*tree.UnresolvedName))
+		def, err := tc.ResolveFunction(context.Background(), fn, tree.EmptySearchPath)
+		if err != nil {
+			return "", err
+		}
+		return formatFunction(def), nil
+
+	case *tree.CreateTrigger:
+		tc.CreateTrigger(stmt)
+		return "", nil
+
+	case *tree.DropTrigger:
+		tc.DropTrigger(stmt)
+		return "", nil
 
 	default:
 		return "", errors.AssertionFailedf("unsupported statement: %v", stmt)
@@ -442,7 +601,7 @@ func (tc *Catalog) qualifyTableName(name *tree.TableName) {
 			return
 		}
 
-		if name.SchemaName == tree.PublicSchemaName {
+		if name.SchemaName == catconstants.PublicSchemaName {
 			// Use the current database.
 			name.CatalogName = testDB
 			return
@@ -450,13 +609,13 @@ func (tc *Catalog) qualifyTableName(name *tree.TableName) {
 
 		// Compatibility with CockroachDB v1.1: use D.public.T.
 		name.CatalogName = name.SchemaName
-		name.SchemaName = tree.PublicSchemaName
+		name.SchemaName = catconstants.PublicSchemaName
 		return
 	}
 
 	// Use the current database.
 	name.CatalogName = testDB
-	name.SchemaName = tree.PublicSchemaName
+	name.SchemaName = catconstants.PublicSchemaName
 }
 
 // Schema implements the cat.Schema interface for testing purposes.
@@ -478,8 +637,8 @@ func (s *Schema) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (s *Schema) PostgresDescriptorID() cat.StableID {
-	return s.SchemaID
+func (s *Schema) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(s.SchemaID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -516,6 +675,7 @@ type View struct {
 	ViewName    cat.DataSourceName
 	QueryText   string
 	ColumnNames tree.NameList
+	Triggers    []Trigger
 
 	// If Revoked is true, then the user has had privileges on the view revoked.
 	Revoked bool
@@ -535,8 +695,8 @@ func (tv *View) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (tv *View) PostgresDescriptorID() cat.StableID {
-	return tv.ViewID
+func (tv *View) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(tv.ViewID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -583,9 +743,20 @@ func (tv *View) CollectTypes(ord int) (descpb.IDs, error) {
 	return nil, nil
 }
 
+// TriggerCount is a part of the cat.View interface.
+func (tv *View) TriggerCount() int {
+	return len(tv.Triggers)
+}
+
+// Trigger is a part of the cat.View interface.
+func (tv *View) Trigger(i int) cat.Trigger {
+	return &tv.Triggers[i]
+}
+
 // Table implements the cat.Table interface for testing purposes.
 type Table struct {
 	TabID      cat.StableID
+	DatabaseID descpb.ID
 	TabVersion int
 	TabName    tree.TableName
 	Columns    []cat.Column
@@ -593,7 +764,9 @@ type Table struct {
 	Stats      TableStats
 	Checks     []cat.CheckConstraint
 	Families   []*Family
+	Triggers   []Trigger
 	IsVirtual  bool
+	IsSystem   bool
 	Catalog    *Catalog
 
 	// If Revoked is true, then the user has had privileges on the table revoked.
@@ -610,14 +783,27 @@ type Table struct {
 	// partitionBy is the partitioning clause that corresponds to the primary
 	// index. Used to initialize the partitioning for the primary index.
 	partitionBy *tree.PartitionBy
+
+	multiRegion bool
+
+	implicitRBRIndexElem *tree.IndexElem
+
+	homeRegion string
 }
 
 var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatTable(tt.Catalog, tt, tp)
+	cat.FormatTable(context.Background(), tt.Catalog, tt, tp, false /* redactableValues */)
 	return tp.String()
+}
+
+// SetMultiRegion can make a table in the test catalog appear to be a
+// multiregion table, in that it can cause cat.Table.IsMultiregion() to return
+// true after SetMultiRegion(true) has been called.
+func (tt *Table) SetMultiRegion(val bool) {
+	tt.multiRegion = val
 }
 
 // ID is part of the cat.DataSource interface.
@@ -626,8 +812,8 @@ func (tt *Table) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (tt *Table) PostgresDescriptorID() cat.StableID {
-	return tt.TabID
+func (tt *Table) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(tt.TabID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -652,6 +838,11 @@ func (tt *Table) fqName() cat.DataSourceName {
 // IsVirtualTable is part of the cat.Table interface.
 func (tt *Table) IsVirtualTable() bool {
 	return tt.IsVirtual
+}
+
+// IsSystemTable is part of the cat.Table interface.
+func (tt *Table) IsSystemTable() bool {
+	return tt.IsSystem
 }
 
 // IsMaterializedView is part of the cat.Table interface.
@@ -749,6 +940,58 @@ func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
+// Zone is part of the cat.Table interface.
+func (tt *Table) Zone() cat.Zone {
+	zone := zonepb.DefaultZoneConfig()
+	return cat.AsZone(&zone)
+}
+
+// IsPartitionAllBy is part of the cat.Table interface.
+func (tt *Table) IsPartitionAllBy() bool {
+	return tt.implicitRBRIndexElem != nil
+}
+
+// HomeRegion is part of the cat.Table interface.
+func (tt *Table) HomeRegion() (region string, ok bool) {
+	if tt.homeRegion == "" {
+		return "", false
+	}
+	return tt.homeRegion, true
+}
+
+// IsGlobalTable is part of the cat.Table interface.
+func (tt *Table) IsGlobalTable() bool {
+	return false
+}
+
+// IsRegionalByRow is part of the cat.Table interface.
+func (tt *Table) IsRegionalByRow() bool {
+	return tt.implicitRBRIndexElem != nil
+}
+
+// IsMultiregion is part of the cat.Table interface.
+func (tt *Table) IsMultiregion() bool {
+	return tt.multiRegion
+}
+
+// HomeRegionColName is part of the cat.Table interface.
+func (tt *Table) HomeRegionColName() (colName string, ok bool) {
+	if !tt.IsRegionalByRow() {
+		return "", false
+	}
+	return string(tree.RegionalByRowRegionDefaultColName), true
+}
+
+// GetDatabaseID is part of the cat.Table interface.
+func (tt *Table) GetDatabaseID() descpb.ID {
+	return tt.DatabaseID
+}
+
+// IsHypothetical is part of the cat.Table interface.
+func (tt *Table) IsHypothetical() bool {
+	return false
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -801,18 +1044,33 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 
 	ids := make(descpb.IDs, 0, len(visitor.OIDs))
 	for collectedOid := range visitor.OIDs {
-		id, err := typedesc.UserDefinedTypeOIDToID(collectedOid)
-		if err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
+		ids = append(ids, typedesc.UserDefinedTypeOIDToID(collectedOid))
 	}
 	return ids, nil
+}
+
+// IsRefreshViewRequired is a part of the cat.Table interface.
+func (tt *Table) IsRefreshViewRequired() bool {
+	return false
+}
+
+// TriggerCount is a part of the cat.Table interface.
+func (tt *Table) TriggerCount() int {
+	return len(tt.Triggers)
+}
+
+// Trigger is a part of the cat.Table interface.
+func (tt *Table) Trigger(i int) cat.Trigger {
+	return &tt.Triggers[i]
 }
 
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
+
+	// ExplicitColCount is the number of columns that are explicitly specified in
+	// the index definition.
+	ExplicitColCount int
 
 	// KeyCount is the number of columns that make up the unique key for the
 	// index. See the cat.Index.KeyColumnCount for more details.
@@ -829,11 +1087,17 @@ type Index struct {
 	// Inverted is true when this index is an inverted index.
 	Inverted bool
 
+	// Invisibility specifies the invisibility of an index and can be any float64
+	// between [0.0, 1.0]. An index with invisibility 0.0 means that the index is
+	// visible. An index with invisibility 1.0 means that the index is fully not
+	// visible.
+	Invisibility float64
+
 	Columns []cat.IndexColumn
 
 	// IdxZone is the zone associated with the index. This may be inherited from
 	// the parent table, database, or even the default zone.
-	IdxZone *zonepb.ZoneConfig
+	IdxZone cat.Zone
 
 	// Ordinal is the ordinal of this index in the table.
 	ordinal int
@@ -853,11 +1117,15 @@ type Index struct {
 	invertedOrd int
 
 	// geoConfig is the geospatial index configuration, if this is a geospatial
-	// inverted index. Otherwise geoConfig is nil.
-	geoConfig *geoindex.Config
+	// inverted index.
+	geoConfig geopb.Config
 
 	// version is the index descriptor version of the index.
 	version descpb.IndexDescriptorVersion
+
+	// numImplicitPartitioningColumns is the number of implicit partitioning
+	// columns defined in this index.
+	numImplicitPartitioningColumns int
 }
 
 // ID is part of the cat.Index interface.
@@ -876,7 +1144,7 @@ func (ti *Index) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (ti *Index) Ordinal() int {
+func (ti *Index) Ordinal() cat.IndexOrdinal {
 	return ti.ordinal
 }
 
@@ -890,9 +1158,19 @@ func (ti *Index) IsInverted() bool {
 	return ti.Inverted
 }
 
+// GetInvisibility is part of the cat.Index interface.
+func (ti *Index) GetInvisibility() float64 {
+	return ti.Invisibility
+}
+
 // ColumnCount is part of the cat.Index interface.
 func (ti *Index) ColumnCount() int {
 	return len(ti.Columns)
+}
+
+// ExplicitColumnCount is part of the cat.Index interface.
+func (ti *Index) ExplicitColumnCount() int {
+	return ti.ExplicitColCount
 }
 
 // KeyColumnCount is part of the cat.Index interface.
@@ -943,13 +1221,18 @@ func (ti *Index) Predicate() (string, bool) {
 	return ti.predicate, ti.predicate != ""
 }
 
+// ImplicitColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitColumnCount() int {
+	return ti.numImplicitPartitioningColumns
+}
+
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (ti *Index) ImplicitPartitioningColumnCount() int {
-	return 0
+	return ti.numImplicitPartitioningColumns
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (ti *Index) GeoConfig() *geoindex.Config {
+func (ti *Index) GeoConfig() geopb.Config {
 	return ti.geoConfig
 }
 
@@ -968,10 +1251,15 @@ func (ti *Index) Partition(i int) cat.Partition {
 	return &ti.partitions[i]
 }
 
+// SetPartitions manually sets the partitions.
+func (ti *Index) SetPartitions(partitions []Partition) {
+	ti.partitions = partitions
+}
+
 // Partition implements the cat.Partition interface for testing purposes.
 type Partition struct {
 	name   string
-	zone   *zonepb.ZoneConfig
+	zone   cat.Zone
 	datums []tree.Datums
 }
 
@@ -992,10 +1280,49 @@ func (p *Partition) PartitionByListPrefixes() []tree.Datums {
 	return p.datums
 }
 
+// SetDatums manually sets the partitioning values.
+func (p *Partition) SetDatums(datums []tree.Datums) {
+	p.datums = datums
+}
+
+// CheckConstraint implements cat.CheckConstraint. See that interface
+// for more information on the fields.
+type CheckConstraint struct {
+	constraint     string
+	validated      bool
+	columnOrdinals []int
+}
+
+var _ cat.CheckConstraint = &CheckConstraint{}
+
+// Constraint is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) Constraint() string {
+	return c.constraint
+}
+
+// Validated is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) Validated() bool {
+	return c.validated
+}
+
+// ColumnCount is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) ColumnCount() int {
+	return len(c.columnOrdinals)
+}
+
+// ColumnOrdinal is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) ColumnOrdinal(i int) int {
+	return c.columnOrdinals[i]
+}
+
 // TableStat implements the cat.TableStatistic interface for testing purposes.
 type TableStat struct {
-	js stats.JSONStatistic
-	tt *Table
+	js            stats.JSONStatistic
+	tt            *Table
+	evalCtx       *eval.Context
+	histogram     []cat.HistogramBucket
+	histogramType *types.T
+	tc            *Catalog
 }
 
 var _ cat.TableStatistic = &TableStat{}
@@ -1034,9 +1361,21 @@ func (ts *TableStat) NullCount() uint64 {
 	return ts.js.NullCount
 }
 
+// AvgSize is part of the cat.TableStatistic interface.
+func (ts *TableStat) AvgSize() uint64 {
+	return ts.js.AvgSize
+}
+
 // Histogram is part of the cat.TableStatistic interface.
 func (ts *TableStat) Histogram() []cat.HistogramBucket {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	if ts.histogram != nil {
+		return ts.histogram
+	}
+	evalCtx := ts.evalCtx
+	if evalCtx == nil {
+		evalCtxVal := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx = &evalCtxVal
+	}
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
@@ -1044,17 +1383,19 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if err != nil {
 		panic(err)
 	}
-	colType := tree.MustBeStaticallyKnownType(colTypeRef)
+	colType, err := tree.ResolveType(context.Background(), colTypeRef, ts.tc)
+	if err != nil {
+		return nil
+	}
 
-	var histogram []cat.HistogramBucket
 	var offset int
 	if ts.js.NullCount > 0 {
 		// A bucket for NULL is not persisted, but we create a fake one to
 		// make histograms easier to work with. The length of histogram
 		// is therefore 1 greater than the length of ts.js.HistogramBuckets.
 		// NOTE: This matches the logic in the TableStatisticsCache.
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets)+1)
-		histogram[0] = cat.HistogramBucket{
+		ts.histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets)+1)
+		ts.histogram[0] = cat.HistogramBucket{
 			NumEq:         float64(ts.js.NullCount),
 			NumRange:      0,
 			DistinctRange: 0,
@@ -1062,24 +1403,57 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 		}
 		offset = 1
 	} else {
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
+		ts.histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
 		offset = 0
 	}
 
-	for i := offset; i < len(histogram); i++ {
+	for i := offset; i < len(ts.histogram); i++ {
 		bucket := &ts.js.HistogramBuckets[i-offset]
-		datum, err := rowenc.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
+		datum, err := rowenc.ParseDatumStringAs(context.Background(), colType, bucket.UpperBound, evalCtx, nil /* semaCtx */)
 		if err != nil {
 			panic(err)
 		}
-		histogram[i] = cat.HistogramBucket{
+		ts.histogram[i] = cat.HistogramBucket{
 			NumEq:         float64(bucket.NumEq),
 			NumRange:      float64(bucket.NumRange),
 			DistinctRange: bucket.DistinctRange,
 			UpperBound:    datum,
 		}
 	}
-	return histogram
+	return ts.histogram
+}
+
+// HistogramType is part of the cat.TableStatistic interface.
+func (ts *TableStat) HistogramType() *types.T {
+	if ts.histogramType != nil {
+		return ts.histogramType
+	}
+	colTypeRef, err := parser.GetTypeFromValidSQLSyntax(ts.js.HistogramColumnType)
+	if err != nil {
+		panic(err)
+	}
+	ts.histogramType = tree.MustBeStaticallyKnownType(colTypeRef)
+	return ts.histogramType
+}
+
+// IsPartial is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsPartial() bool {
+	return ts.js.IsPartial()
+}
+
+// IsMerged is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsMerged() bool {
+	return ts.js.IsMerged()
+}
+
+// IsForecast is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsForecast() bool {
+	return ts.js.IsForecast()
+}
+
+// IsAuto is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsAuto() bool {
+	return ts.js.IsAuto()
 }
 
 // TableStats is a slice of TableStat pointers.
@@ -1183,12 +1557,13 @@ func (fk *ForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
 // UniqueConstraint implements cat.UniqueConstraint. See that interface
 // for more information on the fields.
 type UniqueConstraint struct {
-	name           string
-	tabID          cat.StableID
-	columnOrdinals []int
-	predicate      string
-	withoutIndex   bool
-	validated      bool
+	name             string
+	tabID            cat.StableID
+	columnOrdinals   []int
+	predicate        string
+	withoutIndex     bool
+	canUseTombstones bool
+	validated        bool
 }
 
 var _ cat.UniqueConstraint = &UniqueConstraint{}
@@ -1229,9 +1604,17 @@ func (u *UniqueConstraint) WithoutIndex() bool {
 	return u.withoutIndex
 }
 
+func (u *UniqueConstraint) CanUseTombstones() bool { return u.canUseTombstones }
+
 // Validated is part of the cat.UniqueConstraint interface.
 func (u *UniqueConstraint) Validated() bool {
 	return u.validated
+}
+
+// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
+// interface.
+func (u *UniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
+	return false
 }
 
 // Sequence implements the cat.Sequence interface for testing purposes.
@@ -1253,8 +1636,8 @@ func (ts *Sequence) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (ts *Sequence) PostgresDescriptorID() cat.StableID {
-	return ts.SeqID
+func (ts *Sequence) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(ts.SeqID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -1326,4 +1709,74 @@ func (tf *Family) ColumnCount() int {
 // Column is part of the cat.Family interface.
 func (tf *Family) Column(i int) cat.FamilyColumn {
 	return tf.Columns[i]
+}
+
+// Trigger implements the cat.Trigger interface for testing purposes.
+type Trigger struct {
+	TriggerName               tree.Name
+	TriggerActionTime         tree.TriggerActionTime
+	TriggerEvents             []*tree.TriggerEvent
+	TriggerTableID            cat.StableID
+	TriggerNewTransitionAlias tree.Name
+	TriggerOldTransitionAlias tree.Name
+	TriggerForEachRow         bool
+	TriggerWhenExpr           string
+	TriggerFuncID             cat.StableID
+	TriggerFuncArgs           tree.Datums
+	TriggerFuncBody           string
+	TriggerEnabled            bool
+}
+
+var _ cat.Trigger = &Trigger{}
+
+func (t *Trigger) Name() tree.Name {
+	return t.TriggerName
+}
+
+func (t *Trigger) ActionTime() tree.TriggerActionTime {
+	return t.TriggerActionTime
+}
+
+func (t *Trigger) EventCount() int {
+	return len(t.TriggerEvents)
+}
+
+func (t *Trigger) Event(i int) tree.TriggerEvent {
+	return *t.TriggerEvents[i]
+}
+
+func (t *Trigger) TableID() cat.StableID {
+	return t.TriggerTableID
+}
+
+func (t *Trigger) NewTransitionAlias() tree.Name {
+	return t.TriggerNewTransitionAlias
+}
+
+func (t *Trigger) OldTransitionAlias() tree.Name {
+	return t.TriggerOldTransitionAlias
+}
+
+func (t *Trigger) ForEachRow() bool {
+	return t.TriggerForEachRow
+}
+
+func (t *Trigger) WhenExpr() string {
+	return t.TriggerWhenExpr
+}
+
+func (t *Trigger) FuncID() cat.StableID {
+	return t.TriggerFuncID
+}
+
+func (t *Trigger) FuncArgs() tree.Datums {
+	return t.TriggerFuncArgs
+}
+
+func (t *Trigger) FuncBody() string {
+	return t.TriggerFuncBody
+}
+
+func (t *Trigger) Enabled() bool {
+	return t.TriggerEnabled
 }

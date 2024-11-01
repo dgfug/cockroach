@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqlliveness provides interfaces to associate resources at the SQL
 // level with tenant SQL processes.
@@ -31,22 +26,46 @@ import (
 // may not be a well-formed UTF8 string.
 type SessionID string
 
-// Provider is a wrapper around the sqllivness subsystem for external
+// Provider is a wrapper around the sqlliveness subsystem for external
 // consumption.
 type Provider interface {
-	Start(ctx context.Context)
+	Instance
+	StorageReader
+
+	// Start starts the sqlliveness subsystem. regionPhysicalRep should
+	// represent the physical representation of the current process region
+	// stored in the multi-region enum type associated with the system
+	// database.
+	Start(ctx context.Context, regionPhysicalRep []byte)
+
+	// Release delete's the sqlliveness session managed by the provider. This
+	// should be called near the end of the drain process, after the server has
+	// no running tasks that depend on the session.
+	Release(ctx context.Context) (SessionID, error)
+
+	// PauseLivenessHeartbeat prevents the sqlliveness session from being extended
+	// into the future, which should be done if some key system table like system.leases
+	// is inaccessible.
+	PauseLivenessHeartbeat(ctx context.Context)
+
+	// UnpauseLivenessHeartbeat resumes sqlliveness session extensions.
+	UnpauseLivenessHeartbeat(ctx context.Context)
+
+	// Metrics returns a metric.Struct which holds metrics for the provider.
 	Metrics() metric.Struct
-	Liveness
+}
+
+// StorageReader provides access to Readers which either block or do not
+// block.
+type StorageReader interface {
+	// BlockingReader returns a Reader which only synchronously
+	// checks whether a session is alive if it does not have any
+	// cached information which implies that it currently is.
+	BlockingReader() Reader
 
 	// CachedReader returns a reader which only consults its local cache and
 	// does not perform any RPCs in the IsAlive call.
 	CachedReader() Reader
-}
-
-// Liveness exposes Reader and Instance interfaces.
-type Liveness interface {
-	Reader
-	Instance
 }
 
 // String returns a hex-encoded version of the SessionID.
@@ -75,14 +94,19 @@ type Instance interface {
 type Session interface {
 	ID() SessionID
 
+	// Start is the start timestamp for this session. We offer disjointness over
+	// session intervals, so if combined with Expiration() below, callers can
+	// ensure that transactions run by this Instance (if committing within the
+	// [start, expiration)), are disjoint with others committing within their
+	// session intervals.
+	Start() hlc.Timestamp
+
 	// Expiration is the current expiration value for this Session. If the Session
 	// expires, this function will return a zero-value timestamp.
 	// Transactions run by this Instance which ensure that they commit before
 	// this time will be assured that any resources claimed under this session
 	// are known to be valid.
 	Expiration() hlc.Timestamp
-	// RegisterCallbackForSessionExpiry registers a callback to be executed when the session expires.
-	RegisterCallbackForSessionExpiry(func(ctx context.Context))
 }
 
 // Reader abstracts over the state of session records.

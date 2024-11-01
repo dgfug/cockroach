@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -20,7 +16,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -28,7 +27,7 @@ import (
 // using SQL, as And operator rules simplify the expression before the Filters
 // operator is created.
 func TestSimplifyFilters(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	cat := testcat.New()
 	if _, err := cat.ExecuteDDL("CREATE TABLE a (x INT PRIMARY KEY, y INT)"); err != nil {
@@ -36,9 +35,9 @@ func TestSimplifyFilters(t *testing.T) {
 	}
 
 	var f norm.Factory
-	f.Init(&evalCtx, cat)
+	f.Init(context.Background(), &evalCtx, cat)
 
-	tn := tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "a")
+	tn := tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "a")
 	a := f.Metadata().AddTable(cat.Table(tn), tn)
 	ax := a.ColumnID(0)
 
@@ -47,10 +46,7 @@ func TestSimplifyFilters(t *testing.T) {
 	eq := f.ConstructEq(variable, constant)
 
 	// Filters expression evaluates to False if any operand is False.
-	vals := f.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
-		Cols: opt.ColList{},
-		ID:   f.Metadata().NextUniqueID(),
-	})
+	vals := f.ConstructNoColsRow()
 	filters := memo.FiltersExpr{
 		f.ConstructFiltersItem(eq),
 		f.ConstructFiltersItem(memo.FalseSingleton),
@@ -69,37 +65,36 @@ func TestSimplifyFilters(t *testing.T) {
 	}
 }
 
-// Test CopyAndReplace on an already optimized join. Before CopyAndReplace is
-// called, the join has a placeholder that causes the optimizer to use a merge
-// join. After CopyAndReplace substitutes a constant for the placeholder, the
-// optimizer switches to a lookup join. A similar pattern is used by the
-// ApplyJoin execution operator which replaces variables with constants in an
-// already optimized tree. The CopyAndReplace code must take care to copy over
-// the normalized tree rather than the optimized tree by using the FirstExpr
-// method.
+// Test CopyAndReplace on an already optimized memo. Before CopyAndReplace is
+// called, the query has a placeholder that causes the optimizer to use a
+// parameterized lookup-join. After CopyAndReplace substitutes a constant for
+// the placeholder, the optimizer switches to a constrained scan. A similar
+// pattern is used by the ApplyJoin execution operator which replaces variables
+// with constants in an already optimized tree. The CopyAndReplace code must
+// take care to copy over the normalized tree rather than the optimized tree by
+// using the FirstExpr method.
 func TestCopyAndReplace(t *testing.T) {
 	cat := testcat.New()
 	if _, err := cat.ExecuteDDL("CREATE TABLE ab (a INT PRIMARY KEY, b INT)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cat.ExecuteDDL("CREATE TABLE cde (c INT PRIMARY KEY, d INT, e INT, INDEX(d))"); err != nil {
-		t.Fatal(err)
-	}
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx.SessionData().PlanCacheMode = sessiondatapb.PlanCacheModeAuto
 
 	var o xform.Optimizer
-	testutils.BuildQuery(t, &o, cat, &evalCtx, "SELECT * FROM cde INNER JOIN ab ON a=c AND d=$1")
+	testutils.BuildQuery(t, &o, cat, &evalCtx, "SELECT * FROM ab WHERE a = $1")
 
 	if e, err := o.Optimize(); err != nil {
 		t.Fatal(err)
-	} else if e.Op() != opt.MergeJoinOp {
-		t.Errorf("expected optimizer to choose merge-join, not %v", e.Op())
+	} else if e.Op() != opt.ProjectOp || e.Child(0).Op() != opt.LookupJoinOp {
+		t.Errorf("expected optimizer to choose a (project (lookup-join)), not (%v (%v))",
+			e.Op(), e.Child(0).Op())
 	}
 
 	m := o.Factory().DetachMemo()
 
-	o.Init(&evalCtx, cat)
+	o.Init(context.Background(), &evalCtx, cat)
 	var replaceFn norm.ReplaceFunc
 	replaceFn = func(e opt.Expr) opt.Expr {
 		if e.Op() == opt.PlaceholderOp {
@@ -111,8 +106,10 @@ func TestCopyAndReplace(t *testing.T) {
 
 	if e, err := o.Optimize(); err != nil {
 		t.Fatal(err)
-	} else if e.Op() != opt.LookupJoinOp {
-		t.Errorf("expected optimizer to choose lookup-join, not %v", e.Op())
+	} else if e.Op() != opt.ScanOp {
+		t.Errorf("expected optimizer to choose a constrained scan, not %v", e.Op())
+	} else if e.(*memo.ScanExpr).Constraint == nil {
+		t.Errorf("expected optimizer to choose a constrained scan")
 	}
 }
 
@@ -129,7 +126,7 @@ func TestCopyAndReplaceWithScan(t *testing.T) {
 		}
 	}
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	for _, query := range []string{
 		"WITH cte AS (SELECT * FROM ab) SELECT * FROM cte, cte AS cte2 WHERE cte.a = cte2.b",
 		"INSERT INTO child VALUES (1,1), (2,2)",
@@ -145,7 +142,7 @@ func TestCopyAndReplaceWithScan(t *testing.T) {
 
 			m := o.Factory().DetachMemo()
 
-			o.Init(&evalCtx, cat)
+			o.Init(context.Background(), &evalCtx, cat)
 			var replaceFn norm.ReplaceFunc
 			replaceFn = func(e opt.Expr) opt.Expr {
 				return o.Factory().CopyAndReplaceDefault(e, replaceFn)

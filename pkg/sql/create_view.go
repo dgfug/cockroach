@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,14 +9,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -31,7 +25,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	plpgsql "github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree/utils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -44,17 +42,12 @@ import (
 
 // createViewNode represents a CREATE VIEW statement.
 type createViewNode struct {
-	// viewName is the fully qualified name of the new view.
-	viewName *tree.TableName
+	createView *tree.CreateView
 	// viewQuery contains the view definition, with all table names fully
 	// qualified.
-	viewQuery    string
-	ifNotExists  bool
-	replace      bool
-	persistence  tree.Persistence
-	materialized bool
-	dbDesc       catalog.DatabaseDescriptor
-	columns      colinfo.ResultColumns
+	viewQuery string
+	dbDesc    catalog.DatabaseDescriptor
+	columns   colinfo.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
 	// depends on. This is collected during the construction of
@@ -73,23 +66,29 @@ type createViewNode struct {
 func (n *createViewNode) ReadingOwnWrites() {}
 
 func (n *createViewNode) startExec(params runParams) error {
+	// Check if the parent object is a replicated PCR descriptor, which will block
+	// schema changes.
+	if n.dbDesc.GetReplicatedPCRVersion() != 0 {
+		return pgerror.Newf(pgcode.ReadOnlySQLTransaction, "schema changes are not allowed on a reader catalog")
+	}
+	createView := n.createView
 	tableType := tree.GetTableType(
-		false /* isSequence */, true /* isView */, n.materialized,
+		false /* isSequence */, true /* isView */, createView.Materialized,
 	)
-	if n.replace {
+	if createView.Replace {
 		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(fmt.Sprintf("or_replace_%s", tableType)))
 	} else {
 		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(tableType))
 	}
 
-	viewName := n.viewName.Object()
+	viewName := createView.Name.Object()
 	log.VEventf(params.ctx, 2, "dependencies for view %s:\n%s", viewName, n.planDeps.String())
 
 	// Check that the view does not contain references to other databases.
 	if !allowCrossDatabaseViews.Get(&params.p.execCfg.Settings.SV) {
 		for _, dep := range n.planDeps {
 			if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.GetID() && dbID != keys.SystemDatabaseID {
-				return errors.WithHintf(
+				return errors.WithHint(
 					pgerror.Newf(pgcode.FeatureNotSupported,
 						"the view cannot refer to other databases; (see the '%s' cluster setting)",
 						allowCrossDatabaseViewsSetting),
@@ -103,21 +102,28 @@ func (n *createViewNode) startExec(params runParams) error {
 	// If so, promote this view to temporary.
 	backRefMutables := make(map[descpb.ID]*tabledesc.Mutable, len(n.planDeps))
 	hasTempBackref := false
-	for id, updated := range n.planDeps {
-		backRefMutable, err := params.p.Descriptors().GetUncommittedMutableTableByID(id)
-		if err != nil {
+	{
+		var ids catalog.DescriptorIDSet
+		for id := range n.planDeps {
+			ids.Add(id)
+		}
+		// Lookup the dependent tables in bulk to minimize round-trips to KV.
+		if _, err := params.p.Descriptors().ByIDWithoutLeased(params.p.Txn()).WithoutNonPublic().WithoutSynthetic().Get().Descs(params.ctx, ids.Ordered()); err != nil {
 			return err
 		}
-		if backRefMutable == nil {
-			backRefMutable = tabledesc.NewBuilder(updated.desc.TableDesc()).BuildExistingMutableTable()
+		for id := range n.planDeps {
+			backRefMutable, err := params.p.Descriptors().MutableByID(params.p.Txn()).Table(params.ctx, id)
+			if err != nil {
+				return err
+			}
+			if !createView.Persistence.IsTemporary() && backRefMutable.Temporary {
+				hasTempBackref = true
+			}
+			backRefMutables[id] = backRefMutable
 		}
-		if !n.persistence.IsTemporary() && backRefMutable.Temporary {
-			hasTempBackref = true
-		}
-		backRefMutables[id] = backRefMutable
 	}
 	if hasTempBackref {
-		n.persistence = tree.PersistenceTemporary
+		createView.Persistence = tree.PersistenceTemporary
 		// This notice is sent from pg, let's imitate.
 		params.p.BufferClientNotice(
 			params.ctx,
@@ -126,24 +132,29 @@ func (n *createViewNode) startExec(params runParams) error {
 	}
 
 	var replacingDesc *tabledesc.Mutable
-	schema, err := getSchemaForCreateTable(params, n.dbDesc, n.persistence, n.viewName,
-		tree.ResolveRequireViewDesc, n.ifNotExists)
+	schema, err := getSchemaForCreateTable(params, n.dbDesc, createView.Persistence, &createView.Name,
+		tree.ResolveRequireViewDesc, createView.IfNotExists)
 	if err != nil && !sqlerrors.IsRelationAlreadyExistsError(err) {
 		return err
 	}
-	nameKey := catalogkeys.NewNameKeyComponents(n.dbDesc.GetID(), schema.GetID(), n.viewName.Table())
 	if err != nil {
 		switch {
-		case n.ifNotExists:
+		case createView.IfNotExists:
 			return nil
-		case n.replace:
+		case createView.Replace:
 			// If we are replacing an existing view see if what we are
 			// replacing is actually a view.
-			id, err := catalogkv.GetDescriptorID(params.ctx, params.p.txn, params.ExecCfg().Codec, nameKey)
+			id, err := params.p.Descriptors().LookupObjectID(
+				params.ctx,
+				params.p.txn,
+				n.dbDesc.GetID(),
+				schema.GetID(),
+				createView.Name.Table(),
+			)
 			if err != nil {
 				return err
 			}
-			desc, err := params.p.Descriptors().GetMutableTableVersionByID(params.ctx, id, params.p.txn)
+			desc, err := params.p.Descriptors().MutableByID(params.p.txn).Table(params.ctx, id)
 			if err != nil {
 				return err
 			}
@@ -159,181 +170,198 @@ func (n *createViewNode) startExec(params runParams) error {
 		}
 	}
 
-	if n.persistence.IsTemporary() {
+	if createView.Persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempViewCounter)
 	}
 
-	privs := n.dbDesc.GetDefaultPrivilegeDescriptor().CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		n.dbDesc.GetDefaultPrivilegeDescriptor(),
+		schema.GetDefaultPrivilegeDescriptor(),
 		n.dbDesc.GetID(),
-		params.SessionData().User(), tree.Tables, n.dbDesc.GetPrivileges(),
+		params.SessionData().User(),
+		privilege.Tables,
 	)
+	if err != nil {
+		return err
+	}
 
 	var newDesc *tabledesc.Mutable
 	applyGlobalMultiRegionZoneConfig := false
 
-	// If replacingDesc != nil, we found an existing view while resolving
-	// the name for our view. So instead of creating a new view, replace
-	// the existing one.
-	if replacingDesc != nil {
-		newDesc, err = params.p.replaceViewDesc(
-			params.ctx,
-			params.p,
-			n,
-			replacingDesc,
-			backRefMutables,
-		)
-		if err != nil {
-			return err
-		}
-	} else {
-		// If we aren't replacing anything, make a new table descriptor.
-		id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
-		if err != nil {
-			return err
-		}
-		// creationTime is initialized to a zero value and populated at read time.
-		// See the comment in desc.MaybeIncrementVersion.
-		//
-		// TODO(ajwerner): remove the timestamp from MakeViewTableDesc, it's
-		// currently relied on in import and restore code and tests.
-		var creationTime hlc.Timestamp
-		desc, err := makeViewTableDesc(
-			params.ctx,
-			params.p.ExecCfg().Settings,
-			viewName,
-			n.viewQuery,
-			n.dbDesc.GetID(),
-			schema.GetID(),
-			id,
-			n.columns,
-			creationTime,
-			privs,
-			&params.p.semaCtx,
-			params.p.EvalContext(),
-			n.persistence,
-			n.dbDesc.IsMultiRegion(),
-			params.p,
-		)
-		if err != nil {
-			return err
-		}
+	var retErr error
+	params.p.runWithOptions(resolveFlags{contextDatabaseID: n.dbDesc.GetID()}, func() {
+		retErr = func() error {
+			// If replacingDesc != nil, we found an existing view while resolving
+			// the name for our view. So instead of creating a new view, replace
+			// the existing one.
+			if replacingDesc != nil {
+				newDesc, err = params.p.replaceViewDesc(
+					params.ctx,
+					params.p,
+					n,
+					replacingDesc,
+					backRefMutables,
+				)
+				if err != nil {
+					return err
+				}
+			} else {
+				// If we aren't replacing anything, make a new table descriptor.
+				id, err := params.EvalContext().DescIDGenerator.
+					GenerateUniqueDescID(params.ctx)
+				if err != nil {
+					return err
+				}
+				// creationTime is initialized to a zero value and populated at read time.
+				// See the comment in desc.MaybeIncrementVersion.
+				//
+				// TODO(ajwerner): remove the timestamp from MakeViewTableDesc, it's
+				// currently relied on in import and restore code and tests.
+				var creationTime hlc.Timestamp
+				desc, err := makeViewTableDesc(
+					params.ctx,
+					viewName,
+					n.viewQuery,
+					n.dbDesc.GetID(),
+					schema.GetID(),
+					id,
+					n.columns,
+					creationTime,
+					privs,
+					&params.p.semaCtx,
+					params.p.EvalContext(),
+					params.p.EvalContext().Settings,
+					createView.Persistence,
+					n.dbDesc.IsMultiRegion(),
+					params.p)
+				if err != nil {
+					return err
+				}
 
-		if n.materialized {
-			// If the view is materialized, set up some more state on the view descriptor.
-			// In particular,
-			// * mark the descriptor as a materialized view
-			// * mark the state as adding and remember the AsOf time to perform
-			//   the view query
-			// * use AllocateIDs to give the view descriptor a primary key
-			desc.IsMaterializedView = true
-			desc.State = descpb.DescriptorState_ADD
-			desc.CreateAsOfTime = params.p.Txn().ReadTimestamp()
-			if err := desc.AllocateIDs(params.ctx); err != nil {
+				if createView.Materialized {
+					// If the view is materialized, set up some more state on the view descriptor.
+					// In particular,
+					// * mark the descriptor as a materialized view
+					// * mark the state as adding and remember the AsOf time to perform
+					//   the view query
+					// * use AllocateIDs to give the view descriptor a primary key
+					desc.IsMaterializedView = true
+					// If the materialized view has been created WITH NO DATA option, mark
+					// the table descriptor as requiring a REFRESH VIEW to indicate the view
+					// should only be accessed after a REFRESH VIEW operation has been called
+					// on it.
+					desc.RefreshViewRequired = !createView.WithData
+					desc.State = descpb.DescriptorState_ADD
+					version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
+					if err := desc.AllocateIDs(params.ctx, version); err != nil {
+						return err
+					}
+					// For multi-region databases, we want this descriptor to be GLOBAL instead.
+					if n.dbDesc.IsMultiRegion() {
+						desc.SetTableLocalityGlobal()
+						applyGlobalMultiRegionZoneConfig = true
+					}
+				}
+
+				// Collect all the tables/views this view depends on.
+				orderedDependsOn := catalog.DescriptorIDSet{}
+				for backrefID := range n.planDeps {
+					orderedDependsOn.Add(backrefID)
+				}
+				desc.DependsOn = append(desc.DependsOn, orderedDependsOn.Ordered()...)
+
+				// Collect all types this view depends on.
+				orderedTypeDeps := catalog.DescriptorIDSet{}
+				for backrefID := range n.typeDeps {
+					orderedTypeDeps.Add(backrefID)
+				}
+				desc.DependsOnTypes = append(desc.DependsOnTypes, orderedTypeDeps.Ordered()...)
+				newDesc = &desc
+
+				if err = params.p.createDescriptor(
+					params.ctx,
+					newDesc,
+					tree.AsStringWithFQNames(n.createView, params.Ann()),
+				); err != nil {
+					return err
+				}
+			}
+
+			// Persist the back-references in all referenced table descriptors.
+			for id, updated := range n.planDeps {
+				backRefMutable := backRefMutables[id]
+				// In case that we are replacing a view that already depends on
+				// this table, remove all existing references so that we don't leave
+				// any out of date references. Then, add the new references.
+				backRefMutable.DependedOnBy = removeMatchingReferences(
+					backRefMutable.DependedOnBy,
+					newDesc.ID,
+				)
+				for _, dep := range updated.deps {
+					// The logical plan constructor merely registered the dependencies.
+					// It did not populate the "ID" field of TableDescriptor_Reference,
+					// because the ID of the newly created view descriptor was not
+					// yet known.
+					// We need to do it here.
+					dep.ID = newDesc.ID
+					dep.ByID = updated.desc.IsSequence()
+					backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
+				}
+				if err := params.p.writeSchemaChange(
+					params.ctx,
+					backRefMutable,
+					descpb.InvalidMutationID,
+					fmt.Sprintf("updating view reference %q in table %s(%d)", &createView.Name,
+						updated.desc.GetName(), updated.desc.GetID(),
+					),
+				); err != nil {
+					return err
+				}
+			}
+
+			// Add back references for the type dependencies.
+			for id := range n.typeDeps {
+				jobDesc := fmt.Sprintf("updating type back reference %d for table %d", id, newDesc.ID)
+				if err := params.p.addTypeBackReference(params.ctx, id, newDesc.ID, jobDesc); err != nil {
+					return err
+				}
+			}
+
+			if err := validateDescriptor(params.ctx, params.p, newDesc); err != nil {
 				return err
 			}
-			// For multi-region databases, we want this descriptor to be GLOBAL instead.
-			if n.dbDesc.IsMultiRegion() {
-				desc.SetTableLocalityGlobal()
-				applyGlobalMultiRegionZoneConfig = true
+
+			if applyGlobalMultiRegionZoneConfig {
+				regionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.dbDesc.GetID(), params.p.Descriptors())
+				if err != nil {
+					return err
+				}
+				if err := ApplyZoneConfigForMultiRegionTable(
+					params.ctx,
+					params.p.InternalSQLTxn(),
+					params.p.ExecCfg(),
+					params.p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+					regionConfig,
+					newDesc,
+					applyZoneConfigForMultiRegionTableOptionTableNewConfig(
+						tabledesc.LocalityConfigGlobal(),
+					),
+				); err != nil {
+					return err
+				}
 			}
-		}
 
-		// Collect all the tables/views this view depends on.
-		for backrefID := range n.planDeps {
-			desc.DependsOn = append(desc.DependsOn, backrefID)
-		}
-
-		// Collect all types this view depends on.
-		for backrefID := range n.typeDeps {
-			desc.DependsOnTypes = append(desc.DependsOnTypes, backrefID)
-		}
-
-		// TODO (lucy): I think this needs a NodeFormatter implementation. For now,
-		// do some basic string formatting (not accurate in the general case).
-		if err = params.p.createDescriptorWithID(
-			params.ctx,
-			catalogkeys.EncodeNameKey(params.ExecCfg().Codec, nameKey),
-			id,
-			&desc,
-			params.EvalContext().Settings,
-			fmt.Sprintf("CREATE VIEW %q AS %q", n.viewName, n.viewQuery),
-		); err != nil {
-			return err
-		}
-		newDesc = &desc
-	}
-
-	// Persist the back-references in all referenced table descriptors.
-	for id, updated := range n.planDeps {
-		backRefMutable := backRefMutables[id]
-		// In case that we are replacing a view that already depends on
-		// this table, remove all existing references so that we don't leave
-		// any out of date references. Then, add the new references.
-		backRefMutable.DependedOnBy = removeMatchingReferences(
-			backRefMutable.DependedOnBy,
-			newDesc.ID,
-		)
-		for _, dep := range updated.deps {
-			// The logical plan constructor merely registered the dependencies.
-			// It did not populate the "ID" field of TableDescriptor_Reference,
-			// because the ID of the newly created view descriptor was not
-			// yet known.
-			// We need to do it here.
-			dep.ID = newDesc.ID
-			dep.ByID = updated.desc.IsSequence()
-			backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
-		}
-		if err := params.p.writeSchemaChange(
-			params.ctx,
-			backRefMutable,
-			descpb.InvalidMutationID,
-			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
-				updated.desc.GetName(), updated.desc.GetID(),
-			),
-		); err != nil {
-			return err
-		}
-	}
-
-	// Add back references for the type dependencies.
-	for id := range n.typeDeps {
-		jobDesc := fmt.Sprintf("updating type back reference %d for table %d", id, newDesc.ID)
-		if err := params.p.addTypeBackReference(params.ctx, id, newDesc.ID, jobDesc); err != nil {
-			return err
-		}
-	}
-
-	if err := validateDescriptor(params.ctx, params.p, newDesc); err != nil {
-		return err
-	}
-
-	if applyGlobalMultiRegionZoneConfig {
-		regionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.dbDesc.GetID(), params.p.Descriptors())
-		if err != nil {
-			return err
-		}
-		if err := ApplyZoneConfigForMultiRegionTable(
-			params.ctx,
-			params.p.txn,
-			params.p.ExecCfg(),
-			regionConfig,
-			newDesc,
-			applyZoneConfigForMultiRegionTableOptionTableNewConfig(
-				tabledesc.LocalityConfigGlobal(),
-			),
-		); err != nil {
-			return err
-		}
-	}
-
-	// Log Create View event. This is an auditable log event and is
-	// recorded in the same transaction as the table descriptor update.
-	return params.p.logEvent(params.ctx,
-		newDesc.ID,
-		&eventpb.CreateView{
-			ViewName:  n.viewName.FQString(),
-			ViewQuery: n.viewQuery,
-		})
+			// Log Create View event. This is an auditable log event and is
+			// recorded in the same transaction as the table descriptor update.
+			return params.p.logEvent(params.ctx,
+				newDesc.ID,
+				&eventpb.CreateView{
+					ViewName:  createView.Name.FQString(),
+					ViewQuery: n.viewQuery,
+				})
+		}()
+	})
+	return retErr
 }
 
 func (*createViewNode) Next(runParams) (bool, error) { return false, nil }
@@ -349,7 +377,6 @@ func (n *createViewNode) Close(ctx context.Context)  {}
 // include the back-references.
 func makeViewTableDesc(
 	ctx context.Context,
-	st *cluster.Settings,
 	viewName string,
 	viewQuery string,
 	parentID descpb.ID,
@@ -357,9 +384,10 @@ func makeViewTableDesc(
 	id descpb.ID,
 	resultColumns []colinfo.ResultColumn,
 	creationTime hlc.Timestamp,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
+	st *cluster.Settings,
 	persistence tree.Persistence,
 	isMultiRegion bool,
 	sc resolver.SchemaResolver,
@@ -378,51 +406,64 @@ func makeViewTableDesc(
 		desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
 	}
 
-	// If we're in 21.1, then sequences in views should be referenced
-	// by IDs, so walk the tree and replace sequence names with IDs.
-	version := st.Version.ActiveVersionOrEmpty(ctx)
 	if sc != nil {
-		sequenceReplacedQuery, err := replaceSeqNamesWithIDs(ctx, sc, viewQuery)
+		sequenceReplacedQuery, err := replaceSeqNamesWithIDs(ctx, sc, viewQuery, false /* multiStmt */)
 		if err != nil {
 			return tabledesc.Mutable{}, err
 		}
 		desc.ViewQuery = sequenceReplacedQuery
 	}
 
-	// Serialize user defined types used in the view if in 21.2.
-	if version != (clusterversion.ClusterVersion{}) && version.IsActive(clusterversion.SerializeViewUDTs) {
-		typeReplacedQuery, err := serializeUserDefinedTypes(ctx, semaCtx, desc.ViewQuery)
-		if err != nil {
-			return tabledesc.Mutable{}, err
-		}
-		desc.ViewQuery = typeReplacedQuery
+	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, semaCtx, desc.ViewQuery,
+		false /* multiStmt */, "view queries")
+	if err != nil {
+		return tabledesc.Mutable{}, err
 	}
+	desc.ViewQuery = typeReplacedQuery
 
-	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
+	if err := addResultColumns(ctx, semaCtx, evalCtx, st, &desc, resultColumns); err != nil {
 		return tabledesc.Mutable{}, err
 	}
 
 	return desc, nil
 }
 
-// replaceSeqNamesWithIDs prepares to walk the given viewQuery by defining the
-// function used to replace sequence names with IDs, and parsing the
-// viewQuery into a statement.
+// replaceSeqNamesWithIDsLang walks the query in queryStr, replacing any
+// sequence names with their IDs and returning a new query string with the names
+// replaced. It assumes that the query is in the SQL language.
+// TODO (Chengxiong): move this to a better place.
 func replaceSeqNamesWithIDs(
-	ctx context.Context, sc resolver.SchemaResolver, viewQuery string,
+	ctx context.Context, sc resolver.SchemaResolver, queryStr string, multiStmt bool,
+) (string, error) {
+	return replaceSeqNamesWithIDsLang(ctx, sc, queryStr, multiStmt, catpb.Function_SQL)
+}
+
+// replaceSeqNamesWithIDsLang walks the query in queryStr, replacing any
+// sequence names with their IDs and returning a new query string with the names
+// replaced. Queries may be in either the SQL or PLpgSQL language, indicated by
+// lang.
+func replaceSeqNamesWithIDsLang(
+	ctx context.Context,
+	sc resolver.SchemaResolver,
+	queryStr string,
+	multiStmt bool,
+	lang catpb.Function_Language,
 ) (string, error) {
 	replaceSeqFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		if expr == nil {
+			return false, expr, nil
+		}
 		seqIdentifiers, err := seqexpr.GetUsedSequences(expr)
 		if err != nil {
 			return false, expr, err
 		}
-		seqNameToID := make(map[string]int64)
+		seqNameToID := make(map[string]descpb.ID)
 		for _, seqIdentifier := range seqIdentifiers {
 			seqDesc, err := GetSequenceDescFromIdentifier(ctx, sc, seqIdentifier)
 			if err != nil {
 				return false, expr, err
 			}
-			seqNameToID[seqIdentifier.SeqName] = int64(seqDesc.ID)
+			seqNameToID[seqIdentifier.SeqName] = seqDesc.ID
 		}
 		newExpr, err = seqexpr.ReplaceSequenceNamesWithIDs(expr, seqNameToID)
 		if err != nil {
@@ -431,55 +472,205 @@ func replaceSeqNamesWithIDs(
 		return false, newExpr, nil
 	}
 
-	stmt, err := parser.ParseOne(viewQuery)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to parse view query")
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	switch lang {
+	case catpb.Function_SQL:
+		var stmts tree.Statements
+		if multiStmt {
+			parsedStmtd, err := parser.Parse(queryStr)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to parse query string")
+			}
+			for _, s := range parsedStmtd {
+				stmts = append(stmts, s.AST)
+			}
+		} else {
+			stmt, err := parser.ParseOne(queryStr)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to parse query string")
+			}
+			stmts = tree.Statements{stmt.AST}
+		}
+
+		for i, stmt := range stmts {
+			newStmt, err := tree.SimpleStmtVisit(stmt, replaceSeqFunc)
+			if err != nil {
+				return "", err
+			}
+			if i > 0 {
+				fmtCtx.WriteString("\n")
+			}
+			fmtCtx.FormatNode(newStmt)
+			if multiStmt {
+				fmtCtx.WriteString(";")
+			}
+		}
+	case catpb.Function_PLPGSQL:
+		var stmts plpgsqltree.Statement
+		plstmt, err := plpgsql.Parse(queryStr)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to parse query string")
+		}
+		stmts = plstmt.AST
+
+		v := utils.SQLStmtVisitor{Fn: replaceSeqFunc}
+		newStmt := plpgsqltree.Walk(&v, stmts)
+		fmtCtx.FormatNode(newStmt)
 	}
 
-	newStmt, err := tree.SimpleStmtVisit(stmt.AST, replaceSeqFunc)
-	if err != nil {
-		return "", err
-	}
-	return newStmt.String(), nil
+	return fmtCtx.String(), nil
 }
 
-// serializeUserDefinedTypes will walk the given view query
-// and serialize any user defined types, so that renaming the type
-// does not corrupt the view.
+// serializeUserDefinedTypes walks the given query and serializes any
+// user defined types as IDs, so that renaming the type does not cause
+// corruption, and returns a new query string containing the replacement IDs.
+// It assumes that the query language is SQL.
 func serializeUserDefinedTypes(
-	ctx context.Context, semaCtx *tree.SemaContext, viewQuery string,
+	ctx context.Context, semaCtx *tree.SemaContext, queries string, multiStmt bool, parentType string,
 ) (string, error) {
+	return serializeUserDefinedTypesLang(ctx, semaCtx, queries, multiStmt, parentType, catpb.Function_SQL)
+}
+
+// serializeUserDefinedTypesLang walks the given query and serializes any
+// user defined types as IDs, so that renaming the type does not cause
+// corruption, and returns a new query string containing the replacement IDs.
+// The query may be in either the SQL or PLpgSQL language, indicated by lang.
+func serializeUserDefinedTypesLang(
+	ctx context.Context,
+	semaCtx *tree.SemaContext,
+	queries string,
+	multiStmt bool,
+	parentType string,
+	lang catpb.Function_Language,
+) (string, error) {
+	// replaceFunc is a visitor function that replaces user defined types in SQL
+	// expressions with their IDs.
 	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		switch n := expr.(type) {
-		case *tree.CastExpr, *tree.AnnotateTypeExpr:
-			texpr, err := tree.TypeCheck(ctx, n, semaCtx, types.Any)
-			if err != nil {
-				return false, expr, err
-			}
-			if !texpr.ResolvedType().UserDefined() {
-				return true, expr, nil
-			}
-
-			s := tree.Serialize(texpr)
-			parsedExpr, err := parser.ParseExpr(s)
-			if err != nil {
-				return false, expr, err
-			}
-			return false, parsedExpr, nil
+		if expr == nil {
+			return false, expr, nil
 		}
-		return true, expr, nil
+		var innerExpr tree.Expr
+		var typRef tree.ResolvableTypeReference
+		switch n := expr.(type) {
+		case *tree.CastExpr:
+			innerExpr = n.Expr
+			typRef = n.Type
+		case *tree.AnnotateTypeExpr:
+			innerExpr = n.Expr
+			typRef = n.Type
+		default:
+			return true, expr, nil
+		}
+		// semaCtx may be nil if this is a virtual view being created at
+		// init time.
+		var typeResolver tree.TypeReferenceResolver
+		if semaCtx != nil {
+			typeResolver = semaCtx.TypeResolver
+		}
+		var typ *types.T
+		typ, err = tree.ResolveType(ctx, typRef, typeResolver)
+		if err != nil {
+			return false, expr, err
+		}
+		if !typ.UserDefined() {
+			return true, expr, nil
+		}
+		{
+			// We cannot type-check subqueries without using optbuilder, so we
+			// currently do not support casting expressions with subqueries to
+			// UDTs.
+			context := "casts to enums within " + parentType
+			defer semaCtx.Properties.Restore(semaCtx.Properties)
+			semaCtx.Properties.Require(context, tree.RejectSubqueries)
+		}
+		texpr, err := innerExpr.TypeCheck(ctx, semaCtx, typ)
+		if err != nil {
+			return false, expr, err
+		}
+		s := tree.Serialize(texpr)
+		parsedExpr, err := parser.ParseExpr(s)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, parsedExpr, nil
+	}
+	// replaceTypeFunc is a visitor function that replaces type annotations
+	// containing user defined types with their IDs. This is currently only
+	// necessary for some kinds of PLpgSQL statements.
+	replaceTypeFunc := func(typ tree.ResolvableTypeReference) (newTyp tree.ResolvableTypeReference, err error) {
+		if typ == nil {
+			return typ, nil
+		}
+		// semaCtx may be nil if this is a virtual view being created at
+		// init time.
+		var typeResolver tree.TypeReferenceResolver
+		if semaCtx != nil {
+			typeResolver = semaCtx.TypeResolver
+		}
+		var t *types.T
+		t, err = tree.ResolveType(ctx, typ, typeResolver)
+		if err != nil {
+			return typ, err
+		}
+		if !t.UserDefined() {
+			return typ, nil
+		}
+		return &tree.OIDTypeReference{OID: t.Oid()}, nil
 	}
 
-	stmt, err := parser.ParseOne(viewQuery)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to parse view query")
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	switch lang {
+	case catpb.Function_SQL:
+		var stmts tree.Statements
+		if multiStmt {
+			parsedStmts, err := parser.Parse(queries)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to parse query")
+			}
+			stmts = make(tree.Statements, len(parsedStmts))
+			for i, stmt := range parsedStmts {
+				stmts[i] = stmt.AST
+			}
+		} else {
+			stmt, err := parser.ParseOne(queries)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to parse query")
+			}
+			stmts = tree.Statements{stmt.AST}
+		}
+
+		for i, stmt := range stmts {
+			newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+			if err != nil {
+				return "", err
+			}
+			if i > 0 {
+				fmtCtx.WriteString("\n")
+			}
+			fmtCtx.FormatNode(newStmt)
+			if multiStmt {
+				fmtCtx.WriteString(";")
+			}
+		}
+	case catpb.Function_PLPGSQL:
+		var stmts plpgsqltree.Statement
+		plstmt, err := plpgsql.Parse(queries)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to parse query string")
+		}
+		stmts = plstmt.AST
+
+		v := utils.SQLStmtVisitor{Fn: replaceFunc}
+		newStmt := plpgsqltree.Walk(&v, stmts)
+		// Some PLpgSQL statements (i.e., declarations), may contain type
+		// annotations containing the UDT. We need to walk the AST to replace them,
+		// too.
+		v2 := utils.TypeRefVisitor{Fn: replaceTypeFunc}
+		newStmt = plpgsqltree.Walk(&v2, newStmt)
+		fmtCtx.FormatNode(newStmt)
 	}
 
-	newStmt, err := tree.SimpleStmtVisit(stmt.AST, replaceFunc)
-	if err != nil {
-		return "", err
-	}
-	return newStmt.String(), nil
+	return fmtCtx.CloseAndGetString(), nil
 }
 
 // replaceViewDesc modifies and returns the input view descriptor changed
@@ -498,24 +689,36 @@ func (p *planner) replaceViewDesc(
 	toReplace.ViewQuery = n.viewQuery
 
 	if sc != nil {
-		updatedQuery, err := replaceSeqNamesWithIDs(ctx, sc, n.viewQuery)
+		updatedQuery, err := replaceSeqNamesWithIDs(ctx, sc, n.viewQuery, false /* multiStmt */)
 		if err != nil {
 			return nil, err
 		}
 		toReplace.ViewQuery = updatedQuery
 	}
 
+	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, p.SemaCtx(), toReplace.ViewQuery,
+		false /* multiStmt */, "view queries")
+	if err != nil {
+		return nil, err
+	}
+	toReplace.ViewQuery = typeReplacedQuery
+
+	// Check that the new view has at least as many columns as the old view before
+	// adding result columns.
+	if len(n.columns) < len(toReplace.ClusterVersion().Columns) {
+		return nil, pgerror.Newf(pgcode.InvalidTableDefinition, "cannot drop columns from view")
+	}
 	// Reset the columns to add the new result columns onto.
 	toReplace.Columns = make([]descpb.ColumnDescriptor, 0, len(n.columns))
 	toReplace.NextColumnID = 0
-	if err := addResultColumns(ctx, &p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
+	if err := addResultColumns(ctx, &p.semaCtx, p.EvalContext(), p.EvalContext().Settings, toReplace, n.columns); err != nil {
 		return nil, err
 	}
 
-	// Compare toReplace against its ClusterVersion to verify if
+	// Compare toReplace against its clusterVersion to verify if
 	// its new set of columns is valid for a replacement view.
 	if err := verifyReplacingViewColumns(
-		toReplace.ClusterVersion.Columns,
+		toReplace.ClusterVersion().Columns,
 		toReplace.Columns,
 	); err != nil {
 		return nil, err
@@ -526,7 +729,7 @@ func (p *planner) replaceViewDesc(
 		desc, ok := backRefMutables[id]
 		if !ok {
 			var err error
-			desc, err = p.Descriptors().GetMutableTableVersionByID(ctx, id, p.txn)
+			desc, err = p.Descriptors().MutableByID(p.txn).Table(ctx, id)
 			if err != nil {
 				return nil, err
 			}
@@ -541,7 +744,7 @@ func (p *planner) replaceViewDesc(
 				ctx,
 				desc,
 				descpb.InvalidMutationID,
-				fmt.Sprintf("removing view reference for %q from %s(%d)", n.viewName,
+				fmt.Sprintf("removing view reference for %q from %s(%d)", &n.createView.Name,
 					desc.Name, desc.ID,
 				),
 			); err != nil {
@@ -577,7 +780,7 @@ func (p *planner) replaceViewDesc(
 	// Since we are replacing an existing view here, we need to write the new
 	// descriptor into place.
 	if err := p.writeSchemaChange(ctx, toReplace, descpb.InvalidMutationID,
-		fmt.Sprintf("CREATE OR REPLACE VIEW %q AS %q", n.viewName, n.viewQuery),
+		fmt.Sprintf("CREATE OR REPLACE VIEW %q AS %q", &n.createView.Name, n.viewQuery),
 	); err != nil {
 		return nil, err
 	}
@@ -589,24 +792,30 @@ func (p *planner) replaceViewDesc(
 func addResultColumns(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
+	st *cluster.Settings,
 	desc *tabledesc.Mutable,
 	resultColumns colinfo.ResultColumns,
 ) error {
 	for _, colRes := range resultColumns {
-		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
+		colTyp := colRes.Typ
+		if colTyp.Family() == types.UnknownFamily {
+			colTyp = types.String
+		}
+		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colTyp}
 		// Nullability constraints do not need to exist on the view, since they are
 		// already enforced on the source data.
 		columnTableDef.Nullable.Nullability = tree.SilentNull
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
-		cdd, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
+		cdd, err := tabledesc.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx, tree.ColumnDefaultExprInNewView)
 		if err != nil {
 			return err
 		}
 		desc.AddColumn(cdd.ColumnDescriptor)
 	}
-	if err := desc.AllocateIDs(ctx); err != nil {
+	version := st.Version.ActiveVersionOrEmpty(ctx)
+	if err := desc.AllocateIDs(ctx, version); err != nil {
 		return err
 	}
 	return nil

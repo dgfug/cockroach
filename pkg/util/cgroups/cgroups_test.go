@@ -1,17 +1,11 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cgroups
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,6 +63,15 @@ func TestCgroupsGetMemoryUsage(t *testing.T) {
 			value: 276328448,
 		},
 		{
+			name: "fetches the usage for cgroup v1 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":                           v1CgroupWithMemoryController,
+				"/proc/self/mountinfo":                        mixedMounts,
+				"/sys/fs/cgroup/memory/memory.usage_in_bytes": v1MemoryUsageInBytes,
+			},
+			value: 276328448,
+		},
+		{
 			name: "fetches the value for cgroup v1 when the NS relative paths of mount and cgroup don't match",
 			paths: map[string]string{
 				"/proc/self/cgroup":    v1CgroupWithMemoryControllerNS,
@@ -103,10 +106,18 @@ func TestCgroupsGetMemoryUsage(t *testing.T) {
 			},
 			value: 276328448,
 		},
+		{
+			name: "fetches the usage for cgroup v2 (mixed version mounts))",
+			paths: map[string]string{
+				"/proc/self/cgroup":    v2CgroupWithMemoryController,
+				"/proc/self/mountinfo": mixedMounts,
+				"/sys/fs/cgroup/machine.slice/libpod-f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810.scope/memory.current": "276328448",
+			},
+			value: 276328448,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := createFiles(t, tc.paths)
-			defer func() { _ = os.RemoveAll(dir) }()
 
 			limit, warn, err := getCgroupMemUsage(dir)
 			require.True(t, testutils.IsError(err, tc.errMsg),
@@ -166,6 +177,15 @@ func TestCgroupsGetMemoryInactiveFileUsage(t *testing.T) {
 			value: 1363746816,
 		},
 		{
+			name: "fetches the usage for cgroup v1 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":                 v1CgroupWithMemoryController,
+				"/proc/self/mountinfo":              mixedMounts,
+				"/sys/fs/cgroup/memory/memory.stat": v1MemoryStat,
+			},
+			value: 1363746816,
+		},
+		{
 			name: "fetches the value for cgroup v1 when the NS relative paths of mount and cgroup don't match",
 			paths: map[string]string{
 				"/proc/self/cgroup":                             v1CgroupWithMemoryControllerNS,
@@ -200,10 +220,18 @@ func TestCgroupsGetMemoryInactiveFileUsage(t *testing.T) {
 			},
 			value: 1363746816,
 		},
+		{
+			name: "fetches the usage for cgroup v2 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":    v2CgroupWithMemoryController,
+				"/proc/self/mountinfo": mixedMounts,
+				"/sys/fs/cgroup/machine.slice/libpod-f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810.scope/memory.stat": v2MemoryStat,
+			},
+			value: 1363746816,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := createFiles(t, tc.paths)
-			defer func() { _ = os.RemoveAll(dir) }()
 			limit, warn, err := getCgroupMemInactiveFileUsage(dir)
 			require.True(t, testutils.IsError(err, tc.errMsg),
 				"%v %v", err, tc.errMsg)
@@ -260,6 +288,15 @@ func TestCgroupsGetMemoryLimit(t *testing.T) {
 			limit: 2936016896,
 		},
 		{
+			name: "fetches the limit for cgroup v1 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":                 v1CgroupWithMemoryController,
+				"/proc/self/mountinfo":              mixedMounts,
+				"/sys/fs/cgroup/memory/memory.stat": v1MemoryStat,
+			},
+			limit: 2936016896,
+		},
+		{
 			name: "fetches the limit for cgroup v1 when the NS relative paths of mount and cgroup don't match",
 			paths: map[string]string{
 				"/proc/self/cgroup":                             v1CgroupWithMemoryControllerNS,
@@ -295,6 +332,15 @@ func TestCgroupsGetMemoryLimit(t *testing.T) {
 			limit: 1073741824,
 		},
 		{
+			name: "fetches the limit for cgroup v2 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":    v2CgroupWithMemoryController,
+				"/proc/self/mountinfo": mixedMounts,
+				"/sys/fs/cgroup/machine.slice/libpod-f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810.scope/memory.max": "1073741824\n",
+			},
+			limit: 1073741824,
+		},
+		{
 			name: "recognizes `max` as the limit for cgroup v2",
 			paths: map[string]string{
 				"/proc/self/cgroup":    v2CgroupWithMemoryController,
@@ -306,7 +352,6 @@ func TestCgroupsGetMemoryLimit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := createFiles(t, tc.paths)
-			defer func() { _ = os.RemoveAll(dir) }()
 
 			limit, warn, err := getCgroupMemLimit(dir)
 			require.True(t, testutils.IsError(err, tc.errMsg),
@@ -359,6 +404,21 @@ func TestCgroupsGetCPU(t *testing.T) {
 			paths: map[string]string{
 				"/proc/self/cgroup":                             v1CgroupWithCPUController,
 				"/proc/self/mountinfo":                          v1MountsWithCPUController,
+				"/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us":   "12345",
+				"/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us":  "67890",
+				"/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage_sys":  "123",
+				"/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage_user": "456",
+			},
+			quota:  int64(12345),
+			period: int64(67890),
+			system: uint64(123),
+			user:   uint64(456),
+		},
+		{
+			name: "fetches the cpu quota and usage for cgroup v1 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":                             v1CgroupWithCPUController,
+				"/proc/self/mountinfo":                          mixedMounts,
 				"/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us":   "12345",
 				"/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us":  "67890",
 				"/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage_sys":  "123",
@@ -465,6 +525,19 @@ func TestCgroupsGetCPU(t *testing.T) {
 			system: uint64(200),
 		},
 		{
+			name: "fetches the cpu quota and usage for cgroup v2 (mixed version mounts)",
+			paths: map[string]string{
+				"/proc/self/cgroup":    v2CgroupWithMemoryController,
+				"/proc/self/mountinfo": mixedMounts,
+				"/sys/fs/cgroup/machine.slice/libpod-f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810.scope/cpu.max":  "100 1000\n",
+				"/sys/fs/cgroup/machine.slice/libpod-f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810.scope/cpu.stat": "user_usec 100\nsystem_usec 200",
+			},
+			quota:  int64(100),
+			period: int64(1000),
+			user:   uint64(100),
+			system: uint64(200),
+		},
+		{
 			name: "recognizes `max` as the cpu quota for cgroup v2",
 			paths: map[string]string{
 				"/proc/self/cgroup":    v2CgroupWithMemoryController,
@@ -491,7 +564,6 @@ func TestCgroupsGetCPU(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := createFiles(t, tc.paths)
-			defer func() { _ = os.RemoveAll(dir) }()
 
 			cpuusage, err := getCgroupCPU(dir)
 			require.True(t, testutils.IsError(err, tc.errMsg),
@@ -505,13 +577,12 @@ func TestCgroupsGetCPU(t *testing.T) {
 }
 
 func createFiles(t *testing.T, paths map[string]string) (dir string) {
-	dir, err := ioutil.TempDir("", "")
-	require.NoError(t, err)
+	dir = t.TempDir()
 
 	for path, data := range paths {
 		path = filepath.Join(dir, path)
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
-		require.NoError(t, ioutil.WriteFile(path, []byte(data), 0755))
+		require.NoError(t, os.WriteFile(path, []byte(data), 0755))
 	}
 	return dir
 }
@@ -745,6 +816,39 @@ const (
 389 372 0:42 / /proc/scsi ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
 390 374 0:43 / /sys/firmware ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
 391 374 0:44 / /sys/fs/selinux ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
+392 372 0:37 /bus /proc/bus ro,relatime - proc proc rw
+393 372 0:37 /fs /proc/fs ro,relatime - proc proc rw
+394 372 0:37 /irq /proc/irq ro,relatime - proc proc rw
+395 372 0:37 /sys /proc/sys ro,relatime - proc proc rw
+396 372 0:37 /sysrq-trigger /proc/sysrq-trigger ro,relatime - proc proc rw
+345 373 0:40 /0 /dev/console rw,nosuid,noexec,relatime - devpts devpts rw,context="system_u:object_r:container_file_t:s0:c200,c321",gid=5,mode=620,ptmxmode=666
+`
+	// mixes v1 and v2 mounts
+	mixedMounts = `371 344 0:35 / / rw,relatime - overlay overlay rw,context="system_u:object_r:container_file_t:s0:c200,c321",lowerdir=/var/lib/containers/storage/overlay/l/SPNDOAU3AZNJMNKU3F5THCA36R,upperdir=/var/lib/containers/storage/overlay/7dcd88f815bded7b833fb5dc0f25de897250bcfa828624c0d78393689d0bc312/diff,workdir=/var/lib/containers/storage/overlay/7dcd88f815bded7b833fb5dc0f25de897250bcfa828624c0d78393689d0bc312/work
+372 371 0:37 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+373 371 0:38 / /dev rw,nosuid - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=65536k,mode=755
+374 371 0:39 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+375 373 0:40 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,context="system_u:object_r:container_file_t:s0:c200,c321",gid=5,mode=620,ptmxmode=666
+376 373 0:36 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw,seclabel
+377 371 0:24 /containers/storage/overlay-containers/f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810/userdata/hostname /etc/hostname rw,nosuid,nodev - tmpfs tmpfs rw,seclabel,mode=755
+378 371 0:24 /containers/storage/overlay-containers/f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810/userdata/.containerenv /run/.containerenv rw,nosuid,nodev - tmpfs tmpfs rw,seclabel,mode=755
+379 371 0:24 /containers/storage/overlay-containers/f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810/userdata/run/secrets /run/secrets rw,nosuid,nodev - tmpfs tmpfs rw,seclabel,mode=755
+380 371 0:24 /containers/storage/overlay-containers/f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810/userdata/resolv.conf /etc/resolv.conf rw,nosuid,nodev - tmpfs tmpfs rw,seclabel,mode=755
+381 371 0:24 /containers/storage/overlay-containers/f1c6b44c0d61f273952b8daecf154cee1be2d503b7e9184ebf7fcaf48e139810/userdata/hosts /etc/hosts rw,nosuid,nodev - tmpfs tmpfs rw,seclabel,mode=755
+382 373 0:33 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=64000k
+383 374 0:25 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel
+384 372 0:41 / /proc/acpi ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
+385 372 0:6 /null /proc/kcore rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=1869464k,nr_inodes=467366,mode=755
+386 372 0:6 /null /proc/keys rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=1869464k,nr_inodes=467366,mode=755
+387 372 0:6 /null /proc/timer_list rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=1869464k,nr_inodes=467366,mode=755
+388 372 0:6 /null /proc/sched_debug rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=1869464k,nr_inodes=467366,mode=755
+389 372 0:42 / /proc/scsi ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
+390 374 0:43 / /sys/firmware ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
+391 374 0:44 / /sys/fs/selinux ro,relatime - tmpfs tmpfs rw,context="system_u:object_r:container_file_t:s0:c200,c321",size=0k
+41 33 0:36 /kubepods/besteffort/pod1bf924dd-3f6f-11ea-983d-0abc95f90166/c17eb535a47774285717e40bbda777ee72e81471272a5b8ebffd51fdf7f624e3 /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:18 - cgroup cgroup rw,pids
+46 33 0:41 /kubepods/besteffort/pod1bf924dd-3f6f-11ea-983d-0abc95f90166/c17eb535a47774285717e40bbda777ee72e81471272a5b8ebffd51fdf7f624e3 /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:23 - cgroup cgroup rw,cpuset
+49 33 0:44 /kubepods/besteffort/pod1bf924dd-3f6f-11ea-983d-0abc95f90166/c17eb535a47774285717e40bbda777ee72e81471272a5b8ebffd51fdf7f624e3 /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:26 - cgroup cgroup rw,cpu,cpuacct
+50 33 0:45 /kubepods/besteffort/pod1bf924dd-3f6f-11ea-983d-0abc95f90166/c17eb535a47774285717e40bbda777ee72e81471272a5b8ebffd51fdf7f624e3 /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:27 - cgroup cgroup rw,memory
 392 372 0:37 /bus /proc/bus ro,relatime - proc proc rw
 393 372 0:37 /fs /proc/fs ro,relatime - proc proc rw
 394 372 0:37 /irq /proc/irq ro,relatime - proc proc rw

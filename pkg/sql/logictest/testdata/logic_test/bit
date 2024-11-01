@@ -16,14 +16,13 @@ SHOW CREATE TABLE bits
 ----
 table_name  create_statement
 bits        CREATE TABLE public.bits (
-            a BIT NULL,
-            b BIT(4) NULL,
-            c VARBIT NULL,
-            d VARBIT(4) NULL,
-            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-            CONSTRAINT bits_pkey PRIMARY KEY (rowid ASC),
-            FAMILY "primary" (a, b, c, d, rowid)
-)
+              a BIT NULL,
+              b BIT(4) NULL,
+              c VARBIT NULL,
+              d VARBIT(4) NULL,
+              rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+              CONSTRAINT bits_pkey PRIMARY KEY (rowid ASC)
+            )
 
 subtest bit_fixed1
 
@@ -267,10 +266,9 @@ query T
 SELECT create_statement FROM [SHOW CREATE obitsa]
 ----
 CREATE TABLE public.obitsa (
-   x VARBIT(20)[] NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   CONSTRAINT obitsa_pkey PRIMARY KEY (rowid ASC),
-   FAMILY "primary" (x, rowid)
+  x VARBIT(20)[] NULL,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT obitsa_pkey PRIMARY KEY (rowid ASC)
 )
 
 # Check unindexed ordering.
@@ -318,3 +316,13 @@ query TT
 SELECT 'xAb'::STRING::BIT(8), 'XaB'::STRING::BIT(8)
 ----
 10101011 10101011
+
+query TT
+SELECT BIT(4) '1101', BIT(1) '1010'
+----
+1101  1
+
+query TT
+SELECT VARBIT(4) '1101', VARBIT(2) '1001'
+----
+1101  10

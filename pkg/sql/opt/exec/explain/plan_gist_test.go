@@ -1,16 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package explain_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -20,6 +16,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
 )
 
@@ -41,13 +40,13 @@ func makeGist(ot *opttester.OptTester, t *testing.T) explain.PlanGist {
 }
 
 func explainGist(gist string, catalog cat.Catalog) string {
-	flags := explain.Flags{HideValues: true, Redact: explain.RedactAll}
+	flags := explain.Flags{HideValues: true, Deflake: explain.DeflakeAll}
 	ob := explain.NewOutputBuilder(flags)
 	explainPlan, err := explain.DecodePlanGistToPlan(gist, catalog)
 	if err != nil {
 		panic(err)
 	}
-	err = explain.Emit(explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
+	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
 	if err != nil {
 		panic(err)
 	}
@@ -55,7 +54,7 @@ func explainGist(gist string, catalog cat.Catalog) string {
 }
 
 func plan(ot *opttester.OptTester, t *testing.T) string {
-	f := explain.NewFactory(exec.StubFactory{})
+	f := explain.NewFactory(exec.StubFactory{}, &tree.SemaContext{}, &eval.Context{})
 	expr, err := ot.Optimize()
 	if err != nil {
 		t.Error(err)
@@ -69,14 +68,14 @@ func plan(ot *opttester.OptTester, t *testing.T) string {
 	}
 	explainPlan, err := ot.ExecBuild(f, mem, expr)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	if explainPlan == nil {
-		t.Error("Couldn't ExecBuild memo, use a logictest instead?")
+		t.Fatal("Couldn't ExecBuild memo, use a logictest instead?")
 	}
-	flags := explain.Flags{HideValues: true, Redact: explain.RedactAll}
+	flags := explain.Flags{HideValues: true, Deflake: explain.DeflakeAll, OnlyShape: true}
 	ob := explain.NewOutputBuilder(flags)
-	err = explain.Emit(explainPlan.(*explain.Plan), ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
+	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan.(*explain.Plan), ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
 	if err != nil {
 		t.Error(err)
 	}
@@ -116,8 +115,10 @@ func TestPlanGistBuilder(t *testing.T) {
 		}
 	}
 	// RFC: should I move this to opt_tester?
-	datadriven.RunTest(t, "testdata/gists", testGists)
-	datadriven.RunTest(t, "testdata/gists_tpce", testGists)
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "gists"), testGists)
+	// Reset the catalog for the next test.
+	catalog = testcat.New()
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "gists_tpce"), testGists)
 }
 
 func TestPlanGistHashEquivalency(t *testing.T) {

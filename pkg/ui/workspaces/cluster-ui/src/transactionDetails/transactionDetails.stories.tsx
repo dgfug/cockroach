@@ -1,21 +1,27 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { storiesOf } from "@storybook/react";
+import noop from "lodash/noop";
+import moment from "moment-timezone";
+import React from "react";
 import { MemoryRouter } from "react-router-dom";
-import { transactionDetails } from "./transactionDetails.fixture";
+
+import {
+  nodeRegions,
+  requestTime,
+  routeProps,
+  timeScale,
+  transactionDetailsData,
+  transactionFingerprintId,
+} from "./transactionDetails.fixture";
 
 import { TransactionDetails } from ".";
 
-const { data, nodeRegions, error } = transactionDetails;
+import StatsSortOptions = cockroach.server.serverpb.StatsSortOptions;
 
 storiesOf("Transactions Details", module)
   .addDecorator(storyFn => <MemoryRouter>{storyFn()}</MemoryRouter>)
@@ -24,37 +30,111 @@ storiesOf("Transactions Details", module)
   ))
   .add("with data", () => (
     <TransactionDetails
-      transactionText={data.statements
-        .map(s => s.key.key_data.query)
-        .join("\n")}
-      statements={data.statements as any}
+      {...routeProps}
+      timeScale={timeScale}
+      transactionFingerprintId={transactionFingerprintId.toString()}
       nodeRegions={nodeRegions}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
       isTenant={false}
+      hasViewActivityRedactedRole={false}
+      transactionInsights={undefined}
+      refreshData={noop}
+      refreshUserSQLRoles={noop}
+      onTimeScaleChange={noop}
+      refreshNodes={noop}
+      refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={requestTime}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
   ))
   .add("with loading indicator", () => (
     <TransactionDetails
-      transactionText={""}
-      statements={undefined}
+      {...routeProps}
+      timeScale={timeScale}
+      transactionFingerprintId={transactionFingerprintId.toString()}
       nodeRegions={nodeRegions}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
       isTenant={false}
+      hasViewActivityRedactedRole={false}
+      transactionInsights={undefined}
+      refreshData={noop}
+      refreshUserSQLRoles={noop}
+      onTimeScaleChange={noop}
+      refreshNodes={noop}
+      refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={requestTime}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
   ))
   .add("with error alert", () => (
     <TransactionDetails
-      transactionText={""}
-      statements={undefined}
+      {...routeProps}
+      timeScale={timeScale}
+      transactionFingerprintId={undefined}
       nodeRegions={nodeRegions}
-      error={error}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
       isTenant={false}
+      hasViewActivityRedactedRole={false}
+      transactionInsights={undefined}
+      refreshData={noop}
+      refreshUserSQLRoles={noop}
+      onTimeScaleChange={noop}
+      refreshNodes={noop}
+      refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={moment()}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
-  ));
+  ))
+  .add("No data for this time frame; no cached transaction text", () => {
+    return (
+      <TransactionDetails
+        {...routeProps}
+        timeScale={timeScale}
+        transactionFingerprintId={transactionFingerprintId.toString()}
+        nodeRegions={nodeRegions}
+        isTenant={false}
+        hasViewActivityRedactedRole={false}
+        transactionInsights={undefined}
+        refreshData={noop}
+        refreshUserSQLRoles={noop}
+        onTimeScaleChange={noop}
+        refreshNodes={noop}
+        refreshTransactionInsights={noop}
+        limit={100}
+        reqSortSetting={StatsSortOptions.SERVICE_LAT}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        txnStatsResp={{
+          lastUpdated: moment(),
+          error: null,
+          inFlight: false,
+          valid: true,
+          data: transactionDetailsData,
+        }}
+      />
+    );
+  });

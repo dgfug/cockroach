@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantrate
 
@@ -22,18 +17,21 @@ type systemLimiter struct {
 	tenantMetrics
 }
 
-func (s systemLimiter) Wait(ctx context.Context, reqInfo tenantcostmodel.RequestInfo) error {
-	if isWrite, writeBytes := reqInfo.IsWrite(); isWrite {
-		s.writeRequestsAdmitted.Inc(1)
-		s.writeBytesAdmitted.Inc(writeBytes)
-	} else {
-		s.readRequestsAdmitted.Inc(1)
+func (s systemLimiter) Wait(ctx context.Context, reqInfo tenantcostmodel.BatchInfo) error {
+	if reqInfo.WriteCount > 0 {
+		s.writeBatchesAdmitted.Inc(1)
+		s.writeRequestsAdmitted.Inc(reqInfo.WriteCount)
+		s.writeBytesAdmitted.Inc(reqInfo.WriteBytes)
 	}
 	return nil
 }
 
-func (s systemLimiter) RecordRead(ctx context.Context, respInfo tenantcostmodel.ResponseInfo) {
-	s.readBytesAdmitted.Inc(respInfo.ReadBytes())
+func (s systemLimiter) RecordRead(ctx context.Context, respInfo tenantcostmodel.BatchInfo) {
+	if respInfo.ReadCount > 0 {
+		s.readBatchesAdmitted.Inc(1)
+		s.readRequestsAdmitted.Inc(respInfo.ReadCount)
+		s.readBytesAdmitted.Inc(respInfo.ReadBytes)
+	}
 }
 
 var _ Limiter = (*systemLimiter)(nil)

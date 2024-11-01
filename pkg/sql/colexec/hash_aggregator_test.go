@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -18,7 +13,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -27,12 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -413,12 +408,13 @@ func TestHashAggregator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
+	rng, _ := randutil.NewTestRand()
 	for _, tc := range hashAggregatorTestCases {
 		log.Infof(context.Background(), "%s", tc.name)
 		constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-			&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+			context.Background(), &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 		)
 		require.NoError(t, err)
 		var typs [][]*types.T
@@ -431,9 +427,8 @@ func TestHashAggregator(t *testing.T) {
 		}
 		colexectestutils.RunTestsWithOrderedCols(t, testAllocator, []colexectestutils.Tuples{tc.input}, typs, tc.expected, verifier, tc.orderedCols,
 			func(sources []colexecop.Operator) (colexecop.Operator, error) {
-				return NewHashAggregator(&colexecagg.NewAggregatorArgs{
+				args := &colexecagg.NewAggregatorArgs{
 					Allocator:      testAllocator,
-					MemAccount:     testMemAcc,
 					Input:          sources[0],
 					InputTypes:     tc.typs,
 					Spec:           tc.spec,
@@ -441,10 +436,17 @@ func TestHashAggregator(t *testing.T) {
 					Constructors:   constructors,
 					ConstArguments: constArguments,
 					OutputTypes:    outputTypes,
-				},
+				}
+				args.TestingKnobs.HashTableNumBuckets = uint32(1 + rng.Intn(7))
+				return NewHashAggregator(
+					context.Background(),
+					&colexecagg.NewHashAggregatorArgs{
+						NewAggregatorArgs:        args,
+						HashTableAllocator:       testAllocator,
+						OutputUnlimitedAllocator: testAllocator,
+						MaxOutputBatchMemSize:    math.MaxInt64,
+					},
 					nil, /* newSpillingQueueArgs */
-					testAllocator,
-					math.MaxInt64,
 				), nil
 			})
 	}
@@ -455,15 +457,12 @@ func BenchmarkHashAggregatorInputTuplesTracking(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
-	aggFn := execinfrapb.Min
 	numRows := []int{1, 32, coldata.BatchSize(), 32 * coldata.BatchSize(), 1024 * coldata.BatchSize()}
 	groupSizes := []int{1, 2, 32, 128, coldata.BatchSize()}
 	if testing.Short() {
@@ -471,28 +470,51 @@ func BenchmarkHashAggregatorInputTuplesTracking(b *testing.B) {
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
 	var memAccounts []*mon.BoundAccount
+	// We choose any_not_null aggregate function because it is the simplest
+	// possible and, thus, its Compute function call will have the least
+	// impact when benchmarking the aggregator logic.
+	aggFn := execinfrapb.AnyNotNull
 	for _, numInputRows := range numRows {
 		for _, groupSize := range groupSizes {
 			for _, agg := range []aggType{
 				{
-					new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-						return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
+					new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+						return NewHashAggregator(
+							ctx,
+							&colexecagg.NewHashAggregatorArgs{
+								NewAggregatorArgs:        args,
+								HashTableAllocator:       testAllocator,
+								OutputUnlimitedAllocator: testAllocator,
+								MaxOutputBatchMemSize:    math.MaxInt64,
+							},
+							nil, /* newSpillingQueueArgs */
+						)
 					},
 					name:  "tracking=false",
 					order: unordered,
 				},
 				{
-					new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+					new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 						spillingQueueMemAcc := testMemMonitor.MakeBoundAccount()
 						memAccounts = append(memAccounts, &spillingQueueMemAcc)
-						return NewHashAggregator(args, &colexecutils.NewSpillingQueueArgs{
-							UnlimitedAllocator: colmem.NewAllocator(ctx, &spillingQueueMemAcc, testColumnFactory),
-							Types:              args.InputTypes,
-							MemoryLimit:        execinfra.DefaultMemoryLimit,
-							DiskQueueCfg:       queueCfg,
-							FDSemaphore:        &colexecop.TestingSemaphore{},
-							DiskAcc:            testDiskAcc,
-						}, testAllocator, math.MaxInt64)
+						return NewHashAggregator(
+							ctx,
+							&colexecagg.NewHashAggregatorArgs{
+								NewAggregatorArgs:        args,
+								HashTableAllocator:       testAllocator,
+								OutputUnlimitedAllocator: testAllocator,
+								MaxOutputBatchMemSize:    math.MaxInt64,
+							},
+							&colexecutils.NewSpillingQueueArgs{
+								UnlimitedAllocator: colmem.NewAllocator(ctx, &spillingQueueMemAcc, testColumnFactory),
+								Types:              args.InputTypes,
+								MemoryLimit:        execinfra.DefaultMemoryLimit,
+								DiskQueueCfg:       queueCfg,
+								FDSemaphore:        &colexecop.TestingSemaphore{},
+								DiskAcc:            testDiskAcc,
+								DiskQueueMemAcc:    testMemAcc,
+							},
+						)
 					},
 					name:  "tracking=true",
 					order: unordered,
@@ -500,7 +522,9 @@ func BenchmarkHashAggregatorInputTuplesTracking(b *testing.B) {
 			} {
 				benchmarkAggregateFunction(
 					b, agg, aggFn, []*types.T{types.Int}, 1 /* numGroupCol */, groupSize,
-					0 /* distinctProb */, numInputRows, 0 /* chunkSize */, 0 /* limit */)
+					0 /* distinctProb */, numInputRows, 0, /* chunkSize */
+					0 /* limit */, 0, /* numSameAggs */
+				)
 			}
 		}
 	}
@@ -518,15 +542,12 @@ func BenchmarkHashAggregatorPartialOrder(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
-	queueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
-	queueCfg.SetDefaultBufferSizeBytesForCacheMode()
 
-	aggFn := execinfrapb.Min
 	numRows := []int{1, 32, coldata.BatchSize(), 32 * coldata.BatchSize(), 1024 * coldata.BatchSize()}
 	// chunkSizes is the number of distinct values in the ordered group column.
 	chunkSizes := []int{1, 32, coldata.BatchSize() + 1}
@@ -539,18 +560,32 @@ func BenchmarkHashAggregatorPartialOrder(b *testing.B) {
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
 	var memAccounts []*mon.BoundAccount
-	f := func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+	f := func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
 		spillingQueueMemAcc := testMemMonitor.MakeBoundAccount()
 		memAccounts = append(memAccounts, &spillingQueueMemAcc)
-		return NewHashAggregator(args, &colexecutils.NewSpillingQueueArgs{
-			UnlimitedAllocator: colmem.NewAllocator(ctx, &spillingQueueMemAcc, testColumnFactory),
-			Types:              args.InputTypes,
-			MemoryLimit:        execinfra.DefaultMemoryLimit,
-			DiskQueueCfg:       queueCfg,
-			FDSemaphore:        &colexecop.TestingSemaphore{},
-			DiskAcc:            testDiskAcc,
-		}, testAllocator, math.MaxInt64)
+		return NewHashAggregator(
+			ctx,
+			&colexecagg.NewHashAggregatorArgs{
+				NewAggregatorArgs:        args,
+				HashTableAllocator:       testAllocator,
+				OutputUnlimitedAllocator: testAllocator,
+				MaxOutputBatchMemSize:    math.MaxInt64,
+			},
+			&colexecutils.NewSpillingQueueArgs{
+				UnlimitedAllocator: colmem.NewAllocator(ctx, &spillingQueueMemAcc, testColumnFactory),
+				Types:              args.InputTypes,
+				MemoryLimit:        execinfra.DefaultMemoryLimit,
+				DiskQueueCfg:       queueCfg,
+				FDSemaphore:        &colexecop.TestingSemaphore{},
+				DiskAcc:            testDiskAcc,
+				DiskQueueMemAcc:    testMemAcc,
+			},
+		)
 	}
+	// We choose any_not_null aggregate function because it is the simplest
+	// possible and, thus, its Compute function call will have the least impact
+	// when benchmarking the aggregator logic.
+	aggFn := execinfrapb.AnyNotNull
 	for _, numInputRows := range numRows {
 		for _, limit := range limits {
 			if limit > numInputRows {
@@ -578,7 +613,10 @@ func BenchmarkHashAggregatorPartialOrder(b *testing.B) {
 							// so we can skip all but one case.
 							continue
 						}
-						benchmarkAggregateFunction(b, agg, aggFn, []*types.T{types.Int}, 2, groupSize, 0, numInputRows, chunkSize, limit)
+						benchmarkAggregateFunction(
+							b, agg, aggFn, []*types.T{types.Int}, 2 /* numGroupCol */, groupSize,
+							0 /* distinctProb */, numInputRows, chunkSize, limit, 0, /* numSameAggs */
+						)
 					}
 				}
 			}

@@ -80,12 +80,12 @@
             (CanMapJoinOpFilter
                 $item
                 $leftCols:(OutputCols $left)
-                $equivFD:(GetEquivFD $on $left $right)
+                $equivSet:(GetEquivSet $on $left $right)
             ) &
             (CanMapJoinOpFilter
                 $item
                 $rightCols:(OutputCols $right)
-                $equivFD
+                $equivSet
             )
         ...
     ]
@@ -97,7 +97,7 @@
         $left
         [
             (FiltersItem
-                (MapJoinOpFilter $item $leftCols $equivFD)
+                (MapJoinOpFilter $item $leftCols $equivSet)
             )
         ]
     )
@@ -105,7 +105,7 @@
         $right
         [
             (FiltersItem
-                (MapJoinOpFilter $item $rightCols $equivFD)
+                (MapJoinOpFilter $item $rightCols $equivSet)
             )
         ]
     )
@@ -140,7 +140,7 @@
             (CanMapJoinOpFilter
                 $item
                 $leftCols
-                $equivFD:(GetEquivFD $on $left $right)
+                $equivSet:(GetEquivSet $on $left $right)
             )
         ...
     ]
@@ -153,7 +153,7 @@
     (ReplaceFiltersItem
         $on
         $item
-        (MapJoinOpFilter $item $leftCols $equivFD)
+        (MapJoinOpFilter $item $leftCols $equivSet)
     )
     $private
 )
@@ -174,7 +174,7 @@
             (CanMapJoinOpFilter
                 $item
                 $rightCols
-                $equivFD:(GetEquivFD $on $left $right)
+                $equivSet:(GetEquivSet $on $left $right)
             )
         ...
     ]
@@ -187,7 +187,7 @@
     (ReplaceFiltersItem
         $on
         $item
-        (MapJoinOpFilter $item $rightCols $equivFD)
+        (MapJoinOpFilter $item $rightCols $equivSet)
     )
     $private
 )
@@ -501,10 +501,11 @@ $left
     $private
 )
 
-# ExtractJoinEqualities finds equality conditions such that one side only
-# depends on left columns and the other only on right columns and pushes the
-# expressions down into Project operators. The result is a join that has an
-# equality constraint, which is much more efficient. For example:
+# ExtractJoinComparisons finds equality and inequality conditions such that
+# one side only depends on left columns and the other only on right columns
+# and pushes the expressions down into Project operators. The result is a
+# join that has an equality or inequality constraint, which is much more
+# efficient. For example:
 #
 #   SELECT * FROM abc JOIN xyz ON a=x+1
 #
@@ -516,15 +517,18 @@ $left
 # This join can use hash join or lookup on the equality columns.
 #
 # Depending on the expressions involved, one or both sides require a projection.
-[ExtractJoinEqualities, Normalize]
+[ExtractJoinComparisons, Normalize]
 (JoinNonApply
     $left:* & ^(HasOuterCols $left)
     $right:* & ^(HasOuterCols $right)
     $on:[
         ...
         $item:(FiltersItem
-            (Eq $a:^(ConstValue) $b:^(ConstValue)) &
-                (CanExtractJoinEquality
+            (Eq | Lt | Le | Gt | Ge
+                    $a:^(ConstValue)
+                    $b:^(ConstValue)
+                ) &
+                (CanExtractJoinComparison
                     $a
                     $b
                     (OutputCols $left)
@@ -536,7 +540,7 @@ $left
     $private:*
 )
 =>
-(ExtractJoinEquality (OpName) $left $right $on $item $private)
+(ExtractJoinComparison (OpName) $left $right $on $item $private)
 
 # SortFiltersInJoin ensures that any filters in an inner join are canonicalized
 # by sorting them.

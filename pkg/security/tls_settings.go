@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
@@ -15,12 +10,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 )
 
 const (
 	ocspOff    = 0
 	ocspLax    = 1
 	ocspStrict = 2
+
+	// OldCipherSuitesEnabledEnv is the environment variable used to reenable
+	// use of old cipher suites for backwards compatibility with applications
+	// that do not support any of the recommended cipher suites.
+	OldCipherSuitesEnabledEnv = "COCKROACH_TLS_ENABLE_OLD_CIPHER_SUITES"
 )
 
 // TLSSettings allows for customization of TLS behavior. It's called
@@ -31,22 +32,23 @@ type TLSSettings interface {
 	ocspEnabled() bool
 	ocspStrict() bool
 	ocspTimeout() time.Duration
+	oldCipherSuitesEnabled() bool
 }
 
-var ocspMode = settings.RegisterEnumSetting("security.ocsp.mode",
+var ocspMode = settings.RegisterEnumSetting(
+	settings.ApplicationLevel, "security.ocsp.mode",
 	"use OCSP to check whether TLS certificates are revoked. If the OCSP "+
 		"server is unreachable, in strict mode all certificates will be rejected "+
 		"and in lax mode all certificates will be accepted.",
-	"off", map[int64]string{ocspOff: "off", ocspLax: "lax", ocspStrict: "strict"}).WithPublic()
+	"off", map[int64]string{ocspOff: "off", ocspLax: "lax", ocspStrict: "strict"},
+	settings.WithPublic)
 
-// TODO(bdarnell): 3 seconds is the same as base.NetworkTimeout, but
-// we can't use it here due to import cycles. We need a real
-// no-dependencies base package for constants like this.
-var ocspTimeout = settings.RegisterDurationSetting("security.ocsp.timeout",
+var ocspTimeout = settings.RegisterDurationSetting(
+	settings.ApplicationLevel, "security.ocsp.timeout",
 	"timeout before considering the OCSP server unreachable",
 	3*time.Second,
 	settings.NonNegativeDuration,
-).WithPublic()
+	settings.WithPublic)
 
 type clusterTLSSettings struct {
 	settings *cluster.Settings
@@ -64,6 +66,10 @@ func (c clusterTLSSettings) ocspStrict() bool {
 
 func (c clusterTLSSettings) ocspTimeout() time.Duration {
 	return ocspTimeout.Get(&c.settings.SV)
+}
+
+func (c clusterTLSSettings) oldCipherSuitesEnabled() bool {
+	return areOldCipherSuitesEnabled()
 }
 
 // ClusterTLSSettings creates a TLSSettings backed by the
@@ -88,4 +94,15 @@ func (CommandTLSSettings) ocspStrict() bool {
 
 func (CommandTLSSettings) ocspTimeout() time.Duration {
 	return 0
+}
+
+func (c CommandTLSSettings) oldCipherSuitesEnabled() bool {
+	return areOldCipherSuitesEnabled()
+}
+
+// areOldCipherSuites returns true if CRDB should enable the use of
+// old, no longer recommended TLS cipher suites for the sake of
+// compatibility.
+func areOldCipherSuitesEnabled() bool {
+	return envutil.EnvOrDefaultBool(OldCipherSuitesEnabledEnv, false)
 }

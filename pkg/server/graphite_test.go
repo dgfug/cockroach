@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -27,6 +22,10 @@ import (
 // TestGraphite tests that a server pushes metrics data to Graphite endpoint,
 // if configured. In addition, it verifies that things don't fall apart when
 // the endpoint goes away.
+//
+// TODO(obs-inf): this test takes 2m because GraphiteExporter.Push times out after
+// 2m with a `write: broken pipe` error, even though it's using a DialTimeout. This
+// is a waste of time.
 func TestGraphite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloudinfo
 
@@ -14,7 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
@@ -44,7 +39,7 @@ func NewInstanceMetadataTestClient() *httputil.Client {
 			case awsMetadataEndpoint:
 				// Response taken from the AWS instance identity
 				// document internal endpoint on May 2 2019
-				res.Body = ioutil.NopCloser(bytes.NewBufferString(`{
+				res.Body = io.NopCloser(bytes.NewBufferString(`{
 					"devpayProductCodes" : null,
 					"marketplaceProductCodes" : null,
 					"version" : "2017-09-30",
@@ -64,19 +59,19 @@ func NewInstanceMetadataTestClient() *httputil.Client {
 			case (gcpMetadataEndpoint + "machine-type"):
 				// response taken from the GCP internal metadata
 				// endpoint on May 2 2019
-				res.Body = ioutil.NopCloser(bytes.NewBufferString(
+				res.Body = io.NopCloser(bytes.NewBufferString(
 					`projects/93358566124/machineTypes/g1-small`,
 				))
 			case (gcpMetadataEndpoint + "zone"):
 				// response taken from the GCP internal metadata
 				// endpoint on June 3 2019
-				res.Body = ioutil.NopCloser(bytes.NewBufferString(
+				res.Body = io.NopCloser(bytes.NewBufferString(
 					`projects/93358566124/zones/us-east4-c`,
 				))
 			case azureMetadataEndpoint:
 				// response taken from the Azure internal metadata
 				// endpoint on May 2 2019
-				res.Body = ioutil.NopCloser(bytes.NewBufferString(
+				res.Body = io.NopCloser(bytes.NewBufferString(
 					`{  
 						"compute":{  
 						"azEnvironment":"AzurePublicCloud",
@@ -139,7 +134,7 @@ func NewInstanceMetadataTestClient() *httputil.Client {
 					}`,
 				))
 			default:
-				res.Body = ioutil.NopCloser(bytes.NewBufferString(``))
+				res.Body = io.NopCloser(bytes.NewBufferString(``))
 			}
 
 			return res

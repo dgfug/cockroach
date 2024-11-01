@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -21,12 +16,13 @@ import (
 
 // populateTwoArgsOverloads creates all overload structs related to a single
 // binary, comparison, or cast operator. It takes in:
-// - base - the overload base that will be shared among all new overloads.
-// - opOutputTypes - mapping from a pair of types to the output type, it should
-//   contain an entry for all supported type pairs.
-// - overrideOverloadFuncs - a function that could update AssignFunc and/or
-//   CompareFunc fields of a newly created lastArgWidthOverload based on a
-//   typeCustomizer.
+//   - base - the overload base that will be shared among all new overloads.
+//   - opOutputTypes - mapping from a pair of types to the output type, it should
+//     contain an entry for all supported type pairs.
+//   - overrideOverloadFuncs - a function that could update AssignFunc and/or
+//     CompareFunc fields of a newly created lastArgWidthOverload based on a
+//     typeCustomizer.
+//
 // It returns all new overloads that have the same type (which will be empty
 // for cast operator).
 func populateTwoArgsOverloads(
@@ -49,13 +45,13 @@ func populateTwoArgsOverloads(
 		if !found {
 			colexecerror.InternalError(errors.AssertionFailedf("didn't find supported widths for %s", leftFamily))
 		}
-		leftFamilyStr := toString(leftFamily)
+		leftFamilyStr := familyToString(leftFamily)
 		for _, rightFamily := range combinableCanonicalTypeFamilies[leftFamily] {
 			rightWidths, found := supportedWidthsByCanonicalTypeFamily[rightFamily]
 			if !found {
 				colexecerror.InternalError(errors.AssertionFailedf("didn't find supported widths for %s", rightFamily))
 			}
-			rightFamilyStr := toString(rightFamily)
+			rightFamilyStr := familyToString(rightFamily)
 			for _, leftWidth := range leftWidths {
 				for _, rightWidth := range rightWidths {
 					customizer, ok := customizers[typePair{leftFamily, leftWidth, rightFamily, rightWidth}]
@@ -225,7 +221,9 @@ func makeFunctionRegex(funcName string, numArgs int) *regexp.Regexp {
 
 // makeTemplateFunctionCall makes a string representing a function call in the
 // template language. For example, it will return
-//   `{{.Assign "$1" "$2" "$3"}}`
+//
+//	`{{.Assign "$1" "$2" "$3"}}`
+//
 // if funcName is `Assign` and numArgs is 3.
 func makeTemplateFunctionCall(funcName string, numArgs int) string {
 	res := "{{." + funcName

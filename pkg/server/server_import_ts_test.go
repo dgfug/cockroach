@@ -1,28 +1,25 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server_test
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/ts/tsutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -42,7 +39,7 @@ func TestServerWithTimeseriesImport(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "dump.raw")
 	require.NoError(t,
-		ioutil.WriteFile(path+".yaml", []byte("1: 1"), 0644),
+		os.WriteFile(path+".yaml", []byte("1: 1"), 0644),
 	)
 
 	var bytesDumped int64
@@ -50,8 +47,7 @@ func TestServerWithTimeseriesImport(t *testing.T) {
 		srv := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
 		defer srv.Stopper().Stop(ctx)
 
-		cc, err := srv.Servers[0].RPCContext().GRPCUnvalidatedDial(srv.Servers[0].RPCAddr()).Connect(ctx)
-		require.NoError(t, err)
+		cc := srv.Server(0).RPCClientConn(t, username.RootUserName())
 		bytesDumped = dumpTSNonempty(t, cc, path)
 		t.Logf("dumped %s bytes", humanizeutil.IBytes(bytesDumped))
 	}()
@@ -67,8 +63,7 @@ func TestServerWithTimeseriesImport(t *testing.T) {
 	}
 	srv := testcluster.StartTestCluster(t, 1, args)
 	defer srv.Stopper().Stop(ctx)
-	cc, err := srv.Servers[0].RPCContext().GRPCUnvalidatedDial(srv.Servers[0].RPCAddr()).Connect(ctx)
-	require.NoError(t, err)
+	cc := srv.Server(0).RPCClientConn(t, username.RootUserName())
 	// This would fail if we didn't supply a dump. Just the fact that it returns
 	// successfully proves that we ingested at least some time series (or that we
 	// failed to disable time series).
@@ -79,12 +74,16 @@ func TestServerWithTimeseriesImport(t *testing.T) {
 }
 
 func dumpTSNonempty(t *testing.T, cc *grpc.ClientConn, dest string) (bytes int64) {
-	c, err := tspb.NewTimeSeriesClient(cc).DumpRaw(context.Background(), &tspb.DumpRequest{})
+	names, err := serverpb.GetInternalTimeseriesNamesFromServer(context.Background(), cc)
+	require.NoError(t, err)
+	c, err := tspb.NewTimeSeriesClient(cc).DumpRaw(context.Background(), &tspb.DumpRequest{
+		Names: names,
+	})
 	require.NoError(t, err)
 
 	f, err := os.Create(dest)
 	require.NoError(t, err)
-	require.NoError(t, ts.DumpRawTo(c, f))
+	require.NoError(t, tsutil.DumpRawTo(c, f))
 	require.NoError(t, f.Close())
 	info, err := os.Stat(dest)
 	require.NoError(t, err)

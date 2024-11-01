@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,8 +9,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -43,11 +38,7 @@ func (p *planner) prepareSetSchema(
 	}
 
 	// Lookup the schema we want to set to.
-	res, err := p.Descriptors().GetMutableSchemaByName(
-		ctx, p.txn, db, schema, tree.SchemaLookupFlags{
-			Required:       true,
-			RequireMutable: true,
-		})
+	res, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, db, schema)
 	if err != nil {
 		return 0, err
 	}
@@ -79,7 +70,9 @@ func (p *planner) prepareSetSchema(
 		return desiredSchemaID, nil
 	}
 
-	err = catalogkv.CheckObjectCollision(ctx, p.txn, p.ExecCfg().Codec, db.GetID(), desiredSchemaID, objectName)
+	err = descs.CheckObjectNameCollision(
+		ctx, p.Descriptors(), p.txn, db.GetID(), desiredSchemaID, objectName,
+	)
 	if err != nil {
 		return descpb.InvalidID, err
 	}

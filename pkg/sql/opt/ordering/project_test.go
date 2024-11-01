@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -20,15 +16,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 func TestProject(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	var f norm.Factory
-	f.Init(evalCtx, testcat.New())
+	f.Init(context.Background(), evalCtx, testcat.New())
 	md := f.Metadata()
 	for i := 1; i <= 4; i++ {
 		md.AddColumn(fmt.Sprintf("col%d", i), types.Int)

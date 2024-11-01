@@ -17,7 +17,7 @@ INSERT INTO kv VALUES ('nil3', NULL);
 INSERT INTO kv VALUES ('nil4', NULL);
 INSERT INTO kv (k,v) VALUES ('a', 'b'), ('c', 'd');
 
-query T
+query T rowsort
 SELECT v || 'hello' FROM [INSERT INTO kv VALUES ('e', 'f'), ('g', '') RETURNING v]
 ----
 fhello
@@ -31,19 +31,19 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> NULL
-fetched: /kv/kv_pkey/'a' -> NULL
+fetched: /kv/kv_pkey/'A' -> <undecoded>
+fetched: /kv/kv_pkey/'a' -> <undecoded>
 fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> NULL
+fetched: /kv/kv_pkey/'c' -> <undecoded>
 fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> NULL
+fetched: /kv/kv_pkey/'e' -> <undecoded>
 fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'g' -> NULL
+fetched: /kv/kv_pkey/'g' -> <undecoded>
 fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> NULL
-fetched: /kv/kv_pkey/'nil2' -> NULL
-fetched: /kv/kv_pkey/'nil3' -> NULL
-fetched: /kv/kv_pkey/'nil4' -> NULL
+fetched: /kv/kv_pkey/'nil1' -> <undecoded>
+fetched: /kv/kv_pkey/'nil2' -> <undecoded>
+fetched: /kv/kv_pkey/'nil3' -> <undecoded>
+fetched: /kv/kv_pkey/'nil4' -> <undecoded>
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -92,19 +92,19 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> NULL
-fetched: /kv/kv_pkey/'a' -> NULL
+fetched: /kv/kv_pkey/'A' -> <undecoded>
+fetched: /kv/kv_pkey/'a' -> <undecoded>
 fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> NULL
+fetched: /kv/kv_pkey/'c' -> <undecoded>
 fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> NULL
+fetched: /kv/kv_pkey/'e' -> <undecoded>
 fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'g' -> NULL
+fetched: /kv/kv_pkey/'g' -> <undecoded>
 fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> NULL
-fetched: /kv/kv_pkey/'nil2' -> NULL
-fetched: /kv/kv_pkey/'nil3' -> NULL
-fetched: /kv/kv_pkey/'nil4' -> NULL
+fetched: /kv/kv_pkey/'nil1' -> <undecoded>
+fetched: /kv/kv_pkey/'nil2' -> <undecoded>
+fetched: /kv/kv_pkey/'nil3' -> <undecoded>
+fetched: /kv/kv_pkey/'nil4' -> <undecoded>
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -153,21 +153,21 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> NULL
-fetched: /kv/kv_pkey/'a' -> NULL
+fetched: /kv/kv_pkey/'A' -> <undecoded>
+fetched: /kv/kv_pkey/'a' -> <undecoded>
 fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> NULL
+fetched: /kv/kv_pkey/'c' -> <undecoded>
 fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> NULL
+fetched: /kv/kv_pkey/'e' -> <undecoded>
 fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'f' -> NULL
+fetched: /kv/kv_pkey/'f' -> <undecoded>
 fetched: /kv/kv_pkey/'f'/v -> 'g'
-fetched: /kv/kv_pkey/'g' -> NULL
+fetched: /kv/kv_pkey/'g' -> <undecoded>
 fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> NULL
-fetched: /kv/kv_pkey/'nil2' -> NULL
-fetched: /kv/kv_pkey/'nil3' -> NULL
-fetched: /kv/kv_pkey/'nil4' -> NULL
+fetched: /kv/kv_pkey/'nil1' -> <undecoded>
+fetched: /kv/kv_pkey/'nil2' -> <undecoded>
+fetched: /kv/kv_pkey/'nil3' -> <undecoded>
+fetched: /kv/kv_pkey/'nil4' -> <undecoded>
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -219,21 +219,21 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> NULL
-fetched: /kv/kv_pkey/'a' -> NULL
+fetched: /kv/kv_pkey/'A' -> <undecoded>
+fetched: /kv/kv_pkey/'a' -> <undecoded>
 fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> NULL
+fetched: /kv/kv_pkey/'c' -> <undecoded>
 fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> NULL
+fetched: /kv/kv_pkey/'e' -> <undecoded>
 fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'f' -> NULL
+fetched: /kv/kv_pkey/'f' -> <undecoded>
 fetched: /kv/kv_pkey/'f'/v -> 'g'
-fetched: /kv/kv_pkey/'g' -> NULL
+fetched: /kv/kv_pkey/'g' -> <undecoded>
 fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> NULL
-fetched: /kv/kv_pkey/'nil2' -> NULL
-fetched: /kv/kv_pkey/'nil3' -> NULL
-fetched: /kv/kv_pkey/'nil4' -> NULL
+fetched: /kv/kv_pkey/'nil1' -> <undecoded>
+fetched: /kv/kv_pkey/'nil2' -> <undecoded>
+fetched: /kv/kv_pkey/'nil3' -> <undecoded>
+fetched: /kv/kv_pkey/'nil4' -> <undecoded>
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -292,7 +292,7 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv5/a/NULL/'a' -> NULL
+fetched: /kv5/a/NULL/'a' -> <undecoded>
 output row: ['a' NULL]
 
 statement ok
@@ -316,14 +316,12 @@ vectorized: true
 │
 └── • render
     │ columns: (x, v, rowid_default)
-    │ estimated row count: 10 (missing stats)
     │ render rowid_default: unique_rowid()
     │ render x: x
     │ render v: v
     │
     └── • top-k
         │ columns: (x, v)
-        │ ordering: -v
         │ estimated row count: 10 (missing stats)
         │ order: -v
         │ k: 10
@@ -349,7 +347,6 @@ vectorized: true
 │
 └── • render
     │ columns: (x, v, rowid_default)
-    │ estimated row count: 1 (missing stats)
     │ render rowid_default: unique_rowid()
     │ render x: x
     │ render v: v
@@ -373,10 +370,8 @@ vectorized: true
 │ auto commit
 │
 └── • render
-    │ estimated row count: 1
     │
     └── • limit
-        │ estimated row count: 1
         │ count: 1
         │
         └── • values
@@ -393,7 +388,6 @@ vectorized: true
 │ auto commit
 │
 └── • render
-    │ estimated row count: 1
     │
     └── • top-k
         │ estimated row count: 1
@@ -414,7 +408,6 @@ vectorized: true
 │ auto commit
 │
 └── • render
-    │ estimated row count: 1
     │
     └── • top-k
         │ estimated row count: 1
@@ -435,7 +428,6 @@ vectorized: true
 │ auto commit
 │
 └── • render
-    │ estimated row count: 1
     │
     └── • top-k
         │ estimated row count: 1
@@ -455,7 +447,6 @@ vectorized: true
 ·
 • render
 │ columns: ("?column?")
-│ estimated row count: 10 (missing stats)
 │ render ?column?: x + v
 │
 └── • insert
@@ -465,30 +456,39 @@ vectorized: true
     │
     └── • render
         │ columns: (length, "?column?", rowid_default)
-        │ estimated row count: 10 (missing stats)
         │ render rowid_default: unique_rowid()
         │ render length: length
         │ render ?column?: "?column?"
         │
         └── • top-k
-            │ columns: (length, "?column?", column12)
-            │ ordering: +column12
+            │ columns: (length, "?column?", column16)
             │ estimated row count: 10 (missing stats)
-            │ order: +column12
+            │ order: +column16
             │ k: 10
             │
             └── • render
-                │ columns: (length, "?column?", column12)
-                │ estimated row count: 1,000 (missing stats)
+                │ columns: (length, "?column?", column16)
                 │ render length: length(k)
                 │ render ?column?: 2
-                │ render column12: k::STRING || v::STRING
+                │ render column16: k || v
                 │
                 └── • scan
                       columns: (k, v)
                       estimated row count: 1,000 (missing stats)
                       table: kv@kv_pkey
                       spans: FULL SCAN
+
+# Index hints should be a no-op for normal inserts without ON CONFLICT.
+query T
+EXPLAIN (PLAN) INSERT INTO kv@a VALUES (1,1), (2,2)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: kv(k, v)
+  auto commit
+  size: 2 columns, 2 rows
 
 # ------------------------------------------------------------------------------
 # Insert rows into table during schema changes.
@@ -509,7 +509,6 @@ vectorized: true
 ·
 • project
 │ columns: (x)
-│ estimated row count: 1
 │
 └── • insert fast path
       columns: (x, rowid)
@@ -545,6 +544,57 @@ vectorized: true
 statement ok
 ROLLBACK
 
+# ------------------------------------------------------------------------------
+# Insert fast path.
+# ------------------------------------------------------------------------------
+
+# Do not plan insert fast path when VALUES clause has a subquery.
+# statement ok
+query T
+EXPLAIN INSERT INTO kv VALUES (1, (SELECT v FROM kv))
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: kv(k, v)
+│   │ auto commit
+│   │
+│   └── • values
+│         size: 2 columns, 1 row
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: (SELECT v FROM kv)
+    │ exec mode: one row
+    │
+    └── • max1row
+        │ estimated row count: 1
+        │
+        └── • scan
+              missing stats
+              table: kv@kv_pkey
+              spans: FULL SCAN
+
+statement ok
+CREATE FUNCTION foo() RETURNS VARCHAR LANGUAGE SQL AS 'SELECT v FROM kv'
+
+# Do not plan insert fast path when VALUES clause invokes a UDF.
+query T
+EXPLAIN INSERT INTO kv VALUES (1, foo())
+----
+distribution: local
+vectorized: true
+·
+• insert
+│ into: kv(k, v)
+│ auto commit
+│
+└── • values
+      size: 2 columns, 1 row
+
 # Regression test for #35564: make sure we use the Insert's input required
 # ordering for the internal projection.
 
@@ -565,7 +615,6 @@ vectorized: true
 │
 ├── • sort
 │   │ columns: (z)
-│   │ ordering: +z
 │   │ estimated row count: 1,000 (missing stats)
 │   │ order: +z
 │   │
@@ -585,7 +634,6 @@ vectorized: true
         │
         └── • project
             │ columns: (z)
-            │ estimated row count: 1,000 (missing stats)
             │
             └── • insert
                 │ columns: (z, rowid)
@@ -594,7 +642,6 @@ vectorized: true
                 │
                 └── • render
                     │ columns: (a, b, c, rowid_default)
-                    │ estimated row count: 1,000 (missing stats)
                     │ render rowid_default: unique_rowid()
                     │ render a: a
                     │ render b: b

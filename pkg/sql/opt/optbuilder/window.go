@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -50,17 +46,17 @@ func (w *windowInfo) TypeCheck(
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (w *windowInfo) Eval(_ *tree.EvalContext) (tree.Datum, error) {
+func (w *windowInfo) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("windowInfo must be replaced before evaluation"))
 }
 
 var _ tree.Expr = &windowInfo{}
 var _ tree.TypedExpr = &windowInfo{}
 
-var unboundedStartBound = &tree.WindowFrameBound{BoundType: tree.UnboundedPreceding}
-var unboundedEndBound = &tree.WindowFrameBound{BoundType: tree.UnboundedFollowing}
-var defaultStartBound = &tree.WindowFrameBound{BoundType: tree.UnboundedPreceding}
-var defaultEndBound = &tree.WindowFrameBound{BoundType: tree.CurrentRow}
+var unboundedStartBound = &tree.WindowFrameBound{BoundType: treewindow.UnboundedPreceding}
+var unboundedEndBound = &tree.WindowFrameBound{BoundType: treewindow.UnboundedFollowing}
+var defaultStartBound = &tree.WindowFrameBound{BoundType: treewindow.UnboundedPreceding}
+var defaultEndBound = &tree.WindowFrameBound{BoundType: treewindow.CurrentRow}
 
 // buildWindow adds any window functions on top of the expression.
 func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
@@ -98,13 +94,15 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 		// Build appropriate partitions.
 		partitions[i] = b.buildWindowPartition(def.Partitions, i, w.def.Name, inScope, argScope)
 
-		// Build appropriate orderings.
-		ord := b.buildWindowOrdering(def.OrderBy, i, w.def.Name, inScope, argScope)
-		orderings[i].FromOrdering(ord)
-
+		var isRangeModeWithOffsets bool
 		if def.Frame != nil {
 			windowFrames[i] = *def.Frame
+			isRangeModeWithOffsets = windowFrames[i].Mode == treewindow.RANGE && def.Frame.Bounds.HasOffset()
 		}
+
+		// Build appropriate orderings.
+		ord := b.buildWindowOrdering(def.OrderBy, i, w.def.Name, inScope, argScope, isRangeModeWithOffsets)
+		orderings[i].FromOrdering(ord)
 
 		if w.Filter != nil {
 			col := b.buildFilterCol(w.Filter, i, w.def.Name, inScope, argScope)
@@ -173,7 +171,7 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 				pgerror.Newf(
 					pgcode.InvalidColumnReference,
 					"argument of %s must not contain variables",
-					tree.WindowModeName(windowFrames[i].Mode),
+					treewindow.WindowModeName(windowFrames[i].Mode),
 				),
 			)
 		}
@@ -201,7 +199,19 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 		)
 	}
 
+	// First construct all frames with the PARTITION BY clause - this allows the
+	// execution to be more distributed.
 	for _, f := range frames {
+		if f.Partition.Empty() {
+			continue
+		}
+		outScope.expr = b.factory.ConstructWindow(outScope.expr, f.Windows, &f.WindowPrivate)
+	}
+	// Now construct all frames without the PARTITION BY clause.
+	for _, f := range frames {
+		if !f.Partition.Empty() {
+			continue
+		}
 		outScope.expr = b.factory.ConstructWindow(outScope.expr, f.Windows, &f.WindowPrivate)
 	}
 }
@@ -215,18 +225,19 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 // To support this ordering, we build the aggregate as a window function like below:
 //
 // scalar-group-by
-//  ├── columns: array_agg:2(int[])
-//  ├── window partition=() ordering=+1
-//  │    ├── columns: col1:1(int!null) array_agg:2(int[])
-//  │    ├── scan tab
-//  │    │    └── columns: col1:1(int!null)
-//  │    └── windows
-//  │         └── windows-item: range from unbounded to unbounded [type=int[]]
-//  │              └── array-agg [type=int[]]
-//  │                   └── variable: col1 [type=int]
-//  └── aggregations
-//       └── const-agg [type=int[]]
-//            └── variable: array_agg [type=int[]]
+//
+//	├── columns: array_agg:2(int[])
+//	├── window partition=() ordering=+1
+//	│    ├── columns: col1:1(int!null) array_agg:2(int[])
+//	│    ├── scan tab
+//	│    │    └── columns: col1:1(int!null)
+//	│    └── windows
+//	│         └── windows-item: range from unbounded to unbounded [type=int[]]
+//	│              └── array-agg [type=int[]]
+//	│                   └── variable: col1 [type=int]
+//	└── aggregations
+//	     └── const-agg [type=int[]]
+//	          └── variable: array_agg [type=int[]]
 func (b *Builder) buildAggregationAsWindow(
 	groupingColSet opt.ColSet, having opt.ScalarExpr, fromScope *scope,
 ) *scope {
@@ -255,7 +266,7 @@ func (b *Builder) buildAggregationAsWindow(
 
 		// Build appropriate orderings.
 		if !agg.isCommutative() {
-			ord := b.buildWindowOrdering(agg.OrderBy, i, agg.def.Name, fromScope, g.aggInScope)
+			ord := b.buildWindowOrdering(agg.OrderBy, i, agg.def.Name, fromScope, g.aggInScope, false /* isRangeModeWithOffsets */)
 			orderings[i].FromOrdering(ord)
 		}
 
@@ -305,7 +316,7 @@ func (b *Builder) buildAggregationAsWindow(
 
 	// Wrap with having filter if it exists.
 	if having != nil {
-		input := g.aggOutScope.expr.(memo.RelExpr)
+		input := g.aggOutScope.expr
 		filters := memo.FiltersExpr{b.factory.ConstructFiltersItem(having)}
 		g.aggOutScope.expr = b.factory.ConstructSelect(input, filters)
 	}
@@ -331,7 +342,7 @@ func (b *Builder) getTypedWindowArgs(w *windowInfo) []tree.TypedExpr {
 			argExprs = append(argExprs, tree.NewDInt(1))
 		}
 		if len(argExprs) < 3 {
-			null := tree.ReType(tree.DNull, argExprs[0].ResolvedType())
+			null := reType(tree.DNull, argExprs[0].ResolvedType())
 			argExprs = append(argExprs, null)
 		}
 	}
@@ -400,7 +411,11 @@ func (b *Builder) buildWindowPartition(
 
 // buildWindowOrdering builds the appropriate orderings for window functions.
 func (b *Builder) buildWindowOrdering(
-	orderBy tree.OrderBy, windowIndex int, funcName string, inScope, outScope *scope,
+	orderBy tree.OrderBy,
+	windowIndex int,
+	funcName string,
+	inScope, outScope *scope,
+	isRangeModeWithOffsets bool,
 ) opt.Ordering {
 	ord := make(opt.Ordering, 0, len(orderBy))
 	for j, t := range orderBy {
@@ -408,13 +423,43 @@ func (b *Builder) buildWindowOrdering(
 		te := inScope.resolveType(t.Expr, types.Any)
 		cols := flattenTuples([]tree.TypedExpr{te})
 
-		for _, e := range cols {
+		nullsDefaultOrder := b.hasDefaultNullsOrder(t)
+		if !nullsDefaultOrder && isRangeModeWithOffsets {
+			// TODO(#94032): teach the execution engine to support this special
+			// case.
+			panic(errors.New("NULLS LAST with RANGE mode with OFFSET is currently unsupported"))
+		}
+		for k, e := range cols {
+			if !nullsDefaultOrder {
+				expr := tree.NewTypedIsNullExpr(e)
+				// TODO(#94032): reusing an existing column for the temporary IS
+				// NULL expression can be incorrect if that column was created
+				// for the previous window function (perhaps it's incorrect only
+				// when different PARTITION BY clauses are specified).
+				col := outScope.findExistingCol(expr, false /* allowSideEffects */)
+				if col == nil {
+					// Use an anonymous name because the column cannot be referenced
+					// in other expressions.
+					colName := scopeColName("").WithMetadataName(
+						fmt.Sprintf("%s_%d_nulls_ordering_%d_%d", funcName, windowIndex+1, j+1, k+1),
+					)
+					col = b.synthesizeColumn(
+						outScope,
+						colName,
+						expr.ResolvedType(),
+						expr,
+						b.buildScalar(expr, inScope, nil, nil, nil),
+					)
+				}
+				ord = append(ord, opt.MakeOrderingColumn(col.id, t.Direction == tree.Descending))
+			}
+
 			col := outScope.findExistingCol(e, false /* allowSideEffects */)
 			if col == nil {
 				// Use an anonymous name because the column cannot be referenced
 				// in other expressions.
 				colName := scopeColName("").WithMetadataName(
-					fmt.Sprintf("%s_%d_orderby_%d", funcName, windowIndex+1, j+1),
+					fmt.Sprintf("%s_%d_orderby_%d_%d", funcName, windowIndex+1, j+1, k+1),
 				)
 				col = b.synthesizeColumn(
 					outScope,

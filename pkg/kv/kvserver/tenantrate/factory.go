@@ -1,30 +1,28 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantrate
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 // TestingKnobs configures a LimiterFactory for testing.
 type TestingKnobs struct {
-	TimeSource timeutil.TimeSource
+	QuotaPoolOptions []quotapool.Option
+
+	// Authorizer, if set, replaces the authorizer in the RPCContext.
+	Authorizer tenantcapabilities.Authorizer
 }
 
 // LimiterFactory constructs and manages per-tenant Limiters.
@@ -32,7 +30,9 @@ type LimiterFactory struct {
 	knobs         TestingKnobs
 	metrics       Metrics
 	systemLimiter systemLimiter
-	mu            struct {
+	authorizer    tenantcapabilities.Authorizer
+
+	mu struct {
 		syncutil.RWMutex
 		config  Config
 		tenants map[roachpb.TenantID]*refCountedLimiter
@@ -46,9 +46,12 @@ type refCountedLimiter struct {
 }
 
 // NewLimiterFactory constructs a new LimiterFactory.
-func NewLimiterFactory(sv *settings.Values, knobs *TestingKnobs) *LimiterFactory {
+func NewLimiterFactory(
+	sv *settings.Values, knobs *TestingKnobs, authorizer tenantcapabilities.Authorizer,
+) *LimiterFactory {
 	rl := &LimiterFactory{
-		metrics: makeMetrics(),
+		metrics:    makeMetrics(),
+		authorizer: authorizer,
 	}
 	if knobs != nil {
 		rl.knobs = *knobs
@@ -69,7 +72,7 @@ func NewLimiterFactory(sv *settings.Values, knobs *TestingKnobs) *LimiterFactory
 }
 
 // GetTenant gets or creates a limiter for the given tenant. The limiters are
-// reference counted; call Destroy on the returned limiter when it is no longer
+// reference counted; call Unlink on the returned limiter when it is no longer
 // in use. If the closer channel is non-nil, closing it will lead to any blocked
 // requests becoming unblocked.
 func (rl *LimiterFactory) GetTenant(
@@ -86,14 +89,13 @@ func (rl *LimiterFactory) GetTenant(
 	rcLim, ok := rl.mu.tenants[tenantID]
 	if !ok {
 		var options []quotapool.Option
-		if rl.knobs.TimeSource != nil {
-			options = append(options, quotapool.WithTimeSource(rl.knobs.TimeSource))
-		}
+		options = append(options, rl.knobs.QuotaPoolOptions...)
 		if closer != nil {
 			options = append(options, quotapool.WithCloser(closer))
 		}
+
 		rcLim = new(refCountedLimiter)
-		rcLim.lim.init(rl, tenantID, rl.mu.config, rl.metrics.tenantMetrics(tenantID), options...)
+		rcLim.lim.init(rl, tenantID, rl.mu.config, rl.metrics.tenantMetrics(tenantID), rl.authorizer, options...)
 		rl.mu.tenants[tenantID] = rcLim
 		log.Infof(
 			ctx, "tenant %s rate limiter initialized (rate: %g RU/s; burst: %g RU)",
@@ -109,19 +111,22 @@ func (rl *LimiterFactory) Release(lim Limiter) {
 	if _, isSystem := lim.(*systemLimiter); isSystem {
 		return
 	}
+
 	l := lim.(*limiter)
+	tenID := l.TenantID()
+
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	rcLim, ok := rl.mu.tenants[l.tenantID]
+	rcLim, ok := rl.mu.tenants[tenID]
 	if !ok {
-		panic(errors.AssertionFailedf("expected to find entry for tenant %v", l.tenantID))
+		panic(errors.AssertionFailedf("expected to find entry for tenant %v", tenID))
 	}
 	if &rcLim.lim != lim {
-		panic(errors.AssertionFailedf("two limiters exist for tenant %v", l.tenantID))
+		panic(errors.AssertionFailedf("two limiters exist for tenant %v", tenID))
 	}
 	if rcLim.refCount--; rcLim.refCount == 0 {
-		l.metrics.destroy()
-		delete(rl.mu.tenants, l.tenantID)
+		l.Release()
+		delete(rl.mu.tenants, tenID)
 	}
 }
 

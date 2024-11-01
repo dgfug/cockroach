@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sysutil is a cross-platform compatibility layer on top of package
 // syscall. It exposes APIs for common operations that require package syscall
@@ -69,4 +64,24 @@ func IsErrConnectionReset(err error) bool {
 // IsErrConnectionRefused returns true if an error is a "connection refused" error.
 func IsErrConnectionRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// IsErrTimedOut returns true if an error is an ETIMEDOUT error.
+func IsErrTimedOut(err error) bool {
+	return errors.Is(err, syscall.ETIMEDOUT)
+}
+
+// IsAddrInUse returns true if an error is an EADDRINUSE error.
+func IsAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
+}
+
+// InterruptSelf sends Interrupt to the process itself.
+func InterruptSelf() error {
+	pr, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		// No-op.
+		return nil //nolint:returnerrcheck
+	}
+	return pr.Signal(os.Interrupt)
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgtest
 
@@ -14,12 +9,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/datadriven"
 	"github.com/jackc/pgproto3/v2"
+	"github.com/stretchr/testify/require"
 )
 
 // WalkWithRunningServer walks path for datadriven files and calls RunTest on them.
@@ -45,6 +42,12 @@ func WalkWithNewServer(
 // RunTest executes PGTest commands, connecting to the database specified by
 // addr and user. Supported commands:
 //
+// "let": Run a query that returns a single row with a single column, and
+// save it in the variable named in the command argument. This variable can
+// be used in future "send" commands and is replaced by simple string
+// substitution. The same variable may also be used for replacement in
+// the expected output.
+//
 // "send": Sends messages to a server. Takes a newline-delimited list of
 // pgproto3.FrontendMessage types. Can fill in values by adding a space then
 // a JSON object. No output. Messages with a []byte type (like CopyData) should
@@ -69,9 +72,11 @@ func WalkWithNewServer(
 // happens.
 func RunTest(t *testing.T, path, addr, user string) {
 	p, err := NewPGTest(context.Background(), addr, user)
+
 	if err != nil {
 		t.Fatal(err)
 	}
+	vars := make(map[string]string)
 	datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "only":
@@ -83,12 +88,47 @@ func RunTest(t *testing.T, path, addr, user string) {
 			}
 			return d.Expected
 
+		case "let":
+			if (d.HasArg("crdb_only") && !p.isCockroachDB) ||
+				(d.HasArg("noncrdb_only") && p.isCockroachDB) {
+				return d.Expected
+			}
+			require.GreaterOrEqual(t, len(d.CmdArgs), 1, "at least one argument required for let")
+			require.Regexp(
+				t, `^\$[0-9A-Za-z_]+`, d.CmdArgs[0].Key,
+				"let argument must begin with '$' and only contain word characters",
+			)
+			lines := strings.Split(d.Input, "\n")
+			require.Len(t, lines, 1, "only one input command permitted for let")
+			require.Truef(t, strings.HasPrefix(lines[0], "Query "), "let must use a Query command")
+			if err := p.SendOneLine(lines[0]); err != nil {
+				t.Fatalf("%s: send %s: %v", d.Pos, lines[0], err)
+			}
+			msgs, err := p.Receive(hasKeepErrMsg(d), &pgproto3.DataRow{}, &pgproto3.ReadyForQuery{})
+			if err != nil {
+				t.Fatalf("%s: %+v", d.Pos, err)
+			}
+			sawData := false
+			for _, msg := range msgs {
+				if dataRow, ok := msg.(*pgproto3.DataRow); ok {
+					require.False(t, sawData, "let Query must return only one row")
+					require.Len(t, dataRow.Values, 1, "let Query must return only one column")
+					sawData = true
+					for _, arg := range d.CmdArgs {
+						vars[arg.Key] = string(dataRow.Values[0])
+					}
+				}
+			}
+			return ""
 		case "send":
 			if (d.HasArg("crdb_only") && !p.isCockroachDB) ||
 				(d.HasArg("noncrdb_only") && p.isCockroachDB) {
 				return d.Expected
 			}
 			for _, line := range strings.Split(d.Input, "\n") {
+				for k, v := range vars {
+					line = strings.ReplaceAll(line, k, v)
+				}
 				if err := p.SendOneLine(line); err != nil {
 					t.Fatalf("%s: send %s: %v", d.Pos, line, err)
 				}
@@ -115,7 +155,20 @@ func RunTest(t *testing.T, path, addr, user string) {
 			if err != nil {
 				t.Fatalf("%s: %+v", d.Pos, err)
 			}
-			return MsgsToJSONWithIgnore(msgs, d)
+			out := MsgsToJSONWithIgnore(msgs, d)
+			// If the expected output with the variables replaced with their current
+			// value matches the expected output, allow the expected output to be
+			// used directly. Otherwise, return the generated output.
+			expanded := os.Expand(d.Expected, func(s string) string {
+				if v, ok := vars["$"+s]; ok {
+					return v
+				}
+				return s
+			})
+			if expanded == out {
+				return d.Expected
+			}
+			return out
 		default:
 			t.Fatalf("unknown command %s", d.Cmd)
 			return ""
@@ -181,6 +234,12 @@ func MsgsToJSONWithIgnore(msgs []pgproto3.BackendMessage, args *datadriven.TestD
 					}
 				}
 			}
+		case "ignore_constraint_name":
+			for _, msg := range msgs {
+				if m, ok := msg.(*pgproto3.ErrorResponse); ok {
+					m.ConstraintName = ""
+				}
+			}
 		case "ignore":
 			for _, typ := range arg.Vals {
 				ignore[fmt.Sprintf("*pgproto3.%s", typ)] = true
@@ -207,11 +266,15 @@ func MsgsToJSONWithIgnore(msgs []pgproto3.BackendMessage, args *datadriven.TestD
 				Code           string
 				Message        string `json:",omitempty"`
 				ConstraintName string `json:",omitempty"`
+				Detail         string `json:",omitempty"`
+				Hint           string `json:",omitempty"`
 			}{
 				Type:           "ErrorResponse",
 				Code:           code,
 				Message:        errmsg.Message,
 				ConstraintName: errmsg.ConstraintName,
+				Detail:         errmsg.Detail,
+				Hint:           errmsg.Hint,
 			}); err != nil {
 				panic(err)
 			}
@@ -232,6 +295,8 @@ func toMessage(typ string) interface{} {
 		return &pgproto3.CommandComplete{}
 	case "CopyData":
 		return &pgproto3.CopyData{}
+	case "CopyFail":
+		return &pgproto3.CopyFail{}
 	case "CopyDone":
 		return &pgproto3.CopyDone{}
 	case "CopyInResponse":
@@ -244,6 +309,8 @@ func toMessage(typ string) interface{} {
 		return &pgproto3.ErrorResponse{}
 	case "Execute":
 		return &pgproto3.Execute{}
+	case "Flush":
+		return &pgproto3.Flush{}
 	case "Parse":
 		return &pgproto3.Parse{}
 	case "PortalSuspended":

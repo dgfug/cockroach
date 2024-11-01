@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 @require "~styl/base/palette.styl"
 @require '~src/components/core/index'
 
@@ -36,16 +31,16 @@
     text-align center
     width 95px
     padding 9px 0
-    a
+    a, div
       font-family SourceSansPro-SemiBold
       font-size 12px
       font-weight 600
       line-height 1.67
       letter-spacing 0.3px
       color $adminui-grey-2
-      &:hover
-        color $colors--primary-blue-3
-        text-decoration underline
+    a:hover
+      color $colors--primary-blue-3
+      text-decoration underline
     &:first-child
       border-right 2px solid $colors--neutral-2
     .Chip
@@ -84,12 +79,12 @@
   padding: 30px;
 
 
-.ant-tooltip.Chip--tooltip
+.crl-ant-tooltip.Chip--tooltip
   min-width 384px
-  .ant-tooltip-inner
+  .crl-ant-tooltip-inner
     background-color black
     padding 12px 18px
-  .ant-tooltip-content
+  .crl-ant-tooltip-content
     width 100%
   span, p
     font-family $font-family--base
@@ -98,7 +93,7 @@
     letter-spacing 0.1px
     color $table-border-color
   .Chip--tooltip__latency
-     margin-top 25px
+     margin-bottom 4px
   .Chip--tooltip__nodes
     display flex
     justify-content space-between
@@ -108,7 +103,7 @@
         margin-right 8px
       &:last-child
         margin-left 8px
-    .ant-divider
+    .crl-ant-divider
       background #3b4a60
       margin 0
     &--item-title, &--item-description
@@ -120,6 +115,8 @@
       margin 0
     &--item-title
       line-height 1.71
+    &--header
+      border-bottom solid #3b4a60 1px
   .color
     &--green, &--lightgreen
       color $colors--primary-green-2
@@ -129,3 +126,5 @@
       color $colors--primary-blue-2
     &--yellow
       color $colors--functional-yellow-3
+    &--red
+      color $colors--functional-red-3

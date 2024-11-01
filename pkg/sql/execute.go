@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/errors"
 )
 
@@ -34,7 +30,6 @@ func (p *planner) fillInPlaceholders(
 	}
 
 	qArgs := make(tree.QueryArguments, len(params))
-	var semaCtx tree.SemaContext
 	for i, e := range params {
 		idx := tree.PlaceholderIdx(i)
 
@@ -53,7 +48,7 @@ func (p *planner) fillInPlaceholders(
 			}
 		}
 		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
-			ctx, e, typ, "EXECUTE parameter" /* context */, &semaCtx, tree.VolatilityVolatile,
+			ctx, e, typ, "EXECUTE parameter" /* context */, p.SemaCtx(), volatility.Volatile, true, /*allowAssignmentCast*/
 		)
 		if err != nil {
 			return nil, pgerror.WithCandidateCode(err, pgcode.WrongObjectType)

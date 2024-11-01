@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -23,9 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
 )
@@ -60,9 +57,9 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		// Note that we delay adding the annotation about the distribution until
 		// after the plan is finalized (when the physical plan is successfully
 		// created).
-		distribution := getPlanDistribution(
-			params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
-			params.extendedEvalCtx.SessionData().DistSQLMode, plan.main,
+		distribution, _ := getPlanDistribution(
+			params.ctx, params.p.Descriptors().HasUncommittedTypes(),
+			params.extendedEvalCtx.SessionData().DistSQLMode, plan.main, &params.p.distSQLVisitor,
 		)
 
 		outerSubqueries := params.p.curPlan.subqueryPlans
@@ -71,7 +68,8 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		defer func() {
 			planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 		}()
-		physicalPlan, err := newPhysPlanForExplainPurposes(planCtx, distSQLPlanner, plan.main)
+		physicalPlan, cleanup, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, plan.main)
+		defer cleanup()
 		var diagramURL url.URL
 		var diagramJSON string
 		if err != nil {
@@ -87,12 +85,11 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		} else {
 			// There might be an issue making the physical plan, but that should not
 			// cause an error or panic, so swallow the error. See #40677 for example.
-			distSQLPlanner.finalizePlanWithRowCount(planCtx, physicalPlan, plan.mainRowCount)
+			finalizePlanWithRowCount(params.ctx, planCtx, physicalPlan, plan.mainRowCount)
 			ob.AddDistribution(physicalPlan.Distribution.String())
 			flows := physicalPlan.GenerateFlowSpecs()
-			flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
 
-			ctxSessionData := flowCtx.EvalCtx.SessionData()
+			ctxSessionData := planCtx.EvalContext().SessionData()
 			var willVectorize bool
 			if ctxSessionData.VectorizeMode == sessiondatapb.VectorizeOff {
 				willVectorize = false
@@ -109,7 +106,8 @@ func (e *explainPlanNode) startExec(params runParams) error {
 
 			if e.options.Mode == tree.ExplainDistSQL {
 				flags := execinfrapb.DiagramFlags{
-					ShowInputTypes: e.options.Flags[tree.ExplainFlagTypes],
+					ShowInputTypes:    e.options.Flags[tree.ExplainFlagTypes],
+					MakeDeterministic: e.flags.Deflake.HasAny(explain.DeflakeAll) || params.p.execCfg.TestingKnobs.DeterministicExplain,
 				}
 				diagram, err := execinfrapb.GeneratePlanDiagram(params.p.stmt.String(), flows, flags)
 				if err != nil {
@@ -127,7 +125,7 @@ func (e *explainPlanNode) startExec(params runParams) error {
 			// For the JSON flag, we only want to emit the diagram JSON.
 			rows = []string{diagramJSON}
 		} else {
-			if err := emitExplain(ob, params.EvalContext(), params.p.ExecCfg().Codec, e.plan); err != nil {
+			if err := emitExplain(params.ctx, ob, params.EvalContext(), params.p.ExecCfg().Codec, e.plan); err != nil {
 				return err
 			}
 			rows = ob.BuildStringRows()
@@ -136,7 +134,30 @@ func (e *explainPlanNode) startExec(params runParams) error {
 			}
 		}
 	}
-	v := params.p.newContainerValuesNode(colinfo.ExplainPlanColumns, 0)
+	// Add index recommendations to output, if they exist.
+	if recs := params.p.instrumentation.explainIndexRecs; recs != nil {
+		// First add empty row.
+		rows = append(rows, "")
+		rows = append(rows, fmt.Sprintf("index recommendations: %d", len(recs)))
+		for i := range recs {
+			plural := ""
+			recType := ""
+			switch recs[i].RecType {
+			case indexrec.TypeCreateIndex:
+				recType = "index creation"
+			case indexrec.TypeReplaceIndex:
+				recType = "index replacement"
+				plural = "s"
+			case indexrec.TypeAlterIndex:
+				recType = "index alteration"
+			default:
+				return errors.New("unexpected index recommendation type")
+			}
+			rows = append(rows, fmt.Sprintf("%d. type: %s", i+1, recType))
+			rows = append(rows, fmt.Sprintf("   SQL command%s: %s", plural, recs[i].SQL))
+		}
+	}
+	v := params.p.newContainerValuesNode(colinfo.ExplainPlanColumns, len(rows))
 	datums := make([]tree.DString, len(rows))
 	for i, row := range rows {
 		datums[i] = tree.DString(row)
@@ -150,8 +171,9 @@ func (e *explainPlanNode) startExec(params runParams) error {
 }
 
 func emitExplain(
+	ctx context.Context,
 	ob *explain.OutputBuilder,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	codec keys.SQLCodec,
 	explainPlan *explain.Plan,
 ) (err error) {
@@ -164,7 +186,7 @@ func emitExplain(
 			// manipulate locks.
 			// Note that we don't catch anything in debug builds, so that failures are
 			// more visible.
-			if ok, e := errorutil.ShouldCatch(r); ok && !util.CrdbTestBuild {
+			if ok, e := errorutil.ShouldCatch(r); ok && !buildutil.CrdbTestBuild {
 				err = e
 			} else {
 				// Other panic objects can't be considered "safe" and thus are
@@ -184,7 +206,7 @@ func emitExplain(
 		}
 		tabDesc := table.(*optTable).desc
 		idx := index.(*optIndex).idx
-		spans, err := generateScanSpans(evalCtx, codec, tabDesc, idx, scanParams)
+		spans, err := generateScanSpans(ctx, evalCtx, codec, tabDesc, idx, scanParams)
 		if err != nil {
 			return err.Error()
 		}
@@ -203,44 +225,57 @@ func emitExplain(
 		return catalogkeys.PrettySpans(idx, spans, skip)
 	}
 
-	return explain.Emit(explainPlan, ob, spanFormatFn)
+	return explain.Emit(ctx, evalCtx, explainPlan, ob, spanFormatFn)
 }
 
 func (e *explainPlanNode) Next(params runParams) (bool, error) { return e.run.results.Next(params) }
 func (e *explainPlanNode) Values() tree.Datums                 { return e.run.results.Values() }
 
-func (e *explainPlanNode) Close(ctx context.Context) {
-	closeNode := func(n exec.Node) {
-		switch n := n.(type) {
-		case planNode:
-			n.Close(ctx)
-		case planMaybePhysical:
-			n.Close(ctx)
-		default:
-			panic(errors.AssertionFailedf("unknown plan node type %T", n))
+// closeExplainNode closes the given node which can either be planNode or
+// planMaybePhysical.
+func closeExplainNode(ctx context.Context, n exec.Node) {
+	switch n := n.(type) {
+	case planNode:
+		n.Close(ctx)
+	case planMaybePhysical:
+		n.Close(ctx)
+	default:
+		panic(errors.AssertionFailedf("unknown plan node type %T", n))
+	}
+}
+
+// closeExplainPlan closes the provided explain plan.
+func closeExplainPlan(ctx context.Context, ep *explain.Plan) {
+	closeExplainNode(ctx, ep.Root.WrappedNode())
+	for i := range ep.Subqueries {
+		closeExplainNode(ctx, ep.Subqueries[i].Root.(*explain.Node).WrappedNode())
+	}
+	for _, cascade := range ep.Cascades {
+		// We don't want to create new plans if they haven't been cached - all
+		// necessary plans must have been created already in explain.Emit call.
+		const createPlanIfMissing = false
+		if cp, _ := cascade.GetExplainPlan(ctx, createPlanIfMissing); cp != nil {
+			closeExplainPlan(ctx, cp.(*explain.Plan))
 		}
 	}
-	// The wrapped node can be planNode or planMaybePhysical.
-	closeNode(e.plan.Root.WrappedNode())
-	for i := range e.plan.Subqueries {
-		closeNode(e.plan.Subqueries[i].Root.(*explain.Node).WrappedNode())
+	for i := range ep.Checks {
+		closeExplainNode(ctx, ep.Checks[i].WrappedNode())
 	}
-	for i := range e.plan.Checks {
-		closeNode(e.plan.Checks[i].WrappedNode())
-	}
+}
+
+func (e *explainPlanNode) Close(ctx context.Context) {
+	closeExplainPlan(ctx, e.plan)
 	if e.run.results != nil {
 		e.run.results.Close(ctx)
 	}
 }
 
 func newPhysPlanForExplainPurposes(
-	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner, plan planMaybePhysical,
-) (*PhysicalPlan, error) {
+	ctx context.Context, planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner, plan planMaybePhysical,
+) (_ *PhysicalPlan, cleanup func(), _ error) {
 	if plan.isPhysicalPlan() {
-		return plan.physPlan.PhysicalPlan, nil
+		return plan.physPlan.PhysicalPlan, func() {}, nil
 	}
-	physPlan, err := distSQLPlanner.createPhysPlanForPlanNode(planCtx, plan.planNode)
-	// Release the resources right away since we won't be running the plan.
-	planCtx.getCleanupFunc()()
-	return physPlan, err
+	physPlan, err := distSQLPlanner.createPhysPlanForPlanNode(ctx, planCtx, plan.planNode)
+	return physPlan, planCtx.getCleanupFunc(), err
 }

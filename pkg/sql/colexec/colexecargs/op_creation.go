@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecargs
 
@@ -16,10 +11,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/marusama/semaphore"
@@ -34,6 +33,13 @@ var TestNewColOperator func(ctx context.Context, flowCtx *execinfra.FlowCtx, arg
 
 // OpWithMetaInfo stores a colexecop.Operator together with miscellaneous meta
 // information about the tree rooted in that operator.
+//
+// Note that at some point colexecop.Closers were also included into this
+// struct, but for ease of tracking we pulled them out to the flow-level.
+// Closers are different from the objects tracked here since we have a
+// convenient place to close them from the main goroutine whereas the stats
+// collection as well as metadata draining must happen in the goroutine that
+// "owns" these objects.
 // TODO(yuzefovich): figure out the story about pooling these objects.
 type OpWithMetaInfo struct {
 	Root colexecop.Operator
@@ -45,25 +51,28 @@ type OpWithMetaInfo struct {
 	// tree rooted in Root for which the responsibility of draining hasn't been
 	// claimed yet.
 	MetadataSources colexecop.MetadataSources
-	// ToClose are all colexecop.Closers that are present in the tree rooted in
-	// Root for which the responsibility of closing hasn't been claimed yet.
-	ToClose colexecop.Closers
 }
 
 // NewColOperatorArgs is a helper struct that encompasses all of the input
 // arguments to NewColOperator call.
 type NewColOperatorArgs struct {
-	Spec                 *execinfrapb.ProcessorSpec
-	Inputs               []OpWithMetaInfo
-	StreamingMemAccount  *mon.BoundAccount
+	Spec   *execinfrapb.ProcessorSpec
+	Inputs []OpWithMetaInfo
+	// StreamingMemAccount, if nil, is allocated lazily in NewColOperator.
+	StreamingMemAccount *mon.BoundAccount
+	// StreamingAllocator will be allocated lazily in NewColOperator.
+	StreamingAllocator   *colmem.Allocator
 	ProcessorConstructor execinfra.ProcessorConstructor
 	LocalProcessors      []execinfra.LocalProcessor
-	DiskQueueCfg         colcontainer.DiskQueueCfg
-	FDSemaphore          semaphore.Semaphore
-	ExprHelper           *ExprHelper
-	Factory              coldata.ColumnFactory
-	MonitorRegistry      *MonitorRegistry
-	TestingKnobs         struct {
+	// any is actually a coldata.Batch, see physicalplan.PhysicalInfrastructure comments.
+	LocalVectorSources map[int32]any
+	DiskQueueCfg       colcontainer.DiskQueueCfg
+	FDSemaphore        semaphore.Semaphore
+	SemaCtx            *tree.SemaContext
+	Factory            coldata.ColumnFactory
+	MonitorRegistry    *MonitorRegistry
+	TypeResolver       *descs.DistSQLTypeResolver
+	TestingKnobs       struct {
 		// SpillingCallbackFn will be called when the spilling from an in-memory
 		// to disk-backed operator occurs. It should only be set in tests.
 		SpillingCallbackFn func()
@@ -74,14 +83,6 @@ type NewColOperatorArgs struct {
 		// partitions; for sorter it is merging already created partitions into
 		// new one before proceeding to the next partition from the input).
 		NumForcedRepartitions int
-		// UseStreamingMemAccountForBuffering specifies whether to use
-		// StreamingMemAccount when creating buffering operators and should only
-		// be set to 'true' in tests. The idea behind this flag is reducing the
-		// number of memory accounts and monitors we need to close, so we
-		// plumbed it into the planning code so that it doesn't create extra
-		// memory monitoring infrastructure (and so that we could use
-		// testMemAccount defined in main_test.go).
-		UseStreamingMemAccountForBuffering bool
 		// DiskSpillingDisabled specifies whether only in-memory operators
 		// should be created.
 		DiskSpillingDisabled bool
@@ -105,16 +106,22 @@ type NewColOperatorResult struct {
 	// behind the stats collector interface. We need to track it separately from
 	// all other stats collectors since it requires special handling.
 	Columnarizer colexecop.VectorizedStatsCollector
-	ColumnTypes  []*types.T
-	Releasables  []execinfra.Releasable
+	// TODO(yuzefovich): consider keeping the reference to the types in Release.
+	// This will also require changes to the planning code to actually reuse the
+	// slice if possible. This is not exactly trivial since there is no clear
+	// contract right now of whether or not a particular operator has to make a
+	// copy of the type schema if it needs to use it later.
+	ColumnTypes []*types.T
+	ToClose     colexecop.Closers
+	Releasables []execreleasable.Releasable
 }
 
-var _ execinfra.Releasable = &NewColOperatorResult{}
+var _ execreleasable.Releasable = &NewColOperatorResult{}
 
 // TestCleanupNoError releases the resources associated with this result and
 // asserts that no error is returned. It should only be used in tests.
 func (r *NewColOperatorResult) TestCleanupNoError(t testing.TB) {
-	require.NoError(t, r.ToClose.Close())
+	require.NoError(t, r.ToClose.Close(context.Background()))
 }
 
 var newColOperatorResultPool = sync.Pool{
@@ -155,11 +162,8 @@ func (r *NewColOperatorResult) Release() {
 		OpWithMetaInfo: OpWithMetaInfo{
 			StatsCollectors: r.StatsCollectors[:0],
 			MetadataSources: r.MetadataSources[:0],
-			ToClose:         r.ToClose[:0],
 		},
-		// There is no need to deeply reset the column types because these
-		// objects are very tiny in the grand scheme of things.
-		ColumnTypes: r.ColumnTypes[:0],
+		ToClose:     r.ToClose[:0],
 		Releasables: r.Releasables[:0],
 	}
 	newColOperatorResultPool.Put(r)

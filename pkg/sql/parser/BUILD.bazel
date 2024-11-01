@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "parser",
@@ -22,19 +23,25 @@ go_library(
     deps = [
         "//pkg/docs",
         "//pkg/geo/geopb",  # keep
-        "//pkg/roachpb:with-mocks",  # keep
-        "//pkg/security",  # keep
+        "//pkg/security/username",  # keep
         "//pkg/sql/lexbase",
+        "//pkg/sql/parser/statements",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",  # keep
         "//pkg/sql/scanner",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/tree",
-        "//pkg/sql/sessiondata",
+        "//pkg/sql/sem/tree/treebin",  # keep
+        "//pkg/sql/sem/tree/treecmp",  # keep
+        "//pkg/sql/sem/tree/treewindow",  # keep
         "//pkg/sql/types",
         "//pkg/util/errorutil/unimplemented",
+        "//pkg/util/vector",  # keep
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_lib_pq//oid",  # keep
+        "@org_golang_x_text//cases",
+        "@org_golang_x_text//language",
     ],
 )
 
@@ -54,21 +61,26 @@ go_test(
     deps = [
         "//pkg/sql/lexbase",
         "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/randgen",
         "//pkg/sql/sem/builtins",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",
+        "//pkg/sql/sem/tree/treecmp",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/sqlutils",
         "//pkg/util/leaktest",
-        "//pkg/util/log",
+        "//pkg/util/randutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )
 
 sh_binary(
     name = "sql-gen",
-    srcs = ["sql-gen.sh"],
+    srcs = ["//pkg/sql/lexbase:sql-gen.sh"],
 )
 
 # Define the target to auto-generate sql.go from the grammar file.
@@ -80,13 +92,19 @@ genrule(
     ],
     outs = ["sql.go"],
     cmd = """
-      $(location :sql-gen) $(location sql.y) $(location replace_help_rules.awk) \
-          $(location sql.go) $(location @org_golang_x_tools//cmd/goyacc) \
-          $(location @com_github_cockroachdb_gostdlib//x/tools/cmd/goimports)
-    """,
-    exec_tools = [
+GO_REL_PATH=`dirname $(location @go_sdk//:bin/go)`
+GO_ABS_PATH=`cd $$GO_REL_PATH && pwd`
+export PATH=$$GO_ABS_PATH:$$PATH
+export HOME=$(GENDIR)
+export GOPATH=/nonexist-gopath
+export GOROOT=
+$(location :sql-gen) $(location sql.y) sql $(location replace_help_rules.awk) \
+    $(location sql.go) $(location @org_golang_x_tools//cmd/goyacc)
+""",
+    tags = ["no-remote-exec"],  # keep
+    tools = [
         ":sql-gen",
-        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports",
+        "@go_sdk//:bin/go",
         "@org_golang_x_tools//cmd/goyacc",
     ],
     visibility = ["//visibility:public"],
@@ -108,8 +126,12 @@ genrule(
       $(location :help-gen-test) < $< >$@.tmp
       mv -f $@.tmp $@
     """,
-    exec_tools = [
+    tools = [
         ":help-gen-test",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )
 
@@ -124,6 +146,10 @@ genrule(
     cmd = """
       awk -f $(location :help.awk) < $(location :sql.y) > $@
     """,
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 exports_files(
@@ -133,4 +159,20 @@ exports_files(
         "help.awk",
     ],
     visibility = ["//visibility:public"],
+)
+
+disallowed_imports_test(
+    "parser",
+    disallowed_list = [
+        "//pkg/kv",
+        "//pkg/roachpb",
+        "//pkg/security",
+        "//pkg/server",
+        "//pkg/sql/sessiondata",
+        "//pkg/storage",
+        "//pkg/util/log",
+    ],
+    disallowed_prefixes = [
+        "pkg/sql/catalog",
+    ],
 )

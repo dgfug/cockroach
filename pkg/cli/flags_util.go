@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -155,7 +150,7 @@ func (k *mvccKey) Set(value string) error {
 		}
 		newK, err := storage.DecodeMVCCKey(b)
 		if err != nil {
-			encoded := gohex.EncodeToString(storage.EncodeKey(storage.MakeMVCCMetadataKey(roachpb.Key(b))))
+			encoded := gohex.EncodeToString(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(roachpb.Key(b))))
 			return errors.Wrapf(err, "perhaps this is just a hex-encoded key; you need an "+
 				"encoded MVCCKey (i.e. with a timestamp component); here's one with a zero timestamp: %s",
 				encoded)
@@ -168,7 +163,7 @@ func (k *mvccKey) Set(value string) error {
 		}
 		*k = mvccKey(storage.MakeMVCCMetadataKey(roachpb.Key(unquoted)))
 	case human:
-		scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+		scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 		key, err := scanner.Scan(keyStr)
 		if err != nil {
 			return err
@@ -207,25 +202,10 @@ const (
 	hex
 )
 
-// _keyTypes stores the names of all the possible key types.
-var _keyTypes []string
-
-// keyTypes computes and memoizes the names of all the possible key
-// types, based on the definitions produces by Go's stringer (see
-// keytype_string.go).
-func keyTypes() []string {
-	if _keyTypes == nil {
-		for i := 0; i+1 < len(_keyType_index); i++ {
-			_keyTypes = append(_keyTypes, _keyType_name[_keyType_index[i]:_keyType_index[i+1]])
-		}
-	}
-	return _keyTypes
-}
-
 func parseKeyType(value string) (keyType, error) {
-	for i, typ := range keyTypes() {
+	for typ, i := range _keyTypes {
 		if strings.EqualFold(value, typ) {
-			return keyType(i), nil
+			return i, nil
 		}
 	}
 	return 0, fmt.Errorf("unknown key type '%s'", value)
@@ -263,6 +243,47 @@ func (s *nodeDecommissionWaitType) Set(value string) error {
 	default:
 		return fmt.Errorf("invalid node decommission parameter: %s "+
 			"(possible values: all, none)", value)
+	}
+	return nil
+}
+
+type nodeDecommissionCheckMode int
+
+const (
+	nodeDecommissionChecksSkip nodeDecommissionCheckMode = iota
+	nodeDecommissionChecksEnabled
+	nodeDecommissionChecksStrict
+)
+
+// Type implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) String() string {
+	switch *s {
+	case nodeDecommissionChecksSkip:
+		return "skip"
+	case nodeDecommissionChecksEnabled:
+		return "enabled"
+	case nodeDecommissionChecksStrict:
+		return "strict"
+	default:
+		panic("unexpected node decommission check mode (possible values: enabled, strict, skip)")
+	}
+}
+
+// Set implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Set(value string) error {
+	switch value {
+	case "skip":
+		*s = nodeDecommissionChecksSkip
+	case "enabled":
+		*s = nodeDecommissionChecksEnabled
+	case "strict":
+		*s = nodeDecommissionChecksStrict
+	default:
+		return fmt.Errorf("invalid node decommission parameter: %s "+
+			"(possible values: enabled, strict, skip)", value)
 	}
 	return nil
 }
@@ -330,15 +351,20 @@ func diskPercentResolverFactory(dir string) (percentResolverFunc, error) {
 	}, nil
 }
 
-// newBytesOrPercentageValue creates a bytesOrPercentageValue.
+// makeBytesOrPercentageValue creates a bytesOrPercentageValue.
 //
 // v and percentResolver can be nil (either they're both specified or they're
 // both nil). If they're nil, then Resolve() has to be called later to get the
 // passed-in value.
-func newBytesOrPercentageValue(
+//
+// When using this function, be sure to define the flag Value in a
+// context struct (in context.go) and place the call to
+// makeBytesOrPercentageValue() in one of the context init
+// functions. Do not use global-scope variables.
+func makeBytesOrPercentageValue(
 	v *int64, percentResolver func(percent int) (int64, error),
-) *bytesOrPercentageValue {
-	return &bytesOrPercentageValue{
+) bytesOrPercentageValue {
+	return bytesOrPercentageValue{
 		bval:            humanizeutil.NewBytesValue(v),
 		percentResolver: percentResolver,
 	}

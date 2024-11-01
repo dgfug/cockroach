@@ -1,0 +1,31 @@
+// Copyright 2023 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+@import "src/core/index.module";
+
+.crl-job-profiler-view {
+    &__actions-column {
+        display: flex;
+        flex-direction: row;
+        flex-wrap: nowrap;
+        justify-content: flex-end;
+    }
+}
+
+.column-size-medium {
+    width: 230px;
+}
+
+.download-execution-detail-button {
+    white-space: nowrap;
+
+    >svg {
+        margin-right: $spacing-x-small;
+    }
+}
+
+.full-width {
+  width: 100%;
+}

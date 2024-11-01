@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /**
  * MetricQuery Components
@@ -29,39 +24,22 @@
  * combine it with the result of a query to create some renderable output.
  */
 
-import React from "react";
-import * as protos from "src/js/protos";
+// We use the `Metric` and `Axis` classes data containers, not for rendering.
+/* eslint react/require-render-return: "off" */
 
+import { AxisUnits, TimeScale } from "@cockroachlabs/cluster-ui";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client-ccl";
+import { History } from "history";
+import Long from "long";
+import React from "react";
+
+import { PayloadAction } from "src/interfaces/action";
+import * as protos from "src/js/protos";
+import { TimeWindow } from "src/redux/timeScale";
+
+import TimeSeriesQueryDerivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative;
 type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 import TimeSeriesQueryAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator;
-import TimeSeriesQueryDerivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative;
-import Long from "long";
-import { History } from "history";
-import { TimeWindow, TimeScale } from "src/redux/timewindow";
-import { PayloadAction } from "src/interfaces/action";
-
-/**
- * AxisUnits is an enumeration used to specify the type of units being displayed
- * on an Axis.
- */
-export enum AxisUnits {
-  /**
-   * Units are a simple count.
-   */
-  Count,
-  /**
-   * Units are a count of bytes.
-   */
-  Bytes,
-  /**
-   * Units are durations expressed in nanoseconds.
-   */
-  Duration,
-  /**
-   * Units are percentages expressed as fractional values of 1 (1.0 = 100%).
-   */
-  Percentage,
-}
 
 /**
  * AxisProps represents the properties of an Axis being specified as part of a
@@ -86,7 +64,6 @@ export class Axis extends React.Component<AxisProps, {}> {
     units: AxisUnits.Count,
   };
 
-  // eslint-disable-next-line react/require-render-return
   render(): React.ReactElement<any> {
     throw new Error("Component <Axis /> should never render.");
   }
@@ -109,8 +86,22 @@ export class Axis extends React.Component<AxisProps, {}> {
 export interface MetricProps {
   name: string;
   sources?: string[];
+  tenantSource?: string;
   title?: string;
   rate?: boolean;
+  color?: string;
+
+  // How much to multiply the value of the underlying metric, for example if the
+  // metric was a duration stored in seconds you'd need a scale of 1_000_000_000
+  // to convert it to our Duration format which assumes Nanoseconds.
+  scale?: number;
+
+  // Transform is a function that can be applied to the datapoints of the metric
+  // and applies BEFORE scaling
+  transform?: (
+    d: cockroach.ts.tspb.TimeSeriesQueryResponse.IResult["datapoints"],
+  ) => cockroach.ts.tspb.TimeSeriesQueryResponse.IResult["datapoints"];
+
   nonNegativeRate?: boolean;
   aggregateMax?: boolean;
   aggregateMin?: boolean;
@@ -130,7 +121,6 @@ export interface MetricProps {
  * without rendering them.
  */
 export class Metric extends React.Component<MetricProps> {
-  // eslint-disable-next-line react/require-render-return
   render(): React.ReactElement<any> {
     throw new Error("Component <Metric /> should never render.");
   }
@@ -160,7 +150,8 @@ export interface MetricsDataComponentProps {
   // convenient syntax for a common use case where all metrics on a graph are
   // are from the same source set.
   sources?: string[];
-  setTimeRange?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
+  tenantSource?: string;
+  setMetricsFixedWindow?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
   setTimeScale?: (ts: TimeScale) => PayloadAction<TimeScale>;
   history?: History;
   adjustTimeScaleOnChange?: (

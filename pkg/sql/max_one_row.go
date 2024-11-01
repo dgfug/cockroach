@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -57,7 +52,7 @@ func (m *max1RowNode) Next(params runParams) (bool, error) {
 		var secondOk bool
 		secondOk, err = m.plan.Next(params)
 		if secondOk {
-			// TODO(knz): m.errorText could be passed via log.Safe if there
+			// TODO(knz): m.errorText could be passed via redact.Safe if there
 			// was a guarantee that it does not contain PII. Or better yet,
 			// the caller would construct an `error` object to return here
 			// instead of a string.

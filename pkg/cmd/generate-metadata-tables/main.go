@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This connects to Postgresql and retrieves all the information about
 // the tables in the pg_catalog schema. The result is printed into a
@@ -20,7 +15,8 @@
 // --catalog: can be pg_catalog or information_schema. Default is pg_catalog
 // --rdbms:   can be postgres or mysql. Default is postgres
 // --stdout:  for testing purposes, use this flag to send the output to the
-//            console
+//
+//	console
 //
 // Output of this file should generate (If not using --stout):
 // pkg/sql/testdata/<catalog>_tables_from_<rdbms>.json

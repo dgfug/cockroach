@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package inverted
 
@@ -16,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -80,13 +76,13 @@ type UnknownExpression struct {
 	tight bool
 }
 
-func (u UnknownExpression) IsTight() bool { return u.tight }
-func (u UnknownExpression) SetNotTight()  { u.tight = false }
-func (u UnknownExpression) String() string {
+func (u *UnknownExpression) IsTight() bool { return u.tight }
+func (u *UnknownExpression) SetNotTight()  { u.tight = false }
+func (u *UnknownExpression) String() string {
 	return fmt.Sprintf("unknown expression: tight=%t", u.tight)
 }
-func (u UnknownExpression) Copy() Expression {
-	return UnknownExpression{tight: u.tight}
+func (u *UnknownExpression) Copy() Expression {
+	return &UnknownExpression{tight: u.tight}
 }
 
 // Makes a (shallow) copy of the root node of the expression identified
@@ -112,8 +108,8 @@ func getExprCopy(
 		}
 	case NonInvertedColExpression:
 		return NonInvertedColExpression{}
-	case UnknownExpression:
-		return UnknownExpression{tight: e.tight}
+	case *UnknownExpression:
+		return &UnknownExpression{tight: e.tight}
 	default:
 		d.Fatalf(t, "unknown expr type")
 		return nil
@@ -122,7 +118,7 @@ func getExprCopy(
 
 func toString(expr Expression) string {
 	tp := treeprinter.New()
-	formatExpression(tp, expr, true /* includeSpansToRead */)
+	formatExpression(tp, expr, true /* includeSpansToRead */, false /* redactable */)
 	return tp.String()
 }
 
@@ -139,7 +135,7 @@ func TestExpression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	exprsByName := make(map[string]Expression)
 
-	datadriven.RunTest(t, "testdata/expression", func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "expression"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "new-span-leaf":
 			var name string
@@ -157,7 +153,7 @@ func TestExpression(t *testing.T) {
 			d.ScanArgs(t, "name", &name)
 			var tight bool
 			d.ScanArgs(t, "tight", &tight)
-			expr := UnknownExpression{tight: tight}
+			expr := &UnknownExpression{tight: tight}
 			exprsByName[name] = expr
 			return fmt.Sprintf("%v", expr)
 		case "new-non-inverted-leaf":

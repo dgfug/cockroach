@@ -1,19 +1,24 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
 import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/lib/pq/oid"
 )
 
 func (s *Smither) makeStmt() (stmt tree.Statement, ok bool) {
@@ -95,14 +100,15 @@ var (
 		{10, makeInsert},
 		{10, makeDelete},
 		{10, makeUpdate},
-		{1, makeAlter},
+		{2, makeAlter},
 		{1, makeBegin},
-		{2, makeRollback},
-		{6, makeCommit},
+		{1, makeRollback},
+		{2, makeCommit},
 		{1, makeBackup},
 		{1, makeRestore},
 		{1, makeExport},
 		{1, makeImport},
+		{1, makeCreateStats},
 	}
 	nonMutatingStatements = []statementWeight{
 		{10, makeSelect},
@@ -121,11 +127,6 @@ var (
 		{10, makeJoinExpr},
 		{1, makeValuesTable},
 		{2, makeSelectTable},
-	}
-	vectorizableTableExprs = []tableExprWeight{
-		{20, makeEquiJoinExpr},
-		{20, makeMergeJoinExpr},
-		{20, makeSchemaTable},
 	}
 	allTableExprs = append(mutatingTableExprs, nonMutatingTableExprs...)
 
@@ -171,11 +172,16 @@ var joinTypes = []string{
 	tree.AstFull,
 	tree.AstLeft,
 	tree.AstRight,
-	tree.AstCross,
 	tree.AstInner,
+	// Please keep AstCross as the last item as the Smither.disableCrossJoins
+	// option depends on this in order to avoid cross joins.
+	tree.AstCross,
 }
 
 func makeJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	if s.disableJoins {
+		return nil, nil, false
+	}
 	left, leftRefs, ok := makeTableExpr(s, refs, true)
 	if !ok {
 		return nil, nil, false
@@ -184,20 +190,119 @@ func makeJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRe
 	if !ok {
 		return nil, nil, false
 	}
-
+	maxJoinType := len(joinTypes)
+	if s.disableCrossJoins {
+		maxJoinType = len(joinTypes) - 1
+	}
 	joinExpr := &tree.JoinTableExpr{
-		JoinType: joinTypes[s.rnd.Intn(len(joinTypes))],
+		JoinType: joinTypes[s.rnd.Intn(maxJoinType)],
 		Left:     left,
 		Right:    right,
 	}
 
-	if joinExpr.JoinType != tree.AstCross {
-		on := makeBoolExpr(s, refs)
+	if s.disableCrossJoins {
+		if available, ok := getAvailablePairedColsForJoinPreds(s, leftRefs, rightRefs); ok {
+			cond := makeAndedJoinCond(s, available, false /* onlyEqualityPreds */)
+			joinExpr.Cond = &tree.OnJoinCond{Expr: cond}
+		}
+	}
+	if joinExpr.Cond == nil && joinExpr.JoinType != tree.AstCross {
+		var allRefs colRefs
+		// We used to make an ON clause only out of projected columns.
+		// Now we consider all left and right input relation columns.
+		allRefs = make(colRefs, 0, len(leftRefs)+len(rightRefs))
+		allRefs = append(allRefs, leftRefs...)
+		allRefs = append(allRefs, rightRefs...)
+		on := makeBoolExpr(s, allRefs)
 		joinExpr.Cond = &tree.OnJoinCond{Expr: on}
 	}
 	joinRefs := leftRefs.extend(rightRefs...)
 
 	return joinExpr, joinRefs, true
+}
+
+func getAvailablePairedColsForJoinPreds(
+	s *Smither, leftRefs colRefs, rightRefs colRefs,
+) (available [][2]tree.TypedExpr, ok bool) {
+
+	// Determine overlapping types.
+	for _, leftCol := range leftRefs {
+		for _, rightCol := range rightRefs {
+			// Don't compare non-scalar types. This avoids trying to
+			// compare types like arrays of tuples, tuple[], which
+			// cannot be compared. However, it also avoids comparing
+			// some types that can be compared, like arrays.
+			if !s.isScalarType(leftCol.typ) || !s.isScalarType(rightCol.typ) {
+				continue
+			}
+			if s.disableCrossJoins && (leftCol.typ.Family() == types.OidFamily ||
+				rightCol.typ.Family() == types.OidFamily) {
+				// In smithtests, values in OID columns may have a large number of
+				// duplicates. Avoid generating join predicates on these columns to
+				// prevent what are essentially cross joins, which may time out.
+				// TODO(msirek): Improve the Smither's ability to find and insert valid
+				//               OIDs, so this rule can be removed.
+				continue
+			}
+
+			if leftCol.typ.Equivalent(rightCol.typ) {
+				available = append(available, [2]tree.TypedExpr{
+					typedParen(leftCol.item, leftCol.typ),
+					typedParen(rightCol.item, rightCol.typ),
+				})
+			}
+		}
+	}
+	if len(available) == 0 {
+		// left and right didn't have any columns with the same type.
+		return nil, false
+	}
+	s.rnd.Shuffle(len(available), func(i, j int) {
+		available[i], available[j] = available[j], available[i]
+	})
+
+	return available, true
+}
+
+// makeAndedJoinCond makes a join predicate for each left/right pair of columns
+// in `available` and ANDs them together. Typically these expression pairs are
+// column pairs, but really they could be any pair of expressions. If
+// `onlyEqualityPreds` is true, only equijoin predicates such as `c1 = c2` are
+// generated, otherwise we probabilistically choose between operators `=`, `>`,
+// `<`, `>=`, `<=` and `<>`, except for the first generated predicate, which
+// always uses `=`.
+func makeAndedJoinCond(
+	s *Smither, available [][2]tree.TypedExpr, onlyEqualityPreds bool,
+) tree.TypedExpr {
+	var otherOps []treecmp.ComparisonOperatorSymbol
+	if !onlyEqualityPreds {
+		otherOps = make([]treecmp.ComparisonOperatorSymbol, 0, 5)
+		otherOps = append(otherOps, treecmp.LT)
+		otherOps = append(otherOps, treecmp.GT)
+		otherOps = append(otherOps, treecmp.LE)
+		otherOps = append(otherOps, treecmp.GE)
+		otherOps = append(otherOps, treecmp.NE)
+	}
+	var cond tree.TypedExpr
+	for (cond == nil || s.coin()) && len(available) > 0 {
+		v := available[0]
+		available = available[1:]
+		var expr *tree.ComparisonExpr
+		_, expressionsAreComparable := tree.CmpOps[treecmp.LT].LookupImpl(v[0].ResolvedType(), v[1].ResolvedType())
+		useEQ := cond == nil || onlyEqualityPreds || !expressionsAreComparable || s.coin()
+		if useEQ {
+			expr = tree.NewTypedComparisonExpr(treecmp.MakeComparisonOperator(treecmp.EQ), v[0], v[1])
+		} else {
+			idx := s.rnd.Intn(len(otherOps))
+			expr = tree.NewTypedComparisonExpr(treecmp.MakeComparisonOperator(otherOps[idx]), v[0], v[1])
+		}
+		if cond == nil {
+			cond = expr
+		} else {
+			cond = tree.NewTypedAndExpr(cond, expr)
+		}
+	}
+	return cond
 }
 
 func makeEquiJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -210,46 +315,26 @@ func makeEquiJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, c
 		return nil, nil, false
 	}
 
+	s.lock.RLock()
+	defer s.lock.RUnlock()
 	// Determine overlapping types.
-	var available [][2]tree.TypedExpr
-	for _, leftCol := range leftRefs {
-		for _, rightCol := range rightRefs {
-			if leftCol.typ.Equivalent(rightCol.typ) {
-				available = append(available, [2]tree.TypedExpr{
-					typedParen(leftCol.item, leftCol.typ),
-					typedParen(rightCol.item, rightCol.typ),
-				})
-			}
-		}
-	}
-	if len(available) == 0 {
+	available, ok := getAvailablePairedColsForJoinPreds(s, leftRefs, rightRefs)
+	if !ok {
 		// left and right didn't have any columns with the same type.
 		return nil, nil, false
 	}
 
-	s.rnd.Shuffle(len(available), func(i, j int) {
-		available[i], available[j] = available[j], available[i]
-	})
-
-	var cond tree.TypedExpr
-	for (cond == nil || s.coin()) && len(available) > 0 {
-		v := available[0]
-		available = available[1:]
-		expr := tree.NewTypedComparisonExpr(tree.MakeComparisonOperator(tree.EQ), v[0], v[1])
-		if cond == nil {
-			cond = expr
-		} else {
-			cond = tree.NewTypedAndExpr(cond, expr)
-		}
-	}
-
+	cond := makeAndedJoinCond(s, available, true /* onlyEqualityPreds */)
 	joinExpr := &tree.JoinTableExpr{
 		Left:  left,
 		Right: right,
 		Cond:  &tree.OnJoinCond{Expr: cond},
 	}
 	joinRefs := leftRefs.extend(rightRefs...)
-	return joinExpr, joinRefs, true
+	// If we have a nil cond, then we didn't succeed in generating this join
+	// expr.
+	ok = cond != nil
+	return joinExpr, joinRefs, ok
 }
 
 func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -270,16 +355,31 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 	rightAliasName := tree.NewUnqualifiedTableName(rightAlias)
 
 	// Now look for one that satisfies our constraints (some shared prefix
-	// of type + direction), might end up being the same one. We rely on
-	// Go's non-deterministic map iteration ordering for randomness.
-	rightTableName, cols := func() (*tree.TableIndexName, [][2]colRef) {
+	// of type + direction), might end up being the same one.
+	rightTableName, cols, ok := func() (*tree.TableIndexName, [][2]colRef, bool) {
 		s.lock.RLock()
 		defer s.lock.RUnlock()
-		for tbl, idxs := range s.indexes {
-			for idxName, idx := range idxs {
+		if len(s.tables) == 0 {
+			return nil, nil, false
+		}
+		// Iterate in deterministic but random order over all tables.
+		tableNames := make([]tree.TableName, 0, len(s.tables))
+		for t := range s.indexes {
+			tableNames = append(tableNames, t)
+		}
+		sort.Slice(tableNames, func(i, j int) bool {
+			return strings.Compare(tableNames[i].String(), tableNames[j].String()) < 0
+		})
+		s.rnd.Shuffle(len(tableNames), func(i, j int) {
+			tableNames[i], tableNames[j] = tableNames[j], tableNames[i]
+		})
+		for _, tbl := range tableNames {
+			// Iterate in deterministic but random order over all indexes.
+			idxs := s.getAllIndexesForTableRLocked(tbl)
+			for _, idx := range idxs {
 				rightTableName := &tree.TableIndexName{
 					Table: tbl,
-					Index: tree.UnrestrictedName(idxName),
+					Index: tree.UnrestrictedName(idx.Name),
 				}
 				// cols keeps track of matching column pairs.
 				var cols [][2]colRef
@@ -299,13 +399,22 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 					if !tree.MustBeStaticallyKnownType(rightCol.Type).Equivalent(tree.MustBeStaticallyKnownType(leftCol.Type)) {
 						break
 					}
+					leftType := tree.MustBeStaticallyKnownType(leftCol.Type)
+					rightType := tree.MustBeStaticallyKnownType(rightCol.Type)
+					// Don't compare non-scalar types. This avoids trying to
+					// compare types like arrays of tuples, tuple[], which
+					// cannot be compared. However, it also avoids comparing
+					// some types that can be compared, like arrays.
+					if !s.isScalarType(leftType) || !s.isScalarType(rightType) {
+						break
+					}
 					cols = append(cols, [2]colRef{
 						{
-							typ:  tree.MustBeStaticallyKnownType(leftCol.Type),
+							typ:  leftType,
 							item: tree.NewColumnItem(leftAliasName, leftColElem.Column),
 						},
 						{
-							typ:  tree.MustBeStaticallyKnownType(rightCol.Type),
+							typ:  rightType,
 							item: tree.NewColumnItem(rightAliasName, rightColElem.Column),
 						},
 					})
@@ -314,13 +423,15 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 					}
 				}
 				if len(cols) > 0 {
-					return rightTableName, cols
+					return rightTableName, cols, true
 				}
 			}
 		}
-		// Since we can always match leftIdx we should never get here.
-		panic("unreachable")
+		return nil, nil, false
 	}()
+	if !ok {
+		return nil, nil, false
+	}
 
 	// joinRefs are limited to columns in the indexes (even if they don't
 	// appear in the join condition) because non-stored columns will cause
@@ -337,7 +448,7 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 		v := cols[0]
 		cols = cols[1:]
 		expr := tree.NewTypedComparisonExpr(
-			tree.MakeComparisonOperator(tree.EQ),
+			treecmp.MakeComparisonOperator(treecmp.EQ),
 			typedParen(v[0].item, v[0].typ),
 			typedParen(v[1].item, v[1].typ),
 		)
@@ -359,7 +470,10 @@ func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, col
 		},
 		Cond: &tree.OnJoinCond{Expr: cond},
 	}
-	return joinExpr, joinRefs, true
+	// If we have a nil cond, then we didn't succeed in generating this join
+	// expr.
+	ok = cond != nil
+	return joinExpr, joinRefs, ok
 }
 
 // STATEMENTS
@@ -388,11 +502,11 @@ func (s *Smither) makeWith() (*tree.With, tableRefs) {
 		}
 		alias := s.name("with")
 		tblName := tree.NewUnqualifiedTableName(alias)
-		cols := make(tree.NameList, len(stmtRefs))
+		cols := make(tree.ColumnDefList, len(stmtRefs))
 		defs := make([]*tree.ColumnTableDef, len(stmtRefs))
 		for i, r := range stmtRefs {
 			var err error
-			cols[i] = r.item.ColumnName
+			cols[i].Name = r.item.ColumnName
 			defs[i], err = tree.NewColumnTableDef(r.item.ColumnName, r.typ, false /* isSerial */, nil)
 			if err != nil {
 				panic(err)
@@ -425,6 +539,16 @@ func (s *Smither) randDirection() tree.Direction {
 	return orderDirections[s.rnd.Intn(len(orderDirections))]
 }
 
+var nullsOrders = []tree.NullsOrder{
+	tree.DefaultNullsOrder,
+	tree.NullsFirst,
+	tree.NullsLast,
+}
+
+func (s *Smither) randNullsOrder() tree.NullsOrder {
+	return nullsOrders[s.rnd.Intn(len(nullsOrders))]
+}
+
 var nullabilities = []tree.Nullability{
 	tree.NotNull,
 	tree.Null,
@@ -445,21 +569,29 @@ func (s *Smither) randDropBehavior() tree.DropBehavior {
 	return dropBehaviors[s.rnd.Intn(len(dropBehaviors))]
 }
 
-var stringComparisons = []tree.ComparisonOperatorSymbol{
-	tree.Like,
-	tree.NotLike,
-	tree.ILike,
-	tree.NotILike,
-	tree.SimilarTo,
-	tree.NotSimilarTo,
-	tree.RegMatch,
-	tree.NotRegMatch,
-	tree.RegIMatch,
-	tree.NotRegIMatch,
+func (s *Smither) randDropBehaviorNoCascade() tree.DropBehavior {
+	if s.d6() < 3 {
+		// Make RESTRICT twice less likely than DEFAULT.
+		return tree.DropRestrict
+	}
+	return tree.DropDefault
 }
 
-func (s *Smither) randStringComparison() tree.ComparisonOperator {
-	return tree.MakeComparisonOperator(stringComparisons[s.rnd.Intn(len(stringComparisons))])
+var stringComparisons = []treecmp.ComparisonOperatorSymbol{
+	treecmp.Like,
+	treecmp.NotLike,
+	treecmp.ILike,
+	treecmp.NotILike,
+	treecmp.SimilarTo,
+	treecmp.NotSimilarTo,
+	treecmp.RegMatch,
+	treecmp.NotRegMatch,
+	treecmp.RegIMatch,
+	treecmp.NotRegIMatch,
+}
+
+func (s *Smither) randStringComparison() treecmp.ComparisonOperator {
+	return treecmp.MakeComparisonOperator(stringComparisons[s.rnd.Intn(len(stringComparisons))])
 }
 
 // makeSelectTable returns a TableExpr of the form `(SELECT ...)`, which
@@ -471,15 +603,15 @@ func makeSelectTable(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, co
 	}
 
 	table := s.name("tab")
-	names := make(tree.NameList, len(stmtRefs))
+	names := make(tree.ColumnDefList, len(stmtRefs))
 	clauseRefs := make(colRefs, len(stmtRefs))
 	for i, ref := range stmtRefs {
-		names[i] = s.name("col")
+		names[i].Name = s.name("col")
 		clauseRefs[i] = &colRef{
 			typ: ref.typ,
 			item: tree.NewColumnItem(
 				tree.NewUnqualifiedTableName(table),
-				names[i],
+				names[i].Name,
 			),
 		}
 	}
@@ -513,8 +645,10 @@ func (s *Smither) makeSelectClause(
 
 	var fromRefs colRefs
 	// Sometimes generate a SELECT with no FROM clause.
-	requireFrom := s.vectorizable || s.d6() != 1
-	for (requireFrom && len(clause.From.Tables) < 1) || s.canRecurse() {
+	requireFrom := s.d6() != 1
+	hasJoinTable := false
+	for (requireFrom && len(clause.From.Tables) < 1) ||
+		(!s.disableCrossJoins && s.canRecurse()) {
 		var from tree.TableExpr
 		if len(withTables) == 0 || s.coin() {
 			// Add a normal data source.
@@ -523,6 +657,9 @@ func (s *Smither) makeSelectClause(
 				return nil, nil, nil, false
 			}
 			from = source
+			if _, ok = source.(*tree.JoinTableExpr); ok {
+				hasJoinTable = true
+			}
 			fromRefs = append(fromRefs, sourceRefs...)
 		} else {
 			// Add a CTE reference.
@@ -540,7 +677,11 @@ func (s *Smither) makeSelectClause(
 		}
 		clause.From.Tables = append(clause.From.Tables, from)
 		// Restrict so that we don't have a crazy amount of rows due to many joins.
-		if len(clause.From.Tables) >= 4 {
+		tableLimit := 4
+		if s.disableJoins {
+			tableLimit = 1
+		}
+		if len(clause.From.Tables) >= tableLimit {
 			break
 		}
 	}
@@ -549,14 +690,11 @@ func (s *Smither) makeSelectClause(
 	ctx := emptyCtx
 
 	if len(clause.From.Tables) > 0 {
-		clause.Where = s.makeWhere(fromRefs)
+		clause.Where = s.makeWhere(fromRefs, hasJoinTable)
 		orderByRefs = fromRefs
 		selectListRefs = selectListRefs.extend(fromRefs...)
 
-		// TODO(mjibson): vec only supports GROUP BYs on fully-ordered
-		// columns, which we could support here. Also see #39240 which
-		// will support this more generally.
-		if !s.vectorizable && s.d6() <= 2 && s.canRecurse() {
+		if s.d6() <= 2 && s.canRecurse() {
 			// Enable GROUP BY. Choose some random subset of the
 			// fromRefs.
 			// TODO(mjibson): Refence handling and aggregation functions
@@ -602,17 +740,6 @@ func (s *Smither) makeSelectClause(
 	}
 	clause.Exprs = selectList
 
-	// TODO(mjibson): Vectorized only supports ordered distinct, and so
-	// this often produces queries that won't vec. However since it will
-	// also sometimes produce vec queries with the distinctChainOps node,
-	// we allow this here. Teach this how to correctly limit itself to
-	// distinct only on ordered columns.
-	if s.d100() == 1 {
-		clause.Distinct = true
-		// For SELECT DISTINCT, ORDER BY expressions must appear in select list.
-		orderByRefs = selectRefs
-	}
-
 	return clause, selectRefs, orderByRefs, true
 }
 
@@ -654,7 +781,7 @@ func (s *Smither) makeOrderedAggregate() (
 		From: tree.From{
 			Tables: tree.TableExprs{tableExpr},
 		},
-		Where:   s.makeWhere(tableColRefs),
+		Where:   s.makeWhere(tableColRefs, false /* hasJoinTable */),
 		GroupBy: groupBy,
 		Having:  s.makeHaving(idxRefs),
 	}, selectRefs, idxRefs, true
@@ -671,7 +798,7 @@ var countStar = func() tree.TypedExpr {
 		nil, /* window */
 		typ,
 		&fn.FunctionProperties,
-		fn.Definition[0].(*tree.Overload),
+		fn.Definition[0],
 	)
 }()
 
@@ -684,14 +811,14 @@ func makeSelect(s *Smither) (tree.Statement, bool) {
 		order := make(tree.OrderBy, len(refs))
 		for i, r := range refs {
 			var expr tree.Expr = r.item
-			// PostGIS cannot order box2d types, so we cast to string so the
-			// order is deterministic.
-			if s.postgres && r.typ.Family() == types.Box2DFamily {
+			if !s.isOrderable(r.typ) {
+				// Cast to string so the order is deterministic.
 				expr = &tree.CastExpr{Expr: r.item, Type: types.String}
 			}
 			order[i] = &tree.Order{
 				Expr:       expr,
-				NullsOrder: tree.NullsFirst,
+				Direction:  s.randDirection(),
+				NullsOrder: s.randNullsOrder(),
 			}
 		}
 		stmt = &tree.Select{
@@ -728,11 +855,24 @@ func (s *Smither) makeSelect(desiredTypes []*types.T, refs colRefs) (*tree.Selec
 		return nil, nil, ok
 	}
 
+	var orderBy tree.OrderBy
+	limit := makeLimit(s)
+	if limit != nil && s.disableNondeterministicLimits {
+		// The ORDER BY clause must be fully specified with all select list columns
+		// in order to make a LIMIT clause deterministic.
+		orderBy, ok = s.makeOrderByWithAllCols(orderByRefs.extend(selectRefs...))
+		if !ok {
+			return nil, nil, false
+		}
+	} else {
+		orderBy = s.makeOrderBy(orderByRefs)
+	}
+
 	stmt := tree.Select{
 		Select:  clause,
 		With:    withStmt,
-		OrderBy: s.makeOrderBy(orderByRefs),
-		Limit:   makeLimit(s),
+		OrderBy: orderBy,
+		Limit:   limit,
 	}
 
 	return &stmt, selectRefs, true
@@ -769,29 +909,405 @@ func (s *Smither) makeSelectList(
 	return result, selectRefs, true
 }
 
+func makeCreateFunc(s *Smither) (tree.Statement, bool) {
+	if s.disableUDFCreation {
+		return nil, false
+	}
+	return s.makeCreateFunc()
+}
+
+func makeDropFunc(s *Smither) (tree.Statement, bool) {
+	if s.disableUDFCreation {
+		return nil, false
+	}
+	functions.Lock()
+	defer functions.Unlock()
+	class := tree.NormalClass
+	if s.d6() < 3 {
+		class = tree.GeneratorClass
+	}
+	// fns is a map from return type OID to the list of function overloads.
+	fns := functions.fns[class]
+	if len(fns) == 0 {
+		return nil, false
+	}
+	retOIDs := make([]oid.Oid, 0, len(fns))
+	for oid := range fns {
+		retOIDs = append(retOIDs, oid)
+	}
+	// Sort the slice since iterating over fns is non-deterministic.
+	sort.Slice(retOIDs, func(i, j int) bool {
+		return retOIDs[i] < retOIDs[j]
+	})
+	// Pick a random starting point within the list of OIDs.
+	oidShift := s.rnd.Intn(len(retOIDs))
+	for i := 0; i < len(retOIDs); i++ {
+		oidPos := (i + oidShift) % len(retOIDs)
+		overloads := fns[retOIDs[oidPos]]
+		// Pick a random starting point within the list of overloads.
+		ovShift := s.rnd.Intn(len(overloads))
+		for j := 0; j < len(overloads); j++ {
+			fn := overloads[(j+ovShift)%len(overloads)]
+			if fn.overload.Type == tree.UDFRoutine {
+				routineObj := tree.RoutineObj{
+					FuncName: tree.MakeRoutineNameFromPrefix(tree.ObjectNamePrefix{}, tree.Name(fn.def.Name)),
+				}
+				if s.coin() {
+					// Sometimes simulate omitting the parameter specification,
+					// sometimes specify all parameters.
+					routineObj.Params = fn.overload.RoutineParams
+				}
+				return &tree.DropRoutine{
+					IfExists:  s.d6() < 3,
+					Procedure: false,
+					Routines:  tree.RoutineObjs{routineObj},
+					// TODO(#101380): use s.randDropBehavior() once DROP
+					// FUNCTION CASCADE is implemented.
+					DropBehavior: s.randDropBehaviorNoCascade(),
+				}, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (s *Smither) makeCreateFunc() (cf *tree.CreateRoutine, ok bool) {
+	fname := s.name("func")
+	name := tree.MakeRoutineNameFromPrefix(tree.ObjectNamePrefix{}, fname)
+
+	// There are up to 5 function options that may be applied to UDFs.
+	var opts tree.RoutineOptions
+	opts = make(tree.RoutineOptions, 0, 5)
+
+	// RoutineLanguage
+	lang := tree.RoutineLangSQL
+	if s.coin() {
+		lang = tree.RoutineLangPLpgSQL
+	}
+	opts = append(opts, lang)
+
+	// RoutineNullInputBehavior
+	// 50%: Do not specify behavior (default is RoutineCalledOnNullInput).
+	// ~17%: RoutineCalledOnNullInput
+	// ~17%: RoutineReturnsNullOnNullInput
+	// ~17%: RoutineStrict
+	switch s.d6() {
+	case 1:
+		opts = append(opts, tree.RoutineCalledOnNullInput)
+	case 2:
+		opts = append(opts, tree.RoutineReturnsNullOnNullInput)
+	case 3:
+		opts = append(opts, tree.RoutineStrict)
+	}
+
+	// RoutineVolatility
+	// 50%: Do not specify behavior (default is volatile).
+	// ~17%: RoutineVolatile
+	// ~17%: RoutineImmutable
+	// ~17%: RoutineStable
+	funcVol := tree.RoutineVolatile
+	vol := volatility.Volatile
+	switch s.d6() {
+	case 1:
+		funcVol = tree.RoutineImmutable
+		vol = volatility.Immutable
+	case 2:
+		funcVol = tree.RoutineStable
+		vol = volatility.Stable
+	}
+	if funcVol != tree.RoutineVolatile || s.coin() {
+		opts = append(opts, funcVol)
+	}
+
+	// RoutineLeakproof
+	// Leakproof can only be used with immutable volatility. If the function is
+	// immutable, also specify leakproof 50% of the time. Otherwise, specify
+	// not leakproof 50% of the time (default is not leakproof).
+	leakproof := false
+	if funcVol == tree.RoutineImmutable {
+		leakproof = s.coin()
+	}
+	if leakproof || s.coin() {
+		if leakproof {
+			vol = volatility.Leakproof
+		}
+		opts = append(opts, tree.RoutineLeakproof(leakproof))
+	}
+
+	// Determine the parameters before the RoutineBody, but after the language.
+	paramCnt := s.rnd.Intn(10)
+	if s.types == nil || len(s.types.scalarTypes) == 0 {
+		paramCnt = 0
+	}
+	var usedDefaultExpr bool
+	params := make(tree.RoutineParams, paramCnt)
+	paramTypes := make(tree.ParamTypes, paramCnt)
+	refs := make(colRefs, paramCnt)
+	for i := 0; i < paramCnt; i++ {
+		// Do not allow collated string types. These are not supported in UDFs.
+		// Do not allow RECORD-type parameters for PL/pgSQL routines.
+		// TODO(#105713): lift the RECORD-type restriction.
+		ptyp := s.randType()
+		for ptyp.Family() == types.CollatedStringFamily ||
+			(lang == tree.RoutineLangPLpgSQL && ptyp.Identical(types.AnyTuple)) {
+			ptyp = s.randType()
+		}
+		pname := fmt.Sprintf("p%d", i)
+		// TODO(88947): choose VARIADIC once supported too.
+		const numSupportedParamClasses = 4
+		params[i] = tree.RoutineParam{
+			Name:  tree.Name(pname),
+			Type:  ptyp,
+			Class: tree.RoutineParamClass(s.rnd.Intn(numSupportedParamClasses)),
+		}
+		if params[i].Class != tree.RoutineParamOut {
+			// OUT parameters aren't allowed to have DEFAULT expressions.
+			//
+			// If we already used a DEFAULT expression, then we must add one for
+			// this input parameter too. If we haven't already started using
+			// DEFAULT expressions, start with this parameter in 33% cases.
+			if usedDefaultExpr || s.d6() < 3 {
+				params[i].DefaultVal = makeScalar(s, ptyp, nil /* colRefs */)
+				usedDefaultExpr = true
+			}
+		}
+		paramTypes[i] = tree.ParamType{
+			Name: pname,
+			Typ:  ptyp,
+		}
+		refs[i] = &colRef{
+			typ: ptyp,
+			item: &tree.ColumnItem{
+				ColumnName: tree.Name(pname),
+			},
+		}
+	}
+
+	// Return a record 50% of the time, which means the UDF can return any number
+	// or type in its final SQL statement. Otherwise, pick a random type from
+	// this smither's available types.
+	rTyp := types.AnyTuple
+	if s.coin() {
+		// Do not allow collated string types. These are not supported in UDFs.
+		rTyp = s.randType()
+		for rTyp.Family() == types.CollatedStringFamily {
+			rTyp = s.randType()
+		}
+	}
+
+	// Disable CTEs temporarily, since they are not currently supported in UDFs.
+	// TODO(92961): Allow CTEs in generated statements in UDF bodies.
+	// TODO(93049): Allow UDFs to create other UDFs.
+	oldDisableWith := s.disableWith
+	oldDisableMutations := s.disableMutations
+	defer func() {
+		s.disableWith = oldDisableWith
+		s.disableUDFCreation = false
+		s.disableMutations = oldDisableMutations
+	}()
+	s.disableWith = true
+	s.disableUDFCreation = true
+	s.disableMutations = (funcVol != tree.RoutineVolatile) || s.disableMutations
+
+	// RoutineBodyStr
+	var body string
+	if lang == tree.RoutineLangSQL {
+		var stmtRefs colRefs
+		body, stmtRefs, ok = s.makeRoutineBodySQL(funcVol, refs, rTyp)
+		if !ok {
+			return nil, false
+		}
+		// If the rType isn't a RECORD, change it to stmtRefs or RECORD depending
+		// how many columns there are to avoid return type mismatch errors.
+		if !rTyp.Identical(types.AnyTuple) {
+			if len(stmtRefs) == 1 && s.coin() && stmtRefs[0].typ.Family() != types.CollatedStringFamily {
+				rTyp = stmtRefs[0].typ
+			} else {
+				rTyp = types.AnyTuple
+			}
+		}
+	} else {
+		plpgsqlRTyp := rTyp
+		if plpgsqlRTyp.Identical(types.AnyTuple) {
+			// If the return type is RECORD, choose a concrete type for generating
+			// RETURN statements.
+			numTyps := s.rnd.Intn(3) + 1
+			typs := make([]*types.T, numTyps)
+			for i := range typs {
+				typs[i] = s.randType()
+			}
+			plpgsqlRTyp = types.MakeTuple(typs)
+		}
+		body = s.makeRoutineBodyPLpgSQL(paramTypes, plpgsqlRTyp, funcVol)
+	}
+	opts = append(opts, tree.RoutineBodyStr(body))
+
+	// Return multiple rows with the SETOF option about 33% of the time.
+	// PL/pgSQL functions do not currently support SETOF.
+	setof := false
+	if lang == tree.RoutineLangSQL && s.d6() < 3 {
+		setof = true
+	}
+
+	stmt := &tree.CreateRoutine{
+		// TODO(yuzefovich): once we start generating procedures, we'll need to
+		// ensure that no OUT parameters are added after the first parameter
+		// with the DEFAULT expression.
+		Replace: s.coin(),
+		Name:    name,
+		Params:  params,
+		Options: opts,
+		ReturnType: &tree.RoutineReturnType{
+			Type:  rTyp,
+			SetOf: setof,
+		},
+	}
+
+	// Add this function to the functions list so that we can use it in future
+	// queries. Unfortunately, if the function fails to be created, then any
+	// queries that reference it will also fail.
+	class := tree.NormalClass
+	if setof {
+		class = tree.GeneratorClass
+	}
+
+	// We only add overload fields that are necessary to generate functions.
+	ov := &tree.Overload{
+		Volatility: vol,
+		Types:      paramTypes,
+		Class:      class,
+		Type:       tree.UDFRoutine,
+	}
+
+	functions.Lock()
+	functions.fns[class][rTyp.Oid()] = append(functions.fns[class][rTyp.Oid()], function{
+		def:      tree.NewFunctionDefinition(name.String(), &tree.FunctionProperties{}, nil /* def */),
+		overload: ov,
+	})
+	functions.Unlock()
+	return stmt, true
+}
+
+func (s *Smither) makeRoutineBodySQL(
+	vol tree.RoutineVolatility, refs colRefs, rTyp *types.T,
+) (body string, lastStmtRefs colRefs, ok bool) {
+	// Generate SQL statements for the function body. More than one may be
+	// generated, but only the result of the final statement will matter for
+	// the function return type. Use the RoutineBodyStr option so the statements
+	// are formatted correctly.
+	stmtCnt := s.rnd.Intn(11)
+	stmts := make([]string, 0, stmtCnt)
+	var stmt tree.Statement
+	for i := 0; i < stmtCnt-1; i++ {
+		stmt, ok = s.makeSQLStmtForRoutine(vol, refs)
+		if !ok {
+			continue
+		}
+		stmts = append(stmts, tree.AsStringWithFlags(stmt, tree.FmtParsable))
+	}
+	// The return type of the last statement should match the function return
+	// type.
+	// If mutations are enabled, also use anything from mutatingTableExprs -- needs returning
+	if s.disableMutations || vol != tree.RoutineVolatile || s.coin() {
+		stmt, lastStmtRefs, ok = s.makeSelect([]*types.T{rTyp}, refs)
+		if !ok {
+			return "", nil, false
+		}
+	} else {
+		var expr tree.TableExpr
+		switch s.d6() {
+		case 1, 2:
+			expr, lastStmtRefs, ok = s.makeInsertReturning(refs)
+		case 3, 4:
+			expr, lastStmtRefs, ok = s.makeDeleteReturning(refs)
+		case 5, 6:
+			expr, lastStmtRefs, ok = s.makeUpdateReturning(refs)
+		}
+		if !ok {
+			return "", nil, false
+		}
+		stmt = expr.(*tree.StatementSource).Statement
+	}
+	stmts = append(stmts, tree.AsStringWithFlags(stmt, tree.FmtParsable))
+	return "\n" + strings.Join(stmts, ";\n") + "\n", lastStmtRefs, true
+}
+
+func (s *Smither) makeSQLStmtForRoutine(
+	vol tree.RoutineVolatility, refs colRefs,
+) (stmt tree.Statement, ok bool) {
+	const numRetries = 5
+	for i := 0; i < numRetries; i++ {
+		if s.disableMutations || vol != tree.RoutineVolatile || s.coin() {
+			stmt, _, ok = s.makeSelect(nil /* desiredTypes */, refs)
+		} else {
+			switch s.d6() {
+			case 1, 2:
+				stmt, _, ok = s.makeInsert(refs)
+			case 3, 4:
+				stmt, _, ok = s.makeDelete(refs)
+			case 5, 6:
+				stmt, _, ok = s.makeUpdate(refs)
+			}
+		}
+		if ok {
+			return stmt, true
+		}
+	}
+	return nil, false
+}
+
 func makeDelete(s *Smither) (tree.Statement, bool) {
 	stmt, _, ok := s.makeDelete(nil)
 	return stmt, ok
 }
 
-func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
-	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, []*tableRef, bool) {
+	table, _, ref, cols, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
+	}
+	tRefs := []*tableRef{ref}
+
+	var hasJoinTable bool
+	var using tree.TableExprs
+	// With 50% probably add another table into the USING clause.
+	for s.coin() {
+		t, _, tRef, c, ok2 := s.getSchemaTable()
+		if !ok2 {
+			break
+		}
+		hasJoinTable = true
+		using = append(using, t)
+		tRefs = append(tRefs, tRef)
+		cols = append(cols, c...)
+	}
+
+	var orderBy tree.OrderBy
+	limit := makeLimit(s)
+	if limit != nil && s.disableNondeterministicLimits {
+		// The ORDER BY clause must be fully specified with all columns in order to
+		// make a LIMIT clause deterministic.
+		orderBy, ok = s.makeOrderByWithAllCols(cols)
+		if !ok {
+			return nil, nil, false
+		}
+	} else {
+		orderBy = s.makeOrderBy(cols)
 	}
 
 	del := &tree.Delete{
 		Table:     table,
-		Where:     s.makeWhere(tableRefs),
-		OrderBy:   s.makeOrderBy(tableRefs),
-		Limit:     makeLimit(s),
+		Where:     s.makeWhere(cols, hasJoinTable),
+		OrderBy:   orderBy,
+		Using:     using,
+		Limit:     limit,
 		Returning: &tree.NoReturningClause{},
 	}
 	if del.Limit == nil {
 		del.OrderBy = nil
 	}
 
-	return del, tableRef, true
+	return del, tRefs, true
 }
 
 func makeDeleteReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -818,38 +1334,70 @@ func makeUpdate(s *Smither) (tree.Statement, bool) {
 	return stmt, ok
 }
 
-func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
-	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, []*tableRef, bool) {
+	table, _, ref, cols, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
 	}
-	cols := make(map[tree.Name]*tree.ColumnTableDef)
-	for _, c := range tableRef.Columns {
-		cols[c.Name] = c
+	tRefs := []*tableRef{ref}
+	// Each column can be set at most once. Copy colRefs to upRefs - we will
+	// remove elements from it as we use them below.
+	//
+	// Note that we need to make this copy before we append columns from other
+	// tables added into the FROM clause below.
+	upRefs := cols.extend()
+
+	var hasJoinTable bool
+	var from tree.TableExprs
+	// With 50% probably add another table into the FROM clause.
+	for s.coin() {
+		t, _, tRef, c, ok2 := s.getSchemaTable()
+		if !ok2 {
+			break
+		}
+		hasJoinTable = true
+		from = append(from, t)
+		tRefs = append(tRefs, tRef)
+		cols = append(cols, c...)
+	}
+
+	var orderBy tree.OrderBy
+	limit := makeLimit(s)
+	if limit != nil && s.disableNondeterministicLimits {
+		// The ORDER BY clause must be fully specified with all columns in order to
+		// make a LIMIT clause deterministic.
+		orderBy, ok = s.makeOrderByWithAllCols(cols)
+		if !ok {
+			return nil, nil, false
+		}
+	} else {
+		orderBy = s.makeOrderBy(cols)
 	}
 
 	update := &tree.Update{
 		Table:     table,
-		Where:     s.makeWhere(tableRefs),
-		OrderBy:   s.makeOrderBy(tableRefs),
-		Limit:     makeLimit(s),
+		From:      from,
+		Where:     s.makeWhere(cols, hasJoinTable),
+		OrderBy:   orderBy,
+		Limit:     limit,
 		Returning: &tree.NoReturningClause{},
 	}
-	// Each row can be set at most once. Copy tableRefs to upRefs and remove
-	// elements from it as we use them.
-	upRefs := tableRefs.extend()
+	colByName := make(map[tree.Name]*tree.ColumnTableDef)
+	for _, c := range ref.Columns {
+		colByName[c.Name] = c
+	}
 	for (len(update.Exprs) < 1 || s.coin()) && len(upRefs) > 0 {
 		n := s.rnd.Intn(len(upRefs))
 		ref := upRefs[n]
 		upRefs = append(upRefs[:n], upRefs[n+1:]...)
-		col := cols[ref.item.ColumnName]
+		col := colByName[ref.item.ColumnName]
 		// Ignore computed and hidden columns.
 		if col == nil || col.Computed.Computed || col.Hidden {
 			continue
 		}
 		var expr tree.TypedExpr
 		for {
-			expr = makeScalar(s, ref.typ, tableRefs)
+			expr = makeScalar(s, ref.typ, cols)
 			// Make sure expr isn't null if that's not allowed.
 			if col.Nullable.Nullability != tree.NotNull || expr != tree.DNull {
 				break
@@ -867,7 +1415,7 @@ func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
 		update.OrderBy = nil
 	}
 
-	return update, tableRef, true
+	return update, tRefs, true
 }
 
 func makeUpdateReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -901,7 +1449,7 @@ func makeBegin(s *Smither) (tree.Statement, bool) {
 const letters = "abcdefghijklmnopqrstuvwxyz"
 
 func makeSavepoint(s *Smither) (tree.Statement, bool) {
-	savepointName := randgen.RandString(s.rnd, s.d9(), letters)
+	savepointName := util.RandString(s.rnd, s.d9(), letters)
 	s.activeSavepoints = append(s.activeSavepoints, savepointName)
 	return &tree.Savepoint{Name: tree.Name(savepointName)}, true
 }
@@ -954,11 +1502,17 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 	// Use DEFAULT VALUES only sometimes. A nil insert.Rows.Select indicates
 	// DEFAULT VALUES.
 	if s.d9() == 1 {
-		return insert, tableRef, true
+		if tableRef.insertDefaultsAllowed() {
+			return insert, tableRef, true
+		}
 	}
 
+	insertValues := true
+	if !s.disableInsertSelect {
+		insertValues = s.coin()
+	}
 	// Use a simple INSERT...VALUES statement some of the time.
-	if s.coin() {
+	if insertValues {
 		var names tree.NameList
 		var row tree.Exprs
 		for _, c := range tableRef.Columns {
@@ -971,7 +1525,14 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 			notNull := c.Nullable.Nullability == tree.NotNull
 			if notNull || s.coin() {
 				names = append(names, c.Name)
-				row = append(row, randgen.RandDatum(s.rnd, tree.MustBeStaticallyKnownType(c.Type), !notNull))
+				row = append(row,
+					randgen.RandDatumWithNullChance(
+						s.rnd,
+						tree.MustBeStaticallyKnownType(c.Type),
+						randgen.NullChance(!notNull),
+						s.favorCommonData,
+						c.Unique.IsUnique || c.PrimaryKey.IsPrimaryKey,
+					))
 			}
 		}
 
@@ -993,6 +1554,7 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 	var desiredTypes []*types.T
 	var names tree.NameList
 	unnamed := s.coin()
+	columnSkipped := false
 	for _, c := range tableRef.Columns {
 		// We *must* write a column if it's writable and non-nullable.
 		// We *can* write a column if it's writable and nullable.
@@ -1008,6 +1570,8 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 		if unnamed || c.Nullable.Nullability == tree.NotNull || s.coin() {
 			names = append(names, c.Name)
 			desiredTypes = append(desiredTypes, tree.MustBeStaticallyKnownType(c.Type))
+		} else {
+			columnSkipped = true
 		}
 	}
 
@@ -1015,7 +1579,7 @@ func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 		return nil, nil, false
 	}
 
-	if !unnamed {
+	if columnSkipped {
 		insert.Columns = names
 	}
 
@@ -1040,7 +1604,7 @@ func (s *Smither) makeInsertReturning(refs colRefs) (tree.TableExpr, colRefs, bo
 		return nil, nil, false
 	}
 	var returningRefs colRefs
-	insert.Returning, returningRefs = s.makeReturning(insertRef)
+	insert.Returning, returningRefs = s.makeReturning([]*tableRef{insertRef})
 	return &tree.StatementSource{
 		Statement: insert,
 	}, returningRefs, true
@@ -1066,15 +1630,15 @@ func makeValues(s *Smither, desiredTypes []*types.T, refs colRefs) (tree.TableEx
 		values.Rows[i] = tuple
 	}
 	table := s.name("tab")
-	names := make(tree.NameList, len(desiredTypes))
+	names := make(tree.ColumnDefList, len(desiredTypes))
 	valuesRefs := make(colRefs, len(desiredTypes))
 	for i, typ := range desiredTypes {
-		names[i] = s.name("col")
+		names[i].Name = s.name("col")
 		valuesRefs[i] = &colRef{
 			typ: typ,
 			item: tree.NewColumnItem(
 				tree.NewUnqualifiedTableName(table),
-				names[i],
+				names[i].Name,
 			),
 		}
 	}
@@ -1140,8 +1704,16 @@ func makeSetOp(
 	}, leftRefs, true
 }
 
-func (s *Smither) makeWhere(refs colRefs) *tree.Where {
-	if s.coin() {
+func (s *Smither) makeWhere(refs colRefs, hasJoinTable bool) *tree.Where {
+	var generateWhere bool
+	if s.lowProbWhereWithJoinTables && hasJoinTable {
+		// One out of 5 chance of generating a WHERE clause with join tables.
+		whereChance := 5
+		generateWhere = s.rnd.Intn(whereChance) == 0
+	} else {
+		generateWhere = s.coin()
+	}
+	if generateWhere {
 		where := makeBoolExpr(s, refs)
 		return tree.NewWhere("WHERE", where)
 	}
@@ -1156,6 +1728,20 @@ func (s *Smither) makeHaving(refs colRefs) *tree.Where {
 	return nil
 }
 
+func (s *Smither) isOrderable(typ *types.T) bool {
+	if s.postgres {
+		// PostGIS cannot order box2d types.
+		return typ.Family() != types.Box2DFamily
+	}
+	switch typ.Family() {
+	case types.TSQueryFamily, types.TSVectorFamily:
+		// We can't order by these types - see #92165.
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *Smither) makeOrderBy(refs colRefs) tree.OrderBy {
 	if len(refs) == 0 {
 		return nil
@@ -1163,20 +1749,50 @@ func (s *Smither) makeOrderBy(refs colRefs) tree.OrderBy {
 	var ob tree.OrderBy
 	for s.coin() {
 		ref := refs[s.rnd.Intn(len(refs))]
-		// We don't support order by jsonb columns.
-		if ref.typ.Family() == types.JsonFamily {
-			continue
-		}
-		// PostGIS cannot order box2d types.
-		if s.postgres && ref.typ.Family() == types.Box2DFamily {
+		if !s.isOrderable(ref.typ) {
 			continue
 		}
 		ob = append(ob, &tree.Order{
-			Expr:      ref.item,
-			Direction: s.randDirection(),
+			Expr:       ref.item,
+			Direction:  s.randDirection(),
+			NullsOrder: s.randNullsOrder(),
 		})
 	}
 	return ob
+}
+
+// makeOrderByWithAllCols returns the ORDER BY that includes all reference
+// columns in random order. If at least one of the columns is not orderable,
+// then ok=false is returned.
+func (s *Smither) makeOrderByWithAllCols(refs colRefs) (_ tree.OrderBy, ok bool) {
+	if len(refs) == 0 {
+		return nil, true
+	}
+	var ob tree.OrderBy
+	for _, ref := range refs {
+		if !s.isOrderable(ref.typ) {
+			return nil, false
+		}
+		if ref.typ.Family() == types.CollatedStringFamily {
+			// Some collated strings are equal, yet they differ when comparing
+			// them directly as strings (e.g. e'\x00':::STRING COLLATE en_US
+			// vs e'\x01':::STRING COLLATE en_US), which makes some queries
+			// produce non-deterministic results even with all columns in the
+			// ORDER BY clause. Fixing how we check the expected output is not
+			// easy, so we simply reject stmts that require collated strings to
+			// be in the ORDER BY clause.
+			return nil, false
+		}
+		ob = append(ob, &tree.Order{
+			Expr:       ref.item,
+			Direction:  s.randDirection(),
+			NullsOrder: s.randNullsOrder(),
+		})
+	}
+	s.rnd.Shuffle(len(ob), func(i, j int) {
+		ob[i], ob[j] = ob[j], ob[i]
+	})
+	return ob, true
 }
 
 func makeLimit(s *Smither) *tree.Limit {
@@ -1189,14 +1805,16 @@ func makeLimit(s *Smither) *tree.Limit {
 	return nil
 }
 
-func (s *Smither) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs) {
+func (s *Smither) makeReturning(tables []*tableRef) (*tree.ReturningExprs, colRefs) {
 	desiredTypes := s.makeDesiredTypes()
 
-	refs := make(colRefs, len(table.Columns))
-	for i, c := range table.Columns {
-		refs[i] = &colRef{
-			typ:  tree.MustBeStaticallyKnownType(c.Type),
-			item: &tree.ColumnItem{ColumnName: c.Name},
+	var refs colRefs
+	for _, table := range tables {
+		for _, c := range table.Columns {
+			refs = append(refs, &colRef{
+				typ:  tree.MustBeStaticallyKnownType(c.Type),
+				item: &tree.ColumnItem{ColumnName: c.Name},
+			})
 		}
 	}
 
@@ -1214,4 +1832,71 @@ func (s *Smither) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs)
 		}
 	}
 	return &returning, returningRefs
+}
+
+func makeCreateStats(s *Smither) (tree.Statement, bool) {
+	table, ok := s.getRandTable()
+	if !ok {
+		return nil, false
+	}
+
+	// Names slightly change behavior of statistics, so pick randomly between:
+	// ~50%: __auto__ (simulating auto stats)
+	// ~33%: random (simulating manual CREATE STATISTICS statements)
+	// ~17%: blank (simulating manual ANALYZE statements)
+	var name tree.Name
+	switch s.d6() {
+	case 1, 2, 3:
+		name = jobspb.AutoStatsName
+	case 4, 5:
+		name = s.name("stats")
+	}
+
+	// Pick specific columns ~17% of the time. We only do this for simulated
+	// manual CREATE STATISTICS statements because neither auto stats nor ANALYZE
+	// allow column selection.
+	var columns tree.NameList
+	if name != jobspb.AutoStatsName && name != "" && s.coin() {
+		for _, col := range table.Columns {
+			if !colinfo.IsSystemColumnName(string(col.Name)) {
+				columns = append(columns, col.Name)
+			}
+		}
+		s.rnd.Shuffle(len(columns), func(i, j int) {
+			columns[i], columns[j] = columns[j], columns[i]
+		})
+		columns = columns[0:s.rnd.Intn(len(columns))]
+	}
+
+	var options tree.CreateStatsOptions
+	if name == jobspb.AutoStatsName {
+		// For auto stats we always set throttling and AOST.
+		options.Throttling = 0.9
+		// For auto stats we use AOST -30s by default, but this will make things
+		// non-deterministic, so we use the smallest legal AOST instead.
+		options.AsOf = tree.AsOfClause{Expr: tree.NewStrVal("-0.001ms")}
+	} else if name == "" {
+		// ANALYZE only sets AOST.
+		options.AsOf = tree.AsOfClause{Expr: tree.NewStrVal("-0.001ms")}
+	} else {
+		// For CREATE STATISTICS we randomly set options.
+		// Set throttling ~17% of the time.
+		if s.coin() {
+			options.Throttling = s.rnd.Float64()
+		}
+		// Set AOST ~17% of the time.
+		if s.coin() {
+			options.AsOf = tree.AsOfClause{Expr: tree.NewStrVal("-0.001ms")}
+		}
+		// Set USING EXTREMES ~17% of the time.
+		options.UsingExtremes = s.coin()
+		// TODO(93998): Add random predicate when we support WHERE.
+	}
+
+	return &tree.CreateStats{
+		Name:        name,
+		ColumnNames: columns,
+		Table:       table.TableName,
+		Options:     options,
+	}, true
 }

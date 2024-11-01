@@ -1,18 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package workload provides an abstraction for generators of sql query loads
 // (and requisite initial data) as well as tools for working with these
 // generators.
 
 package kvserverbase
+
+import "time"
 
 // BatchEvalTestingKnobs contains testing helpers that are used during batch evaluation.
 type BatchEvalTestingKnobs struct {
@@ -32,6 +29,29 @@ type BatchEvalTestingKnobs struct {
 	// the chance that conflicting transactions will prevent parallel commit
 	// attempts from succeeding.
 	RecoverIndeterminateCommitsOnFailedPushes bool
+
+	// AllowGCWithNewThresholdAndKeys configures whether GC requests are allowed
+	// to increase the GC threshold and to GC individual keys at the same time. By
+	// default, this is not allowed because it is unsafe. See cmd_gc.go for an
+	// explanation of why.
+	AllowGCWithNewThresholdAndKeys bool
+
+	// DisableInitPutFailOnTombstones disables FailOnTombstones for InitPut. This
+	// is useful together with e.g. StoreTestingKnobs.GlobalMVCCRangeTombstone,
+	// where we still want InitPut to succeed on top of the range tombstone.
+	DisableInitPutFailOnTombstones bool
+
+	// UseRangeTombstonesForPointDeletes will use point-sized MVCC range
+	// tombstones when deleting point keys, to increase test coverage. These
+	// should not appear different from a point tombstone to a KV client.
+	UseRangeTombstonesForPointDeletes bool
+
+	// DisableTxnAutoGC disables automatically gc-ing transaction record entries
+	// upon EndTxn. Without this knob, synchronous transaction record cleanup is
+	// performed in cases when a transaction has only locks on the same range as
+	// its record (which can be resolved synchronously with EndTxn). This is
+	// useful in certain tests.
+	DisableTxnAutoGC bool
 }
 
 // IntentResolverTestingKnobs contains testing helpers that are used during
@@ -54,4 +74,14 @@ type IntentResolverTestingKnobs struct {
 	// MaxIntentResolutionBatchSize overrides the maximum number of intent
 	// resolution requests which can be sent in a single batch.
 	MaxIntentResolutionBatchSize int
+
+	// InFlightBackpressureLimit overrides the number of batches in flight above
+	// which sending intent resolution batch requests should experience
+	// backpressure.
+	InFlightBackpressureLimit int
+
+	// MaxIntentResolutionSendBatchTimeout overrides the maximum amount of time
+	// that sending an intent resolution batch request can run for before timing
+	// out.
+	MaxIntentResolutionSendBatchTimeout time.Duration
 }

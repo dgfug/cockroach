@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package version
 
@@ -55,7 +50,8 @@ func (v *Version) Metadata() string {
 }
 
 // String returns the string representation, in the format:
-//   "v1.2.3-beta+md"
+//
+//	"v1.2.3-beta+md"
 func (v Version) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "v%d.%d.%d", v.major, v.minor, v.patch)
@@ -81,7 +77,9 @@ var numericRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
 // Parse creates a version from a string. The string must be a valid semantic
 // version (as per https://semver.org/spec/v2.0.0.html) in the format:
-//   "vMINOR.MAJOR.PATCH[-PRERELEASE][+METADATA]".
+//
+//	"vMINOR.MAJOR.PATCH[-PRERELEASE][+METADATA]".
+//
 // MINOR, MAJOR, and PATCH are numeric values (without any leading 0s).
 // PRERELEASE and METADATA can contain ASCII characters and digits, hyphens and
 // dots.

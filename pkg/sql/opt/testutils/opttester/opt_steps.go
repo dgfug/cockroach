@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
@@ -19,37 +14,37 @@ import (
 // command. See the OptTester.OptSteps comment for more details on the command.
 //
 // The algorithm works as follows:
-//   1. The first time optSteps.next() is called, optSteps returns the starting
-//      expression tree, with no transformations applied to it.
 //
-//   2. Each optSteps.next() call after that will perform N+1 transformations,
-//      where N is the number of steps performed during the previous call
-//      (starting at 0 with the first call).
+//  1. The first time optSteps.next() is called, optSteps returns the starting
+//     expression tree, with no transformations applied to it.
 //
-//   3. Each optSteps.next() call will build the expression tree from scratch
-//      and re-run all transformations that were run in the previous call, plus
-//      one additional transformation (N+1). Therefore, the output expression
-//      tree from each call will differ from the previous call only by the last
-//      transformation's changes.
+//  2. Each optSteps.next() call after that will perform N+1 transformations,
+//     where N is the number of steps performed during the previous call
+//     (starting at 0 with the first call).
 //
-//   4. optSteps hooks the optimizer's MatchedRule event in order to limit the
-//      number of transformations that can be applied, as well as to record the
-//      name of the last rule that was applied, for later output.
+//  3. Each optSteps.next() call will build the expression tree from scratch
+//     and re-run all transformations that were run in the previous call, plus
+//     one additional transformation (N+1). Therefore, the output expression
+//     tree from each call will differ from the previous call only by the last
+//     transformation's changes.
 //
-//   5. While this works well for normalization rules, exploration rules are
-//      more difficult. This is because exploration rules are not guaranteed to
-//      produce a lower cost tree. Unless extra measures are taken, the returned
-//      Expr would not include the changed portion of the Memo, since Expr only
-//      shows the lowest cost path through the Memo.
+//  4. optSteps hooks the optimizer's MatchedRule event in order to limit the
+//     number of transformations that can be applied, as well as to record the
+//     name of the last rule that was applied, for later output.
 //
-//   6. To address this issue, optSteps hooks the optimizer's AppliedRule event
-//      and records the expression(s) that the last transformation has affected.
-//      It then re-runs the optimizer, but this time using a special Coster
-//      implementation that fools the optimizer into thinking that the new
-//      expression(s) have the lowest cost. The coster does this by assigning an
-//      infinite cost to all other expressions in the same group as the new
-//      expression(s), as well as in all ancestor groups.
+//  5. While this works well for normalization rules, exploration rules are
+//     more difficult. This is because exploration rules are not guaranteed to
+//     produce a lower cost tree. Unless extra measures are taken, the returned
+//     Expr would not include the changed portion of the Memo, since Expr only
+//     shows the lowest cost path through the Memo.
 //
+//  6. To address this issue, optSteps hooks the optimizer's AppliedRule event
+//     and records the expression(s) that the last transformation has affected.
+//     It then re-runs the optimizer, but this time using a special Coster
+//     implementation that fools the optimizer into thinking that the new
+//     expression(s) have the lowest cost. The coster does this by assigning an
+//     infinite cost to all other expressions in the same group as the new
+//     expression(s), as well as in all ancestor groups.
 type optSteps struct {
 	tester *OptTester
 
@@ -109,7 +104,7 @@ func (os *optSteps) Next() error {
 		panic("iteration already complete")
 	}
 
-	fo, err := newForcingOptimizer(os.tester, os.steps, false /* ignoreNormRules */, true /* disableCheckExpr */)
+	fo, err := newForcingOptimizer(os.tester, os.steps, false /* ignoreNormRules */)
 	if err != nil {
 		return err
 	}
@@ -125,25 +120,32 @@ func (os *optSteps) Next() error {
 	} else if !os.Done() {
 		// The expression is not better, so suppress the lowest cost expressions
 		// so that the changed portions of the tree will be part of the output.
-		fo2, err := newForcingOptimizer(os.tester, os.steps, false /* ignoreNormRules */, true /* disableCheckExpr */)
+		fo2, err := newForcingOptimizer(os.tester, os.steps, false /* ignoreNormRules */)
 		if err != nil {
 			return err
 		}
 
 		if fo.lastAppliedSource == nil {
 			// This was a normalization that created a new memo group.
-			fo2.RestrictToExpr(fo.LookupPath(fo.lastAppliedTarget))
+			path := fo.LookupPath(fo.lastAppliedTarget)
+			if path == nil {
+				// If the path is nil, skip this step. This can happen when an
+				// expression that is not in the memo is normalized.
+				os.steps++
+				return nil
+			}
+			fo2.RestrictToExpr(path)
 		} else if fo.lastAppliedTarget == nil {
 			// This was an exploration rule that didn't add any expressions to the
 			// group, so only ancestor groups need to be suppressed.
-			path := fo.LookupPath(fo.lastAppliedSource)
+			path := fo.MustLookupPath(fo.lastAppliedSource)
 			fo2.RestrictToExpr(path[:len(path)-1])
 		} else {
 			// This was an exploration rule that added one or more expressions to
 			// an existing group. Suppress all other members of the group.
 			member := fo.lastAppliedTarget.(memo.RelExpr)
 			for member != nil {
-				fo2.RestrictToExpr(fo.LookupPath(member))
+				fo2.RestrictToExpr(fo.MustLookupPath(member))
 				member = member.NextExpr()
 			}
 		}

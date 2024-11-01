@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metamorphic
 
@@ -19,24 +14,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
 const zipfMax uint64 = 100000
-
-func makeStorageConfig(path string) base.StorageConfig {
-	return base.StorageConfig{
-		Dir:      path,
-		Settings: cluster.MakeTestingClusterSettings(),
-	}
-}
 
 func rngIntRange(rng *rand.Rand, min int64, max int64) int64 {
 	return min + rng.Int63n(max-min)
@@ -47,21 +35,24 @@ type engineConfig struct {
 	opts *pebble.Options
 }
 
-func (e *engineConfig) create(path string, fs vfs.FS) (storage.Engine, error) {
-	pebbleConfig := storage.PebbleConfig{
-		StorageConfig: makeStorageConfig(path),
-		Opts:          e.opts,
+func (e *engineConfig) create(path string, baseFS vfs.FS) (storage.Engine, error) {
+	env, err := fs.InitEnv(context.Background(), baseFS, path, fs.EnvConfig{}, nil /* diskWriteStats */)
+	if err != nil {
+		return nil, err
 	}
-	if pebbleConfig.Opts == nil {
-		pebbleConfig.Opts = storage.DefaultPebbleOptions()
-	}
-	if fs != nil {
-		pebbleConfig.Opts.FS = fs
-	}
-	pebbleConfig.Opts.Cache = pebble.NewCache(1 << 20)
-	defer pebbleConfig.Opts.Cache.Unref()
 
-	return storage.NewPebble(context.Background(), pebbleConfig)
+	var configOpts []storage.ConfigOption
+	configOpts = append(configOpts, storage.CacheSize(1<<20))
+	e.opts.EnsureDefaults()
+	if e.opts != nil {
+		configOpts = append(configOpts, storage.PebbleOptions(e.opts.String(), parseHooks))
+	}
+	eng, err := storage.Open(context.Background(), env, cluster.MakeTestingClusterSettings(), configOpts...)
+	if err != nil {
+		env.Close()
+		return nil, err
+	}
+	return eng, nil
 }
 
 var _ fmt.Stringer = &engineConfig{}
@@ -70,7 +61,7 @@ func (e *engineConfig) String() string {
 	return e.name
 }
 
-var engineConfigStandard = engineConfig{"standard=0", storage.DefaultPebbleOptions()}
+var engineConfigStandard = engineConfig{"standard=0", standardOptions(0)}
 
 type engineSequence struct {
 	name    string
@@ -111,6 +102,7 @@ type metaTestRunner struct {
 	nameToGenerator map[string]*opGenerator
 	ops             []opRun
 	weights         []int
+	st              *cluster.Settings
 }
 
 func (m *metaTestRunner) init() {
@@ -123,7 +115,8 @@ func (m *metaTestRunner) init() {
 
 	var err error
 	m.engine, err = m.engineSeq.configs[0].create(m.path, m.engineFS)
-	m.printComment(fmt.Sprintf("engine options: %s", m.engineSeq.configs[0].opts.String()))
+	m.printComment(fmt.Sprintf("name: %s", m.engineSeq.configs[0].name))
+	m.printComment(fmt.Sprintf("engine options:\n%s", m.engineSeq.configs[0].opts.String()))
 	if err != nil {
 		m.engine = nil
 		m.t.Fatal(err)
@@ -301,7 +294,7 @@ func (m *metaTestRunner) generateAndRun(n int) {
 	for i := range m.ops {
 		opRun := &m.ops[i]
 		output := opRun.op.run(m.ctx)
-		m.printOp(opRun.name, opRun.args, output)
+		m.printOp(i, opRun.name, opRun.args, output)
 	}
 }
 
@@ -405,7 +398,7 @@ func (m *metaTestRunner) parseFileAndRun(f io.Reader) {
 	for i := range m.ops {
 		op := &m.ops[i]
 		actualOutput := op.op.run(m.ctx)
-		m.printOp(op.name, op.args, actualOutput)
+		actualOutput = m.printOp(i, op.name, op.args, actualOutput)
 		if strings.Compare(strings.TrimSpace(op.expectedOutput), strings.TrimSpace(actualOutput)) != 0 {
 			// Error messages can sometimes mismatch. If both outputs contain "error",
 			// consider this a pass.
@@ -480,7 +473,9 @@ func (m *metaTestRunner) resolveAndAddOp(op *opGenerator, fixedArgs ...string) {
 }
 
 // Print passed-in operation, arguments and output string to output file.
-func (m *metaTestRunner) printOp(opName string, argStrings []string, output string) {
+func (m *metaTestRunner) printOp(
+	index int, opName string, argStrings []string, output string,
+) string {
 	fmt.Fprintf(m.w, "%s(", opName)
 	for i, arg := range argStrings {
 		if i > 0 {
@@ -488,7 +483,9 @@ func (m *metaTestRunner) printOp(opName string, argStrings []string, output stri
 		}
 		fmt.Fprintf(m.w, "%s", arg)
 	}
+	output = fmt.Sprintf("%s // #%d", output, index)
 	fmt.Fprintf(m.w, ") -> %s\n", output)
+	return output
 }
 
 // printComment prints a comment line into the output file. Supports single-line

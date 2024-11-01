@@ -1,37 +1,76 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package explain
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 )
 
 // Emit produces the EXPLAIN output against the given OutputBuilder. The
 // OutputBuilder flags are taken into account.
-func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
+func Emit(
+	ctx context.Context,
+	evalCtx *eval.Context,
+	plan *Plan,
+	ob *OutputBuilder,
+	spanFormatFn SpanFormatFn,
+) error {
+	return emitInternal(ctx, evalCtx, plan, ob, spanFormatFn, nil /* visitedFKsByCascades */)
+}
+
+// MaybeAdjustVirtualIndexScan is injected from the sql package.
+//
+// This function clarifies usage of the virtual indexes for EXPLAIN purposes.
+var MaybeAdjustVirtualIndexScan func(
+	ctx context.Context, evalCtx *eval.Context, index cat.Index, params exec.ScanParams,
+) (_ cat.Index, _ exec.ScanParams, extraAttribute string)
+
+// joinIndexNames emits a string of index names on table 'table' as specified in
+// 'ords', with each name separated by 'sep'.
+func joinIndexNames(table cat.Table, ords cat.IndexOrdinals, sep string) string {
+	var sb strings.Builder
+	for i, idx := range ords {
+		index := table.Index(idx)
+		if i > 0 {
+			sb.WriteString(sep)
+		}
+		sb.WriteString(string(index.Name()))
+	}
+	return sb.String()
+}
+
+// - visitedFKsByCascades is updated on recursive calls for each cascade plan.
+// Can be nil if the plan doesn't have any cascades. In this map the key is the
+// "id" of the FK constraint that we construct as OriginTableID || Name.
+func emitInternal(
+	ctx context.Context,
+	evalCtx *eval.Context,
+	plan *Plan,
+	ob *OutputBuilder,
+	spanFormatFn SpanFormatFn,
+	visitedFKsByCascades map[string]struct{},
+) error {
 	e := makeEmitter(ob, spanFormatFn)
 	var walk func(n *Node) error
 	walk = func(n *Node) error {
@@ -49,7 +88,7 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 			return err
 		}
 		ob.EnterNode(name, columns, ordering)
-		if err := e.emitNodeAttributes(n); err != nil {
+		if err := e.emitNodeAttributes(ctx, evalCtx, n); err != nil {
 			return err
 		}
 		for _, c := range n.children {
@@ -75,7 +114,14 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 		// This field contains the original subquery (which could have been modified
 		// by optimizer transformations).
 		if s.ExprNode != nil {
-			ob.Attr("original sql", tree.AsStringWithFlags(s.ExprNode, tree.FmtSimple))
+			flags := tree.FmtSimple | tree.FmtShortenConstants
+			if e.ob.flags.HideValues {
+				flags |= tree.FmtHideConstants
+			}
+			if e.ob.flags.RedactValues {
+				flags |= tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
+			}
+			ob.Attr("original sql", tree.AsStringWithFlags(s.ExprNode, flags))
 		}
 		var mode string
 		switch s.Mode {
@@ -98,11 +144,34 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 		ob.LeaveNode()
 	}
 
-	for i := range plan.Cascades {
+	for _, cascade := range plan.Cascades {
 		ob.EnterMetaNode("fk-cascade")
-		ob.Attr("fk", plan.Cascades[i].FKName)
-		if buffer := plan.Cascades[i].Buffer; buffer != nil {
-			ob.Attr("input", buffer.(*Node).args.(*bufferArgs).Label)
+		ob.Attr("fk", cascade.FKConstraint.Name())
+		// Here we do want to allow creation of the plans for the cascades to be
+		// able to include them into the EXPLAIN output.
+		const createPlanIfMissing = true
+		if cascadePlan, err := cascade.GetExplainPlan(ctx, createPlanIfMissing); err != nil {
+			return err
+		} else {
+			if visitedFKsByCascades == nil {
+				visitedFKsByCascades = make(map[string]struct{})
+			}
+			fk := cascade.FKConstraint
+			// Come up with a custom "id" for this FK.
+			fkID := fmt.Sprintf("%d%s", fk.OriginTableID(), fk.Name())
+			if _, visited := visitedFKsByCascades[fkID]; visited {
+				// If we have already visited this particular FK cascade, we
+				// don't recurse into it again to prevent infinite recursion.
+				if buffer := cascade.Buffer; buffer != nil {
+					ob.Attr("input", buffer.(*Node).args.(*bufferArgs).Label)
+				}
+			} else {
+				visitedFKsByCascades[fkID] = struct{}{}
+				defer delete(visitedFKsByCascades, fkID)
+				if err = emitInternal(ctx, evalCtx, cascadePlan.(*Plan), ob, spanFormatFn, visitedFKsByCascades); err != nil {
+					return err
+				}
+			}
 		}
 		ob.LeaveNode()
 	}
@@ -113,6 +182,7 @@ func Emit(plan *Plan, ob *OutputBuilder, spanFormatFn SpanFormatFn) error {
 		}
 		ob.LeaveNode()
 	}
+	// TODO(drewk): handle triggers as well.
 	ob.LeaveNode()
 	return nil
 }
@@ -139,7 +209,7 @@ func omitTrivialProjections(n *Node) (*Node, colinfo.ResultColumns, colinfo.Colu
 	input, inputColumns, inputOrdering := omitTrivialProjections(n.children[0])
 
 	// Check if the projection is a bijection (i.e. permutation of all input
-	// columnns), and construct the inverse projection.
+	// columns), and construct the inverse projection.
 	if len(projection) != len(inputColumns) {
 		return n, n.Columns(), n.Ordering()
 	}
@@ -175,12 +245,20 @@ func makeEmitter(ob *OutputBuilder, spanFormatFn SpanFormatFn) emitter {
 	return emitter{ob: ob, spanFormatFn: spanFormatFn}
 }
 
-func (e *emitter) nodeName(n *Node) (string, error) {
+func (e *emitter) nodeName(n *Node) (name string, _ error) {
+	defer func() {
+		if stats, ok := n.annotations[exec.ExecutionStatsID]; ok && !omitStats(n) {
+			if stats.(*exec.ExecutionStats).UsedStreamer {
+				name += " (streamer)"
+			}
+		}
+	}()
+
 	switch n.op {
 	case scanOp:
 		a := n.args.(*scanArgs)
 		if a.Table == nil {
-			return "unknown table", nil
+			return "scan", nil
 		}
 		if a.Table.IsVirtualTable() {
 			return "virtual table", nil
@@ -271,19 +349,23 @@ func (e *emitter) nodeName(n *Node) (string, error) {
 }
 
 var nodeNames = [...]string{
-	alterTableRelocateOp:   "relocate",
+	alterRangeRelocateOp:   "relocate range",
+	alterTableRelocateOp:   "relocate table",
 	alterTableSplitOp:      "split",
 	alterTableUnsplitAllOp: "unsplit all",
 	alterTableUnsplitOp:    "unsplit",
 	applyJoinOp:            "", // This node does not have a fixed name.
 	bufferOp:               "buffer",
+	callOp:                 "call",
 	cancelQueriesOp:        "cancel queries",
 	cancelSessionsOp:       "cancel sessions",
 	controlJobsOp:          "control jobs",
 	controlSchedulesOp:     "control schedules",
 	createStatisticsOp:     "create statistics",
+	createFunctionOp:       "create function",
 	createTableOp:          "create table",
 	createTableAsOp:        "create table as",
+	createTriggerOp:        "create trigger",
 	createViewOp:           "create view",
 	deleteOp:               "delete",
 	deleteRangeOp:          "delete range",
@@ -317,6 +399,7 @@ var nodeNames = [...]string{
 	hashSetOpOp:            "", // This node does not have a fixed name.
 	streamingSetOpOp:       "", // This node does not have a fixed name.
 	unionAllOp:             "union all",
+	showCompletionsOp:      "show completions",
 	showTraceOp:            "show trace",
 	simpleProjectOp:        "project",
 	serializingProjectOp:   "project",
@@ -359,41 +442,86 @@ func (e *emitter) joinNodeName(algo string, joinType descpb.JoinType) string {
 	return fmt.Sprintf("%s join (%s)", algo, typ)
 }
 
-func (e *emitter) emitNodeAttributes(n *Node) error {
-	if stats, ok := n.annotations[exec.ExecutionStatsID]; ok {
+// omitStats returns true if n should not be annotated with the execution
+// statistics nor estimates.
+func omitStats(n *Node) bool {
+	// Some simple nodes don't have their own statistics, yet they share the
+	// stats with their children. In such scenarios, we skip stats for the
+	// "simple" node to avoid confusion. The rule of thumb for including a node
+	// into this list is checking whether it is handled during the
+	// post-processing stage by the DistSQL engine.
+	switch n.op {
+	case simpleProjectOp,
+		serializingProjectOp,
+		renderOp,
+		limitOp:
+		return true
+	}
+	return false
+}
+
+func (e *emitter) emitNodeAttributes(ctx context.Context, evalCtx *eval.Context, n *Node) error {
+	var actualRowCount uint64
+	var hasActualRowCount bool
+	if stats, ok := n.annotations[exec.ExecutionStatsID]; ok && !omitStats(n) {
 		s := stats.(*exec.ExecutionStats)
-		if len(s.Nodes) > 0 {
-			e.ob.AddRedactableField(RedactNodes, "nodes", strings.Join(s.Nodes, ", "))
+		if len(s.SQLNodes) > 0 {
+			e.ob.AddFlakyField(DeflakeNodes, "sql nodes", strings.Join(s.SQLNodes, ", "))
+		}
+		if len(s.KVNodes) > 0 {
+			e.ob.AddFlakyField(DeflakeNodes, "kv nodes", strings.Join(s.KVNodes, ", "))
 		}
 		if len(s.Regions) > 0 {
-			e.ob.AddRedactableField(RedactNodes, "regions", strings.Join(s.Regions, ", "))
+			e.ob.AddFlakyField(DeflakeNodes, "regions", strings.Join(s.Regions, ", "))
+		}
+		if s.UsedFollowerRead {
+			e.ob.AddField("used follower read", "")
 		}
 		if s.RowCount.HasValue() {
-			e.ob.AddField("actual row count", humanizeutil.Count(s.RowCount.Value()))
+			actualRowCount = s.RowCount.Value()
+			hasActualRowCount = true
+			e.ob.AddField("actual row count", string(humanizeutil.Count(actualRowCount)))
 		}
 		// Omit vectorized batches in non-verbose mode.
 		if e.ob.flags.Verbose {
 			if s.VectorizedBatchCount.HasValue() {
-				e.ob.AddField("vectorized batch count", humanizeutil.Count(s.VectorizedBatchCount.Value()))
+				e.ob.AddField("vectorized batch count",
+					string(humanizeutil.Count(s.VectorizedBatchCount.Value())))
 			}
 		}
 		if s.KVTime.HasValue() {
-			e.ob.AddField("KV time", humanizeutil.Duration(s.KVTime.Value()))
+			e.ob.AddField("KV time", string(humanizeutil.Duration(s.KVTime.Value())))
 		}
 		if s.KVContentionTime.HasValue() {
-			e.ob.AddField("KV contention time", humanizeutil.Duration(s.KVContentionTime.Value()))
+			e.ob.AddField("KV contention time", string(humanizeutil.Duration(s.KVContentionTime.Value())))
 		}
 		if s.KVRowsRead.HasValue() {
-			e.ob.AddField("KV rows read", humanizeutil.Count(s.KVRowsRead.Value()))
+			e.ob.AddField("KV rows decoded", string(humanizeutil.Count(s.KVRowsRead.Value())))
+		}
+		if s.KVPairsRead.HasValue() {
+			pairs := s.KVPairsRead.Value()
+			rows := s.KVRowsRead.Value()
+			if pairs != rows || e.ob.flags.Verbose {
+				// Only show the number of KV pairs read when it's different
+				// from the number of rows decoded or if verbose output is
+				// requested.
+				e.ob.AddField("KV pairs read", string(humanizeutil.Count(s.KVPairsRead.Value())))
+			}
 		}
 		if s.KVBytesRead.HasValue() {
 			e.ob.AddField("KV bytes read", humanize.IBytes(s.KVBytesRead.Value()))
+		}
+		if s.KVBatchRequestsIssued.HasValue() {
+			e.ob.AddField("KV gRPC calls", string(humanizeutil.Count(s.KVBatchRequestsIssued.Value())))
 		}
 		if s.MaxAllocatedMem.HasValue() {
 			e.ob.AddField("estimated max memory allocated", humanize.IBytes(s.MaxAllocatedMem.Value()))
 		}
 		if s.MaxAllocatedDisk.HasValue() {
 			e.ob.AddField("estimated max sql temp disk usage", humanize.IBytes(s.MaxAllocatedDisk.Value()))
+		}
+		if s.SQLCPUTime.HasValue() {
+			e.ob.AddField("sql cpu time", string(humanizeutil.Duration(s.SQLCPUTime.Value())))
 		}
 		if e.ob.flags.Verbose {
 			if s.StepCount.HasValue() {
@@ -409,7 +537,10 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		}
 	}
 
-	if stats, ok := n.annotations[exec.EstimatedStatsID]; ok {
+	var inaccurateEstimate bool
+	const inaccurateFactor = 2
+	const inaccurateAdditive = 100
+	if stats, ok := n.annotations[exec.EstimatedStatsID]; ok && !omitStats(n) {
 		s := stats.(*exec.EstimatedStats)
 
 		var estimatedRowCountString string
@@ -417,9 +548,21 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			maxEstimatedRowCount := uint64(math.Ceil(math.Max(s.LimitHint, s.RowCount)))
 			minEstimatedRowCount := uint64(math.Ceil(math.Min(s.LimitHint, s.RowCount)))
 			estimatedRowCountString = fmt.Sprintf("%s - %s", humanizeutil.Count(minEstimatedRowCount), humanizeutil.Count(maxEstimatedRowCount))
+			if hasActualRowCount && s.TableStatsAvailable {
+				// If we have both the actual row count and the table stats
+				// available, check whether the estimate is inaccurate.
+				inaccurateEstimate = actualRowCount*inaccurateFactor+inaccurateAdditive < minEstimatedRowCount ||
+					maxEstimatedRowCount*inaccurateFactor+inaccurateAdditive < actualRowCount
+			}
 		} else {
 			estimatedRowCount := uint64(math.Round(s.RowCount))
-			estimatedRowCountString = humanizeutil.Count(estimatedRowCount)
+			estimatedRowCountString = string(humanizeutil.Count(estimatedRowCount))
+			if hasActualRowCount && s.TableStatsAvailable {
+				// If we have both the actual row count and the table stats
+				// available, check whether the estimate is inaccurate.
+				inaccurateEstimate = actualRowCount*inaccurateFactor+inaccurateAdditive < estimatedRowCount ||
+					estimatedRowCount*inaccurateFactor+inaccurateAdditive < actualRowCount
+			}
 		}
 
 		// Show the estimated row count (except Values, where it is redundant).
@@ -442,19 +585,40 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 					}
 
 					var duration string
-					if e.ob.flags.Redact.Has(RedactVolatile) {
+					if e.ob.flags.Deflake.HasAny(DeflakeVolatile) {
 						duration = "<hidden>"
 					} else {
 						timeSinceStats := timeutil.Since(s.TableStatsCreatedAt)
 						if timeSinceStats < 0 {
 							timeSinceStats = 0
 						}
-						duration = humanizeutil.LongDuration(timeSinceStats)
+						duration = string(humanizeutil.LongDuration(timeSinceStats))
 					}
+
+					var forecastStr string
+					if s.Forecast {
+						if e.ob.flags.Deflake.HasAny(DeflakeVolatile) {
+							forecastStr = "; using stats forecast"
+						} else {
+							timeSinceStats := timeutil.Since(s.ForecastAt)
+							if timeSinceStats >= 0 {
+								forecastStr = fmt.Sprintf(
+									"; using stats forecast for %s ago", humanizeutil.LongDuration(timeSinceStats),
+								)
+							} else {
+								timeSinceStats *= -1
+								forecastStr = fmt.Sprintf(
+									"; using stats forecast for %s in the future",
+									humanizeutil.LongDuration(timeSinceStats),
+								)
+							}
+						}
+					}
+
 					e.ob.AddField("estimated row count", fmt.Sprintf(
-						"%s (%s%% of the table; stats collected %s ago)",
+						"%s (%s%% of the table; stats collected %s ago%s)",
 						estimatedRowCountString, percentageStr,
-						duration,
+						duration, forecastStr,
 					))
 				} else {
 					e.ob.AddField("estimated row count", estimatedRowCountString)
@@ -480,14 +644,34 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	switch n.op {
 	case scanOp:
 		a := n.args.(*scanArgs)
-		e.emitTableAndIndex("table", a.Table, a.Index)
+		var suffix string
+		if inaccurateEstimate {
+			suffix = fmt.Sprintf(
+				"  ----------------------  WARNING: the row count estimate is inaccurate, "+
+					"consider running 'ANALYZE %s'", a.Table.Name(),
+			)
+			ob.AddWarning(fmt.Sprintf(
+				"WARNING: the row count estimate on table %[1]q is inaccurate, "+
+					"consider running 'ANALYZE %[1]s'", a.Table.Name(),
+			))
+		}
+		var extraAttribute string
+		if a.Table.IsVirtualTable() && MaybeAdjustVirtualIndexScan != nil {
+			a.Index, a.Params, extraAttribute = MaybeAdjustVirtualIndexScan(ctx, evalCtx, a.Index, a.Params)
+		}
+		e.emitTableAndIndex("table", a.Table, a.Index, suffix)
 		// Omit spans for virtual tables, unless we actually have a constraint.
 		if a.Table != nil && !(a.Table.IsVirtualTable() && a.Params.IndexConstraint == nil) {
 			e.emitSpans("spans", a.Table, a.Index, a.Params)
 		}
+		if extraAttribute != "" {
+			ob.Attr(extraAttribute, "")
+		}
 
 		if a.Params.HardLimit > 0 {
 			ob.Attr("limit", a.Params.HardLimit)
+		} else if a.Params.HardLimit == -1 {
+			ob.Attr("limit", "")
 		}
 
 		if a.Params.Parallelize {
@@ -499,7 +683,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		a := n.args.(*valuesArgs)
 		// Don't emit anything for the "norows" and "emptyrow" cases.
 		if len(a.Rows) > 0 && (len(a.Rows) > 1 || len(a.Columns) > 0) {
-			e.emitTuples(a.Rows, len(a.Columns))
+			e.emitTuples(tree.RawRows(a.Rows), len(a.Columns))
 		}
 
 	case filterOp:
@@ -555,6 +739,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			}
 		}
 		ob.VAttr("key columns", strings.Join(cols, ", "))
+		e.emitLockingPolicy(a.Locking)
 
 	case groupByOp:
 		a := n.args.(*groupByArgs)
@@ -628,7 +813,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 
 	case lookupJoinOp:
 		a := n.args.(*lookupJoinArgs)
-		e.emitTableAndIndex("table", a.Table, a.Index)
+		e.emitTableAndIndex("table", a.Table, a.Index, "" /* suffix */)
 		inputCols := a.Input.Columns()
 		if len(a.EqCols) > 0 {
 			rightEqCols := make([]string, len(a.EqCols))
@@ -638,7 +823,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			ob.Attrf(
 				"equality", "(%s) = (%s)",
 				printColumnList(inputCols, a.EqCols),
-				strings.Join(rightEqCols, ","),
+				strings.Join(rightEqCols, ", "),
 			)
 		}
 		if a.EqColsAreKey {
@@ -657,31 +842,38 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.OnCond != tree.DBoolTrue {
 			ob.Expr("pred", a.OnCond, appendColumns(leftCols, rightCols...))
 		}
-		e.emitTableAndIndex("left table", a.LeftTable, a.LeftIndex)
+		e.emitTableAndIndex("left table", a.LeftTable, a.LeftIndex, "" /* suffix */)
 		ob.Attrf("left columns", "(%s)", printColumns(leftCols))
 		if n := len(a.LeftFixedVals); n > 0 {
 			ob.Attrf("left fixed values", "%d column%s", n, util.Pluralize(int64(n)))
 		}
-		e.emitTableAndIndex("right table", a.RightTable, a.RightIndex)
+		e.emitLockingPolicyWithPrefix("left ", a.LeftLocking)
+		e.emitTableAndIndex("right table", a.RightTable, a.RightIndex, "" /* suffix */)
 		ob.Attrf("right columns", "(%s)", printColumns(rightCols))
 		if n := len(a.RightFixedVals); n > 0 {
 			ob.Attrf("right fixed values", "%d column%s", n, util.Pluralize(int64(n)))
 		}
+		e.emitLockingPolicyWithPrefix("right ", a.RightLocking)
 
 	case invertedFilterOp:
 		a := n.args.(*invertedFilterArgs)
-		ob.Attr("inverted column", a.Input.Columns()[a.InvColumn].Name)
-		ob.Attr("num spans", len(a.InvFilter.SpansToRead))
+		if a.InvColumn != 0 {
+			ob.Attr("inverted column", a.Input.Columns()[a.InvColumn].Name)
+		}
+		if a.InvFilter != nil && len(a.InvFilter.SpansToRead) > 0 {
+			ob.Attr("num spans", len(a.InvFilter.SpansToRead))
+		}
 
 	case invertedJoinOp:
 		a := n.args.(*invertedJoinArgs)
-		e.emitTableAndIndex("table", a.Table, a.Index)
+		e.emitTableAndIndex("table", a.Table, a.Index, "" /* suffix */)
 		cols := appendColumns(a.Input.Columns(), tableColumns(a.Table, a.LookupCols)...)
 		ob.VExpr("inverted expr", a.InvertedExpr, cols)
 		// TODO(radu): we should be passing nil instead of true.
 		if a.OnCond != tree.DBoolTrue {
 			ob.Expr("on", a.OnCond, cols)
 		}
+		e.emitLockingPolicy(a.Locking)
 
 	case projectSetOp:
 		a := n.args.(*projectSetArgs)
@@ -717,16 +909,8 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
 		}
-		if len(a.ArbiterIndexes) > 0 {
-			var sb strings.Builder
-			for i, idx := range a.ArbiterIndexes {
-				index := a.Table.Index(idx)
-				if i > 0 {
-					sb.WriteString(", ")
-				}
-				sb.WriteString(string(index.Name()))
-			}
-			ob.Attr("arbiter indexes", sb.String())
+		if arbind := joinIndexNames(a.Table, a.ArbiterIndexes, ", "); arbind != "" {
+			ob.Attr("arbiter indexes", arbind)
 		}
 		if len(a.ArbiterConstraints) > 0 {
 			var sb strings.Builder
@@ -738,6 +922,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 				sb.WriteString(uniqueConstraint.Name())
 			}
 			ob.Attr("arbiter constraints", sb.String())
+		}
+		if uniqWithTombstoneIndexes := joinIndexNames(a.Table, a.UniqueWithTombstonesIndexes, ", "); uniqWithTombstoneIndexes != "" {
+			ob.Attr("uniqueness checks (tombstones)", uniqWithTombstoneIndexes)
 		}
 
 	case insertFastPathOp:
@@ -754,9 +941,19 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			ob.Attr(
 				"FK check", fmt.Sprintf("%s@%s", fk.ReferencedTable.Name(), fk.ReferencedIndex.Name()),
 			)
+			e.emitLockingPolicyWithPrefix("FK check ", fk.Locking)
+		}
+		for _, uniq := range a.UniqChecks {
+			ob.Attr(
+				"uniqueness check", fmt.Sprintf("%s@%s", uniq.ReferencedTable.Name(), uniq.ReferencedIndex.Name()),
+			)
+			e.emitLockingPolicyWithPrefix("uniqueness check ", uniq.Locking)
+		}
+		if uniqWithTombstoneIndexes := joinIndexNames(a.Table, a.UniqueWithTombstonesIndexes, ", "); uniqWithTombstoneIndexes != "" {
+			ob.Attr("uniqueness checks (tombstones)", uniqWithTombstoneIndexes)
 		}
 		if len(a.Rows) > 0 {
-			e.emitTuples(a.Rows, len(a.Rows[0]))
+			e.emitTuples(tree.RawRows(a.Rows), len(a.Rows[0]))
 		}
 
 	case upsertOp:
@@ -769,16 +966,8 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
 		}
-		if len(a.ArbiterIndexes) > 0 {
-			var sb strings.Builder
-			for i, idx := range a.ArbiterIndexes {
-				index := a.Table.Index(idx)
-				if i > 0 {
-					sb.WriteString(", ")
-				}
-				sb.WriteString(string(index.Name()))
-			}
-			ob.Attr("arbiter indexes", sb.String())
+		if arbind := joinIndexNames(a.Table, a.ArbiterIndexes, ", "); arbind != "" {
+			ob.Attr("arbiter indexes", arbind)
 		}
 		if len(a.ArbiterConstraints) > 0 {
 			var sb strings.Builder
@@ -795,6 +984,9 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	case updateOp:
 		a := n.args.(*updateArgs)
 		ob.Attrf("table", "%s", a.Table.Name())
+		if uniqWithTombstoneIndexes := joinIndexNames(a.Table, a.UniqueWithTombstonesIndexes, ", "); uniqWithTombstoneIndexes != "" {
+			ob.Attr("uniqueness checks (tombstones)", uniqWithTombstoneIndexes)
+		}
 		ob.Attr("set", printColumns(tableColumns(a.Table, a.UpdateCols)))
 		if a.AutoCommit {
 			ob.Attr("auto commit", "")
@@ -820,11 +1012,47 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		}
 		e.emitSpans("spans", a.Table, a.Table.Index(cat.PrimaryIndex), params)
 
+	case showCompletionsOp:
+		a := n.args.(*showCompletionsArgs)
+		if a.Command != nil {
+			ob.Attrf("offset", "%s", a.Command.Offset.OrigString())
+			ob.Attrf("syntax", "%q", shorten(a.Command.Statement.RawString()))
+		}
+
+	case alterTableSplitOp:
+		a := n.args.(*alterTableSplitArgs)
+		ob.Attrf("index", "%s@%s", a.Index.Table().Name(), a.Index.Name())
+		ob.Expr("expiry", a.Expiration, nil /* columns */)
+
+	case alterTableUnsplitOp:
+		a := n.args.(*alterTableUnsplitArgs)
+		ob.Attrf("index", "%s@%s", a.Index.Table().Name(), a.Index.Name())
+
+	case alterTableUnsplitAllOp:
+		a := n.args.(*alterTableUnsplitAllArgs)
+		ob.Attrf("index", "%s@%s", a.Index.Table().Name(), a.Index.Name())
+
+	case alterTableRelocateOp:
+		a := n.args.(*alterTableRelocateArgs)
+		ob.Attrf("index", "%s@%s", a.Index.Table().Name(), a.Index.Name())
+
 	case recursiveCTEOp:
 		a := n.args.(*recursiveCTEArgs)
 		if e.ob.flags.Verbose && a.Deduplicate {
 			ob.Attrf("deduplicate", "")
 		}
+
+	case alterRangeRelocateOp:
+		a := n.args.(*alterRangeRelocateArgs)
+		ob.Attr("replicas", a.subjectReplicas)
+		ob.Expr("to", a.toStoreID, nil /* columns */)
+		if a.subjectReplicas != tree.RelocateLease {
+			ob.Expr("from", a.fromStoreID, nil /* columns */)
+		}
+
+	case callOp:
+		a := n.args.(*callArgs)
+		ob.Expr("procedure", a.Proc, nil /* columns */)
 
 	case simpleProjectOp,
 		serializingProjectOp,
@@ -835,17 +1063,15 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 		explainOptOp,
 		explainOp,
 		showTraceOp,
+		createFunctionOp,
 		createTableOp,
 		createTableAsOp,
+		createTriggerOp,
 		createViewOp,
 		sequenceSelectOp,
 		saveTableOp,
 		errorIfRowsOp,
 		opaqueOp,
-		alterTableSplitOp,
-		alterTableUnsplitOp,
-		alterTableUnsplitAllOp,
-		alterTableRelocateOp,
 		controlJobsOp,
 		controlSchedulesOp,
 		cancelQueriesOp,
@@ -859,16 +1085,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 	return nil
 }
 
-func (e *emitter) emitTableAndIndex(field string, table cat.Table, index cat.Index) {
-	if table == nil || index == nil {
-		e.ob.Attr(field, "?@?")
-		return
-	}
+func (e *emitter) emitTableAndIndex(field string, table cat.Table, index cat.Index, suffix string) {
 	partial := ""
 	if _, isPartial := index.Predicate(); isPartial {
 		partial = " (partial index)"
 	}
-	e.ob.Attrf(field, "%s@%s%s", table.Name(), index.Name(), partial)
+	e.ob.Attrf(field, "%s@%s%s%s", table.Name(), index.Name(), partial, suffix)
 }
 
 func (e *emitter) emitSpans(
@@ -879,14 +1101,24 @@ func (e *emitter) emitSpans(
 
 func (e *emitter) spansStr(table cat.Table, index cat.Index, scanParams exec.ScanParams) string {
 	if scanParams.InvertedConstraint == nil && scanParams.IndexConstraint == nil {
-		if scanParams.HardLimit > 0 {
+		// HardLimit can be -1 to signal unknown limit (for gists).
+		if scanParams.HardLimit != 0 {
 			return "LIMITED SCAN"
+		}
+		if scanParams.SoftLimit > 0 {
+			return "FULL SCAN (SOFT LIMIT)"
 		}
 		return "FULL SCAN"
 	}
 
+	// If we are only showing the shape, show a non-specific number of spans.
+	if e.ob.flags.OnlyShape {
+		return "1+ spans"
+	}
+
 	// In verbose mode show the physical spans, unless the table is virtual.
-	if e.ob.flags.Verbose && !table.IsVirtualTable() {
+	if e.ob.flags.Verbose && !e.ob.flags.HideValues && !e.ob.flags.RedactValues &&
+		!table.IsVirtualTable() {
 		return e.spanFormatFn(table, index, scanParams)
 	}
 
@@ -897,8 +1129,8 @@ func (e *emitter) spansStr(table cat.Table, index cat.Index, scanParams exec.Sca
 		return fmt.Sprintf("%d span%s", n, util.Pluralize(int64(n)))
 	}
 
-	// If we must hide values, only show the count.
-	if e.ob.flags.HideValues {
+	// If we must hide or redact values, only show the count.
+	if e.ob.flags.HideValues || e.ob.flags.RedactValues {
 		n := scanParams.IndexConstraint.Spans.Count()
 		return fmt.Sprintf("%d span%s", n, util.Pluralize(int64(n)))
 	}
@@ -916,29 +1148,39 @@ func (e *emitter) spansStr(table cat.Table, index cat.Index, scanParams exec.Sca
 	return sp.String()
 }
 
-func (e *emitter) emitLockingPolicy(locking *tree.LockingItem) {
-	if locking == nil {
-		return
-	}
+func (e *emitter) emitLockingPolicy(locking opt.Locking) {
+	e.emitLockingPolicyWithPrefix("", locking)
+}
+
+func (e *emitter) emitLockingPolicyWithPrefix(keyPrefix string, locking opt.Locking) {
 	strength := descpb.ToScanLockingStrength(locking.Strength)
 	waitPolicy := descpb.ToScanLockingWaitPolicy(locking.WaitPolicy)
+	form := locking.Form
+	durability := locking.Durability
 	if strength != descpb.ScanLockingStrength_FOR_NONE {
-		e.ob.Attr("locking strength", strength.PrettyString())
+		e.ob.Attr(keyPrefix+"locking strength", strength.PrettyString())
 	}
 	if waitPolicy != descpb.ScanLockingWaitPolicy_BLOCK {
-		e.ob.Attr("locking wait policy", waitPolicy.PrettyString())
+		e.ob.Attr(keyPrefix+"locking wait policy", waitPolicy.PrettyString())
+	}
+	if form != tree.LockRecord {
+		e.ob.Attr(keyPrefix+"locking form", form.String())
+	}
+	if durability != tree.LockDurabilityBestEffort {
+		e.ob.Attr(keyPrefix+"locking durability", durability.String())
 	}
 }
 
-func (e *emitter) emitTuples(rows [][]tree.TypedExpr, numColumns int) {
+func (e *emitter) emitTuples(rows tree.ExprContainer, numColumns int) {
 	e.ob.Attrf(
 		"size", "%d column%s, %d row%s",
 		numColumns, util.Pluralize(int64(numColumns)),
-		len(rows), util.Pluralize(int64(len(rows))),
+		rows.NumRows(), util.Pluralize(int64(rows.NumRows())),
 	)
 	if e.ob.flags.Verbose {
-		for i := range rows {
-			for j, expr := range rows[i] {
+		for i := 0; i < rows.NumRows(); i++ {
+			for j := 0; j < rows.NumCols(); j++ {
+				expr := rows.Get(i, j).(tree.TypedExpr)
 				e.ob.Expr(fmt.Sprintf("row %d, expr %d", i, j), expr, nil /* varColumns */)
 			}
 		}
@@ -1028,4 +1270,11 @@ func printColumnSet(inputCols colinfo.ResultColumns, cols exec.NodeColumnOrdinal
 		buf.WriteString(inputCols[col].Name)
 	})
 	return buf.String()
+}
+
+func shorten(s string) string {
+	if len(s) > 20 {
+		return s[:20] + "…"
+	}
+	return s
 }

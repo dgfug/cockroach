@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -58,27 +53,39 @@ const (
 	Schedules
 	// FullTableScans represents the SHOW FULL TABLE SCANS command.
 	FullTableScans
+	// SuperRegions represents the SHOW SUPER REGIONS command.
+	SuperRegions
+	// CreateExternalConnection represents the SHOW CREATE EXTERNAL CONNECTION command.
+	CreateExternalConnection
+	// ExternalConnection represents the SHOW EXTERNAL CONNECTION command.
+	ExternalConnection
+	// LogicalReplicationJobs represents the SHOW LOGICAL REPLICATION JOBS command.
+	LogicalReplicationJobs
 )
 
 var showTelemetryNameMap = map[ShowTelemetryType]string{
-	Ranges:                  "ranges",
-	Partitions:              "partitions",
-	Locality:                "locality",
-	Create:                  "create",
-	CreateSchedule:          "create_schedule",
-	RangeForRow:             "rangeforrow",
-	Regions:                 "regions",
-	RegionsFromCluster:      "regions_from_cluster",
-	RegionsFromDatabase:     "regions_from_database",
-	RegionsFromAllDatabases: "regions_from_all_databases",
-	SurvivalGoal:            "survival_goal",
-	Queries:                 "queries",
-	Indexes:                 "indexes",
-	Constraints:             "constraints",
-	Jobs:                    "jobs",
-	Roles:                   "roles",
-	Schedules:               "schedules",
-	FullTableScans:          "full_table_scans",
+	Ranges:                   "ranges",
+	Partitions:               "partitions",
+	Locality:                 "locality",
+	Create:                   "create",
+	CreateSchedule:           "create_schedule",
+	RangeForRow:              "rangeforrow",
+	Regions:                  "regions",
+	RegionsFromCluster:       "regions_from_cluster",
+	RegionsFromDatabase:      "regions_from_database",
+	RegionsFromAllDatabases:  "regions_from_all_databases",
+	SurvivalGoal:             "survival_goal",
+	Queries:                  "queries",
+	Indexes:                  "indexes",
+	Constraints:              "constraints",
+	Jobs:                     "jobs",
+	Roles:                    "roles",
+	Schedules:                "schedules",
+	FullTableScans:           "full_table_scans",
+	SuperRegions:             "super_regions",
+	CreateExternalConnection: "create_external_connection",
+	ExternalConnection:       "external_connection",
+	LogicalReplicationJobs:   "logical_replication_jobs",
 }
 
 func (s ShowTelemetryType) String() string {

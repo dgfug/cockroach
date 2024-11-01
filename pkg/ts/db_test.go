@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -35,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 )
@@ -79,24 +73,14 @@ type testModelRunner struct {
 // be called before using it.
 func newTestModelRunner(t *testing.T) testModelRunner {
 	st := cluster.MakeTestingClusterSettings()
-	workerMonitor := mon.NewUnlimitedMonitor(
-		context.Background(),
-		"timeseries-test-worker",
-		mon.MemoryResource,
-		nil,
-		nil,
-		math.MaxInt64,
-		st,
-	)
-	resultMonitor := mon.NewUnlimitedMonitor(
-		context.Background(),
-		"timeseries-test-result",
-		mon.MemoryResource,
-		nil,
-		nil,
-		math.MaxInt64,
-		st,
-	)
+	workerMonitor := mon.NewUnlimitedMonitor(context.Background(), mon.Options{
+		Name:     "timeseries-test-worker",
+		Settings: st,
+	})
+	resultMonitor := mon.NewUnlimitedMonitor(context.Background(), mon.Options{
+		Name:     "timeseries-test-result",
+		Settings: st,
+	})
 	return testModelRunner{
 		t:                      t,
 		model:                  testmodel.NewModelDB(),
@@ -111,8 +95,7 @@ func newTestModelRunner(t *testing.T) testModelRunner {
 // Start constructs and starts the local test server and creates a
 // time series DB.
 func (tm *testModelRunner) Start() {
-	tm.LocalTestCluster.Start(tm.t, testutils.NewNodeTestBaseContext(),
-		kvcoord.InitFactoryForLocalTestCluster)
+	tm.LocalTestCluster.Start(tm.t, kvcoord.InitFactoryForLocalTestCluster)
 	tm.DB = NewDB(tm.LocalTestCluster.DB, tm.Cfg.Settings)
 }
 
@@ -405,7 +388,7 @@ func (tm *testModelRunner) rollupWithMemoryContext(
 // maintain calls the same operation called by the TS maintenance queue,
 // simulating the effects in the model at the same time.
 func (tm *testModelRunner) maintain(nowNanos int64) {
-	snap := tm.Store.Engine().NewSnapshot()
+	snap := tm.Store.TODOEngine().NewSnapshot()
 	defer snap.Close()
 	if err := tm.DB.MaintainTimeSeries(
 		context.Background(),
@@ -752,10 +735,11 @@ func TestStoreTimeSeries(t *testing.T) {
 func TestPollSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	runTestCaseMultipleFormats(t, func(t *testing.T, tm testModelRunner) {
+		tr := tm.Cfg.AmbientCtx.Tracer
 		testSource := modelDataSource{
 			model:   tm,
 			r:       Resolution10s,
-			stopper: stop.NewStopper(),
+			stopper: stop.NewStopper(stop.WithTracer(tr)),
 			datasets: [][]tspb.TimeSeriesData{
 				{
 					tsd("test.metric.float", "cpu01",
@@ -777,7 +761,7 @@ func TestPollSource(t *testing.T) {
 			},
 		}
 
-		ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+		ambient := log.MakeTestingAmbientContext(tr)
 		tm.DB.PollSource(ambient, &testSource, time.Millisecond, Resolution10s, testSource.stopper)
 		<-testSource.stopper.IsStopped()
 		if a, e := testSource.calledCount, 2; a != e {
@@ -830,7 +814,7 @@ func TestDisableStorage(t *testing.T) {
 			},
 		}
 
-		ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
+		ambient := log.MakeTestingAmbientCtxWithNewTracer()
 		tm.DB.PollSource(ambient, &testSource, time.Millisecond, Resolution10s, testSource.stopper)
 		select {
 		case <-testSource.stopper.IsStopped():

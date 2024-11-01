@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,8 +12,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -41,16 +36,16 @@ func postgisColumnsTablePopulator(
 	matchingFamily types.Family,
 ) func(context.Context, *planner, catalog.DatabaseDescriptor, func(...tree.Datum) error) error {
 	return func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(
-			ctx,
-			p,
-			dbContext,
-			hideVirtual,
-			func(db catalog.DatabaseDescriptor, scName string, table catalog.TableDescriptor) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual}
+		return forEachTableDesc(ctx, p, dbContext, opts,
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				if !table.IsPhysicalTable() {
 					return nil
 				}
-				if p.CheckAnyPrivilege(ctx, table) != nil {
+				if ok, err := p.HasAnyPrivilege(ctx, table); err != nil {
+					return err
+				} else if !ok {
 					return nil
 				}
 				for _, col := range table.PublicColumns() {
@@ -103,7 +98,7 @@ func postgisColumnsTablePopulator(
 
 					if err := addRow(
 						tree.NewDString(db.GetName()),
-						tree.NewDString(scName),
+						tree.NewDString(sc.GetName()),
 						tree.NewDString(table.GetName()),
 						tree.NewDString(col.GetName()),
 						datumNDims,

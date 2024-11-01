@@ -1,23 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import { assert } from "chai";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { assert } from "chai";
+
 import {
   FlatPlanNode,
   FlatPlanNodeAttribute,
   flattenTreeAttributes,
   flattenAttributes,
   standardizeKey,
+  planNodeToString,
+  planNodeAttrsToString,
 } from "./planView";
+
 import IAttr = cockroach.sql.ExplainTreePlanNode.IAttr;
 
 type IExplainTreePlanNode = cockroach.sql.IExplainTreePlanNode;
@@ -258,6 +256,96 @@ describe("planView", () => {
     it("should remove '(anti)' from the key", () => {
       assert.equal(standardizeKey("lookup join (anti)"), "lookupJoin");
       assert.equal(standardizeKey("(anti) hello world"), "helloWorld");
+    });
+  });
+
+  describe("planNodeAttrsToString", () => {
+    it("should convert an array of FlatPlanNodeAttribute[] into a string", () => {
+      const testNodeAttrs: FlatPlanNodeAttribute[] = [
+        {
+          key: "Into",
+          values: ["users(id, city, name, address, credit_card)"],
+          warn: false,
+        },
+        {
+          key: "Size",
+          values: ["5 columns, 3 rows"],
+          warn: false,
+        },
+      ];
+
+      const expectedString =
+        "Into users(id, city, name, address, credit_card) Size 5 columns, 3 rows";
+
+      assert.equal(planNodeAttrsToString(testNodeAttrs), expectedString);
+    });
+  });
+
+  describe("planNodeToString", () => {
+    it("should recursively convert a FlatPlanNode into a string.", () => {
+      const testPlanNode: FlatPlanNode = {
+        name: "insert fast path",
+        attrs: [
+          {
+            key: "Into",
+            values: ["users(id, city, name, address, credit_card)"],
+            warn: false,
+          },
+          {
+            key: "Size",
+            values: ["5 columns, 3 rows"],
+            warn: false,
+          },
+        ],
+        children: [],
+      };
+
+      const expectedString =
+        "insert fast path Into users(id, city, name, address, credit_card) Size 5 columns, 3 rows";
+
+      assert.equal(planNodeToString(testPlanNode), expectedString);
+    });
+
+    it("should recursively convert a FlatPlanNode (with children) into a string.", () => {
+      const testPlanNode: FlatPlanNode = {
+        name: "render",
+        attrs: [],
+        children: [
+          {
+            name: "group (scalar)",
+            attrs: [],
+            children: [
+              {
+                name: "filter",
+                attrs: [
+                  {
+                    key: "filter",
+                    values: ["variable = _"],
+                    warn: false,
+                  },
+                ],
+                children: [
+                  {
+                    name: "virtual table",
+                    attrs: [
+                      {
+                        key: "table",
+                        values: ["cluster_settings@primary"],
+                        warn: false,
+                      },
+                    ],
+                    children: [],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const expectedString =
+        "render  group (scalar)  filter filter variable = _ virtual table table cluster_settings@primary";
+      assert.equal(planNodeToString(testPlanNode), expectedString);
     });
   });
 });

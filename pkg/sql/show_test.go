@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -21,18 +16,20 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -108,8 +105,7 @@ func TestShowCreateTable(t *testing.T) {
 )`,
 			Expect: `CREATE TABLE public.%[1]s (
 	i INT8 NOT NULL,
-	CONSTRAINT %[1]s_pkey PRIMARY KEY (i ASC),
-	FAMILY "primary" (i)
+	CONSTRAINT %[1]s_pkey PRIMARY KEY (i ASC)
 )`,
 		},
 		{
@@ -136,13 +132,11 @@ func TestShowCreateTable(t *testing.T) {
 		{
 			CreateStatement: `CREATE TABLE %s (
 	"te""st" INT8 NOT NULL,
-	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
-	FAMILY "primary" ("te""st")
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC)
 )`,
 			Expect: `CREATE TABLE public.%[1]s (
 	"te""st" INT8 NOT NULL,
-	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
-	FAMILY "primary" ("te""st")
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC)
 )`,
 		},
 		{
@@ -156,9 +150,19 @@ func TestShowCreateTable(t *testing.T) {
 	b INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	INDEX c (a ASC, b DESC),
-	FAMILY "primary" (a, b, rowid)
+	INDEX c (a ASC, b DESC)
 )`,
+		},
+
+		{
+			CreateStatement: `CREATE TABLE %s (
+	pk int8 PRIMARY KEY
+) WITH (ttl_expire_after = '10 minutes', ttl_job_cron = '@hourly')`,
+			Expect: `CREATE TABLE public.%[1]s (
+	pk INT8 NOT NULL,
+	crdb_internal_expiration TIMESTAMPTZ NOT VISIBLE NOT NULL DEFAULT current_timestamp():::TIMESTAMPTZ + '00:10:00':::INTERVAL ON UPDATE current_timestamp():::TIMESTAMPTZ + '00:10:00':::INTERVAL,
+	CONSTRAINT %[1]s_pkey PRIMARY KEY (pk ASC)
+) WITH (ttl = 'on', ttl_expire_after = '00:10:00':::INTERVAL, ttl_job_cron = '@hourly')`,
 		},
 		// Check that FK dependencies inside the current database
 		// have their db name omitted.
@@ -176,8 +180,7 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b),
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c),
-	FAMILY "primary" (i, j, k, rowid)
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c)
 )`,
 		},
 		// Check that FK dependencies using MATCH FULL on a non-composite key still
@@ -196,8 +199,7 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) MATCH FULL,
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL,
-	FAMILY "primary" (i, j, k, rowid)
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL
 )`,
 		},
 		// Check that FK dependencies outside of the current database
@@ -211,8 +213,7 @@ func TestShowCreateTable(t *testing.T) {
 	x INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x),
-	FAMILY "primary" (x, rowid)
+	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x)
 )`,
 		},
 		// Check that FK dependencies using SET NULL or SET DEFAULT
@@ -231,8 +232,7 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL,
-	FAMILY "primary" (i, j, k, rowid)
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL
 )`,
 		},
 		// Check that FK dependencies using MATCH FULL and MATCH SIMPLE are both
@@ -254,24 +254,35 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT %[1]s_k_l_fkey FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE,
-	FAMILY "primary" (i, j, k, l, rowid)
+	CONSTRAINT %[1]s_k_l_fkey FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE
 )`,
 		},
 		// Check hash sharded indexes are round trippable.
 		{
 			CreateStatement: `CREATE TABLE %s (
 				a INT,
-				INDEX (a) USING HASH WITH BUCKET_COUNT = 8
+				INDEX (a) USING HASH WITH (bucket_count=8)
 			)`,
 			Expect: `CREATE TABLE public.%[1]s (
 	a INT8 NULL,
-	crdb_internal_a_shard_8 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 8:::INT8)) STORED,
+	crdb_internal_a_shard_8 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(a))), 8:::INT8)) VIRTUAL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	INDEX t12_a_idx (a ASC) USING HASH WITH BUCKET_COUNT = 8,
-	FAMILY "primary" (a, crdb_internal_a_shard_8, rowid),
-	CONSTRAINT check_crdb_internal_a_shard_8 CHECK (crdb_internal_a_shard_8 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8))
+	INDEX %[1]s_a_idx (a ASC) USING HASH WITH (bucket_count=8)
+)`,
+		},
+		// Check trigram inverted indexes.
+		{
+			CreateStatement: `CREATE TABLE %s (
+        id INT PRIMARY KEY,
+				a TEXT,
+				INVERTED INDEX (a gin_trgm_ops)
+			)`,
+			Expect: `CREATE TABLE public.%[1]s (
+	id INT8 NOT NULL,
+	a STRING NULL,
+	CONSTRAINT %[1]s_pkey PRIMARY KEY (id ASC),
+	INVERTED INDEX %[1]s_a_idx (a gin_trgm_ops)
 )`,
 		},
 	}
@@ -282,7 +293,7 @@ func TestShowCreateView(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -300,35 +311,37 @@ func TestShowCreateView(t *testing.T) {
 	}{
 		{
 			`CREATE VIEW %s AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW public.%s (i, s, v, t) AS SELECT i, s, v, t FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\ti,\n\ts,\n\tv,\n\tt\n) AS SELECT i, s, v, t FROM d.public.t",
 		},
 		{
 			`CREATE VIEW %s AS SELECT i, s, t FROM t`,
-			`CREATE VIEW public.%s (i, s, t) AS SELECT i, s, t FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\ti,\n\ts,\n\tt\n) AS SELECT i, s, t FROM d.public.t",
 		},
 		{
 			`CREATE VIEW %s AS SELECT t.i, t.s, t.t FROM t`,
-			`CREATE VIEW public.%s (i, s, t) AS SELECT t.i, t.s, t.t FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\ti,\n\ts,\n\tt\n) AS SELECT t.i, t.s, t.t FROM d.public.t",
 		},
 		{
 			`CREATE VIEW %s AS SELECT foo.i, foo.s, foo.t FROM t AS foo WHERE foo.i > 3`,
-			`CREATE VIEW public.%s (i, s, t) AS SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3`,
+			"CREATE VIEW public.%s (\n\ti,\n\ts,\n\tt\n) AS " +
+				"SELECT foo.i, foo.s, foo.t FROM d.public.t AS foo WHERE foo.i > 3",
 		},
 		{
 			`CREATE VIEW %s AS SELECT count(*) FROM t`,
-			`CREATE VIEW public.%s (count) AS SELECT count(*) FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\tcount\n) AS SELECT count(*) FROM d.public.t",
 		},
 		{
 			`CREATE VIEW %s AS SELECT s, count(*) FROM t GROUP BY s HAVING count(*) > 3:::INT8`,
-			`CREATE VIEW public.%s (s, count) AS SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8`,
+			"CREATE VIEW public.%s (\n\ts,\n\tcount\n) AS " +
+				"SELECT s, count(*) FROM d.public.t GROUP BY s HAVING count(*) > 3:::INT8",
 		},
 		{
 			`CREATE VIEW %s (a, b, c, d) AS SELECT i, s, v, t FROM t`,
-			`CREATE VIEW public.%s (a, b, c, d) AS SELECT i, s, v, t FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\ta,\n\tb,\n\tc,\n\td\n) AS SELECT i, s, v, t FROM d.public.t",
 		},
 		{
 			`CREATE VIEW %s (a, b) AS SELECT i, v FROM t`,
-			`CREATE VIEW public.%s (a, b) AS SELECT i, v FROM d.public.t`,
+			"CREATE VIEW public.%s (\n\ta,\n\tb\n) AS SELECT i, v FROM d.public.t",
 		},
 	}
 	for i, test := range tests {
@@ -377,7 +390,7 @@ func TestShowCreateSequence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -415,6 +428,38 @@ func TestShowCreateSequence(t *testing.T) {
 		{
 			`CREATE SEQUENCE %s INCREMENT 5 MAXVALUE 10000 START 10 MINVALUE 0 CACHE 10`,
 			`CREATE SEQUENCE public.%s MINVALUE 0 MAXVALUE 10000 INCREMENT 5 START 10 CACHE 10`,
+		},
+		{
+			`CREATE SEQUENCE %s AS smallint`,
+			`CREATE SEQUENCE public.%s AS INT2 MINVALUE 1 MAXVALUE 32767 INCREMENT 1 START 1`,
+		},
+		{
+			`CREATE SEQUENCE %s AS int2`,
+			`CREATE SEQUENCE public.%s AS INT2 MINVALUE 1 MAXVALUE 32767 INCREMENT 1 START 1`,
+		},
+		// Int type is determined by `default_int_size` in cluster settings. Default is int8.
+		{
+			`CREATE SEQUENCE %s AS int`,
+			`CREATE SEQUENCE public.%s AS INT8 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
+		},
+		{
+			`CREATE SEQUENCE %s AS bigint`,
+			`CREATE SEQUENCE public.%s AS INT8 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1`,
+		},
+		// Override int/bigint's max value with user configured max value.
+		{
+			`CREATE SEQUENCE %s AS integer MINVALUE -5 MAXVALUE 9001`,
+			`CREATE SEQUENCE public.%s AS INT8 MINVALUE -5 MAXVALUE 9001 INCREMENT 1 START -5`,
+		},
+		{
+			`
+			CREATE SEQUENCE %s AS integer
+			START WITH -20000
+			INCREMENT BY -1
+			MINVALUE -20000
+			MAXVALUE 0
+			CACHE 1;`,
+			`CREATE SEQUENCE public.%s AS INT8 MINVALUE -20000 MAXVALUE 0 INCREMENT -1 START -20000`,
 		},
 	}
 	for i, test := range tests {
@@ -547,7 +592,7 @@ func TestShowQueries(t *testing.T) {
 		}
 	}
 
-	tc := serverutils.StartNewTestCluster(t, 2, /* numNodes */
+	tc := serverutils.StartCluster(t, 2, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -608,6 +653,75 @@ func TestShowQueries(t *testing.T) {
 	}
 }
 
+func TestShowQueriesDelegatesInternal(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	pgURL, cleanup := sqlutils.PGUrl(
+		t,
+		s.AdvSQLAddr(),
+		"TestShowQueriesDelegatesInternal",
+		url.User(username.RootUser),
+	)
+	defer cleanup()
+
+	q := pgURL.Query()
+	q.Add("application_name", "app_name")
+	pgURL.RawQuery = q.Encode()
+	copyConn, err := pgx.Connect(ctx, pgURL.String())
+	require.NoError(t, err)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		// COPY TO uses the internal executor to run the source query.
+		_, err := copyConn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
+		return err
+	})
+
+	showConn, err := pgx.Connect(ctx, pgURL.String())
+	require.NoError(t, err)
+
+	// SucceedsSoon is used since COPY is being executed concurrently.
+	var appName string
+	testutils.SucceedsSoon(t, func() error {
+		// The COPY query should use the specified app name.
+		err = showConn.QueryRow(ctx, "SELECT application_name FROM [SHOW QUERIES] WHERE query LIKE 'COPY (SELECT pg_sleep(1) %'").Scan(&appName)
+		if err != nil {
+			return err
+		}
+		if appName != "app_name" {
+			return errors.New("expected COPY to appear in SHOW QUERIES")
+		}
+
+		// The internal query should use the delegated app name.
+		err = showConn.QueryRow(ctx, "SELECT application_name FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep(1) %'").Scan(&appName)
+		if err != nil {
+			return err
+		}
+		if appName != catconstants.DelegatedAppNamePrefix+"app_name" {
+			return errors.New("expected delegated query to appear in SHOW QUERIES")
+		}
+
+		return nil
+	})
+
+	err = copyConn.PgConn().CancelRequest(ctx)
+	require.NoError(t, err)
+
+	// An error is allowed here, since the query was canceled.
+	_ = g.Wait()
+
+	err = showConn.Close(ctx)
+	require.NoError(t, err)
+	err = copyConn.Close(ctx)
+	require.NoError(t, err)
+
+}
+
 func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -647,7 +761,7 @@ func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 		},
 	}
 
-	tc := serverutils.StartNewTestCluster(t, 3,
+	tc := serverutils.StartCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs:      testServerArgs,
@@ -676,6 +790,21 @@ func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 			"SELECT upper($1)",
 			[]interface{}{"hello"},
 			"SELECT upper('hello')",
+		},
+		{
+			"SELECT /* test */ upper($1)",
+			[]interface{}{"hello"},
+			"SELECT upper('hello') /* test */",
+		},
+		{
+			"SELECT /* test */ 'hi'::string",
+			[]interface{}{},
+			"SELECT 'hi'::STRING /* test */",
+		},
+		{
+			"SELECT /* test */ 'hi'::string /* fnord */",
+			[]interface{}{},
+			"SELECT 'hi'::STRING /* test */ /* fnord */",
 		},
 	}
 
@@ -712,7 +841,14 @@ func TestShowQueriesFillsInValuesForPlaceholders(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				require.Equal(t, test.expected, recordedQueries[test.statement])
+				// parse and stringify the statement so that it matches the key in the
+				// recordedQueries map.
+				stmt, err := parser.ParseOne(test.statement)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sql := stmt.AST.String()
+				require.Equal(t, test.expected, recordedQueries[sql])
 			})
 		}
 	}
@@ -724,7 +860,7 @@ func TestShowSessions(t *testing.T) {
 
 	var conn *gosql.DB
 
-	tc := serverutils.StartNewTestCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
+	tc := serverutils.StartCluster(t, 2 /* numNodes */, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.Background())
 
 	conn = tc.ServerConn(0)
@@ -834,18 +970,20 @@ func TestShowSessionPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Insecure = true
 	s, rawSQLDBroot, _ := serverutils.StartServer(t, params)
 	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
 	defer s.Stopper().Stop(context.Background())
 
-	// Create three users: one with no special permissions, one with the
-	// VIEWACTIVITY role option, and one admin. We'll check that the VIEWACTIVITY
+	// Create four users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, one with VIEWACTIVITYREDACTED option,
+	// and one admin. We'll check that the VIEWACTIVITY, VIEWACTIVITYREDACTED
 	// users and the admin can see all sessions and the unpermissioned user can
 	// only see their own session.
 	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
 	_ = sqlDBroot.Exec(t, `CREATE USER viewactivity VIEWACTIVITY`)
+	_ = sqlDBroot.Exec(t, `CREATE USER viewactivityredacted VIEWACTIVITYREDACTED`)
 	_ = sqlDBroot.Exec(t, `CREATE USER adminuser`)
 	_ = sqlDBroot.Exec(t, `GRANT admin TO adminuser`)
 
@@ -858,13 +996,14 @@ func TestShowSessionPrivileges(t *testing.T) {
 	users := []user{
 		{"noperms", false, nil},
 		{"viewactivity", true, nil},
+		{"viewactivityredacted", true, nil},
 		{"adminuser", true, nil},
 	}
 	for i, tc := range users {
 		pgURL := url.URL{
 			Scheme:   "postgres",
 			User:     url.User(tc.username),
-			Host:     s.ServingSQLAddr(),
+			Host:     s.AdvSQLAddr(),
 			RawQuery: "sslmode=disable",
 		}
 		db, err := gosql.Open("postgres", pgURL.String())
@@ -908,131 +1047,326 @@ func TestShowSessionPrivileges(t *testing.T) {
 	}
 }
 
-func TestLintClusterSettingNames(t *testing.T) {
+// TestShowRedactedActiveStatements tests the crdb_internal.cluster_queries
+// table for system permissions.
+func TestShowRedactedActiveStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, _ := serverutils.StartServer(t, params)
+	params, _ := createTestServerParams()
+	params.Insecure = true
+	ctx, cancel := context.WithCancel(context.Background())
+	s, rawSQLDBroot, _ := serverutils.StartServer(t, params)
+	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
 	defer s.Stopper().Stop(context.Background())
 
-	rows, err := sqlDB.Query(`SELECT variable, setting_type, description FROM [SHOW ALL CLUSTER SETTINGS]`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
+	// Create four users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, one with VIEWACTIVITYREDACTED option,
+	// and one with both permissions.
+	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
+	_ = sqlDBroot.Exec(t, `CREATE USER onlyviewactivity`)
+	_ = sqlDBroot.Exec(t, `CREATE USER onlyviewactivityredacted`)
+	_ = sqlDBroot.Exec(t, `CREATE USER bothperms`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITY TO onlyviewactivity`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITYREDACTED TO onlyviewactivityredacted`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITY TO bothperms`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITYREDACTED TO bothperms`)
 
-	for rows.Next() {
-		var varName, sType, desc string
-		if err := rows.Scan(&varName, &sType, &desc); err != nil {
+	type user struct {
+		username         string
+		canViewOtherRows bool // Can the user view other users' rows in the table?
+		isQueryRedacted  bool // Are the other userss queries redacted?
+		sqlRunner        *sqlutils.SQLRunner
+	}
+
+	// A user with no permissions should only be able to see their own rows
+	// in the table.
+	// A user with only VIEWACTIVITY should be able to see the whole query.
+	// A user with only VIEWACTIVITYREDACTED should see a redacted query.
+	// A user with both should see the redacted query, as VIEWACTIVITYREDACTED
+	// takes precedence.
+	users := []user{
+		{"onlyviewactivityredacted", true, true, nil},
+		{"onlyviewactivity", true, false, nil},
+		{"noperms", false, false, nil},
+		{"bothperms", true, true, nil},
+	}
+	for i, tc := range users {
+		pgURL := url.URL{
+			Scheme:   "postgres",
+			User:     url.User(tc.username),
+			Host:     s.AdvSQLAddr(),
+			RawQuery: "sslmode=disable",
+		}
+		db, err := gosql.Open("postgres", pgURL.String())
+		if err != nil {
 			t.Fatal(err)
 		}
+		defer db.Close()
+		users[i].sqlRunner = sqlutils.MakeSQLRunner(db)
 
-		if strings.ToLower(varName) != varName {
-			t.Errorf("%s: variable name must be all lowercase", varName)
-		}
-
-		suffixSuggestions := map[string]string{
-			"_ttl":     ".ttl",
-			"_enabled": ".enabled",
-			"_timeout": ".timeout",
-		}
-
-		nameErr := func() error {
-			segments := strings.Split(varName, ".")
-			for _, segment := range segments {
-				if strings.TrimSpace(segment) != segment {
-					return errors.Errorf("%s: part %q has heading or trailing whitespace", varName, segment)
-				}
-				tokens, ok := parser.Tokens(segment)
-				if !ok {
-					return errors.Errorf("%s: part %q does not scan properly", varName, segment)
-				}
-				if len(tokens) == 0 || len(tokens) > 1 {
-					return errors.Errorf("%s: part %q has invalid structure", varName, segment)
-				}
-				if tokens[0].TokenID != parser.IDENT {
-					cat, ok := lexbase.KeywordsCategories[tokens[0].Str]
-					if !ok {
-						return errors.Errorf("%s: part %q has invalid structure", varName, segment)
-					}
-					if cat == "R" {
-						return errors.Errorf("%s: part %q is a reserved keyword", varName, segment)
-					}
-				}
-			}
-
-			for suffix, repl := range suffixSuggestions {
-				if strings.HasSuffix(varName, suffix) {
-					return errors.Errorf("%s: use %q instead of %q", varName, repl, suffix)
-				}
-			}
-
-			if sType == "b" && !strings.HasSuffix(varName, ".enabled") {
-				return errors.Errorf("%s: use .enabled for booleans", varName)
-			}
-
-			return nil
-		}()
-		if nameErr != nil {
-			var grandFathered = map[string]string{
-				"server.declined_reservation_timeout":                `server.declined_reservation_timeout: use ".timeout" instead of "_timeout"`,
-				"server.failed_reservation_timeout":                  `server.failed_reservation_timeout: use ".timeout" instead of "_timeout"`,
-				"server.web_session_timeout":                         `server.web_session_timeout: use ".timeout" instead of "_timeout"`,
-				"sql.distsql.flow_stream_timeout":                    `sql.distsql.flow_stream_timeout: use ".timeout" instead of "_timeout"`,
-				"debug.panic_on_failed_assertions":                   `debug.panic_on_failed_assertions: use .enabled for booleans`,
-				"diagnostics.reporting.send_crash_reports":           `diagnostics.reporting.send_crash_reports: use .enabled for booleans`,
-				"kv.closed_timestamp.follower_reads_enabled":         `kv.closed_timestamp.follower_reads_enabled: use ".enabled" instead of "_enabled"`,
-				"kv.raft_log.disable_synchronization_unsafe":         `kv.raft_log.disable_synchronization_unsafe: use .enabled for booleans`,
-				"kv.range_merge.queue_enabled":                       `kv.range_merge.queue_enabled: use ".enabled" instead of "_enabled"`,
-				"kv.range_split.by_load_enabled":                     `kv.range_split.by_load_enabled: use ".enabled" instead of "_enabled"`,
-				"kv.transaction.parallel_commits_enabled":            `kv.transaction.parallel_commits_enabled: use ".enabled" instead of "_enabled"`,
-				"kv.transaction.write_pipelining_enabled":            `kv.transaction.write_pipelining_enabled: use ".enabled" instead of "_enabled"`,
-				"server.clock.forward_jump_check_enabled":            `server.clock.forward_jump_check_enabled: use ".enabled" instead of "_enabled"`,
-				"sql.defaults.experimental_optimizer_mutations":      `sql.defaults.experimental_optimizer_mutations: use .enabled for booleans`,
-				"sql.distsql.distribute_index_joins":                 `sql.distsql.distribute_index_joins: use .enabled for booleans`,
-				"sql.metrics.statement_details.dump_to_logs":         `sql.metrics.statement_details.dump_to_logs: use .enabled for booleans`,
-				"sql.metrics.statement_details.sample_logical_plans": `sql.metrics.statement_details.sample_logical_plans: use .enabled for booleans`,
-				"sql.trace.log_statement_execute":                    `sql.trace.log_statement_execute: use .enabled for booleans`,
-				"trace.debug.enable":                                 `trace.debug.enable: use .enabled for booleans`,
-				// These two settings have been deprecated in favor of a new (better named) setting
-				// but the old name is still around to support migrations.
-				// TODO(knz): remove these cases when these settings are retired.
-				"timeseries.storage.10s_resolution_ttl": `timeseries.storage.10s_resolution_ttl: part "10s_resolution_ttl" has invalid structure`,
-				"timeseries.storage.30m_resolution_ttl": `timeseries.storage.30m_resolution_ttl: part "30m_resolution_ttl" has invalid structure`,
-
-				// These use the _timeout suffix to stay consistent with the
-				// corresponding session variables.
-				"sql.defaults.statement_timeout":                   `sql.defaults.statement_timeout: use ".timeout" instead of "_timeout"`,
-				"sql.defaults.lock_timeout":                        `sql.defaults.lock_timeout: use ".timeout" instead of "_timeout"`,
-				"sql.defaults.idle_in_session_timeout":             `sql.defaults.idle_in_session_timeout: use ".timeout" instead of "_timeout"`,
-				"sql.defaults.idle_in_transaction_session_timeout": `sql.defaults.idle_in_transaction_session_timeout: use ".timeout" instead of "_timeout"`,
-			}
-			expectedErr, found := grandFathered[varName]
-			if !found || expectedErr != nameErr.Error() {
-				t.Error(nameErr)
-			}
-		}
-
-		if strings.TrimSpace(desc) != desc {
-			t.Errorf("%s: description %q has heading or trailing whitespace", varName, desc)
-		}
-
-		if len(desc) == 0 {
-			t.Errorf("%s: description is empty", varName)
-		}
-
-		if len(desc) > 0 {
-			if strings.ToLower(desc[0:1]) != desc[0:1] {
-				t.Errorf("%s: description %q must not start with capital", varName, desc)
-			}
-			if sType != "e" && (desc[len(desc)-1] == '.') && !strings.Contains(desc, ". ") {
-				// TODO(knz): this check doesn't work with the way enum values are added to their descriptions.
-				t.Errorf("%s: description %q must end with period only if it contains a secondary sentence", varName, desc)
-			}
-		}
+		// Ensure the session is open.
+		users[i].sqlRunner.Exec(t, `SELECT version()`)
 	}
 
+	// Run a long-running sleep query in the background.
+	startSignal := make(chan struct{})
+	waiter := make(chan struct{})
+	go func() {
+		// Signal that we have started the query.
+		close(startSignal)
+		_, _ = rawSQLDBroot.ExecContext(ctx, `SELECT pg_sleep(30)`)
+		// Signal that we have finished the query.
+		close(waiter)
+	}()
+
+	// Wait for the start signal.
+	<-startSignal
+
+	selectRootQuery := `SELECT query FROM [SHOW CLUSTER QUERIES] WHERE query LIKE 'SELECT pg_sleep%' AND user_name = 'root'`
+
+	testutils.SucceedsSoon(t, func() error {
+		rows := sqlDBroot.Query(t, selectRootQuery)
+		defer rows.Close()
+		count := 0
+		for rows.Next() {
+			count++
+			var query string
+			if err := rows.Scan(&query); err != nil {
+				return err
+			}
+			if query != "SELECT pg_sleep(30)" {
+				return errors.Errorf("Expected `SELECT pg_sleep(30)`, got %s", query)
+			}
+		}
+		if count != 1 {
+			return errors.Errorf("expected 1 row, got %d", count)
+		}
+		return nil
+	})
+
+	for _, u := range users {
+		t.Run(u.username, func(t *testing.T) {
+			rootRows := u.sqlRunner.Query(t, selectRootQuery)
+			defer func() { require.NoError(t, rootRows.Close()) }()
+
+			count := 0
+			for rootRows.Next() {
+				count++
+
+				var query string
+				if err := rootRows.Scan(&query); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Log(query)
+				// Make sure that if the user is supposed to see a redacted query, they do.
+				if u.isQueryRedacted {
+					if !strings.HasPrefix(query, "SELECT pg_sleep(_)") {
+						t.Fatalf("Expected `SELECT pg_sleep(_)`, got %s", query)
+					}
+					// Make sure that if the user is supposed to see the full query, they do.
+				} else {
+					if !strings.HasPrefix(query, "SELECT pg_sleep(30)") {
+						t.Fatalf("Expected `SELECT pg_sleep(30)`, got %s", query)
+					}
+				}
+			}
+			if u.canViewOtherRows {
+				require.Equalf(t, 1, count, "expected 1 row, got %d", count)
+			} else {
+				require.Equalf(t, 0, count, "expected 0 rows, got %d", count)
+			}
+
+			selectOwnQuery := fmt.Sprintf(
+				`SELECT query FROM [SHOW CLUSTER QUERIES] WHERE query LIKE 'SELECT query FROM%%' AND user_name = '%s'`,
+				u.username,
+			)
+			ownRows := u.sqlRunner.Query(t, selectOwnQuery)
+			defer func() { require.NoError(t, ownRows.Close()) }()
+
+			count = 0
+			for ownRows.Next() {
+				count++
+
+				var query string
+				if err := ownRows.Scan(&query); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Log(query)
+				// Any user can always see their own unredacted queries.
+				if !strings.Contains(query, fmt.Sprintf("user_name = '%s'", u.username)) {
+					t.Fatalf("Expected unredacted query, got %s", query)
+				}
+			}
+			require.Equalf(t, 1, count, "expected 1 row, got %d", count)
+		})
+	}
+
+	cancel()
+	<-waiter
+}
+
+// TestShowRedactedSessions tests the crdb_internal.cluster_sessions
+// table for system permissions.
+func TestShowRedactedSessions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := createTestServerParams()
+	params.Insecure = true
+	ctx, cancel := context.WithCancel(context.Background())
+	s, rawSQLDBroot, _ := serverutils.StartServer(t, params)
+	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
+	defer s.Stopper().Stop(context.Background())
+
+	// Create four users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, one with VIEWACTIVITYREDACTED option,
+	// and one with both permissions.
+	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
+	_ = sqlDBroot.Exec(t, `CREATE USER onlyviewactivity`)
+	_ = sqlDBroot.Exec(t, `CREATE USER onlyviewactivityredacted`)
+	_ = sqlDBroot.Exec(t, `CREATE USER bothperms`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITY TO onlyviewactivity`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITYREDACTED TO onlyviewactivityredacted`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITY TO bothperms`)
+	_ = sqlDBroot.Exec(t, `GRANT SYSTEM VIEWACTIVITYREDACTED TO bothperms`)
+
+	type user struct {
+		username         string
+		canViewOtherRows bool // Can the user view other users' rows in the table?
+		isQueryRedacted  bool // Are the other userss queries redacted?
+		sqlRunner        *sqlutils.SQLRunner
+	}
+
+	// A user with no permissions should only be able to see their own rows
+	// in the table.
+	// A user with only VIEWACTIVITY should be able to see the whole query.
+	// A user with only VIEWACTIVITYREDACTED should see a redacted query.
+	// A user with both should see the redacted query, as VIEWACTIVITYREDACTED
+	// takes precedence.
+	users := []user{
+		{"onlyviewactivityredacted", true, true, nil},
+		{"onlyviewactivity", true, false, nil},
+		{"noperms", false, false, nil},
+		{"bothperms", true, true, nil},
+	}
+	for i, tc := range users {
+		pgURL := url.URL{
+			Scheme:   "postgres",
+			User:     url.User(tc.username),
+			Host:     s.AdvSQLAddr(),
+			RawQuery: "sslmode=disable",
+		}
+		db, err := gosql.Open("postgres", pgURL.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		users[i].sqlRunner = sqlutils.MakeSQLRunner(db)
+
+		// Ensure the session is open.
+		users[i].sqlRunner.Exec(t, `SELECT version()`)
+	}
+
+	// Run a long-running sleep query in the background.
+	startSignal := make(chan struct{})
+	waiter := make(chan struct{})
+	go func() {
+		// Signal that we have started the query.
+		close(startSignal)
+		_, _ = rawSQLDBroot.ExecContext(ctx, `SELECT pg_sleep(30)`)
+		// Signal that we have finished the query.
+		close(waiter)
+	}()
+
+	// Wait for the start signal.
+	<-startSignal
+
+	selectRootQuery := `SELECT active_queries FROM [SHOW CLUSTER SESSIONS] WHERE active_queries LIKE 'SELECT pg_sleep%' AND user_name = 'root'`
+
+	testutils.SucceedsSoon(t, func() error {
+		rows := sqlDBroot.Query(t, selectRootQuery)
+		defer rows.Close()
+		count := 0
+		for rows.Next() {
+			count++
+			var query string
+			if err := rows.Scan(&query); err != nil {
+				return err
+			}
+			if query != "SELECT pg_sleep(30)" {
+				return errors.Errorf("Expected `SELECT pg_sleep(30)`, got %s", query)
+			}
+		}
+		if count != 1 {
+			return errors.Errorf("expected 1 row, got %d", count)
+		}
+		return nil
+	})
+
+	for _, u := range users {
+		t.Run(u.username, func(t *testing.T) {
+			rootRows := u.sqlRunner.Query(t, selectRootQuery)
+			defer func() { require.NoError(t, rootRows.Close()) }()
+
+			count := 0
+			for rootRows.Next() {
+				count++
+
+				var query string
+				if err := rootRows.Scan(&query); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Log(query)
+				// Make sure that if the user is supposed to see a redacted query, they do.
+				if u.isQueryRedacted {
+					if !strings.HasPrefix(query, "SELECT pg_sleep(_)") {
+						t.Fatalf("Expected `SELECT pg_sleep(_)`, got %s", query)
+					}
+					// Make sure that if the user is supposed to see the full query, they do.
+				} else {
+					if !strings.HasPrefix(query, "SELECT pg_sleep(30)") {
+						t.Fatalf("Expected `SELECT pg_sleep(30)`, got %s", query)
+					}
+				}
+			}
+			if u.canViewOtherRows {
+				require.Equalf(t, 1, count, "expected 1 row, got %d", count)
+			} else {
+				require.Equalf(t, 0, count, "expected 0 rows, got %d", count)
+			}
+
+			selectOwnQuery := fmt.Sprintf(
+				`SELECT active_queries FROM [SHOW CLUSTER SESSIONS] WHERE active_queries LIKE 'SELECT active_queries FROM%%' AND user_name = '%s'`,
+				u.username,
+			)
+			ownRows := u.sqlRunner.Query(t, selectOwnQuery)
+			defer func() { require.NoError(t, ownRows.Close()) }()
+
+			count = 0
+			for ownRows.Next() {
+				count++
+
+				var query string
+				if err := ownRows.Scan(&query); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Log(query)
+				// Any user can always see their own unredacted queries.
+				if !strings.Contains(query, fmt.Sprintf("user_name = '%s'", u.username)) {
+					t.Fatalf("Expected unredacted query, got %s", query)
+				}
+			}
+			require.Equalf(t, 1, count, "expected 1 row, got %d", count)
+		})
+	}
+
+	cancel()
+	<-waiter
 }
 
 // TestCancelQueriesRace can be stressed to try and reproduce a race
@@ -1050,12 +1384,18 @@ func TestCancelQueriesRace(t *testing.T) {
 		_, _ = sqlDB.ExecContext(ctx, `SELECT pg_sleep(10)`)
 		close(waiter)
 	}()
-	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+	_, err1 := sqlDB.ExecContext(ctx, `CANCEL QUERIES (
 		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
 	)`)
-	_, _ = sqlDB.ExecContext(ctx, `CANCEL QUERIES (
+
+	_, err2 := sqlDB.ExecContext(ctx, `CANCEL QUERIES (
 		SELECT query_id FROM [SHOW QUERIES] WHERE query LIKE 'SELECT pg_sleep%'
 	)`)
+	// At least one query cancellation is expected to succeed.
+	require.Truef(
+		t,
+		err1 == nil || err2 == nil,
+		"Both query cancellations failed with errors: %v and %v", err1, err2)
 
 	cancel()
 	<-waiter

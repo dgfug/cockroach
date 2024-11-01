@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -23,6 +18,12 @@ type DiscardMode int
 const (
 	// DiscardModeAll represents a DISCARD ALL statement.
 	DiscardModeAll DiscardMode = iota
+
+	// DiscardModeSequences represents a DISCARD SEQUENCES statement
+	DiscardModeSequences
+
+	// DiscardModeTemp represents a DISCARD TEMPORARY statement
+	DiscardModeTemp
 )
 
 // Format implements the NodeFormatter interface.
@@ -30,6 +31,10 @@ func (node *Discard) Format(ctx *FmtCtx) {
 	switch node.Mode {
 	case DiscardModeAll:
 		ctx.WriteString("DISCARD ALL")
+	case DiscardModeSequences:
+		ctx.WriteString("DISCARD SEQUENCES")
+	case DiscardModeTemp:
+		ctx.WriteString("DISCARD TEMPORARY")
 	}
 }
 

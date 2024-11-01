@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -16,8 +11,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -26,9 +23,9 @@ import (
 )
 
 // migrationServer is an implementation of the Migration service. The RPCs here
-// are used to power the migrations infrastructure in pkg/migrations.
+// are used to power the upgrades infrastructure in pkg/upgrades.
 type migrationServer struct {
-	server *Server
+	server *topLevelServer
 
 	// We use this mutex to serialize attempts to bump the cluster version.
 	syncutil.Mutex
@@ -52,15 +49,15 @@ func (m *migrationServer) ValidateTargetClusterVersion(
 	// We're validating the following:
 	//
 	//   node's minimum supported version <= target version <= node's binary version
-	if targetCV.Less(versionSetting.BinaryMinSupportedVersion()) {
+	if targetCV.Less(versionSetting.MinSupportedVersion()) {
 		msg := fmt.Sprintf("target cluster version %s less than binary's min supported version %s",
-			targetCV, versionSetting.BinaryMinSupportedVersion())
+			targetCV, versionSetting.MinSupportedVersion())
 		log.Warningf(ctx, "%s", msg)
 		return nil, errors.Newf("%s", redact.Safe(msg))
 	}
 
 	// TODO(irfansharif): These errors are propagated all the way back to the
-	// user during improper version upgrades. Given the migrations
+	// user during improper version upgrades. Given the upgrades
 	// infrastructure is stepping through internal versions during major cluster
 	// version upgrades, and given we don't use negative internal versions (as
 	// suggested in #33578), it currently manifests (see
@@ -71,9 +68,9 @@ func (m *migrationServer) ValidateTargetClusterVersion(
 	// It would be a bit clearer to use negative internal versions, to be able
 	// to surface more obvious errors. Alternatively we could simply construct
 	// a better error message here.
-	if versionSetting.BinaryVersion().Less(targetCV.Version) {
+	if versionSetting.LatestVersion().Less(targetCV.Version) {
 		msg := fmt.Sprintf("binary version %s less than target cluster version %s",
-			versionSetting.BinaryVersion(), targetCV)
+			versionSetting.LatestVersion(), targetCV)
 		log.Warningf(ctx, "%s", msg)
 		return nil, errors.Newf("%s", redact.Safe(msg))
 	}
@@ -110,9 +107,9 @@ func bumpClusterVersion(
 ) error {
 
 	versionSetting := st.Version
-	prevCV, err := kvserver.SynthesizeClusterVersionFromEngines(
-		ctx, engines, versionSetting.BinaryVersion(),
-		versionSetting.BinaryMinSupportedVersion(),
+	prevCV, err := kvstorage.SynthesizeClusterVersionFromEngines(
+		ctx, engines, versionSetting.LatestVersion(),
+		versionSetting.MinSupportedVersion(),
 	)
 	if err != nil {
 		return err
@@ -130,7 +127,7 @@ func bumpClusterVersion(
 	// Whenever the version changes, we want to persist that update to
 	// wherever the CRDB process retrieved the initial version from
 	// (typically a collection of storage.Engines).
-	if err := kvserver.WriteClusterVersionToEngines(ctx, engines, newCV); err != nil {
+	if err := kvstorage.WriteClusterVersionToEngines(ctx, engines, newCV); err != nil {
 		return err
 	}
 
@@ -168,8 +165,7 @@ func (m *migrationServer) SyncAllEngines(
 		m.server.node.waitForAdditionalStoreInit()
 
 		for _, eng := range m.server.engines {
-			batch := eng.NewBatch()
-			if err := batch.LogData(nil); err != nil {
+			if err := storage.WriteSyncNoop(eng); err != nil {
 				return err
 			}
 		}
@@ -210,11 +206,11 @@ func (m *migrationServer) PurgeOutdatedReplicas(
 	return resp, nil
 }
 
-// TODO(ayang): remove this RPC and associated request/response in 22.1
-func (m *migrationServer) DeprecateBaseEncryptionRegistry(
-	ctx context.Context, req *serverpb.DeprecateBaseEncryptionRegistryRequest,
-) (*serverpb.DeprecateBaseEncryptionRegistryResponse, error) {
-	const opName = "deprecate-base-encryption-registry"
+// WaitForSpanConfigSubscription implements the MigrationServer interface.
+func (m *migrationServer) WaitForSpanConfigSubscription(
+	ctx context.Context, _ *serverpb.WaitForSpanConfigSubscriptionRequest,
+) (*serverpb.WaitForSpanConfigSubscriptionResponse, error) {
+	const opName = "wait-for-spanconfig-subscription"
 	ctx, span := m.server.AnnotateCtxWithSpan(ctx, opName)
 	defer span.Finish()
 	ctx = logtags.AddTag(ctx, opName, nil)
@@ -226,17 +222,13 @@ func (m *migrationServer) DeprecateBaseEncryptionRegistry(
 		// need to ensure that the bootstrap process has happened.
 		m.server.node.waitForAdditionalStoreInit()
 
-		for _, eng := range m.server.engines {
-			if err := eng.SetMinVersion(*req.Version); err != nil {
-				return err
-			}
-		}
-
-		return nil
+		return m.server.node.stores.VisitStores(func(s *kvserver.Store) error {
+			return s.WaitForSpanConfigSubscription(ctx)
+		})
 	}); err != nil {
 		return nil, err
 	}
 
-	resp := &serverpb.DeprecateBaseEncryptionRegistryResponse{}
+	resp := &serverpb.WaitForSpanConfigSubscriptionResponse{}
 	return resp, nil
 }

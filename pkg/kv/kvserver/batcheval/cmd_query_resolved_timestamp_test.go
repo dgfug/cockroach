@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
@@ -35,21 +32,29 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	db := storage.NewInMemForTesting(true)
+	db := storage.NewDefaultInMemForTesting()
 	defer db.Close()
 
 	makeTS := func(ts int64) hlc.Timestamp {
 		return hlc.Timestamp{WallTime: ts}
 	}
 	writeValue := func(k string, ts int64) {
-		require.NoError(t, storage.MVCCDelete(ctx, db, nil, roachpb.Key(k), makeTS(ts), nil))
+		_, _, err := storage.MVCCDelete(ctx, db, roachpb.Key(k), makeTS(ts), storage.MVCCWriteOptions{})
+		require.NoError(t, err)
 	}
 	writeIntent := func(k string, ts int64) {
-		txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, makeTS(ts), 0)
-		require.NoError(t, storage.MVCCDelete(ctx, db, nil, roachpb.Key(k), makeTS(ts), &txn))
+		txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, 0, makeTS(ts), 0, 1, 0, false /* omitInRangefeeds */)
+		_, _, err := storage.MVCCDelete(ctx, db, roachpb.Key(k), makeTS(ts), storage.MVCCWriteOptions{Txn: &txn})
+		require.NoError(t, err)
 	}
 	writeInline := func(k string) {
-		require.NoError(t, storage.MVCCDelete(ctx, db, nil, roachpb.Key(k), hlc.Timestamp{}, nil))
+		_, _, err := storage.MVCCDelete(ctx, db, roachpb.Key(k), hlc.Timestamp{}, storage.MVCCWriteOptions{})
+		require.NoError(t, err)
+	}
+	writeLock := func(k string, str lock.Strength) {
+		txn := roachpb.MakeTransaction("test", roachpb.Key(k), 0, 0, makeTS(1), 0, 1, 0, false /* omitInRangefeeds */)
+		err := storage.MVCCAcquireLock(ctx, db, &txn, str, roachpb.Key(k), nil, 0, 0)
+		require.NoError(t, err)
 	}
 
 	// Setup: (with separated intents the actual key layout in the store is not what is listed below.)
@@ -57,12 +62,15 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 	//  a: intent @ 5
 	//  a: value  @ 3
 	//  b: inline value
+	//  c: shared lock #1
+	//  c: shared lock #2
 	//  c: value  @ 6
 	//  c: value  @ 4
 	//  c: value  @ 1
 	//  d: intent @ 2
 	//  e: intent @ 7
 	//  f: inline value
+	//  g: exclusive lock
 	//
 	// NB: must write each key in increasing timestamp order.
 	writeValue("a", 3)
@@ -70,9 +78,12 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 	writeInline("b")
 	writeValue("c", 1)
 	writeValue("c", 4)
+	writeLock("c", lock.Shared)
+	writeLock("c", lock.Shared)
 	writeIntent("d", 2)
 	writeIntent("e", 7)
 	writeInline("f")
+	writeLock("g", lock.Exclusive)
 
 	for _, cfg := range []struct {
 		name                         string
@@ -176,12 +187,11 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 			}
 
 			st := cluster.MakeTestingClusterSettings()
-			gc.MaxIntentsPerCleanupBatch.Override(ctx, &st.SV, cfg.maxEncounteredIntents)
-			gc.MaxIntentKeyBytesPerCleanupBatch.Override(ctx, &st.SV, cfg.maxEncounteredIntentKeyBytes)
+			gc.MaxLocksPerCleanupBatch.Override(ctx, &st.SV, cfg.maxEncounteredIntents)
+			gc.MaxLockKeyBytesPerCleanupBatch.Override(ctx, &st.SV, cfg.maxEncounteredIntentKeyBytes)
 			QueryResolvedTimestampIntentCleanupAge.Override(ctx, &st.SV, cfg.intentCleanupAge)
 
-			manual := hlc.NewManualClock(10)
-			clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 10)))
 
 			evalCtx := &MockEvalCtx{
 				ClusterSettings: st,
@@ -190,15 +200,15 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 			}
 			cArgs := CommandArgs{
 				EvalCtx: evalCtx.EvalContext(),
-				Args: &roachpb.QueryResolvedTimestampRequest{
-					RequestHeader: roachpb.RequestHeader{
+				Args: &kvpb.QueryResolvedTimestampRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key:    roachpb.Key(cfg.span[0]),
 						EndKey: roachpb.Key(cfg.span[1]),
 					},
 				},
 			}
 
-			var resp roachpb.QueryResolvedTimestampResponse
+			var resp kvpb.QueryResolvedTimestampResponse
 			res, err := QueryResolvedTimestamp(ctx, db, cArgs, &resp)
 			require.NoError(t, err)
 			require.Equal(t, cfg.expResolvedTS, resp.ResolvedTS)
@@ -217,22 +227,21 @@ func TestQueryResolvedTimestampErrors(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	db := storage.NewInMemForTesting(true)
+	db := storage.NewDefaultInMemForTesting()
 	defer db.Close()
 
 	txnUUID := uuid.FromUint128(uint128.FromInts(0, 12345))
 
 	lockTableKey := storage.LockTableKey{
 		Key:      roachpb.Key("a"),
-		Strength: lock.Exclusive,
-		TxnUUID:  txnUUID.GetBytes(),
+		Strength: lock.Intent,
+		TxnUUID:  txnUUID,
 	}
 	engineKey, buf := lockTableKey.ToEngineKey(nil)
 
 	st := cluster.MakeTestingClusterSettings()
 
-	manual := hlc.NewManualClock(10)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 10)))
 
 	evalCtx := &MockEvalCtx{
 		ClusterSettings: st,
@@ -241,14 +250,14 @@ func TestQueryResolvedTimestampErrors(t *testing.T) {
 	}
 	cArgs := CommandArgs{
 		EvalCtx: evalCtx.EvalContext(),
-		Args: &roachpb.QueryResolvedTimestampRequest{
-			RequestHeader: roachpb.RequestHeader{
+		Args: &kvpb.QueryResolvedTimestampRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    roachpb.Key("a"),
 				EndKey: roachpb.Key("z"),
 			},
 		},
 	}
-	var resp roachpb.QueryResolvedTimestampResponse
+	var resp kvpb.QueryResolvedTimestampResponse
 	t.Run("LockTable entry without MVCC metadata", func(t *testing.T) {
 		require.NoError(t, db.PutEngineKey(engineKey, buf))
 		_, err := QueryResolvedTimestamp(ctx, db, cArgs, &resp)

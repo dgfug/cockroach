@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -17,7 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -25,9 +20,9 @@ import (
 type sumAggTmplInfo struct {
 	aggTmplInfoBase
 	SumKind        string
-	NeedsHelper    bool
 	InputVecMethod string
 	RetGoType      string
+	RetGoTypeSlice string
 	RetVecMethod   string
 
 	sumOverload assignFunc
@@ -40,7 +35,7 @@ func (s sumAggTmplInfo) AssignAdd(
 	// the resolved overload to use Plus overload in particular, so all other
 	// fields remain unset.
 	lawo := &lastArgWidthOverload{lastArgTypeOverload: &lastArgTypeOverload{
-		overloadBase: newBinaryOverloadBase(tree.Plus),
+		overloadBase: newBinaryOverloadBase(treebin.Plus),
 	}}
 	return s.sumOverload(lawo, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol)
 }
@@ -54,7 +49,7 @@ func (s sumAggTmplInfo) AssignSubtract(
 	// the resolved overload to use Minus overload in particular, so all other
 	// fields remain unset.
 	lawo := &lastArgWidthOverload{lastArgTypeOverload: &lastArgTypeOverload{
-		overloadBase: newBinaryOverloadBase(tree.Minus),
+		overloadBase: newBinaryOverloadBase(treebin.Minus),
 	}}
 	return s.sumOverload(lawo, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol)
 }
@@ -93,7 +88,7 @@ func getSumAddOverload(inputTypeFamily types.Family) assignFunc {
 		return c.getBinOpAssignFunc()
 	}
 	var overload *oneArgOverload
-	for _, o := range sameTypeBinaryOpToOverloads[tree.Plus] {
+	for _, o := range sameTypeBinaryOpToOverloads[treebin.Plus] {
 		if o.CanonicalTypeFamily == inputTypeFamily {
 			overload = o
 			break
@@ -112,9 +107,10 @@ const sumAggTmpl = "pkg/sql/colexec/colexecagg/sum_agg_tmpl.go"
 
 func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 	r := strings.NewReplacer(
-		"_TYPE_FAMILY", "{{.TypeFamily}}",
+		"_CANONICAL_TYPE_FAMILY", "{{.TypeFamily}}",
 		"_TYPE_WIDTH", typeWidthReplacement,
 		"_SUMKIND", "{{.SumKind}}",
+		"_RET_GOTYPESLICE", `{{.RetGoTypeSlice}}`,
 		"_RET_GOTYPE", `{{.RetGoType}}`,
 		"_RET_TYPE", "{{.RetVecMethod}}",
 		"_TYPE", "{{.InputVecMethod}}",
@@ -160,21 +156,18 @@ func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 	var tmplInfos []sumAggTypeTmplInfo
 	for _, inputTypeFamily := range supportedTypeFamilies {
 		tmplInfo := sumAggTypeTmplInfo{
-			TypeFamily: toString(inputTypeFamily),
+			TypeFamily: familyToString(inputTypeFamily),
 		}
 		for _, inputTypeWidth := range supportedWidthsByCanonicalTypeFamily[inputTypeFamily] {
-			needsHelper := false
-			// Note that we don't use execinfrapb.GetAggregateInfo because we don't
-			// want to bring in a dependency on that package to reduce the burden
-			// of regenerating execgen code when the protobufs get generated.
+			// Note that we don't use execinfrapb.GetAggregateOutputType because
+			// we don't want to bring in a dependency on that package to reduce
+			// the burden of regenerating execgen code when the protobufs get
+			// generated.
 			retTypeFamily, retTypeWidth := inputTypeFamily, inputTypeWidth
 			if inputTypeFamily == types.IntFamily {
 				if isSumInt {
 					retTypeFamily, retTypeWidth = types.IntFamily, anyWidth
 				} else {
-					// Non-integer summation of integers needs a helper because
-					// the result is a decimal.
-					needsHelper = true
 					retTypeFamily, retTypeWidth = types.DecimalFamily, anyWidth
 				}
 			}
@@ -185,9 +178,9 @@ func genSumAgg(inputFileContents string, wr io.Writer, isSumInt bool) error {
 						canonicalTypeFamily: typeconv.TypeFamilyToCanonicalTypeFamily(retTypeFamily),
 					},
 					SumKind:        sumKind,
-					NeedsHelper:    needsHelper,
 					InputVecMethod: toVecMethod(inputTypeFamily, inputTypeWidth),
 					RetGoType:      toPhysicalRepresentation(retTypeFamily, retTypeWidth),
+					RetGoTypeSlice: goTypeSliceName(retTypeFamily, retTypeWidth),
 					RetVecMethod:   toVecMethod(retTypeFamily, retTypeWidth),
 					sumOverload:    getAddOverload(inputTypeFamily),
 				}})
@@ -210,9 +203,11 @@ func init() {
 		}
 	}
 	registerAggGenerator(
-		sumAggGenerator(false /* isSumInt */), "sum_agg.eg.go",
-		sumAggTmpl, true /* genWindowVariant */)
+		sumAggGenerator(false /* isSumInt */), "sum_agg.eg.go", /* filenameSuffix */
+		sumAggTmpl, "sum" /* aggName */, true, /* genWindowVariant */
+	)
 	registerAggGenerator(
-		sumAggGenerator(true /* isSumInt */), "sum_int_agg.eg.go",
-		sumAggTmpl, true /* genWindowVariant */)
+		sumAggGenerator(true /* isSumInt */), "sum_int_agg.eg.go", /* filenameSuffix */
+		sumAggTmpl, "sumInt" /* aggName */, true, /* genWindowVariant */
+	)
 }

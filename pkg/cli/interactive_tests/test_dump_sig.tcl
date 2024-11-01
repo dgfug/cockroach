@@ -25,14 +25,19 @@ eexpect ":/# "
 end_test
 
 start_test "Check that the client also can generate goroutine dumps."
-send "$argv demo --no-example-database\r"
+send "$argv demo --no-line-editor --no-example-database --log-dir=logs \r"
 eexpect root@
 # Dump goroutines in server.
 system "killall -QUIT `basename \$(realpath $argv)`"
-eexpect "SIGQUIT: quit"
+eexpect "SIGQUIT received"
 eexpect "RunAsyncTask"
 
-# Check that the client terminates.
+# Check that the client has survived.
+send "\r"
+eexpect root@
+
+# Finish the test.
+send_eof
 eexpect ":/# "
 end_test
 

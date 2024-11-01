@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
@@ -64,7 +59,7 @@ func (et *exploreTracer) Next() error {
 		panic("iteration already complete")
 	}
 
-	fo, err := newForcingOptimizer(et.tester, et.steps, true /* ignoreNormRules */, false /* disableCheckExpr */)
+	fo, err := newForcingOptimizer(et.tester, et.steps, true /* ignoreNormRules */)
 	if err != nil {
 		return err
 	}
@@ -75,12 +70,12 @@ func (et *exploreTracer) Next() error {
 	}
 
 	// Compute the lowest cost tree for the source expression.
-	et.srcExpr = et.restrictToExpr(fo.LookupPath(fo.lastAppliedSource))
+	et.srcExpr = et.restrictToExpr(fo.MustLookupPath(fo.lastAppliedSource))
 
 	// Compute the lowest code tree for any target expressions.
 	et.newExprs = et.newExprs[:0]
 	if fo.lastAppliedTarget != nil {
-		et.newExprs = append(et.newExprs, et.restrictToExpr(fo.LookupPath(fo.lastAppliedTarget)))
+		et.newExprs = append(et.newExprs, et.restrictToExpr(fo.MustLookupPath(fo.lastAppliedTarget)))
 
 		if rel, ok := fo.lastAppliedTarget.(memo.RelExpr); ok {
 			for {
@@ -88,7 +83,7 @@ func (et *exploreTracer) Next() error {
 				if rel == nil {
 					break
 				}
-				et.newExprs = append(et.newExprs, et.restrictToExpr(fo.LookupPath(rel)))
+				et.newExprs = append(et.newExprs, et.restrictToExpr(fo.MustLookupPath(rel)))
 			}
 		}
 	}
@@ -98,7 +93,7 @@ func (et *exploreTracer) Next() error {
 }
 
 func (et *exploreTracer) restrictToExpr(path []memoLoc) opt.Expr {
-	fo2, err := newForcingOptimizer(et.tester, et.steps, true /* ignoreNormRules */, false /* disableCheckExpr */)
+	fo2, err := newForcingOptimizer(et.tester, et.steps, true /* ignoreNormRules */)
 	if err != nil {
 		// We should have already built the query successfully once.
 		panic(err)

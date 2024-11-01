@@ -1,30 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { Badge } from "@cockroachlabs/cluster-ui";
 import React from "react";
 import { Helmet } from "react-helmet";
-import { RouteComponentProps, withRouter } from "react-router-dom";
 import { connect } from "react-redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
 
-import NavigationBar from "src/views/app/components/layoutSidebar";
-import TimeWindowManager from "src/views/app/containers/timewindow";
-import AlertBanner from "src/views/app/containers/alertBanner";
-import RequireLogin from "src/views/login/requireLogin";
-import {
-  clusterIdSelector,
-  clusterNameSelector,
-  singleVersionSelector,
-} from "src/redux/nodes";
-import { AdminUIState } from "src/redux/state";
-import LoginIndicator from "src/views/app/components/loginIndicator";
-import FeedbackSurveyLink from "src/views/app/components/feedbackSurveyLink/feedbackSurveyLink";
 import {
   GlobalNavigation,
   CockroachLabsLockupIcon,
@@ -33,11 +17,27 @@ import {
   PageHeader,
   Text,
   TextTypes,
-  Badge,
 } from "src/components";
+import {
+  clusterIdSelector,
+  clusterNameSelector,
+  clusterVersionLabelSelector,
+} from "src/redux/nodes";
+import { AdminUIState } from "src/redux/state";
+import { getDataFromServer } from "src/util/dataFromServer";
+import ErrorBoundary from "src/views/app/components/errorMessage/errorBoundary";
+import NavigationBar from "src/views/app/components/layoutSidebar";
+import LoginIndicator from "src/views/app/components/loginIndicator";
+import AlertBanner from "src/views/app/containers/alertBanner";
+import TimeWindowManager from "src/views/app/containers/metricsTimeManager";
+import RequireLogin from "src/views/login/requireLogin";
+import { ThrottleNotificationBar } from "src/views/shared/components/alertBar/alertBar";
 
 import "./layout.styl";
 import "./layoutPanel.styl";
+
+import TenantDropdown from "../../components/tenantDropdown/tenantDropdown";
+import { LicenseNotification } from "../licenseNotification/licenseNotification";
 
 export interface LayoutProps {
   clusterName: string;
@@ -60,7 +60,9 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
     // AdminUI layout keeps left and top panels have fixed position on a screen and has internal scrolling for content div
     // element which has to be scrolled back on top with navigation change.
     if (this.props.location.pathname !== prevProps.location.pathname) {
-      this.contentRef.current.scrollTo(0, 0);
+      if (typeof this.contentRef.current.scrollTo === "function") {
+        this.contentRef.current.scrollTo(0, 0);
+      }
     }
   }
 
@@ -81,7 +83,7 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
                 <CockroachLabsLockupIcon height={26} />
               </Left>
               <Right>
-                <FeedbackSurveyLink />
+                <LicenseNotification />
                 <LoginIndicator />
               </Right>
             </GlobalNavigation>
@@ -89,17 +91,24 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
           <div className="layout-panel__navigation-bar">
             <PageHeader>
               <Text textType={TextTypes.Heading2} noWrap>
+                {getDataFromServer().FeatureFlags.is_observability_service
+                  ? "(Obs Service) "
+                  : ""}
                 {clusterName || `Cluster id: ${clusterId || ""}`}
               </Text>
               <Badge text={clusterVersion} />
+              <TenantDropdown />
             </PageHeader>
           </div>
+          <ThrottleNotificationBar />
           <div className="layout-panel__body">
             <div className="layout-panel__sidebar">
               <NavigationBar />
             </div>
             <div ref={this.contentRef} className="layout-panel__content">
-              {this.props.children}
+              <ErrorBoundary key={this.props.location.pathname}>
+                {this.props.children}
+              </ErrorBoundary>
             </div>
           </div>
         </div>
@@ -111,7 +120,7 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
 const mapStateToProps = (state: AdminUIState) => {
   return {
     clusterName: clusterNameSelector(state),
-    clusterVersion: singleVersionSelector(state),
+    clusterVersion: clusterVersionLabelSelector(state),
     clusterId: clusterIdSelector(state),
   };
 };

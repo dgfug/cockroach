@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -58,10 +53,10 @@ func partitionByFromTableDescImpl(
 	}
 
 	// Copy the LIST of the PARTITION BY clause.
-	a := &rowenc.DatumAlloc{}
+	a := &tree.DatumAlloc{}
 	err := part.ForEachList(func(name string, values [][]byte, subPartitioning catalog.Partitioning) (err error) {
 		lp := tree.ListPartition{
-			Name:  tree.UnrestrictedName(name),
+			Name:  tree.Name(name),
 			Exprs: make(tree.Exprs, len(values)),
 		}
 		for j, values := range values {
@@ -101,7 +96,7 @@ func partitionByFromTableDescImpl(
 
 	// Copy the RANGE of the PARTITION BY clause.
 	err = part.ForEachRange(func(name string, from, to []byte) error {
-		rp := tree.RangePartition{Name: tree.UnrestrictedName(name)}
+		rp := tree.RangePartition{Name: tree.Name(name)}
 		fromTuple, _, err := rowenc.DecodePartitionTuple(
 			a, codec, tableDesc, idx, part, from, fakePrefixDatums)
 		if err != nil {

@@ -1,22 +1,18 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,14 +29,14 @@ func (s *statusServer) Statements(
 		return s.CombinedStatementStats(ctx, &combinedRequest)
 	}
 
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	if s.gossip.NodeID.Get() == 0 {
+	if s.serverIterator.getID() == 0 {
 		return nil, status.Errorf(codes.Unavailable, "nodeID not set")
 	}
 
@@ -51,16 +47,21 @@ func (s *statusServer) Statements(
 	}
 
 	localReq := &serverpb.StatementsRequest{
-		NodeID: "local",
+		NodeID:    "local",
+		FetchMode: req.FetchMode,
 	}
 
 	if len(req.NodeID) > 0 {
 		requestedNodeID, local, err := s.parseNodeID(req.NodeID)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		if local {
-			return statementsLocal(ctx, s.gossip.NodeID.Get(), s.admin.server.sqlServer)
+			return statementsLocal(
+				ctx,
+				roachpb.NodeID(s.serverIterator.getID()),
+				s.sqlServer,
+				req.FetchMode)
 		}
 		status, err := s.dialNode(ctx, requestedNodeID)
 		if err != nil {
@@ -69,17 +70,13 @@ func (s *statusServer) Statements(
 		return status.Statements(ctx, localReq)
 	}
 
-	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
-		client, err := s.dialNode(ctx, nodeID)
-		return client, err
-	}
-	nodeStatement := func(ctx context.Context, client interface{}, _ roachpb.NodeID) (interface{}, error) {
-		status := client.(serverpb.StatusClient)
+	nodeStatement := func(ctx context.Context, status serverpb.StatusClient, _ roachpb.NodeID) (interface{}, error) {
 		return status.Statements(ctx, localReq)
 	}
 
-	if err := s.iterateNodes(ctx, fmt.Sprintf("statement statistics for node %s", req.NodeID),
-		dialFn,
+	if err := iterateNodes(ctx, s.serverIterator, s.stopper, "statement statistics",
+		noTimeout,
+		s.dialNode,
 		nodeStatement,
 		func(nodeID roachpb.NodeID, resp interface{}) {
 			statementsResp := resp.(*serverpb.StatementsResponse)
@@ -100,16 +97,27 @@ func (s *statusServer) Statements(
 }
 
 func statementsLocal(
-	ctx context.Context, nodeID roachpb.NodeID, sqlServer *SQLServer,
+	ctx context.Context,
+	nodeID roachpb.NodeID,
+	sqlServer *SQLServer,
+	fetchMode serverpb.StatementsRequest_FetchMode,
 ) (*serverpb.StatementsResponse, error) {
-	stmtStats, err := sqlServer.pgServer.SQLServer.GetUnscrubbedStmtStats(ctx)
-	if err != nil {
-		return nil, err
+	var stmtStats []appstatspb.CollectedStatementStatistics
+	var txnStats []appstatspb.CollectedTransactionStatistics
+	var err error
+
+	if fetchMode != serverpb.StatementsRequest_TxnStatsOnly {
+		stmtStats, err = sqlServer.pgServer.SQLServer.GetUnscrubbedStmtStats(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	txnStats, err := sqlServer.pgServer.SQLServer.GetUnscrubbedTxnStats(ctx)
-	if err != nil {
-		return nil, err
+	if fetchMode != serverpb.StatementsRequest_StmtStatsOnly {
+		txnStats, err = sqlServer.pgServer.SQLServer.GetUnscrubbedTxnStats(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	lastReset := sqlServer.pgServer.SQLServer.GetStmtStatsLastReset()

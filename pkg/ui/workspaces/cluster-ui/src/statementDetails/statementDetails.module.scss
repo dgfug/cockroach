@@ -1,9 +1,22 @@
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 @import "src/core/index.module";
 
-.app-name {
+.text-link {
   white-space: nowrap;
   line-height: $line-height--medium;
   font-weight: $font-weight--bold;
+  color: $colors--primary-blue-3;
+
+  &:hover {
+    color: $colors--primary-blue-3;
+    text-decoration: underline;
+  }
+
+  color: $colors--link;
 
   &__unset {
     color: $tooltip-color;
@@ -14,6 +27,9 @@
 .section {
   flex: 0 0 auto;
   padding: 12px 24px 12px 0px;
+  row-gap: 24px;
+  display: flex;
+  flex-direction: column;
 
   &--heading {
     padding-top: 0;
@@ -65,7 +81,13 @@
   }
 }
 
-.last-cleared-tooltip, .numeric-stats-table, .plan-view-table {
+.table-area {
+  overflow-x: scroll;
+}
+
+.last-cleared-tooltip,
+.numeric-stats-table,
+.plan-view-table {
   &__tooltip {
     width: 36px;
     height: 16px;
@@ -125,4 +147,39 @@
 
 .no-margin-bottom {
   margin-bottom: 0px;
+}
+
+.margin-bottom {
+  margin-bottom: 20px;
+}
+
+.margin-bottom-large {
+  margin-bottom: 40px;
+}
+
+.margin-right {
+  margin-right: 12px !important;
+}
+
+.margin-header {
+  margin-top: 10px;
+}
+
+.margin-left-neg {
+  margin-left: -11px !important;
+}
+
+.crl-anchor {
+  font-weight: $font-weight--bold;
+  font-size: $font-size--small;
+  line-height: $line-height--small;
+  letter-spacing: 0.3px;
+  color: $colors--neutral-0;
+  text-decoration: underline;
+
+  &:hover {
+    opacity: 0.7;
+    color: $colors--neutral-0;
+    text-decoration: underline;
+  }
 }

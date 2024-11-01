@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package nocopy defines an Analyzer that detects invalid uses of util.NoCopy.
 package nocopy
@@ -36,10 +31,10 @@ const noCopyType = "github.com/cockroachdb/cockroach/pkg/util.NoCopy"
 // ensures that the type is always embedded without a name as the first field in
 // a parent struct like:
 //
-//     type s struct {
-//         _ util.NoCopy
-//         ...
-//     }
+//	type s struct {
+//	    _ util.NoCopy
+//	    ...
+//	}
 //
 // We lint against including the type in other positions in structs both for
 // uniformity and because it can have runtime performance effects. Specifically,

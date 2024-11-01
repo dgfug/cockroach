@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package addr_test
 
@@ -15,7 +10,41 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
+	"github.com/stretchr/testify/require"
 )
+
+func TestPortRangeSetter(t *testing.T) {
+	testData := []struct {
+		v      string
+		lower  int
+		upper  int
+		str    string
+		errStr string
+	}{
+		{"5-10", 5, 10, "5-10", ""},
+		{"5-", 5, 0, "", "too few parts"},
+		{"5", 5, 0, "", "too few parts"},
+		{"5-8-10", 0, 0, "", "too many parts"},
+		{"a-5", 0, 0, "", "invalid syntax"},
+		{"5-b", 0, 0, "", "invalid syntax"},
+		{"10-5", 0, 0, "", "lower bound (10) > upper bound (5)"},
+	}
+	for _, tc := range testData {
+		t.Run(tc.v, func(t *testing.T) {
+			var upper, lower int
+			s := addr.NewPortRangeSetter(&lower, &upper)
+			err := s.Set(tc.v)
+			if tc.errStr != "" {
+				require.ErrorContains(t, err, tc.errStr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.str, s.String())
+				require.Equal(t, tc.upper, upper)
+				require.Equal(t, tc.lower, lower)
+			}
+		})
+	}
+}
 
 func TestSplitHostPort(t *testing.T) {
 	testData := []struct {

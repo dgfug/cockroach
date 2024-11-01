@@ -1,29 +1,101 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clusterversion
 
 import (
+	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/redact"
-	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
 )
 
-func TestVersionsAreValid(t *testing.T) {
+// TestVersionTable runs sanity checks on the versions table:
+//   - all keys have a non-zero version;
+//   - versions are strictly increasing;
+//   - we have no odd Internal values.
+func TestVersionTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	require.NoError(t, versionsSingleton.Validate())
+	var prev roachpb.Version
+	for k := Key(0); k < numKeys; k++ {
+		v := versionTable[k]
+		require.NotEqual(t, roachpb.Version{}, v)
+		// We don't use Patch for cluster versions.
+		require.Zero(t, v.Patch)
+		// All internal versions must be even (since 23.1).
+		require.Zero(t, v.Internal%2)
+		if k > 0 {
+			require.True(t, prev.Less(v))
+		}
+		prev = v
+	}
+}
+
+// TestNoMissingVersions checks that starting with MinSupported, we have no gaps
+// in Internal versions (which would happen if a version was incorrectly
+// removed).
+func TestNoMissingVersions(t *testing.T) {
+	// removedVersions lists versions that have been purposely removed during a
+	// development cycle.
+	//
+	// Any additions here should be accompanied by a comment explaining the
+	// reason. The versions in the list must be in order.
+	removedVersions := []roachpb.Version{
+		// In the 23.2 cycle V23_2TTLAllowDescPK and V23_2_PartiallyVisibleIndexes
+		// were introduced but then later removed (since they were redundant).
+		{Major: 23, Minor: 1, Internal: 4},
+		{Major: 23, Minor: 1, Internal: 6},
+	}
+
+	for k := MinSupported + 1; k < numKeys; k++ {
+		prev := (k - 1).Version()
+		v := k.Version()
+		if v.Major == prev.Major && v.Minor == prev.Minor {
+			expectedInternal := prev.Internal + 2
+
+			// Allow exceptions. This loop assumes the removed versions are increasing
+			// (the condition could hit multiple times).
+			for _, removed := range removedVersions {
+				if (removed.Major == v.Major || removed.Major+DevOffset == v.Major) &&
+					removed.Minor == v.Minor &&
+					removed.Internal == expectedInternal {
+					expectedInternal += 2
+				}
+			}
+
+			require.Equalf(t, expectedInternal, v.Internal,
+				"version gap between %s (%s) and %s (%s)", k-1, prev, k, v,
+			)
+		}
+	}
+}
+
+// TestKeyConstants runs sanity checks on version key constants.
+func TestKeyConstants(t *testing.T) {
+	require.Equal(t, numKeys-1, Latest)
+	// MinSupported should be a final release.
+	require.True(t, MinSupported.IsFinal())
+
+	supported := SupportedPreviousReleases()
+	require.Equal(t, MinSupported, supported[0])
+	// Check PreviousRelease.
+	require.Equal(t, PreviousRelease, supported[len(supported)-1])
+}
+
+func TestFinalVersion(t *testing.T) {
+	if finalVersion >= 0 {
+		require.False(t, DevelopmentBranch, "final version set but developmentBranch is still set")
+		require.Equal(t, Latest, finalVersion, "finalVersion must match the minted latest version")
+	} else {
+		require.False(t, Latest.IsFinal(), "finalVersion not set but Latest is final")
+	}
 }
 
 func TestVersionFormat(t *testing.T) {
@@ -64,16 +136,15 @@ func TestClusterVersionPrettyPrint(t *testing.T) {
 		}
 	}
 
-	var tests = []struct {
+	tests := []struct {
 		cv  ClusterVersion
 		exp string
 	}{
-		{cv(19, 2, 1, 5), "19.2-5"},
-		{cv(20, 1, 0, 4), "20.1-4"},
-		{cv(20, 2, 0, 7), "20.2-7(fence)"},
-		{cv(20, 2, 0, 4), "20.2-4"},
-		{cv(20, 2, 1, 5), "20.2-5(fence)"},
-		{cv(20, 2, 1, 4), "20.2-4"},
+		{cv(20, 1, 0, 4), "20.1-upgrading-to-20.2-step-004"},
+		{cv(20, 2, 0, 7), "20.2-upgrading-to-21.1-step-007(fence)"},
+		{cv(20, 2, 0, 4), "20.2-upgrading-to-21.1-step-004"},
+		{cv(22, 2, 1, 5), "22.2-upgrading-to-23.1-step-005(fence)"},
+		{cv(22, 2, 1, 4), "22.2-upgrading-to-23.1-step-004"},
 	}
 	for _, test := range tests {
 		if actual := test.cv.PrettyPrint(); actual != test.exp {
@@ -82,50 +153,62 @@ func TestClusterVersionPrettyPrint(t *testing.T) {
 	}
 }
 
-func TestGetVersionsBetween(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	// Define a list of versions v3..v9
-	var vs keyedVersions
-	for i := 3; i < 10; i++ {
-		vs = append(vs, keyedVersion{
-			Key:     Key(42),
-			Version: roachpb.Version{Major: int32(i)},
-		})
-	}
-	cv := func(major int32) ClusterVersion {
-		return ClusterVersion{Version: roachpb.Version{Major: major}}
-	}
-	list := func(first, last int32) []ClusterVersion {
-		var cvs []ClusterVersion
-		for i := first; i <= last; i++ {
-			cvs = append(cvs, cv(i))
+func TestReleaseSeries(t *testing.T) {
+	// Verify that the ReleaseSeries call works on all keys.
+	for k := Latest; k > 0; k-- {
+		if k.Version().Major > 0 {
+			require.NotEqual(t, roachpb.ReleaseSeries{}, k.ReleaseSeries())
+		} else {
+			require.Equal(t, roachpb.ReleaseSeries{}, k.ReleaseSeries())
 		}
-		return cvs
 	}
 
-	var tests = []struct {
-		from, to ClusterVersion
-		exp      []ClusterVersion
+	// Verify the latest version.
+	major, minor := build.BranchReleaseSeries()
+	require.Equal(t, fmt.Sprintf("v%s", Latest.ReleaseSeries()), fmt.Sprintf("v%d.%d", major, minor))
+
+	// Verify the ReleaseSeries results down to MinSupported.
+	expected := Latest.ReleaseSeries()
+	for k := Latest; k >= MinSupported; k-- {
+		if k.IsFinal() {
+			v := RemoveDevOffset(k.Version())
+			expected = roachpb.ReleaseSeries{Major: v.Major, Minor: v.Minor}
+		}
+		require.Equalf(t, expected, k.ReleaseSeries(), "version: %s", k)
+	}
+}
+
+func TestStringForPersistence(t *testing.T) {
+	testCases := []struct {
+		v            roachpb.Version
+		minSupported roachpb.Version
+		expected     string
 	}{
-		{cv(5), cv(8), list(6, 8)},
-		{cv(1), cv(1), []ClusterVersion{}},
-		{cv(7), cv(7), []ClusterVersion{}},
-		{cv(1), cv(5), list(3, 5)},
-		{cv(6), cv(12), list(7, 9)},
-		{cv(4), cv(5), list(5, 5)},
+		{
+			v:            roachpb.Version{Major: 23, Minor: 2},
+			minSupported: roachpb.Version{Major: 23, Minor: 2},
+			expected:     "23.2",
+		},
+		{
+			v:            roachpb.Version{Major: 24, Minor: 1},
+			minSupported: roachpb.Version{Major: 23, Minor: 2},
+			expected:     "24.1",
+		},
+		{
+			v:            roachpb.Version{Major: 24, Minor: 1, Internal: 10},
+			minSupported: roachpb.Version{Major: 23, Minor: 2},
+			expected:     "24.1-10",
+		},
+		{
+			v:            roachpb.Version{Major: 24, Minor: 1, Internal: 10},
+			minSupported: roachpb.Version{Major: 24, Minor: 1},
+			expected:     "24.1-upgrading-to-24.2-step-010",
+		},
 	}
 
-	for _, test := range tests {
-		actual := listBetweenInternal(test.from, test.to, vs)
-		if len(actual) != len(test.exp) {
-			t.Errorf("expected %d versions, got %d", len(test.exp), len(actual))
-		}
-
-		for i := range test.exp {
-			if actual[i] != test.exp[i] {
-				t.Errorf("%s version incorrect: expected %s, got %s", humanize.Ordinal(i), test.exp[i], actual[i])
-			}
-		}
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			require.Equal(t, tc.expected, stringForPersistenceWithMinSupported(tc.v, tc.minSupported))
+		})
 	}
 }

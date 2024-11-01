@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs_test
 
@@ -24,29 +19,26 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -58,14 +50,14 @@ func TestRoundtripJob(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	registry := s.JobRegistry().(*jobs.Registry)
 	defer s.Stopper().Stop(ctx)
 
 	jobID := registry.MakeJobID()
 	record := jobs.Record{
 		Description:   "beep boop",
-		Username:      security.MakeSQLUsernameFromPreNormalizedString("robot"),
+		Username:      username.MakeSQLUsernameFromPreNormalizedString("robot"),
 		DescriptorIDs: descpb.IDs{42},
 		Details:       jobspb.RestoreDetails{},
 		Progress:      jobspb.RestoreProgress{},
@@ -100,31 +92,15 @@ func TestExpiringSessionsAndClaimJobsDoesNotTouchTerminalJobs(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 
-	payload, err := protoutil.Marshal(&jobspb.Payload{
-		Details: jobspb.WrapPayloadDetails(jobspb.BackupDetails{}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	progress, err := protoutil.Marshal(&jobspb.Progress{
-		Details: jobspb.WrapProgressDetails(jobspb.BackupProgress{}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	const insertQuery = `
    INSERT
      INTO system.jobs (
                         status,
-                        payload,
-                        progress,
                         claim_session_id,
                         claim_instance_id
                       )
-   VALUES ($1, $2, $3, $4, $5)
+   VALUES ($1, $2, $3)
 RETURNING id;
 `
 	// Disallow clean up of claimed jobs
@@ -132,14 +108,17 @@ RETURNING id;
 	terminalStatuses := []jobs.Status{jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed}
 	terminalIDs := make([]jobspb.JobID, len(terminalStatuses))
 	terminalClaims := make([][]byte, len(terminalStatuses))
+	mkSessionID := func() []byte {
+		sessionID, err := slstorage.MakeSessionID([]byte("us"), uuid.MakeV4())
+		require.NoError(t, err)
+		return []byte(sessionID)
+	}
 	for i, s := range terminalStatuses {
-		terminalClaims[i] = uuid.MakeV4().GetBytes() // bogus claim
-		tdb.QueryRow(t, insertQuery, s, payload, progress, terminalClaims[i], 42).
-			Scan(&terminalIDs[i])
+		terminalClaims[i] = mkSessionID() // bogus claim
+		tdb.QueryRow(t, insertQuery, s, terminalClaims[i], 42).Scan(&terminalIDs[i])
 	}
 	var nonTerminalID jobspb.JobID
-	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, payload, progress, uuid.MakeV4().GetBytes(), 42).
-		Scan(&nonTerminalID)
+	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, mkSessionID(), 42).Scan(&nonTerminalID)
 
 	checkClaimEqual := func(id jobspb.JobID, exp []byte) error {
 		const getClaimQuery = `SELECT claim_session_id FROM system.jobs WHERE id = $1`
@@ -223,12 +202,13 @@ func TestRegistrySettingUpdate(t *testing.T) {
 	}
 
 	for _, test := range [...]struct {
-		name       string      // Test case ID.
-		setting    string      // Cluster setting key.
-		value      interface{} // Duration when expecting a large number of job runs.
-		matchStmt  string      // SQL statement to match to identify the target job.
-		initCount  int         // Initial number of jobs to ignore at the beginning of the test.
-		toOverride *settings.DurationSetting
+		name         string      // Test case ID.
+		setting      string      // Cluster setting key.
+		value        interface{} // Duration when expecting a large number of job runs.
+		matchStmt    string      // SQL statement to match to identify the target job.
+		matchAppName string
+		initCount    int // Initial number of jobs to ignore at the beginning of the test.
+		toOverride   *settings.DurationSetting
 	}{
 		{
 			name:       "adopt setting",
@@ -263,33 +243,44 @@ func TestRegistrySettingUpdate(t *testing.T) {
 			toOverride: jobs.CancelIntervalSetting,
 		},
 		{
-			name:       "gc setting",
-			setting:    jobs.GcIntervalSettingKey,
-			value:      shortDuration,
-			matchStmt:  jobs.GcQuery,
-			initCount:  0,
-			toOverride: jobs.GcIntervalSetting,
+			name:         "gc setting",
+			setting:      jobs.GcIntervalSettingKey,
+			value:        shortDuration,
+			matchAppName: "$ internal-gc-jobs",
+			initCount:    0,
+			toOverride:   jobs.GcIntervalSetting,
 		},
 		{
-			name:       "gc setting with base",
-			setting:    jobs.IntervalBaseSettingKey,
-			value:      shortDurationBase,
-			matchStmt:  jobs.GcQuery,
-			initCount:  0,
-			toOverride: jobs.GcIntervalSetting,
+			name:         "gc setting with base",
+			setting:      jobs.IntervalBaseSettingKey,
+			value:        shortDurationBase,
+			matchAppName: "$ internal-gc-jobs",
+			initCount:    0,
+			toOverride:   jobs.GcIntervalSetting,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
-			// Replace multiple white spaces with a single space, remove the last ';', and
-			// trim leading and trailing spaces.
-			matchStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(test.matchStmt, " "))
+			var stmtMatcher func(*sessiondata.SessionData, string) bool
+			if test.matchAppName != "" {
+				stmtMatcher = func(sd *sessiondata.SessionData, _ string) bool {
+					return sd.ApplicationName == test.matchAppName
+				}
+			} else {
+				// Replace multiple white spaces with a single space, remove the last ';', and
+				// trim leading and trailing spaces.
+				matchStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(test.matchStmt, " "))
+				stmtMatcher = func(_ *sessiondata.SessionData, stmt string) bool {
+					return stmt == matchStmt
+				}
+			}
+
 			var seen = int32(0)
-			stmtFilter := func(ctxt context.Context, _ *sessiondata.SessionData, stmt string, err error) {
+			stmtFilter := func(_ context.Context, sd *sessiondata.SessionData, stmt string, err error) {
 				if err != nil {
 					return
 				}
-				if stmt == matchStmt {
+				if stmtMatcher(sd, stmt) {
 					atomic.AddInt32(&seen, 1)
 				}
 			}
@@ -352,13 +343,12 @@ func TestGCDurationControl(t *testing.T) {
 	//
 	// Replace multiple white spaces with a single space, remove the last ';', and
 	// trim leading and trailing spaces.
-	gcStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(jobs.GcQuery, " "))
 	var seen = int32(0)
-	stmtFilter := func(ctxt context.Context, _ *sessiondata.SessionData, stmt string, err error) {
+	stmtFilter := func(_ context.Context, sd *sessiondata.SessionData, _ string, err error) {
 		if err != nil {
 			return
 		}
-		if stmt == gcStmt {
+		if sd.ApplicationName == "$ internal-gc-jobs" {
 			atomic.AddInt32(&seen, 1)
 		}
 	}
@@ -377,27 +367,29 @@ func TestGCDurationControl(t *testing.T) {
 		},
 	}
 
-	jobs.RegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
-		return jobs.FakeResumer{}
-	})
-	s, sqlDB, kvDB := serverutils.StartServer(t, args)
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
+	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 
 	// Create and run a dummy job.
+	idb := s.InternalDB().(isql.DB)
 	id := registry.MakeJobID()
-	require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
 			// Job does not accept an empty Details field, so arbitrarily provide
 			// ImportDetails.
 			Details:  jobspb.ImportDetails{},
 			Progress: jobspb.ImportProgress{},
+			Username: username.TestUserName(),
 		}, id, txn)
 		return err
 	}))
 	require.NoError(t,
 		registry.WaitForJobs(
-			ctx, s.InternalExecutor().(sqlutil.InternalExecutor), []jobspb.JobID{id},
+			ctx, []jobspb.JobID{id},
 		))
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -440,7 +432,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 		return event{id: j.ID(), resume: make(chan error)}
 	}
 	evChan := make(chan event)
-	jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, cs *cluster.Settings) jobs.Resumer {
 		execFn := func(ctx context.Context) error {
 			ev := mkEvent(j)
 			select {
@@ -455,11 +447,11 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 				return ctx.Err()
 			}
 		}
-		return jobs.FakeResumer{
+		return jobstest.FakeResumer{
 			OnResume:     execFn,
 			FailOrCancel: execFn,
 		}
-	})
+	}, jobs.UsesTenantCostControl)()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -469,7 +461,6 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
-	ie := s.InternalExecutor().(sqlutil.InternalExecutor)
 	mkJob := func(t *testing.T) jobspb.JobID {
 		id := registry.MakeJobID()
 		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
@@ -477,6 +468,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 			// ImportDetails.
 			Details:  jobspb.ImportDetails{},
 			Progress: jobspb.ImportProgress{},
+			Username: username.TestUserName(),
 		}, id, nil /* txn */)
 		require.NoError(t, err)
 		return id
@@ -498,7 +490,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 		errorIdx    = executionErrorRE.SubexpIndex("error")
 	)
 	parseTimestamp := func(t *testing.T, s string) time.Time {
-		ptc := tree.NewParseTimeContext(timeutil.Now())
+		ptc := tree.NewParseContext(timeutil.Now())
 		ts, _, err := tree.ParseDTimestamp(ptc, s, time.Microsecond)
 		require.NoError(t, err)
 		return ts.Time
@@ -566,7 +558,7 @@ SELECT unnest(execution_errors)
 		t *testing.T, id jobspb.JobID, status jobs.Status,
 		from, to time.Time, cause string,
 	) {
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(
 			from.UnixNano(), to.UnixNano(), 2,
 			regexp.MustCompile(fmt.Sprintf(
@@ -608,7 +600,7 @@ SELECT unnest(execution_errors)
 			checkLogEntry(t, id, jobs.StatusRunning, secondStart, thirdStart, err2)
 		}
 		close(thirdRun.resume)
-		require.NoError(t, registry.WaitForJobs(ctx, ie, []jobspb.JobID{id}))
+		require.NoError(t, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
 	})
 	t.Run("fail or cancel error", func(t *testing.T) {
 		id := mkJob(t)
@@ -649,7 +641,7 @@ SELECT unnest(execution_errors)
 			checkLogEntry(t, id, jobs.StatusReverting, thirdStart, fourthStart, err3)
 		}
 		close(fourthRun.resume)
-		require.Regexp(t, err2, registry.WaitForJobs(ctx, ie, []jobspb.JobID{id}))
+		require.Regexp(t, err2, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
 	})
 	t.Run("truncation", func(t *testing.T) {
 		id := mkJob(t)
@@ -726,144 +718,86 @@ SELECT unnest(execution_errors)
 			checkLogEntry(t, id, jobs.StatusReverting, sixthStart, seventhStart, err6)
 		}
 		close(seventhRun.resume)
-		require.Regexp(t, err3, registry.WaitForJobs(ctx, ie, []jobspb.JobID{id}))
+		require.Regexp(t, err3, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
 	})
 }
 
-// TestExponentialBackoffUpgradeRacesWithUpdate tests that the system does not
-// encounter a nil pointer panic if the version is activated during an update.
-// When exponential-backoff is not active, num_runs and last_run columns are not
-// present in system.jobs table. As we checked version updates at multiple
-// locations and query system.jobs table during a job lifecycle, this test
-// checks that version update between two cluster-version checks does not result
-// in an error.
-func TestExponentialBackoffUpgradeRacesWithUpdate(t *testing.T) {
+// TestWaitWithRetryableError tests retryable errors when querying
+// for jobs.
+func TestWaitWithRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	var stmtFilter atomic.Value
-	resetStmtFilter := func() { stmtFilter.Store(func(context.Context, string) {}) }
-	clusterArgs := base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
-					BinaryVersionOverride: clusterversion.ByKey(
-						clusterversion.RetryJobsWithExponentialBackoff - 1),
-				},
-				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					StatementFilter: func(ctx context.Context, data *sessiondata.SessionData, s string, err error) {
-						stmtFilter.Load().(func(context.Context, string))(ctx, s)
-					},
-				},
-			},
-		},
-	}
-
-	jobs.RegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
-		return jobs.FakeResumer{}
-	})
-	defer jobs.ResetConstructors()
-	type updateFunc = func(j *jobs.Job, ctx context.Context) error
-	// Sketch of the test:
-	//  * Create the cluster in the old version.
-	//  * Create the job but don't start it.
-	//  * Install a hook to block the select of the update.
-	//  * Launch a goroutine to run the relevant update.
-	//  * Wait for the update to block and unregister the hook.
-	//  * Upgrade the version.
-	//  * Unblock the update, see no panic.
-	run := func(t *testing.T, f updateFunc) {
-		resetStmtFilter()
-		ctx := context.Background()
-		tc := testcluster.StartTestCluster(t, 1, clusterArgs)
-		defer tc.Stopper().Stop(ctx)
-		s := tc.Server(0)
-
-		sqlDB := tc.ServerConn(0)
-		tdb := sqlutils.MakeSQLRunner(sqlDB)
-		registry := s.JobRegistry().(*jobs.Registry)
-		var sj *jobs.StartableJob
-		require.NoError(t, s.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return registry.CreateStartableJobWithTxn(ctx, &sj, registry.MakeJobID(), txn, jobs.Record{
-				Details:  jobspb.ImportDetails{},
-				Progress: jobspb.ImportProgress{},
-			})
-		}))
-		blocked := make(chan chan struct{})
-
-		stmtFilter.Store(func(ctx context.Context, s string) {
-			if !strings.HasPrefix(s, `SELECT status, payload, progress`) {
-				return
-			}
-			resetStmtFilter() // so nobody else gets blocked
-			unblock := make(chan struct{})
-			blocked <- unblock
-			<-unblock
-		})
-		updateErr := make(chan error)
-		go func() { updateErr <- f(sj.Job, ctx) }()
-		unblock := <-blocked
-		resetStmtFilter() // so we don't catch other jobs
-		tdb.Exec(t,
-			`SET CLUSTER SETTING version = $1`, clusterversion.ByKey(clusterversion.RetryJobsWithExponentialBackoff).String(),
-		)
-		select {
-		case <-unblock:
-			t.Fatal("expected update not to finish")
-		case <-time.After(time.Millisecond):
-		}
-		close(unblock)
-		require.NoError(t, <-updateErr)
-	}
-	for _, tc := range []struct {
-		name string
-		f    updateFunc
-	}{
-		{"started", (*jobs.Job).Started},
-		{"reverted", func(j *jobs.Job, ctx context.Context) error {
-			return j.Reverted(ctx, errors.New("boom"))
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			run(t, tc.f)
-		})
-	}
-}
-
-// TestMixedVersionRevertFailed tests a revert failure in the mixed version
-// state before exponential backoff has been made active will result in the
-// job failing permanently rather than retrying forever without backoff.
-func TestMixedVersionRevertFailed(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	defer jobs.ResetConstructors()()
 	ctx := context.Background()
 
-	// Override the version because in 21.2, expontential backoff and uncontitional
-	// retries are not permitted.
-	v21_1 := clusterversion.ByKey(clusterversion.V21_1)
-	settings := cluster.MakeTestingClusterSettingsWithVersions(
-		v21_1, v21_1, true, /* initializeVersion */
-	)
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Settings: settings,
+	cs := cluster.MakeTestingClusterSettings()
+	// Set the lease duration to zero for instanty expiry.
+	lease.LeaseDuration.Override(ctx, &cs.SV, 0)
+	// Renewal timeout to 0 saying that the lease will get renewed only
+	// after the lease expires when a request requests the descriptor.
+	lease.LeaseRenewalDuration.Override(ctx, &cs.SV, 0)
+
+	var targetJobID atomic.Int64
+	var numberOfTimesDetected atomic.Int64
+	const targetNumberOfRetries = 5
+	args := base.TestServerArgs{
+		Settings: cs,
+		// Leasing settings used above conflict with some updates
+		// when starting the server, so skip those.
+		PartOfCluster: true,
 		Knobs: base.TestingKnobs{
-			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-			DistSQL: &execinfra.TestingKnobs{
-				RunBeforeBackfillChunk: func(sp roachpb.Span) error {
-					return errors.New("boom")
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				DisableAutoCommitDuringExec: true,
+				AfterExecute: func(ctx context.Context, stmt string, isInternal bool, err error) {
+					if targetJobID.Load() > 0 &&
+						strings.Contains(stmt, "SELECT count(*) FROM system.jobs") &&
+						strings.Contains(stmt, fmt.Sprintf("%d", targetJobID.Load())) {
+						// Leases expire almost instantly, without a renewal we will need
+						// a retry.
+						time.Sleep(time.Second)
+						// Detect this multiple times to ensure retries, once observed
+						// enough times disable the after execution.
+						if numberOfTimesDetected.Add(1) > targetNumberOfRetries-1 {
+							targetJobID.Store(0)
+						}
+					}
 				},
 			},
 		},
-	})
-	defer s.Stopper().Stop(ctx)
+	}
 
-	tdb := sqlutils.MakeSQLRunner(sqlDB)
-	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
-	_, err := sqlDB.Exec("ALTER TABLE foo ADD COLUMN j INT NOT NULL DEFAULT 32")
-	require.Regexp(t, "boom", err)
-	tdb.CheckQueryResults(t, "SELECT status, error FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%'", [][]string{
-		{"revert-failed", "boom"},
-	})
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
+	s := serverutils.StartServerOnly(t, args)
+	defer s.Stopper().Stop(ctx)
+	ts := s.ApplicationLayer()
+	registry := ts.JobRegistry().(*jobs.Registry)
+
+	// Create and run a dummy job.
+	idb := ts.InternalDB().(isql.DB)
+	id := registry.MakeJobID()
+	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
+			// Job does not accept an empty Details field, so arbitrarily provide
+			// ImportDetails.
+			Details:  jobspb.ImportDetails{},
+			Progress: jobspb.ImportProgress{},
+			Username: username.TestUserName(),
+		}, id, txn)
+		return err
+	}))
+	targetJobID.Store(int64(id))
+	require.NoError(t,
+		registry.WaitForJobs(
+			ctx, []jobspb.JobID{id},
+		))
+	if !skip.Duress() {
+		require.Equalf(t, int64(targetNumberOfRetries), numberOfTimesDetected.Load(), "jobs query did not retry")
+	} else {
+		// For stress be lenient since we are relying on timing for leasing
+		// expiration, which can be imprecise. So, lets aim for at least one
+		// retry.
+		require.GreaterOrEqualf(t, numberOfTimesDetected.Load(), int64(2), "jobs query did not retry")
+	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package retry
 
@@ -209,7 +204,7 @@ func TestRetryWithMaxAttempts(t *testing.T) {
 			maxNumAttempts: 1,
 		},
 		{
-			desc: "errors when max attempts is exhausted",
+			desc: "errors when max_attempts=3 is exhausted",
 			ctx:  context.Background(),
 			opts: Options{
 				InitialBackoff: time.Microsecond * 10,
@@ -222,6 +217,22 @@ func TestRetryWithMaxAttempts(t *testing.T) {
 
 			minNumAttempts:  3,
 			maxNumAttempts:  3,
+			expectedErrText: expectedErr.Error(),
+		},
+		{
+			desc: "errors when max_attempts=1 is exhausted",
+			ctx:  context.Background(),
+			opts: Options{
+				InitialBackoff: time.Microsecond * 10,
+				MaxBackoff:     time.Microsecond * 20,
+				Multiplier:     2,
+				MaxRetries:     0,
+			},
+			retryFunc:   errWithAttemptsCounterFunc,
+			maxAttempts: 1,
+
+			minNumAttempts:  1,
+			maxNumAttempts:  1,
 			expectedErrText: expectedErr.Error(),
 		},
 		{

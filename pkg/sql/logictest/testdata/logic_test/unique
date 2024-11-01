@@ -1,3 +1,7 @@
+# LogicTest: !weak-iso-level-configs
+# READ COMMITTED and REPEATABLE READ do not work with UNIQUE WITHOUT INDEX
+# constraints. See https://github.com/cockroachdb/cockroach/issues/110873.
+
 statement ok
 SET experimental_enable_unique_without_index_constraints = true
 
@@ -274,7 +278,7 @@ INSERT INTO uniq_enum VALUES ('us-west', 'foo', 1, 1), ('eu-west', 'bar', 2, 2)
 # index, and the prefix of the index is an enum. This case uses the default
 # value for columns r and j.
 statement error pgcode 23505 pq: duplicate key value violates unique constraint "unique_i"\nDETAIL: Key \(i\)=\(1\) already exists\.
-INSERT INTO uniq_enum (s, i) VALUES ('foo', 1), ('bar', 2)
+INSERT INTO uniq_enum (s, i) VALUES ('foo', 1), ('bar', 3)
 
 query TTII colnames,rowsort
 SELECT * FROM uniq_enum
@@ -361,10 +365,10 @@ NULL  5
 statement ok
 INSERT INTO uniq_computed_pk (i, s, d) VALUES (1, 'a', 1.0), (2, 'b', 2.0)
 
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr,i\)=\('bar',1\) already exists\.
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr, i\)=\('bar', 1\) already exists\.
 INSERT INTO uniq_computed_pk (i, s, d) VALUES (1, 'c', 3.0)
 
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s,s\)=\('b','b'\) already exists\.
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s, s\)=\('b', 'b'\) already exists\.
 INSERT INTO uniq_computed_pk (i, s, d) VALUES (3, 'b', 3.0)
 
 statement error pgcode 23505 pq: duplicate key value violates unique constraint "unique_d"\nDETAIL: Key \(d\)=\(1\.00\) already exists\.
@@ -542,10 +546,10 @@ NULL  10
 # Check that uniqueness violations are detected in a table with UNIQUE indexes
 # containing computed columns that are dependent on UNIQUE WITHOUT INDEX
 # columns.
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr,i\)=\('bar',1\) already exists\.
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr, i\)=\('bar', 1\) already exists\.
 UPDATE uniq_computed_pk SET i = 1 WHERE i = 2
 
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s,s\)=\('a','a'\) already exists\.
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s, s\)=\('a', 'a'\) already exists\.
 UPDATE uniq_computed_pk SET s = 'a' WHERE i = 2
 
 statement error pgcode 23505 pq: duplicate key value violates unique constraint "unique_d"\nDETAIL: Key \(d\)=\(1\.00\) already exists\.
@@ -825,14 +829,14 @@ i
 # Check that uniqueness violations are detected in a table with UNIQUE indexes
 # containing computed columns that are dependent on UNIQUE WITHOUT INDEX
 # columns.
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr,i\)=\('bar',2\) already exists\.
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_pkey"\nDETAIL: Key \(c_i_expr, i\)=\('bar', 2\) already exists\.
 INSERT INTO uniq_computed_pk (i, s, d) VALUES (1, 'a', 1.0) ON CONFLICT (s) DO UPDATE SET i = 2
 
-statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s,s\)=\('b','b'\) already exists\.
-UPSERT INTO uniq_computed_pk (i, s, d) VALUES (1, 'b', 1.0)
+statement error pgcode 23505 pq: duplicate key value violates unique constraint "uniq_computed_pk_c_s_s_key"\nDETAIL: Key \(c_s, s\)=\('b', 'b'\) already exists\.
+UPSERT INTO uniq_computed_pk (i, s, d) VALUES (3, 'b', 3.0)
 
 statement error pgcode 23505 pq: duplicate key value violates unique constraint "unique_d"\nDETAIL: Key \(d\)=\(2\.00\) already exists\.
-UPSERT INTO uniq_computed_pk (i, s, d) VALUES (1, 'a', 2.00)
+UPSERT INTO uniq_computed_pk (i, s, d) VALUES (3, 'c', 2.00)
 
 query ITFTTFT colnames,rowsort
 SELECT * FROM uniq_computed_pk
@@ -872,3 +876,216 @@ SELECT * FROM uniq_fk_child
 a  b     c  d     e
 1  1     1  1     1
 2  NULL  2  NULL  NULL
+
+subtest GroupByUnique
+
+# Group by UNIQUE WITHOUT INDEX columns which are nullable must not allow
+# non-aggregate expressions outside of the grouping columns.
+statement error pq: column "b" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT b FROM uniq_hidden_pk GROUP BY a
+
+# Group by UNIQUE INDEX columns which are nullable must not allow non-aggregate
+# expressions outside of the grouping columns.
+statement error pq: column "x" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT x FROM uniq GROUP BY v
+
+# Group by UNIQUE WITHOUT INDEX constraint can allow non-aggregate expressions
+# outside of the grouping columns if the constraint is not null.
+query TI colnames,rowsort
+SELECT r, i FROM uniq_enum GROUP BY i
+----
+r        i
+us-west  1
+eu-west  2
+
+statement ok
+ALTER TABLE uniq_hidden_pk ALTER COLUMN b SET NOT NULL
+
+# Group by UNIQUE WITHOUT INDEX constraint cannot allow non-aggregate
+# expressions if any of index columns is nullable.
+statement error pq: column "a" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT a FROM uniq_hidden_pk GROUP BY b, c
+
+statement ok
+ALTER TABLE uniq_hidden_pk ALTER COLUMN c SET NOT NULL
+
+# Group by UNIQUE WITHOUT INDEX constraint can allow non-aggregate expressions
+# outside of the grouping columns if the constraint is not nullable.
+query II colnames,rowsort
+SELECT a,d FROM uniq_hidden_pk GROUP BY b, c
+----
+a  d
+1  1
+2  2
+
+# Group by a subset of UNIQUE WITHOUT INDEX columns must not allow non-aggregate
+# expressions outside of the grouping columns.
+statement error pq: column "a" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT a FROM uniq_hidden_pk GROUP BY b
+
+# Group by UNIQUE INDEX constraint cannot allow non-aggregate expressions
+# outside of the grouping columns if index columns are nullable.
+statement error pq: column "x" must appear in the GROUP BY clause or be used in an aggregate function
+SELECT x FROM uniq GROUP BY v
+
+statement ok
+ALTER TABLE uniq ALTER COLUMN v SET NOT NULL
+
+# Group by UNIQUE INDEX constraint can allow non-aggregate expressions
+# outside of the grouping columns if index columns are not nullable.
+query I colnames,rowsort
+SELECT x FROM uniq GROUP BY v ORDER BY v
+----
+x
+1
+2
+3
+NULL
+5
+NULL
+2
+NULL
+1
+NULL
+NULL
+20
+NULL
+NULL
+NULL
+
+subtest multirowValuesInsertFastPath
+
+statement ok
+CREATE TABLE t1 (
+  pk int PRIMARY KEY,
+  pk2 int,
+  a int,
+  b int,
+  j JSON,
+  INDEX (a),
+  UNIQUE WITHOUT INDEX(b, a),
+  INDEX (b,a) STORING(pk2, j),
+  INVERTED INDEX (j),
+  FAMILY (pk, pk2, a, b)
+)
+
+statement ok
+INSERT INTO t1 (pk, pk2, a, b, j) VALUES
+   (0, 0, 1, 3, '{"a": "b"}');
+
+# This uses insert fast-path. Verify it catches the duplicate value of (b,a).
+statement error pq: duplicate key value violates unique constraint "unique_b_a"\nDETAIL: Key \(a, b\)=\(1, 3\) already exists\.
+INSERT INTO t1 (pk, pk2, a, b, j) VALUES
+   (2, 2, 1, 3, '{"a": "b"}'), (4, 5, 6, 7, '{"a": "b"}');
+
+statement ok
+CREATE TABLE multiple_uniq (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  UNIQUE WITHOUT INDEX (b, c),
+  UNIQUE WITHOUT INDEX (a, b, d),
+  UNIQUE WITHOUT INDEX (a),
+  INDEX (a, b, d),
+  INDEX (b, c),
+  FAMILY (a),
+  FAMILY (b),
+  FAMILY (c),
+  FAMILY (d)
+)
+
+# This uses insert fast-path and should succeed.
+statement ok
+INSERT INTO multiple_uniq
+VALUES (1,2,3,4), (5,6,7,8)
+
+# A table with multiple unique without index checks is eligible for insert fast
+# path. Verify it catches the duplicate value of (a).
+statement error pq: duplicate key value violates unique constraint "unique_a"\nDETAIL: Key \(a\)=\(1\) already exists\.
+INSERT INTO multiple_uniq
+VALUES (1,12,13,14), (15,16,17,18)
+
+# A table with multiple unique without index checks is eligible for insert fast
+# path. Verify it catches the duplicate value of (b,c).
+statement error pq: duplicate key value violates unique constraint "unique_b_c"\nDETAIL: Key \(b, c\)=\(2, 3\) already exists\.
+INSERT INTO multiple_uniq (a,c,b,d)
+VALUES (11,3,2,14), (15,16,17,18)
+
+statement ok
+PREPARE p1 AS INSERT INTO multiple_uniq
+VALUES ($1, $1, $1, $1), ($2, $2, $2, $2)
+
+# A table with multiple unique without index checks is eligible for parameterized insert fast
+# path. Verify it catches the duplicate value of (a).
+statement error pq: duplicate key value violates unique constraint "unique_a"\nDETAIL: Key \(a\)=\(1\) already exists\.
+EXECUTE p1(1, 2)
+
+statement ok
+ALTER TABLE multiple_uniq ADD CONSTRAINT uniq_fk FOREIGN KEY (d) REFERENCES uniq (k) ON DELETE CASCADE;
+
+# A table with multiple unique without index checks and an FK constraint is
+# eligible for insert fast path. Verify it catches the foreign key violation on
+# (d).
+statement error pq: insert on table "multiple_uniq" violates foreign key constraint "uniq_fk"\nDETAIL: Key \(d\)=\(14\) is not present in table "uniq"\.
+INSERT INTO multiple_uniq (a,b,c,d)
+VALUES (11,12,13,14), (15,16,17,18)
+
+# Regression test for #115377.
+statement ok
+CREATE TABLE t115377 (
+  k INT,
+  a INT,
+  b INT,
+  s TEXT NOT NULL,
+  PRIMARY KEY (s, k),
+  UNIQUE WITHOUT INDEX (k),
+  UNIQUE (s, a, b),
+  UNIQUE WITHOUT INDEX (a, b),
+  CHECK (s IN ('east', 'west'))
+)
+
+statement ok
+INSERT INTO t115377 VALUES (2, 0, 0, 'east')
+
+statement error pgcode 23505 duplicate key value violates unique constraint \"unique_k\"
+INSERT INTO t115377 VALUES (2, 1, 1, 'east')
+
+# Regression test for #126988.
+statement ok
+CREATE TABLE t126988 (
+  k INT PRIMARY KEY,
+  j INT,
+  i INT,
+  v INT AS (i) VIRTUAL,
+  UNIQUE WITHOUT INDEX (i, j),
+  INDEX (j, v) STORING (i)
+)
+
+statement ok
+INSERT INTO t126988 VALUES (1, 10, 200)
+
+statement error pgcode 23505 duplicate key value violates unique constraint \"unique_i_j\"\nDETAIL: Key \(10, 200\) already exists.
+INSERT INTO t126988 VALUES (1, 10, 200)
+
+subtest end
+
+# Regression test for hitting a nil pointer in the insert fast path when seeing
+# a bool expression in the VALUES clause (#123103).
+statement ok
+CREATE TABLE t123103 (
+	id STRING DEFAULT gen_random_uuid()::STRING NOT NULL,
+	r  region NOT NULL DEFAULT 'us-east'::region,
+	a  STRING NOT NULL,
+	b  BOOL NOT NULL,
+	CONSTRAINT tab_pkey PRIMARY KEY (r ASC, id ASC),
+	CONSTRAINT tab_id_key UNIQUE WITHOUT INDEX (id ASC),
+	CONSTRAINT tab_r_a_b_key UNIQUE (r ASC, a ASC, b ASC),
+	CONSTRAINT tab_a_b_key UNIQUE WITHOUT INDEX (a ASC, b ASC)
+);
+INSERT INTO t123103 (id, a, b) VALUES ('1234567890', 'foo', true);
+
+query TTB
+SELECT id, a, b FROM t123103;
+----
+1234567890  foo  true

@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package allccl
 
@@ -52,7 +49,7 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 	for _, meta := range workload.Registered() {
 		meta := meta
 		gen := meta.New()
-		hasInitialData := true
+		hasInitialData := len(gen.Tables()) != 0
 		for _, table := range gen.Tables() {
 			if table.InitialRows.FillBatch == nil {
 				hasInitialData = false
@@ -71,7 +68,7 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 		}
 
 		switch meta.Name {
-		case `startrek`, `roachmart`, `interleavedpartitioned`:
+		case `startrek`, `roachmart`, `interleavedpartitioned`, `ttlbench`:
 			// These don't work with IMPORT.
 			continue
 		case `tpch`:
@@ -88,6 +85,9 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 
 			ctx := context.Background()
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+				// The test tenant needs to be disabled for this test until
+				// we address #75449.
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				UseDatabase:       "d",
 				SQLMemoryPoolSize: sqlMemoryPoolSize,
 			})
@@ -113,6 +113,7 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 
 func TestAllRegisteredSetup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 
 	for _, meta := range workload.Registered() {
 		if bigInitialData(meta) {
@@ -140,17 +141,22 @@ func TestAllRegisteredSetup(t *testing.T) {
 		case `interleavedpartitioned`:
 			// This require a specific node locality setup
 			continue
+		case `ttlbench`:
+			continue
 		}
 
 		t.Run(meta.Name, func(t *testing.T) {
 			defer log.Scope(t).Close(t)
 			ctx := context.Background()
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-				UseDatabase: "d",
+				// Need to disable the test tenant here until we resolve
+				// #75449 as this test makes use of import through a fixture.
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				UseDatabase:       "d",
 			})
 			defer s.Stopper().Stop(ctx)
 			sqlutils.MakeSQLRunner(db).Exec(t, `CREATE DATABASE d`)
-			sqlutils.MakeSQLRunner(db).Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = false`)
+			sqlutils.MakeSQLRunner(db).Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = false`)
 
 			var l workloadsql.InsertsDataLoader
 			if _, err := workloadsql.Setup(ctx, db, gen, l); err != nil {
@@ -257,7 +263,7 @@ func TestDeterministicInitialData(t *testing.T) {
 	// TODO(dan): We're starting to accumulate these various lists, bigInitialData
 	// is another. Consider moving them to be properties on the workload.Meta.
 	fingerprintGoldens := map[string]uint64{
-		`bank`:       0x7b4d519ed8bd07ce,
+		`bank`:       0xb9065bb21c3594a2,
 		`bulkingest`: 0xcf3e4028ac084aea,
 		`indexes`:    0xcbf29ce484222325,
 		`intro`:      0x81c6a8cfd9c3452a,
@@ -270,8 +276,8 @@ func TestDeterministicInitialData(t *testing.T) {
 		`sqlsmith`:   0xcbf29ce484222325,
 		`startrek`:   0xa0249fbdf612734c,
 		`tpcc`:       0xab32e4f5e899eb2f,
-		`tpch`:       0x65a1e18ddf4e59aa,
-		`ycsb`:       0x1244ea1c29ef67f6,
+		`tpch`:       0xe4fd28db230b9149,
+		`ycsb`:       0xcfd3f148a01a2c47,
 	}
 
 	var a bufalloc.ByteAllocator
@@ -285,6 +291,14 @@ func TestDeterministicInitialData(t *testing.T) {
 			continue
 		}
 		t.Run(meta.Name, func(t *testing.T) {
+			// assertions depend on this seed
+			switch rs := meta.RandomSeed.(type) {
+			case *workload.Int64RandomSeed:
+				rs.Set(1)
+			case *workload.Uint64RandomSeed:
+				rs.Set(1)
+			}
+
 			if bigInitialData(meta) {
 				skip.UnderShort(t, fmt.Sprintf(`%s involves a lot of data`, meta.Name))
 			}

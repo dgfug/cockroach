@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowenc
 
@@ -16,24 +11,27 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
-// EncodingDirToDatumEncoding returns an equivalent descpb.DatumEncoding for the given
+// EncodingDirToDatumEncoding returns an equivalent catenumpb.DatumEncoding for the given
 // encoding direction.
-func EncodingDirToDatumEncoding(dir encoding.Direction) descpb.DatumEncoding {
+func EncodingDirToDatumEncoding(dir encoding.Direction) catenumpb.DatumEncoding {
 	switch dir {
 	case encoding.Ascending:
-		return descpb.DatumEncoding_ASCENDING_KEY
+		return catenumpb.DatumEncoding_ASCENDING_KEY
 	case encoding.Descending:
-		return descpb.DatumEncoding_DESCENDING_KEY
+		return catenumpb.DatumEncoding_DESCENDING_KEY
 	default:
 		panic(errors.AssertionFailedf("invalid encoding direction: %d", dir))
 	}
@@ -44,7 +42,7 @@ func EncodingDirToDatumEncoding(dir encoding.Direction) descpb.DatumEncoding {
 // reencoding.
 type EncDatum struct {
 	// Encoding type. Valid only if encoded is not nil.
-	encoding descpb.DatumEncoding
+	encoding catenumpb.DatumEncoding
 
 	// Encoded datum (according to the encoding field).
 	encoded []byte
@@ -53,13 +51,13 @@ type EncDatum struct {
 	Datum tree.Datum
 }
 
-func (ed *EncDatum) stringWithAlloc(typ *types.T, a *DatumAlloc) string {
+func (ed *EncDatum) stringWithAlloc(typ *types.T, a *tree.DatumAlloc) string {
 	if ed.Datum == nil {
 		if ed.encoded == nil {
 			return "<unset>"
 		}
 		if a == nil {
-			a = &DatumAlloc{}
+			a = &tree.DatumAlloc{}
 		}
 		err := ed.EnsureDecoded(typ, a)
 		if err != nil {
@@ -124,7 +122,7 @@ func (ed EncDatum) DiskSize() uintptr {
 // value. The encoded value is stored as a shallow copy, so the caller must
 // make sure the slice is not modified for the lifetime of the EncDatum.
 // The underlying Datum is nil.
-func EncDatumFromEncoded(enc descpb.DatumEncoding, encoded []byte) EncDatum {
+func EncDatumFromEncoded(enc catenumpb.DatumEncoding, encoded []byte) EncDatum {
 	if len(encoded) == 0 {
 		panic(errors.AssertionFailedf("empty encoded value"))
 	}
@@ -139,14 +137,12 @@ func EncDatumFromEncoded(enc descpb.DatumEncoding, encoded []byte) EncDatum {
 // possibly followed by other data. Similar to EncDatumFromEncoded,
 // except that this function figures out where the encoding stops and returns a
 // slice for the rest of the buffer.
-func EncDatumFromBuffer(
-	typ *types.T, enc descpb.DatumEncoding, buf []byte,
-) (EncDatum, []byte, error) {
+func EncDatumFromBuffer(enc catenumpb.DatumEncoding, buf []byte) (EncDatum, []byte, error) {
 	if len(buf) == 0 {
 		return EncDatum{}, nil, errors.New("empty encoded value")
 	}
 	switch enc {
-	case descpb.DatumEncoding_ASCENDING_KEY, descpb.DatumEncoding_DESCENDING_KEY:
+	case catenumpb.DatumEncoding_ASCENDING_KEY, catenumpb.DatumEncoding_DESCENDING_KEY:
 		var encLen int
 		var err error
 		encLen, err = encoding.PeekLength(buf)
@@ -155,7 +151,7 @@ func EncDatumFromBuffer(
 		}
 		ed := EncDatumFromEncoded(enc, buf[:encLen])
 		return ed, buf[encLen:], nil
-	case descpb.DatumEncoding_VALUE:
+	case catenumpb.DatumEncoding_VALUE:
 		typeOffset, encLen, err := encoding.PeekValueLength(buf)
 		if err != nil {
 			return EncDatum{}, nil, err
@@ -168,7 +164,7 @@ func EncDatumFromBuffer(
 }
 
 // EncDatumValueFromBufferWithOffsetsAndType is just like calling
-// EncDatumFromBuffer with descpb.DatumEncoding_VALUE, except it expects that you pass
+// EncDatumFromBuffer with catenumpb.DatumEncoding_VALUE, except it expects that you pass
 // in the result of calling DecodeValueTag on the input buf. Use this if you've
 // already called DecodeValueTag on buf already, to avoid it getting called
 // more than necessary.
@@ -179,21 +175,38 @@ func EncDatumValueFromBufferWithOffsetsAndType(
 	if err != nil {
 		return EncDatum{}, nil, err
 	}
-	ed := EncDatumFromEncoded(descpb.DatumEncoding_VALUE, buf[typeOffset:encLen])
+	ed := EncDatumFromEncoded(catenumpb.DatumEncoding_VALUE, buf[typeOffset:encLen])
 	return ed, buf[encLen:], nil
 }
 
 // DatumToEncDatum initializes an EncDatum with the given Datum.
 func DatumToEncDatum(ctyp *types.T, d tree.Datum) EncDatum {
+	ed, err := DatumToEncDatumEx(ctyp, d)
+	if err != nil {
+		panic(err)
+	}
+	return ed
+}
+
+// DatumToEncDatumEx is the same as DatumToEncDatum that returns an error
+// instead of panicking under unexpected circumstances.
+// TODO(yuzefovich): we should probably get rid of DatumToEncDatum in favor of
+// this method altogether.
+func DatumToEncDatumEx(ctyp *types.T, d tree.Datum) (EncDatum, error) {
 	if d == nil {
-		panic(errors.AssertionFailedf("cannot convert nil datum to EncDatum"))
+		return EncDatum{}, errors.AssertionFailedf("cannot convert nil datum to EncDatum")
 	}
 
 	dTyp := d.ResolvedType()
 	if d != tree.DNull && !ctyp.Equivalent(dTyp) && !dTyp.IsAmbiguous() {
-		panic(errors.AssertionFailedf("invalid datum type given: %s, expected %s", dTyp, ctyp))
+		return EncDatum{}, errors.AssertionFailedf("invalid datum type given: %s, expected %s", dTyp.SQLStringForError(), ctyp.SQLStringForError())
 	}
-	return EncDatum{Datum: d}
+	return EncDatum{Datum: d}, nil
+}
+
+// NullEncDatum initializes an EncDatum with the NULL value.
+func NullEncDatum() EncDatum {
+	return EncDatum{Datum: tree.DNull}
 }
 
 // UnsetDatum ensures subsequent IsUnset() calls return false.
@@ -218,11 +231,11 @@ func (ed *EncDatum) IsNull() bool {
 		panic(errors.AssertionFailedf("IsNull on unset EncDatum"))
 	}
 	switch ed.encoding {
-	case descpb.DatumEncoding_ASCENDING_KEY, descpb.DatumEncoding_DESCENDING_KEY:
+	case catenumpb.DatumEncoding_ASCENDING_KEY, catenumpb.DatumEncoding_DESCENDING_KEY:
 		_, isNull := encoding.DecodeIfNull(ed.encoded)
 		return isNull
 
-	case descpb.DatumEncoding_VALUE:
+	case catenumpb.DatumEncoding_VALUE:
 		_, _, _, typ, err := encoding.DecodeValueTag(ed.encoded)
 		if err != nil {
 			panic(errors.WithAssertionFailure(err))
@@ -235,7 +248,7 @@ func (ed *EncDatum) IsNull() bool {
 }
 
 // EnsureDecoded ensures that the Datum field is set (decoding if it is not).
-func (ed *EncDatum) EnsureDecoded(typ *types.T, a *DatumAlloc) error {
+func (ed *EncDatum) EnsureDecoded(typ *types.T, a *tree.DatumAlloc) error {
 	if ed.Datum != nil {
 		return nil
 	}
@@ -245,29 +258,29 @@ func (ed *EncDatum) EnsureDecoded(typ *types.T, a *DatumAlloc) error {
 	var err error
 	var rem []byte
 	switch ed.encoding {
-	case descpb.DatumEncoding_ASCENDING_KEY:
-		ed.Datum, rem, err = DecodeTableKey(a, typ, ed.encoded, encoding.Ascending)
-	case descpb.DatumEncoding_DESCENDING_KEY:
-		ed.Datum, rem, err = DecodeTableKey(a, typ, ed.encoded, encoding.Descending)
-	case descpb.DatumEncoding_VALUE:
-		ed.Datum, rem, err = DecodeTableValue(a, typ, ed.encoded)
+	case catenumpb.DatumEncoding_ASCENDING_KEY:
+		ed.Datum, rem, err = keyside.Decode(a, typ, ed.encoded, encoding.Ascending)
+	case catenumpb.DatumEncoding_DESCENDING_KEY:
+		ed.Datum, rem, err = keyside.Decode(a, typ, ed.encoded, encoding.Descending)
+	case catenumpb.DatumEncoding_VALUE:
+		ed.Datum, rem, err = valueside.Decode(a, typ, ed.encoded)
 	default:
-		return errors.AssertionFailedf("unknown encoding %d", log.Safe(ed.encoding))
+		return errors.AssertionFailedf("unknown encoding %d", redact.Safe(ed.encoding))
 	}
 	if err != nil {
-		return errors.Wrapf(err, "error decoding %d bytes", log.Safe(len(ed.encoded)))
+		return errors.Wrapf(err, "error decoding %d bytes", redact.Safe(len(ed.encoded)))
 	}
 	if len(rem) != 0 {
 		ed.Datum = nil
 		return errors.AssertionFailedf(
-			"%d trailing bytes in encoded value: %+v", log.Safe(len(rem)), rem)
+			"%d trailing bytes in encoded value: %+v", redact.Safe(len(rem)), rem)
 	}
 	return nil
 }
 
 // Encoding returns the encoding that is already available (the latter indicated
 // by the bool return value).
-func (ed *EncDatum) Encoding() (descpb.DatumEncoding, bool) {
+func (ed *EncDatum) Encoding() (catenumpb.DatumEncoding, bool) {
 	if ed.encoded == nil {
 		return 0, false
 	}
@@ -276,10 +289,10 @@ func (ed *EncDatum) Encoding() (descpb.DatumEncoding, bool) {
 
 // Encode appends the encoded datum to the given slice using the requested
 // encoding.
-// Note: descpb.DatumEncoding_VALUE encodings are not unique because they can contain
+// Note: catenumpb.DatumEncoding_VALUE encodings are not unique because they can contain
 // a column ID so they should not be used to test for equality.
 func (ed *EncDatum) Encode(
-	typ *types.T, a *DatumAlloc, enc descpb.DatumEncoding, appendTo []byte,
+	typ *types.T, a *tree.DatumAlloc, enc catenumpb.DatumEncoding, appendTo []byte,
 ) ([]byte, error) {
 	if ed.encoded != nil && enc == ed.encoding {
 		// We already have an encoding that matches that we can use.
@@ -289,14 +302,41 @@ func (ed *EncDatum) Encode(
 		return nil, err
 	}
 	switch enc {
-	case descpb.DatumEncoding_ASCENDING_KEY:
-		return EncodeTableKey(appendTo, ed.Datum, encoding.Ascending)
-	case descpb.DatumEncoding_DESCENDING_KEY:
-		return EncodeTableKey(appendTo, ed.Datum, encoding.Descending)
-	case descpb.DatumEncoding_VALUE:
-		return EncodeTableValue(appendTo, descpb.ColumnID(encoding.NoColumnID), ed.Datum, a.scratch)
+	case catenumpb.DatumEncoding_ASCENDING_KEY:
+		return keyside.Encode(appendTo, ed.Datum, encoding.Ascending)
+	case catenumpb.DatumEncoding_DESCENDING_KEY:
+		return keyside.Encode(appendTo, ed.Datum, encoding.Descending)
+	case catenumpb.DatumEncoding_VALUE:
+		return valueside.Encode(appendTo, valueside.NoColumnID, ed.Datum, nil /* scratch */)
 	default:
 		panic(errors.AssertionFailedf("unknown encoding requested %s", enc))
+	}
+}
+
+func mustUseValueEncodingForFingerprinting(t *types.T) bool {
+	switch t.Family() {
+	// Both TSQuery and TSVector types don't have key-encoding, so we must use
+	// the value encoding for them. JSON type now (as of 23.2) has key-encoding
+	// available, but for historical reasons we will keep on using the
+	// value-encoding (Fingerprint is used by hash routers, so changing its
+	// behavior can result in incorrect results in mixed version clusters).
+	case types.JsonFamily, types.TSQueryFamily, types.TSVectorFamily, types.PGVectorFamily:
+		return true
+	case types.ArrayFamily:
+		// Note that at time of this writing we don't support arrays of JSON
+		// (tracked via #23468) nor of TSQuery / TSVector / PGVector types (tracked by
+		// #90886, #121432), so technically we don't need to do a recursive call here,
+		// but we choose to be on the safe side, so we do it anyway.
+		return mustUseValueEncodingForFingerprinting(t.ArrayContents())
+	case types.TupleFamily:
+		for _, tupleT := range t.TupleContents() {
+			if mustUseValueEncodingForFingerprinting(tupleT) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
 	}
 }
 
@@ -312,7 +352,7 @@ func (ed *EncDatum) Encode(
 // returned byte slice. Note that the context will only be used if acc is
 // non-nil.
 func (ed *EncDatum) Fingerprint(
-	ctx context.Context, typ *types.T, a *DatumAlloc, appendTo []byte, acc *mon.BoundAccount,
+	ctx context.Context, typ *types.T, a *tree.DatumAlloc, appendTo []byte, acc *mon.BoundAccount,
 ) ([]byte, error) {
 	// Note: we don't ed.EnsureDecoded on top of this method, because the default
 	// case uses ed.Encode, which has a fast path if the encoded bytes are already
@@ -320,15 +360,14 @@ func (ed *EncDatum) Fingerprint(
 	var fingerprint []byte
 	var err error
 	memUsageBefore := ed.Size()
-	switch typ.Family() {
-	case types.JsonFamily:
+	if mustUseValueEncodingForFingerprinting(typ) {
 		if err = ed.EnsureDecoded(typ, a); err != nil {
 			return nil, err
 		}
 		// We must use value encodings without a column ID even if the EncDatum already
 		// is encoded with the value encoding so that the hashes are indeed unique.
-		fingerprint, err = EncodeTableValue(appendTo, descpb.ColumnID(encoding.NoColumnID), ed.Datum, a.scratch)
-	default:
+		fingerprint, err = valueside.Encode(appendTo, valueside.NoColumnID, ed.Datum, nil /* scratch */)
+	} else {
 		// For values that are key encodable, using the ascending key.
 		// Note that using a value encoding will not easily work in case when
 		// there already exists the encoded representation because that
@@ -337,7 +376,7 @@ func (ed *EncDatum) Fingerprint(
 		// when already present, but it doesn't seem worth it at this point.
 		// TODO(yuzefovich): consider reusing the descending key encoding when
 		// already present.
-		fingerprint, err = ed.Encode(typ, a, descpb.DatumEncoding_ASCENDING_KEY, appendTo)
+		fingerprint, err = ed.Encode(typ, a, catenumpb.DatumEncoding_ASCENDING_KEY, appendTo)
 	}
 	if err == nil && acc != nil {
 		return fingerprint, acc.Grow(ctx, int64(ed.Size()-memUsageBefore))
@@ -346,29 +385,44 @@ func (ed *EncDatum) Fingerprint(
 }
 
 // Compare returns:
-//    -1 if the receiver is less than rhs,
-//    0  if the receiver is equal to rhs,
-//    +1 if the receiver is greater than rhs.
+//
+//	-1 if the receiver is less than rhs,
+//	0  if the receiver is equal to rhs,
+//	+1 if the receiver is greater than rhs.
 func (ed *EncDatum) Compare(
-	typ *types.T, a *DatumAlloc, evalCtx *tree.EvalContext, rhs *EncDatum,
+	ctx context.Context, typ *types.T, a *tree.DatumAlloc, evalCtx *eval.Context, rhs *EncDatum,
+) (int, error) {
+	return ed.CompareEx(ctx, typ, a, evalCtx, rhs, typ)
+}
+
+// CompareEx is the same as Compare but allows specifying the type of RHS
+// EncDatum in case it's different from ed (e.g. we might be comparing Oid
+// family types with different Oids).
+func (ed *EncDatum) CompareEx(
+	ctx context.Context,
+	typ *types.T,
+	a *tree.DatumAlloc,
+	evalCtx *eval.Context,
+	rhs *EncDatum,
+	rhsTyp *types.T,
 ) (int, error) {
 	// TODO(radu): if we have both the Datum and a key encoding available, which
 	// one would be faster to use?
 	if ed.encoding == rhs.encoding && ed.encoded != nil && rhs.encoded != nil {
 		switch ed.encoding {
-		case descpb.DatumEncoding_ASCENDING_KEY:
+		case catenumpb.DatumEncoding_ASCENDING_KEY:
 			return bytes.Compare(ed.encoded, rhs.encoded), nil
-		case descpb.DatumEncoding_DESCENDING_KEY:
+		case catenumpb.DatumEncoding_DESCENDING_KEY:
 			return bytes.Compare(rhs.encoded, ed.encoded), nil
 		}
 	}
 	if err := ed.EnsureDecoded(typ, a); err != nil {
 		return 0, err
 	}
-	if err := rhs.EnsureDecoded(typ, a); err != nil {
+	if err := rhs.EnsureDecoded(rhsTyp, a); err != nil {
 		return 0, err
 	}
-	return ed.Datum.Compare(evalCtx, rhs.Datum), nil
+	return ed.Datum.Compare(ctx, evalCtx, rhs.Datum)
 }
 
 // GetInt decodes an EncDatum that is known to be of integer type and returns
@@ -383,21 +437,21 @@ func (ed *EncDatum) GetInt() (int64, error) {
 	}
 
 	switch ed.encoding {
-	case descpb.DatumEncoding_ASCENDING_KEY:
+	case catenumpb.DatumEncoding_ASCENDING_KEY:
 		if _, isNull := encoding.DecodeIfNull(ed.encoded); isNull {
 			return 0, errors.Errorf("NULL INT value")
 		}
 		_, val, err := encoding.DecodeVarintAscending(ed.encoded)
 		return val, err
 
-	case descpb.DatumEncoding_DESCENDING_KEY:
+	case catenumpb.DatumEncoding_DESCENDING_KEY:
 		if _, isNull := encoding.DecodeIfNull(ed.encoded); isNull {
 			return 0, errors.Errorf("NULL INT value")
 		}
 		_, val, err := encoding.DecodeVarintDescending(ed.encoded)
 		return val, err
 
-	case descpb.DatumEncoding_VALUE:
+	case catenumpb.DatumEncoding_VALUE:
 		_, dataOffset, _, typ, err := encoding.DecodeValueTag(ed.encoded)
 		if err != nil {
 			return 0, err
@@ -418,9 +472,10 @@ func (ed *EncDatum) GetInt() (int64, error) {
 // EncDatumRow is a row of EncDatums.
 type EncDatumRow []EncDatum
 
-func (r EncDatumRow) stringToBuf(types []*types.T, a *DatumAlloc, b *bytes.Buffer) {
+func (r EncDatumRow) stringToBuf(types []*types.T, a *tree.DatumAlloc, b *bytes.Buffer) {
 	if len(types) != len(r) {
-		panic(errors.AssertionFailedf("mismatched types (%v) and row (%v)", types, r))
+		b.WriteString(fmt.Sprintf("mismatched types (%v) and row (%v)", types, r))
+		return
 	}
 	b.WriteString("[")
 	for i := range r {
@@ -445,7 +500,7 @@ func (r EncDatumRow) Copy() EncDatumRow {
 
 func (r EncDatumRow) String(types []*types.T) string {
 	var b bytes.Buffer
-	r.stringToBuf(types, &DatumAlloc{}, &b)
+	r.stringToBuf(types, &tree.DatumAlloc{}, &b)
 	return b.String()
 }
 
@@ -464,7 +519,7 @@ func (r EncDatumRow) Size() uintptr {
 
 // EncDatumRowToDatums converts a given EncDatumRow to a Datums.
 func EncDatumRowToDatums(
-	types []*types.T, datums tree.Datums, row EncDatumRow, da *DatumAlloc,
+	types []*types.T, datums tree.Datums, row EncDatumRow, da *tree.DatumAlloc,
 ) error {
 	if len(types) != len(row) {
 		return errors.AssertionFailedf(
@@ -490,27 +545,46 @@ func EncDatumRowToDatums(
 
 // Compare returns the relative ordering of two EncDatumRows according to a
 // ColumnOrdering:
-//   -1 if the receiver comes before the rhs in the ordering,
-//   +1 if the receiver comes after the rhs in the ordering,
-//   0 if the relative order does not matter (i.e. the two rows have the same
-//     values for the columns in the ordering).
+//
+//	-1 if the receiver comes before the rhs in the ordering,
+//	+1 if the receiver comes after the rhs in the ordering,
+//	0 if the relative order does not matter (i.e. the two rows have the same
+//	  values for the columns in the ordering).
 //
 // Note that a return value of 0 does not (in general) imply that the rows are
 // equal; for example, rows [1 1 5] and [1 1 6] when compared against ordering
 // {{0, asc}, {1, asc}} (i.e. ordered by first column and then by second
 // column).
 func (r EncDatumRow) Compare(
+	ctx context.Context,
 	types []*types.T,
-	a *DatumAlloc,
+	a *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rhs EncDatumRow,
 ) (int, error) {
-	if len(r) != len(types) || len(rhs) != len(types) {
-		panic(errors.AssertionFailedf("length mismatch: %d types, %d lhs, %d rhs\n%+v\n%+v\n%+v", len(types), len(r), len(rhs), types, r, rhs))
+	return r.CompareEx(ctx, types, a, ordering, evalCtx, rhs, types)
+}
+
+// CompareEx is the same as Compare but allows specifying a different type
+// schema for RHS row.
+func (r EncDatumRow) CompareEx(
+	ctx context.Context,
+	types []*types.T,
+	a *tree.DatumAlloc,
+	ordering colinfo.ColumnOrdering,
+	evalCtx *eval.Context,
+	rhs EncDatumRow,
+	rhsTypes []*types.T,
+) (int, error) {
+	if len(r) != len(types) || len(rhs) != len(rhsTypes) || len(r) != len(rhs) {
+		panic(errors.AssertionFailedf(
+			"length mismatch: %d types, %d rhs types, %d lhs, %d rhs\n%+v\n%+v\n%+v",
+			len(types), len(rhsTypes), len(r), len(rhs), types, r, rhs,
+		))
 	}
 	for _, c := range ordering {
-		cmp, err := r[c.ColIdx].Compare(types[c.ColIdx], a, evalCtx, &rhs[c.ColIdx])
+		cmp, err := r[c.ColIdx].CompareEx(ctx, types[c.ColIdx], a, evalCtx, &rhs[c.ColIdx], rhsTypes[c.ColIdx])
 		if err != nil {
 			return 0, err
 		}
@@ -526,17 +600,21 @@ func (r EncDatumRow) Compare(
 
 // CompareToDatums is a version of Compare which compares against decoded Datums.
 func (r EncDatumRow) CompareToDatums(
+	ctx context.Context,
 	types []*types.T,
-	a *DatumAlloc,
+	a *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rhs tree.Datums,
 ) (int, error) {
 	for _, c := range ordering {
 		if err := r[c.ColIdx].EnsureDecoded(types[c.ColIdx], a); err != nil {
 			return 0, err
 		}
-		cmp := r[c.ColIdx].Datum.Compare(evalCtx, rhs[c.ColIdx])
+		cmp, err := r[c.ColIdx].Datum.Compare(ctx, evalCtx, rhs[c.ColIdx])
+		if err != nil {
+			return 0, err
+		}
 		if cmp != 0 {
 			if c.Direction == encoding.Descending {
 				cmp = -cmp
@@ -551,7 +629,7 @@ func (r EncDatumRow) CompareToDatums(
 type EncDatumRows []EncDatumRow
 
 func (r EncDatumRows) String(types []*types.T) string {
-	var a DatumAlloc
+	var a tree.DatumAlloc
 	var b bytes.Buffer
 	b.WriteString("[")
 	for i, r := range r {

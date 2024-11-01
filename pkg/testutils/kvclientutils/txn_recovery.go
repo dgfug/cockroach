@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvclientutils
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -62,18 +58,18 @@ func CheckPushResult(
 	expResolution ExpectedTxnResolution,
 	pushExpectation PushExpectation,
 ) error {
-	pushReq := roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	pushReq := kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
 		PusheeTxn: txn.TxnMeta,
 		PushTo:    hlc.Timestamp{},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		// We're going to Force the push in order to not wait for the pushee to
 		// expire.
 		Force: true,
 	}
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Add(&pushReq)
 
 	recCtx, collectRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test trace")

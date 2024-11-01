@@ -1,4 +1,4 @@
-# LogicTest: local !3node-tenant(52567)
+# LogicTest: local
 
 ## Tests for ensuring that prepared statements can't get overwritten and for
 ## deallocate and deallocate all.
@@ -86,8 +86,10 @@ EXECUTE a(3, 1)
 query error could not parse "foo" as type int
 EXECUTE a('foo', 1)
 
-query error expected EXECUTE parameter expression to have type int, but '3.5' has type decimal
+query I
 EXECUTE a(3.5, 1)
+----
+5
 
 query error aggregate functions are not allowed in EXECUTE parameter
 EXECUTE a(max(3), 1)
@@ -162,21 +164,24 @@ EXECUTE i(2)
 query error could not parse "foo" as type int
 EXECUTE i('foo')
 
-query error expected EXECUTE parameter expression to have type int, but '2.3' has type decimal
-EXECUTE i(2.3)
-
 query I
-EXECUTE i(3.3::int)
+EXECUTE i(3.3)
 ----
 4
 
-query I colnames
+query I
+EXECUTE i(4.3::int)
+----
+5
+
+query I colnames,rowsort
 EXECUTE s
 ----
 a
 1
 2
 3
+4
 
 # DISCARD ROWS drops the results, but does not affect the schema or the
 # internal plan.
@@ -196,8 +201,8 @@ PREPARE x AS SELECT avg(column1) OVER (PARTITION BY column2) FROM (VALUES (1, 2)
 query R rowsort
 EXECUTE x
 ----
-1
-3
+1.0000000000000000000
+3.0000000000000000000
 
 statement
 PREPARE y AS SELECT avg(a.column1) OVER (PARTITION BY a.column2) FROM (VALUES (1, 2), (3, 4)) a
@@ -205,8 +210,8 @@ PREPARE y AS SELECT avg(a.column1) OVER (PARTITION BY a.column2) FROM (VALUES (1
 query R rowsort
 EXECUTE y
 ----
-1
-3
+1.0000000000000000000
+3.0000000000000000000
 
 statement
 DEALLOCATE ALL
@@ -242,7 +247,7 @@ ALTER TABLE f ADD COLUMN t int
 statement error cached plan must not change result type
 EXECUTE y (3, 4)
 
-query III
+query III rowsort
 SELECT * FROM f
 ----
 1 2 NULL
@@ -286,12 +291,13 @@ EXECUTE wrongTypeImpossibleCast('crabgas')
 statement ok
 PREPARE s AS SELECT a FROM t; PREPARE p1 AS UPSERT INTO t(a) VALUES($1) RETURNING a
 
-query I
+query I rowsort
 EXECUTE s
 ----
 1
 2
 3
+4
 
 query I
 EXECUTE p1(123)
@@ -301,31 +307,34 @@ EXECUTE p1(123)
 statement ok
 PREPARE p2 AS UPDATE t SET a = a + $1 RETURNING a
 
-query I
+query I rowsort
 EXECUTE s
 ----
 1
 2
 3
+4
 123
 
-query I
+query I rowsort
 EXECUTE p2(123)
 ----
 124
 125
 126
+127
 246
 
 statement ok
 PREPARE p3 AS DELETE FROM t WHERE a = $1 RETURNING a
 
-query I
+query I rowsort
 EXECUTE s
 ----
 124
 125
 126
+127
 246
 
 query I
@@ -369,7 +378,7 @@ hello
 # because it doesn't propagate immediately.
 
 statement ok
-PREPARE sets(string) AS SET CLUSTER SETTING cluster.organization = $1
+PREPARE sets(string) AS SET CLUSTER SETTING cluster.label = $1
 
 statement ok
 EXECUTE sets('hello')
@@ -427,7 +436,7 @@ EXECUTE x21701a(NULL)
 statement ok
 PREPARE x21701b AS SELECT * FROM kv WHERE k IS DISTINCT FROM $1
 
-query II
+query II rowsort
 EXECUTE x21701b(NULL)
 ----
 1  1
@@ -885,7 +894,10 @@ query error pq: column "b" does not exist
 EXECUTE change_drop
 
 statement ok
-ALTER TABLE othertable ADD COLUMN b INT; UPDATE othertable SET b=10
+ALTER TABLE othertable ADD COLUMN b INT;
+
+statement ok
+UPDATE othertable SET b=10
 
 query II
 EXECUTE change_drop
@@ -942,7 +954,7 @@ query OOIIIIIB colnames
 EXECUTE pg_catalog_query
 ----
 seqrelid  seqtypid  seqstart  seqincrement  seqmax               seqmin  seqcache  seqcycle
-67        20        1         1             9223372036854775807  1       1         false
+121       20        1         1             9223372036854775807  1       1         false
 
 statement ok
 USE test
@@ -1134,7 +1146,7 @@ PREPARE b AS OPT PLAN '
   (OrderingChoice "+str")
 )'
 
-query IT
+query IT nosort
 EXECUTE b
 ----
 5  five
@@ -1164,21 +1176,21 @@ PREPARE e AS OPT PLAN '
   (NoOrdering)
 )'
 
-query T
+query T nosort
 EXECUTE e
 ----
 select
  ├── columns: k:1 str:2
  ├── immutable
- ├── stats: [rows=333.333333]
- ├── cost: 1074.45
+ ├── stats: [rows=333.3333]
+ ├── cost: 1118.85
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── prune: (2)
  ├── scan t2
  │    ├── columns: k:1 str:2
  │    ├── stats: [rows=1000]
- │    ├── cost: 1064.42
+ │    ├── cost: 1108.82
  │    ├── key: (1)
  │    ├── fd: (1)-->(2)
  │    └── prune: (1,2)
@@ -1222,15 +1234,19 @@ PREPARE rcc(string) AS SELECT $1::REGCLASS::OID
 query O
 EXECUTE rcc('t')
 ----
-53
+106
 
 user root
 
-# Regression test for #46217. Histogram type doesn't match column type.
-statement ok
-CREATE TABLE ts (d DATE PRIMARY KEY, x INT);
 
+user root
+
+# Regression test for #46217. Test that we cannot inject a histogram type that
+# doesn't match the column type.
 statement ok
+CREATE TABLE ts (d DATE PRIMARY KEY, x INT)
+
+statement error pq: histogram for table ts column d created_at 2020-03-24 15:34:22\.863634\+00:00 does not match column type DATE: TIMESTAMP
 ALTER TABLE ts INJECT STATISTICS '[
   {
     "columns": ["d"],
@@ -1255,13 +1271,7 @@ ALTER TABLE ts INJECT STATISTICS '[
     "null_count": 0,
     "row_count": 100000
   }
-]';
-
-statement ok
-PREPARE q AS DELETE FROM ts WHERE ts.d <= $1
-
-statement ok
-EXECUTE q ('2020-03-25')
+]'
 
 # Test that if we replace a view the cached plan is invalidated.
 statement ok
@@ -1289,7 +1299,7 @@ PREPARE a1 AS SELECT * FROM t3 FOR UPDATE
 statement ok
 BEGIN READ ONLY
 
-statement error cannot execute FOR UPDATE in a read-only transaction
+statement error cannot execute SELECT FOR UPDATE in a read-only transaction
 EXECUTE a1
 
 statement ok
@@ -1304,7 +1314,7 @@ PREPARE a1 AS SELECT * FROM t3 FOR NO KEY UPDATE
 statement ok
 BEGIN READ ONLY
 
-statement error cannot execute FOR NO KEY UPDATE in a read-only transaction
+statement error cannot execute SELECT FOR NO KEY UPDATE in a read-only transaction
 EXECUTE a1
 
 statement ok
@@ -1319,7 +1329,7 @@ PREPARE a1 AS SELECT * FROM t3 FOR SHARE
 statement ok
 BEGIN READ ONLY
 
-statement error cannot execute FOR SHARE in a read-only transaction
+statement error cannot execute SELECT FOR SHARE in a read-only transaction
 EXECUTE a1
 
 statement ok
@@ -1334,7 +1344,7 @@ PREPARE a1 AS SELECT * FROM t3 FOR KEY SHARE
 statement ok
 BEGIN READ ONLY
 
-statement error cannot execute FOR KEY SHARE in a read-only transaction
+statement error cannot execute SELECT FOR KEY SHARE in a read-only transaction
 EXECUTE a1
 
 statement ok
@@ -1390,3 +1400,324 @@ PREPARE q64765 as SELECT * FROM t64765 WHERE x = $1 AND y = $2
 
 statement ok
 EXECUTE q64765(1, 1)
+
+# Regression test for #81315.
+statement ok
+CREATE TABLE t81315 (a DECIMAL NOT NULL PRIMARY KEY, b INT);
+PREPARE q81315 AS SELECT * FROM t81315 WHERE a = $1::INT8;
+INSERT INTO t81315 VALUES (1, 100), (2, 200)
+
+query TI
+SELECT * FROM t81315 WHERE a = 1
+----
+1  100
+
+query TI
+EXECUTE q81315 (1)
+----
+1  100
+
+statement ok
+CREATE TABLE t81315_2 (
+  k INT PRIMARY KEY,
+  a INT
+);
+PREPARE q81315_2 AS SELECT * FROM t81315_2 WHERE k = $1;
+INSERT INTO t81315_2 VALUES (1, 1)
+
+query II
+EXECUTE q81315_2(1::DECIMAL)
+----
+1  1
+
+subtest possible_mismatch_num_types
+
+statement ok
+PREPARE args_test_many(int, int) as select $1
+
+query I
+EXECUTE args_test_many(1, 2)
+----
+1
+
+query error wrong number of parameters for prepared statement "args_test_many": expected 2, got 1
+EXECUTE args_test_many(1)
+
+statement ok
+PREPARE args_test_few(int) as select $1, $2::int
+
+query II
+EXECUTE args_test_few(1, 2)
+----
+1  2
+
+query error wrong number of parameters for prepared statement "args_test_few": expected 2, got 1
+EXECUTE args_test_few(1)
+
+statement ok
+DROP TABLE IF EXISTS t;
+
+statement ok
+CREATE TABLE t (x int, y varchar(10), z int2);
+
+statement ok
+PREPARE args_deduce_type(int, int, int, int) AS INSERT INTO t VALUES ($1, $2, $3);
+
+statement ok
+EXECUTE args_deduce_type(1,2,3,4);
+EXECUTE args_deduce_type('1','2',3,'4');
+
+query ITI rowsort
+SELECT * FROM t;
+----
+1  2  3
+1  2  3
+
+statement ok
+PREPARE args_deduce_type_1(int) AS SELECT $1::int, $2::varchar(10), $3::varchar(20);
+
+query ITT
+EXECUTE args_deduce_type_1(1,10,100);
+----
+1  10  100
+
+# Test that prepared_statements_cache_size functions correctly.
+subtest prepared_statements_cache_size
+
+statement ok
+DEALLOCATE ALL
+
+# With a very small cache, all prepared statements except the most recent one
+# should be automatically deallocated.
+statement ok
+SET prepared_statements_cache_size = '1 KiB'
+
+statement ok
+PREPARE pscs01 AS SELECT $1::bool, 1
+
+statement ok
+PREPARE pscs02 AS SELECT $1::float, 2
+
+statement ok
+PREPARE pscs03 AS SELECT $1::decimal, 3
+
+statement ok
+PREPARE pscs04 AS SELECT $1::string, 4
+
+statement ok
+PREPARE pscs05 AS SELECT $1::json, 5
+
+statement ok
+PREPARE pscs06 AS SELECT $1::int, 6
+
+query T
+SELECT name FROM pg_catalog.pg_prepared_statements ORDER BY name
+----
+pscs06
+
+query II
+EXECUTE pscs06(6)
+----
+6  6
+
+statement error prepared statement \"pscs05\" does not exist
+EXECUTE pscs05(5)
+
+statement error prepared statement \"pscs04\" does not exist
+EXECUTE pscs04(4)
+
+statement error prepared statement \"pscs03\" does not exist
+EXECUTE pscs03(3)
+
+statement error prepared statement \"pscs02\" does not exist
+EXECUTE pscs02(2)
+
+statement error prepared statement \"pscs01\" does not exist
+EXECUTE pscs01(1)
+
+# We should automatically deallocate old prepared statements as the cache grows.
+statement ok
+SET prepared_statements_cache_size = '20 KiB'
+
+statement ok
+PREPARE pscs07 AS SELECT $1::date, 7
+
+statement ok
+PREPARE pscs08 AS SELECT $1::timestamp, 8
+
+statement ok
+PREPARE pscs09 AS SELECT $1::bool, 9
+
+statement ok
+PREPARE pscs10 AS SELECT $1::bytes, 10
+
+statement ok
+PREPARE pscs11 AS SELECT $1::smallint, 11
+
+statement ok
+PREPARE pscs12 AS SELECT $1::time, 12
+
+statement ok
+PREPARE pscs13 AS SELECT $1::bigint, 13
+
+query T
+SELECT name FROM pg_catalog.pg_prepared_statements ORDER BY name
+----
+pscs09
+pscs10
+pscs11
+pscs12
+pscs13
+
+statement ok
+DEALLOCATE pscs10
+
+# Now we should have room for one more.
+statement ok
+PREPARE pscs14 AS SELECT $1::int, 14
+
+query T
+SELECT name FROM pg_catalog.pg_prepared_statements ORDER BY name
+----
+pscs09
+pscs11
+pscs12
+pscs13
+pscs14
+
+# Executing a prepared statement should move it to the front of the LRU list.
+query II
+EXECUTE pscs11(11)
+----
+11  11
+
+statement ok
+PREPARE pscs15 AS SELECT $1::timetz, 15
+
+statement ok
+PREPARE pscs16 AS SELECT $1::float, 16
+
+statement ok
+PREPARE pscs17 AS SELECT $1::interval, 17
+
+query T
+SELECT name FROM pg_catalog.pg_prepared_statements ORDER BY name
+----
+pscs11
+pscs14
+pscs15
+pscs16
+pscs17
+
+# Retrying a transaction should rewind the LRU list after each retry even if
+# some prepared statements were evicted. (We use a sequence to break out of the
+# retry loop.)
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE TABLE prep_stmts (which INT, name STRING)
+
+statement ok
+BEGIN;
+INSERT INTO prep_stmts SELECT 1, name FROM pg_catalog.pg_prepared_statements;
+PREPARE pscs18 AS SELECT $1::inet, 18;
+EXECUTE pscs11(11);
+PREPARE pscs19 AS SELECT $1::string, 19;
+INSERT INTO prep_stmts SELECT 2, name FROM pg_catalog.pg_prepared_statements;
+SELECT IF(nextval('s') <= 3, crdb_internal.force_retry('1 hour'), 0);
+COMMIT
+
+# Validate that the transaction was actually tried multiple times.
+query I
+SELECT currval('s')
+----
+4
+
+# Validate that the LRU list was correct before and after the PREPAREs, even
+# after multiple retries.
+query IT
+SELECT which, name FROM prep_stmts ORDER BY which, name
+----
+1  pscs11
+1  pscs14
+1  pscs15
+1  pscs16
+1  pscs17
+2  pscs11
+2  pscs16
+2  pscs17
+2  pscs18
+2  pscs19
+
+statement ok
+DROP TABLE prep_stmts
+
+statement ok
+DROP SEQUENCE s
+
+statement ok
+DEALLOCATE ALL
+
+statement ok
+RESET prepared_statements_cache_size
+
+statement error EXPLAIN ANALYZE can only be used as a top-level statement
+PREPARE p AS EXPLAIN ANALYZE SELECT 1
+
+# Regression test for #114867 to make sure that a statement that uses an enum
+# can be re-prepared after a schema change.
+subtest reprepare_statement_with_enum
+
+statement ok
+CREATE TYPE color AS ENUM ('red', 'blue', 'green');
+CREATE TABLE test_114867 (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    colors color[] DEFAULT ARRAY[]::color[]
+)
+
+statement ok
+PREPARE s_114867 AS INSERT INTO test_114867(colors) VALUES (ARRAY[$1::text]::color[]);
+EXECUTE s_114867('red')
+
+statement ok
+TRUNCATE TABLE test_114867 CASCADE
+
+statement ok
+EXECUTE s_114867('red')
+
+query T
+SELECT colors FROM test_114867
+----
+{red}
+
+subtest prepare_call
+
+# CALL statements cannot be prepared.
+statement ok
+CREATE PROCEDURE foo(x INT) LANGUAGE SQL AS $$
+  SELECT 1;
+  SELECT 2;
+$$;
+
+statement error pgcode 42601 syntax error
+PREPARE bar AS CALL foo(0);
+
+statement error pgcode 42601 syntax error
+PREPARE bar AS CALL foo($1);
+
+subtest end
+
+# Regression test for #126288 to make sure that zone configurations in
+# prepared statements work as expected.
+subtest zone_config
+
+statement ok
+PREPARE p AS
+ALTER DATABASE test CONFIGURE ZONE USING gc.ttlseconds = $1
+
+statement ok
+EXECUTE p(120)
+
+subtest end

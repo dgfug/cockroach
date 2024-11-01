@@ -1,19 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package certmgr
 
 import (
 	"context"
 	"crypto/tls"
-	"io/ioutil"
+	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -50,13 +45,13 @@ func (fc *FileCert) Reload(ctx context.Context) {
 		return
 	}
 
-	certBytes, err := ioutil.ReadFile(fc.certFile)
+	certBytes, err := os.ReadFile(fc.certFile)
 	if err != nil {
 		fc.err = errors.Wrapf(err, "could not reload cert file %s", fc.certFile)
 		return
 	}
 
-	keyBytes, err := ioutil.ReadFile(fc.keyFile)
+	keyBytes, err := os.ReadFile(fc.keyFile)
 	if err != nil {
 		fc.err = errors.Wrapf(err, "could not reload cert key file %s", fc.keyFile)
 		return

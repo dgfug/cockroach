@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord_test
 
@@ -18,15 +13,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 // This file contains contains integration tests that don't fit anywhere else.
@@ -71,15 +67,15 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
 				DisableSplitQueue: true,
-				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					// We'll recognize the attempt to commit our transaction and store the
 					// respective command id.
 					ba := args.Req
-					etReq, ok := ba.GetArg(roachpb.EndTxn)
+					etReq, ok := ba.GetArg(kvpb.EndTxn)
 					if !ok {
 						return nil
 					}
-					if !etReq.(*roachpb.EndTxnRequest).Commit {
+					if !etReq.(*kvpb.EndTxnRequest).Commit {
 						return nil
 					}
 					v := txnID.Load()
@@ -92,7 +88,7 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 					commitCmdID.Store(args.CmdID)
 					return nil
 				},
-				TestingApplyFilter: func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+				TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 					// We'll trap the processing of the commit command and return an error
 					// for it.
 					v := commitCmdID.Load()
@@ -104,15 +100,15 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 						if illegalLeaseIndex {
 							illegalLeaseIndex = false
 							// NB: 1 is proposalIllegalLeaseIndex.
-							return 1, roachpb.NewErrorf("test injected err (illegal lease index)")
+							return 1, kvpb.NewErrorf("test injected err (illegal lease index)")
 						}
 						// NB: 0 is proposalNoReevaluation.
-						return 0, roachpb.NewErrorf("test injected err")
+						return 0, kvpb.NewErrorf("test injected err")
 					}
 					return 0, nil
 				},
 				TxnWaitKnobs: txnwait.TestingKnobs{
-					OnPusherBlocked: func(ctx context.Context, push *roachpb.PushTxnRequest) {
+					OnPusherBlocked: func(ctx context.Context, push *kvpb.PushTxnRequest) {
 						// We'll trap a reader entering the wait queue for our txn.
 						v := txnID.Load()
 						if v == nil {
@@ -177,9 +173,8 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 	<-readerBlocked
 	<-readerBlocked
 
-	if err := txn.CommitOrCleanup(ctx); !testutils.IsError(err, "test injected err") {
-		t.Fatalf("expected injected err, got: %v", err)
-	}
+	require.ErrorContains(t, txn.Commit(ctx), "test injected err", "expected injected error")
+	require.NoError(t, txn.Rollback(ctx))
 	// Wait for the txn wait queue to be pinged and check the status.
 	if status := <-txnUpdate; status != roachpb.ABORTED {
 		t.Fatalf("expected the wait queue to be updated with an Aborted txn, instead got: %s", status)

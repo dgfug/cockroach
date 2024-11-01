@@ -1,19 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { TimeScale } from "@cockroachlabs/cluster-ui";
+import isString from "lodash/isString";
+import map from "lodash/map";
 import React from "react";
 import { connect } from "react-redux";
-import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
+import { createSelector } from "reselect";
 
+import { PayloadAction } from "src/interfaces/action";
 import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
 import {
   hoverOff as hoverOffAction,
@@ -21,22 +19,30 @@ import {
   hoverStateSelector,
   HoverState,
 } from "src/redux/hover";
-import { NodesSummary, nodesSummarySelector } from "src/redux/nodes";
+import {
+  nodeDisplayNameByIDSelector,
+  nodeIDsStringifiedSelector,
+  selectStoreIDsByNodeID,
+  nodeIDsSelector,
+} from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
+import { setGlobalTimeScaleAction } from "src/redux/statements";
+import { TimeWindow, setMetricsFixedWindow } from "src/redux/timeScale";
 import { nodeIDAttr } from "src/util/constants";
+import { getMatchParamByName } from "src/util/query";
 import {
   GraphDashboardProps,
   storeIDsForNode,
 } from "src/views/cluster/containers/nodeGraphs/dashboards/dashboardUtils";
-import TimeScaleDropdown from "src/views/cluster/containers/timescale";
+import TimeScaleDropdown from "src/views/cluster/containers/timeScaleDropdownWithSearchParams";
 import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
 import {
   PageConfig,
   PageConfigItem,
 } from "src/views/shared/components/pageconfig";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
+
 import messagesDashboard from "./messages";
-import { getMatchParamByName } from "src/util/query";
 
 interface NodeGraphsOwnProps {
   refreshNodes: typeof refreshNodes;
@@ -45,8 +51,18 @@ interface NodeGraphsOwnProps {
   hoverOff: typeof hoverOffAction;
   nodesQueryValid: boolean;
   livenessQueryValid: boolean;
-  nodesSummary: NodesSummary;
+  nodeDropdownOptions: ReturnType<
+    typeof nodeDropdownOptionsSelector.resultFunc
+  >;
+  storeIDsByNodeID: ReturnType<typeof selectStoreIDsByNodeID.resultFunc>;
   hoverState: HoverState;
+  setMetricsFixedWindow: (tw: TimeWindow) => PayloadAction<TimeWindow>;
+  setTimeScale: (ts: TimeScale) => PayloadAction<TimeScale>;
+
+  nodeIds: string[];
+  nodeDisplayNameByID: ReturnType<
+    typeof nodeDisplayNameByIDSelector.resultFunc
+  >;
 }
 
 type RaftMessagesProps = NodeGraphsOwnProps & RouteComponentProps;
@@ -56,21 +72,6 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
    * Selector to compute node dropdown options from the current node summary
    * collection.
    */
-  private nodeDropdownOptions = createSelector(
-    (summary: NodesSummary) => summary.nodeStatuses,
-    (summary: NodesSummary) => summary.nodeDisplayNameByID,
-    (nodeStatuses, nodeDisplayNameByID): DropdownOption[] => {
-      const base = [{ value: "", label: "Cluster" }];
-      return base.concat(
-        _.map(nodeStatuses, ns => {
-          return {
-            value: ns.desc.node_id.toString(),
-            label: nodeDisplayNameByID[ns.desc.node_id],
-          };
-        }),
-      );
-    },
-  );
 
   refresh(props = this.props) {
     if (!props.nodesQueryValid) {
@@ -83,7 +84,7 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
 
   setClusterPath(nodeID: string) {
     const push = this.props.history.push;
-    if (!_.isString(nodeID) || nodeID === "") {
+    if (!isString(nodeID) || nodeID === "") {
       push("/raft/messages/all/");
     } else {
       push(`/raft/messages/node/${nodeID}`);
@@ -103,7 +104,15 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
   }
 
   render() {
-    const { match, nodesSummary, hoverState, hoverOn, hoverOff } = this.props;
+    const {
+      match,
+      hoverState,
+      hoverOn,
+      hoverOff,
+      storeIDsByNodeID,
+      nodeIds,
+      nodeDisplayNameByID,
+    } = this.props;
 
     const selectedNode = getMatchParamByName(match, nodeIDAttr) || "";
     const nodeSources = selectedNode !== "" ? [selectedNode] : null;
@@ -112,13 +121,13 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
     // node in the cluster using the nodeIDs collection. However, if a specific
     // node is already selected, these per-node graphs should only display data
     // only for the selected node.
-    const nodeIDs = nodeSources ? nodeSources : nodesSummary.nodeIDs;
+    const nodeIDs = nodeSources ? nodeSources : nodeIds;
 
     // If a single node is selected, we need to restrict the set of stores
     // queried for per-store metrics (only stores that belong to that node will
     // be queried).
     const storeSources = nodeSources
-      ? storeIDsForNode(nodesSummary, nodeSources[0])
+      ? storeIDsForNode(storeIDsByNodeID, nodeSources[0])
       : null;
 
     // tooltipSelection is a string used in tooltips to reference the currently
@@ -131,20 +140,27 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
 
     const dashboardProps: GraphDashboardProps = {
       nodeIDs,
-      nodesSummary,
       nodeSources,
       storeSources,
       tooltipSelection,
+      nodeDisplayNameByID,
+      storeIDsByNodeID,
     };
 
     // Generate graphs for the current dashboard, wrapping each one in a
     // MetricsDataProvider with a unique key.
     const graphs = messagesDashboard(dashboardProps);
-    const graphComponents = _.map(graphs, (graph, idx) => {
+    const graphComponents = map(graphs, (graph, idx) => {
       const key = `nodes.raftMessages.${idx}`;
       return (
         <div key={key}>
-          <MetricsDataProvider id={key}>
+          <MetricsDataProvider
+            id={key}
+            key={key}
+            setMetricsFixedWindow={this.props.setMetricsFixedWindow}
+            setTimeScale={this.props.setTimeScale}
+            history={this.props.history}
+          >
             {React.cloneElement(graph, { hoverOn, hoverOff, hoverState })}
           </MetricsDataProvider>
         </div>
@@ -157,7 +173,7 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
           <PageConfigItem>
             <Dropdown
               title="Graph"
-              options={this.nodeDropdownOptions(this.props.nodesSummary)}
+              options={this.props.nodeDropdownOptions}
               selected={selectedNode}
               onChange={this.nodeChange}
             />
@@ -174,12 +190,30 @@ export class RaftMessages extends React.Component<RaftMessagesProps> {
   }
 }
 
+const nodeDropdownOptionsSelector = createSelector(
+  nodeIDsSelector,
+  nodeDisplayNameByIDSelector,
+  (nodeIds, nodeDisplayNameByID): DropdownOption[] => {
+    const base = [{ value: "", label: "Cluster" }];
+    return base.concat(
+      map(nodeIds, id => {
+        return {
+          value: id.toString(),
+          label: nodeDisplayNameByID[id],
+        };
+      }),
+    );
+  },
+);
+
 const mapStateToProps = (state: AdminUIState) => ({
-  // RootState contains declaration for whole state
-  nodesSummary: nodesSummarySelector(state),
   nodesQueryValid: state.cachedData.nodes.valid,
   livenessQueryValid: state.cachedData.nodes.valid,
   hoverState: hoverStateSelector(state),
+  nodeIds: nodeIDsStringifiedSelector(state),
+  storeIDsByNodeID: selectStoreIDsByNodeID(state),
+  nodeDropdownOptions: nodeDropdownOptionsSelector(state),
+  nodeDisplayNameByID: nodeDisplayNameByIDSelector(state),
 });
 
 const mapDispatchToProps = {
@@ -187,6 +221,8 @@ const mapDispatchToProps = {
   refreshLiveness,
   hoverOn: hoverOnAction,
   hoverOff: hoverOffAction,
+  setMetricsFixedWindow: setMetricsFixedWindow,
+  setTimeScale: setGlobalTimeScaleAction,
 };
 
 export default withRouter(

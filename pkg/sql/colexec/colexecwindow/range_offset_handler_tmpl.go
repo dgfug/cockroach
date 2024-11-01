@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -24,17 +19,16 @@ package colexecwindow
 import (
 	"context"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -95,8 +89,8 @@ type rangeOffsetHandler interface {
 }
 
 func newRangeOffsetHandler(
-	evalCtx *tree.EvalContext,
-	datumAlloc *rowenc.DatumAlloc,
+	evalCtx *eval.Context,
+	datumAlloc *tree.DatumAlloc,
 	bound *execinfrapb.WindowerSpec_Frame_Bound,
 	ordColType *types.T,
 	ordColAsc, isStart bool,
@@ -119,14 +113,16 @@ func newRangeOffsetHandler(
 						op := &_OP_STRING{
 							offset: decodeOffset(datumAlloc, ordColType, bound.TypedOffset).(_OFFSET_GOTYPE),
 						}
+						// {{if eq .VecMethod "Datum"}}
 						// {{if .BinOpIsPlus}}
-						binOp, _, _ := tree.WindowFrameRangeOps{}.LookupImpl(
+						binOp, _, _ := eval.WindowFrameRangeOps{}.LookupImpl(
 							ordColType, getOffsetType(ordColType))
 						// {{else}}
-						_, binOp, _ := tree.WindowFrameRangeOps{}.LookupImpl(
+						_, binOp, _ := eval.WindowFrameRangeOps{}.LookupImpl(
 							ordColType, getOffsetType(ordColType))
 						// {{end}}
-						op.overloadHelper = execgen.OverloadHelper{BinFn: binOp.Fn, EvalCtx: evalCtx}
+						op.overloadHelper = colexecutils.BinaryOverloadHelper{BinOp: binOp.EvalOp, EvalCtx: evalCtx}
+						// {{end}}
 						return op
 						// {{end}}
 					}
@@ -145,10 +141,9 @@ func newRangeOffsetHandler(
 // rangeOffsetHandlerBase extracts common fields and methods of the
 // rangeOffsetHandler utility operators.
 type rangeOffsetHandlerBase struct {
-	storedCols     *colexecutils.SpillingBuffer
-	ordColIdx      int
-	peersColIdx    int
-	overloadHelper execgen.OverloadHelper
+	storedCols  *colexecutils.SpillingBuffer
+	ordColIdx   int
+	peersColIdx int
 }
 
 // {{range .}}
@@ -161,6 +156,9 @@ type rangeOffsetHandlerBase struct {
 // the start or end bound for each row when in RANGE mode with an offset.
 type _OP_STRING struct {
 	rangeOffsetHandlerBase
+	// {{if eq .VecMethod "Datum"}}
+	overloadHelper colexecutils.BinaryOverloadHelper
+	// {{end}}
 	offset _OFFSET_GOTYPE
 }
 
@@ -170,16 +168,16 @@ var _ rangeOffsetHandler = &_OP_STRING{}
 // location of the last bound index. It is called for the first row of each
 // peer group. For example:
 //
-//    ord col
-//    -------
-//       1
-//       2
-//       2
-//       3
+//	 ord col
+//	 -------
+//	    1
+//	    2
+//	    2
+//	    3
 //
-//   currRow: 1
-//   lastIdx: 0
-//   offset:  1
+//	currRow: 1
+//	lastIdx: 0
+//	offset:  1
 //
 // Assume we are calculating the end index for an ascending column. In this
 // case, the value at the current row is '2' and the offset is '1' unit. So,
@@ -188,17 +186,23 @@ var _ rangeOffsetHandler = &_OP_STRING{}
 // the partition, whichever comes first. In this case, the returned index would
 // be '4' to indicate that the end index is the end of the partition.
 func (h *_OP_STRING) getIdx(ctx context.Context, currRow, lastIdx int) (idx int) {
-	// In order to inline the templated code of overloads, we need to have a
-	// "_overloadHelper" local variable of type "overloadHelper". This is
-	// necessary when dealing with Datum columns.
+	// {{if eq .VecMethod "Datum"}}
+	// {{/*
+	//     In order to inline the templated code of the binary overloads
+	//     operating on datums, we need to have a `_overloadHelper` local
+	//     variable of type `colexecutils.BinaryOverloadHelper`. This is
+	//     necessary when dealing with Time and TimeTZ columns since they aren't
+	//     yet handled natively.
+	// */}}
 	_overloadHelper := h.overloadHelper
-	_ = _overloadHelper // Avoid unused variable warnings.
+	_ctx := ctx
+	// {{end}}
 
 	if lastIdx >= h.storedCols.Length() {
 		return lastIdx
 	}
 
-	var vec coldata.Vec
+	var vec *coldata.Vec
 	var vecIdx, n int
 	vec, vecIdx, _ = h.storedCols.GetVecWithTuple(ctx, h.ordColIdx, currRow)
 
@@ -284,7 +288,7 @@ func (h *_OP_STRING) getIdx(ctx context.Context, currRow, lastIdx int) (idx int)
 	// Scan to the next peer group and then compare to the value indicated by
 	// the offset. If the comparison fails, scan again to the next peer group
 	// and repeat.
-	var peersVec coldata.Vec
+	var peersVec *coldata.Vec
 	for {
 		if idx >= h.storedCols.Length() {
 			break
@@ -360,7 +364,7 @@ func (b *rangeOffsetHandlerBase) startPartition(
 
 // decodeOffset decodes the given encoded offset into the given type.
 func decodeOffset(
-	datumAlloc *rowenc.DatumAlloc, orderColType *types.T, typedOffset []byte,
+	datumAlloc *tree.DatumAlloc, orderColType *types.T, typedOffset []byte,
 ) interface{} {
 	offsetType := getOffsetType(orderColType)
 	datum, err := execinfra.DecodeDatum(datumAlloc, offsetType, typedOffset)

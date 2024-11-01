@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package querycache
 
@@ -56,9 +51,6 @@ type CachedData struct {
 	// PrepareMetadata is set for prepare queries. In this case the memo contains
 	// unassigned placeholders. For non-prepared queries, it is nil.
 	PrepareMetadata *PrepareMetadata
-	// IsCorrelated memoizes whether the query contained correlated
-	// subqueries during planning (prior to de-correlation).
-	IsCorrelated bool
 }
 
 func (cd *CachedData) memoryEstimate() int64 {

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
@@ -16,19 +11,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/errors"
 )
 
 // IterateTransactionStats implements sqlstats.Provider interface.
 func (s *PersistedSQLStats) IterateTransactionStats(
-	ctx context.Context, options *sqlstats.IteratorOptions, visitor sqlstats.TransactionVisitor,
+	ctx context.Context, options sqlstats.IteratorOptions, visitor sqlstats.TransactionVisitor,
 ) (err error) {
 	// We override the sorting options since otherwise we would need to implement
 	// sorted and unsorted merge separately. We can revisit this decision if
@@ -39,11 +33,11 @@ func (s *PersistedSQLStats) IterateTransactionStats(
 
 	// We compute the current aggregated_ts so that the in-memory stats can be
 	// merged with the persisted stats.
-	curAggTs := s.computeAggregatedTs()
-	aggInterval := SQLStatsFlushInterval.Get(&s.cfg.Settings.SV)
+	curAggTs := s.ComputeAggregatedTs()
+	aggInterval := s.GetAggregationInterval()
 	memIter := newMemTxnStatsIterator(s.SQLStats, options, curAggTs, aggInterval)
 
-	var persistedIter sqlutil.InternalRows
+	var persistedIter isql.Rows
 	var colCnt int
 	persistedIter, colCnt, err = s.persistedTxnStatsIter(ctx, options)
 	if err != nil {
@@ -79,27 +73,25 @@ func (s *PersistedSQLStats) IterateTransactionStats(
 }
 
 func (s *PersistedSQLStats) persistedTxnStatsIter(
-	ctx context.Context, options *sqlstats.IteratorOptions,
-) (iter sqlutil.InternalRows, expectedColCnt int, err error) {
+	ctx context.Context, options sqlstats.IteratorOptions,
+) (iter isql.Rows, expectedColCnt int, err error) {
 	query, expectedColCnt := s.getFetchQueryForTxnStatsTable(options)
-
-	persistedIter, err := s.cfg.InternalExecutor.QueryIteratorEx(
+	exec := s.cfg.DB.Executor()
+	if iter, err = exec.QueryIteratorEx(
 		ctx,
 		"read-txn-stats",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		query,
-	)
-
-	if err != nil {
+	); err != nil {
 		return nil /* iter */, 0 /* expectedColCnt */, err
 	}
 
-	return persistedIter, expectedColCnt, err
+	return iter, expectedColCnt, err
 }
 
 func (s *PersistedSQLStats) getFetchQueryForTxnStatsTable(
-	options *sqlstats.IteratorOptions,
+	options sqlstats.IteratorOptions,
 ) (query string, colCnt int) {
 	selectedColumns := []string{
 		"aggregated_ts",
@@ -119,11 +111,7 @@ FROM
 	system.transaction_statistics
 %[2]s`
 
-	followerReadClause := "AS OF SYSTEM TIME follower_read_timestamp()"
-
-	if s.cfg.Knobs != nil {
-		followerReadClause = s.cfg.Knobs.AOSTClause
-	}
+	followerReadClause := s.cfg.Knobs.GetAOSTClause()
 
 	query = fmt.Sprintf(query, strings.Join(selectedColumns, ","), followerReadClause)
 
@@ -141,8 +129,8 @@ FROM
 	return query, len(selectedColumns)
 }
 
-func rowToTxnStats(row tree.Datums) (*roachpb.CollectedTransactionStatistics, error) {
-	var stats roachpb.CollectedTransactionStatistics
+func rowToTxnStats(row tree.Datums) (*appstatspb.CollectedTransactionStatistics, error) {
+	var stats appstatspb.CollectedTransactionStatistics
 	var err error
 
 	stats.AggregatedTs = tree.MustBeDTimestampTZ(row[0]).Time
@@ -151,7 +139,7 @@ func rowToTxnStats(row tree.Datums) (*roachpb.CollectedTransactionStatistics, er
 	if err != nil {
 		return nil, err
 	}
-	stats.TransactionFingerprintID = roachpb.TransactionFingerprintID(value)
+	stats.TransactionFingerprintID = appstatspb.TransactionFingerprintID(value)
 
 	stats.App = string(tree.MustBeDString(row[2]))
 

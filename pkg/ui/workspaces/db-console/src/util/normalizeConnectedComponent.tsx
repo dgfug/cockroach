@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React, { ExoticComponent } from "react";
 
@@ -18,6 +13,6 @@ import React, { ExoticComponent } from "react";
  * > "However, we have no way of telling the JSX parser that it's a JSX element type or its props other than
  * > by pretending to be a normal component."
  * */
-export const normalizeConnectedComponent = (
-  ConnectedComponent: ExoticComponent,
-) => (props: React.ComponentProps<any>) => <ConnectedComponent {...props} />;
+export const normalizeConnectedComponent =
+  (ConnectedComponent: ExoticComponent) =>
+  (props: React.ComponentProps<any>) => <ConnectedComponent {...props} />;

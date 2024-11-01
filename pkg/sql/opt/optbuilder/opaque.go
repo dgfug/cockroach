@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -16,13 +11,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
 
 // BuildOpaqueFn is a handler for building the metadata for an opaque statement.
 type BuildOpaqueFn func(
-	context.Context, *tree.SemaContext, *tree.EvalContext, tree.Statement,
+	context.Context, *tree.SemaContext, *eval.Context, tree.Statement,
 ) (opt.OpaqueMetadata, error)
 
 // OpaqueType indicates whether an opaque statement can mutate data or change

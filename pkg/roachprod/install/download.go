@@ -1,35 +1,38 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
 import (
+	"context"
 	_ "embed" // required for go:embed
 	"fmt"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/local"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 )
 
 const (
-	gcsCacheBaseURL = "https://storage.googleapis.com/cockroach-fixtures/tools/"
+	// We store downloadable content in a public bucket to allow for easy curling.
+	gcsCacheBaseURL = "https://storage.googleapis.com/cockroach-test-artifacts"
 )
 
 //go:embed scripts/download.sh
 var downloadScript string
 
 // Download downloads the remote resource, preferring a GCS cache if available.
-func Download(c *SyncedCluster, sourceURLStr string, sha string, dest string) error {
+func Download(
+	ctx context.Context,
+	l *logger.Logger,
+	c *SyncedCluster,
+	sourceURLStr string,
+	sha string,
+	dest string,
+) error {
 	// https://example.com/foo/bar.txt
 	sourceURL, err := url.Parse(sourceURLStr)
 	if err != nil {
@@ -65,8 +68,8 @@ func Download(c *SyncedCluster, sourceURLStr string, sha string, dest string) er
 		sha,
 		dest,
 	)
-	if err := c.Run(os.Stdout, os.Stderr,
-		downloadNodes,
+	if err := c.Run(ctx, l, l.Stdout, l.Stderr,
+		WithNodes(downloadNodes),
 		fmt.Sprintf("downloading %s", basename),
 		downloadCmd,
 	); err != nil {
@@ -76,9 +79,9 @@ func Download(c *SyncedCluster, sourceURLStr string, sha string, dest string) er
 	// If we are local and the destination is relative, then copy the file from
 	// the download node to the other nodes.
 	if c.IsLocal() && !filepath.IsAbs(dest) {
-		src := filepath.Join(local.VMDir(c.Name, downloadNodes[0]), dest)
+		src := filepath.Join(c.localVMDir(downloadNodes[0]), dest)
 		cpCmd := fmt.Sprintf(`cp "%s" "%s"`, src, dest)
-		return c.Run(os.Stdout, os.Stderr, c.Nodes[1:], "copying to remaining nodes", cpCmd)
+		return c.Run(ctx, l, l.Stdout, l.Stderr, WithNodes(c.Nodes[1:]), "copying to remaining nodes", cpCmd)
 	}
 
 	return nil

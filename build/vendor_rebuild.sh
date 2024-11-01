@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2020 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -Eeoux pipefail
 
 TMP_VENDOR_DIR=.vendor.tmp.$(date +"%Y-%m-%d.%H%M%S")
@@ -13,8 +19,11 @@ function restore() {
   fi
 }
 
-mv vendor $TMP_VENDOR_DIR
+if [ -d vendor ]; then
+    mv vendor $TMP_VENDOR_DIR
+fi
+go mod download
 go mod vendor
 modvendor -copy="**/*.c **/*.h **/*.proto"  -include 'github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis/google/api,github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis/google/rpc,github.com/prometheus/client_model'
-mv $TMP_VENDOR_DIR/.git vendor/.git
+
 rm -rf $TMP_VENDOR_DIR

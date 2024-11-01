@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package covering
 
@@ -16,7 +11,6 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,7 +19,8 @@ func BenchmarkOverlapCoveringMerge(b *testing.B) {
 		name   string
 		inputs []Covering
 	}
-	rand.Seed(timeutil.Now().Unix())
+	//lint:ignore SA1019 deprecated
+	rand.Seed(0)
 
 	for _, numLayers := range []int{
 		1,      // single backup

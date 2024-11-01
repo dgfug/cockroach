@@ -1,27 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
 import (
+	"context"
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/distribution"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -37,7 +36,7 @@ type MatchedRuleFunc = norm.MatchedRuleFunc
 type AppliedRuleFunc = norm.AppliedRuleFunc
 
 // RuleSet efficiently stores an unordered set of RuleNames.
-type RuleSet = util.FastIntSet
+type RuleSet = intsets.Fast
 
 // Optimizer transforms an input expression tree into the logically equivalent
 // output expression tree with the lowest possible execution cost.
@@ -50,7 +49,9 @@ type RuleSet = util.FastIntSet
 // expression must provide. The optimizer will return an Expr over the output
 // expression tree with the lowest cost.
 type Optimizer struct {
-	evalCtx *tree.EvalContext
+	ctx           context.Context
+	evalCtx       *eval.Context
+	cancelChecker cancelchecker.CancelChecker
 
 	// f is the factory that creates the normalized expressions during the first
 	// optimization phase.
@@ -90,41 +91,78 @@ type Optimizer struct {
 	// It can be set via a call to the NotifyOnAppliedRule method.
 	appliedRule AppliedRuleFunc
 
-	// disabledRules is a set of rules that are not allowed to run, used for
-	// testing.
-	disabledRules RuleSet
-
 	// JoinOrderBuilder adds new join orderings to the memo.
 	jb JoinOrderBuilder
+
+	// rng is used to deterministically perturb costs and/or disable rules and/or
+	// determine the visibility (for this query) of a partially visible index.
+	rng *rand.Rand
+
+	// scratchSort is used to avoid repeated allocations during sort enforcement.
+	// It should be set to nil whenever the SortExpr is added to the memo so that
+	// a new scratch SortExpr will be allocated the next time it is requested, but
+	// otherwise can be reused (this happens when adding the sort does not produce
+	// a lower-cost expression). scratchSort should be accessed using
+	// getScratchSort to ensure that it is properly initialized.
+	scratchSort *memo.SortExpr
 }
+
+// maxGroupPasses is the maximum allowed number of optimization passes for any
+// single memo group. The groupState.passes field is incremented every time
+// optimizeGroup is called on the group. If a groupState's passes exceeds this
+// limit, there is likely a cycle in the memo where a path exists from a group
+// member's children back to the group member's group. To avoid stack overflows
+// that these memo cycles cause, the optimizer throws an internal error when
+// this limit is reached.
+const maxGroupPasses = 100_000
 
 // Init initializes the Optimizer with a new, blank memo structure inside. This
 // must be called before the optimizer can be used (or reused).
-func (o *Optimizer) Init(evalCtx *tree.EvalContext, catalog cat.Catalog) {
+func (o *Optimizer) Init(ctx context.Context, evalCtx *eval.Context, catalog cat.Catalog) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*o = Optimizer{
+		ctx:      ctx,
 		evalCtx:  evalCtx,
 		catalog:  catalog,
 		f:        o.f,
 		stateMap: make(map[groupStateKey]*groupState),
 	}
-	o.f.Init(evalCtx, catalog)
+	o.cancelChecker.Reset(ctx)
+	o.f.Init(ctx, evalCtx, catalog)
 	o.mem = o.f.Memo()
 	o.explorer.init(o)
-	o.defaultCoster.Init(evalCtx, o.mem, evalCtx.TestingKnobs.OptimizerCostPerturbation)
+
+	if seed := evalCtx.SessionData().TestingOptimizerRandomSeed; seed != 0 {
+		o.rng = rand.New(rand.NewSource(seed))
+	}
+	costPerturbation := evalCtx.TestingKnobs.OptimizerCostPerturbation
+	if p := evalCtx.SessionData().TestingOptimizerCostPerturbation; p != 0 {
+		// If non-zero, the setting TestingOptimizerCostPerturbation should
+		// override the equivalent testing knob. This is needed for use by the
+		// costfuzz roachtest.
+		costPerturbation = p
+	}
+	disableRuleProbability := evalCtx.TestingKnobs.DisableOptimizerRuleProbability
+	if p := evalCtx.SessionData().TestingOptimizerDisableRuleProbability; p != 0 {
+		// If non-zero, the setting TestingOptimizerDisableRuleProbability should
+		// override the equivalent testing knob. This is needed for use by the
+		// unoptimized-query-oracle roachtest.
+		disableRuleProbability = p
+	}
+	o.defaultCoster.Init(ctx, evalCtx, o.mem, costPerturbation, o.rng, o)
 	o.coster = &o.defaultCoster
-	if evalCtx.TestingKnobs.DisableOptimizerRuleProbability > 0 {
-		o.disableRules(evalCtx.TestingKnobs.DisableOptimizerRuleProbability)
+	if disableRuleProbability > 0 {
+		o.disableRulesRandom(disableRuleProbability)
 	}
 }
 
 // DetachMemo extracts the memo from the optimizer, and then re-initializes the
 // optimizer so that its reuse will not impact the detached memo. This method is
 // used to extract a read-only memo during the PREPARE phase.
-func (o *Optimizer) DetachMemo() *memo.Memo {
+func (o *Optimizer) DetachMemo(ctx context.Context) *memo.Memo {
 	detach := o.f.DetachMemo()
-	o.Init(o.evalCtx, o.catalog)
+	o.Init(ctx, o.evalCtx, o.catalog)
 	return detach
 }
 
@@ -196,6 +234,8 @@ func (o *Optimizer) Memo() *memo.Memo {
 // equivalent to the given expression. If there is a cost "tie", then any one
 // of the qualifying lowest cost expressions may be selected by the optimizer.
 func (o *Optimizer) Optimize() (_ opt.Expr, err error) {
+	log.VEventf(o.ctx, 1, "optimize start")
+	defer log.VEventf(o.ctx, 1, "optimize finish")
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate internal errors without having to add
@@ -204,6 +244,7 @@ func (o *Optimizer) Optimize() (_ opt.Expr, err error) {
 			// locks.
 			if ok, e := errorutil.ShouldCatch(r); ok {
 				err = e
+				log.VEventf(o.ctx, 1, "%v", err)
 			} else {
 				// Other panic objects can't be considered "safe" and thus are
 				// propagated as crashes that terminate the session.
@@ -279,17 +320,17 @@ func (o *Optimizer) optimizeExpr(
 // The following is a simplified walkthrough of how the optimizer might handle
 // the following SQL query:
 //
-//   SELECT * FROM a WHERE x=1 ORDER BY y
+//	SELECT * FROM a WHERE x=1 ORDER BY y
 //
 // Before the optimizer is invoked, the memo group contains a single normalized
 // expression:
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    ├── G2: (scan a)
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 ├── G2: (scan a)
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // Optimization begins at the root of the memo (group #1), and calls
 // optimizeGroup with the properties required of that group ("ordering:y").
@@ -309,32 +350,32 @@ func (o *Optimizer) optimizeExpr(
 // cost expression for that group for that set of properties (i.e. the empty
 // set).
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    ├── G2: (scan a)
-//    │    └── []
-//    │         ├── best: (scan a)
-//    │         └── cost: 100.00
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 ├── G2: (scan a)
+//	 │    └── []
+//	 │         ├── best: (scan a)
+//	 │         └── cost: 100.00
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // The recursion pops up a level, and now the Sort enforcer knows its input,
 // and so it too can be costed (cost of input + extra cost of sort) and added
 // as the best expression for the property set with the ordering requirement.
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    ├── G2: (scan a)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (sort G2)
-//    │    │    └── cost: 150.00
-//    │    └── []
-//    │         ├── best: (scan a)
-//    │         └── cost: 100.00
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 ├── G2: (scan a)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (sort G2)
+//	 │    │    └── cost: 150.00
+//	 │    └── []
+//	 │         ├── best: (scan a)
+//	 │         └── cost: 100.00
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // Recursion pops up another level, and the Select operator now knows its input
 // (the Sort of the Scan). It then moves on to its scalar filter child and
@@ -345,21 +386,21 @@ func (o *Optimizer) optimizeExpr(
 // ordering requirement. It requires the same ordering requirement from its
 // input child (i.e. the scan).
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    │    └── [ordering: y]
-//    │         ├── best: (select G2="ordering: y" G3)
-//    │         └── cost: 160.00
-//    ├── G2: (scan a)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (sort G2)
-//    │    │    └── cost: 150.00
-//    │    └── []
-//    │         ├── best: (scan a)
-//    │         └── cost: 100.00
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 │    └── [ordering: y]
+//	 │         ├── best: (select G2="ordering: y" G3)
+//	 │         └── cost: 160.00
+//	 ├── G2: (scan a)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (sort G2)
+//	 │    │    └── cost: 150.00
+//	 │    └── []
+//	 │         ├── best: (scan a)
+//	 │         └── cost: 100.00
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // But the process is not yet complete. After traversing the Select child
 // groups, optimizeExpr generates an alternate plan that satisfies the ordering
@@ -371,24 +412,24 @@ func (o *Optimizer) optimizeExpr(
 // returns them immediately with no extra work. The Select expression is now
 // costed and added as the best expression without an ordering requirement.
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (select G2="ordering: y" G3)
-//    │    │    └── cost: 160.00
-//    │    └── []
-//    │         ├── best: (select G2 G3)
-//    │         └── cost: 110.00
-//    ├── G2: (scan a)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (sort G2)
-//    │    │    └── cost: 150.00
-//    │    └── []
-//    │         ├── best: (scan a)
-//    │         └── cost: 100.00
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (select G2="ordering: y" G3)
+//	 │    │    └── cost: 160.00
+//	 │    └── []
+//	 │         ├── best: (select G2 G3)
+//	 │         └── cost: 110.00
+//	 ├── G2: (scan a)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (sort G2)
+//	 │    │    └── cost: 150.00
+//	 │    └── []
+//	 │         ├── best: (scan a)
+//	 │         └── cost: 100.00
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // Finally, the Sort enforcer for group #1 has its input and can be costed. But
 // rather than costing 50.0 like the other Sort enforcer, this one only costs
@@ -396,39 +437,38 @@ func (o *Optimizer) optimizeExpr(
 // cost is only 111.0, which makes it the new best expression for group #1 with
 // an ordering requirement:
 //
-//   memo
-//    ├── G1: (select G2 G3)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (sort G1)
-//    │    │    └── cost: 111.00
-//    │    └── []
-//    │         ├── best: (select G2 G3)
-//    │         └── cost: 110.00
-//    ├── G2: (scan a)
-//    │    ├── [ordering: y]
-//    │    │    ├── best: (sort G2)
-//    │    │    └── cost: 150.00
-//    │    └── []
-//    │         ├── best: (scan a)
-//    │         └── cost: 100.00
-//    ├── G3: (eq 3 2)
-//    ├── G4: (variable x)
-//    └── G5: (const 1)
+//	memo
+//	 ├── G1: (select G2 G3)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (sort G1)
+//	 │    │    └── cost: 111.00
+//	 │    └── []
+//	 │         ├── best: (select G2 G3)
+//	 │         └── cost: 110.00
+//	 ├── G2: (scan a)
+//	 │    ├── [ordering: y]
+//	 │    │    ├── best: (sort G2)
+//	 │    │    └── cost: 150.00
+//	 │    └── []
+//	 │         ├── best: (scan a)
+//	 │         └── cost: 100.00
+//	 ├── G3: (eq 3 2)
+//	 ├── G4: (variable x)
+//	 └── G5: (const 1)
 //
 // Now the memo has been fully optimized, and the best expression for group #1
 // and "ordering:y" can be set as the root of the tree by setLowestCostTree:
 //
-//   sort
-//    ├── columns: x:1(int) y:2(int)
-//    ├── ordering: +2
-//    └── select
-//         ├── columns: x:1(int) y:2(int)
-//         ├── scan
-//         │    └── columns: x:1(int) y:2(int)
-//         └── eq [type=bool]
-//              ├── variable: a.x [type=int]
-//              └── const: 1 [type=int]
-//
+//	sort
+//	 ├── columns: x:1(int) y:2(int)
+//	 ├── ordering: +2
+//	 └── select
+//	      ├── columns: x:1(int) y:2(int)
+//	      ├── scan
+//	      │    └── columns: x:1(int) y:2(int)
+//	      └── eq [type=bool]
+//	           ├── variable: a.x [type=int]
+//	           └── const: 1 [type=int]
 func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required) *groupState {
 	// Always start with the first expression in the group.
 	grp = grp.FirstExpr()
@@ -438,6 +478,57 @@ func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required)
 	state := o.ensureOptState(grp, required)
 	if state.fullyOptimized {
 		return state
+	}
+
+	// Check whether the optimization has been canceled (most likely due to a
+	// statement timeout). Internally, only every 1024th Check() call (or every
+	// nth Check(), if overridden, where n is a power of 2) will poll on the Done
+	// channel, so this should only have negligible performance overhead.
+	if err := o.cancelChecker.Check(); err != nil {
+		panic(err)
+	}
+
+	state.passes++
+	if state.passes > maxGroupPasses {
+		// If optimizeGroup has been called on a group more than maxGroupPasses
+		// times, there is likely a cycle in the memo. To avoid a stack
+		// overflow, throw an internal error. The formatted memo is included as
+		// an error detail to aid in debugging the cycle.
+		mf := makeMemoFormatter(o, FmtCycle, false /* redactableValues */)
+		panic(errors.WithDetail(
+			errors.AssertionFailedf(
+				"memo group optimization passes surpassed limit of %v; "+
+					"there may be a cycle in the memo",
+				maxGroupPasses,
+			),
+			mf.format(),
+		))
+	}
+
+	// deriveLCP is a closure that returns the longest common prefix between the
+	// interesting orderings of the group and the required ordering.
+	//
+	// Interesting orderings are shared by all members of a group (see
+	// ordering.DeriveInterestingOrderings), so the longest common prefix
+	// between the interesting ordering and a specific required ordering is also
+	// the same for all members.
+	//
+	// Caching and reusing the result in lcp reduces the expensive computation
+	// of the deriving the longest common prefix. The closure allows lazily
+	// deriving the longest common prefix only when needed.
+	var cachedLCP struct {
+		lcp    props.OrderingChoice
+		ok     bool
+		exists bool
+	}
+	deriveLCP := func() (_ props.OrderingChoice, ok bool) {
+		if cachedLCP.exists {
+			return cachedLCP.lcp, cachedLCP.ok
+		}
+		interestingOrderings := ordering.DeriveInterestingOrderings(grp)
+		cachedLCP.lcp, cachedLCP.ok = interestingOrderings.LongestCommonPrefix(&required.Ordering)
+		cachedLCP.exists = true
+		return cachedLCP.lcp, cachedLCP.ok
 	}
 
 	// Iterate until the group has been fully optimized.
@@ -452,7 +543,7 @@ func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required)
 			}
 
 			// Optimize the group member with respect to the required properties.
-			memberOptimized := o.optimizeGroupMember(state, member, required)
+			memberOptimized := o.optimizeGroupMember(state, member, required, deriveLCP)
 
 			// If any of the group members have not yet been fully optimized, then
 			// the group is not yet fully optimized.
@@ -465,7 +556,7 @@ func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required)
 
 		// Now try to generate new expressions that are logically equivalent to
 		// other expressions in this group.
-		if o.shouldExplore(required) && !o.explorer.exploreGroup(grp).fullyExplored {
+		if o.shouldExplore(required) && !o.explorer.exploreGroup(grp, required).fullyExplored {
 			fullyOptimized = false
 		}
 
@@ -485,21 +576,24 @@ func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required)
 // can provide the required properties at a lower cost. The lowest cost
 // expression is saved to groupState.
 func (o *Optimizer) optimizeGroupMember(
-	state *groupState, member memo.RelExpr, required *physical.Required,
+	state *groupState,
+	member memo.RelExpr,
+	required *physical.Required,
+	deriveLCP func() (_ props.OrderingChoice, ok bool),
 ) (fullyOptimized bool) {
 	// Compute the cost for enforcers to provide the required properties. This
 	// may be lower than the expression providing the properties itself. For
 	// example, it might be better to sort the results of a hash join than to
 	// use the results of a merge join that are already sorted, but at the cost
 	// of requiring one of the merge join children to be sorted.
-	fullyOptimized = o.enforceProps(state, member, required)
+	fullyOptimized = o.enforceProps(state, member, required, deriveLCP)
 
 	// If the expression cannot provide the required properties, then don't
 	// continue. But what if the expression is able to provide a subset of the
 	// properties? That case is taken care of by enforceProps, which will
 	// recursively optimize the group with property subsets and then add
 	// enforcers to provide the remainder.
-	if CanProvidePhysicalProps(member, required) {
+	if CanProvidePhysicalProps(o.ctx, o.evalCtx, member, required) {
 		var cost memo.Cost
 		for i, n := 0, member.ChildCount(); i < n; i++ {
 			// Given required parent properties, get the properties required from
@@ -510,7 +604,20 @@ func (o *Optimizer) optimizeGroupMember(
 			childCost, childOptimized := o.optimizeExpr(member.Child(i), childRequired)
 
 			// Accumulate cost of children.
-			cost += childCost
+			if member.Op() == opt.LocalityOptimizedSearchOp && i > 0 {
+				// If the child ops are locality optimized, distribution costs are added
+				// to the remote branch, but not the local branch. Scale the remote
+				// branch costs by a factor reflecting the likelihood of executing that
+				// branch. Right now this probability is not estimated, so just use a
+				// default probability of 1/10.
+				// TODO(msirek): Add an estimation of the probability of executing the
+				//               remote branch, e.g., compare the size of the limit hint
+				//               with the expected row count of the local branch.
+				//               Is there a better approach?
+				cost += childCost / 10
+			} else {
+				cost += childCost
+			}
 
 			// If any child expression is not fully optimized, then the parent
 			// expression is also not fully optimized.
@@ -555,12 +662,12 @@ func (o *Optimizer) optimizeScalarExpr(
 // been provided by an enforcer rather than by the expression itself. There are
 // two reasons why this is necessary/desirable:
 //
-//   1. The expression may not be able to provide the property on its own. For
-//      example, a hash join cannot provide ordered results.
-//   2. The enforcer might be able to provide the property at lower overall
-//      cost. For example, an enforced sort on top of a hash join might be
-//      lower cost than a merge join that is already sorted, but at the cost of
-//      requiring one of its children to be sorted.
+//  1. The expression may not be able to provide the property on its own. For
+//     example, a hash join cannot provide ordered results.
+//  2. The enforcer might be able to provide the property at lower overall
+//     cost. For example, an enforced sort on top of a hash join might be
+//     lower cost than a merge join that is already sorted, but at the cost of
+//     requiring one of its children to be sorted.
 //
 // Note that enforceProps will recursively optimize this same group, but with
 // one less required physical property. The recursive call will eventually make
@@ -573,30 +680,45 @@ func (o *Optimizer) optimizeScalarExpr(
 // update shouldExplore, which should return true if enforceProps will explore
 // the group by recursively calling optimizeGroup (by way of optimizeEnforcer).
 func (o *Optimizer) enforceProps(
-	state *groupState, member memo.RelExpr, required *physical.Required,
+	state *groupState,
+	member memo.RelExpr,
+	required *physical.Required,
+	deriveLCP func() (_ props.OrderingChoice, ok bool),
 ) (fullyOptimized bool) {
 	// Strip off one property that can be enforced. Other properties will be
 	// stripped by recursively optimizing the group with successively fewer
 	// properties. The properties are stripped off in a heuristic order, from
 	// least likely to be expensive to enforce to most likely.
-	if !required.Ordering.Any() {
-		// Try Sort enforcer that requires no ordering from its input.
-		enforcer := &memo.SortExpr{Input: member}
-		memberProps := BuildChildPhysicalProps(o.mem, enforcer, 0, required)
-		fullyOptimized = o.optimizeEnforcer(state, enforcer, required, member, memberProps)
+	if !required.Distribution.Any() && member.Op() != opt.ExplainOp {
+		enforcer := &memo.DistributeExpr{Input: member}
+		getEnforcer := func() memo.RelExpr {
+			return enforcer
+		}
+		return o.optimizeEnforcer(state, getEnforcer, required, member)
+	}
 
-		// Try Sort enforcer that requires a partial ordering from its input. Choose
-		// the interesting ordering that forms the longest common prefix with the
-		// required ordering. We do not need to add the enforcer if the required
-		// ordering is implied by the input ordering (in which case the returned
-		// prefix is nil).
-		interestingOrderings := ordering.DeriveInterestingOrderings(member)
-		longestCommonPrefix := interestingOrderings.LongestCommonPrefix(&required.Ordering)
-		if longestCommonPrefix != nil {
-			enforcer := &memo.SortExpr{Input: state.best}
-			enforcer.InputOrdering = *longestCommonPrefix
-			memberProps := BuildChildPhysicalProps(o.mem, enforcer, 0, required)
-			if o.optimizeEnforcer(state, enforcer, required, member, memberProps) {
+	if ordering.CanEnforce(member, &required.Ordering) {
+		// Try Sort enforcer that requires no ordering from its input.
+		getEnforcer := func() memo.RelExpr {
+			enforcer := o.getScratchSort()
+			enforcer.Input = member
+			return enforcer
+		}
+		fullyOptimized = o.optimizeEnforcer(state, getEnforcer, required, member)
+
+		// Try Sort enforcer that requires a partial ordering from its input.
+		// Choose the interesting ordering that forms the longest common prefix
+		// with the required ordering. We do not need to add the enforcer if
+		// there is no common prefix or if the required ordering is implied by
+		// the input ordering.
+		if lcp, ok := deriveLCP(); ok {
+			getEnforcer = func() memo.RelExpr {
+				enforcer := o.getScratchSort()
+				enforcer.Input = state.best
+				enforcer.InputOrdering = lcp
+				return enforcer
+			}
+			if o.optimizeEnforcer(state, getEnforcer, required, member) {
 				fullyOptimized = true
 			}
 		}
@@ -607,23 +729,32 @@ func (o *Optimizer) enforceProps(
 	return true
 }
 
-// optimizeEnforcer optimizes and costs the enforcer.
+// optimizeEnforcer optimizes and costs the enforcer. getEnforcer is used to
+// reset the enforcer after recursing in optimizeGroup, since the current group
+// and its children may use the same SortExpr to avoid allocations.
 func (o *Optimizer) optimizeEnforcer(
 	state *groupState,
-	enforcer memo.RelExpr,
+	getEnforcer func() memo.RelExpr,
 	enforcerProps *physical.Required,
 	member memo.RelExpr,
-	memberProps *physical.Required,
 ) (fullyOptimized bool) {
 	// Recursively optimize the member group with respect to a subset of the
-	// enforcer properties.
+	// enforcer properties. Make sure to reset the enforcer after recursing.
+	enforcer := getEnforcer()
+	memberProps := BuildChildPhysicalProps(o.mem, enforcer, 0, enforcerProps)
 	innerState := o.optimizeGroup(member, memberProps)
 	fullyOptimized = innerState.fullyOptimized
+	enforcer = getEnforcer()
 
 	// Check whether this is the new lowest cost expression with the enforcer
 	// added.
 	cost := innerState.cost + o.coster.ComputeCost(enforcer, enforcerProps)
-	o.ratchetCost(state, enforcer, cost)
+	if o.ratchetCost(state, enforcer, cost) {
+		if _, ok := enforcer.(*memo.SortExpr); ok {
+			// The expression was added to the memo, so lose the reference.
+			o.scratchSort = nil
+		}
+	}
 
 	// Enforcer expression is fully optimized if its input expression is fully
 	// optimized.
@@ -633,7 +764,7 @@ func (o *Optimizer) optimizeEnforcer(
 // shouldExplore ensures that exploration is only triggered for optimizeGroup
 // calls that will not recurse via a call from enforceProps.
 func (o *Optimizer) shouldExplore(required *physical.Required) bool {
-	return required.Ordering.Any()
+	return required.Ordering.Any() && required.Distribution.Any()
 }
 
 // setLowestCostTree traverses the memo and recursively updates child pointers
@@ -644,15 +775,15 @@ func (o *Optimizer) shouldExplore(required *physical.Required) bool {
 // the memo, with a normalized tree containing the first expression in each of
 // the groups:
 //
-//   memo
-//    ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
-//    ├── G2: (scan a)
-//    ├── G3: (select G5 G6) (scan b,constrained)
-//    ├── G4: (true)
-//    ├── G5: (scan b)
-//    ├── G6: (eq G7 G8)
-//    ├── G7: (variable b.x)
-//    └── G8: (const 1)
+//	memo
+//	 ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
+//	 ├── G2: (scan a)
+//	 ├── G3: (select G5 G6) (scan b,constrained)
+//	 ├── G4: (true)
+//	 ├── G5: (scan b)
+//	 ├── G6: (eq G7 G8)
+//	 ├── G7: (variable b.x)
+//	 └── G8: (const 1)
 //
 // setLowestCostTree is called after exploration is complete, and after each
 // group member has been costed. If the second expression in groups G1 and G3
@@ -679,6 +810,8 @@ func (o *Optimizer) setLowestCostTree(parent opt.Expr, parentProps *physical.Req
 	case memo.ScalarPropsExpr:
 		// Short-circuit traversal of scalar expressions with no nested subquery,
 		// since there's only one possible tree.
+		// TODO(mgartner): Think about whether we need to short-circuit in the
+		// presence or absence of UDFs.
 		if !t.ScalarProps().HasSubquery {
 			return parent
 		}
@@ -690,13 +823,11 @@ func (o *Optimizer) setLowestCostTree(parent opt.Expr, parentProps *physical.Req
 	var childProps *physical.Required
 	for i, n := 0, parent.ChildCount(); i < n; i++ {
 		before := parent.Child(i)
-
 		if relParent != nil {
 			childProps = BuildChildPhysicalProps(o.mem, relParent, i, parentProps)
 		} else {
 			childProps = BuildChildPhysicalPropsScalar(o.mem, parent, i)
 		}
-
 		after := o.setLowestCostTree(before, childProps)
 		if after != before {
 			if mutable == nil {
@@ -710,7 +841,8 @@ func (o *Optimizer) setLowestCostTree(parent opt.Expr, parentProps *physical.Req
 		var provided physical.Provided
 		// BuildProvided relies on ProvidedPhysical() being set in the children, so
 		// it must run after the recursive calls on the children.
-		provided.Ordering = ordering.BuildProvided(relParent, &parentProps.Ordering)
+		provided.Ordering = ordering.BuildProvided(o.evalCtx, relParent, &parentProps.Ordering)
+		provided.Distribution = distribution.BuildProvided(o.ctx, o.evalCtx, relParent, &parentProps.Distribution)
 		o.mem.SetBestProps(relParent, parentProps, &provided, relCost)
 	}
 
@@ -720,11 +852,46 @@ func (o *Optimizer) setLowestCostTree(parent opt.Expr, parentProps *physical.Req
 // ratchetCost computes the cost of the candidate expression, and then checks
 // whether it's lower than the cost of the existing best expression in the
 // group. If so, then the candidate becomes the new lowest cost expression.
-func (o *Optimizer) ratchetCost(state *groupState, candidate memo.RelExpr, cost memo.Cost) {
+// ratchetCost returns true if the candidate is the new lowest-cost expression.
+func (o *Optimizer) ratchetCost(state *groupState, candidate memo.RelExpr, cost memo.Cost) bool {
 	if state.best == nil || cost.Less(state.cost) {
 		state.best = candidate
 		state.cost = cost
+		return true
 	}
+	return false
+}
+
+// getScratchSort initializes and returns a SortExpr for use in enforcing order
+// for an expression.
+func (o *Optimizer) getScratchSort() *memo.SortExpr {
+	if o.scratchSort == nil {
+		// (Re)allocate the expression.
+		o.scratchSort = &memo.SortExpr{}
+	} else {
+		// Reset the expression.
+		*o.scratchSort = memo.SortExpr{}
+	}
+	return o.scratchSort
+}
+
+// MaybeGetBestCostRelation returns the best-cost relation for the given memo
+// group if the group has been fully optimized for the `required` physical
+// properties.
+func (o *Optimizer) MaybeGetBestCostRelation(
+	grp memo.RelExpr, required *physical.Required,
+) (best memo.RelExpr, ok bool) {
+	if o == nil {
+		return nil, false
+	}
+	state := o.lookupOptState(grp, required)
+	if state == nil {
+		return nil, false
+	}
+	if state.best == nil || !state.fullyOptimized {
+		return nil, false
+	}
+	return state.best, true
 }
 
 // lookupOptState looks up the state associated with the given group and
@@ -843,11 +1010,15 @@ type groupState struct {
 	// expression in the group that has been fully optimized for the required
 	// properties. These never need to be recosted, no matter how many additional
 	// optimization passes are made.
-	fullyOptimizedExprs util.FastIntSet
+	fullyOptimizedExprs intsets.Fast
 
 	// explore is used by the explorer to store intermediate state so that
 	// redundant work is minimized.
 	explore exploreState
+
+	// passes tracks the number of times optimizeGroup has been called on the
+	// group. It is used to detect cycles in the memo. See maxGroupPasses.
+	passes int
 }
 
 // isMemberFullyOptimized returns true if the group member at the given ordinal
@@ -891,13 +1062,27 @@ func (a *groupStateAlloc) allocate() *groupState {
 	return state
 }
 
-// disableRules disables rules with the given probability for testing.
-func (o *Optimizer) disableRules(probability float64) {
-	essentialRules := util.MakeFastIntSet(
+// disableRulesRandom disables rules with the given probability for testing.
+func (o *Optimizer) disableRulesRandom(probability float64) {
+	essentialRules := intsets.MakeFast(
 		// Needed to prevent constraint building from failing.
 		int(opt.NormalizeInConst),
 		// Needed when an index is forced.
 		int(opt.GenerateIndexScans),
+		// The fold null rules are needed to prevent errors like
+		// "expected *DString, found DNull"
+		int(opt.FoldNullBinaryRight),
+		int(opt.FoldNullBinaryLeft),
+		int(opt.FoldNullComparisonRight),
+		int(opt.FoldNullComparisonLeft),
+		// FoldDivOne is needed for consistent formatting, so tests won't fail.
+		int(opt.FoldDivOne),
+		// Without PruneAggCols, it's common to receive
+		// "optimizer factory constructor call stack exceeded max depth of 10000"
+		int(opt.PruneAggCols),
+		// Needed to prevent "null rejection requested on non-null column"
+		int(opt.RejectNullsUnderJoinLeft),
+		int(opt.RejectNullsUnderJoinRight),
 		// Needed to prevent "same fingerprint cannot map to different groups."
 		int(opt.PruneJoinLeftCols),
 		int(opt.PruneJoinRightCols),
@@ -909,17 +1094,41 @@ func (o *Optimizer) disableRules(probability float64) {
 		// supports distinct on an empty column set.
 		int(opt.EliminateDistinctNoColumns),
 		int(opt.EliminateEnsureDistinctNoColumns),
+		// TODO(#84191): Needed to remove the same column and direction
+		// appearing consecutively in ordering columns, which can cause
+		// incorrect results until #84191 is addressed.
+		int(opt.SimplifyRootOrdering),
+		// Needed to prevent rule cycles that lead to timeouts and OOMs.
+		int(opt.EliminateProject),
+		int(opt.EliminateSelect),
+		// Needed to make sure that dummy columns are pruned so that the
+		// database name is retrieved correctly.
+		int(opt.PruneScanCols),
+		// Needed to ensure that the input of a RangeExpr is always an AndExpr.
+		int(opt.SimplifyRange),
+		// Needed to ensure that all uncorrelated EXISTS subqueries are
+		// converted to COALESCE+subquery expressions.
+		int(opt.ConvertUncorrelatedExistsToCoalesceSubquery),
 	)
 
+	var disabledRules RuleSet
 	for i := opt.RuleName(1); i < opt.NumRuleNames; i++ {
-		if rand.Float64() < probability && !essentialRules.Contains(int(i)) {
-			o.disabledRules.Add(int(i))
+		var r float64
+		if o.rng == nil {
+			r = rand.Float64()
+		} else {
+			r = o.rng.Float64()
+		}
+		if r < probability && !essentialRules.Contains(int(i)) {
+			disabledRules.Add(int(i))
 		}
 	}
 
+	o.f.SetDisabledRules(disabledRules)
+
 	o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
-		if o.disabledRules.Contains(int(ruleName)) {
-			log.Infof(o.evalCtx.Context, "disabled rule matched: %s", ruleName.String())
+		if disabledRules.Contains(int(ruleName)) {
+			log.Infof(o.ctx, "disabled rule matched: %s", ruleName.String())
 			return false
 		}
 		return true
@@ -927,13 +1136,13 @@ func (o *Optimizer) disableRules(probability float64) {
 }
 
 func (o *Optimizer) String() string {
-	return o.FormatMemo(FmtPretty)
+	return o.FormatMemo(FmtPretty, false /* redactableValues */)
 }
 
 // FormatMemo returns a string representation of the memo for testing
 // and debugging. The given flags control which properties are shown.
-func (o *Optimizer) FormatMemo(flags FmtFlags) string {
-	mf := makeMemoFormatter(o, flags)
+func (o *Optimizer) FormatMemo(flags FmtFlags, redactableValues bool) string {
+	mf := makeMemoFormatter(o, flags, redactableValues)
 	return mf.format()
 }
 
@@ -943,7 +1152,7 @@ func (o *Optimizer) FormatMemo(flags FmtFlags) string {
 // the real computed cost, not the perturbed cost.
 func (o *Optimizer) RecomputeCost() {
 	var c coster
-	c.Init(o.evalCtx, o.mem, 0 /* perturbation */)
+	c.Init(o.ctx, o.evalCtx, o.mem, 0 /* perturbation */, nil /* rng */, o /* o */)
 
 	root := o.mem.RootExpr()
 	rootProps := o.mem.RootProps()
@@ -974,8 +1183,8 @@ func (o *Optimizer) recomputeCostImpl(
 }
 
 // FormatExpr is a convenience wrapper for memo.FormatExpr.
-func (o *Optimizer) FormatExpr(e opt.Expr, flags memo.ExprFmtFlags) string {
-	return memo.FormatExpr(e, flags, o.mem, o.catalog)
+func (o *Optimizer) FormatExpr(e opt.Expr, flags memo.ExprFmtFlags, redactableValues bool) string {
+	return memo.FormatExpr(o.ctx, e, flags, redactableValues, o.mem, o.catalog)
 }
 
 // CustomFuncs exports the xform.CustomFuncs for testing purposes.

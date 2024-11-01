@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -44,7 +39,6 @@ type filePrefixer struct {
 //
 // Use FilePrefixerOptions to override default token
 // delimiters and template.
-//
 func newFilePrefixer(opts ...filePrefixerOption) filePrefixer {
 	options := defaultFilePrefixerOptions
 	for _, o := range opts {
@@ -64,19 +58,20 @@ func newFilePrefixer(opts ...filePrefixerOption) filePrefixer {
 // template is provided, template defaults to "${host} > ".
 //
 // example file paths:
-//   testdata/merge_logs_v2/nodes/1/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
-//   testdata/merge_logs_v2/nodes/2/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
-//   testdata/merge_logs_v2/nodes/3/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
+//
+//	testdata/merge_logs_v2/nodes/1/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
+//	testdata/merge_logs_v2/nodes/2/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
+//	testdata/merge_logs_v2/nodes/3/cockroach.test-0001.ubuntu.2018-11-30T22_06_47Z.003959.log
 //
 // prefix provided: (${fpath}) ${host}>
 //
 // produces:
-//   (1) test-0001>
-//   (2) test-0001>
-//   (3) test-0001>
+//
+//	(1) test-0001>
+//	(2) test-0001>
+//	(3) test-0001>
 //
 // See [debug_merge_logs_test.go, prefixer_test.go] for additional examples.
-//
 func (f filePrefixer) PopulatePrefixes(logFiles []fileInfo) {
 
 	tPaths := make([][]string, len(logFiles))

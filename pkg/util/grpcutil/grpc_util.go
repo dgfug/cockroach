@@ -1,47 +1,46 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package grpcutil
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
-	circuit "github.com/cockroachdb/circuitbreaker"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 )
 
-// ErrCannotReuseClientConn is returned when a failed connection is
+// ErrConnectionInterrupted is returned when a failed connection is
 // being reused. We require that new connections be created with
 // pkg/rpc.GRPCDial instead.
-var ErrCannotReuseClientConn = errors.New(errCannotReuseClientConnMsg)
+var ErrConnectionInterrupted = errors.New(errConnectionInterruptedMsg)
 
-const errCannotReuseClientConnMsg = "cannot reuse client connection"
+const errConnectionInterruptedMsg = "connection interrupted (did the remote node shut down or are there networking issues?)"
 
 type localRequestKey struct{}
 
-// NewLocalRequestContext returns a Context that can be used for local (in-process) requests.
-func NewLocalRequestContext(ctx context.Context) context.Context {
-	return context.WithValue(ctx, localRequestKey{}, struct{}{})
+// NewLocalRequestContext returns a Context that can be used for local
+// (in-process) RPC requests performed by the InternalClientAdapter. The ctx
+// carries information about what tenant (if any) is the client of the RPC. The
+// auth interceptor uses this information to authorize the tenant.
+func NewLocalRequestContext(ctx context.Context, tenantID roachpb.TenantID) context.Context {
+	return context.WithValue(ctx, localRequestKey{}, tenantID)
 }
 
 // IsLocalRequestContext returns true if this context is marked for local (in-process) use.
-func IsLocalRequestContext(ctx context.Context) bool {
-	return ctx.Value(localRequestKey{}) != nil
+func IsLocalRequestContext(ctx context.Context) (roachpb.TenantID, bool) {
+	val := ctx.Value(localRequestKey{})
+	if val == nil {
+		return roachpb.TenantID{}, false
+	}
+	return val.(roachpb.TenantID), true
 }
 
 // IsTimeout returns true if err's Cause is a gRPC timeout, or the request
@@ -53,6 +52,17 @@ func IsTimeout(err error) bool {
 	err = errors.Cause(err)
 	if s, ok := status.FromError(err); ok {
 		return s.Code() == codes.DeadlineExceeded
+	}
+	return false
+}
+
+// IsConnectionUnavailable checks if grpc code is either codes.Unavailable which
+// is set when we are not able to establish connection to remote node or
+// codes.FailedPrecondition when node itself blocked access to remote node
+// because it is marked as decommissioned in the local tombstone storage.
+func IsConnectionUnavailable(err error) bool {
+	if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
+		return s.Code() == codes.Unavailable || s.Code() == codes.FailedPrecondition
 	}
 	return false
 }
@@ -69,7 +79,7 @@ func IsContextCanceled(err error) bool {
 // IsClosedConnection returns true if err's Cause is an error produced by gRPC
 // on closed connections.
 func IsClosedConnection(err error) bool {
-	if errors.Is(err, ErrCannotReuseClientConn) {
+	if errors.Is(err, ErrConnectionInterrupted) {
 		return true
 	}
 	err = errors.Cause(err)
@@ -108,8 +118,27 @@ func IsConnectionRejected(err error) bool {
 	return false
 }
 
-// IsAuthError returns true if err's Cause is an error produced by
-// gRPC due to an authentication or authorization error for the operation.
+// IsAuthError returns true if err's Cause is an authentication or authorization
+// error for the operation.
+//
+// AuthErrors can be due to a problem on either the client or the server. An
+// AuthError received from multiple different servers can be used an indication
+// that the issue is most likely on the client should not be retried.
+//
+// A non-exhaustive list of reasons from the client side are:
+// 1) The client has a bad TLS certificate.
+// 2) The client does not have permission to run this batch request.
+// 3) The client has been decommissioned.
+// 4) The client is in the process of terminating.
+//
+// A non-exhaustive list of reasons fro the server side is:
+// 1) The server has a bad TLS certificate.
+// 2) The server has stale liveness information for this node.
+// 3) The server has stale tenant authorization information.
+// 4) The server sent the request as a proxy and returned a ProxyFailedError
+// 5) The server was removed from the cluster and can't validate our auth info.
+// TODO(baptist): Validate uses of this check. Prior code assumed an auth error
+// from one sever should always be treated as terminal.
 func IsAuthError(err error) bool {
 	if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
 		switch s.Code() {
@@ -120,60 +149,27 @@ func IsAuthError(err error) bool {
 	return false
 }
 
-// RequestDidNotStart returns true if the given error from gRPC
-// means that the request definitely could not have started on the
-// remote server.
-//
-// This method currently depends on implementation details, matching
-// on the text of an error message that is known to only be used
-// in this case in the version of gRPC that we use today. We will
-// need to watch for changes here in future versions of gRPC.
-// TODO(bdarnell): Replace this with a cleaner mechanism when/if
-// https://github.com/grpc/grpc-go/issues/1443 is resolved.
+// IsWaitingForInit checks whether the provided error is because the node is
+// still waiting for initialization.
+func IsWaitingForInit(err error) bool {
+	s, ok := status.FromError(errors.UnwrapAll(err))
+	return ok && s.Code() == codes.Unavailable && strings.Contains(err.Error(), "node waiting for init")
+}
+
+// RequestDidNotStart returns true if the given RPC error means that the request
+// definitely could not have started on the remote server.
 func RequestDidNotStart(err error) bool {
-	if errors.HasType(err, connectionNotReadyError{}) ||
-		errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
-		errors.Is(err, circuit.ErrBreakerOpen) ||
-		IsConnectionRejected(err) {
-		return true
-	}
-	s, ok := status.FromError(errors.Cause(err))
-	if !ok {
-		// This is a non-gRPC error; assume nothing.
-		return false
-	}
-	// TODO(bdarnell): In gRPC 1.7, we have no good way to distinguish
-	// ambiguous from unambiguous failures, so we must assume all gRPC
-	// errors are ambiguous.
-	// https://github.com/cockroachdb/cockroach/issues/19708#issuecomment-343891640
-	if false && s.Code() == codes.Unavailable && s.Message() == "grpc: the connection is unavailable" {
-		return true
-	}
-	return false
-}
-
-// ConnectionReady returns nil if the given connection is ready to
-// send a request, or an error (which will pass RequestDidNotStart) if
-// not.
-//
-// This is a workaround for the fact that gRPC 1.7 fails to
-// distinguish between ambiguous and unambiguous errors.
-//
-// This is designed for use with connections prepared by
-// pkg/rpc.Connection.Connect (which performs an initial heartbeat and
-// thereby ensures that we will never see a connection in the
-// first-time Connecting state).
-func ConnectionReady(conn *grpc.ClientConn) error {
-	if s := conn.GetState(); s == connectivity.TransientFailure {
-		return connectionNotReadyError{s}
-	}
-	return nil
-}
-
-type connectionNotReadyError struct {
-	state connectivity.State
-}
-
-func (e connectionNotReadyError) Error() string {
-	return fmt.Sprintf("connection not ready: %s", e.state)
+	// NB: gRPC doesn't provide a way to distinguish unambiguous failures, but
+	// InitialHeartbeatFailedError serves mostly the same purpose. See also
+	// https://github.com/grpc/grpc-go/issues/1443.
+	//
+	// NB: We specifically don't check circuit.ErrBreakerOpen. These are returned
+	// both by the RPC circuit breakers and also the Raft replica circuit
+	// breakers, and the latter don't guarantee that the request won't go through
+	// (e.g. they can be broken on a proposal that's actively being reproposed and
+	// will eventually succeed). The RPC circuit breakers will result in an
+	// InitialHeartbeatFailedError.
+	return errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
+		IsConnectionRejected(err) ||
+		IsWaitingForInit(err)
 }

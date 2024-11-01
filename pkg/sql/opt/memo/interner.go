@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo
 
@@ -18,14 +13,15 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
@@ -70,20 +66,20 @@ type internHash uint64
 // The non-cryptographic hash function is adapted from fnv.go in Golang's
 // standard library. That in turn was taken from FNV-1a, described here:
 //
-//   https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+//	https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
 //
 // Each expression type follows the same interning pattern:
 //
-//   1. Compute an int64 hash value for the expression using FNV-1a.
-//   2. Do a fast 64-bit Go map lookup to determine if an expression with the
-//      same hash is already in the cache.
-//   3. If so, then test whether the existing expression is equivalent, since
-//      there may be a hash value collision.
-//   4. Expressions with colliding hash values are linked together in a list.
-//      Rather than use an explicit linked list data structure, colliding
-//      entries are rehashed using a randomly generated hash value that is
-//      stored in the existing entry. This effectively uses the Go map as if it
-//      were a hash table of size 2^64.
+//  1. Compute an int64 hash value for the expression using FNV-1a.
+//  2. Do a fast 64-bit Go map lookup to determine if an expression with the
+//     same hash is already in the cache.
+//  3. If so, then test whether the existing expression is equivalent, since
+//     there may be a hash value collision.
+//  4. Expressions with colliding hash values are linked together in a list.
+//     Rather than use an explicit linked list data structure, colliding
+//     entries are rehashed using a randomly generated hash value that is
+//     stored in the existing entry. This effectively uses the Go map as if it
+//     were a hash table of size 2^64.
 //
 // This pattern enables very low overhead hashing of expressions - the
 // allocation of a Go map with a fast 64-bit key, plus a couple of reusable
@@ -137,14 +133,14 @@ func (in *interner) InternPhysicalProps(val *physical.Required) *physical.Requir
 // internCache is a helper class that implements the interning pattern described
 // in the comment for the interner struct. Here is a usage example:
 //
-//   var cache internCache
-//   cache.Start(hash)
-//   for cache.Next() {
-//     if isEqual(cache.Item(), other) {
-//       // Found existing item in cache.
-//     }
-//   }
-//   cache.Add(other)
+//	var cache internCache
+//	cache.Start(hash)
+//	for cache.Next() {
+//	  if isEqual(cache.Item(), other) {
+//	    // Found existing item in cache.
+//	  }
+//	}
+//	cache.Add(other)
 //
 // The calls to the Next method iterate over any entries with the same hash,
 // until either a match is found or it is proven their are no matches, in which
@@ -360,7 +356,7 @@ func (h *hasher) HashDatum(val tree.Datum) {
 	case *tree.DString:
 		h.HashString(string(*t))
 	case *tree.DBytes:
-		h.HashBytes([]byte(*t))
+		h.HashBytes(t.UnsafeBytes())
 	case *tree.DDate:
 		h.HashUint64(uint64(t.PGEpochDays()))
 	case *tree.DTime:
@@ -424,6 +420,10 @@ func (h *hasher) HashType(val *types.T) {
 		h.HashInt(int(geo.SRID))
 		h.HashInt(int(geo.ShapeType))
 	}
+}
+
+func (h *hasher) HashExpr(val tree.Expr) {
+	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
 }
 
 func (h *hasher) HashTypedExpr(val tree.TypedExpr) {
@@ -515,6 +515,7 @@ func (h *hasher) HashScanFlags(val ScanFlags) {
 	h.HashBool(val.NoZigzagJoin)
 	h.HashBool(val.NoFullScan)
 	h.HashBool(val.ForceIndex)
+	h.HashBool(val.ForceInvertedIndex)
 	h.HashBool(val.ForceZigzag)
 	h.HashInt(int(val.Direction))
 	h.HashUint64(uint64(val.Index))
@@ -533,6 +534,12 @@ func (h *hasher) HashJoinFlags(val JoinFlags) {
 func (h *hasher) HashFKCascades(val FKCascades) {
 	for i := range val {
 		h.HashUint64(uint64(reflect.ValueOf(val[i].Builder).Pointer()))
+	}
+}
+
+func (h *hasher) HashAfterTriggers(val *AfterTriggers) {
+	if val != nil {
+		h.HashUint64(uint64(reflect.ValueOf(val.Builder).Pointer()))
 	}
 }
 
@@ -568,6 +575,10 @@ func (h *hasher) HashIndexOrdinal(val cat.IndexOrdinal) {
 	h.HashInt(val)
 }
 
+func (h *hasher) HashRelocateSubject(val tree.RelocateSubject) {
+	h.HashUint64(uint64(val))
+}
+
 func (h *hasher) HashIndexOrdinals(val cat.IndexOrdinals) {
 	hash := h.hash
 	for _, ord := range val {
@@ -586,7 +597,16 @@ func (h *hasher) HashUniqueOrdinals(val cat.UniqueOrdinals) {
 	h.hash = hash
 }
 
-func (h *hasher) HashViewDeps(val opt.ViewDeps) {
+func (h *hasher) HashSchemaFunctionDeps(val opt.SchemaFunctionDeps) {
+	hash := h.hash
+	val.ForEach(func(i int) {
+		hash ^= internHash(i)
+		hash *= prime64
+	})
+	h.hash = hash
+}
+
+func (h *hasher) HashSchemaDeps(val opt.SchemaDeps) {
 	// Hash the length and address of the first element.
 	h.HashInt(len(val))
 	if len(val) > 0 {
@@ -594,7 +614,7 @@ func (h *hasher) HashViewDeps(val opt.ViewDeps) {
 	}
 }
 
-func (h *hasher) HashViewTypeDeps(val opt.ViewTypeDeps) {
+func (h *hasher) HashSchemaTypeDeps(val opt.SchemaTypeDeps) {
 	hash := h.hash
 	val.ForEach(func(i int) {
 		hash ^= internHash(i)
@@ -626,13 +646,18 @@ func (h *hasher) HashPhysProps(val *physical.Required) {
 	}
 	h.HashOrderingChoice(val.Ordering)
 	h.HashFloat64(val.LimitHint)
+	h.HashDistribution(val.Distribution)
 }
 
-func (h *hasher) HashLockingItem(val *tree.LockingItem) {
-	if val != nil {
-		h.HashByte(byte(val.Strength))
-		h.HashByte(byte(val.WaitPolicy))
+func (h *hasher) HashDistribution(val physical.Distribution) {
+	for _, region := range val.Regions {
+		h.HashString(region)
 	}
+}
+
+func (h *hasher) HashLocking(val opt.Locking) {
+	h.HashByte(byte(val.Strength))
+	h.HashByte(byte(val.WaitPolicy))
 }
 
 func (h *hasher) HashInvertedSpans(val inverted.Spans) {
@@ -708,6 +733,21 @@ func (h *hasher) HashUniqueChecksExpr(val UniqueChecksExpr) {
 	}
 }
 
+func (h *hasher) HashFastPathUniqueChecksExpr(val FastPathUniqueChecksExpr) {
+	for i := range val {
+		h.HashRelExpr(val[i].Check)
+		h.HashTableID(val[i].ReferencedTableID)
+		h.HashIndexOrdinal(val[i].ReferencedIndexOrdinal)
+		h.HashInt(val[i].CheckOrdinal)
+		h.HashColList(val[i].InsertCols)
+		h.HashLocking(val[i].Locking)
+		for _, scalarListExpr := range val[i].DatumsFromConstraint {
+			tuple := *(scalarListExpr.(*TupleExpr))
+			h.HashScalarListExpr(tuple.Elems)
+		}
+	}
+}
+
 func (h *hasher) HashKVOptionsExpr(val KVOptionsExpr) {
 	for i := range val {
 		h.HashString(val[i].Key)
@@ -731,14 +771,39 @@ func (h *hasher) HashPointer(val unsafe.Pointer) {
 	h.HashUint64(uint64(uintptr(val)))
 }
 
-func (h *hasher) HashMaterializeClause(val tree.MaterializeClause) {
-	h.HashBool(val.Set)
-	h.HashBool(val.Materialize)
+func (h *hasher) HashCTEMaterializeClause(val tree.CTEMaterializeClause) {
+	h.HashInt(int(val))
 }
 
 func (h *hasher) HashPersistence(val tree.Persistence) {
 	h.hash ^= internHash(val)
 	h.hash *= prime64
+}
+
+func (h *hasher) HashVolatility(val volatility.V) {
+	h.HashInt(int(val))
+}
+
+func (h *hasher) HashLiteralRows(val *opt.LiteralRows) {
+	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
+}
+
+func (h *hasher) HashUDFDefinition(val *UDFDefinition) {
+	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
+}
+
+func (h *hasher) HashStoredProcTxnOp(val tree.StoredProcTxnOp) {
+	h.HashUint64(uint64(val))
+}
+
+func (h *hasher) HashTransactionModes(val tree.TransactionModes) {
+	h.HashUint64(uint64(val.Isolation))
+	h.HashUint64(uint64(val.UserPriority))
+	h.HashUint64(uint64(val.ReadWriteMode))
+	if val.AsOf.Expr != nil {
+		h.HashExpr(val.AsOf.Expr)
+	}
+	h.HashUint64(uint64(val.Deferrable))
 }
 
 // ----------------------------------------------------------------------
@@ -819,7 +884,7 @@ func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
 		return lt.Locale == rt.Locale && h.IsStringEqual(lt.Contents, rt.Contents)
 	case *tree.DBytes:
 		rt := r.(*tree.DBytes)
-		return bytes.Equal([]byte(*lt), []byte(*rt))
+		return bytes.Equal(lt.UnsafeBytes(), rt.UnsafeBytes())
 	case *tree.DDate:
 		rt := r.(*tree.DDate)
 		return lt.Date == rt.Date
@@ -875,6 +940,10 @@ func (h *hasher) areDatumsWithTypeEqual(ldatums, rdatums tree.Datums, ltyp, rtyp
 		return h.IsTypeEqual(ltyp, rtyp)
 	}
 	return true
+}
+
+func (h *hasher) IsExprEqual(l, r tree.Expr) bool {
+	return l == r
 }
 
 func (h *hasher) IsTypedExprEqual(l, r tree.TypedExpr) bool {
@@ -954,6 +1023,17 @@ func (h *hasher) IsFKCascadesEqual(l, r FKCascades) bool {
 	return true
 }
 
+func (h *hasher) IsAfterTriggersEqual(l, r *AfterTriggers) bool {
+	if l == r {
+		return true
+	}
+	if l == nil || r == nil {
+		return false
+	}
+	// It's sufficient to compare the TriggerBuilder instances.
+	return l.Builder == r.Builder
+}
+
 func (h *hasher) IsExplainOptionsEqual(l, r tree.ExplainOptions) bool {
 	return l == r
 }
@@ -975,6 +1055,10 @@ func (h *hasher) IsScheduleCommandEqual(l, r tree.ScheduleCommand) bool {
 }
 
 func (h *hasher) IsIndexOrdinalEqual(l, r cat.IndexOrdinal) bool {
+	return l == r
+}
+
+func (h *hasher) IsRelocateSubjectEqual(l, r tree.RelocateSubject) bool {
 	return l == r
 }
 
@@ -1002,14 +1086,18 @@ func (h *hasher) IsUniqueOrdinalsEqual(l, r cat.UniqueOrdinals) bool {
 	return true
 }
 
-func (h *hasher) IsViewDepsEqual(l, r opt.ViewDeps) bool {
+func (h *hasher) IsSchemaFunctionDepsEqual(l, r opt.SchemaFunctionDeps) bool {
+	return l.Equals(r)
+}
+
+func (h *hasher) IsSchemaDepsEqual(l, r opt.SchemaDeps) bool {
 	if len(l) != len(r) {
 		return false
 	}
 	return len(l) == 0 || &l[0] == &r[0]
 }
 
-func (h *hasher) IsViewTypeDepsEqual(l, r opt.ViewTypeDeps) bool {
+func (h *hasher) IsSchemaTypeDepsEqual(l, r opt.SchemaTypeDeps) bool {
 	return l.Equals(r)
 }
 
@@ -1028,11 +1116,12 @@ func (h *hasher) IsPhysPropsEqual(l, r *physical.Required) bool {
 	return l.Equals(r)
 }
 
-func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
-	if l == nil || r == nil {
-		return l == r
-	}
-	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
+func (h *hasher) IsDistributionEqual(l, r physical.Distribution) bool {
+	return l.Equals(r)
+}
+
+func (h *hasher) IsLockingEqual(l, r opt.Locking) bool {
+	return l == r
 }
 
 func (h *hasher) IsInvertedSpansEqual(l, r inverted.Spans) bool {
@@ -1149,6 +1238,41 @@ func (h *hasher) IsUniqueChecksExprEqual(l, r UniqueChecksExpr) bool {
 	return true
 }
 
+func (h *hasher) IsFastPathUniqueChecksExprEqual(l, r FastPathUniqueChecksExpr) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if !h.IsRelExprEqual(l[i].Check, r[i].Check) {
+			return false
+		}
+		if l[i].ReferencedTableID != r[i].ReferencedTableID {
+			return false
+		}
+		if l[i].ReferencedIndexOrdinal != r[i].ReferencedIndexOrdinal {
+			return false
+		}
+		if l[i].CheckOrdinal != r[i].CheckOrdinal {
+			return false
+		}
+		if !h.IsLockingEqual(l[i].Locking, r[i].Locking) {
+			return false
+		}
+		if !h.IsColListEqual(l[i].InsertCols, r[i].InsertCols) {
+			return false
+		}
+		if len(l[i].DatumsFromConstraint) != len(r[i].DatumsFromConstraint) {
+			return false
+		}
+		for j := range l[i].DatumsFromConstraint {
+			if l[i].DatumsFromConstraint[j] != r[i].DatumsFromConstraint[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsKVOptionsExprEqual(l, r KVOptionsExpr) bool {
 	if len(l) != len(r) {
 		return false
@@ -1177,12 +1301,72 @@ func (h *hasher) IsOpaqueMetadataEqual(l, r opt.OpaqueMetadata) bool {
 	return l == r
 }
 
-func (h *hasher) IsMaterializeClauseEqual(l, r tree.MaterializeClause) bool {
-	return l.Set == r.Set && l.Materialize == r.Materialize
+func (h *hasher) IsCTEMaterializeClauseEqual(l, r tree.CTEMaterializeClause) bool {
+	return l == r
 }
 
 func (h *hasher) IsPersistenceEqual(l, r tree.Persistence) bool {
 	return l == r
+}
+
+func (h *hasher) IsVolatilityEqual(l, r volatility.V) bool {
+	return l == r
+}
+
+func (h *hasher) IsLiteralRowsEqual(l, r *opt.LiteralRows) bool {
+	return l == r
+}
+
+func (h *hasher) IsUDFDefinitionEqual(l, r *UDFDefinition) bool {
+	if len(l.Body) != len(r.Body) {
+		return false
+	}
+	for i := range l.Body {
+		if !h.IsRelExprEqual(l.Body[i], r.Body[i]) {
+			return false
+		}
+		if !h.IsPhysPropsEqual(l.BodyProps[i], r.BodyProps[i]) {
+			return false
+		}
+	}
+	if l.ExceptionBlock != nil {
+		if r.ExceptionBlock == nil || len(l.ExceptionBlock.Actions) != len(r.ExceptionBlock.Actions) {
+			return false
+		}
+		for i := range l.ExceptionBlock.Actions {
+			if !h.IsUDFDefinitionEqual(l.ExceptionBlock.Actions[i], r.ExceptionBlock.Actions[i]) {
+				return false
+			}
+			if l.ExceptionBlock.Codes[i] != r.ExceptionBlock.Codes[i] {
+				return false
+			}
+		}
+	} else if r.ExceptionBlock != nil {
+		return false
+	}
+	if l.CursorDeclaration != nil {
+		if r.CursorDeclaration == nil {
+			return false
+		}
+		if l.CursorDeclaration.NameArgIdx != r.CursorDeclaration.NameArgIdx ||
+			l.CursorDeclaration.Scroll != r.CursorDeclaration.Scroll ||
+			l.CursorDeclaration.CursorSQL != r.CursorDeclaration.CursorSQL {
+			return false
+		}
+	} else if r.CursorDeclaration != nil {
+		return false
+	}
+	return h.IsColListEqual(l.Params, r.Params) && l.IsRecursive == r.IsRecursive
+}
+
+func (h *hasher) IsStoredProcTxnOpEqual(l, r tree.StoredProcTxnOp) bool {
+	return l == r
+}
+
+func (h *hasher) IsTransactionModesEqual(l, r tree.TransactionModes) bool {
+	return l.Isolation == r.Isolation && l.UserPriority == r.UserPriority &&
+		l.ReadWriteMode == r.ReadWriteMode && l.AsOf.Expr == r.AsOf.Expr &&
+		l.Deferrable == r.Deferrable
 }
 
 // encodeDatum turns the given datum into an encoded string of bytes. If two
@@ -1198,13 +1382,13 @@ func encodeDatum(b []byte, val tree.Datum) []byte {
 	// should not be considered equivalent by the interner (e.g. decimal values
 	// 1.0 and 1.00).
 	if !colinfo.CanHaveCompositeKeyEncoding(val.ResolvedType()) {
-		b, err = rowenc.EncodeTableKey(b, val, encoding.Ascending)
+		b, err = keyside.Encode(b, val, encoding.Ascending)
 		if err == nil {
 			return b
 		}
 	}
 
-	b, err = rowenc.EncodeTableValue(b, descpb.ColumnID(encoding.NoColumnID), val, nil /* scratch */)
+	b, err = valueside.Encode(b, valueside.NoColumnID, val, nil /* scratch */)
 	if err != nil {
 		panic(err)
 	}

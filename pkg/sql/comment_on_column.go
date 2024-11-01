@@ -1,24 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
@@ -38,11 +33,10 @@ func (p *planner) CommentOnColumn(ctx context.Context, n *tree.CommentOnColumn) 
 		return nil, err
 	}
 
-	var tableName tree.TableName
-	if n.ColumnItem.TableName != nil {
-		tableName = n.ColumnItem.TableName.ToTableName()
+	if n.ColumnItem.TableName == nil {
+		return nil, pgerror.New(pgcode.Syntax, "column name must be qualified")
 	}
-	tableDesc, err := p.resolveUncachedTableDescriptor(ctx, &tableName, true, tree.ResolveRequireTableDesc)
+	tableDesc, err := p.ResolveUncachedTableDescriptorEx(ctx, n.ColumnItem.TableName, true, tree.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -55,38 +49,22 @@ func (p *planner) CommentOnColumn(ctx context.Context, n *tree.CommentOnColumn) 
 }
 
 func (n *commentOnColumnNode) startExec(params runParams) error {
-	col, err := n.tableDesc.FindColumnWithName(n.n.ColumnItem.ColumnName)
+	col, err := catalog.MustFindColumnByTreeName(n.tableDesc, n.n.ColumnItem.ColumnName)
 	if err != nil {
 		return err
 	}
 
-	if n.n.Comment != nil {
-		_, err := params.p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			"set-column-comment",
-			params.p.Txn(),
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
-			keys.ColumnCommentType,
-			n.tableDesc.GetID(),
-			col.GetPGAttributeNum(),
-			*n.n.Comment)
-		if err != nil {
-			return err
-		}
+	if n.n.Comment == nil {
+		err = params.p.deleteComment(
+			params.ctx, n.tableDesc.GetID(), uint32(col.GetPGAttributeNum()), catalogkeys.ColumnCommentType,
+		)
 	} else {
-		_, err := params.p.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			"delete-column-comment",
-			params.p.Txn(),
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
-			keys.ColumnCommentType,
-			n.tableDesc.GetID(),
-			col.GetPGAttributeNum())
-		if err != nil {
-			return err
-		}
+		err = params.p.updateComment(
+			params.ctx, n.tableDesc.GetID(), uint32(col.GetPGAttributeNum()), catalogkeys.ColumnCommentType, *n.n.Comment,
+		)
+	}
+	if err != nil {
+		return err
 	}
 
 	comment := ""

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -17,8 +12,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,7 +22,7 @@ func TestSplitAt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -98,7 +91,7 @@ func TestSplitAt(t *testing.T) {
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES ($1)",
 			args:  []interface{}{"blah"},
-			error: "error in argument for $1: strconv.ParseInt",
+			error: "error in argument for $1: could not parse \"blah\" as type int: strconv.ParseInt",
 		},
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES ($1::string)",
@@ -147,7 +140,7 @@ func TestSplitAt(t *testing.T) {
 		},
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '-1 day'::interval",
-			error: "SPLIT AT: expiration time should be greater than or equal to current time",
+			error: "SPLIT AT: interval value '-1 days' too small, SPLIT interval must be >= 1µs",
 		},
 		{
 			in:    "ALTER TABLE d.i SPLIT AT VALUES (17) WITH EXPIRATION '0.1us'",
@@ -170,7 +163,7 @@ func TestSplitAt(t *testing.T) {
 			}
 		} else {
 			// Successful split, verify it happened.
-			rng, err := s.(*server.TestServer).LookupRange(key)
+			rng, err := s.LookupRange(key)
 			if err != nil {
 				t.Fatal(err)
 			}

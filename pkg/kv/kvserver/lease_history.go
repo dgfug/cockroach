@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -26,9 +21,9 @@ type leaseHistory struct {
 	history []roachpb.Lease // A circular buffer with index.
 }
 
-func newLeaseHistory() *leaseHistory {
+func newLeaseHistory(maxEntries int) *leaseHistory {
 	lh := &leaseHistory{
-		history: make([]roachpb.Lease, 0, leaseHistoryMaxEntries),
+		history: make([]roachpb.Lease, 0, maxEntries),
 	}
 	return lh
 }
@@ -44,7 +39,7 @@ func (lh *leaseHistory) add(lease roachpb.Lease) {
 		lh.history[lh.index] = lease
 	}
 	lh.index++
-	if lh.index >= leaseHistoryMaxEntries {
+	if lh.index >= cap(lh.history) {
 		lh.index = 0
 	}
 }
@@ -55,7 +50,7 @@ func (lh *leaseHistory) get() []roachpb.Lease {
 	if len(lh.history) == 0 {
 		return nil
 	}
-	if len(lh.history) < leaseHistoryMaxEntries || lh.index == 0 {
+	if len(lh.history) < cap(lh.history) || lh.index == 0 {
 		result := make([]roachpb.Lease, len(lh.history))
 		copy(result, lh.history)
 		return result

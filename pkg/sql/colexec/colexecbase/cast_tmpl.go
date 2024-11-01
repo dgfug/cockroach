@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -22,26 +17,29 @@
 package colexecbase
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -56,6 +54,9 @@ var (
 	_ = uuid.FromBytes
 	_ = oid.T_name
 	_ = util.TruncateString
+	_ = pgcode.Syntax
+	_ = pgdate.ParseTimestamp
+	_ = pgerror.Wrapf
 )
 
 // {{/*
@@ -76,7 +77,7 @@ const _TYPE_WIDTH = 0
 // "castOp" template in the scope of this value's "callsite".
 const _GENERATE_CAST_OP = 0
 
-func _CAST(to, from, fromCol, toType interface{}) {
+func _CAST(to, from, evalCtx, toType, buf interface{}) {
 	colexecerror.InternalError(errors.AssertionFailedf(""))
 }
 
@@ -91,9 +92,10 @@ func isIdentityCast(fromType, toType *types.T) bool {
 		// by float64 physically.
 		return true
 	}
-	if fromType.Family() == types.UuidFamily && toType.Family() == types.BytesFamily {
-		// The cast from UUID to Bytes is an identity because we don't need to
-		// perform any conversion since both are represented in the same way.
+	if toType.Family() == types.BytesFamily && (fromType.Family() == types.UuidFamily || fromType.Family() == types.EnumFamily) {
+		// The casts from UUID or enum to Bytes is an identity because we don't
+		// need to perform any conversion since both are represented in the same
+		// way.
 		return true
 	}
 	return false
@@ -106,7 +108,7 @@ func GetCastOperator(
 	resultIdx int,
 	fromType *types.T,
 	toType *types.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 ) (colexecop.Operator, error) {
 	input = colexecutils.NewVectorTypeEnforcer(allocator, input, toType, resultIdx)
 	base := castOpBase{
@@ -120,7 +122,15 @@ func GetCastOperator(
 		return &castOpNullAny{castOpBase: base}, nil
 	}
 	if isIdentityCast(fromType, toType) {
-		return &castIdentityOp{castOpBase: base}, nil
+		// bpchars require special handling.
+		if toType.Oid() == oid.T_bpchar {
+			return &castBPCharIdentityOp{castOpBase: base}, nil
+		}
+		// If we don't have an array of bpchars, then we use the identity,
+		// otherwise we'll fallback to datum-datum cast below.
+		if toType.Oid() != oid.T__bpchar {
+			return &castIdentityOp{castOpBase: base}, nil
+		}
 	}
 	isFromDatum := typeconv.TypeFamilyToCanonicalTypeFamily(fromType.Family()) == typeconv.DatumVecCanonicalTypeFamily
 	isToDatum := typeconv.TypeFamilyToCanonicalTypeFamily(toType.Family()) == typeconv.DatumVecCanonicalTypeFamily
@@ -167,7 +177,11 @@ func GetCastOperator(
 			// {{end}}
 		}
 	}
-	return nil, errors.Errorf("unhandled cast %s -> %s", fromType.SQLString(), toType.SQLString())
+	return nil, errors.Errorf(
+		"unhandled cast %s -> %s",
+		fromType.SQLStringForError(),
+		toType.SQLStringForError(),
+	)
 }
 
 func IsCastSupported(fromType, toType *types.T) bool {
@@ -224,12 +238,12 @@ func IsCastSupported(fromType, toType *types.T) bool {
 }
 
 type castOpBase struct {
-	colexecop.OneInputInitCloserHelper
-
 	allocator *colmem.Allocator
+	evalCtx   *eval.Context
+	buf       bytes.Buffer
+	colexecop.OneInputInitCloserHelper
 	colIdx    int
 	outputIdx int
-	evalCtx   *tree.EvalContext
 }
 
 func (c *castOpBase) Reset(ctx context.Context) {
@@ -254,11 +268,6 @@ func (c *castOpNullAny) Next() coldata.Batch {
 	projVec := batch.ColVec(c.outputIdx)
 	vecNulls := vec.Nulls()
 	projNulls := projVec.Nulls()
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over nulls values in the
-		// output vector.
-		projNulls.UnsetNulls()
-	}
 	if sel := batch.Selection(); sel != nil {
 		sel = sel[:n]
 		for _, i := range sel {
@@ -284,12 +293,14 @@ func (c *castOpNullAny) Next() coldata.Batch {
 // types are identical. The job of this operator is to simply copy the input
 // column into the output column, without performing the deselection step. Not
 // performing the deselection is justified by the following:
-// 1. to be in line with other cast operators
-// 2. AND/OR projection operators cannot handle when a different batch is
-//    returned than the one they fed into the projection chain (which might
-//    contain casts)
-// 3. performing the deselection would require copying over all vectors, not
-//    just the output one.
+//
+//  1. to be in line with other cast operators
+//  2. AND/OR projection operators cannot handle when a different batch is
+//     returned than the one they fed into the projection chain (which might
+//     contain casts)
+//  3. performing the deselection would require copying over all vectors, not
+//     just the output one.
+//
 // This operator should be planned rarely enough (if ever) to not be very
 // important.
 type castIdentityOp struct {
@@ -298,6 +309,16 @@ type castIdentityOp struct {
 
 var _ colexecop.ClosableOperator = &castIdentityOp{}
 
+// identityOrder is a slice in which every integer equals its ordinal.
+var identityOrder []int
+
+func init() {
+	identityOrder = make([]int, coldata.MaxBatchSize)
+	for i := range identityOrder {
+		identityOrder[i] = i
+	}
+}
+
 func (c *castIdentityOp) Next() coldata.Batch {
 	batch := c.Input.Next()
 	n := batch.Length()
@@ -305,18 +326,64 @@ func (c *castIdentityOp) Next() coldata.Batch {
 		return coldata.ZeroBatch
 	}
 	projVec := batch.ColVec(c.outputIdx)
-	c.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
-		maxIdx := n
+	c.allocator.PerformOperation([]*coldata.Vec{projVec}, func() {
+		srcVec := batch.ColVec(c.colIdx)
 		if sel := batch.Selection(); sel != nil {
 			// We don't want to perform the deselection during copying, so we
-			// will copy everything up to (and including) the last selected
-			// element, without the selection vector.
-			maxIdx = sel[n-1] + 1
+			// use a special copy in which we use the identity order but apply
+			// the selection vector.
+			projVec.CopyWithReorderedSource(srcVec, sel[:n], identityOrder)
+		} else {
+			projVec.Copy(coldata.SliceArgs{
+				Src:         srcVec,
+				SrcStartIdx: 0,
+				SrcEndIdx:   n,
+			})
 		}
-		projVec.Copy(coldata.SliceArgs{
-			Src:       batch.ColVec(c.colIdx),
-			SrcEndIdx: maxIdx,
-		})
+	})
+	return batch
+}
+
+// castBPCharIdentityOp is a specialization of castIdentityOp which handles
+// casts to the bpchar type (which trims trailing whitespaces).
+type castBPCharIdentityOp struct {
+	castOpBase
+}
+
+var _ colexecop.ClosableOperator = &castBPCharIdentityOp{}
+
+func (c *castBPCharIdentityOp) Next() coldata.Batch {
+	batch := c.Input.Next()
+	n := batch.Length()
+	if n == 0 {
+		return coldata.ZeroBatch
+	}
+	inputVec := batch.ColVec(c.colIdx)
+	inputCol := inputVec.Bytes()
+	inputNulls := inputVec.Nulls()
+	outputVec := batch.ColVec(c.outputIdx)
+	outputCol := outputVec.Bytes()
+	outputNulls := outputVec.Nulls()
+	// Note that the loops below are not as optimized as in other cast operators
+	// since this operator should only be planned in tests.
+	c.allocator.PerformOperation([]*coldata.Vec{outputVec}, func() {
+		if sel := batch.Selection(); sel != nil {
+			for _, i := range sel[:n] {
+				if inputNulls.NullAt(i) {
+					outputNulls.SetNull(i)
+				} else {
+					outputCol.Set(i, bytes.TrimRight(inputCol.Get(i), " "))
+				}
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				if inputNulls.NullAt(i) {
+					outputNulls.SetNull(i)
+				} else {
+					outputCol.Set(i, bytes.TrimRight(inputCol.Get(i), " "))
+				}
+			}
+		}
 	})
 	return batch
 }
@@ -325,7 +392,7 @@ type castNativeToDatumOp struct {
 	castOpBase
 
 	scratch []tree.Datum
-	da      rowenc.DatumAlloc
+	da      tree.DatumAlloc
 }
 
 var _ colexecop.ClosableOperator = &castNativeToDatumOp{}
@@ -341,9 +408,9 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 	outputCol := outputVec.Datum()
 	outputNulls := outputVec.Nulls()
 	toType := outputVec.Type()
-	c.allocator.PerformOperation([]coldata.Vec{outputVec}, func() {
-		if n > c.da.AllocSize {
-			c.da.AllocSize = n
+	c.allocator.PerformOperation([]*coldata.Vec{outputVec}, func() {
+		if n > c.da.DefaultAllocSize {
+			c.da.DefaultAllocSize = n
 		}
 		if cap(c.scratch) < n {
 			c.scratch = make([]tree.Datum, n)
@@ -356,22 +423,22 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 		if sel != nil {
 			if inputVec.Nulls().MaybeHasNulls() {
 				for scratchIdx, outputIdx := range sel[:n] {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, true, false)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, true, false)
 				}
 			} else {
 				for scratchIdx, outputIdx := range sel[:n] {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, false, false)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, scratchIdx, outputIdx, toType, c.evalCtx, false, false)
 				}
 			}
 		} else {
 			_ = scratch[n-1]
 			if inputVec.Nulls().MaybeHasNulls() {
 				for idx := 0; idx < n; idx++ {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, true, true)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, true, true)
 				}
 			} else {
 				for idx := 0; idx < n; idx++ {
-					setNativeToDatumCast(outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, false, true)
+					setNativeToDatumCast(c.Ctx, outputCol, outputNulls, scratch, idx, idx, toType, c.evalCtx, false, true)
 				}
 			}
 		}
@@ -385,13 +452,14 @@ func (c *castNativeToDatumOp) Next() coldata.Batch {
 // execgen:inline
 // execgen:template<hasNulls,scratchBCE>
 func setNativeToDatumCast(
+	ctx context.Context,
 	outputCol coldata.DatumVec,
 	outputNulls *coldata.Nulls,
 	scratch []tree.Datum,
 	scratchIdx int,
 	outputIdx int,
 	toType *types.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	hasNulls bool,
 	scratchBCE bool,
 ) {
@@ -403,7 +471,7 @@ func setNativeToDatumCast(
 		outputNulls.SetNull(outputIdx)
 		continue
 	}
-	res, err := tree.PerformCast(evalCtx, converted, toType)
+	res, err := eval.PerformCast(ctx, evalCtx, converted, toType)
 	if err != nil {
 		colexecerror.ExpectedError(err)
 	}
@@ -419,14 +487,6 @@ func setNativeToDatumCast(
 
 type cast_NAMEOp struct {
 	castOpBase
-
-	// {{if and (eq $fromFamily "types.DecimalFamily") (eq $toFamily "types.IntFamily")}}
-	// {{/*
-	// overloadHelper is used only when we perform the cast from decimals to
-	// ints. In all other cases we don't want to wastefully allocate the helper.
-	// */}}
-	overloadHelper execgen.OverloadHelper
-	// {{end}}
 }
 
 var _ colexecop.ResettableOperator = &cast_NAMEOp{}
@@ -438,19 +498,22 @@ func (c *cast_NAMEOp) Next() coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	// {{if and (eq $fromFamily "types.DecimalFamily") (eq $toFamily "types.IntFamily")}}
-	// In order to inline the templated code of overloads, we need to have a
-	// "_overloadHelper" local variable of type "execgen.OverloadHelper".
-	_overloadHelper := c.overloadHelper
-	// {{end}}
 	sel := batch.Selection()
 	inputVec := batch.ColVec(c.colIdx)
 	outputVec := batch.ColVec(c.outputIdx)
+	// {{if eq $fromFamily "types.EnumFamily"}}
+	// {{/*
+	//     TODO(yuzefovich): fromType should really be propagated as an
+	//     argument, but it is only used in one cast at the moment, so we're
+	//     being lazy.
+	// */}}
+	fromType := inputVec.Type()
+	// {{end}}
 	toType := outputVec.Type()
 	// Remove unused warnings.
 	_ = toType
 	c.allocator.PerformOperation(
-		[]coldata.Vec{outputVec}, func() {
+		[]*coldata.Vec{outputVec}, func() {
 			inputCol := inputVec._FROM_TYPE()
 			inputNulls := inputVec.Nulls()
 			outputCol := outputVec._TO_TYPE()
@@ -461,26 +524,17 @@ func (c *cast_NAMEOp) Next() coldata.Batch {
 			if inputVec.MaybeHasNulls() {
 				outputNulls.Copy(inputNulls)
 				if sel != nil {
-					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, true, true)
+					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, &c.buf, true, true)
 				} else {
-					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, true, false)
+					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, &c.buf, true, false)
 				}
 			} else {
-				// We need to make sure that there are no left over null values
-				// in the output vector.
-				outputNulls.UnsetNulls()
 				if sel != nil {
-					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, false, true)
+					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, &c.buf, false, true)
 				} else {
-					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, false, false)
+					castTuples(inputCol, inputNulls, outputCol, outputNulls, toType, n, sel, c.evalCtx, &c.buf, false, false)
 				}
 			}
-			// {{/*
-			// Although we didn't change the length of the batch, it is
-			// necessary to set the length anyway (this helps maintaining the
-			// invariant of flat bytes).
-			// */}}
-			batch.SetLength(n)
 		},
 	)
 	return batch
@@ -537,12 +591,14 @@ func castTuples(
 	toType *types.T,
 	n int,
 	sel []int,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
+	buf *bytes.Buffer,
 	hasNulls bool,
 	hasSel bool,
 ) {
-	// Silence unused warning.
+	// Silence unused warnings.
 	_ = evalCtx
+	_ = buf
 	if !hasSel {
 		// {{if $fromInfo.Sliceable}}
 		_ = inputCol.Get(n - 1)
@@ -568,7 +624,7 @@ func castTuples(
 		}
 		v := inputCol.Get(tupleIdx)
 		var r _TO_GO_TYPE
-		_CAST(r, v, evalCtx, toType)
+		_CAST(r, v, evalCtx, toType, buf)
 		if !hasSel {
 			// {{if .Sliceable}}
 			//gcassert:bce

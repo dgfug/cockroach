@@ -1,18 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package raftentry
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -80,12 +76,13 @@ func TestRingBuffer_Add(t *testing.T) {
 
 func TestRingBuffer_Scan(t *testing.T) {
 	for _, tc := range []struct {
-		desc       string
-		lo, hi, mb uint64
+		desc   string
+		lo, hi kvpb.RaftIndex
+		mb     uint64
 
 		idxs             []uint64 // full range is 10,11,12,13,14, each of size 10
 		scanBytes        uint64
-		nextIdx          uint64
+		nextIdx          kvpb.RaftIndex
 		exceededMaxBytes bool
 	}{
 		{
@@ -190,9 +187,9 @@ func TestRingBuffer_ClearTo(t *testing.T) {
 	eq(t, b)
 }
 
-func eq(t *testing.T, b *ringBuf, idxs ...uint64) {
+func eq(t *testing.T, b *ringBuf, idxs ...kvpb.RaftIndex) {
 	t.Helper()
-	var sl []uint64
+	var sl []kvpb.RaftIndex
 	it := first(b)
 	for it.valid(b) {
 		idx := it.index(b)
@@ -200,7 +197,7 @@ func eq(t *testing.T, b *ringBuf, idxs ...uint64) {
 		it, _ = it.next(b)
 		ent, ok := b.get(idx)
 		require.True(t, ok)
-		require.Equal(t, idx, ent.Index)
+		require.Equal(t, idx, kvpb.RaftIndex(ent.Index))
 	}
 	require.Equal(t, idxs, sl)
 	if len(sl) == 0 {

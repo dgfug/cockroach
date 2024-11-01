@@ -1,8 +1,9 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "ssmemstorage",
     srcs = [
+        "ss_mem_counter.go",
         "ss_mem_iterator.go",
         "ss_mem_storage.go",
         "ss_mem_writer.go",
@@ -11,17 +12,37 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
         "//pkg/server/serverpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/appstatspb",
         "//pkg/sql/execstats",
+        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sqlstats",
+        "//pkg/sql/sqlstats/insights",
         "//pkg/util",
         "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+    ],
+)
+
+go_test(
+    name = "ssmemstorage_test",
+    srcs = ["ss_mem_writer_test.go"],
+    embed = [":ssmemstorage"],
+    deps = [
+        "//pkg/settings/cluster",
+        "//pkg/sql/appstatspb",
+        "//pkg/sql/clusterunique",
+        "//pkg/sql/sqlstats",
+        "//pkg/sql/sqlstats/insights",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
+        "//pkg/util/mon",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_stretchr_testify//require",
     ],
 )

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 type refreshMaterializedViewNode struct {
@@ -30,9 +26,6 @@ type refreshMaterializedViewNode struct {
 func (p *planner) RefreshMaterializedView(
 	ctx context.Context, n *tree.RefreshMaterializedView,
 ) (planNode, error) {
-	if !p.EvalContext().TxnImplicit {
-		return nil, pgerror.Newf(pgcode.InvalidTransactionState, "cannot refresh view in an explicit transaction")
-	}
 	_, desc, err := p.ResolveMutableTableDescriptorEx(ctx, n.Name, true /* required */, tree.ResolveRequireViewDesc)
 	if err != nil {
 		return nil, err
@@ -49,18 +42,12 @@ func (p *planner) RefreshMaterializedView(
 		}
 	}
 
-	// Only the owner or an admin (superuser) can refresh the view.
-	hasAdminRole, err := p.HasAdminRole(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	hasOwnership, err := p.HasOwnership(ctx, desc)
 	if err != nil {
 		return nil, err
 	}
 
-	if !(hasOwnership || hasAdminRole) {
+	if !hasOwnership {
 		return nil, pgerror.Newf(
 			pgcode.InsufficientPrivilege,
 			"must be owner of materialized view %s",
@@ -79,7 +66,11 @@ func (n *refreshMaterializedViewNode) startExec(params runParams) error {
 	// results of the view query into the new set of indexes, and then change the
 	// set of indexes over to the new set of indexes atomically.
 
-	telemetry.Inc(n.n.TelemetryCounter())
+	if !params.p.extendedEvalCtx.TxnIsSingleStmt {
+		return pgerror.Newf(pgcode.InvalidTransactionState, "cannot refresh view in a multi-statement transaction")
+	}
+
+	telemetry.Inc(sqltelemetry.SchemaRefreshMaterializedView)
 
 	// Inform the user that CONCURRENTLY is not needed.
 	if n.n.Concurrently {
@@ -107,6 +98,9 @@ func (n *refreshMaterializedViewNode) startExec(params runParams) error {
 		newIndexes[i].ID = getID()
 	}
 
+	// Set RefreshViewRequired to false. This will allow SELECT operations on the materialized
+	// view to succeed when the view has been created with the NO DATA option.
+	n.desc.RefreshViewRequired = false
 	// Queue the refresh mutation.
 	n.desc.AddMaterializedViewRefreshMutation(&descpb.MaterializedViewRefresh{
 		NewPrimaryIndex: newPrimaryIndex,
@@ -118,7 +112,7 @@ func (n *refreshMaterializedViewNode) startExec(params runParams) error {
 	return params.p.writeSchemaChange(
 		params.ctx,
 		n.desc,
-		n.desc.ClusterVersion.NextMutationID,
+		n.desc.ClusterVersion().NextMutationID,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
 	)
 }

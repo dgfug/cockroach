@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -98,7 +94,7 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 		}
 
 		// Get the array type that needs to be dropped as well.
-		mutArrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
+		mutArrayDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeDesc.ArrayTypeID)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +116,7 @@ func (p *planner) canDropTypeDesc(
 		return err
 	}
 	if len(desc.ReferencingDescriptorIDs) > 0 && behavior != tree.DropCascade {
-		dependentNames, err := p.getFullyQualifiedTableNamesFromIDs(ctx, desc.ReferencingDescriptorIDs)
+		dependentNames, err := p.getFullyQualifiedNamesFromIDs(ctx, desc.ReferencingDescriptorIDs)
 		if err != nil {
 			return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
 		}
@@ -161,7 +157,7 @@ func (n *dropTypeNode) startExec(params runParams) error {
 func (p *planner) addTypeBackReference(
 	ctx context.Context, typeID, ref descpb.ID, jobDesc string,
 ) error {
-	mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeID)
+	mutDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
 	if err != nil {
 		return err
 	}
@@ -181,7 +177,7 @@ func (p *planner) removeTypeBackReferences(
 	ctx context.Context, typeIDs []descpb.ID, ref descpb.ID, jobDesc string,
 ) error {
 	for _, typeID := range typeIDs {
-		mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeID)
+		mutDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
 		if err != nil {
 			return err
 		}
@@ -196,13 +192,12 @@ func (p *planner) removeTypeBackReferences(
 func (p *planner) addBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
-	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
-		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return err
 	}
 	typeIDs, _, err := desc.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
-		mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, id)
+		mutDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -223,13 +218,12 @@ func (p *planner) addBackRefsFromAllTypesInTable(
 func (p *planner) removeBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
-	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
-		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return err
 	}
 	typeIDs, _, err := desc.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
-		mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, id)
+		mutDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -242,6 +236,31 @@ func (p *planner) removeBackRefsFromAllTypesInTable(
 	return p.removeTypeBackReferences(ctx, typeIDs, desc.ID, jobDesc)
 }
 
+func (p *planner) addBackRefsFromAllTypesInType(ctx context.Context, desc *typedesc.Mutable) error {
+	typeIDs := desc.GetIDClosure()
+	for _, id := range typeIDs.Ordered() {
+		if id == desc.ID {
+			// Don't add a self back reference.
+			continue
+		}
+		jobDesc := fmt.Sprintf("updating type back reference %d for type %d", id, desc.ID)
+		if err := p.addTypeBackReference(ctx, id, desc.ID, jobDesc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *planner) removeBackRefsFromAllTypesInType(
+	ctx context.Context, desc *typedesc.Mutable,
+) error {
+	typeIDs := desc.GetIDClosure()
+	// Don't add a self back reference.
+	typeIDs.Remove(desc.ID)
+	jobDesc := fmt.Sprintf("updating type back references %v for type %d", typeIDs, desc.ID)
+	return p.removeTypeBackReferences(ctx, typeIDs.Ordered(), desc.ID, jobDesc)
+}
+
 // dropTypeImpl does the work of dropping a type and everything that depends on it.
 func (p *planner) dropTypeImpl(
 	ctx context.Context, typeDesc *typedesc.Mutable, jobDesc string, queueJob bool,
@@ -250,16 +269,38 @@ func (p *planner) dropTypeImpl(
 		return errors.Errorf("type %q is already being dropped", typeDesc.Name)
 	}
 
+	// Exit early with an error if the type is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(typeDesc) {
+		return scerrors.ConcurrentSchemaChangeError(typeDesc)
+	}
+
 	// Actually mark the type as dropped.
 	typeDesc.SetDropped()
 
 	// Delete namespace entry for type.
 	b := p.txn.NewBatch()
-	p.dropNamespaceEntry(ctx, b, typeDesc)
+	if err := p.dropNamespaceEntry(ctx, b, typeDesc); err != nil {
+		return err
+	}
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
 	}
 
+	// For this type descriptor, delete queued schema change jobs from the job
+	// cache. If the job had already been scheduled, we would also need to mark
+	// these jobs as successful, but that should never happen for types.
+	//
+	// Note that we still wait for jobs removed from the cache to finish running
+	// after the transaction, since they're not removed from the jobsCollection.
+	// Also, changes made here do not affect schema change jobs created in this
+	// transaction with no mutation ID; they remain in the cache, and will be
+	// updated when writing the job record to drop the table.
+	delete(p.ExtendedEvalContext().jobs.uniqueToCreate, typeDesc.ID)
+
+	if err := p.removeBackRefsFromAllTypesInType(ctx, typeDesc); err != nil {
+		return err
+	}
 	// Write updated type descriptor.
 	if queueJob {
 		return p.writeTypeSchemaChange(ctx, typeDesc, jobDesc)

@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutilsccl
 
@@ -17,10 +14,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/stretchr/testify/require"
@@ -62,12 +59,21 @@ func AlterPrimaryKeyCorrectZoneConfigTest(
 	for _, tc := range testCases {
 		t.Run(tc.Desc, func(t *testing.T) {
 			var db *gosql.DB
-			params, _ := tests.CreateTestServerParams()
+			var params base.TestServerArgs
+			params.Settings = cluster.MakeClusterSettings()
 			params.Locality.Tiers = []roachpb.Tier{
 				{Key: "region", Value: "ajstorm-1"},
 			}
 
 			runCheck := false
+
+			// This setting must be overridden so that secondary tenants can configure
+			// regions.
+			sql.SecondaryTenantsMultiRegionAbstractionsEnabled.Override(
+				ctx,
+				&params.Settings.SV,
+				true,
+			)
 			params.Knobs = base.TestingKnobs{
 				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 					BackfillChunkSize: chunkSize,

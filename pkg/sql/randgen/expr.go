@@ -1,19 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randgen
 
 import (
 	"math/rand"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -81,7 +80,8 @@ func isAllowedPartialIndexColType(columnTableDef *tree.ColumnTableDef) bool {
 	}
 }
 
-var cmpOps = []tree.ComparisonOperatorSymbol{tree.EQ, tree.NE, tree.LT, tree.LE, tree.GE, tree.GT}
+// TODO(jordan): should we be including more comparison operators here?
+var cmpOps = []treecmp.ComparisonOperatorSymbol{treecmp.EQ, treecmp.NE, treecmp.LT, treecmp.LE, treecmp.GE, treecmp.GT}
 
 // randBoolColumnExpr returns a random boolean expression with the given column.
 func randBoolColumnExpr(
@@ -101,7 +101,7 @@ func randBoolColumnExpr(
 	// Otherwise, return a comparison expression with a random comparison
 	// operator, the column as the left side, and an interesting datum as the
 	// right side.
-	op := tree.MakeComparisonOperator(cmpOps[rng.Intn(len(cmpOps))])
+	op := treecmp.MakeComparisonOperator(cmpOps[rng.Intn(len(cmpOps))])
 	datum := randInterestingDatum(rng, t)
 	return &tree.ComparisonExpr{Operator: op, Left: varExpr, Right: datum}
 }
@@ -129,8 +129,9 @@ func randAndOrExpr(rng *rand.Rand, left, right tree.Expr) tree.Expr {
 // have a NotNull nullability.
 func randExpr(
 	rng *rand.Rand, normalColDefs []*tree.ColumnTableDef, nullOk bool,
-) (tree.Expr, *types.T, tree.Nullability) {
+) (_ tree.Expr, _ *types.T, _ tree.Nullability, referencedCols map[tree.Name]struct{}) {
 	nullability := tree.NotNull
+	referencedCols = make(map[tree.Name]struct{})
 
 	if rng.Intn(2) == 0 {
 		// Try to find a set of numeric columns with the same type; the computed
@@ -155,8 +156,8 @@ func randExpr(
 			}
 		}
 		if len(cols) > 1 {
-			// If any of the columns are nullable, set the computed column to be
-			// nullable.
+			// If any of the columns are nullable, the resulting expression
+			// could be null.
 			for _, x := range cols {
 				if x.Nullable.Nullability != tree.NotNull {
 					nullability = x.Nullable.Nullability
@@ -166,26 +167,40 @@ func randExpr(
 
 			var expr tree.Expr
 			expr = tree.NewUnresolvedName(string(cols[0].Name))
+			referencedCols[cols[0].Name] = struct{}{}
+			colType := cols[0].Type.(*types.T)
 			for _, x := range cols[1:] {
+				origExpr := expr
+				origColType := colType
 				expr = &tree.BinaryExpr{
-					Operator: tree.MakeBinaryOperator(tree.Plus),
+					Operator: treebin.MakeBinaryOperator(treebin.Plus),
 					Left:     expr,
 					Right:    tree.NewUnresolvedName(string(x.Name)),
 				}
+				referencedCols[x.Name] = struct{}{}
+				// Make sure the data type is large enough to hold the result. For
+				// example, (INT4 + INT8) should be an INT8, not an INT4.
+				colType = tree.InferBinaryType(treebin.Plus, colType, x.Type.(*types.T))
+				if colType == nil {
+					// If the plus expression is illegal, don't use it.
+					colType = origColType
+					expr = origExpr
+				}
 			}
-			return expr, cols[0].Type.(*types.T), nullability
+			return expr, colType, nullability, referencedCols
 		}
 	}
 
 	// Pick a single column and create a computed column that depends on it.
 	// The expression is as follows:
-	//  - for numeric types (int, float, decimal), the expression is "x+1";
+	//  - for numeric types (int, float, decimal), the expression is "abs(x)";
 	//  - for string type, the expression is "lower(x)";
 	//  - for types that can be cast to string in computed columns, the expression
 	//    is "lower(x::string)";
 	//  - otherwise, the expression is `CASE WHEN x IS NULL THEN 'foo' ELSE 'bar'`.
 	x := normalColDefs[randutil.RandIntInRange(rng, 0, len(normalColDefs))]
 	xTyp := x.Type.(*types.T)
+	referencedCols[x.Name] = struct{}{}
 
 	// Match the nullability with the nullability of the reference column.
 	nullability = x.Nullable.Nullability
@@ -196,10 +211,10 @@ func randExpr(
 	switch xTyp.Family() {
 	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
 		typ = xTyp
-		expr = &tree.BinaryExpr{
-			Operator: tree.MakeBinaryOperator(tree.Plus),
-			Left:     tree.NewUnresolvedName(string(x.Name)),
-			Right:    RandDatum(rng, xTyp, nullOk),
+		// Avoid using an arithmetic operation that could overflow.
+		expr = &tree.FuncExpr{
+			Func:  tree.WrapFunction("abs"),
+			Exprs: tree.Exprs{tree.NewUnresolvedName(string(x.Name))},
 		}
 
 	case types.StringFamily:
@@ -210,8 +225,9 @@ func randExpr(
 		}
 
 	default:
-		volatility, ok := tree.LookupCastVolatility(xTyp, types.String, nil /* sessionData */)
-		if ok && volatility <= tree.VolatilityImmutable {
+		vol, ok := cast.LookupCastVolatility(xTyp, types.String)
+		if ok && vol <= volatility.Immutable &&
+			!typeToStringCastHasIncorrectVolatility(xTyp) {
 			// We can cast to string; use lower(x::string)
 			typ = types.String
 			expr = &tree.FuncExpr{
@@ -241,5 +257,28 @@ func randExpr(
 		}
 	}
 
-	return expr, typ, nullability
+	return expr, typ, nullability, referencedCols
+}
+
+// typeToStringCastHasIncorrectVolatility returns true for a given type if the
+// cast from it to STRING types has been given an incorrect volatility. For
+// example, REGCLASS->STRING casts are immutable when they should be stable (see
+// #74286 and #74553 for more details).
+//
+// Creating computed column expressions with such a cast can cause logical
+// correctness bugs and internal errors. The volatilities cannot be fixed
+// without causing backward incompatibility, so this function is used to prevent
+// sqlsmith and TLP from repetitively finding these known volatility bugs.
+func typeToStringCastHasIncorrectVolatility(t *types.T) bool {
+	switch t.Family() {
+	case types.DateFamily, types.EnumFamily, types.TimestampFamily,
+		types.IntervalFamily, types.TupleFamily:
+		return true
+	case types.OidFamily:
+		return t.Identical(types.RegClass) || t.Identical(types.RegNamespace) ||
+			t.Identical(types.RegProc) || t.Identical(types.RegProcedure) ||
+			t.Identical(types.RegRole) || t.Identical(types.RegType)
+	default:
+		return false
+	}
 }

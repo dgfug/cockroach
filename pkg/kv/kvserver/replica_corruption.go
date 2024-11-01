@@ -1,21 +1,17 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -38,8 +34,8 @@ import (
 // @bdarnell remarks: Corruption errors should be rare so we may want the store
 // to just recompute its stats in the background when one occurs.
 func (r *Replica) setCorruptRaftMuLocked(
-	ctx context.Context, cErr *roachpb.ReplicaCorruptionError,
-) *roachpb.Error {
+	ctx context.Context, cErr *kvpb.ReplicaCorruptionError,
+) *kvpb.Error {
 	r.readOnlyCmdMu.Lock()
 	defer r.readOnlyCmdMu.Unlock()
 	r.mu.Lock()
@@ -49,8 +45,8 @@ func (r *Replica) setCorruptRaftMuLocked(
 	cErr.Processed = true
 	r.mu.destroyStatus.Set(cErr, destroyReasonRemoved)
 
-	auxDir := r.store.engine.GetAuxiliaryDir()
-	_ = r.store.engine.MkdirAll(auxDir)
+	auxDir := r.store.TODOEngine().GetAuxiliaryDir()
+	_ = r.store.TODOEngine().Env().MkdirAll(auxDir, os.ModePerm)
 	path := base.PreventedStartupFile(auxDir)
 
 	preventStartupMsg := fmt.Sprintf(`ATTENTION:
@@ -63,10 +59,10 @@ A file preventing this node from restarting was placed at:
 %s
 `, r, path)
 
-	if err := fs.WriteFile(r.store.engine, path, []byte(preventStartupMsg)); err != nil {
+	if err := fs.WriteFile(r.store.TODOEngine().Env(), path, []byte(preventStartupMsg), fs.UnspecifiedWriteCategory); err != nil {
 		log.Warningf(ctx, "%v", err)
 	}
 
 	log.FatalfDepth(ctx, 1, "replica is corrupted: %s", cErr)
-	return roachpb.NewError(cErr)
+	return kvpb.NewError(cErr)
 }

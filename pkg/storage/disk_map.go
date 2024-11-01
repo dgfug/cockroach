@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -53,11 +48,13 @@ type pebbleMapBatchWriter struct {
 type pebbleMapIterator struct {
 	allowDuplicates bool
 	iter            *pebble.Iterator
-	// makeKey is a function that transforms a key into a byte slice with a prefix
-	// used to SeekGE() the underlying iterator.
-	makeKey func(k []byte) []byte
-	// prefix is the prefix of keys that this iterator iterates over.
-	prefix []byte
+	// prefixLen is the length of the prefix of keys that this iterator iterates
+	// over.
+	prefixLen int
+	// makeKeyScratch is a scratch space reused when transforming a key into a
+	// byte slice with a prefix used to SeekGE() the iterator. First prefixLen
+	// bytes are always the prefix of all keys touched by this iterator.
+	makeKeyScratch []byte
 }
 
 // pebbleMap is a SortedDiskMap, similar to rocksDBMap, that uses pebble as its
@@ -112,13 +109,18 @@ func (r *pebbleMap) makeKeyWithSequence(k []byte) []byte {
 
 // NewIterator implements the SortedDiskMap interface.
 func (r *pebbleMap) NewIterator() diskmap.SortedDiskMapIterator {
+	iter, err := r.store.NewIter(&pebble.IterOptions{
+		UpperBound: roachpb.Key(r.prefix).PrefixEnd(),
+	})
+	if err != nil {
+		// TODO(bilal): Update all diskMap interfaces to allow returning errors here.
+		panic(err)
+	}
 	return &pebbleMapIterator{
 		allowDuplicates: r.allowDuplicates,
-		iter: r.store.NewIter(&pebble.IterOptions{
-			UpperBound: roachpb.Key(r.prefix).PrefixEnd(),
-		}),
-		makeKey: r.makeKey,
-		prefix:  r.prefix,
+		iter:            iter,
+		prefixLen:       len(r.prefix),
+		makeKeyScratch:  append([]byte{}, r.prefix...),
 	}
 }
 
@@ -164,6 +166,14 @@ func (r *pebbleMap) Close(ctx context.Context) {
 	}
 }
 
+// makeKey is a function that transforms a key into a byte slice with a prefix
+// used to SeekGE() the underlying iterator. This key is only valid until the
+// next call to makeKey and **cannot** be mutated.
+func (i *pebbleMapIterator) makeKey(k []byte) []byte {
+	i.makeKeyScratch = append(i.makeKeyScratch[:i.prefixLen], k...)
+	return i.makeKeyScratch
+}
+
 // SeekGE implements the SortedDiskMapIterator interface.
 func (i *pebbleMapIterator) SeekGE(k []byte) {
 	i.iter.SeekGE(i.makeKey(k))
@@ -192,11 +202,14 @@ func (i *pebbleMapIterator) UnsafeKey() []byte {
 		// There are 8 bytes of sequence number at the end of the key, remove them.
 		end -= 8
 	}
-	return unsafeKey[len(i.prefix):end]
+	return unsafeKey[i.prefixLen:end]
 }
 
 // UnsafeValue implements the SortedDiskMapIterator interface.
 func (i *pebbleMapIterator) UnsafeValue() []byte {
+	// TODO(sumeer): switch to using ValueAndErr. Since error only happens for
+	// non in-place values, and temp engines only have in-place values, this
+	// change is not critical.
 	return i.iter.Value()
 }
 

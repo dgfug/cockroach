@@ -1,16 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
+	"context"
 	"database/sql/driver"
 	"fmt"
 	"net/http"
@@ -19,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -92,15 +88,20 @@ func runLogin(cmd *cobra.Command, args []string) error {
 func createAuthSessionToken(
 	username string,
 ) (sessionID int64, httpCookie *http.Cookie, resErr error) {
-	sqlConn, err := makeSQLClient("cockroach auth-session login", useSystemDb)
+	ctx := context.Background()
+	sqlConn, err := makeSQLClient(ctx, "cockroach auth-session login", useSystemDb)
 	if err != nil {
 		return -1, nil, err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, sqlConn.Close()) }()
 
 	// First things first. Does the user exist?
-	_, rows, err := sqlExecCtx.RunQuery(sqlConn,
-		clisqlclient.MakeQuery(`SELECT count(username) FROM system.users WHERE username = $1 AND NOT "isRole"`, username), false)
+	_, rows, err := sqlExecCtx.RunQuery(
+		ctx,
+		sqlConn,
+		clisqlclient.MakeQuery(`SELECT count(username) FROM system.users WHERE username = $1 AND NOT "isRole"`, username),
+		false, /* showMoreChars */
+	)
 	if err != nil {
 		return -1, nil, err
 	}
@@ -109,41 +110,54 @@ func createAuthSessionToken(
 	}
 
 	// Make a secret.
-	secret, hashedSecret, err := server.CreateAuthSecret()
+	secret, hashedSecret, err := authserver.CreateAuthSecret()
 	if err != nil {
 		return -1, nil, err
 	}
 	expiration := timeutil.Now().Add(authCtx.validityPeriod)
 
 	// Create the session on the server to the server.
-	insertSessionStmt := `
-INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt")
-VALUES($1, $2, $3)
+	var id int64
+	err = sqlConn.ExecTxn(ctx, func(ctx context.Context, conn clisqlclient.TxBoundConn) error {
+		insertSessionStmt := `
+INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt", user_id)
+VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $2))
 RETURNING id
 `
-	var id int64
-	row, err := sqlConn.QueryRow(
-		insertSessionStmt,
-		[]driver.Value{
+		rows, err := conn.Query(ctx,
+			insertSessionStmt,
 			hashedSecret,
 			username,
 			expiration,
-		},
-	)
+		)
+		if err != nil {
+			return err
+		}
+		row := make([]driver.Value, 1)
+		if err := rows.Next(row); err != nil {
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(row) != 1 {
+			return errors.Newf("expected 1 column, got %d", len(row))
+		}
+
+		var ok bool
+		id, ok = row[0].(int64)
+		if !ok {
+			return errors.Newf("expected integer, got %T", row[0])
+		}
+		return nil
+	})
 	if err != nil {
 		return -1, nil, err
-	}
-	if len(row) != 1 {
-		return -1, nil, errors.Newf("expected 1 column, got %d", len(row))
-	}
-	id, ok := row[0].(int64)
-	if !ok {
-		return -1, nil, errors.Newf("expected integer, got %T", row[0])
 	}
 
 	// Spell out the cookie.
 	sCookie := &serverpb.SessionCookie{ID: id, Secret: secret}
-	httpCookie, err = server.EncodeSessionCookie(sCookie, false /* forHTTPSOnly */)
+	httpCookie, err = authserver.EncodeSessionCookie(sCookie, false /* forHTTPSOnly */)
 	return id, httpCookie, err
 }
 
@@ -162,8 +176,8 @@ The user for which the HTTP sessions are revoked can be arbitrary.
 
 func runLogout(cmd *cobra.Command, args []string) (resErr error) {
 	username := tree.Name(args[0]).Normalize()
-
-	sqlConn, err := makeSQLClient("cockroach auth-session logout", useSystemDb)
+	ctx := context.Background()
+	sqlConn, err := makeSQLClient(ctx, "cockroach auth-session logout", useSystemDb)
 	if err != nil {
 		return err
 	}
@@ -176,7 +190,9 @@ func runLogout(cmd *cobra.Command, args []string) (resErr error) {
             id AS "session ID",
             "revokedAt" AS "revoked"`,
 		username)
-	return sqlExecCtx.RunQueryAndFormatResults(sqlConn, os.Stdout, stderr, logoutQuery)
+	return sqlExecCtx.RunQueryAndFormatResults(
+		ctx,
+		sqlConn, os.Stdout, os.Stdout, stderr, logoutQuery)
 }
 
 var authListCmd = &cobra.Command{
@@ -192,21 +208,26 @@ The user invoking the 'list' CLI command must be an admin on the cluster.
 }
 
 func runAuthList(cmd *cobra.Command, args []string) (resErr error) {
-	sqlConn, err := makeSQLClient("cockroach auth-session list", useSystemDb)
+	ctx := context.Background()
+	sqlConn, err := makeSQLClient(ctx, "cockroach auth-session list", useSystemDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, sqlConn.Close()) }()
 
-	logoutQuery := clisqlclient.MakeQuery(`
+	// TODO(yang): Change this to read the user_id directly from the table in 23.2.
+	authListQuery := clisqlclient.MakeQuery(`
 SELECT username,
+       (SELECT user_id FROM system.users AS u WHERE w.username = u.username) AS "user ID",
        id AS "session ID",
        "createdAt" as "created",
        "expiresAt" as "expires",
        "revokedAt" as "revoked",
        "lastUsedAt" as "last used"
-  FROM system.web_sessions`)
-	return sqlExecCtx.RunQueryAndFormatResults(sqlConn, os.Stdout, stderr, logoutQuery)
+  FROM system.web_sessions AS w`)
+	return sqlExecCtx.RunQueryAndFormatResults(
+		ctx,
+		sqlConn, os.Stdout, os.Stdout, stderr, authListQuery)
 }
 
 var authCmds = []*cobra.Command{

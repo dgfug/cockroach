@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser
 
@@ -116,7 +111,7 @@ world$$`, []int{SCONST}},
 		{`1e-1`, []int{FCONST}},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var tokens []int
 		for {
 			var lval = &sqlSymType{}
@@ -153,7 +148,7 @@ foo`, "", "foo"},
 		{`/* /* */`, "unterminated comment", ""},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var lval = &sqlSymType{}
 		present, ok := s.ScanComment(lval)
 		if d.err == "" && (!present || !ok) {
@@ -169,7 +164,7 @@ foo`, "", "foo"},
 
 func TestScanKeyword(t *testing.T) {
 	for _, kwName := range lexbase.KeywordNames {
-		s := makeScanner(kwName)
+		s := makeSQLScanner(kwName)
 		var lval = &sqlSymType{}
 		s.Scan(lval)
 		if id := lexbase.GetKeywordID(kwName); id != lval.ID() {
@@ -209,7 +204,7 @@ func TestScanNumber(t *testing.T) {
 		{`9223372036854775809`, `9223372036854775809`, ICONST},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var lval = &sqlSymType{}
 		s.Scan(lval)
 		if d.id != int(lval.ID()) {
@@ -231,7 +226,7 @@ func TestScanPlaceholder(t *testing.T) {
 		{`$123`, "123"},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var lval = &sqlSymType{}
 		s.Scan(lval)
 		if lval.ID() != PLACEHOLDER {
@@ -255,6 +250,7 @@ func TestScanString(t *testing.T) {
 		{`'a""b'`, `a""b`},
 		{`'a''b'`, `a'b`},
 		{`"a" "b"`, `a`},
+		{"\"a\"\n\"b\"", `a`},
 		{`'a' 'b'`, `a`},
 		{`'\n'`, `\n`},
 		{`e'\n'`, "\n"},
@@ -262,7 +258,7 @@ func TestScanString(t *testing.T) {
 		{`'\'''`, `\'`},
 		{`'\0\'`, `\0\`},
 		{`"a"
-	"b"`, `ab`},
+	"b"`, `a`},
 		{`"a"
 	'b'`, `a`},
 		{`'a'
@@ -324,7 +320,7 @@ world`},
 		{`$a$a$$`, `unterminated string`},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var lval = &sqlSymType{}
 		s.Scan(lval)
 		if d.expected != lval.Str() {
@@ -355,9 +351,12 @@ func TestScanError(t *testing.T) {
 		{`$0`, "placeholder index must be between 1 and 65536"},
 		{`$9223372036854775809`, "placeholder index must be between 1 and 65536"},
 		{`B'123'`, `"2" is not a valid binary digit`},
+		{`123foo`, "trailing junk after numeric literal at or near \"123f\""},
+		{`1.23foo`, "trailing junk after numeric literal at or near \"1.23f\""},
+		{`0x0afoo`, "trailing junk after numeric literal at or near \"0x0afo\""},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql)
+		s := makeSQLScanner(d.sql)
 		var lval = &sqlSymType{}
 		s.Scan(lval)
 		if lval.ID() != ERROR {

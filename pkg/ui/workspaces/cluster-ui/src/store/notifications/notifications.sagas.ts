@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { createAction } from "@reduxjs/toolkit";
 import { all, put, takeEvery } from "redux-saga/effects";
@@ -38,32 +33,32 @@ export function* notifificationsSaga() {
   // Terminate Query notifications //
   // ***************************** //
   yield all([
-    takeEvery(terminateQueryActions.terminateSessionCompleted, function*() {
+    takeEvery(terminateQueryActions.terminateSessionCompleted, function* () {
       yield put(
-        notificationAction(NotificationType.Success, "Session terminated."),
+        notificationAction(NotificationType.Success, "Session cancelled."),
       );
     }),
 
-    takeEvery(terminateQueryActions.terminateSessionFailed, function*() {
+    takeEvery(terminateQueryActions.terminateSessionFailed, function* () {
       yield put(
         notificationAction(
           NotificationType.Error,
-          "There was an error terminating the session",
+          "There was an error cancelling the session",
         ),
       );
     }),
 
-    takeEvery(terminateQueryActions.terminateQueryCompleted, function*() {
+    takeEvery(terminateQueryActions.terminateQueryCompleted, function* () {
       yield put(
-        notificationAction(NotificationType.Success, "Query terminated."),
+        notificationAction(NotificationType.Success, "Statement cancelled."),
       );
     }),
 
-    takeEvery(terminateQueryActions.terminateQueryFailed, function*() {
+    takeEvery(terminateQueryActions.terminateQueryFailed, function* () {
       yield put(
         notificationAction(
           NotificationType.Error,
-          "There was an error terminating the query.",
+          "There was an error cancelling the statement.",
         ),
       );
     }),

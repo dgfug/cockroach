@@ -1,18 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -37,7 +32,7 @@ type CommandFilters struct {
 
 // RunFilters executes the registered filters, stopping at the first one
 // that returns an error.
-func (c *CommandFilters) RunFilters(args kvserverbase.FilterArgs) *roachpb.Error {
+func (c *CommandFilters) RunFilters(args kvserverbase.FilterArgs) *kvpb.Error {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -47,7 +42,7 @@ func (c *CommandFilters) RunFilters(args kvserverbase.FilterArgs) *roachpb.Error
 	return c.runFiltersInternal(args)
 }
 
-func (c *CommandFilters) runFiltersInternal(args kvserverbase.FilterArgs) *roachpb.Error {
+func (c *CommandFilters) runFiltersInternal(args kvserverbase.FilterArgs) *kvpb.Error {
 	for _, f := range c.filters {
 		if pErr := f.filter(args); pErr != nil {
 			return pErr

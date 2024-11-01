@@ -1,10 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ccl
 
@@ -12,24 +9,52 @@ package ccl
 // import of this package enables building a binary with CCL features.
 
 import (
-	// ccl init hooks. Don't include cliccl here, it pulls in pkg/cli, which
-	// does weird things at init time.
+	"github.com/cockroachdb/cockroach/pkg/base"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/auditloggingccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/buildccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/cliccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/crosscluster/logical"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/crosscluster/physical"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/crosscluster/producer"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/gqpccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/importccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/jwtauthccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/ldapccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/oidcccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/pgcryptoccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/plpgsqlccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/securityccl/fipsccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingest"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingutils"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
+	"github.com/cockroachdb/cockroach/pkg/server/license"
 )
+
+func init() {
+	// Set up license-related hooks from OSS to CCL. The implementation of the
+	// functions we bind is in utilccl, but license checks only work once
+	// utilccl.AllCCLCodeImported is set, above; that's why this hookup is done in
+	// this `ccl` pkg.
+	base.CheckEnterpriseEnabled = utilccl.CheckEnterpriseEnabled
+	base.LicenseType = utilccl.GetLicenseType
+	base.GetLicenseTTL = utilccl.GetLicenseTTL
+	license.RegisterCallbackOnLicenseChange = utilccl.RegisterCallbackOnLicenseChange
+}
+
+// TestingEnableEnterprise allows overriding the license check in tests.
+func TestingEnableEnterprise() func() {
+	return utilccl.TestingEnableEnterprise()
+}
+
+// TestingDisableEnterprise allows re-enabling the license check in tests.
+func TestingDisableEnterprise() func() {
+	return utilccl.TestingDisableEnterprise()
+}

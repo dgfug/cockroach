@@ -1,19 +1,16 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package blobs
 
 import (
+	"context"
 	"io"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 )
 
 // Within the blob service, streaming is used in two functions:
@@ -35,7 +32,7 @@ var chunkSize = 128 * 1 << 10
 
 // blobStreamReader implements a ReadCloser which receives
 // gRPC streaming messages.
-var _ io.ReadCloser = &blobStreamReader{}
+var _ ioctx.ReadCloserCtx = &blobStreamReader{}
 
 type streamReceiver interface {
 	SendAndClose(*blobspb.StreamResponse) error
@@ -55,7 +52,7 @@ func (*nopSendAndClose) SendAndClose(*blobspb.StreamResponse) error {
 
 // newGetStreamReader creates an io.ReadCloser that uses gRPC's streaming API
 // to read chunks of data.
-func newGetStreamReader(client blobspb.Blob_GetStreamClient) io.ReadCloser {
+func newGetStreamReader(client blobspb.Blob_GetStreamClient) ioctx.ReadCloserCtx {
 	return &blobStreamReader{
 		stream: &nopSendAndClose{client},
 	}
@@ -63,7 +60,7 @@ func newGetStreamReader(client blobspb.Blob_GetStreamClient) io.ReadCloser {
 
 // newPutStreamReader creates an io.ReadCloser that uses gRPC's streaming API
 // to read chunks of data.
-func newPutStreamReader(client blobspb.Blob_PutStreamServer) io.ReadCloser {
+func newPutStreamReader(client blobspb.Blob_PutStreamServer) ioctx.ReadCloserCtx {
 	return &blobStreamReader{stream: client}
 }
 
@@ -74,7 +71,7 @@ type blobStreamReader struct {
 	EOFReached  bool
 }
 
-func (r *blobStreamReader) Read(out []byte) (int, error) {
+func (r *blobStreamReader) Read(ctx context.Context, out []byte) (int, error) {
 	if r.EOFReached {
 		return 0, io.EOF
 	}
@@ -115,7 +112,7 @@ func (r *blobStreamReader) Read(out []byte) (int, error) {
 	return offset, nil
 }
 
-func (r *blobStreamReader) Close() error {
+func (r *blobStreamReader) Close(ctx context.Context) error {
 	return r.stream.SendAndClose(&blobspb.StreamResponse{})
 }
 
@@ -126,11 +123,11 @@ type streamSender interface {
 // streamContent splits the content into chunks, of size `chunkSize`,
 // and streams those chunks to sender.
 // Note: This does not close the stream.
-func streamContent(sender streamSender, content io.Reader) error {
+func streamContent(ctx context.Context, sender streamSender, content ioctx.ReaderCtx) error {
 	payload := make([]byte, chunkSize)
 	var chunk blobspb.StreamChunk
 	for {
-		n, err := content.Read(payload)
+		n, err := content.Read(ctx, payload)
 		if n > 0 {
 			chunk.Payload = payload[:n]
 			err = sender.Send(&chunk)

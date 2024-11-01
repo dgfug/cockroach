@@ -1,15 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package sqlproxyccl implements a server to proxy SQL connections.
 package sqlproxyccl
 
 import (
-	"io"
 	"net"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -30,35 +27,27 @@ func updateMetricsAndSendErrToClient(err error, conn net.Conn, metrics *metrics)
 }
 
 func toPgError(err error) *pgproto3.ErrorResponse {
-	codeErr := (*codeError)(nil)
-	if errors.As(err, &codeErr) {
+	if getErrorCode(err) != codeNone {
 		var msg string
-		switch codeErr.code {
+		switch getErrorCode(err) {
 		// These are send as is.
 		case codeExpiredClientConnection,
-			codeBackendDown,
+			codeBackendDialFailed,
 			codeParamsRoutingFailed,
 			codeClientDisconnected,
 			codeBackendDisconnected,
 			codeAuthFailed,
 			codeProxyRefusedConnection,
-			codeIdleDisconnect:
-			msg = codeErr.Error()
+			codeUnavailable:
+			msg = err.Error()
 		// The rest - the message sent back is sanitized.
 		case codeUnexpectedInsecureStartupMessage:
 			msg = "server requires encryption"
 		}
 
-		var pgCode string
-		if codeErr.code == codeIdleDisconnect {
-			pgCode = pgcode.AdminShutdown.String()
-		} else {
-			pgCode = pgcode.SQLserverRejectedEstablishmentOfSQLconnection.String()
-		}
-
 		return &pgproto3.ErrorResponse{
 			Severity: "FATAL",
-			Code:     pgCode,
+			Code:     pgcode.ProxyConnectionError.String(),
 			Message:  msg,
 			Hint:     errors.FlattenHints(err),
 		}
@@ -66,7 +55,7 @@ func toPgError(err error) *pgproto3.ErrorResponse {
 	// Return a generic "internal server error" message.
 	return &pgproto3.ErrorResponse{
 		Severity: "FATAL",
-		Code:     pgcode.SQLserverRejectedEstablishmentOfSQLconnection.String(),
+		Code:     pgcode.ProxyConnectionError.String(),
 		Message:  "internal server error",
 	}
 }
@@ -79,46 +68,4 @@ var SendErrToClient = func(conn net.Conn, err error) {
 		return
 	}
 	_, _ = conn.Write(toPgError(err).Encode(nil))
-}
-
-// ConnectionCopy does a bi-directional copy between the backend and frontend
-// connections. It terminates when one of connections terminate.
-func ConnectionCopy(crdbConn, conn net.Conn) error {
-	errOutgoing := make(chan error, 1)
-	errIncoming := make(chan error, 1)
-
-	go func() {
-		_, err := io.Copy(crdbConn, conn)
-		errOutgoing <- err
-	}()
-	go func() {
-		_, err := io.Copy(conn, crdbConn)
-		errIncoming <- err
-	}()
-
-	select {
-	// NB: when using pgx, we see a nil errIncoming first on clean connection
-	// termination. Using psql I see a nil errOutgoing first. I think the PG
-	// protocol stipulates sending a message to the server at which point the
-	// server closes the connection (errIncoming), but presumably the client
-	// gets to close the connection once it's sent that message, meaning either
-	// case is possible.
-	case err := <-errIncoming:
-		if err == nil {
-			return nil
-		} else if codeErr := (*codeError)(nil); errors.As(err, &codeErr) &&
-			codeErr.code == codeExpiredClientConnection {
-			return codeErr
-		} else if ne := (net.Error)(nil); errors.As(err, &ne) && ne.Timeout() {
-			return newErrorf(codeIdleDisconnect, "terminating connection due to idle timeout: %v", err)
-		} else {
-			return newErrorf(codeBackendDisconnected, "copying from target server to client: %s", err)
-		}
-	case err := <-errOutgoing:
-		// The incoming connection got closed.
-		if err != nil {
-			return newErrorf(codeClientDisconnected, "copying from target server to client: %v", err)
-		}
-		return nil
-	}
 }

@@ -1,21 +1,18 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // recursiveCTENode implements the logic for a recursive CTE:
@@ -23,15 +20,18 @@ import (
 //     a "working" table.
 //  2. So long as the working table is not empty:
 //     * evaluate the recursive query, substituting the current contents of
-//       the working table for the recursive self-reference;
+//     the working table for the recursive self-reference;
 //     * emit all resulting rows, and save them as the next iteration's
-//       working table.
+//     working table.
+//
 // The recursive query tree is regenerated each time using a callback
 // (implemented by the execbuilder).
 type recursiveCTENode struct {
 	initial planNode
 
 	genIterationFn exec.RecursiveCTEIterationFn
+	// iterationCount tracks the number of invocations of genIterationFn.
+	iterationCount int
 
 	label string
 
@@ -63,9 +63,9 @@ type recursiveCTERun struct {
 
 func (n *recursiveCTENode) startExec(params runParams) error {
 	n.typs = planTypes(n.initial)
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 	if n.deduplicate {
-		n.allRows.InitWithDedup(n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
+		n.allRows.InitWithDedup(params.ctx, n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
 	}
 	return nil
 }
@@ -91,7 +91,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 				return false, err
 			}
 		}
-		n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+		n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 		n.initialDone = true
 	}
 
@@ -123,7 +123,7 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 	defer lastWorkingRows.Close(params.ctx)
 
 	n.workingRows = rowContainerHelper{}
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 
 	// Set up a bufferNode that can be used as a reference for a scanBufferNode.
 	buf := &bufferNode{
@@ -134,16 +134,23 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 		rows:  lastWorkingRows,
 		label: n.label,
 	}
-	newPlan, err := n.genIterationFn(newExecFactory(params.p), buf)
+	newPlan, err := n.genIterationFn(newExecFactory(params.ctx, params.p), buf)
 	if err != nil {
 		return false, err
 	}
 
-	if err := runPlanInsidePlan(params, newPlan.(*planComponents), rowResultWriter(n)); err != nil {
+	n.iterationCount++
+	opName := "recursive-cte-iteration-" + strconv.Itoa(n.iterationCount)
+	ctx, sp := tracing.ChildSpan(params.ctx, opName)
+	defer sp.Finish()
+	if err := runPlanInsidePlan(
+		ctx, params, newPlan.(*planComponents), rowResultWriter(n),
+		nil /* deferredRoutineSender */, "", /* stmtForDistSQLDiagram */
+	); err != nil {
 		return false, err
 	}
 
-	n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+	n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 	n.currentRow, err = n.iterator.Next()
 	if err != nil {
 		return false, err
@@ -189,8 +196,8 @@ func (n *recursiveCTENode) AddRow(ctx context.Context, row tree.Datums) error {
 	return n.workingRows.AddRow(ctx, row)
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (n *recursiveCTENode) IncrementRowsAffected(context.Context, int) {
+// SetRowsAffected is part of the rowResultWriter interface.
+func (n *recursiveCTENode) SetRowsAffected(context.Context, int) {
 }
 
 // SetError is part of the rowResultWriter interface.

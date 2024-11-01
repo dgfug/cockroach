@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -17,15 +12,16 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/stretchr/testify/require"
 )
 
 type queryCounter struct {
@@ -42,6 +38,7 @@ type queryCounter struct {
 	ddlCount                        int64
 	miscCount                       int64
 	miscExecutedCount               int64
+	copyCount                       int64
 	failureCount                    int64
 	txnCommitCount                  int64
 	txnRollbackCount                int64
@@ -56,7 +53,7 @@ func TestQueryCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLLeaseManager: &lease.ManagerTestingKnobs{
 			// Disable SELECT called for delete orphaned leases to keep
@@ -64,8 +61,9 @@ func TestQueryCounts(t *testing.T) {
 			DisableDeleteOrphanedLeases: true,
 		},
 	}
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	var testcases = []queryCounter{
 		// The counts are deltas for each query.
@@ -105,6 +103,7 @@ func TestQueryCounts(t *testing.T) {
 		{query: "SELECT 3", selectCount: 1, selectExecutedCount: 1},
 		{query: "CREATE TABLE mt.n (num INTEGER PRIMARY KEY)", ddlCount: 1},
 		{query: "UPDATE mt.n SET num = num + 1", updateCount: 1},
+		{query: "COPY mt.n(num) FROM STDIN", copyCount: 1, expectError: true},
 	}
 
 	accum := initializeQueryCounter(s)
@@ -116,7 +115,7 @@ func TestQueryCounts(t *testing.T) {
 			}
 
 			// Force metric snapshot refresh.
-			if err := s.WriteSummaries(); err != nil {
+			if err := srv.WriteSummaries(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -157,6 +156,9 @@ func TestQueryCounts(t *testing.T) {
 			if accum.miscExecutedCount, err = checkCounterDelta(s, sql.MetaMiscExecuted, accum.miscExecutedCount, tc.miscExecutedCount); err != nil {
 				t.Errorf("%q: %s", tc.query, err)
 			}
+			if accum.copyCount, err = checkCounterDelta(s, sql.MetaCopyStarted, accum.copyCount, tc.copyCount); err != nil {
+				t.Errorf("%q: %s", tc.query, err)
+			}
 			if accum.failureCount, err = checkCounterDelta(s, sql.MetaFailure, accum.failureCount, tc.failureCount); err != nil {
 				t.Errorf("%q: %s", tc.query, err)
 			}
@@ -172,7 +174,7 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testutils.RunTrueAndFalse(t, "retry loop", func(t *testing.T, retry bool) {
-		params, cmdFilters := tests.CreateTestServerParams()
+		params, cmdFilters := createTestServerParams()
 		s, sqlDB, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(context.Background())
 
@@ -187,15 +189,15 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 
 		// Inject errors on the INSERT below.
 		restarted := false
-		cmdFilters.AppendFilter(func(args kvserverbase.FilterArgs) *roachpb.Error {
+		cmdFilters.AppendFilter(func(args kvserverbase.FilterArgs) *kvpb.Error {
 			switch req := args.Req.(type) {
 			// SQL INSERT generates ConditionalPuts for unique indexes (such as the PK).
-			case *roachpb.ConditionalPutRequest:
+			case *kvpb.ConditionalPutRequest:
 				if bytes.Contains(req.Value.RawBytes, []byte("marker")) && !restarted {
 					restarted = true
-					return roachpb.NewErrorWithTxn(
-						roachpb.NewTransactionAbortedError(
-							roachpb.ABORT_REASON_ABORTED_RECORD_FOUND), args.Hdr.Txn)
+					return kvpb.NewErrorWithTxn(
+						kvpb.NewTransactionAbortedError(
+							kvpb.ABORT_REASON_ABORTED_RECORD_FOUND), args.Hdr.Txn)
 				}
 			}
 			return nil
@@ -277,7 +279,7 @@ func TestAbortCountConflictingWrites(t *testing.T) {
 func TestAbortCountErrorDuringTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -312,7 +314,7 @@ func TestSavepointMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -384,4 +386,29 @@ func TestSavepointMetrics(t *testing.T) {
 	if _, err := checkCounterDelta(s, sql.MetaTxnRollbackStarted, accum.txnRollbackCount, 2); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestMemMetricsCorrectlyRegistered(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	r := metric.NewRegistry()
+	mm := sql.MakeMemMetrics("test", base.DefaultHistogramWindowInterval())
+	r.AddMetricStruct(mm)
+
+	expectedMetrics := []string{
+		"sql.mem.test.max",
+		"sql.mem.test.current",
+		"sql.mem.test.txn.max",
+		"sql.mem.test.txn.current",
+		"sql.mem.test.session.max",
+		"sql.mem.test.session.current",
+		"sql.mem.test.session.prepared.max",
+		"sql.mem.test.session.prepared.current",
+	}
+	var registered []string
+	r.Each(func(name string, val interface{}) {
+		registered = append(registered, name)
+	})
+	require.ElementsMatch(t, expectedMetrics, registered)
 }

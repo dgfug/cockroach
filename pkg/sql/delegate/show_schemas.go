@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
@@ -27,18 +23,26 @@ func (d *delegator) delegateShowSchemas(n *tree.ShowSchemas) (tree.Statement, er
 	if err != nil {
 		return nil, err
 	}
+
+	commentColumn, commentJoin := ``, ``
+	if n.WithComment {
+		commentTableName := name.String() + ".pg_catalog.pg_description"
+		commentColumn, commentJoin = d.getCommentQuery(commentTableName, catconstants.PgCatalogNamespaceTableID, "n.oid")
+
+	}
+
 	getSchemasQuery := fmt.Sprintf(`
-      SELECT nspname AS schema_name, rolname AS owner
-      FROM %[1]s.information_schema.schemata i
-      INNER JOIN pg_catalog.pg_namespace n ON (n.nspname = i.schema_name)
-      LEFT JOIN pg_catalog.pg_roles r ON (n.nspowner = r.oid)
-			WHERE catalog_name = %[2]s
-			ORDER BY schema_name`,
-		name.String(), // note: (tree.Name).String() != string(name)
-		lexbase.EscapeSQLString(string(name)),
+									SELECT n.nspname AS schema_name, r.rolname AS owner%[1]s
+FROM %[2]s.information_schema.schemata i
+INNER JOIN %[2]s.pg_catalog.pg_namespace n ON (n.nspname = i.schema_name)
+LEFT JOIN %[2]s.pg_catalog.pg_roles r ON (n.nspowner = r.oid)
+							%s
+WHERE catalog_name = %s
+ORDER BY schema_name`,
+		commentColumn, name.String(), commentJoin, lexbase.EscapeSQLString(string(name)),
 	)
 
-	return parse(getSchemasQuery)
+	return d.parse(getSchemasQuery)
 }
 
 func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
@@ -53,7 +57,7 @@ func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
 		lexbase.EscapeSQLString(databaseLiteral),
 	)
 
-	return parse(query)
+	return d.parse(query)
 }
 
 // getSpecifiedOrCurrentDatabase returns the name of the specified database, or
@@ -62,18 +66,6 @@ func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
 // Returns an error if there is no current database, or if the specified
 // database doesn't exist.
 func (d *delegator) getSpecifiedOrCurrentDatabase(specifiedDB tree.Name) (tree.Name, error) {
-	var name cat.SchemaName
-	if specifiedDB != "" {
-		// Note: the schema name may be interpreted as database name,
-		// see name_resolution.go.
-		name.SchemaName = specifiedDB
-		name.ExplicitSchema = true
-	}
-
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	_, resName, err := d.catalog.ResolveSchema(d.ctx, flags, &name)
-	if err != nil {
-		return "", err
-	}
-	return resName.CatalogName, nil
+	return d.catalog.LookupDatabaseName(d.ctx, flags, string(specifiedDB))
 }

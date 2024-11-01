@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -21,8 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -44,25 +38,26 @@ func TestGossipFirstRange(t *testing.T) {
 
 	errors := make(chan error, 1)
 	descs := make(chan *roachpb.RangeDescriptor)
-	unregister := tc.Servers[0].Gossip().RegisterCallback(gossip.KeyFirstRangeDescriptor,
-		func(_ string, content roachpb.Value) {
-			var desc roachpb.RangeDescriptor
-			if err := content.GetProto(&desc); err != nil {
-				select {
-				case errors <- err:
-				default:
+	unregister := tc.Servers[0].GossipI().(*gossip.Gossip).
+		RegisterCallback(gossip.KeyFirstRangeDescriptor,
+			func(_ string, content roachpb.Value) {
+				var desc roachpb.RangeDescriptor
+				if err := content.GetProto(&desc); err != nil {
+					select {
+					case errors <- err:
+					default:
+					}
+				} else {
+					select {
+					case descs <- &desc:
+					case <-time.After(45 * time.Second):
+						t.Logf("had to drop descriptor %+v", desc)
+					}
 				}
-			} else {
-				select {
-				case descs <- &desc:
-				case <-time.After(45 * time.Second):
-					t.Logf("had to drop descriptor %+v", desc)
-				}
-			}
-		},
-		// Redundant callbacks are required by this test.
-		gossip.Redundant,
-	)
+			},
+			// Redundant callbacks are required by this test.
+			gossip.Redundant,
+		)
 	// Unregister the callback before attempting to stop the stopper to prevent
 	// deadlock. This is still flaky in theory since a callback can fire between
 	// the last read from the channels and this unregister, but testing has
@@ -147,6 +142,8 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 
 	// As of Nov 2018 it takes 3.6s.
 	skip.UnderShort(t)
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
 	ctx := context.Background()
 
 	// Shorten the raft tick interval and election timeout to make range leases
@@ -161,8 +158,8 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 			MaxBackoff:     50 * time.Millisecond,
 		},
 	}
-	serverArgs.RaftTickInterval = 50 * time.Millisecond
-	serverArgs.RaftElectionTimeoutTicks = 10
+	serverArgs.RaftConfig.RaftTickInterval = 50 * time.Millisecond
+	serverArgs.RaftConfig.RaftElectionTimeoutTicks = 10
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
@@ -173,13 +170,26 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	// Take down the first node and replace it with a new one.
 	oldNodeIdx := 0
 	newServerArgs := serverArgs
-	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingRPCAddr()
-	newServerArgs.SQLAddr = tc.Servers[oldNodeIdx].ServingSQLAddr()
+	newServerArgs.Addr = tc.Servers[oldNodeIdx].AdvRPCAddr()
+	newServerArgs.SQLAddr = tc.Servers[oldNodeIdx].AdvSQLAddr()
 	newServerArgs.PartOfCluster = true
-	newServerArgs.JoinAddr = tc.Servers[1].ServingRPCAddr()
+	newServerArgs.JoinAddr = tc.Servers[1].AdvRPCAddr()
 	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
-	tc.AddAndStartServer(t, newServerArgs)
+	// We are re-using a hard-coded port. Other processes on the system may by now
+	// be listening on this port, so there will be flakes. For now, skip the test
+	// when this flake occurs.
+	//
+	// The real solution would be to create listeners for both RPC and SQL at the
+	// beginning of the test, and to make sure they aren't closed on server
+	// shutdown. Then we can pass the listeners to the second invocation. Alas,
+	// this requires some refactoring that remains out of scope for now.
+	err := tc.AddAndStartServerE(newServerArgs)
+	if testutils.IsError(err, `address already in use`) {
+		skip.WithIssue(t, 114036, "could not start server due to port reuse:", err)
+	} else {
+		require.NoError(t, err)
+	}
 
 	tc.WaitForNStores(t, tc.NumServers(), tc.Server(1).GossipI().(*gossip.Gossip))
 
@@ -194,71 +204,5 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		if err := kvClient.Put(ctx, fmt.Sprintf("%d", i), i); err != nil {
 			t.Errorf("failed Put to node %d: %+v", i, err)
 		}
-	}
-}
-
-// TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents tests
-// that failures to gossip the system config due to intents are rectified when
-// later intents are aborted.
-func TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	require.NoError(t, tc.WaitForFullReplication())
-
-	db := tc.Server(0).DB()
-
-	txA := db.NewTxn(ctx, "a")
-	txB := db.NewTxn(ctx, "b")
-
-	require.NoError(t, txA.SetSystemConfigTrigger(true /* forSystemTenant */))
-	db1000 := dbdesc.NewInitial(1000, "1000", security.AdminRoleName())
-	require.NoError(t, txA.Put(ctx,
-		keys.SystemSQLCodec.DescMetadataKey(1000),
-		db1000.DescriptorProto()))
-
-	require.NoError(t, txB.SetSystemConfigTrigger(true /* forSystemTenant */))
-	db2000 := dbdesc.NewInitial(2000, "2000", security.AdminRoleName())
-	require.NoError(t, txB.Put(ctx,
-		keys.SystemSQLCodec.DescMetadataKey(2000),
-		db2000.DescriptorProto()))
-
-	const someTime = 10 * time.Millisecond
-	clearNotifictions := func(ch <-chan struct{}) {
-		for {
-			select {
-			case <-ch:
-			case <-time.After(someTime):
-				return
-			}
-		}
-	}
-	systemConfChangeCh := tc.Server(0).GossipI().(*gossip.Gossip).RegisterSystemConfigChannel()
-	clearNotifictions(systemConfChangeCh)
-	require.NoError(t, txB.Commit(ctx))
-	select {
-	case <-systemConfChangeCh:
-		// This case is rare but happens sometimes. We gossip the node liveness
-		// in a bunch of cases so we just let the test finish here. The important
-		// thing is that sometimes we get to the next phase.
-		t.Log("got unexpected update. This can happen for a variety of " +
-			"reasons like lease transfers. The test is exiting without testing anything")
-		return
-	case <-time.After(someTime):
-		// Did not expect an update so this is the happy case
-	}
-	// Roll back the transaction which had laid down the intent which blocked the
-	// earlier gossip update, make sure we get a gossip notification now.
-	const aLongTime = 20 * someTime
-	require.NoError(t, txA.Rollback(ctx))
-	select {
-	case <-systemConfChangeCh:
-		// Got an update.
-	case <-time.After(aLongTime):
-		t.Fatal("expected update")
 	}
 }

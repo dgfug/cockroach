@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -16,7 +11,7 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/spf13/cobra"
 )
@@ -50,7 +45,7 @@ func runDebugResetQuorum(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up GRPC Connection for running ResetQuorum.
-	cc, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	cc, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		log.Errorf(ctx, "connection to server failed: %v", err)
 		return err
@@ -58,7 +53,7 @@ func runDebugResetQuorum(cmd *cobra.Command, args []string) error {
 	defer finish()
 
 	// Call ResetQuorum to reset quorum for given range on target node.
-	_, err = roachpb.NewInternalClient(cc).ResetQuorum(ctx, &roachpb.ResetQuorumRequest{
+	_, err = kvpb.NewInternalClient(cc).ResetQuorum(ctx, &kvpb.ResetQuorumRequest{
 		RangeID: int32(rangeID),
 	})
 	if err != nil {

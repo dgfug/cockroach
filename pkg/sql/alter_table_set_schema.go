@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,13 +10,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
@@ -81,11 +76,16 @@ func (p *planner) AlterTableSetSchema(
 	// If so, then we disallow renaming, otherwise we allow it.
 	for _, dependent := range tableDesc.DependedOnBy {
 		if !dependent.ByID {
-			return nil, p.dependentViewError(
+			return nil, p.dependentError(
 				ctx, string(tableDesc.DescriptorType()), tableDesc.Name,
 				tableDesc.ParentID, dependent.ID, "set schema on",
 			)
 		}
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkSchemaChangeIsAllowed(tableDesc, n); err != nil {
+		return nil, err
 	}
 
 	return &alterTableSetSchemaNode{
@@ -97,7 +97,10 @@ func (p *planner) AlterTableSetSchema(
 }
 
 func (n *alterTableSetSchemaNode) startExec(params runParams) error {
-	telemetry.Inc(n.n.TelemetryCounter())
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra(
+		tree.GetTableType(n.n.IsSequence, n.n.IsView, n.n.IsMaterialized),
+		n.n.TelemetryName(),
+	))
 	ctx := params.ctx
 	p := params.p
 	tableDesc := n.tableDesc
@@ -121,11 +124,10 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 		return nil
 	}
 
-	// TODO(ajwerner): Use the collection here.
-	exists, _, err := catalogkv.LookupObjectID(
-		ctx, p.txn, p.ExecCfg().Codec, tableDesc.GetParentID(), desiredSchemaID, tableDesc.GetName(),
+	objectID, err := p.Descriptors().LookupObjectID(
+		ctx, p.txn, tableDesc.GetParentID(), desiredSchemaID, tableDesc.GetName(),
 	)
-	if err == nil && exists {
+	if err == nil && objectID != descpb.InvalidID {
 		return pgerror.Newf(pgcode.DuplicateRelation,
 			"relation %s already exists in schema %s", tableDesc.GetName(), n.newSchema)
 	} else if err != nil {
@@ -136,7 +138,9 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 	tableDesc.SetParentSchemaID(desiredSchemaID)
 
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc); err != nil {
+		return err
+	}
 
 	if err := p.writeSchemaChange(
 		ctx, tableDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
@@ -156,11 +160,9 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 	return p.logEvent(ctx,
 		desiredSchemaID,
 		&eventpb.SetSchema{
-			CommonEventDetails:    eventpb.CommonEventDetails{},
-			CommonSQLEventDetails: eventpb.CommonSQLEventDetails{},
-			DescriptorName:        oldName.FQString(),
-			NewDescriptorName:     newName.FQString(),
-			DescriptorType:        kind,
+			DescriptorName:    oldName.FQString(),
+			NewDescriptorName: newName.FQString(),
+			DescriptorType:    kind,
 		},
 	)
 }

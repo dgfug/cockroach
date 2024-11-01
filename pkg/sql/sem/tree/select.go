@@ -7,13 +7,8 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -24,8 +19,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // SelectStatement represents any SELECT statement.
@@ -34,10 +31,11 @@ type SelectStatement interface {
 	selectStatement()
 }
 
-func (*ParenSelect) selectStatement()  {}
-func (*SelectClause) selectStatement() {}
-func (*UnionClause) selectStatement()  {}
-func (*ValuesClause) selectStatement() {}
+func (*ParenSelect) selectStatement()         {}
+func (*SelectClause) selectStatement()        {}
+func (*UnionClause) selectStatement()         {}
+func (*ValuesClause) selectStatement()        {}
+func (*LiteralValuesClause) selectStatement() {}
 
 // Select represents a SelectStatement with an ORDER and/or LIMIT.
 type Select struct {
@@ -185,21 +183,52 @@ func (node *SelectExpr) Format(ctx *FmtCtx) {
 	}
 }
 
-// AliasClause represents an alias, optionally with a column list:
-// "AS name" or "AS name(col1, col2)".
+// AliasClause represents an alias, optionally with a column def list:
+// "AS name", "AS name(col1, col2)", or "AS name(col1 INT, col2 STRING)".
+// Note that the last form is only valid in the context of record-returning
+// functions, which also require the last form to define their output types.
 type AliasClause struct {
 	Alias Name
-	Cols  NameList
+	Cols  ColumnDefList
 }
 
 // Format implements the NodeFormatter interface.
-func (a *AliasClause) Format(ctx *FmtCtx) {
-	ctx.FormatNode(&a.Alias)
-	if len(a.Cols) != 0 {
+func (f *AliasClause) Format(ctx *FmtCtx) {
+	ctx.FormatNode(&f.Alias)
+	if len(f.Cols) != 0 {
 		// Format as "alias (col1, col2, ...)".
 		ctx.WriteString(" (")
-		ctx.FormatNode(&a.Cols)
+		ctx.FormatNode(&f.Cols)
 		ctx.WriteByte(')')
+	}
+}
+
+// ColumnDef represents a column definition in the context of a record type
+// alias, like in select * from json_to_record(...) AS foo(a INT, b INT).
+type ColumnDef struct {
+	Name Name
+	Type ResolvableTypeReference
+}
+
+// Format implements the NodeFormatter interface.
+func (c *ColumnDef) Format(ctx *FmtCtx) {
+	ctx.FormatNode(&c.Name)
+	if c.Type != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatTypeReference(c.Type)
+	}
+}
+
+// ColumnDefList represents a list of ColumnDefs.
+type ColumnDefList []ColumnDef
+
+// Format implements the NodeFormatter interface.
+func (c *ColumnDefList) Format(ctx *FmtCtx) {
+	for i := range *c {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(&(*c)[i])
 	}
 }
 
@@ -270,18 +299,24 @@ func (node *StatementSource) Format(ctx *FmtCtx) {
 }
 
 // IndexID is a custom type for IndexDescriptor IDs.
-type IndexID uint32
+type IndexID = catid.IndexID
+
+// FamilyID is a custom type for column family ID.
+type FamilyID = catid.FamilyID
 
 // IndexFlags represents "@<index_name|index_id>" or "@{param[,param]}" where
 // param is one of:
-//  - FORCE_INDEX=<index_name|index_id>
-//  - ASC / DESC
-//  - NO_INDEX_JOIN
-//  - NO_ZIGZAG_JOIN
-//  - NO_FULL_SCAN
-//  - IGNORE_FOREIGN_KEYS
-//  - FORCE_ZIGZAG
-//  - FORCE_ZIGZAG=<index_name|index_id>*
+//   - FORCE_INDEX=<index_name|index_id>
+//   - ASC / DESC
+//   - NO_INDEX_JOIN
+//   - NO_ZIGZAG_JOIN
+//   - NO_FULL_SCAN
+//   - IGNORE_FOREIGN_KEYS
+//   - FORCE_INVERTED_INDEX
+//   - FORCE_ZIGZAG
+//   - FORCE_ZIGZAG=<index_name|index_id>*
+//   - FAMILY=[family_id]
+//
 // It is used optionally after a table name in SELECT statements.
 type IndexFlags struct {
 	Index   UnrestrictedName
@@ -302,6 +337,9 @@ type IndexFlags struct {
 	// IgnoreUniqueWithoutIndexKeys disables optimizations based on unique without
 	// index constraints.
 	IgnoreUniqueWithoutIndexKeys bool
+	// ForceInvertedIndex indicates that we should only plan scans over inverted
+	// indexes.
+	ForceInvertedIndex bool
 	// Zigzag hinting fields are distinct:
 	// ForceZigzag means we saw a TABLE@{FORCE_ZIGZAG}
 	// ZigzagIndexes means we saw TABLE@{FORCE_ZIGZAG=name}
@@ -310,6 +348,10 @@ type IndexFlags struct {
 	ForceZigzag    bool
 	ZigzagIndexes  []UnrestrictedName
 	ZigzagIndexIDs []IndexID
+
+	// Restrict select to the specified column family.
+	// Used by changefeed.
+	FamilyID *FamilyID
 }
 
 // ForceIndex returns true if a forced index was specified, either using a name
@@ -336,6 +378,9 @@ func (ih *IndexFlags) CombineWith(other *IndexFlags) error {
 	if ih.IgnoreUniqueWithoutIndexKeys && other.IgnoreUniqueWithoutIndexKeys {
 		return errors.New("IGNORE_UNIQUE_WITHOUT_INDEX_KEYS specified multiple times")
 	}
+	if ih.ForceInvertedIndex && other.ForceInvertedIndex {
+		return errors.New("FORCE_INVERTED_INDEX specified multiple times")
+	}
 	result := *ih
 	result.NoIndexJoin = ih.NoIndexJoin || other.NoIndexJoin
 	result.NoZigzagJoin = ih.NoZigzagJoin || other.NoZigzagJoin
@@ -343,6 +388,7 @@ func (ih *IndexFlags) CombineWith(other *IndexFlags) error {
 	result.IgnoreForeignKeys = ih.IgnoreForeignKeys || other.IgnoreForeignKeys
 	result.IgnoreUniqueWithoutIndexKeys = ih.IgnoreUniqueWithoutIndexKeys ||
 		other.IgnoreUniqueWithoutIndexKeys
+	result.ForceInvertedIndex = ih.ForceInvertedIndex || other.ForceInvertedIndex
 
 	if other.Direction != 0 {
 		if ih.Direction != 0 {
@@ -389,14 +435,17 @@ func (ih *IndexFlags) CombineWith(other *IndexFlags) error {
 }
 
 // Check verifies if the flags are valid:
-//  - ascending/descending is not specified without an index;
-//  - no_index_join isn't specified with an index.
+//   - ascending/descending is not specified without an index;
+//   - no_index_join isn't specified with an index.
 func (ih *IndexFlags) Check() error {
 	if ih.NoIndexJoin && ih.ForceIndex() {
 		return errors.New("FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN")
 	}
 	if ih.Direction != 0 && !ih.ForceIndex() {
 		return errors.New("ASC/DESC must be specified in conjunction with an index")
+	}
+	if ih.ForceInvertedIndex && ih.ForceIndex() {
+		return errors.New("FORCE_INVERTED_INDEX cannot be specified in conjunction with FORCE_INDEX")
 	}
 	if ih.zigzagForced() && ih.NoIndexJoin {
 		return errors.New("FORCE_ZIGZAG cannot be specified in conjunction with NO_INDEX_JOIN")
@@ -413,14 +462,30 @@ func (ih *IndexFlags) Check() error {
 		}
 	}
 
+	// FamilyID is currently set internally by changefeed, and is never parsed/serialized.
+	// TODO(#94900): Remove this restriction.
+	if ih.FamilyID != nil && !enableFamilyIDIndexHintForTests {
+		return pgerror.New(pgcode.InvalidParameterValue, "FAMILY is an internal hint used by CDC")
+	}
+
 	return nil
+}
+
+var enableFamilyIDIndexHintForTests = false
+
+// TestingEnableFamilyIndexHint enables the use of Family index hint
+// for tests.
+func TestingEnableFamilyIndexHint() func() {
+	enableFamilyIDIndexHintForTests = true
+	return func() {
+		enableFamilyIDIndexHintForTests = false
+	}
 }
 
 // Format implements the NodeFormatter interface.
 func (ih *IndexFlags) Format(ctx *FmtCtx) {
 	ctx.WriteByte('@')
-	if !ih.NoIndexJoin && !ih.NoZigzagJoin && !ih.NoFullScan && !ih.IgnoreForeignKeys &&
-		!ih.IgnoreUniqueWithoutIndexKeys && ih.Direction == 0 && !ih.zigzagForced() {
+	if ih.indexOnlyHint() {
 		if ih.Index != "" {
 			ctx.FormatNode(&ih.Index)
 		} else {
@@ -470,6 +535,11 @@ func (ih *IndexFlags) Format(ctx *FmtCtx) {
 			ctx.WriteString("IGNORE_UNIQUE_WITHOUT_INDEX_KEYS")
 		}
 
+		if ih.ForceInvertedIndex {
+			sep()
+			ctx.WriteString("FORCE_INVERTED_INDEX")
+		}
+
 		if ih.ForceZigzag || len(ih.ZigzagIndexes) > 0 || len(ih.ZigzagIndexIDs) > 0 {
 			sep()
 			if ih.ForceZigzag {
@@ -494,8 +564,17 @@ func (ih *IndexFlags) Format(ctx *FmtCtx) {
 				}
 			}
 		}
+		if ih.FamilyID != nil {
+			ctx.Printf("FAMILY=[%d]", *ih.FamilyID)
+		}
 		ctx.WriteString("}")
 	}
+}
+
+func (ih *IndexFlags) indexOnlyHint() bool {
+	return !ih.NoIndexJoin && !ih.NoZigzagJoin && !ih.NoFullScan && !ih.IgnoreForeignKeys &&
+		!ih.IgnoreUniqueWithoutIndexKeys && ih.Direction == 0 && !ih.ForceInvertedIndex &&
+		!ih.zigzagForced() && ih.FamilyID == nil
 }
 
 func (ih *IndexFlags) zigzagForced() bool {
@@ -574,6 +653,7 @@ const (
 	AstLookup   = "LOOKUP"
 	AstMerge    = "MERGE"
 	AstInverted = "INVERTED"
+	AstStraight = "STRAIGHT"
 )
 
 // Format implements the NodeFormatter interface.
@@ -912,44 +992,6 @@ func (node *WindowDef) Format(ctx *FmtCtx) {
 	ctx.WriteRune(')')
 }
 
-// WindowFrameMode indicates which mode of framing is used.
-type WindowFrameMode int
-
-const (
-	// RANGE is the mode of specifying frame in terms of logical range (e.g. 100 units cheaper).
-	RANGE WindowFrameMode = iota
-	// ROWS is the mode of specifying frame in terms of physical offsets (e.g. 1 row before etc).
-	ROWS
-	// GROUPS is the mode of specifying frame in terms of peer groups.
-	GROUPS
-)
-
-// Name returns a string representation of the window frame mode to be used in
-// struct names for generated code.
-func (m WindowFrameMode) Name() string {
-	switch m {
-	case RANGE:
-		return "Range"
-	case ROWS:
-		return "Rows"
-	case GROUPS:
-		return "Groups"
-	}
-	return ""
-}
-
-func (m WindowFrameMode) String() string {
-	switch m {
-	case RANGE:
-		return "RANGE"
-	case ROWS:
-		return "ROWS"
-	case GROUPS:
-		return "GROUPS"
-	}
-	return ""
-}
-
 // OverrideWindowDef implements the logic to have a base window definition which
 // then gets augmented by a different window definition.
 func OverrideWindowDef(base *WindowDef, override WindowDef) (WindowDef, error) {
@@ -974,64 +1016,9 @@ func OverrideWindowDef(base *WindowDef, override WindowDef) (WindowDef, error) {
 	return override, nil
 }
 
-// WindowFrameBoundType indicates which type of boundary is used.
-type WindowFrameBoundType int
-
-const (
-	// UnboundedPreceding represents UNBOUNDED PRECEDING type of boundary.
-	UnboundedPreceding WindowFrameBoundType = iota
-	// OffsetPreceding represents 'value' PRECEDING type of boundary.
-	OffsetPreceding
-	// CurrentRow represents CURRENT ROW type of boundary.
-	CurrentRow
-	// OffsetFollowing represents 'value' FOLLOWING type of boundary.
-	OffsetFollowing
-	// UnboundedFollowing represents UNBOUNDED FOLLOWING type of boundary.
-	UnboundedFollowing
-)
-
-// IsOffset returns true if the WindowFrameBoundType is an offset.
-func (ft WindowFrameBoundType) IsOffset() bool {
-	return ft == OffsetPreceding || ft == OffsetFollowing
-}
-
-// Name returns a string representation of the bound type to be used in struct
-// names for generated code.
-func (ft WindowFrameBoundType) Name() string {
-	switch ft {
-	case UnboundedPreceding:
-		return "UnboundedPreceding"
-	case OffsetPreceding:
-		return "OffsetPreceding"
-	case CurrentRow:
-		return "CurrentRow"
-	case OffsetFollowing:
-		return "OffsetFollowing"
-	case UnboundedFollowing:
-		return "UnboundedFollowing"
-	}
-	return ""
-}
-
-func (ft WindowFrameBoundType) String() string {
-	switch ft {
-	case UnboundedPreceding:
-		return "UNBOUNDED PRECEDING"
-	case OffsetPreceding:
-		return "OFFSET PRECEDING"
-	case CurrentRow:
-		return "CURRENT ROW"
-	case OffsetFollowing:
-		return "OFFSET FOLLOWING"
-	case UnboundedFollowing:
-		return "UNBOUNDED FOLLOWING"
-	}
-	return ""
-}
-
 // WindowFrameBound specifies the offset and the type of boundary.
 type WindowFrameBound struct {
-	BoundType  WindowFrameBoundType
+	BoundType  treewindow.WindowFrameBoundType
 	OffsetExpr Expr
 }
 
@@ -1052,124 +1039,66 @@ func (node *WindowFrameBounds) HasOffset() bool {
 	return node.StartBound.HasOffset() || (node.EndBound != nil && node.EndBound.HasOffset())
 }
 
-// WindowFrameExclusion indicates which mode of exclusion is used.
-type WindowFrameExclusion int
-
-const (
-	// NoExclusion represents an omitted frame exclusion clause.
-	NoExclusion WindowFrameExclusion = iota
-	// ExcludeCurrentRow represents EXCLUDE CURRENT ROW mode of frame exclusion.
-	ExcludeCurrentRow
-	// ExcludeGroup represents EXCLUDE GROUP mode of frame exclusion.
-	ExcludeGroup
-	// ExcludeTies represents EXCLUDE TIES mode of frame exclusion.
-	ExcludeTies
-)
-
-func (node WindowFrameExclusion) String() string {
-	switch node {
-	case NoExclusion:
-		return "EXCLUDE NO ROWS"
-	case ExcludeCurrentRow:
-		return "EXCLUDE CURRENT ROW"
-	case ExcludeGroup:
-		return "EXCLUDE GROUP"
-	case ExcludeTies:
-		return "EXCLUDE TIES"
-	}
-	return ""
-}
-
-// Name returns a string representation of the exclusion type to be used in
-// struct names for generated code.
-func (node WindowFrameExclusion) Name() string {
-	switch node {
-	case NoExclusion:
-		return "NoExclusion"
-	case ExcludeCurrentRow:
-		return "ExcludeCurrentRow"
-	case ExcludeGroup:
-		return "ExcludeGroup"
-	case ExcludeTies:
-		return "ExcludeTies"
-	}
-	return ""
-}
-
 // WindowFrame represents static state of window frame over which calculations are made.
 type WindowFrame struct {
-	Mode      WindowFrameMode      // the mode of framing being used
-	Bounds    WindowFrameBounds    // the bounds of the frame
-	Exclusion WindowFrameExclusion // optional frame exclusion
+	Mode      treewindow.WindowFrameMode      // the mode of framing being used
+	Bounds    WindowFrameBounds               // the bounds of the frame
+	Exclusion treewindow.WindowFrameExclusion // optional frame exclusion
+}
+
+// IsDefaultFrame returns whether a frame equivalent to the default frame
+// is being used (default is RANGE UNBOUNDED PRECEDING).
+func (f *WindowFrame) IsDefaultFrame() bool {
+	if f == nil {
+		return true
+	}
+	if f.Bounds.StartBound.BoundType == treewindow.UnboundedPreceding {
+		return f.DefaultFrameExclusion() && f.Mode == treewindow.RANGE &&
+			(f.Bounds.EndBound == nil || f.Bounds.EndBound.BoundType == treewindow.CurrentRow)
+	}
+	return false
+}
+
+// DefaultFrameExclusion returns true if optional frame exclusion is omitted.
+func (f *WindowFrame) DefaultFrameExclusion() bool {
+	return f == nil || f.Exclusion == treewindow.NoExclusion
 }
 
 // Format implements the NodeFormatter interface.
 func (node *WindowFrameBound) Format(ctx *FmtCtx) {
 	switch node.BoundType {
-	case UnboundedPreceding:
+	case treewindow.UnboundedPreceding:
 		ctx.WriteString("UNBOUNDED PRECEDING")
-	case OffsetPreceding:
+	case treewindow.OffsetPreceding:
 		ctx.FormatNode(node.OffsetExpr)
 		ctx.WriteString(" PRECEDING")
-	case CurrentRow:
+	case treewindow.CurrentRow:
 		ctx.WriteString("CURRENT ROW")
-	case OffsetFollowing:
+	case treewindow.OffsetFollowing:
 		ctx.FormatNode(node.OffsetExpr)
 		ctx.WriteString(" FOLLOWING")
-	case UnboundedFollowing:
+	case treewindow.UnboundedFollowing:
 		ctx.WriteString("UNBOUNDED FOLLOWING")
 	default:
-		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(node.BoundType)))
+		panic(errors.AssertionFailedf("unhandled case: %d", redact.Safe(node.BoundType)))
 	}
 }
 
 // Format implements the NodeFormatter interface.
-func (node WindowFrameExclusion) Format(ctx *FmtCtx) {
-	if node == NoExclusion {
-		return
-	}
-	ctx.WriteString("EXCLUDE ")
-	switch node {
-	case ExcludeCurrentRow:
-		ctx.WriteString("CURRENT ROW")
-	case ExcludeGroup:
-		ctx.WriteString("GROUP")
-	case ExcludeTies:
-		ctx.WriteString("TIES")
-	default:
-		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(node)))
-	}
-}
-
-// WindowModeName returns the name of the window frame mode.
-func WindowModeName(mode WindowFrameMode) string {
-	switch mode {
-	case RANGE:
-		return "RANGE"
-	case ROWS:
-		return "ROWS"
-	case GROUPS:
-		return "GROUPS"
-	default:
-		panic(errors.AssertionFailedf("unhandled case: %d", log.Safe(mode)))
-	}
-}
-
-// Format implements the NodeFormatter interface.
-func (node *WindowFrame) Format(ctx *FmtCtx) {
-	ctx.WriteString(WindowModeName(node.Mode))
+func (f *WindowFrame) Format(ctx *FmtCtx) {
+	ctx.WriteString(treewindow.WindowModeName(f.Mode))
 	ctx.WriteByte(' ')
-	if node.Bounds.EndBound != nil {
+	if f.Bounds.EndBound != nil {
 		ctx.WriteString("BETWEEN ")
-		ctx.FormatNode(node.Bounds.StartBound)
+		ctx.FormatNode(f.Bounds.StartBound)
 		ctx.WriteString(" AND ")
-		ctx.FormatNode(node.Bounds.EndBound)
+		ctx.FormatNode(f.Bounds.EndBound)
 	} else {
-		ctx.FormatNode(node.Bounds.StartBound)
+		ctx.FormatNode(f.Bounds.StartBound)
 	}
-	if node.Exclusion != NoExclusion {
+	if f.Exclusion != treewindow.NoExclusion {
 		ctx.WriteByte(' ')
-		ctx.FormatNode(node.Exclusion)
+		ctx.WriteString(f.Exclusion.String())
 	}
 }
 
@@ -1184,13 +1113,11 @@ func (node *LockingClause) Format(ctx *FmtCtx) {
 }
 
 // LockingItem represents a single locking item in a locking clause.
-//
-// NOTE: if this struct changes, HashLockingItem and IsLockingItemEqual
-// in opt/memo/interner.go will need to be updated accordingly.
 type LockingItem struct {
 	Strength   LockingStrength
 	Targets    TableNames
 	WaitPolicy LockingWaitPolicy
+	Form       LockingForm
 }
 
 // Format implements the NodeFormatter interface.
@@ -1201,6 +1128,7 @@ func (f *LockingItem) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&f.Targets)
 	}
 	ctx.FormatNode(f.WaitPolicy)
+	// Form and durability are not currently exposed through SQL.
 }
 
 // LockingStrength represents the possible row-level lock modes for a SELECT
@@ -1260,17 +1188,17 @@ const (
 	// LockWaitBlock represents the default - wait for the lock to become
 	// available.
 	LockWaitBlock LockingWaitPolicy = iota
-	// LockWaitSkip represents SKIP LOCKED - skip rows that can't be locked.
-	LockWaitSkip
+	// LockWaitSkipLocked represents SKIP LOCKED - skip rows that can't be locked.
+	LockWaitSkipLocked
 	// LockWaitError represents NOWAIT - raise an error if a row cannot be
 	// locked.
 	LockWaitError
 )
 
 var lockingWaitPolicyName = [...]string{
-	LockWaitBlock: "",
-	LockWaitSkip:  "SKIP LOCKED",
-	LockWaitError: "NOWAIT",
+	LockWaitBlock:      "",
+	LockWaitSkipLocked: "SKIP LOCKED",
+	LockWaitError:      "NOWAIT",
 }
 
 func (p LockingWaitPolicy) String() string {
@@ -1290,9 +1218,80 @@ func (p LockingWaitPolicy) Max(p2 LockingWaitPolicy) LockingWaitPolicy {
 	return LockingWaitPolicy(max(byte(p), byte(p2)))
 }
 
-func max(a, b byte) byte {
-	if a > b {
-		return a
-	}
-	return b
+// LockingForm represents the form of locking to use, record locking or
+// predicate locking. It is not currently exposed through SQL, but could be once
+// more fully supported.
+type LockingForm byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// LockRecord represents the default: lock existing rows within the specified
+	// span(s), which prevents modification of those rows but does not prevent
+	// insertion of new rows (phantoms) into the span(s).
+	LockRecord LockingForm = iota
+	// LockPredicate represents locking the logical predicate defined by the
+	// span(s), preventing modification of existing rows as well as insertion of
+	// new rows (phantoms). This is similar to the behavior of "next-key locks" in
+	// InnoDB, "key-range locks" in SQL Server, "phantom locks" in Sybase, etc.
+	// (Postgres also has predicate locks, which it uses under serializable
+	// isolation, but these are used to detect serializable violations rather than
+	// for mutual exclusion.)
+	//
+	// We currently only use predicate locks for uniqueness checks under snapshot
+	// and read committed isolation, and only support predicate locks on
+	// single-key spans.
+	LockPredicate
+)
+
+var lockingClassName = [...]string{
+	LockRecord:    "record",
+	LockPredicate: "predicate",
+}
+
+func (p LockingForm) String() string {
+	return lockingClassName[p]
+}
+
+// Max returns the maximum of the two locking forms.
+func (p LockingForm) Max(p2 LockingForm) LockingForm {
+	return LockingForm(max(byte(p), byte(p2)))
+}
+
+// LockingDurability represents the durability of a lock. It is not exposed
+// through SQL, but is instead set by the system according to statement type and
+// isolation level. It is included here for completeness.
+type LockingDurability byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// LockDurabilityBestEffort represents the default: make a best-effort attempt
+	// to hold the lock until commit while keeping it unreplicated and in-memory
+	// on the leaseholder of the locked row. Best-effort locks do not propagate
+	// via Raft to other nodes, and are therefore much faster to acquire than
+	// guaranteed-durable locks. For this reason we prefer to use best-effort
+	// locks when possible (i.e. whenever locking is used as an optimization
+	// rather than as a guarantor of exclusion).
+	LockDurabilityBestEffort LockingDurability = iota
+
+	// LockDurabilityGuaranteed guarantees that if the transaction commits, the
+	// lock was held until commit, even in the face of lease transfers, range
+	// splits, range merges, node failures, memory limits, etc. Guaranteed-durable
+	// locks *must* be used whenever correctness depends on locking.
+	LockDurabilityGuaranteed
+)
+
+var lockingDurabilityName = [...]string{
+	LockDurabilityBestEffort: "best-effort",
+	LockDurabilityGuaranteed: "guaranteed",
+}
+
+func (d LockingDurability) String() string {
+	return lockingDurabilityName[d]
+}
+
+// Max returns the most durable of the two locking durabilities.
+func (d LockingDurability) Max(d2 LockingDurability) LockingDurability {
+	return LockingDurability(max(byte(d), byte(d2)))
 }

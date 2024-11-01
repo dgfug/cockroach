@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -56,16 +51,27 @@ type lookupJoinNode struct {
 	remoteLookupExpr tree.TypedExpr
 
 	// columns are the produced columns, namely the input columns and (unless the
-	// join type is semi or anti join) the columns in the table scanNode.
+	// join type is semi or anti join) the columns in the table scanNode. It
+	// includes an additional continuation column when IsFirstJoinInPairedJoin
+	// is true.
 	columns colinfo.ResultColumns
 
 	// onCond is any ON condition to be used in conjunction with the implicit
 	// equality condition on eqCols or the conditions in lookupExpr.
 	onCond tree.TypedExpr
 
+	// At most one of is{First,Second}JoinInPairedJoiner can be true.
+	isFirstJoinInPairedJoiner  bool
 	isSecondJoinInPairedJoiner bool
 
 	reqOrdering ReqOrdering
+
+	limitHint int64
+
+	// remoteOnlyLookups is true when this join is defined with only lookups
+	// that read into remote regions, though the lookups are defined in
+	// lookupExpr, not remoteLookupExpr.
+	remoteOnlyLookups bool
 }
 
 func (lj *lookupJoinNode) startExec(params runParams) error {

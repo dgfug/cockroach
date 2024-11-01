@@ -1,24 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient_test
 
 import (
-	"database/sql/driver"
-	"io/ioutil"
+	"context"
+	"io"
 	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -27,7 +22,7 @@ import (
 
 func makeSQLConn(url string) clisqlclient.Conn {
 	var sqlConnCtx clisqlclient.Context
-	return sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard, url)
+	return sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url)
 }
 
 func TestConnRecover(t *testing.T) {
@@ -36,8 +31,9 @@ func TestConnRecover(t *testing.T) {
 	p := cli.TestCLIParams{T: t}
 	c := cli.NewCLITest(p)
 	defer c.Cleanup()
+	ctx := context.Background()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -48,7 +44,7 @@ func TestConnRecover(t *testing.T) {
 	}()
 
 	// Sanity check to establish baseline.
-	rows, err := conn.Query(`SELECT 1`, nil)
+	rows, err := conn.Query(ctx, `SELECT 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,18 +60,18 @@ func TestConnRecover(t *testing.T) {
 	// and starts delivering ErrBadConn. We don't know the timing of
 	// this however.
 	testutils.SucceedsSoon(t, func() error {
-		if sqlRows, err := conn.Query(`SELECT 1`, nil); err == nil {
+		if sqlRows, err := conn.Query(ctx, `SELECT 1`); err == nil {
 			if closeErr := sqlRows.Close(); closeErr != nil {
 				t.Fatal(closeErr)
 			}
-		} else if !errors.Is(err, driver.ErrBadConn) {
-			return errors.Newf("expected ErrBadConn, got %v", err)
+		} else if !errors.Is(err, clisqlclient.ErrConnectionClosed) {
+			return errors.Newf("expected ErrConnectionClosed, got %v", err) // nolint:errwrap
 		}
 		return nil
 	})
 
 	// Check that Query recovers from a connection close by re-connecting.
-	rows, err = conn.Query(`SELECT 1`, nil)
+	rows, err = conn.Query(ctx, `SELECT 1`)
 	if err != nil {
 		t.Fatalf("conn.Query(): expected no error after reconnect, got %v", err)
 	}
@@ -88,14 +84,14 @@ func TestConnRecover(t *testing.T) {
 
 	// Ditto from Query().
 	testutils.SucceedsSoon(t, func() error {
-		if err := conn.Exec(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
-			return errors.Newf("expected ErrBadConn, got %v", err)
+		if err := conn.Exec(ctx, `SELECT 1`); !errors.Is(err, clisqlclient.ErrConnectionClosed) {
+			return errors.Newf("expected ErrConnectionClosed, got %v", err) // nolint:errwrap
 		}
 		return nil
 	})
 
 	// Check that Exec recovers from a connection close by re-connecting.
-	if err := conn.Exec(`SELECT 1`, nil); err != nil {
+	if err := conn.Exec(ctx, `SELECT 1`); err != nil {
 		t.Fatalf("conn.Exec(): expected no error after reconnect, got %v", err)
 	}
 }
@@ -107,7 +103,7 @@ func simulateServerRestart(
 	t *testing.T, c *cli.TestCLI, p cli.TestCLIParams, conn clisqlclient.Conn,
 ) func() {
 	c.RestartServer(p)
-	url2, cleanup2 := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url2, cleanup2 := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	conn.SetURL(url2.String())
 	return cleanup2
 }
@@ -118,8 +114,9 @@ func TestTransactionRetry(t *testing.T) {
 	p := cli.TestCLIParams{T: t}
 	c := cli.NewCLITest(p)
 	defer c.Cleanup()
+	ctx := context.Background()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -130,14 +127,14 @@ func TestTransactionRetry(t *testing.T) {
 	}()
 
 	var tries int
-	err := conn.ExecTxn(func(conn clisqlclient.TxBoundConn) error {
+	err := conn.ExecTxn(ctx, func(ctx context.Context, conn clisqlclient.TxBoundConn) error {
 		tries++
 		if tries > 2 {
 			return nil
 		}
 
 		// Prevent automatic server-side retries.
-		rows, err := conn.Query(`SELECT now()`, nil)
+		rows, err := conn.Query(ctx, `SELECT now()`)
 		if err != nil {
 			return err
 		}
@@ -146,7 +143,7 @@ func TestTransactionRetry(t *testing.T) {
 		}
 
 		// Force a client-side retry.
-		rows, err = conn.Query(`SELECT crdb_internal.force_retry('1h')`, nil)
+		rows, err = conn.Query(ctx, `SELECT crdb_internal.force_retry('1h')`)
 		if err != nil {
 			return err
 		}

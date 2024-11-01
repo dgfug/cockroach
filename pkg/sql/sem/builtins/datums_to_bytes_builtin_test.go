@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins_test
 
@@ -18,14 +13,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
@@ -38,10 +33,11 @@ import (
 // same way.
 func TestCrdbInternalDatumsToBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
 	types := []string{
 		"INT2", "INT4", "INT8",
 		"FLOAT4", "FLOAT8",
@@ -81,7 +77,7 @@ func TestCrdbInternalDatumsToBytes(t *testing.T) {
 		if util.RaceEnabled {
 			numRows = 2
 		}
-		tab := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", t.Name())
+		tab := desctestutils.TestingGetPublicTableDescriptor(kvDB, srv.ApplicationLayer().Codec(), "defaultdb", t.Name())
 		for i := 0; i < numRows; i++ {
 			var row []string
 			for _, col := range tab.WritableColumns() {
@@ -145,13 +141,14 @@ SELECT (SELECT count(DISTINCT (cols)) FROM t) -
 // Test that some data types cannot be key encoded.
 func TestCrdbInternalDatumsToBytesIllegalType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	for _, val := range []string{
-		"'{\"a\": 1}'::JSONB",
+		"'foo:1,2 bar:3'::tsvector",
 	} {
 		t.Run(val, func(t *testing.T) {
 			tdb.ExpectErr(t, ".*illegal argument.*",

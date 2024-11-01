@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // Processor definitions for distributed SQL APIs. See
 // docs/RFCS/distributed_sql.md.
@@ -17,11 +12,12 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
 import "sql/execinfrapb/processors_sql.proto";
+import "sql/execinfrapb/processors_ttl.proto";
 import "sql/execinfrapb/processors_bulk_io.proto";
 import "sql/execinfrapb/processors_changefeeds.proto";
 import "sql/execinfrapb/processors_table_stats.proto";
@@ -100,13 +96,8 @@ message ProcessorCoreUnion {
   optional ValuesCoreSpec values = 10;
   optional BackfillerSpec backfiller = 11;
   optional ReadImportDataSpec readImport = 13;
-  reserved 14;
-  optional CSVWriterSpec CSVWriter = 20;
   optional SamplerSpec Sampler = 15;
   optional SampleAggregatorSpec SampleAggregator = 16;
-  reserved 17;
-  optional MetadataTestSenderSpec metadataTestSender = 18;
-  optional MetadataTestReceiverSpec metadataTestReceiver = 19;
   optional ZigzagJoinerSpec zigzagJoiner = 21;
   optional ProjectSetSpec projectSet = 22;
   optional WindowerSpec windower = 23;
@@ -118,14 +109,22 @@ message ProcessorCoreUnion {
   optional InvertedFiltererSpec invertedFilterer = 29;
   optional InvertedJoinerSpec invertedJoiner = 30;
   optional BackupDataSpec backupData = 31;
-  optional SplitAndScatterSpec splitAndScatter = 32;
   optional RestoreDataSpec restoreData = 33;
   optional FiltererSpec filterer = 34;
   optional StreamIngestionDataSpec streamIngestionData = 35;
   optional StreamIngestionFrontierSpec streamIngestionFrontier = 36;
-  optional ParquetWriterSpec ParquetWriter = 37;
+  optional ExportSpec exporter = 37;
+  optional IndexBackfillMergerSpec indexBackfillMerger = 38;
+  optional TTLSpec ttl = 39;
+  optional HashGroupJoinerSpec hashGroupJoiner = 40;
+  optional GenerativeSplitAndScatterSpec generativeSplitAndScatter = 41;
+  optional CloudStorageTestSpec cloudStorageTest = 42;
+  optional InsertSpec insert = 43;
+  optional IngestStoppedSpec ingestStopped = 44;
+  optional LogicalReplicationWriterSpec logicalReplicationWriter = 45;
 
-  reserved 6, 12;
+  reserved 6, 12, 14, 17, 18, 19, 20, 32;
+  // NEXT ID: 45.
 }
 
 // NoopCoreSpec indicates a "no-op" processor core. This is used when we just
@@ -146,13 +145,3 @@ message LocalPlanNodeSpec {
   optional uint32 NumInputs = 2 [(gogoproto.nullable) = false];
   optional string Name = 3 [(gogoproto.nullable) = false];
 }
-
-message MetadataTestSenderSpec {
-  optional string id = 1 [(gogoproto.nullable) = false,
-                         (gogoproto.customname) = "ID"];
-}
-
-message MetadataTestReceiverSpec {
-  repeated string sender_ids = 1 [(gogoproto.customname) = "SenderIDs"];
-}
-

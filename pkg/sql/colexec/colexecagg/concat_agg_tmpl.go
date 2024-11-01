@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
@@ -39,35 +34,34 @@ func newConcat_AGGKINDAggAlloc(allocator *colmem.Allocator, allocSize int64) agg
 type concat_AGGKINDAgg struct {
 	// {{if eq "_AGGKIND" "Ordered"}}
 	orderedAggregateFuncBase
+	// col points to the output vector we are updating.
+	col *coldata.Bytes
 	// {{else}}
 	unorderedAggregateFuncBase
 	// {{end}}
 	// curAgg holds the running total.
 	curAgg []byte
-	// col points to the output vector we are updating.
-	col *coldata.Bytes
 	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
 	// for the group that is currently being aggregated.
 	foundNonNullForCurrentGroup bool
 }
 
-func (a *concat_AGGKINDAgg) SetOutput(vec coldata.Vec) {
-	// {{if eq "_AGGKIND" "Ordered"}}
+// {{if eq "_AGGKIND" "Ordered"}}
+func (a *concat_AGGKINDAgg) SetOutput(vec *coldata.Vec) {
 	a.orderedAggregateFuncBase.SetOutput(vec)
-	// {{else}}
-	a.unorderedAggregateFuncBase.SetOutput(vec)
-	// {{end}}
 	a.col = vec.Bytes()
 }
 
+// {{end}}
+
 func (a *concat_AGGKINDAgg) Compute(
-	vecs []coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
+	vecs []*coldata.Vec, inputIdxs []uint32, startIdx, endIdx int, sel []int,
 ) {
 	execgen.SETVARIABLESIZE(oldCurAggSize, a.curAgg)
 	vec := vecs[inputIdxs[0]]
 	col, nulls := vec.Bytes(), vec.Nulls()
 	// {{if not (eq "_AGGKIND" "Window")}}
-	a.allocator.PerformOperation([]coldata.Vec{a.vec}, func() {
+	a.allocator.PerformOperation([]*coldata.Vec{a.vec}, func() {
 		// {{if eq "_AGGKIND" "Ordered"}}
 		// Capture groups to force bounds check to work. See
 		// https://github.com/golang/go/issues/39756
@@ -120,7 +114,7 @@ func (a *concat_AGGKINDAgg) Compute(
 	// {{end}}
 	execgen.SETVARIABLESIZE(newCurAggSize, a.curAgg)
 	if newCurAggSize != oldCurAggSize {
-		a.allocator.AdjustMemoryUsage(int64(newCurAggSize - oldCurAggSize))
+		a.allocator.AdjustMemoryUsageAfterAllocation(int64(newCurAggSize - oldCurAggSize))
 	}
 }
 
@@ -130,11 +124,14 @@ func (a *concat_AGGKINDAgg) Flush(outputIdx int) {
 	_ = outputIdx
 	outputIdx = a.curIdx
 	a.curIdx++
+	col := a.col
+	// {{else}}
+	col := a.vec.Bytes()
 	// {{end}}
 	if !a.foundNonNullForCurrentGroup {
 		a.nulls.SetNull(outputIdx)
 	} else {
-		a.col.Set(outputIdx, a.curAgg)
+		col.Set(outputIdx, a.curAgg)
 	}
 	// Release the reference to curAgg eagerly.
 	a.allocator.AdjustMemoryUsage(-int64(len(a.curAgg)))

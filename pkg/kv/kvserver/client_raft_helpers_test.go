@@ -1,48 +1,53 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
+	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness/storelivenesspb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
+	"github.com/stretchr/testify/require"
 )
 
 type unreliableRaftHandlerFuncs struct {
 	// If non-nil, can return false to avoid dropping the msg to
 	// unreliableRaftHandler.rangeID. If nil, all messages pertaining to the
 	// respective range are dropped.
-	dropReq  func(*kvserver.RaftMessageRequest) bool
-	dropHB   func(*kvserver.RaftHeartbeat) bool
-	dropResp func(*kvserver.RaftMessageResponse) bool
-	// snapErr defaults to returning nil.
-	snapErr func(*kvserver.SnapshotRequest_Header) error
+	dropReq  func(*kvserverpb.RaftMessageRequest) bool
+	dropHB   func(*kvserverpb.RaftHeartbeat) bool
+	dropResp func(*kvserverpb.RaftMessageResponse) bool
+	// snapErr and delegateErr default to returning nil.
+	snapErr     func(*kvserverpb.SnapshotRequest_Header) error
+	delegateErr func(request *kvserverpb.DelegateSendSnapshotRequest) error
 }
 
 func noopRaftHandlerFuncs() unreliableRaftHandlerFuncs {
 	return unreliableRaftHandlerFuncs{
-		dropResp: func(*kvserver.RaftMessageResponse) bool {
+		dropResp: func(*kvserverpb.RaftMessageResponse) bool {
 			return false
 		},
-		dropReq: func(*kvserver.RaftMessageRequest) bool {
+		dropReq: func(*kvserverpb.RaftMessageRequest) bool {
 			return false
 		},
-		dropHB: func(*kvserver.RaftHeartbeat) bool {
+		dropHB: func(*kvserverpb.RaftHeartbeat) bool {
 			return false
 		},
 	}
@@ -53,15 +58,15 @@ func noopRaftHandlerFuncs() unreliableRaftHandlerFuncs {
 type unreliableRaftHandler struct {
 	name    string
 	rangeID roachpb.RangeID
-	kvserver.RaftMessageHandler
+	kvserver.IncomingRaftMessageHandler
 	unreliableRaftHandlerFuncs
 }
 
 func (h *unreliableRaftHandler) HandleRaftRequest(
 	ctx context.Context,
-	req *kvserver.RaftMessageRequest,
+	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	if len(req.Heartbeats)+len(req.HeartbeatResps) > 0 {
 		reqCpy := *req
 		req = &reqCpy
@@ -89,17 +94,35 @@ func (h *unreliableRaftHandler) HandleRaftRequest(
 
 			return nil
 		}
+		if !h.dropReq(req) && log.V(1) {
+			// Debug logging, even if requests aren't dropped. This is a
+			// convenient way to observe all raft messages in unit tests when
+			// run using --vmodule='client_raft_helpers_test=1'.
+			var prefix string
+			if h.name != "" {
+				prefix = fmt.Sprintf("[%s] ", h.name)
+			}
+			log.Infof(
+				ctx,
+				"%s [raft] r%d Raft message %s",
+				prefix,
+				req.RangeID,
+				raft.DescribeMessage(req.Message, func([]byte) string {
+					return "<omitted>"
+				}),
+			)
+		}
 	}
-	return h.RaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
+	return h.IncomingRaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
 }
 
 func (h *unreliableRaftHandler) filterHeartbeats(
-	hbs []kvserver.RaftHeartbeat,
-) []kvserver.RaftHeartbeat {
+	hbs []kvserverpb.RaftHeartbeat,
+) []kvserverpb.RaftHeartbeat {
 	if len(hbs) == 0 {
 		return hbs
 	}
-	var cpy []kvserver.RaftHeartbeat
+	var cpy []kvserverpb.RaftHeartbeat
 	for i := range hbs {
 		hb := &hbs[i]
 		if hb.RangeID != h.rangeID || (h.dropHB != nil && !h.dropHB(hb)) {
@@ -110,19 +133,19 @@ func (h *unreliableRaftHandler) filterHeartbeats(
 }
 
 func (h *unreliableRaftHandler) HandleRaftResponse(
-	ctx context.Context, resp *kvserver.RaftMessageResponse,
+	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	if resp.RangeID == h.rangeID {
 		if h.dropResp == nil || h.dropResp(resp) {
 			return nil
 		}
 	}
-	return h.RaftMessageHandler.HandleRaftResponse(ctx, resp)
+	return h.IncomingRaftMessageHandler.HandleRaftResponse(ctx, resp)
 }
 
 func (h *unreliableRaftHandler) HandleSnapshot(
 	ctx context.Context,
-	header *kvserver.SnapshotRequest_Header,
+	header *kvserverpb.SnapshotRequest_Header,
 	respStream kvserver.SnapshotResponseStream,
 ) error {
 	if header.RaftMessageRequest.RangeID == h.rangeID && h.snapErr != nil {
@@ -130,7 +153,21 @@ func (h *unreliableRaftHandler) HandleSnapshot(
 			return err
 		}
 	}
-	return h.RaftMessageHandler.HandleSnapshot(ctx, header, respStream)
+	return h.IncomingRaftMessageHandler.HandleSnapshot(ctx, header, respStream)
+}
+
+func (h *unreliableRaftHandler) HandleDelegatedSnapshot(
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	if req.RangeID == h.rangeID && h.delegateErr != nil {
+		if err := h.delegateErr(req); err != nil {
+			return &kvserverpb.DelegateSnapshotResponse{
+				Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+				EncodedError: errors.EncodeError(context.Background(), err),
+			}
+		}
+	}
+	return h.IncomingRaftMessageHandler.HandleDelegatedSnapshot(ctx, req)
 }
 
 // testClusterStoreRaftMessageHandler exists to allows a store to be stopped and
@@ -142,23 +179,23 @@ type testClusterStoreRaftMessageHandler struct {
 
 func (h *testClusterStoreRaftMessageHandler) getStore() (*kvserver.Store, error) {
 	ts := h.tc.Servers[h.storeIdx]
-	return ts.Stores().GetStore(ts.GetFirstStoreID())
+	return ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 }
 
 func (h *testClusterStoreRaftMessageHandler) HandleRaftRequest(
 	ctx context.Context,
-	req *kvserver.RaftMessageRequest,
+	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	store, err := h.getStore()
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	return store.HandleRaftRequest(ctx, req, respStream)
 }
 
 func (h *testClusterStoreRaftMessageHandler) HandleRaftResponse(
-	ctx context.Context, resp *kvserver.RaftMessageResponse,
+	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	store, err := h.getStore()
 	if err != nil {
@@ -169,7 +206,7 @@ func (h *testClusterStoreRaftMessageHandler) HandleRaftResponse(
 
 func (h *testClusterStoreRaftMessageHandler) HandleSnapshot(
 	ctx context.Context,
-	header *kvserver.SnapshotRequest_Header,
+	header *kvserverpb.SnapshotRequest_Header,
 	respStream kvserver.SnapshotResponseStream,
 ) error {
 	store, err := h.getStore()
@@ -179,17 +216,30 @@ func (h *testClusterStoreRaftMessageHandler) HandleSnapshot(
 	return store.HandleSnapshot(ctx, header, respStream)
 }
 
-// testClusterPartitionedRange is a convenient abstraction to create a range on a node
-// in a multiTestContext which can be partitioned and unpartitioned.
+func (h *testClusterStoreRaftMessageHandler) HandleDelegatedSnapshot(
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	store, err := h.getStore()
+	if err != nil {
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError: errors.EncodeError(context.Background(), err),
+		}
+	}
+	return store.HandleDelegatedSnapshot(ctx, req)
+}
+
+// testClusterPartitionedRange is a convenient abstraction to create a range on
+// a node in a multiTestContext which can be partitioned and unpartitioned.
 type testClusterPartitionedRange struct {
 	rangeID roachpb.RangeID
 	mu      struct {
 		syncutil.RWMutex
-		partitionedNode     int
+		partitionedNodeIdx  int
 		partitioned         bool
 		partitionedReplicas map[roachpb.ReplicaID]bool
 	}
-	handlers []kvserver.RaftMessageHandler
+	handlers []kvserver.IncomingRaftMessageHandler
 }
 
 // setupPartitionedRange sets up an testClusterPartitionedRange for the provided
@@ -204,11 +254,11 @@ type testClusterPartitionedRange struct {
 // out messages from the partitioned store. When activated the configuration
 // looks like:
 //
-//           [p]
-//          x  x
-//         /    \
-//        x      x
-//      [*]<---->[*]
+//	     [p]
+//	    x  x
+//	   /    \
+//	  x      x
+//	[*]<---->[*]
 //
 // The activated argument controls whether the partition is activated when this
 // function returns.
@@ -219,38 +269,38 @@ func setupPartitionedRange(
 	tc *testcluster.TestCluster,
 	rangeID roachpb.RangeID,
 	replicaID roachpb.ReplicaID,
-	partitionedNode int,
+	partitionedNodeIdx int,
 	activated bool,
 	funcs unreliableRaftHandlerFuncs,
 ) (*testClusterPartitionedRange, error) {
-	handlers := make([]kvserver.RaftMessageHandler, 0, len(tc.Servers))
+	handlers := make([]kvserver.IncomingRaftMessageHandler, 0, len(tc.Servers))
 	for i := range tc.Servers {
 		handlers = append(handlers, &testClusterStoreRaftMessageHandler{
 			tc:       tc,
 			storeIdx: i,
 		})
 	}
-	return setupPartitionedRangeWithHandlers(tc, rangeID, replicaID, partitionedNode, activated, handlers, funcs)
+	return setupPartitionedRangeWithHandlers(tc, rangeID, replicaID, partitionedNodeIdx, activated, handlers, funcs)
 }
 
 func setupPartitionedRangeWithHandlers(
 	tc *testcluster.TestCluster,
 	rangeID roachpb.RangeID,
 	replicaID roachpb.ReplicaID,
-	partitionedNode int,
+	partitionedNodeIdx int,
 	activated bool,
-	handlers []kvserver.RaftMessageHandler,
+	handlers []kvserver.IncomingRaftMessageHandler,
 	funcs unreliableRaftHandlerFuncs,
 ) (*testClusterPartitionedRange, error) {
 	pr := &testClusterPartitionedRange{
 		rangeID:  rangeID,
-		handlers: make([]kvserver.RaftMessageHandler, 0, len(handlers)),
+		handlers: make([]kvserver.IncomingRaftMessageHandler, 0, len(handlers)),
 	}
 	pr.mu.partitioned = activated
-	pr.mu.partitionedNode = partitionedNode
+	pr.mu.partitionedNodeIdx = partitionedNodeIdx
 	if replicaID == 0 {
-		ts := tc.Servers[partitionedNode]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		ts := tc.Servers[partitionedNodeIdx]
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			return nil, err
 		}
@@ -271,35 +321,44 @@ func setupPartitionedRangeWithHandlers(
 		s := i
 		h := &unreliableRaftHandler{
 			rangeID:                    rangeID,
-			RaftMessageHandler:         handlers[s],
+			IncomingRaftMessageHandler: handlers[s],
 			unreliableRaftHandlerFuncs: funcs,
 		}
 		// Only filter messages from the partitioned store on the other
 		// two stores.
 		if h.dropReq == nil {
-			h.dropReq = func(req *kvserver.RaftMessageRequest) bool {
+			h.dropReq = func(req *kvserverpb.RaftMessageRequest) bool {
 				pr.mu.RLock()
 				defer pr.mu.RUnlock()
 				return pr.mu.partitioned &&
-					(s == pr.mu.partitionedNode ||
-						req.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNode)+1)
+					(s == pr.mu.partitionedNodeIdx ||
+						req.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNodeIdx)+1)
 			}
 		}
 		if h.dropHB == nil {
-			h.dropHB = func(hb *kvserver.RaftHeartbeat) bool {
+			h.dropHB = func(hb *kvserverpb.RaftHeartbeat) bool {
 				pr.mu.RLock()
 				defer pr.mu.RUnlock()
 				if !pr.mu.partitioned {
 					return false
 				}
-				if s == partitionedNode {
+				if s == partitionedNodeIdx {
 					return true
 				}
 				return pr.mu.partitionedReplicas[hb.FromReplicaID]
 			}
 		}
+		if h.dropResp == nil {
+			h.dropResp = func(resp *kvserverpb.RaftMessageResponse) bool {
+				pr.mu.RLock()
+				defer pr.mu.RUnlock()
+				return pr.mu.partitioned &&
+					(s == pr.mu.partitionedNodeIdx ||
+						resp.FromReplica.StoreID == roachpb.StoreID(pr.mu.partitionedNodeIdx)+1)
+			}
+		}
 		if h.snapErr == nil {
-			h.snapErr = func(header *kvserver.SnapshotRequest_Header) error {
+			h.snapErr = func(header *kvserverpb.SnapshotRequest_Header) error {
 				pr.mu.RLock()
 				defer pr.mu.RUnlock()
 				if !pr.mu.partitioned {
@@ -311,8 +370,18 @@ func setupPartitionedRangeWithHandlers(
 				return nil
 			}
 		}
+		if h.delegateErr == nil {
+			h.delegateErr = func(resp *kvserverpb.DelegateSendSnapshotRequest) error {
+				pr.mu.RLock()
+				defer pr.mu.RUnlock()
+				if pr.mu.partitionedReplicas[resp.DelegatedSender.ReplicaID] {
+					return errors.New("partitioned")
+				}
+				return nil
+			}
+		}
 		pr.handlers = append(pr.handlers, h)
-		tc.Servers[s].RaftTransport().Listen(tc.Target(s).StoreID, h)
+		tc.Servers[s].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(tc.Target(s).StoreID, h)
 	}
 	return pr, nil
 }
@@ -340,4 +409,106 @@ func (pr *testClusterPartitionedRange) extend(
 	funcs unreliableRaftHandlerFuncs,
 ) (*testClusterPartitionedRange, error) {
 	return setupPartitionedRangeWithHandlers(tc, rangeID, replicaID, partitionedNode, activated, pr.handlers, funcs)
+}
+
+// dropRaftMessagesFrom sets up a Raft message handler on the given server that
+// drops inbound Raft messages from the given range and replica IDs. In addition
+// to raft messages, StoreLiveness messages from the replica IDs' store are also
+// dropped. Outbound messages are not affected, and must be dropped on the
+// receiver.
+//
+// If cond is given, messages are only dropped when the atomic bool is true.
+// Otherwise, messages are always dropped.
+//
+// This will replace the previous message handlers, if any.
+func dropRaftMessagesFrom(
+	t *testing.T,
+	srv serverutils.TestServerInterface,
+	desc roachpb.RangeDescriptor,
+	fromReplicaIDs []roachpb.ReplicaID,
+	cond *atomic.Bool,
+) {
+	store, err := srv.GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
+	require.NoError(t, err)
+
+	dropFrom := map[roachpb.ReplicaID]bool{}
+	dropFromStore := map[roachpb.StoreID]bool{}
+	for _, id := range fromReplicaIDs {
+		dropFrom[id] = true
+		rep, ok := desc.GetReplicaDescriptorByID(id)
+		if !ok {
+			t.Fatalf("replica %d not found in range descriptor: %v", id, desc)
+		}
+		t.Logf("from store %d; adding replica %s to drop list", store.StoreID(), id)
+		t.Logf("from store %d; adding store %s to drop list", store.StoreID(), rep.StoreID)
+		dropFromStore[rep.StoreID] = true
+	}
+	shouldDrop := func(rID roachpb.RangeID, from roachpb.ReplicaID) bool {
+		return rID == desc.RangeID && (cond == nil || cond.Load()) && dropFrom[from]
+	}
+	shouldDropFromStore := func(from roachpb.StoreID) bool {
+		return (cond == nil || cond.Load()) && dropFromStore[from]
+	}
+
+	srv.RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(store.StoreID(), &unreliableRaftHandler{
+		rangeID:                    desc.RangeID,
+		IncomingRaftMessageHandler: store,
+		unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
+			dropHB: func(hb *kvserverpb.RaftHeartbeat) bool {
+				return shouldDrop(hb.RangeID, hb.FromReplicaID)
+			},
+			dropReq: func(req *kvserverpb.RaftMessageRequest) bool {
+				return shouldDrop(req.RangeID, req.FromReplica.ReplicaID)
+			},
+			dropResp: func(resp *kvserverpb.RaftMessageResponse) bool {
+				return shouldDrop(resp.RangeID, resp.FromReplica.ReplicaID)
+			},
+		},
+	})
+	srv.StoreLivenessTransport().(*storeliveness.Transport).ListenMessages(store.StoreID(), &storeliveness.UnreliableHandler{
+		MessageHandler: store.TestingStoreLivenessMessageHandler(),
+		UnreliableHandlerFuncs: storeliveness.UnreliableHandlerFuncs{
+			DropStoreLivenessMsg: func(msg *storelivenesspb.Message) bool {
+				drop := shouldDropFromStore(msg.From.StoreID)
+				if drop {
+					t.Logf("dropping msg %s from store %d: to %d", msg.Type, msg.From.StoreID, msg.To.StoreID)
+				} else {
+					t.Logf("allowing msg %s from store %d: to %d", msg.Type, msg.From.StoreID, msg.To.StoreID)
+				}
+				return drop
+			},
+		},
+	})
+}
+
+// getMapsDiff returns the difference between the values of corresponding
+// metrics in two maps. Assumption: beforeMap and afterMap contain the same set
+// of keys.
+func getMapsDiff(beforeMap map[string]int64, afterMap map[string]int64) map[string]int64 {
+	diffMap := make(map[string]int64)
+	for metricName, beforeValue := range beforeMap {
+		if v, ok := afterMap[metricName]; ok {
+			diffMap[metricName] = v - beforeValue
+		}
+	}
+	return diffMap
+}
+
+// alwaysRunWithLeaderLeases configures settings to ensure the caller is always
+// using leader leases, regardless of any metamorphic constants.
+func alwaysRunWithLeaderLeases(ctx context.Context, st *cluster.Settings) {
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false)
+	kvserver.LeaderLeasesEnabled.Override(ctx, &st.SV, true)
+	kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, &st.SV, 1.0)
+	// TODO(arul): Once https://github.com/cockroachdb/cockroach/issues/118435 we
+	// can remove this. Leader leases require us to reject lease requests on
+	// replicas that are not the leader.
+	kvserver.RejectLeaseOnLeaderUnknown.Override(ctx, &st.SV, true)
+}
+
+func alwaysRunWithEpochLeases(ctx context.Context, st *cluster.Settings) {
+	// Only run the test with epoch based leases.
+	kvserver.TransferExpirationLeasesFirstEnabled.Override(ctx, &st.SV, false)
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false)
+	kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, &st.SV, 0.0)
 }

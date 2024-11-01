@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
 import (
+	"bytes"
 	"context"
 	gosql "database/sql"
 	"fmt"
@@ -23,34 +19,37 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPostProcess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -72,16 +71,14 @@ func TestPostProcess(t *testing.T) {
 	}
 
 	testCases := []struct {
-		post          execinfrapb.PostProcessSpec
-		outputTypes   []*types.T
-		expNeededCols []int
-		expected      string
+		post        execinfrapb.PostProcessSpec
+		outputTypes []*types.T
+		expected    string
 	}{
 		{
-			post:          execinfrapb.PostProcessSpec{},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 
 		// Projection.
@@ -90,9 +87,8 @@ func TestPostProcess(t *testing.T) {
 				Projection:    true,
 				OutputColumns: []uint32{0, 2},
 			},
-			outputTypes:   types.TwoIntCols,
-			expNeededCols: []int{0, 2},
-			expected:      "[[0 2] [0 3] [0 4] [0 3] [0 4] [0 4] [1 3] [1 4] [1 4] [2 4]]",
+			outputTypes: types.TwoIntCols,
+			expected:    "[[0 2] [0 3] [0 4] [0 3] [0 4] [0 4] [1 3] [1 4] [1 4] [2 4]]",
 		},
 
 		// Rendering.
@@ -100,9 +96,8 @@ func TestPostProcess(t *testing.T) {
 			post: execinfrapb.PostProcessSpec{
 				RenderExprs: []execinfrapb.Expression{{Expr: "@1"}, {Expr: "@2"}, {Expr: "@1 + @2"}},
 			},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1},
-			expected:      "[[0 1 1] [0 1 1] [0 1 1] [0 2 2] [0 2 2] [0 3 3] [1 2 3] [1 2 3] [1 3 4] [2 3 5]]",
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 1] [0 1 1] [0 1 1] [0 2 2] [0 2 2] [0 3 3] [1 2 3] [1 2 3] [1 3 4] [2 3 5]]",
 		},
 
 		// More complex rendering expressions.
@@ -117,8 +112,7 @@ func TestPostProcess(t *testing.T) {
 					{Expr: "@1 = @2 - 1 AND @1 = @3 - 2"},
 				},
 			},
-			outputTypes:   []*types.T{types.Int, types.Int, types.Bool, types.Bool, types.Bool, types.Bool},
-			expNeededCols: []int{0, 1, 2},
+			outputTypes: []*types.T{types.Int, types.Int, types.Bool, types.Bool, types.Bool, types.Bool},
 			expected: "[" + strings.Join([]string{
 				/* 0 1 2 */ "[-1 2 false true true true]",
 				/* 0 1 3 */ "[-1 3 false true true false]",
@@ -135,95 +129,74 @@ func TestPostProcess(t *testing.T) {
 
 		// Offset.
 		{
-			post:          execinfrapb.PostProcessSpec{Offset: 3},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Offset: 3},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 
 		// Limit.
 		{
-			post:          execinfrapb.PostProcessSpec{Limit: 3},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 1 2] [0 1 3] [0 1 4]]",
+			post:        execinfrapb.PostProcessSpec{Limit: 3},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 2] [0 1 3] [0 1 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Limit: 9},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Limit: 9},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Limit: 10},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Limit: 10},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Limit: 11},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Limit: 11},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 1 2] [0 1 3] [0 1 4] [0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 
 		// Offset + limit.
 		{
-			post:          execinfrapb.PostProcessSpec{Offset: 3, Limit: 2},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 2 3] [0 2 4]]",
+			post:        execinfrapb.PostProcessSpec{Offset: 3, Limit: 2},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 2 3] [0 2 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Offset: 3, Limit: 6},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Offset: 3, Limit: 6},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Offset: 3, Limit: 7},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Offset: 3, Limit: 7},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 		{
-			post:          execinfrapb.PostProcessSpec{Offset: 3, Limit: 8},
-			outputTypes:   types.ThreeIntCols,
-			expNeededCols: []int{0, 1, 2},
-			expected:      "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
+			post:        execinfrapb.PostProcessSpec{Offset: 3, Limit: 8},
+			outputTypes: types.ThreeIntCols,
+			expected:    "[[0 2 3] [0 2 4] [0 3 4] [1 2 3] [1 2 4] [1 3 4] [2 3 4]]",
 		},
 	}
 
+	ctx := context.Background()
+	flowCtx := &execinfra.FlowCtx{}
 	for tcIdx, tc := range testCases {
 		t.Run(strconv.Itoa(tcIdx), func(t *testing.T) {
 			inBuf := distsqlutils.NewRowBuffer(types.ThreeIntCols, input, distsqlutils.RowBufferArgs{})
 			outBuf := &distsqlutils.RowBuffer{}
 
 			var out execinfra.ProcOutputHelper
-			semaCtx := tree.MakeSemaContext()
-			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			defer evalCtx.Stop(context.Background())
-			if err := out.Init(&tc.post, inBuf.OutputTypes(), &semaCtx, evalCtx); err != nil {
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
+			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			defer evalCtx.Stop(ctx)
+			if err := out.Init(ctx, &tc.post, inBuf.OutputTypes(), &semaCtx, evalCtx, flowCtx); err != nil {
 				t.Fatal(err)
 			}
 
-			// Verify NeededColumns().
-			count := 0
-			neededCols := out.NeededColumns()
-			neededCols.ForEach(func(_ int) {
-				count++
-			})
-			if count != len(tc.expNeededCols) {
-				t.Fatalf("invalid neededCols length %d, expected %d", count, len(tc.expNeededCols))
-			}
-			for _, col := range tc.expNeededCols {
-				if !neededCols.Contains(col) {
-					t.Errorf("column %d not found in neededCols", col)
-				}
-			}
 			// Run the rows through the helper.
 			for i := range input {
-				status, err := out.EmitRow(context.Background(), input[i], outBuf)
+				status, err := out.EmitRow(ctx, input[i], outBuf)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -250,6 +223,7 @@ func TestPostProcess(t *testing.T) {
 
 func TestAggregatorSpecAggregationEquals(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Used for FilterColIdx *uint32.
 	colIdx1 := uint32(0)
@@ -340,35 +314,42 @@ func TestAggregatorSpecAggregationEquals(t *testing.T) {
 
 func TestProcessorBaseContext(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
+	// Use a custom context to distinguish it from the background one.
+	ctx := context.WithValue(context.Background(), struct{}{}, struct{}{})
 	st := cluster.MakeTestingClusterSettings()
 
 	runTest := func(t *testing.T, f func(noop *noopProcessor)) {
-		evalCtx := tree.MakeTestingEvalContext(st)
+		evalCtx := eval.MakeTestingEvalContext(st)
 		flowCtx := &execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{Settings: st},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 		}
 		defer flowCtx.EvalCtx.Stop(ctx)
 
 		input := execinfra.NewRepeatableRowSource(types.OneIntCol, randgen.MakeIntRows(10, 1))
-		noop, err := newNoopProcessor(flowCtx, 0 /* processorID */, input, &execinfrapb.PostProcessSpec{}, &rowDisposer{})
+		noop, err := newNoopProcessor(ctx, flowCtx, 0 /* processorID */, input, &execinfrapb.PostProcessSpec{})
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Before Start we should get the background context.
+		if noop.Ctx() != context.Background() {
+			t.Fatalf("ProcessorBase.Ctx() didn't return the background context before Start")
+		}
 		noop.Start(ctx)
-		origCtx := noop.Ctx
+		origCtx := noop.Ctx()
 
 		// The context should be valid after Start but before Next is called in case
 		// ConsumerDone or ConsumerClosed are called without calling Next.
-		if noop.Ctx == nil {
+		if noop.Ctx() == context.Background() {
 			t.Fatalf("ProcessorBase.ctx not initialized")
 		}
 		f(noop)
 		// The context should be reset after ConsumerClosed is called so that any
 		// subsequent logging calls will not operate on closed spans.
-		if noop.Ctx != origCtx {
+		if noop.Ctx() != origCtx {
 			t.Fatalf("ProcessorBase.ctx not reset on close")
 		}
 	}
@@ -419,7 +400,7 @@ func getPGXConnAndCleanupFunc(
 	ctx context.Context, t *testing.T, servingSQLAddr string,
 ) (*pgx.Conn, func()) {
 	t.Helper()
-	pgURL, cleanup := sqlutils.PGUrl(t, servingSQLAddr, t.Name(), url.User(security.RootUser))
+	pgURL, cleanup := sqlutils.PGUrl(t, servingSQLAddr, t.Name(), url.User(username.RootUser))
 	pgURL.Path = "test"
 	pgxConfig, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
@@ -447,6 +428,7 @@ func populateRangeCacheAndDisableBuffering(t *testing.T, db *gosql.DB, tableName
 // interesting to test is the integration between DistSQL and KV.
 func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// We're going to test by running a query that selects rows 1..10 with limit
 	// 5. Out of these, rows 1..5 are on node 1, 6..10 on node 2. We're going to
@@ -462,19 +444,19 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 	// entirely easy to cause given the current implementation details.
 
 	var (
-		// trapRead is set, atomically, once the test wants to block a read on the
-		// first node.
-		trapRead    int64
-		blockedRead struct {
+		// We will want to block exactly one read to the first node.
+		blockOneRead atomic.Bool
+		blockedRead  struct {
 			syncutil.Mutex
 			unblockCond   *sync.Cond
 			shouldUnblock bool
 		}
+		endKeyToBlock string
 	)
 
 	blockedRead.unblockCond = sync.NewCond(&blockedRead.Mutex)
 
-	tc := serverutils.StartNewTestCluster(t, 3, /* numNodes */
+	tc := serverutils.StartCluster(t, 3, /* numNodes */
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -484,31 +466,37 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 				0: {
 					Knobs: base.TestingKnobs{
 						Store: &kvserver.StoreTestingKnobs{
-							TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
-								if atomic.LoadInt64(&trapRead) == 0 {
+							TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+								if !blockOneRead.Load() {
 									return nil
 								}
 								// We're going to trap a read for the rows [1,5].
-								req, ok := ba.GetArg(roachpb.Scan)
+								req, ok := ba.GetArg(kvpb.Scan)
 								if !ok {
 									return nil
 								}
-								key := req.(*roachpb.ScanRequest).Key.String()
-								endKey := req.(*roachpb.ScanRequest).EndKey.String()
-								if strings.Contains(key, "/1") && strings.Contains(endKey, "/6") {
-									blockedRead.Lock()
-									for !blockedRead.shouldUnblock {
-										blockedRead.unblockCond.Wait()
-									}
-									blockedRead.Unlock()
-									return roachpb.NewError(
-										roachpb.NewReadWithinUncertaintyIntervalError(
-											ba.Timestamp,           /* readTs */
-											ba.Timestamp.Add(1, 0), /* existingTs */
-											hlc.Timestamp{},        /* localUncertaintyLimit */
-											ba.Txn))
+								endKey := req.(*kvpb.ScanRequest).EndKey.String()
+								if !strings.Contains(endKey, endKeyToBlock) {
+									// Either a request for a different table or
+									// for a different part of the target table.
+									return nil
 								}
-								return nil
+								// Since we're blocking this read, the caller
+								// must set it again if it wants to block
+								// another read.
+								blockOneRead.Store(false)
+								blockedRead.Lock()
+								for !blockedRead.shouldUnblock {
+									blockedRead.unblockCond.Wait()
+								}
+								blockedRead.Unlock()
+								return kvpb.NewError(
+									kvpb.NewReadWithinUncertaintyIntervalError(
+										ba.Timestamp,           /* readTs */
+										hlc.ClockTimestamp{},   /* localUncertaintyLimit */
+										ba.Txn,                 /* txn */
+										ba.Timestamp.Add(1, 0), /* valueTS */
+										hlc.ClockTimestamp{} /* localTS */))
 							},
 						},
 					},
@@ -525,6 +513,15 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 		10, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
+	row := origDB0.QueryRow("SELECT 't'::regclass::oid")
+	var tableID int
+	require.NoError(t, row.Scan(&tableID))
+	// Request that we want to block is of the form
+	//   Scan /Table/105/1{-/6}
+	// so it'll have the end key like
+	//   /Table/105/1/6.
+	endKeyToBlock = fmt.Sprintf("/Table/%d/1/6", tableID)
+
 	// Split the table and move half of the rows to the 2nd node. We'll block the
 	// read on the first node, and so the rows we're going to be expecting are the
 	// ones from the second node.
@@ -539,10 +536,8 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 	}
 
 	populateRangeCacheAndDisableBuffering(t, origDB0, "t")
-	defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).ServingSQLAddr())
+	defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).AdvSQLAddr())
 	defer cleanup()
-
-	atomic.StoreInt64(&trapRead, 1)
 
 	// Run with the vectorize off and on.
 	testutils.RunTrueAndFalse(t, "vectorize", func(t *testing.T, vectorize bool) {
@@ -551,6 +546,7 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 		// by increasing the limit from 5 to 6 and checking that we get the injected
 		// error in that case.
 		testutils.RunTrueAndFalse(t, "dummy", func(t *testing.T, dummy bool) {
+			blockOneRead.Store(true)
 			// Reset the blocking condition.
 			blockedRead.Lock()
 			blockedRead.shouldUnblock = false
@@ -646,8 +642,8 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 
 	filters := make([]struct {
 		syncutil.Mutex
-		enabled          bool
-		tableIDsToFilter []int
+		enabled   bool
+		keyPrefix roachpb.Key
 	}, numNodes)
 
 	var allNodeIdxs []int
@@ -659,39 +655,32 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 			testClusterArgs.ServerArgsPerNode[node] = base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+						TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if atomic.LoadInt64(&trapRead) == 0 {
 								return nil
 							}
 							filters[node].Lock()
 							enabled := filters[node].enabled
-							tableIDsToFilter := filters[node].tableIDsToFilter
+							keyPrefix := filters[node].keyPrefix
 							filters[node].Unlock()
 							if !enabled {
 								return nil
 							}
 
-							if req, ok := ba.GetArg(roachpb.Scan); !ok {
+							req, ok := ba.GetArg(kvpb.Scan)
+							if !ok {
 								return nil
-							} else if tableIDsToFilter != nil {
-								shouldReturnUncertaintyError := false
-								for _, tableID := range tableIDsToFilter {
-									if strings.Contains(req.(*roachpb.ScanRequest).Key.String(), fmt.Sprintf("/Table/%d", tableID)) {
-										shouldReturnUncertaintyError = true
-										break
-									}
-								}
-								if !shouldReturnUncertaintyError {
-									return nil
-								}
 							}
-
-							return roachpb.NewError(
-								roachpb.NewReadWithinUncertaintyIntervalError(
+							if !bytes.HasPrefix(req.(*kvpb.ScanRequest).Key, keyPrefix) {
+								return nil
+							}
+							return kvpb.NewError(
+								kvpb.NewReadWithinUncertaintyIntervalError(
 									ba.Timestamp,
-									ba.Timestamp.Add(1, 0),
-									hlc.Timestamp{},
+									hlc.ClockTimestamp{},
 									ba.Txn,
+									ba.Timestamp.Add(1, 0),
+									hlc.ClockTimestamp{},
 								),
 							)
 						},
@@ -703,12 +692,13 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, numNodes, testClusterArgs)
+	tc := serverutils.StartCluster(t, numNodes, testClusterArgs)
 	defer tc.Stopper().Stop(ctx)
 
 	// Create a 30-row table, split and scatter evenly across the numNodes nodes.
 	dbConn := tc.ServerConn(0)
 	sqlutils.CreateTable(t, dbConn, "t", "x INT, y INT, INDEX (y)", 30, sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowIdxFn))
+	tableID := desctestutils.TestingGetPublicTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", "t").GetID()
 	// onerow is a table created to test #51458. The value of the only row in this
 	// table is explicitly set to 2 so that it is routed by hash to a desired
 	// destination.
@@ -723,15 +713,8 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 	))
 	require.NoError(t, err)
 	populateRangeCacheAndDisableBuffering(t, dbConn, "t")
-	defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).ServingSQLAddr())
+	defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).AdvSQLAddr())
 	defer cleanup()
-
-	// errorOriginSpec is a way for test cases to enable a request filter on the
-	// node index provided for the given tableNames.
-	type errorOriginSpec struct {
-		nodeIdx    int
-		tableNames []string
-	}
 
 	testCases := []struct {
 		query           string
@@ -739,30 +722,23 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 		// overrideErrorOrigin if non-nil, defines special request filtering
 		// behavior.
 		// The default behavior is to enable uncertainty errors for a single random
-		// node and for all scan requests.
-		overrideErrorOrigin []errorOriginSpec
-		// if non-empty, this test will be skipped.
-		skip string
+		// node.
+		overrideErrorOrigin []int
 	}{
 		{
 			query:           "SELECT * FROM t AS t1 JOIN t AS t2 ON t1.x = t2.x",
-			expectedPlanURL: "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lOFr4jAYxr_fXxFeOLYdcW1S52Zh0HHrse483engDkY_dDbTgmt6SQSH-L8fbQWvoolesd-MeX9vnifP2yxB_pmBCyO_5399Rkn6xtG34eAHevF_P_Xugj46vw9Gz6OfvQu0rvlSFih0N0KKoMdB0F8vKBr0kSKXC3SLFL1chOjXgz_0y6694LuPzu6TaCKid_fzGWBIecz60TuT4L4AAQwUMDgQYsgEHzMpuci3lkVhEC_AtTEkaTZX-d8hhjEXDNwlqETNGLjwHL3O2JBFMROWDRhipqJkVrRXXiaS90h8AIZRFqXSRS2L5EWDuXKRR7BHIVxh4HO1PmDT9_UDTSM5rXb0CISrEINU0YSBS1b4_4Q6DQule4Vu-sxTLmImWFzpFOakqWSH24dITh95kjJhdarSZuxNnXvk4lYkk2nxq-ITew722ltuN06cGk52yOzzFs-s7rblnUe3K0eTw9MmxrQtYrcserLJPEJru3mtdK_WBobz-nTDSQ-_dWq-dWq3TjUeRwi9algo3Su0gdm4aebh2iFiyGTGU8kOepfs3AaLJ6y8FsnnYsyeBB8Xx5TLQcEVX1fMpCp3abkI0nIrF3g43KkDd_UwOUI2PQ7u1IG7ephuw_a_sKP37GhhYldoe5tu1wlaDxuC1sOGoK_qBK2HDUHrYUPQnTpBX9eJSg8botLDhqhu6kSlhw1R6WFDVN2jogpXn_4GAAD__4WsRD0=",
+			expectedPlanURL: "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEld9u2jAUh-_3FNaRpraTKbHD30iVqApT6Sh0gLRJFapcYiBqiJltVKqKd58CdC0J8UjWslwgTJwvv2N_5jyD-uWDA71Gq3HRR14wEuhrt3ONbhs_b1rnzTY6rjd7_d73Fka9y_ObxgnaTP2ynqfReQ9pgq46zfZmQFGnjTQ5XaAzpOnpYoB-XDa6jTW81fzWQEd1j40lmzqfjwBDIFzeZlOuwLkFAhgoYLBhgGEmxZArJWR463k1sekuwLEweMFsrsOfBxiGQnJwnkF72ufgQJ_d-7zLmctl3gIMLtfM81d4XdN3swf-BBguhD-fBspBC4zCcW_GwlEuTywYLDGIud684pV8_4QmTE22mTUCg-UAg9JszMEhb3I36-BYS5wtun3w6DQS3U6M_sqdB0K6XHJ3izwIn_zblB31XzI1uRJewGW-tB3V5yN9XCMnZ9IbT1bfAENnrh1UI7hGcc3GtUKk-tfK7EhlpX-obEfstsiJWb4aXYKdUQqRKNWtKGR_P0haP_LEyuXp-9pNsqYv_I_0UcELiekPIHj5IwUvb1VG998XmnpfqJV7V6Vo1ujFg0eP-lRMjH4Anyof6VMlTRfrcjUTgeJ7_R9akTflSFgnd8d8vW5KzOWQ30gxXM1dDzsr0Modlyu9vkvXg2bwcktpydn0TxPen1RKJpXSkarJJEKjKJKiPPoWZacjlZJJ1XSkajKJFKMoGkVZb1G2YaUqUZRtRBFri2UZTShkdYqkIxmcKqcjmZyKmVDM6lQhHcngFImtuRllkip2_EqZpYqpXs5qQuwgm0kGE2Kim0kmE2L7V8lqQuwgm0kmE2JnxowymRA7NNWsJlAr7DgjXzzeeS44YG2u3I6PlwvCB9hYhW2vNxGPK27_aRY2rRHzFcdwzR54nWsup17gKe0NwdFyzpfLT78DAAD__5SzAcM=",
 		},
 		{
 			query:           "SELECT * FROM t AS t1 INNER LOOKUP JOIN t AS t2 ON t1.x = t2.y",
-			expectedPlanURL: "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lGGL2kAQhr_3VwwD5dqyntmNehoo5OilNHdpYtXSwhGO1GwlrWbTzQYU8b-XGOHU6pp64Mdk5vF93JnNEvM_U7Rw6HjOhxEk6U8BHwfBZ3h0vve9W9eHN3fucDT84r2FTc-7qkHB7RAUBdf3nQF4QfDwtQ_3getvKgwCHxS9nsN7UOx6EcK3T87AqSI898GBq7skmshoZr2-QoKpiLkfzXiO1iNSJMiQoIkhwUyKMc9zIcvSct3oxnO0DIJJmhWqfB0SHAvJ0VqiStSUo4Wj6MeUD3gUc9k0kGDMVZRM1z-v7Ewms0gukOAwi9LcgkaTlk1BoSywKbEZhiuColDPAbmKJhwtuiL1Je5Fkm4czH0H9bR4SuI5EvSE-F1k8EskKYi0FNhRIXaL2O2jQuxMoc7xQ_lHqLUn1Ca2eVTIPCr07FGkQsZc8nhHIlwdUPZFQ2TN3l7j4ejWTjStvyH05IY0qdFosrOW5ITH1kxal1mS-kI3l1kSVn9S7PSkmNE4Z0wnJLZOpX2ZMdUX6l7-Lh8QGvA8E2nOa11Vo7zrPJ7w6sOQi0KOeV-K8TqmegzW3PpFzHNVVWn14KZVqRTchqkWZnqYaWFzB6b7sKnXNvTRLS3d1sNtLdzRw52X_OkbLdzVJ3e1cE8P9_5LO1y9-hsAAP__cuHbAw==",
+			expectedPlanURL: "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzElV1v2jwUgO_fX2Ed6VW3yZTY4TPSJKqSqWlpwgjTJlWoyojLvIY4sx0VVPHfpwBdIW0iwkWbCyTHh8ePfY5PHkH9icAC3x7Y52PE4zuBvoy8a3Rj_xgOzhwXfeg7_tj_OsDIvzgb2h_RNvTTJk6jMx9pghzXtUdo4HlX34bo0nPc7QxFnos0OV2gz0jT0-UEfb-wR_ZmpYFzZaOTPg9mMphb_58AhliEzA3mTIF1AwQwUMBgwgRDIsWUKSVkNvW4DnTCBVgGBh4nqc5eTzBMhWRgPYLmOmJgwTj4GbERC0Im6wZgCJkOeLTG656-Te7ZEjCciyidx8pCC4yysZ8E2ahWJwZMVhhEqp-XUDqYMbDIjpPTB8tY4cO1LgWPt1bmS6vlLQ8XgGEgxH2aoN-Cx0jEFuqRXdclRlI88LDQkOYMzSMNW4Xn9kKwsXeYgMFLdeaNexT3mrhnFsqaOdlWoeyzYxoLGTLJwj3ByeqV7biiJpJ6Nxf4ukojp9LdUyGHFxypWnB1YtTq9PCaI1XMdjLaeLOaaxxp2H6PmmvvydLDE00rJ5oatYOzTKto7Zxh882y3DzSsPMeWe5UaYMjphIRK3ZQ4zByK9VI1opYOGObvqVEKqdsKMV0HbsZemvQ-kXIlN7Mks3AiZ-mlJYsmP_7zuySSCmJFpPMPImWksw9EtkltfIks3x3RoXtNUpRzWISyZOapaRWMamRJ7WOPah2ntQuJXWKnWie1CkldYtJzType-zuOlm530Xi4ZaHYIGxfWqv_Dw9kP0hmKnszvm_xMMaO14m2Y25CyLFMFwH96zPNJNzHnOl-RQsLVO2Wv33NwAA___OinSA",
 		},
 		{
-			// This test reproduces 51458 and should be enabled once that issue is
-			// fixed.
-			query:           "SELECT * FROM t JOIN onerow ON t.x = onerow.x",
-			expectedPlanURL: "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lOFr2kAYxr_vrzheGG3H2eROW0egkLFmNJ3TToUNSj5czVsNaC67O5lF_N9HEsFF0kQJ-s3z3t97z_O8uVuD_jMHB0Zez_s6JlH8Ksm34eAHefZ-P_W--H1yee-PxqOfvSuyrfmUFxjyOPD7RMao5F8y6BNzvSJ32_X1KiC_Hryhl3fs-d89cnEfiakSC-fjBVCIZYh9sUANzjMwoMCBQhsCComSE9RaqnRrnRX64Qocm0IUJ0uT_h1QmEiF4KzBRGaO4MBYvMxxiCJEZdlAIUQjonnW3riJihZCvQGFUSJi7ZCWxdKiwdI4xGXU5RBsKMil2R6w6_vyRmZCz4odXQbBJqCgjZgiOGxD3xG667OMpQpRYVjoFKRkXUmJ2wehZ48yilFZnaK0Ob6aS5dd3aloOst-FXxSt71ndWej3cBGica-bMnE6u77LT26UziaHT5qVjtqi9kti59s2uy807450bT54ZHz-si53TpV3kcIbRfb5k9TyVuwk9pIJ39X5xm-i9szvAIlCoaoExlrPOiS26kHDKeYZ6LlUk3wSclJdky-HGRcdq1C1Cbf3S78ON9KBR4Od5rA3WqY7cP2_zCvhnkl_LkA2_twu0lg1XBNYNVwTWCdJoHdNPFcDdd4roZrPN8eIZsfB3eawN1quHvUqILNh38BAAD___TFXIc=",
-			overrideErrorOrigin: []errorOriginSpec{
-				{
-					nodeIdx:    0,
-					tableNames: []string{"t"},
-				},
-			},
+			// Reproduction of not propagating errors to all outputs of the
+			// hash router (#51458).
+			query:               "SELECT * FROM t JOIN onerow ON t.x = onerow.x",
+			expectedPlanURL:     "Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lW9P4koUxt_fTzE5yY16M0inFPA2McEIN-JFcIFkNzHEjPQAjaXDzkwjxvDdN21xpYV2Kf7pC2WY098855knhxdQPz2wYdDqtC6HxPUngvzX792Qu9aP285Fu0uOm-3BcPCtQ8ng6uK2dULWpf_EdZpc99pdInyU4on0ukSfLsn5en26HJHvV61-KwZ32v-3yFHT5VPJ5_bfR0DBFw52-RwV2HfAgIIJFCoworCQYoxKCRluvUSFbWcJtkHB9ReBDr8eURgLiWC_gHa1h2DDkD942EfuoCwbQMFBzV0vwuuGvl884jNQuBReMPeVTZaUhOvBgoerUpkZMFpREIFeH_FGfngmM65mSWaDwWg1oqA0nyLYbEN3uwm2saIZ0t-4gS-kgxKdBHkUvvmnkh39X3E1uxauj7JsJaV6ONHHDXZyLt3pLPoEFHqBtkmD0YZJG5VU629tVVJtWe9oa4fmriiJRbme7n-nFCslpZ6QwvYPBysajjIzSmXzY_PBMtV_QT6qn5aPaqItc_9LMQtfimmUPvRGzEOlV5LHxAOwEf_bbmJj5rxLvpmSX8mU_wWBqn1aoGqZA2eHoj6qhfAV7jVPjNRJJRY2ic4UY9OUCOQYb6UYR7XxsheBovA4qHS8u160_dctpSXy-e-fgf1JVjbJKkaqZ5PO0iSWJhmbJDObxMw0ysxFnSVQRq5RlUMtZ8VIOZZXi5FyLP83TbIOtrySRlUPNWrr8vJJOUbVipFyjGJbOagVaM_cRG0ZlU-yskn1YqR6NolthbN-cBCscFxNPPF07zpgg7F-Sjv-vD4QvsCnKpyZg5l4irjD50U48SbcU0jhhj9iEzXKueu7SrtjsLUMcLX661cAAAD__3vS9aQ=",
+			overrideErrorOrigin: []int{0},
 		},
 	}
 
@@ -786,40 +762,39 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 		}
 		for _, testCase := range testCases {
 			t.Run(testCase.query, func(t *testing.T) {
-				if testCase.skip != "" {
-					skip.IgnoreLint(t, testCase.skip)
-				}
 				func() {
 					_, err := defaultConn.Exec(ctx, fmt.Sprintf("set vectorize=%s", vectorizeOpt))
 					require.NoError(t, err)
-					func() {
-						// Check distsql plan.
+					// We allow for the DistSQL plan to be different for some
+					// time in case the range cache wasn't populated as we
+					// expected (we've seen this under race in #108250).
+					testutils.SucceedsSoon(t, func() error {
 						rows, err := defaultConn.Query(
 							ctx,
-							fmt.Sprintf("SELECT info FROM [EXPLAIN (DISTSQL) %s] WHERE info LIKE 'Diagram:%%'", testCase.query),
+							fmt.Sprintf("SELECT info FROM [EXPLAIN (DISTSQL, SHAPE) %s] WHERE info LIKE 'Diagram:%%'", testCase.query),
 						)
 						require.NoError(t, err)
 						defer rows.Close()
 						rows.Next()
 						var actualPlanURL string
 						require.NoError(t, rows.Scan(&actualPlanURL))
-						require.Equal(t, testCase.expectedPlanURL, actualPlanURL)
-					}()
+						if testCase.expectedPlanURL != actualPlanURL {
+							return errors.Newf(
+								"DistSQL plans didn't match:\nexpected:%s\nactual: %s",
+								testCase.expectedPlanURL, actualPlanURL,
+							)
+						}
+						return nil
+					})
 
-					errorOrigin := []errorOriginSpec{{nodeIdx: allNodeIdxs[rng.Intn(len(allNodeIdxs))]}}
+					errorOrigin := []int{allNodeIdxs[rng.Intn(len(allNodeIdxs))]}
 					if testCase.overrideErrorOrigin != nil {
 						errorOrigin = testCase.overrideErrorOrigin
 					}
-					for _, errorOriginSpec := range errorOrigin {
-						nodeIdx := errorOriginSpec.nodeIdx
+					for _, nodeIdx := range errorOrigin {
 						filters[nodeIdx].Lock()
 						filters[nodeIdx].enabled = true
-						for _, tableName := range errorOriginSpec.tableNames {
-							filters[nodeIdx].tableIDsToFilter = append(
-								filters[nodeIdx].tableIDsToFilter,
-								int(catalogkv.TestingGetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", tableName).GetID()),
-							)
-						}
+						filters[nodeIdx].keyPrefix = keys.SystemSQLCodec.TablePrefix(uint32(tableID))
 						filters[nodeIdx].Unlock()
 					}
 					// Reset all filters for the next test case.
@@ -827,7 +802,7 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 						for i := range filters {
 							filters[i].Lock()
 							filters[i].enabled = false
-							filters[i].tableIDsToFilter = nil
+							filters[i].keyPrefix = nil
 							filters[i].Unlock()
 						}
 					}()
@@ -858,17 +833,18 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 // instantiation of processors.
 func TestFlowConcurrentTxnUse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	t.Run("TestSingleGoroutine", func(t *testing.T) {
 		flow := &flowinfra.FlowBase{}
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			// samplerProcessor is used here and the other subtests because it does
 			// not implement RowSource and so must be run in a separate goroutine (it
 			// cannot be fused).
 			&samplerProcessor{
 				input: &tableReader{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil}))
 		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because there is only one goroutine")
 	})
 	t.Run("TestMultipleGoroutinesWithNoConcurrentTxnUse", func(t *testing.T) {
@@ -876,28 +852,28 @@ func TestFlowConcurrentTxnUse(t *testing.T) {
 		// This is a common plan for stats collection. Neither processor implements
 		// RowSource, so the sampleAggregator must be run in a separate goroutine
 		// with a RowChannel connecting the two.
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			&samplerProcessor{
 				input: &tableReader{},
 			},
 			&sampleAggregator{
 				input: &execinfra.RowChannel{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil, nil}))
 		require.False(t, flow.ConcurrentTxnUse(), "expected no concurrent txn use because the tableReader should be the only txn user")
 	})
 	t.Run("TestMultipleGoroutinesWithConcurrentTxnUse", func(t *testing.T) {
 		flow := &flowinfra.FlowBase{}
 		// This is a scenario that should never happen, but is useful for testing
 		// (multiple concurrent samplerProcessors).
-		flow.SetProcessors([]execinfra.Processor{
+		require.NoError(t, flow.SetProcessorsAndOutputs([]execinfra.Processor{
 			&samplerProcessor{
 				input: &tableReader{},
 			},
 			&samplerProcessor{
 				input: &tableReader{},
 			},
-		})
+		}, []execinfra.RowReceiver{nil, nil}))
 		require.True(t, flow.ConcurrentTxnUse(), "expected concurrent txn use given that there are two tableReaders each in a separate goroutine")
 	})
 }
@@ -908,20 +884,18 @@ func TestFlowConcurrentTxnUse(t *testing.T) {
 // responsibility to set up all the necessary infrastructure. This method is
 // intended to be used by "reader" processors - those that read data from disk.
 func testReaderProcessorDrain(
-	ctx context.Context,
-	t *testing.T,
-	processorConstructor func(out execinfra.RowReceiver) (execinfra.Processor, error),
+	ctx context.Context, t *testing.T, processorConstructor func() (execinfra.Processor, error),
 ) {
 	// ConsumerClosed verifies that when a processor's consumer is closed, the
 	// processor finishes gracefully.
 	t.Run("ConsumerClosed", func(t *testing.T) {
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerClosed()
-		p, err := processorConstructor(out)
+		p, err := processorConstructor()
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(ctx)
+		p.Run(ctx, out)
 	})
 
 	// ConsumerDone verifies that the producer drains properly by checking that
@@ -930,11 +904,11 @@ func testReaderProcessorDrain(
 	t.Run("ConsumerDone", func(t *testing.T) {
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerDone()
-		p, err := processorConstructor(out)
+		p, err := processorConstructor()
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(ctx)
+		p.Run(ctx, out)
 		var traceSeen, txnFinalStateSeen bool
 		for {
 			row, meta := out.Next()

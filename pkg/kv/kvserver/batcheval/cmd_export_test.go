@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval_test
 
@@ -17,21 +12,33 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -39,36 +46,37 @@ import (
 
 func TestExportCmd(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: dir}})
-	defer tc.Stopper().Stop(ctx)
-	kvDB := tc.Server(0).DB()
+	srv, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109429),
+		ExternalIODir:     dir,
+	})
+	defer srv.Stopper().Stop(ctx)
+	ts := srv.ApplicationLayer()
 
 	export := func(
-		t *testing.T, start hlc.Timestamp, mvccFilter roachpb.MVCCFilter, maxResponseSSTBytes int64,
-	) (roachpb.Response, *roachpb.Error) {
-		req := &roachpb.ExportRequest{
-			RequestHeader: roachpb.RequestHeader{Key: keys.UserTableDataMin, EndKey: keys.MaxKey},
-			StartTime:     start,
-			Storage: roachpb.ExternalStorage{
-				Provider:  roachpb.ExternalStorageProvider_nodelocal,
-				LocalFile: roachpb.ExternalStorage_LocalFilePath{Path: "/foo"},
-			},
+		t *testing.T, start hlc.Timestamp, mvccFilter kvpb.MVCCFilter, maxResponseSSTBytes int64,
+	) (kvpb.Response, *kvpb.Error) {
+		startKey := ts.Codec().TablePrefix(bootstrap.TestingUserDescID(0))
+		endKey := ts.Codec().TenantSpan().EndKey
+		req := &kvpb.ExportRequest{
+			RequestHeader:  kvpb.RequestHeader{Key: startKey, EndKey: endKey},
+			StartTime:      start,
 			MVCCFilter:     mvccFilter,
-			ReturnSST:      true,
-			TargetFileSize: batcheval.ExportRequestTargetFileSize.Get(&tc.Server(0).ClusterSettings().SV),
+			TargetFileSize: batcheval.ExportRequestTargetFileSize.Get(&ts.ClusterSettings().SV),
 		}
-		var h roachpb.Header
+		var h kvpb.Header
 		h.TargetBytes = maxResponseSSTBytes
 		return kv.SendWrappedWith(ctx, kvDB.NonTransactionalSender(), h, req)
 	}
 
 	exportAndSlurpOne := func(
-		t *testing.T, start hlc.Timestamp, mvccFilter roachpb.MVCCFilter, maxResponseSSTBytes int64,
-	) ([]string, []storage.MVCCKeyValue, roachpb.ResponseHeader) {
+		t *testing.T, start hlc.Timestamp, mvccFilter kvpb.MVCCFilter, maxResponseSSTBytes int64,
+	) ([]string, []storage.MVCCKeyValue, kvpb.ResponseHeader) {
 		res, pErr := export(t, start, mvccFilter, maxResponseSSTBytes)
 		if pErr != nil {
 			t.Fatalf("%+v", pErr)
@@ -76,10 +84,14 @@ func TestExportCmd(t *testing.T) {
 
 		var paths []string
 		var kvs []storage.MVCCKeyValue
-		for _, file := range res.(*roachpb.ExportResponse).Files {
+		for _, file := range res.(*kvpb.ExportResponse).Files {
 			paths = append(paths, file.Path)
-
-			sst, err := storage.NewMemSSTIterator(file.SST, false)
+			iterOpts := storage.IterOptions{
+				KeyTypes:   storage.IterKeyTypePointsOnly,
+				LowerBound: keys.LocalMax,
+				UpperBound: keys.MaxKey,
+			}
+			sst, err := storage.NewMemSSTIterator(file.SST, true, iterOpts)
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
@@ -96,13 +108,15 @@ func TestExportCmd(t *testing.T) {
 				newKv := storage.MVCCKeyValue{}
 				newKv.Key.Key = append(newKv.Key.Key, sst.UnsafeKey().Key...)
 				newKv.Key.Timestamp = sst.UnsafeKey().Timestamp
-				newKv.Value = append(newKv.Value, sst.UnsafeValue()...)
+				v, err := sst.UnsafeValue()
+				require.NoError(t, err)
+				newKv.Value = append(newKv.Value, v...)
 				kvs = append(kvs, newKv)
 				sst.Next()
 			}
 		}
 
-		return paths, kvs, res.(*roachpb.ExportResponse).Header()
+		return paths, kvs, res.(*kvpb.ExportResponse).Header()
 	}
 	type ExportAndSlurpResult struct {
 		end                      hlc.Timestamp
@@ -110,17 +124,17 @@ func TestExportCmd(t *testing.T) {
 		mvccLatestKVs            []storage.MVCCKeyValue
 		mvccAllFiles             []string
 		mvccAllKVs               []storage.MVCCKeyValue
-		mvccLatestResponseHeader roachpb.ResponseHeader
-		mvccAllResponseHeader    roachpb.ResponseHeader
+		mvccLatestResponseHeader kvpb.ResponseHeader
+		mvccAllResponseHeader    kvpb.ResponseHeader
 	}
 	exportAndSlurp := func(t *testing.T, start hlc.Timestamp,
 		maxResponseSSTBytes int64) ExportAndSlurpResult {
 		var ret ExportAndSlurpResult
-		ret.end = hlc.NewClock(hlc.UnixNano, time.Nanosecond).Now()
+		ret.end = hlc.NewClockForTesting(nil).Now()
 		ret.mvccLatestFiles, ret.mvccLatestKVs, ret.mvccLatestResponseHeader = exportAndSlurpOne(t,
-			start, roachpb.MVCCFilter_Latest, maxResponseSSTBytes)
+			start, kvpb.MVCCFilter_Latest, maxResponseSSTBytes)
 		ret.mvccAllFiles, ret.mvccAllKVs, ret.mvccAllResponseHeader = exportAndSlurpOne(t, start,
-			roachpb.MVCCFilter_All, maxResponseSSTBytes)
+			kvpb.MVCCFilter_All, maxResponseSSTBytes)
 		return ret
 	}
 
@@ -136,8 +150,8 @@ func TestExportCmd(t *testing.T) {
 	}
 
 	expectResponseHeader := func(
-		t *testing.T, res ExportAndSlurpResult, mvccLatestResponseHeader roachpb.ResponseHeader,
-		mvccAllResponseHeader roachpb.ResponseHeader) {
+		t *testing.T, res ExportAndSlurpResult, mvccLatestResponseHeader kvpb.ResponseHeader,
+		mvccAllResponseHeader kvpb.ResponseHeader) {
 		t.Helper()
 		requireResumeSpan := func(expect, actual *roachpb.Span, msgAndArgs ...interface{}) {
 			t.Helper()
@@ -162,9 +176,13 @@ func TestExportCmd(t *testing.T) {
 			"unexpected ResumeReason in latest export")
 	}
 
-	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
+	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE DATABASE mvcclatest`)
 	sqlDB.Exec(t, `CREATE TABLE mvcclatest.export (id INT PRIMARY KEY, value INT)`)
+	tableID := descpb.ID(sqlutils.QueryTableID(
+		t, sqlDB.DB, "mvcclatest", "public", "export",
+	))
+
 	const (
 		targetSizeSetting = "kv.bulk_sst.target_size"
 		maxOverageSetting = "kv.bulk_sst.max_allowed_overage"
@@ -277,13 +295,13 @@ INTO
 		defer resetMaxOverage(t)
 		setMaxOverage(t, "'1b'")
 		const expectedError = `export size \(11 bytes\) exceeds max size \(2 bytes\)`
-		_, pErr := export(t, res5.end, roachpb.MVCCFilter_Latest, noTargetBytes)
+		_, pErr := export(t, res5.end, kvpb.MVCCFilter_Latest, noTargetBytes)
 		require.Regexp(t, expectedError, pErr)
 		hints := errors.GetAllHints(pErr.GoError())
 		require.Equal(t, 1, len(hints))
 		const expectedHint = `consider increasing cluster setting "kv.bulk_sst.max_allowed_overage"`
 		require.Regexp(t, expectedHint, hints[0])
-		_, pErr = export(t, res5.end, roachpb.MVCCFilter_All, noTargetBytes)
+		_, pErr = export(t, res5.end, kvpb.MVCCFilter_All, noTargetBytes)
 		require.Regexp(t, expectedError, pErr)
 
 		// Disable the TargetSize and ensure that we don't get any errors
@@ -310,10 +328,10 @@ INTO
 		maxResponseSSTBytes = kvByteSize + 1
 		res7 = exportAndSlurp(t, res5.end, maxResponseSSTBytes)
 		expect(t, res7, 2, 100, 2, 100)
-		latestRespHeader := roachpb.ResponseHeader{
+		latestRespHeader := kvpb.ResponseHeader{
 			NumBytes: maxResponseSSTBytes,
 		}
-		allRespHeader := roachpb.ResponseHeader{
+		allRespHeader := kvpb.ResponseHeader{
 			NumBytes: maxResponseSSTBytes,
 		}
 		expectResponseHeader(t, res7, latestRespHeader, allRespHeader)
@@ -325,20 +343,20 @@ INTO
 		maxResponseSSTBytes = kvByteSize
 		res7 = exportAndSlurp(t, res5.end, maxResponseSSTBytes)
 		expect(t, res7, 1, 1, 1, 1)
-		latestRespHeader = roachpb.ResponseHeader{
+		latestRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/2"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/2", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
-		allRespHeader = roachpb.ResponseHeader{
+		allRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/2"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/2", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
 		expectResponseHeader(t, res7, latestRespHeader, allRespHeader)
@@ -349,20 +367,20 @@ INTO
 		maxResponseSSTBytes = 2 * kvByteSize
 		res7 = exportAndSlurp(t, res5.end, maxResponseSSTBytes)
 		expect(t, res7, 2, 2, 2, 2)
-		latestRespHeader = roachpb.ResponseHeader{
+		latestRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/3/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/3/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
-		allRespHeader = roachpb.ResponseHeader{
+		allRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/3/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/3/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
 		expectResponseHeader(t, res7, latestRespHeader, allRespHeader)
@@ -372,20 +390,20 @@ INTO
 		maxResponseSSTBytes = 99 * kvByteSize
 		res7 = exportAndSlurp(t, res5.end, maxResponseSSTBytes)
 		expect(t, res7, 99, 99, 99, 99)
-		latestRespHeader = roachpb.ResponseHeader{
+		latestRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/100/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/100/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
-		allRespHeader = roachpb.ResponseHeader{
+		allRespHeader = kvpb.ResponseHeader{
 			ResumeSpan: &roachpb.Span{
-				Key:    []byte("/Table/53/1/100/0"),
+				Key:    []byte(fmt.Sprintf("/Table/%d/1/100/0", tableID)),
 				EndKey: []byte("/Max"),
 			},
-			ResumeReason: roachpb.RESUME_BYTE_LIMIT,
+			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 			NumBytes:     maxResponseSSTBytes,
 		}
 		expectResponseHeader(t, res7, latestRespHeader, allRespHeader)
@@ -397,26 +415,99 @@ INTO
 		maxResponseSSTBytes = 101 * kvByteSize
 		res7 = exportAndSlurp(t, res5.end, maxResponseSSTBytes)
 		expect(t, res7, 100, 100, 100, 100)
-		latestRespHeader = roachpb.ResponseHeader{
+		latestRespHeader = kvpb.ResponseHeader{
 			NumBytes: 100 * kvByteSize,
 		}
-		allRespHeader = roachpb.ResponseHeader{
+		allRespHeader = kvpb.ResponseHeader{
 			NumBytes: 100 * kvByteSize,
 		}
 		expectResponseHeader(t, res7, latestRespHeader, allRespHeader)
 	})
 }
 
-func TestExportGCThreshold(t *testing.T) {
+func TestExportRequestWithCPULimitResumeSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test runs into overload issues when run with the {race, deadlock}
+	// detector using remote execution.
+	skip.UnderRace(t)
+	skip.UnderDeadlock(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	kvDB := tc.Server(0).DB()
+	rng, _ := randutil.NewTestRand()
 
-	req := &roachpb.ExportRequest{
-		RequestHeader: roachpb.RequestHeader{Key: keys.UserTableDataMin, EndKey: keys.MaxKey},
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			UseDatabase: "test",
+			Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+					for _, ru := range request.Requests {
+						if _, ok := ru.GetInner().(*kvpb.ExportRequest); ok {
+							h := admission.ElasticCPUWorkHandleFromContext(ctx)
+							if h == nil {
+								t.Fatalf("expected context to have CPU work handle")
+							}
+							h.TestingOverrideOverLimit(func() (bool, time.Duration) {
+								if rng.Float32() > 0.5 {
+									return true, 0
+								}
+								return false, 0
+							})
+						}
+					}
+					return nil
+				},
+			}}}})
+	defer tc.Stopper().Stop(context.Background())
+
+	srv := tc.Server(0)
+
+	s := srv.ApplicationLayer()
+	sqlDB := tc.Conns[0]
+	kvDB := s.DB()
+
+	db := sqlutils.MakeSQLRunner(sqlDB)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+
+	const (
+		initRows = 1000
+		splits   = 100
+	)
+	db.Exec(t, "CREATE DATABASE IF NOT EXISTS test")
+	db.Exec(t, "CREATE TABLE test (k PRIMARY KEY) AS SELECT generate_series(1, $1)", initRows)
+	db.Exec(t, "ALTER TABLE test SPLIT AT (select i*10 from generate_series(1, $1) as i)", initRows/splits)
+	db.Exec(t, "ALTER TABLE test SCATTER")
+
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, execCfg.Codec, "test", "test")
+	span := desc.TableSpan(execCfg.Codec)
+
+	req := &kvpb.ExportRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    span.Key,
+			EndKey: span.EndKey},
+	}
+	header := kvpb.Header{
+		ReturnElasticCPUResumeSpans: true,
+	}
+	_, err := kv.SendWrappedWith(ctx, kvDB.NonTransactionalSender(), header, req)
+	require.NoError(t, err.GoError())
+}
+
+func TestExportGCThreshold(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	ts := srv.ApplicationLayer()
+
+	startKey := bootstrap.TestingUserTableDataMin(ts.Codec())
+	endKey := ts.Codec().TenantEndKey()
+
+	req := &kvpb.ExportRequest{
+		RequestHeader: kvpb.RequestHeader{Key: startKey, EndKey: endKey},
 		StartTime:     hlc.Timestamp{WallTime: -1},
 	}
 	_, pErr := kv.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
@@ -428,40 +519,44 @@ func TestExportGCThreshold(t *testing.T) {
 // exportUsingGoIterator uses the legacy implementation of export, and is used
 // as an oracle to check the correctness of pebbleExportToSst.
 func exportUsingGoIterator(
-	filter roachpb.MVCCFilter,
+	ctx context.Context,
+	filter kvpb.MVCCFilter,
 	startTime, endTime hlc.Timestamp,
 	startKey, endKey roachpb.Key,
-	enableTimeBoundIteratorOptimization timeBoundOptimisation,
 	reader storage.Reader,
 ) ([]byte, error) {
-	memFile := &storage.MemFile{}
-	sst := storage.MakeIngestionSSTWriter(memFile)
+	memFile := &storage.MemObject{}
+	sst := storage.MakeIngestionSSTWriter(
+		ctx, cluster.MakeTestingClusterSettings(), memFile,
+	)
 	defer sst.Close()
 
 	var skipTombstones bool
 	var iterFn func(*storage.MVCCIncrementalIterator)
 	switch filter {
-	case roachpb.MVCCFilter_Latest:
+	case kvpb.MVCCFilter_Latest:
 		skipTombstones = true
 		iterFn = (*storage.MVCCIncrementalIterator).NextKey
-	case roachpb.MVCCFilter_All:
+	case kvpb.MVCCFilter_All:
 		skipTombstones = false
 		iterFn = (*storage.MVCCIncrementalIterator).Next
 	default:
 		return nil, nil
 	}
 
-	iter := storage.NewMVCCIncrementalIterator(reader, storage.MVCCIncrementalIterOptions{
-		EndKey:                              endKey,
-		EnableTimeBoundIteratorOptimization: bool(enableTimeBoundIteratorOptimization),
-		StartTime:                           startTime,
-		EndTime:                             endTime,
+	iter, err := storage.NewMVCCIncrementalIterator(ctx, reader, storage.MVCCIncrementalIterOptions{
+		EndKey:    endKey,
+		StartTime: startTime,
+		EndTime:   endTime,
 	})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 	for iter.SeekGE(storage.MakeMVCCMetadataKey(startKey)); ; iterFn(iter) {
 		ok, err := iter.Valid()
 		if err != nil {
-			// The error may be a WriteIntentError. In which case, returning it will
+			// The error may be a LockConflictError. In which case, returning it will
 			// cause this command to be retried.
 			return nil, err
 		}
@@ -471,11 +566,15 @@ func exportUsingGoIterator(
 
 		// Skip tombstone (len=0) records when startTime is zero
 		// (non-incremental) and we're not exporting all versions.
-		if skipTombstones && startTime.IsEmpty() && len(iter.UnsafeValue()) == 0 {
+		v, err := iter.UnsafeValue()
+		if err != nil {
+			return nil, err
+		}
+		if skipTombstones && startTime.IsEmpty() && len(v) == 0 {
 			continue
 		}
 
-		if err := sst.Put(iter.UnsafeKey(), iter.UnsafeValue()); err != nil {
+		if err := sst.Put(iter.UnsafeKey(), v); err != nil {
 			return nil, err
 		}
 	}
@@ -497,7 +596,12 @@ func loadSST(t *testing.T, data []byte, start, end roachpb.Key) []storage.MVCCKe
 		return nil
 	}
 
-	sst, err := storage.NewMemSSTIterator(data, false)
+	iterOpts := storage.IterOptions{
+		KeyTypes:   storage.IterKeyTypePointsOnly,
+		LowerBound: start,
+		UpperBound: end,
+	}
+	sst, err := storage.NewMemSSTIterator(data, true, iterOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +622,11 @@ func loadSST(t *testing.T, data []byte, start, end roachpb.Key) []storage.MVCCKe
 		newKv := storage.MVCCKeyValue{}
 		newKv.Key.Key = append(newKv.Key.Key, sst.UnsafeKey().Key...)
 		newKv.Key.Timestamp = sst.UnsafeKey().Timestamp
-		newKv.Value = append(newKv.Value, sst.UnsafeValue()...)
+		v, err := sst.UnsafeValue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		newKv.Value = append(newKv.Value, v...)
 		kvs = append(kvs, newKv)
 		sst.Next()
 	}
@@ -528,7 +636,6 @@ func loadSST(t *testing.T, data []byte, start, end roachpb.Key) []storage.MVCCKe
 
 type exportRevisions bool
 type batchBoundaries bool
-type timeBoundOptimisation bool
 
 const (
 	exportAll    exportRevisions = true
@@ -536,51 +643,45 @@ const (
 
 	stopAtTimestamps batchBoundaries = true
 	stopAtKeys       batchBoundaries = false
-
-	optimizeTimeBounds     timeBoundOptimisation = true
-	dontOptimizeTimeBounds timeBoundOptimisation = false
 )
 
 func assertEqualKVs(
 	ctx context.Context,
+	st *cluster.Settings,
 	e storage.Engine,
 	startKey, endKey roachpb.Key,
 	startTime, endTime hlc.Timestamp,
 	exportAllRevisions exportRevisions,
 	stopMidKey batchBoundaries,
-	enableTimeBoundIteratorOptimization timeBoundOptimisation,
 	targetSize uint64,
 ) func(*testing.T) {
 	return func(t *testing.T) {
 		t.Helper()
 
-		var filter roachpb.MVCCFilter
+		var filter kvpb.MVCCFilter
 		if exportAllRevisions {
-			filter = roachpb.MVCCFilter_All
+			filter = kvpb.MVCCFilter_All
 		} else {
-			filter = roachpb.MVCCFilter_Latest
+			filter = kvpb.MVCCFilter_Latest
 		}
 
 		// Run the oracle which is a legacy implementation of pebbleExportToSst
 		// backed by an MVCCIncrementalIterator.
-		expected, err := exportUsingGoIterator(filter, startTime, endTime,
-			startKey, endKey, enableTimeBoundIteratorOptimization, e)
+		expected, err := exportUsingGoIterator(ctx, filter, startTime, endTime, startKey, endKey, e)
 		if err != nil {
 			t.Fatalf("Oracle failed to export provided key range.")
 		}
 
 		// Run the actual code path used when exporting MVCCs to SSTs.
 		var kvs []storage.MVCCKeyValue
-		var resumeTs hlc.Timestamp
-		for start := startKey; start != nil; {
+		start := storage.MVCCKey{Key: startKey}
+		for start.Key != nil {
 			var sst []byte
-			var summary roachpb.BulkOpSummary
 			maxSize := uint64(0)
 			prevStart := start
-			prevTs := resumeTs
-			sstFile := &storage.MemFile{}
-			summary, start, resumeTs, err = e.ExportMVCCToSst(ctx, storage.ExportOptions{
-				StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeTs},
+			var sstFile bytes.Buffer
+			summary, resumeInfo, err := storage.MVCCExportToSST(ctx, st, e, storage.MVCCExportOptions{
+				StartKey:           start,
 				EndKey:             endKey,
 				StartTS:            startTime,
 				EndTS:              endTime,
@@ -588,13 +689,13 @@ func assertEqualKVs(
 				TargetSize:         targetSize,
 				MaxSize:            maxSize,
 				StopMidKey:         bool(stopMidKey),
-				UseTBI:             bool(enableTimeBoundIteratorOptimization),
-			}, sstFile)
+			}, &sstFile)
 			require.NoError(t, err)
-			sst = sstFile.Data()
+			start = resumeInfo.ResumeKey
+			sst = sstFile.Bytes()
 			loaded := loadSST(t, sst, startKey, endKey)
 			// Ensure that the pagination worked properly.
-			if start != nil {
+			if start.Key != nil {
 				dataSize := uint64(summary.DataSize)
 				require.Truef(t, targetSize <= dataSize, "%d > %d",
 					targetSize, summary.DataSize)
@@ -628,8 +729,8 @@ func assertEqualKVs(
 				if dataSizeWhenExceeded == maxSize {
 					maxSize--
 				}
-				_, _, _, err = e.ExportMVCCToSst(ctx, storage.ExportOptions{
-					StartKey:           storage.MVCCKey{Key: prevStart, Timestamp: prevTs},
+				_, _, err = storage.MVCCExportToSST(ctx, st, e, storage.MVCCExportOptions{
+					StartKey:           prevStart,
 					EndKey:             endKey,
 					StartTS:            startTime,
 					EndTS:              endTime,
@@ -637,8 +738,7 @@ func assertEqualKVs(
 					TargetSize:         targetSize,
 					MaxSize:            maxSize,
 					StopMidKey:         false,
-					UseTBI:             bool(enableTimeBoundIteratorOptimization),
-				}, &storage.MemFile{})
+				}, &bytes.Buffer{})
 				require.Regexp(t, fmt.Sprintf("export size \\(%d bytes\\) exceeds max size \\(%d bytes\\)",
 					dataSizeWhenExceeded, maxSize), err)
 			}
@@ -665,15 +765,16 @@ func assertEqualKVs(
 
 func TestRandomKeyAndTimestampExport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	storage.DisableMetamorphicSimpleValueEncoding(t)
 
 	ctx := context.Background()
 
+	st := cluster.MakeTestingClusterSettings()
 	mkEngine := func(t *testing.T) (e storage.Engine, cleanup func()) {
 		dir, cleanupDir := testutils.TempDir(t)
-		e, err := storage.Open(ctx,
-			storage.Filesystem(dir),
-			storage.CacheSize(0),
-			storage.Settings(cluster.MakeTestingClusterSettings()))
+		e, err := storage.Open(ctx, fs.MustInitPhysicalTestingEnv(dir), st, storage.CacheSize(0))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -708,27 +809,27 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 		var keys []roachpb.Key
 		var timestamps []hlc.Timestamp
 
-		var curWallTime = 0
-		var curLogical = 0
-
+		numDigits := len(strconv.Itoa(numKeys))
 		batch := e.NewBatch()
 		for i := 0; i < numKeys; i++ {
 			// Ensure walltime and logical are monotonically increasing.
-			curWallTime = randutil.RandIntInRange(rnd, 0, math.MaxInt64-1)
-			curLogical = randutil.RandIntInRange(rnd, 0, math.MaxInt32-1)
+			curWallTime := randutil.RandIntInRange(rnd, 0, math.MaxInt64-1)
+			curLogical := randutil.RandIntInRange(rnd, 0, math.MaxInt32-1)
 			ts := hlc.Timestamp{WallTime: int64(curWallTime), Logical: int32(curLogical)}
 			timestamps = append(timestamps, ts)
 
 			// Make keys unique and ensure they are monotonically increasing.
 			key := roachpb.Key(randutil.RandBytes(rnd, keySize))
-			key = append([]byte(fmt.Sprintf("#%d", i)), key...)
+			key = append([]byte(fmt.Sprintf("#%0"+strconv.Itoa(numDigits)+"d", i)), key...)
 			keys = append(keys, key)
 
 			averageValueSize := bytesPerValue - keySize
 			valueSize := randutil.RandIntInRange(rnd, averageValueSize-100, averageValueSize+100)
 			value := roachpb.MakeValueFromBytes(randutil.RandBytes(rnd, valueSize))
 			value.InitChecksum(key)
-			if err := storage.MVCCPut(ctx, batch, nil, key, ts, value, nil); err != nil {
+			if _, err := storage.MVCCPut(
+				ctx, batch, key, ts, value, storage.MVCCWriteOptions{},
+			); err != nil {
 				t.Fatal(err)
 			}
 
@@ -739,7 +840,9 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 				ts = hlc.Timestamp{WallTime: int64(curWallTime), Logical: int32(curLogical)}
 				value = roachpb.MakeValueFromBytes(randutil.RandBytes(rnd, 200))
 				value.InitChecksum(key)
-				if err := storage.MVCCPut(ctx, batch, nil, key, ts, value, nil); err != nil {
+				if _, err := storage.MVCCPut(
+					ctx, batch, key, ts, value, storage.MVCCWriteOptions{},
+				); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -784,18 +887,12 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 			{"kv [randLower, randUpper)", keys[keyLowerBound], keys[keyUpperBound], tsMin, tsMax},
 			{"kv (randLowerTime, randUpperTime]", keyMin, keyMax, timestamps[tsLowerBound], timestamps[tsUpperBound]},
 		} {
-			t.Run(fmt.Sprintf("%s, latest, nontimebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportLatest, stopAtKeys, dontOptimizeTimeBounds, targetSize))
-			t.Run(fmt.Sprintf("%s, all, nontimebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtKeys, dontOptimizeTimeBounds, targetSize))
-			t.Run(fmt.Sprintf("%s, all, split rows, nontimebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtTimestamps, dontOptimizeTimeBounds, targetSize))
-			t.Run(fmt.Sprintf("%s, latest, timebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportLatest, stopAtKeys, optimizeTimeBounds, targetSize))
-			t.Run(fmt.Sprintf("%s, all, timebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtKeys, optimizeTimeBounds, targetSize))
-			t.Run(fmt.Sprintf("%s, all, split rows, timebound", s.name),
-				assertEqualKVs(ctx, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtTimestamps, optimizeTimeBounds, targetSize))
+			t.Run(fmt.Sprintf("%s, latest", s.name),
+				assertEqualKVs(ctx, st, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportLatest, stopAtKeys, targetSize))
+			t.Run(fmt.Sprintf("%s, all", s.name),
+				assertEqualKVs(ctx, st, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtKeys, targetSize))
+			t.Run(fmt.Sprintf("%s, all, split rows", s.name),
+				assertEqualKVs(ctx, st, e, s.keyMin, s.keyMax, s.tsMin, s.tsMax, exportAll, stopAtTimestamps, targetSize))
 		}
 	}
 	// Exercise min to max time and key ranges.

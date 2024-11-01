@@ -1,26 +1,48 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /**
  * Alerts is a collection of selectors which determine if there are any Alerts
  * to display based on the current redux state.
  */
 
-import _ from "lodash";
-import moment from "moment";
-import { createSelector } from "reselect";
+import filter from "lodash/filter";
+import has from "lodash/has";
+import isEmpty from "lodash/isEmpty";
+import isNil from "lodash/isNil";
+import without from "lodash/without";
+import moment from "moment-timezone";
 import { Store, Dispatch, Action, AnyAction } from "redux";
 import { ThunkAction } from "redux-thunk";
+import { createSelector } from "reselect";
 
-import { LocalSetting } from "./localsettings";
 import {
+  singleVersionSelector,
+  numNodesByVersionsTagSelector,
+  numNodesByVersionsSelector,
+} from "src/redux/nodes";
+import * as docsURL from "src/util/docs";
+import { longToInt } from "src/util/fixLong";
+
+import { getDataFromServer } from "../util/dataFromServer";
+
+import {
+  refreshCluster,
+  refreshNodes,
+  refreshVersion,
+  refreshHealth,
+  refreshSettings,
+} from "./apiReducers";
+import {
+  selectClusterSettings,
+  selectClusterSettingVersion,
+} from "./clusterSettings";
+import { LocalSetting } from "./localsettings";
+import { AdminUIState, AppDispatch } from "./state";
+import {
+  LICENSE_UPDATE_DISMISSED_KEY,
   VERSION_DISMISSED_KEY,
   INSTRUCTIONS_BOX_COLLAPSED_KEY,
   saveUIData,
@@ -29,21 +51,13 @@ import {
   UIDataState,
   UIDataStatus,
 } from "./uiData";
-import {
-  refreshCluster,
-  refreshNodes,
-  refreshVersion,
-  refreshHealth,
-} from "./apiReducers";
-import { singleVersionSelector, versionsSelector } from "src/redux/nodes";
-import { AdminUIState, AppDispatch } from "./state";
-import * as docsURL from "src/util/docs";
 
 export enum AlertLevel {
   NOTIFICATION,
   WARNING,
   CRITICAL,
   SUCCESS,
+  INFORMATION,
 }
 
 export interface AlertInfo {
@@ -83,7 +97,7 @@ const instructionsBoxCollapsedPersistentLoadedSelector = createSelector(
   (state: AdminUIState) => state.uiData,
   (uiData): boolean =>
     uiData &&
-    _.has(uiData, INSTRUCTIONS_BOX_COLLAPSED_KEY) &&
+    has(uiData, INSTRUCTIONS_BOX_COLLAPSED_KEY) &&
     uiData[INSTRUCTIONS_BOX_COLLAPSED_KEY].status === UIDataStatus.VALID,
 );
 
@@ -91,7 +105,7 @@ const instructionsBoxCollapsedPersistentSelector = createSelector(
   (state: AdminUIState) => state.uiData,
   (uiData): boolean =>
     uiData &&
-    _.has(uiData, INSTRUCTIONS_BOX_COLLAPSED_KEY) &&
+    has(uiData, INSTRUCTIONS_BOX_COLLAPSED_KEY) &&
     uiData[INSTRUCTIONS_BOX_COLLAPSED_KEY].status === UIDataStatus.VALID &&
     uiData[INSTRUCTIONS_BOX_COLLAPSED_KEY].data,
 );
@@ -134,23 +148,28 @@ export const staggeredVersionDismissedSetting = new LocalSetting(
  * This excludes decommissioned nodes.
  */
 export const staggeredVersionWarningSelector = createSelector(
-  versionsSelector,
+  numNodesByVersionsTagSelector,
   staggeredVersionDismissedSetting.selector,
-  (versions, versionMismatchDismissed): Alert => {
+  (versionsMap, versionMismatchDismissed): Alert => {
     if (versionMismatchDismissed) {
       return undefined;
     }
-
-    if (!versions || versions.length <= 1) {
+    if (!versionsMap || versionsMap.size < 2) {
       return undefined;
     }
-
+    const versionsText = Array.from(versionsMap)
+      .map(([k, v]) => (v === 1 ? `1 node on ${k}` : `${v} nodes on ${k}`))
+      .join(", ")
+      .concat(". ");
     return {
       level: AlertLevel.WARNING,
-      title: "Staggered Version",
-      text: `We have detected that multiple versions of CockroachDB are running
-      in this cluster. This may be part of a normal rolling upgrade process, but
-      should be investigated if this is unexpected.`,
+      title: "Multiple versions of CockroachDB are running on this cluster.",
+      text:
+        "Listed versions: " +
+        versionsText +
+        `You can see a list of all nodes and their versions below.
+        This may be part of a normal rolling upgrade process, but should be investigated
+        if unexpected.`,
       dismiss: (dispatch: AppDispatch) => {
         dispatch(staggeredVersionDismissedSetting.set(true));
         return Promise.resolve();
@@ -165,7 +184,7 @@ export const staggeredVersionWarningSelector = createSelector(
 // "loaded, doesn't exist on server" without a separate selector.
 const newVersionDismissedPersistentLoadedSelector = createSelector(
   (state: AdminUIState) => state.uiData,
-  uiData => uiData && _.has(uiData, VERSION_DISMISSED_KEY),
+  uiData => uiData && has(uiData, VERSION_DISMISSED_KEY),
 );
 
 const newVersionDismissedPersistentSelector = createSelector(
@@ -338,8 +357,7 @@ export const createStatementDiagnosticsAlertSelector = createSelector(
       return {
         level: AlertLevel.CRITICAL,
         title: "There was an error activating statement diagnostics",
-        text:
-          "Please try activating again. If the problem continues please reach out to customer support.",
+        text: "Please try activating again. If the problem continues please reach out to customer support.",
         showAsAlert: true,
         dismiss: (dispatch: Dispatch<Action>) => {
           dispatch(
@@ -358,6 +376,57 @@ export const createStatementDiagnosticsAlertSelector = createSelector(
       dismiss: (dispatch: Dispatch<Action>) => {
         dispatch(
           createStatementDiagnosticsAlertLocalSetting.set({ show: false }),
+        );
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+type CancelStatementDiagnosticsAlertPayload = {
+  show: boolean;
+  status?: "SUCCESS" | "FAILED";
+};
+
+export const cancelStatementDiagnosticsAlertLocalSetting = new LocalSetting<
+  AdminUIState,
+  CancelStatementDiagnosticsAlertPayload
+>("cancel_stmnt_diagnostics_alert", localSettingsSelector, { show: false });
+
+export const cancelStatementDiagnosticsAlertSelector = createSelector(
+  cancelStatementDiagnosticsAlertLocalSetting.selector,
+  (cancelStatementDiagnosticsAlert): Alert => {
+    if (
+      !cancelStatementDiagnosticsAlert ||
+      !cancelStatementDiagnosticsAlert.show
+    ) {
+      return undefined;
+    }
+    const { status } = cancelStatementDiagnosticsAlert;
+
+    if (status === "FAILED") {
+      return {
+        level: AlertLevel.CRITICAL,
+        title: "There was an error cancelling statement diagnostics",
+        text: "Please try cancelling the statement diagnostic again. If the problem continues please reach out to customer support.",
+        showAsAlert: true,
+        dismiss: (dispatch: Dispatch<Action>) => {
+          dispatch(
+            cancelStatementDiagnosticsAlertLocalSetting.set({ show: false }),
+          );
+          return Promise.resolve();
+        },
+      };
+    }
+    return {
+      level: AlertLevel.SUCCESS,
+      title: "Statement diagnostics were successfully cancelled",
+      showAsAlert: true,
+      autoClose: true,
+      closable: false,
+      dismiss: (dispatch: Dispatch<Action>) => {
+        dispatch(
+          cancelStatementDiagnosticsAlertLocalSetting.set({ show: false }),
         );
         return Promise.resolve();
       },
@@ -386,9 +455,8 @@ export const terminateSessionAlertSelector = createSelector(
     if (status === "FAILED") {
       return {
         level: AlertLevel.CRITICAL,
-        title: "There was an error terminating the session.",
-        text:
-          "Please try activating again. If the problem continues please reach out to customer support.",
+        title: "There was an error cancelling the session.",
+        text: "Please try cancelling again. If the problem continues please reach out to customer support.",
         showAsAlert: true,
         dismiss: (dispatch: Dispatch<Action>) => {
           dispatch(terminateSessionAlertLocalSetting.set({ show: false }));
@@ -398,7 +466,7 @@ export const terminateSessionAlertSelector = createSelector(
     }
     return {
       level: AlertLevel.SUCCESS,
-      title: "Session terminated.",
+      title: "Session cancelled.",
       showAsAlert: true,
       autoClose: true,
       closable: false,
@@ -431,9 +499,8 @@ export const terminateQueryAlertSelector = createSelector(
     if (status === "FAILED") {
       return {
         level: AlertLevel.CRITICAL,
-        title: "There was an error terminating the query.",
-        text:
-          "Please try terminating again. If the problem continues please reach out to customer support.",
+        title: "There was an error cancelling the statement.",
+        text: "Please try cancelling again. If the problem continues please reach out to customer support.",
         showAsAlert: true,
         dismiss: (dispatch: Dispatch<Action>) => {
           dispatch(terminateQueryAlertLocalSetting.set({ show: false }));
@@ -443,12 +510,122 @@ export const terminateQueryAlertSelector = createSelector(
     }
     return {
       level: AlertLevel.SUCCESS,
-      title: "Query terminated.",
+      title: "Statement cancelled.",
       showAsAlert: true,
       autoClose: true,
       closable: false,
       dismiss: (dispatch: Dispatch<Action>) => {
         dispatch(terminateQueryAlertLocalSetting.set({ show: false }));
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+/**
+ * Notification for when the cluster.preserve_downgrade_option has been set for
+ * too long of a duration (48hrs) as part of a version upgrade.
+ */
+export const clusterPreserveDowngradeOptionDismissedSetting = new LocalSetting(
+  "cluster_preserve_downgrade_option_dismissed",
+  localSettingsSelector,
+  false,
+);
+
+export const clusterPreserveDowngradeOptionOvertimeSelector = createSelector(
+  selectClusterSettings,
+  clusterPreserveDowngradeOptionDismissedSetting.selector,
+  (settings, notificationDismissed): Alert => {
+    if (notificationDismissed || !settings) {
+      return undefined;
+    }
+    const clusterPreserveDowngradeOption =
+      settings["cluster.preserve_downgrade_option"];
+    const value = clusterPreserveDowngradeOption?.value;
+    const lastUpdated = clusterPreserveDowngradeOption?.last_updated;
+    if (!value || !lastUpdated) {
+      return undefined;
+    }
+    const lastUpdatedTime = moment.unix(longToInt(lastUpdated.seconds));
+    const diff = moment.duration(moment().diff(lastUpdatedTime)).asHours();
+    if (diff <= 0) {
+      return undefined;
+    }
+    return {
+      level: AlertLevel.WARNING,
+      title: `Cluster setting cluster.preserve_downgrade_option has been set for ${diff.toFixed(
+        1,
+      )} hours`,
+      text: `You can see a list of all nodes and their versions below.
+        Once all cluster nodes have been upgraded, and you have validated the stability and performance of
+        your workload on the new version, you must reset the cluster.preserve_downgrade_option cluster
+        setting with the following command:
+        RESET CLUSTER SETTING cluster.preserve_downgrade_option;`,
+      dismiss: (dispatch: AppDispatch) => {
+        dispatch(clusterPreserveDowngradeOptionDismissedSetting.set(true));
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+////////////////////////////////////////
+// Upgrade not finalized.
+////////////////////////////////////////
+export const upgradeNotFinalizedDismissedSetting = new LocalSetting(
+  "upgrade_not_finalized_dismissed",
+  localSettingsSelector,
+  false,
+);
+
+/**
+ * Warning when all the nodes are running on the new version, but the cluster is not finalized.
+ */
+export const upgradeNotFinalizedWarningSelector = createSelector(
+  selectClusterSettings,
+  numNodesByVersionsSelector,
+  selectClusterSettingVersion,
+  upgradeNotFinalizedDismissedSetting.selector,
+  (
+    settings,
+    versionsMap,
+    clusterVersion,
+    upgradeNotFinalizedDismissed,
+  ): Alert => {
+    if (upgradeNotFinalizedDismissed || !settings) {
+      return undefined;
+    }
+    // Don't show this warning if nodes are on different versions, since there is
+    // already an alert for that (staggeredVersionWarningSelector).
+    if (!versionsMap || versionsMap.size !== 1 || !clusterVersion) {
+      return undefined;
+    }
+    // Don't show this warning if cluster.preserve_downgrade_option is set,
+    // because it's expected for the upgrade not be finalized on that case and there is
+    // an alert for that (clusterPreserveDowngradeOptionOvertimeSelector)
+    const clusterPreserveDowngradeOption =
+      settings["cluster.preserve_downgrade_option"];
+    const value = clusterPreserveDowngradeOption?.value;
+    const lastUpdated = clusterPreserveDowngradeOption?.last_updated;
+    if (value && lastUpdated) {
+      return undefined;
+    }
+
+    const nodesVersion = versionsMap.keys().next().value;
+    // Prod: node version is 23.1 and cluster version is 23.1.
+    // Dev: node version is 23.1 and cluster version is 23.1-2.
+    if (clusterVersion.startsWith(nodesVersion)) {
+      return undefined;
+    }
+
+    return {
+      level: AlertLevel.WARNING,
+      title: "Upgrade not finalized.",
+      text: `All nodes are running on version ${nodesVersion}, but the cluster is on version ${clusterVersion}. 
+      Features might not be available in this state.`,
+      link: docsURL.upgradeTroubleshooting,
+      dismiss: (dispatch: AppDispatch) => {
+        dispatch(upgradeNotFinalizedDismissedSetting.set(true));
         return Promise.resolve();
       },
     };
@@ -464,8 +641,173 @@ export const panelAlertsSelector = createSelector(
   newVersionNotificationSelector,
   staggeredVersionWarningSelector,
   (...alerts: Alert[]): Alert[] => {
-    return _.without(alerts, null, undefined);
+    return without(alerts, null, undefined);
   },
+);
+
+/**
+ * dataFromServerAlertSelector returns an alert when the
+ * `dataFromServer` window variable is unset. This variable is retrieved
+ * prior to page render and contains some base metadata about the
+ * backing CRDB node.
+ */
+export const dataFromServerAlertSelector = createSelector(
+  () => {},
+  (): Alert => {
+    if (isEmpty(getDataFromServer())) {
+      return {
+        level: AlertLevel.CRITICAL,
+        title: "There was an error retrieving base DB Console configuration.",
+        text: "Please try refreshing the page. If the problem continues please reach out to customer support.",
+        showAsAlert: true,
+        dismiss: (_: Dispatch<Action>) => {
+          // Dismiss is a no-op here because the alert component itself
+          // is dismissable by default and because we do want to keep
+          // showing it if the metadata continues to be missing.
+          return Promise.resolve();
+        },
+      };
+    } else {
+      return null;
+    }
+  },
+);
+
+export type LicenseType =
+  | "Evaluation"
+  | "Trial"
+  | "Enterprise"
+  | "Non-Commercial"
+  | "None"
+  | "Free";
+
+const licenseTypeNames = new Map<string, LicenseType>([
+  ["Evaluation", "Evaluation"],
+  ["Enterprise", "Enterprise"],
+  ["NonCommercial", "Non-Commercial"],
+  ["OSS", "None"],
+  ["BSD", "None"],
+  ["Free", "Free"],
+  ["Trial", "Trial"],
+]);
+
+// licenseTypeSelector returns user-friendly names of license types.
+export const licenseTypeSelector = createSelector(
+  getDataFromServer,
+  data => licenseTypeNames.get(data.LicenseType) || "None",
+);
+
+export const licenseUpdateDismissedLocalSetting = new LocalSetting(
+  "license_update_dismissed",
+  localSettingsSelector,
+  moment(0),
+);
+
+const licenseUpdateDismissedPersistentLoadedSelector = createSelector(
+  (state: AdminUIState) => state.uiData,
+  uiData =>
+    uiData &&
+    Object.prototype.hasOwnProperty.call(uiData, LICENSE_UPDATE_DISMISSED_KEY),
+);
+
+const licenseUpdateDismissedPersistentSelector = createSelector(
+  (state: AdminUIState) => state.uiData,
+  uiData => moment(uiData?.[LICENSE_UPDATE_DISMISSED_KEY]?.data ?? 0),
+);
+
+export const licenseUpdateNotificationSelector = createSelector(
+  licenseTypeSelector,
+  licenseUpdateDismissedLocalSetting.selector,
+  licenseUpdateDismissedPersistentSelector,
+  licenseUpdateDismissedPersistentLoadedSelector,
+  (
+    licenseType,
+    licenseUpdateDismissed,
+    licenseUpdateDismissedPersistent,
+    licenseUpdateDismissedPersistentLoaded,
+  ): Alert => {
+    // If customer has Enterprise license they don't need to worry about this.
+    if (licenseType === "Enterprise") {
+      return undefined;
+    }
+
+    // If the notification has been dismissed based on the session storage
+    // timestamp, don't show it.'
+    //
+    // Note: `licenseUpdateDismissed` is wrapped in `moment()` because
+    // the local storage selector won't convert it back from a string.
+    // We omit fixing that here since this change is being backported
+    // to many versions.
+    if (moment(licenseUpdateDismissed).isAfter(moment(0))) {
+      return undefined;
+    }
+
+    // If the notification has been dismissed based on the uiData
+    // storage in the cluster, don't show it. Note that this is
+    // different from how version upgrade notifications work, this one
+    // is dismissed forever and won't return even if you upgrade
+    // further or time passes.
+    if (
+      licenseUpdateDismissedPersistentLoaded &&
+      licenseUpdateDismissedPersistent &&
+      licenseUpdateDismissedPersistent.isAfter(moment(0))
+    ) {
+      return undefined;
+    }
+
+    return {
+      level: AlertLevel.INFORMATION,
+      title: "Coming November 18, 2024",
+      text: "Important changes to CockroachDB’s licensing model.",
+      link: docsURL.enterpriseLicenseUpdate,
+      dismiss: (dispatch: any) => {
+        const dismissedAt = moment();
+        // Note(davidh): I haven't been able to find historical context
+        // for why some alerts have both a "local" and a "persistent"
+        // dismissal. My thinking is that just the persistent dismissal
+        // should be adequate, but I'm preserving that behavior here to
+        // match the version upgrade notification.
+
+        // Dismiss locally.
+        dispatch(licenseUpdateDismissedLocalSetting.set(dismissedAt));
+        // Dismiss persistently.
+        return dispatch(
+          saveUIData({
+            key: LICENSE_UPDATE_DISMISSED_KEY,
+            value: dismissedAt.valueOf(),
+          }),
+        );
+      },
+    };
+  },
+);
+
+/**
+ * Selector which returns an array of all active alerts which should be
+ * displayed in the overview list page, these should be non-critical alerts.
+ */
+
+export const overviewListAlertsSelector = createSelector(
+  staggeredVersionWarningSelector,
+  clusterPreserveDowngradeOptionOvertimeSelector,
+  upgradeNotFinalizedWarningSelector,
+  licenseUpdateNotificationSelector,
+  (...alerts: Alert[]): Alert[] => {
+    return without(alerts, null, undefined);
+  },
+);
+
+// daysUntilLicenseExpiresSelector returns number of days remaining before license expires.
+export const daysUntilLicenseExpiresSelector = createSelector(
+  getDataFromServer,
+  data => {
+    return Math.ceil(data.SecondsUntilLicenseExpiry / 86400); // seconds in 1 day
+  },
+);
+
+export const isManagedClusterSelector = createSelector(
+  getDataFromServer,
+  data => data.IsManaged,
 );
 
 /**
@@ -478,10 +820,12 @@ export const bannerAlertsSelector = createSelector(
   disconnectedAlertSelector,
   emailSubscriptionAlertSelector,
   createStatementDiagnosticsAlertSelector,
+  cancelStatementDiagnosticsAlertSelector,
   terminateSessionAlertSelector,
   terminateQueryAlertSelector,
+  dataFromServerAlertSelector,
   (...alerts: Alert[]): Alert[] => {
-    return _.without(alerts, null, undefined);
+    return without(alerts, null, undefined);
   },
 );
 
@@ -504,6 +848,21 @@ export function alertDataSync(store: Store<AdminUIState>) {
     // Always refresh health.
     dispatch(refreshHealth());
 
+    const { Insecure } = getDataFromServer();
+    // We should not send out requests to the endpoints below if
+    // the user has not successfully logged in since the requests
+    // will always return with a 401 error.
+    // Insecure mode is an exception, where login state is irrelevant.
+    if (!Insecure) {
+      if (
+        !state.login ||
+        !state.login.loggedInUser ||
+        state.login.loggedInUser === ``
+      ) {
+        return;
+      }
+    }
+
     // Load persistent settings which have not yet been loaded.
     const uiData = state.uiData;
     if (uiData !== lastUIData) {
@@ -511,9 +870,10 @@ export function alertDataSync(store: Store<AdminUIState>) {
       const keysToMaybeLoad = [
         VERSION_DISMISSED_KEY,
         INSTRUCTIONS_BOX_COLLAPSED_KEY,
+        LICENSE_UPDATE_DISMISSED_KEY,
       ];
-      const keysToLoad = _.filter(keysToMaybeLoad, key => {
-        return !(_.has(uiData, key) || isInFlight(state, key));
+      const keysToLoad = filter(keysToMaybeLoad, key => {
+        return !(has(uiData, key) || isInFlight(state, key));
       });
       if (keysToLoad) {
         dispatch(loadUIData(...keysToLoad));
@@ -522,14 +882,20 @@ export function alertDataSync(store: Store<AdminUIState>) {
 
     // Load Cluster ID once at startup.
     const cluster = state.cachedData.cluster;
-    if (cluster && !cluster.data && !cluster.inFlight) {
+    if (cluster && !cluster.data && !cluster.inFlight && !cluster.valid) {
       dispatch(refreshCluster());
     }
 
     // Load Nodes initially if it has not yet been loaded.
     const nodes = state.cachedData.nodes;
-    if (nodes && !nodes.data && !nodes.inFlight) {
+    if (nodes && !nodes.data && !nodes.inFlight && !nodes.valid) {
       dispatch(refreshNodes());
+    }
+
+    // Load settings if not loaded
+    const settings = state.cachedData.settings;
+    if (settings && !settings.data && !settings.inFlight && !settings.valid) {
+      dispatch(refreshSettings());
     }
 
     // Load potential new versions from CockroachDB cluster. This is the
@@ -537,7 +903,7 @@ export function alertDataSync(store: Store<AdminUIState>) {
     // ID and node statuses being loaded first and thus cannot simply run at
     // startup.
     const currentVersion = singleVersionSelector(state);
-    if (_.isNil(newerVersionsSelector(state))) {
+    if (isNil(newerVersionsSelector(state))) {
       if (cluster.data && cluster.data.cluster_id && currentVersion) {
         dispatch(
           refreshVersion({

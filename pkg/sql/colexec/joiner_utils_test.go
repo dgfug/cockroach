@@ -1,20 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
@@ -59,6 +55,18 @@ func (tc *joinTestCase) init() {
 			tc.rightDirections[i] = execinfrapb.Ordering_Column_ASC
 		}
 	}
+}
+
+// shuffleInputTuples reorders input tuples on both sides of the join. This
+// should only be called when tc is fed into a hash joiner.
+func (tc *joinTestCase) shuffleInputTuples(rng *rand.Rand) {
+	shuffle := func(tuples colexectestutils.Tuples) {
+		rng.Shuffle(len(tuples), func(i, j int) {
+			tuples[i], tuples[j] = tuples[j], tuples[i]
+		})
+	}
+	shuffle(tc.leftTuples)
+	shuffle(tc.rightTuples)
 }
 
 // mirror attempts to create a "mirror" test case of tc and returns nil if it

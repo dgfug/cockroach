@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -16,14 +13,13 @@ import (
 	"hash/fnv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq"
 )
 
 const (
@@ -55,22 +51,28 @@ const (
 type sqlSink struct {
 	db *gosql.DB
 
-	uri       string
-	tableName string
-	topics    map[string]struct{}
-	hasher    hash.Hash32
+	uri        string
+	tableName  string
+	topicNamer *TopicNamer
+	hasher     hash.Hash32
 
 	rowBuf  []interface{}
 	scratch bufalloc.ByteAllocator
 
-	targetNames map[descpb.ID]string
+	metrics metricsRecorder
+}
+
+func (s *sqlSink) getConcreteType() sinkType {
+	return sinkTypeSQL
 }
 
 // TODO(dan): Make tableName configurable or based on the job ID or
 // something.
 const sqlSinkTableName = `sqlsink`
 
-func makeSQLSink(u sinkURL, tableName string, targets jobspb.ChangefeedTargets) (Sink, error) {
+func makeSQLSink(
+	u sinkURL, tableName string, targets changefeedbase.Targets, mb metricsRecorderBuilder,
+) (Sink, error) {
 	// Swap the changefeed prefix for the sql connection one that sqlSink
 	// expects.
 	u.Scheme = `postgres`
@@ -79,11 +81,9 @@ func makeSQLSink(u sinkURL, tableName string, targets jobspb.ChangefeedTargets) 
 		return nil, errors.Errorf(`must specify database`)
 	}
 
-	topics := make(map[string]struct{})
-	targetNames := make(map[descpb.ID]string)
-	for id, t := range targets {
-		topics[t.StatementTimeName] = struct{}{}
-		targetNames[id] = t.StatementTimeName
+	topicNamer, err := MakeTopicNamer(targets)
+	if err != nil {
+		return nil, err
 	}
 
 	uri := u.String()
@@ -98,19 +98,22 @@ func makeSQLSink(u sinkURL, tableName string, targets jobspb.ChangefeedTargets) 
 	}
 
 	return &sqlSink{
-		uri:         uri,
-		tableName:   tableName,
-		topics:      topics,
-		hasher:      fnv.New32a(),
-		targetNames: targetNames,
+		uri:        uri,
+		tableName:  tableName,
+		topicNamer: topicNamer,
+		hasher:     fnv.New32a(),
+		metrics:    mb(noResourceAccounting),
 	}, nil
 }
 
 func (s *sqlSink) Dial() error {
-	db, err := gosql.Open(`postgres`, s.uri)
+	connector, err := pq.NewConnector(s.uri)
 	if err != nil {
 		return err
 	}
+
+	s.metrics.netMetrics().WrapPqDialer(connector, "sql")
+	db := gosql.OpenDB(connector)
 	if _, err := db.Exec(fmt.Sprintf(sqlSinkCreateTableStmt, s.tableName)); err != nil {
 		db.Close()
 		return err
@@ -124,14 +127,15 @@ func (s *sqlSink) EmitRow(
 	ctx context.Context,
 	topicDescr TopicDescriptor,
 	key, value []byte,
-	updated hlc.Timestamp,
+	updated, mvcc hlc.Timestamp,
 	alloc kvevent.Alloc,
 ) error {
 	defer alloc.Release(ctx)
+	defer s.metrics.recordOneMessage()(mvcc, len(key)+len(value), sinkDoesNotCompress)
 
-	topic := s.targetNames[topicDescr.GetID()]
-	if _, ok := s.topics[topic]; !ok {
-		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
+	topic, err := s.topicNamer.Name(topicDescr)
+	if err != nil {
+		return err
 	}
 
 	// Hashing logic copied from sarama.HashPartitioner.
@@ -152,8 +156,10 @@ func (s *sqlSink) EmitRow(
 func (s *sqlSink) EmitResolvedTimestamp(
 	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
 ) error {
+	defer s.metrics.recordResolvedCallback()()
+
 	var noKey, noValue []byte
-	for topic := range s.topics {
+	return s.topicNamer.Each(func(topic string) error {
 		payload, err := encoder.EncodeResolvedTimestamp(ctx, topic, resolved)
 		if err != nil {
 			return err
@@ -164,8 +170,14 @@ func (s *sqlSink) EmitResolvedTimestamp(
 				return err
 			}
 		}
-	}
-	return nil
+		return nil
+	})
+}
+
+// Topics gives the names of all topics that have been initialized
+// and will receive resolved timestamps.
+func (s *sqlSink) Topics() []string {
+	return s.topicNamer.DisplayNamesSlice()
 }
 
 func (s *sqlSink) emit(
@@ -174,7 +186,7 @@ func (s *sqlSink) emit(
 	// Generate the message id on the client to match the guaranttees of kafka
 	// (two messages are only guaranteed to keep their order if emitted from the
 	// same producer to the same partition).
-	messageID := builtins.GenerateUniqueInt(base.SQLInstanceID(partition))
+	messageID := builtins.GenerateUniqueInt(builtins.ProcessUniqueID(partition))
 	s.rowBuf = append(s.rowBuf, topic, partition, messageID, key, value, resolved)
 	if len(s.rowBuf)/sqlSinkEmitCols >= sqlSinkRowBatchSize {
 		return s.Flush(ctx)
@@ -184,6 +196,8 @@ func (s *sqlSink) emit(
 
 // Flush implements the Sink interface.
 func (s *sqlSink) Flush(ctx context.Context) error {
+	defer s.metrics.recordFlushRequestCallback()()
+
 	if len(s.rowBuf) == 0 {
 		return nil
 	}
@@ -211,5 +225,8 @@ func (s *sqlSink) Flush(ctx context.Context) error {
 
 // Close implements the Sink interface.
 func (s *sqlSink) Close() error {
+	if s.db == nil {
+		return nil
+	}
 	return s.db.Close()
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat
 
@@ -45,7 +40,8 @@ type Column struct {
 
 // Ordinal returns the position of the column in its table. The following always
 // holds:
-//   tab.Column(i).Ordinal() == i
+//
+//	tab.Column(i).Ordinal() == i
 func (c *Column) Ordinal() int {
 	return c.ordinal
 }
@@ -346,6 +342,7 @@ func (c *Column) InitVirtualComputed(
 	ordinal int,
 	stableID StableID,
 	name tree.Name,
+	kind ColumnKind,
 	datumType *types.T,
 	nullable bool,
 	visibility ColumnVisibility,
@@ -357,7 +354,7 @@ func (c *Column) InitVirtualComputed(
 		ordinal:                     ordinal,
 		stableID:                    stableID,
 		name:                        name,
-		kind:                        Ordinary,
+		kind:                        kind,
 		datumType:                   datumType,
 		nullable:                    nullable,
 		visibility:                  visibility,

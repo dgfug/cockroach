@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -65,6 +60,10 @@ var LookupJoinHintUseCounter = telemetry.GetCounterOnce("sql.plan.hints.lookup-j
 // inverted join via a query hint.
 var InvertedJoinHintUseCounter = telemetry.GetCounterOnce("sql.plan.hints.inverted-join")
 
+// StraightJoinHintUseCounter is to be incremented whenever a query specifies a
+// straight join via a query hint.
+var StraightJoinHintUseCounter = telemetry.GetCounterOnce("sql.plan.hints.straight-join")
+
 // IndexHintUseCounter is to be incremented whenever a query specifies an index
 // hint. Incremented whenever one of the more specific variants below is
 // incremented.
@@ -106,11 +105,14 @@ var ExplainOptUseCounter = telemetry.GetCounterOnce("sql.plan.explain-opt")
 // ExplainVecUseCounter is to be incremented whenever EXPLAIN (VEC) is run.
 var ExplainVecUseCounter = telemetry.GetCounterOnce("sql.plan.explain-vec")
 
-// ExplainDDLStages is to be incremented whenever EXPLAIN (DDL, STAGES) is run.
-var ExplainDDLStages = telemetry.GetCounterOnce("sql.plan.explain-ddl-stages")
+// ExplainDDL is to be incremented whenever EXPLAIN (DDL) is run.
+var ExplainDDL = telemetry.GetCounterOnce("sql.plan.explain-ddl")
 
-// ExplainDDLDeps is to be incremented whenever EXPLAIN (DDL, DEPS) is run.
-var ExplainDDLDeps = telemetry.GetCounterOnce("sql.plan.explain-ddl-deps")
+// ExplainDDLVerbose is to be incremented whenever EXPLAIN (DDL, VERBOSE) is run.
+var ExplainDDLVerbose = telemetry.GetCounterOnce("sql.plan.explain-ddl-verbose")
+
+// ExplainDDLViz is to be incremented whenever EXPLAIN (DDL, VIZ) is run.
+var ExplainDDLViz = telemetry.GetCounterOnce("sql.plan.explain-ddl-viz")
 
 // ExplainOptVerboseUseCounter is to be incremented whenever
 // EXPLAIN (OPT, VERBOSE) is run.
@@ -128,6 +130,11 @@ var CreateStatisticsUseCounter = telemetry.GetCounterOnce("sql.plan.stats.create
 // ordering of nulls is used for ORDER BY (either ASC NULLS LAST or DESC NULLS
 // FIRST).
 var OrderByNullsNonStandardCounter = telemetry.GetCounterOnce("sql.plan.opt.order-by-nulls-non-standard")
+
+// OrderByNullsStandardCounter is to be incremented whenever a standard
+// ordering of nulls is used for ORDER BY (either ASC NULLS FIRST or DESC NULLS
+// LAST).
+var OrderByNullsStandardCounter = telemetry.GetCounterOnce("sql.plan.opt.order-by-nulls-standard")
 
 // TurnAutoStatsOnUseCounter is to be incremented whenever automatic stats
 // collection is explicitly enabled.
@@ -196,6 +203,22 @@ var CancelQueriesUseCounter = telemetry.GetCounterOnce("sql.session.cancel-queri
 // CancelSessionsUseCounter is to be incremented whenever CANCEL SESSION or
 // CANCEL SESSIONS is run.
 var CancelSessionsUseCounter = telemetry.GetCounterOnce("sql.session.cancel-sessions")
+
+// PlanTypeForceCustomCounter is to be incremented whenever a custom plan is
+// used when plan_cache_mode=force_custom_plan.
+var PlanTypeForceCustomCounter = telemetry.GetCounterOnce("sql.plan.type.force-custom")
+
+// PlanTypeForceGenericCounter is to be incremented whenever a generic plan is used
+// when plan_cache_mode=force_generic_plan.
+var PlanTypeForceGenericCounter = telemetry.GetCounterOnce("sql.plan.type.force-generic")
+
+// PlanTypeAutoCustomCounter is to be incremented whenever a generic plan is
+// used when plan_cache_mode=auto.
+var PlanTypeAutoCustomCounter = telemetry.GetCounterOnce("sql.plan.type.auto-custom")
+
+// PlanTypeAutoGenericCounter is to be incremented whenever a custom plan is
+// used when plan_cache_mode=auto.
+var PlanTypeAutoGenericCounter = telemetry.GetCounterOnce("sql.plan.type.auto-generic")
 
 // We can't parameterize these telemetry counters, so just make a bunch of
 // buckets for setting the join reorder limit since the range of reasonable

@@ -1,5 +1,5 @@
 # =============================================================================
-# groupby.opt contains exploration rules for the groupby operators
+# groupby.opt contains exploration rules for the groupby operators.
 # =============================================================================
 
 # ReplaceScalarMinMaxWithScalarSubqueries replaces a scalar group by having a
@@ -99,7 +99,10 @@
         (OtherAggsAreConst $aggregations $item)
     $groupingPrivate:* &
         (IsCanonicalGroupBy $groupingPrivate) &
-        (ColsAreConst (GroupingCols $groupingPrivate) $input)
+        (ColsAreConst
+            $groupingCols:(GroupingCols $groupingPrivate)
+            $input
+        )
 )
 =>
 (MakeProjectFromPassthroughAggs
@@ -109,6 +112,7 @@
         (MakeOrderingChoiceFromColumn Min $col)
     )
     $aggregations
+    $groupingCols
 )
 
 # ReplaceMaxWithLimit is analogous to the ReplaceMinWithLimit rule, except that
@@ -127,7 +131,10 @@
         (OtherAggsAreConst $aggregations $item)
     $groupingPrivate:* &
         (IsCanonicalGroupBy $groupingPrivate) &
-        (ColsAreConst (GroupingCols $groupingPrivate) $input)
+        (ColsAreConst
+            $groupingCols:(GroupingCols $groupingPrivate)
+            $input
+        )
 )
 =>
 (MakeProjectFromPassthroughAggs
@@ -137,6 +144,7 @@
         (MakeOrderingChoiceFromColumn Max $col)
     )
     $aggregations
+    $groupingCols
 )
 
 # GenerateStreamingGroupBy creates variants of a GroupBy, DistinctOn,

@@ -13,6 +13,7 @@ go_library(
     deps = [
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
+        "//pkg/sql/opt/distribution",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/optgen/lang",
@@ -36,6 +37,7 @@ go_test(
     deps = [
         "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",
+        "//pkg/testutils/datapathutils",
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],
 )

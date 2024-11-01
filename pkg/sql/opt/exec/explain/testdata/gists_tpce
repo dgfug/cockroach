@@ -22,7 +22,7 @@ GROUP BY b_name
 ORDER BY 2 DESC
 ----
 hash: 14732118561700026222
-plan-gist: AgGUAQQAPAAAAAGqAQQAAwIAABQAogEEAgAUAJgBBAIAFACsAQQCAAkAAgIAARQAhgECAgEHBAsCBwQRBgQ=
+plan-gist: AgGKAQQAPAAAAAGgAQQAAwIAABQAmAEEAgAUAI4BBAIAFACiAQQCAAkAAgIAARQAfAICAQcECwIHBBEGBA==
 explain(shape):
 • sort
 │ order: -sum
@@ -45,7 +45,6 @@ explain(shape):
                     │ right cols are key
                     │
                     ├── • scan
-                    │     missing stats
                     │     table: trade_request@trade_request_tr_b_id_tr_s_symb_idx
                     │     spans: FULL SCAN
                     │
@@ -62,9 +61,8 @@ explain(shape):
                                 │ equality: (sc_id) = (in_sc_id)
                                 │
                                 └── • scan
-                                      missing stats
                                       table: sector@sector_sc_name_key
-                                      spans: 1 span
+                                      spans: 1+ spans
 explain(gist):
 • sort
 │ order
@@ -118,7 +116,7 @@ LEFT JOIN last_trade      ON lt_s_symb = hs_s_symb
     LIMIT 10;
 ----
 hash: 10378570089558454947
-plan-gist: AgF4BAAFAgAAE3gCFAGAAQICABQBpAECAgEHBgsCBwYYBgY=
+plan-gist: AgFuBAAFAgAAE24CFAF2AgIAFAGaAQICAQcGCwIHBhgGBg==
 explain(shape):
 • top-k
 │ order: +"coalesce"
@@ -145,9 +143,8 @@ explain(shape):
                         │ table: customer_account@customer_account_pkey
                         │
                         └── • scan
-                              missing stats
                               table: customer_account@customer_account_ca_c_id_idx
-                              spans: 1 span
+                              spans: 1+ spans
 explain(gist):
 • top-k
 │ order
@@ -214,20 +211,20 @@ update_trade_submitted AS (
 SELECT * FROM request_list;
 ----
 hash: 7096273538769246907
-plan-gist: AgGkAQIAHwIAAAcQBRAhpAEAAAcCMAGUAQIAHwAAAAMHCDAxBQIUAJQBAgIBBQgHCAUII5QBAAcCMDEFAgcGBQYwH5IBADEFAhQFkAECAgEqMQUCFAWwAQICASoHAjAxBQIUAJABAgIBBRwHIAUgMCGQAQAAMQUCFAWwAQICASoHAjAxBQgGCA==
+plan-gist: AgGaAQIAHwIAAAcQBRAhmgEAAAcCMAGKAQIAHwAAAAMHCDAxBQIUAIoBAgIBBQgHCAUII4oBAAcCMDEFAgcGBQYwH4gBADEFAhQFhgECAgEqMQUCFAWmAQICASoHAjAxBQIUAIYBAgIBBRwHIAUgMCGGAQAAMQUCFAWmAQICASoHAjAxBQgGCA==
 explain(shape):
 • root
 │
 ├── • scan buffer
-│     label: buffer 3 (request_list)
+│     label: buffer 2 (request_list)
 │
 ├── • subquery
 │   │ id: @S1
-│   │ original sql: UPDATE last_trade SET lt_vol = lt_vol + 10, lt_price = 100.0::DECIMAL, lt_dts = '2020-06-15 22:27:42.148484+00:00'::TIMESTAMP WHERE lt_s_symb = 'ROACH' RETURNING NULL
+│   │ original sql: UPDATE last_trade SET lt_vol = lt_vol + _, lt_price = _::DECIMAL, lt_dts = '_'::TIMESTAMP WHERE lt_s_symb = '_' RETURNING _
 │   │ exec mode: all rows
 │   │
 │   └── • buffer
-│       │ label: buffer 2 (update_last_trade)
+│       │ label: buffer 1 (update_last_trade)
 │       │
 │       └── • render
 │           │
@@ -238,17 +235,17 @@ explain(shape):
 │               └── • render
 │                   │
 │                   └── • scan
-│                         missing stats
 │                         table: last_trade@last_trade_pkey
-│                         spans: 1 span
+│                         spans: 1+ spans
+│                         locking strength: for update
 │
 ├── • subquery
 │   │ id: @S2
-│   │ original sql: SELECT tr_t_id, tr_bid_price::FLOAT8, tr_tt_id, tr_qty FROM trade_request WHERE (tr_s_symb = 'ROACH') AND ((((tr_tt_id = 'TMB'::VARCHAR(3)) AND (tr_bid_price >= 100.0::DECIMAL)) OR ((tr_tt_id = 'TMS'::VARCHAR(3)) AND (tr_bid_price <= 100.0::DECIMAL))) OR ((tr_tt_id = 'TLS'::VARCHAR(3)) AND (tr_bid_price >= 100.0::DECIMAL)))
+│   │ original sql: SELECT tr_t_id, tr_bid_price::FLOAT8, tr_tt_id, tr_qty FROM trade_request WHERE (tr_s_symb = '_') AND ((((tr_tt_id = _::VARCHAR(3)) AND (tr_bid_price >= _::DECIMAL)) OR ((tr_tt_id = _::VARCHAR(3)) AND (tr_bid_price <= _::DECIMAL))) OR ((tr_tt_id = _::VARCHAR(3)) AND (tr_bid_price >= _::DECIMAL)))
 │   │ exec mode: all rows
 │   │
 │   └── • buffer
-│       │ label: buffer 3 (request_list)
+│       │ label: buffer 2 (request_list)
 │       │
 │       └── • render
 │           │
@@ -256,17 +253,16 @@ explain(shape):
 │               │ filter: (tr_s_symb = _) AND ((((tr_tt_id = _) AND (tr_bid_price >= _)) OR ((tr_tt_id = _) AND (tr_bid_price <= _))) OR ((tr_tt_id = _) AND (tr_bid_price >= _)))
 │               │
 │               └── • scan
-│                     missing stats
 │                     table: trade_request@trade_request_pkey
 │                     spans: FULL SCAN
 │
 ├── • subquery
 │   │ id: @S3
-│   │ original sql: DELETE FROM trade_request WHERE tr_t_id IN (SELECT tr_t_id FROM request_list) RETURNING NULL
+│   │ original sql: DELETE FROM trade_request WHERE tr_t_id IN (SELECT tr_t_id FROM request_list) RETURNING _
 │   │ exec mode: all rows
 │   │
 │   └── • buffer
-│       │ label: buffer 4 (delete_trade_request)
+│       │ label: buffer 3 (delete_trade_request)
 │       │
 │       └── • render
 │           │
@@ -281,15 +277,15 @@ explain(shape):
 │                       │ equality cols are key
 │                       │
 │                       └── • scan buffer
-│                             label: buffer 3 (request_list)
+│                             label: buffer 2 (request_list)
 │
 ├── • subquery
 │   │ id: @S4
-│   │ original sql: INSERT INTO trade_history(th_t_id, th_st_id, th_dts) (SELECT tr_t_id, 'SBMT', '2020-06-15 22:27:42.148484+00:00'::TIMESTAMP FROM request_list) RETURNING NULL
+│   │ original sql: INSERT INTO trade_history(th_t_id, th_st_id, th_dts) (SELECT tr_t_id, '_', '_'::TIMESTAMP FROM request_list) RETURNING _
 │   │ exec mode: all rows
 │   │
 │   └── • buffer
-│       │ label: buffer 6 (insert_trade_history)
+│       │ label: buffer 5 (insert_trade_history)
 │       │
 │       └── • render
 │           │
@@ -297,20 +293,20 @@ explain(shape):
 │               │ into: trade_history(th_t_id, th_dts, th_st_id)
 │               │
 │               └── • buffer
-│                   │ label: buffer 5
+│                   │ label: buffer 4
 │                   │
 │                   └── • render
 │                       │
 │                       └── • scan buffer
-│                             label: buffer 3 (request_list)
+│                             label: buffer 2 (request_list)
 │
 ├── • subquery
 │   │ id: @S5
-│   │ original sql: UPDATE trade SET t_st_id = 'SBMT', t_dts = '2020-06-15 22:27:42.148484+00:00'::TIMESTAMP WHERE t_id IN (SELECT tr_t_id FROM request_list) RETURNING NULL
+│   │ original sql: UPDATE trade SET t_st_id = '_', t_dts = '_'::TIMESTAMP WHERE t_id IN (SELECT tr_t_id FROM request_list) RETURNING _
 │   │ exec mode: all rows
 │   │
 │   └── • buffer
-│       │ label: buffer 8 (update_trade_submitted)
+│       │ label: buffer 7 (update_trade_submitted)
 │       │
 │       └── • render
 │           │
@@ -319,7 +315,7 @@ explain(shape):
 │               │ set: t_dts, t_st_id
 │               │
 │               └── • buffer
-│                   │ label: buffer 7
+│                   │ label: buffer 6
 │                   │
 │                   └── • render
 │                       │
@@ -329,7 +325,7 @@ explain(shape):
 │                           │ equality cols are key
 │                           │
 │                           └── • scan buffer
-│                                 label: buffer 3 (request_list)
+│                                 label: buffer 2 (request_list)
 │
 ├── • constraint-check
 │   │
@@ -341,7 +337,7 @@ explain(shape):
 │           │ equality cols are key
 │           │
 │           └── • scan buffer
-│                 label: buffer 5
+│                 label: buffer 4
 │
 ├── • constraint-check
 │   │
@@ -349,11 +345,11 @@ explain(shape):
 │       │
 │       └── • lookup join (anti)
 │           │ table: status_type@status_type_pkey
-│           │ equality: (?column?) = (st_id)
+│           │ equality: (th_st_id_cast) = (st_id)
 │           │ equality cols are key
 │           │
 │           └── • scan buffer
-│                 label: buffer 5
+│                 label: buffer 4
 │
 └── • constraint-check
     │
@@ -361,11 +357,11 @@ explain(shape):
         │
         └── • lookup join (anti)
             │ table: status_type@status_type_pkey
-            │ equality: (t_st_id_new) = (st_id)
+            │ equality: (t_st_id_cast) = (st_id)
             │ equality cols are key
             │
             └── • scan buffer
-                  label: buffer 7
+                  label: buffer 6
 explain(gist):
 • root
 │

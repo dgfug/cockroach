@@ -1,43 +1,51 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
-	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
+// monitorImpl implements the Monitor interface. A monitor both
+// manages "user tasks" -- goroutines provided by tests -- as well as
+// checks that every node in the cluster is still running. A failure
+// in a user task or an unexpected node death should cause all
+// goroutines managed by the monitor (user tasks or internal
+// monitoring) to finish, providing semantics similar to an
+// `errgroup`. The actual implementation uses two different errgroups
+// (one for node events, and another one for user tasks). This is to
+// support the use-case where callers wish to monitor exclusively for
+// node events even if they do not have a goroutine (user task) to be
+// run.
 type monitorImpl struct {
 	t interface {
 		Fatal(...interface{})
 		Failed() bool
 		WorkerStatus(...interface{})
 	}
-	l         *logger.Logger
-	nodes     string
-	ctx       context.Context
-	cancel    func()
-	g         *errgroup.Group
+	l            *logger.Logger
+	nodes        string
+	ctx          context.Context
+	cancel       func()
+	userGroup    *errgroup.Group // user-provided functions
+	monitorGroup *errgroup.Group // monitor goroutine
+	monitorOnce  sync.Once       // guarantees monitor goroutine is only started once
+
 	expDeaths int32 // atomically
 }
 
@@ -58,7 +66,8 @@ func newMonitor(
 		nodes: c.MakeNodes(opts...),
 	}
 	m.ctx, m.cancel = context.WithCancel(ctx)
-	m.g, m.ctx = errgroup.WithContext(m.ctx)
+	m.userGroup, _ = errgroup.WithContext(m.ctx)
+	m.monitorGroup, _ = errgroup.WithContext(m.ctx)
 	return m
 }
 
@@ -81,7 +90,7 @@ func (m *monitorImpl) ResetDeaths() {
 var errTestFatal = errors.New("t.Fatal() was called")
 
 func (m *monitorImpl) Go(fn func(context.Context) error) {
-	m.g.Go(func() (err error) {
+	m.userGroup.Go(func() (err error) {
 		defer func() {
 			r := recover()
 			if r == nil {
@@ -99,7 +108,7 @@ func (m *monitorImpl) Go(fn func(context.Context) error) {
 			// Note that `t.Fatal` calls `panic(err)`, so this mechanism primarily
 			// enables that use case. But it also offers protection against accidental
 			// panics (NPEs and such) which should not bubble up to the runtime.
-			err = rErr
+			err = errors.Wrap(errors.WithStack(rErr), "monitor user task failed")
 		}()
 		// Automatically clear the worker status message when the goroutine exits.
 		defer m.t.WorkerStatus()
@@ -107,13 +116,25 @@ func (m *monitorImpl) Go(fn func(context.Context) error) {
 	})
 }
 
+// GoWithCancel is like Go, but returns a function that can be used to cancel
+// the goroutine.
+func (m *monitorImpl) GoWithCancel(fn func(context.Context) error) func() {
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.Go(func(_ context.Context) error {
+		return fn(ctx)
+	})
+	return cancel
+}
+
+// WaitE will wait for errors coming from user-tasks or from the node
+// monitoring goroutine.
 func (m *monitorImpl) WaitE() error {
 	if m.t.Failed() {
 		// If the test has failed, don't try to limp along.
 		return errors.New("already failed")
 	}
 
-	return errors.Wrap(m.wait(roachprod, "monitor", m.nodes), "monitor failure")
+	return errors.Wrap(m.wait(), "monitor failure")
 }
 
 func (m *monitorImpl) Wait() {
@@ -129,111 +150,84 @@ func (m *monitorImpl) Wait() {
 	}
 }
 
-func (m *monitorImpl) wait(args ...string) error {
-	// It is surprisingly difficult to get the cancellation semantics exactly
-	// right. We need to watch for the "workers" group (m.g) to finish, or for
-	// the monitor command to emit an unexpected node failure, or for the monitor
-	// command itself to exit. We want to capture whichever error happens first
-	// and then cancel the other goroutines. This ordering prevents the usage of
-	// an errgroup.Group for the goroutines below. Consider:
-	//
-	//   g, _ := errgroup.WithContext(m.ctx)
-	//   g.Go(func(context.Context) error {
-	//     defer m.cancel()
-	//     return m.g.Wait()
-	//   })
-	//
-	// Now consider what happens when an error is returned. Before the error
-	// reaches the errgroup, we invoke the cancellation closure which can cause
-	// the other goroutines to wake up and perhaps race and set the errgroup
-	// error first.
-	//
-	// The solution is to implement our own errgroup mechanism here which allows
-	// us to set the error before performing the cancellation.
+// startNodeMonitor will start a background function that monitors
+// unexpected node deaths. To read errors coming from these events,
+// callers are expected to call `Wait` or `WaitForNodeDeath`.
+func (m *monitorImpl) startNodeMonitor() {
+	m.monitorOnce.Do(func() {
+		m.monitorGroup.Go(func() error {
+			defer m.cancel() // stop user-tasks
 
-	var errOnce sync.Once
-	var err error
-	setErr := func(e error) {
-		if e != nil {
-			errOnce.Do(func() {
-				err = e
-			})
-		}
-	}
-
-	// 1. The first goroutine waits for the worker errgroup to exit.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer func() {
-			m.cancel()
-			wg.Done()
-		}()
-		setErr(errors.Wrap(m.g.Wait(), "monitor task failed"))
-	}()
-
-	setMonitorCmdErr := func(err error) {
-		setErr(errors.Wrap(err, "monitor command failure"))
-	}
-
-	// 2. The second goroutine forks/execs the monitoring command.
-	pipeR, pipeW := io.Pipe()
-	wg.Add(1)
-	go func() {
-		defer func() {
-			_ = pipeW.Close()
-			wg.Done()
-			// NB: we explicitly do not want to call m.cancel() here as we want the
-			// goroutine that is reading the monitoring events to be able to decide
-			// on the error if the monitoring command exits peacefully.
-		}()
-
-		monL, err := m.l.ChildLogger(`MONITOR`)
-		if err != nil {
-			setMonitorCmdErr(err)
-			return
-		}
-		defer monL.Close()
-
-		cmd := exec.CommandContext(m.ctx, args[0], args[1:]...)
-		cmd.Stdout = io.MultiWriter(pipeW, monL.Stdout)
-		cmd.Stderr = monL.Stderr
-		if err := cmd.Run(); err != nil {
-			if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "killed") {
-				// The expected reason for an error is that the monitor was killed due
-				// to the context being canceled. Any other error is an actual error.
-				setMonitorCmdErr(err)
-				return
+			eventsCh, err := roachprod.Monitor(m.ctx, m.l, m.nodes, install.MonitorOpts{})
+			if err != nil {
+				return errors.Wrap(err, "monitor node command failure")
 			}
-		}
-		// Returning will cause the pipe to be closed which will cause the reader
-		// goroutine to exit and close the monitoring channel.
-	}()
 
-	// 3. The third goroutine reads from the monitoring pipe, watching for any
-	// unexpected death events.
-	wg.Add(1)
-	go func() {
-		defer func() {
-			_ = pipeR.Close()
-			m.cancel()
-			wg.Done()
-		}()
+			for info := range eventsCh {
+				var expectedDeathStr string
+				var retErr error
 
-		scanner := bufio.NewScanner(pipeR)
-		for scanner.Scan() {
-			msg := scanner.Text()
-			var id int
-			var s string
-			if n, _ := fmt.Sscanf(msg, "%d: %s", &id, &s); n == 2 {
-				if strings.Contains(s, "dead") && atomic.AddInt32(&m.expDeaths, -1) < 0 {
-					setErr(fmt.Errorf("unexpected node event: %s", msg))
-					return
+				switch e := info.Event.(type) {
+				case install.MonitorError:
+					if !errors.Is(e.Err, install.MonitorNoCockroachProcessesError) {
+						// Monitor errors should only occur when something went
+						// wrong in the monitor logic itself or test infrastructure
+						// (SSH flakes, VM preemption, etc). These should be sent
+						// directly to TestEng.
+						//
+						// NOTE: we ignore `MonitorNoCockroachProcessesError` as a
+						// lot of monitors uses in current tests would fail with
+						// this error if we returned it and current uses are
+						// harmless.  In the future, the monitor should be able to
+						// detect when new cockroach processes start running on a
+						// node instead of assuming that the processes are running
+						// when the monitor starts.
+						retErr = registry.ErrorWithOwner(
+							registry.OwnerTestEng,
+							e.Err,
+							registry.WithTitleOverride("monitor_failure"),
+							registry.InfraFlake,
+						)
+					}
+				case install.MonitorProcessDead:
+					isExpectedDeath := atomic.AddInt32(&m.expDeaths, -1) >= 0
+					if isExpectedDeath {
+						expectedDeathStr = ": expected"
+					}
+
+					if !isExpectedDeath {
+						retErr = fmt.Errorf("unexpected node event: %s", info)
+					}
+				}
+
+				m.l.Printf("Monitor event: %s%s", info, expectedDeathStr)
+				if retErr != nil {
+					return retErr
 				}
 			}
-		}
-	}()
 
-	wg.Wait()
-	return err
+			return nil
+		})
+	})
+}
+
+// WaitForNodeDeath blocks while the monitor is active. Any errors due
+// to unexpected node deaths are returned.
+func (m *monitorImpl) WaitForNodeDeath() error {
+	m.startNodeMonitor()
+	return m.monitorGroup.Wait()
+}
+
+func (m *monitorImpl) wait() error {
+	m.startNodeMonitor()
+	userErr := m.userGroup.Wait()
+	m.cancel() // stop monitoring goroutine
+	// By canceling the monitor context above, the goroutines created by
+	// `roachprod.Monitor` should terminate the session and close the
+	// event channel that the monitoring goroutine is reading from. We
+	// wait for that goroutine to return to ensure that we don't leak
+	// goroutines after wait() returns.
+	monitorErr := m.WaitForNodeDeath()
+
+	return errors.Join(userErr, monitorErr)
 }

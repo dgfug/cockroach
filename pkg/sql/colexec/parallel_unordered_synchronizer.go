@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -18,10 +13,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -31,13 +29,13 @@ import (
 // message originated from.
 // Note that either a batch or metadata must be sent, but not both.
 type unorderedSynchronizerMsg struct {
-	inputIdx int
 	b        coldata.Batch
 	meta     []execinfrapb.ProducerMetadata
+	inputIdx int
 }
 
 var _ colexecop.Operator = &ParallelUnorderedSynchronizer{}
-var _ execinfra.OpNode = &ParallelUnorderedSynchronizer{}
+var _ execopnode.OpNode = &ParallelUnorderedSynchronizer{}
 
 type parallelUnorderedSynchronizerState int
 
@@ -63,14 +61,19 @@ const (
 type ParallelUnorderedSynchronizer struct {
 	colexecop.InitHelper
 
-	inputs []colexecargs.OpWithMetaInfo
-	// cancelLocalInput stores context cancellation functions for each of the
-	// inputs. The functions are populated only if LocalPlan is true.
-	cancelLocalInput []context.CancelFunc
-	// LocalPlan indicates whether this synchronizer is a part of the fully
-	// local plan.
-	LocalPlan    bool
-	tracingSpans []*tracing.Span
+	flowCtx         *execinfra.FlowCtx
+	processorID     int32
+	streamingMemAcc *mon.BoundAccount
+	// metadataAccountedFor tracks how much memory has been reserved in the
+	// streamingMemAcc for the metadata.
+	metadataAccountedFor int64
+	inputs               []colexecargs.OpWithMetaInfo
+	// cancelInputsOnDrain stores context cancellation functions for each of the
+	// inputs. The slice is only allocated and populated if eager cancellation
+	// on drain should be performed (see the comments in
+	// NewParallelUnorderedSynchronizer for more details).
+	cancelInputsOnDrain []context.CancelFunc
+	tracingSpans        []*tracing.Span
 	// readNextBatch is a slice of channels, where each channel corresponds to the
 	// input at the same index in inputs. It is used as a barrier for input
 	// goroutines to wait on until the Next goroutine signals that it is safe to
@@ -109,17 +112,31 @@ type ParallelUnorderedSynchronizer struct {
 	bufferedMeta []execinfrapb.ProducerMetadata
 }
 
-var _ colexecop.DrainableOperator = &ParallelUnorderedSynchronizer{}
-var _ colexecop.ClosableOperator = &ParallelUnorderedSynchronizer{}
+var _ colexecop.DrainableClosableOperator = &ParallelUnorderedSynchronizer{}
 
-// ChildCount implements the execinfra.OpNode interface.
+// ChildCount implements the execopnode.OpNode interface.
 func (s *ParallelUnorderedSynchronizer) ChildCount(verbose bool) int {
 	return len(s.inputs)
 }
 
-// Child implements the execinfra.OpNode interface.
-func (s *ParallelUnorderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child implements the execopnode.OpNode interface.
+func (s *ParallelUnorderedSynchronizer) Child(nth int, verbose bool) execopnode.OpNode {
 	return s.inputs[nth].Root
+}
+
+// hasParallelUnorderedSync returns whether there is at least one parallel
+// unordered sync in the tree of operators rooted in op.
+func hasParallelUnorderedSync(op execopnode.OpNode) bool {
+	if _, ok := op.(*ParallelUnorderedSynchronizer); ok {
+		return true
+	}
+	const verbose = true
+	for i := 0; i < op.ChildCount(verbose); i++ {
+		if hasParallelUnorderedSync(op.Child(i, verbose)) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewParallelUnorderedSynchronizer creates a new ParallelUnorderedSynchronizer.
@@ -129,8 +146,44 @@ func (s *ParallelUnorderedSynchronizer) Child(nth int, verbose bool) execinfra.O
 // guaranteed that these spawned goroutines will have completed on any error or
 // zero-length batch received from Next.
 func NewParallelUnorderedSynchronizer(
-	inputs []colexecargs.OpWithMetaInfo, wg *sync.WaitGroup,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	streamingMemAcc *mon.BoundAccount,
+	inputs []colexecargs.OpWithMetaInfo,
+	wg *sync.WaitGroup,
 ) *ParallelUnorderedSynchronizer {
+	// Check whether the synchronizer should be allowed to eagerly cancel its
+	// inputs when it transitions into the draining state. This optimization is
+	// needed to support locality-optimized search feature.
+	//
+	// If the plan is distributed, there might be an inbox in the input tree,
+	// and the synchronizer cannot cancel the work eagerly because canceling the
+	// context would break the gRPC stream and make it impossible to fetch the
+	// remote metadata. Furthermore, it will result in the remote flow
+	// cancellation.
+	// TODO(yuzefovich): we could allow eager cancellation in the distributed
+	// plans too, but only of inputs that don't have inboxes in the input tree.
+	var allowEagerCancellationOnDrain bool
+	if flowCtx.Local {
+		// If the plan is local, then the only requirement for allowing eager
+		// cancellation on drain is that there are no other parallel unordered
+		// syncs in the input trees. This is needed since the "child" sync won't
+		// be able to distinguish the benign context cancellation error from a
+		// true query execution error, so it can "poison" the query execution if
+		// the child sync hasn't transitioned into the draining mode when we
+		// perform the eager cancellation.
+		allowEagerCancellationOnDrain = true
+		for _, input := range inputs {
+			if hasParallelUnorderedSync(input.Root) {
+				allowEagerCancellationOnDrain = false
+				break
+			}
+		}
+	}
+	var cancelInputs []context.CancelFunc
+	if allowEagerCancellationOnDrain {
+		cancelInputs = make([]context.CancelFunc, len(inputs))
+	}
 	readNextBatch := make([]chan struct{}, len(inputs))
 	for i := range readNextBatch {
 		// Buffer readNextBatch chans to allow for non-blocking writes. There will
@@ -138,14 +191,17 @@ func NewParallelUnorderedSynchronizer(
 		readNextBatch[i] = make(chan struct{}, 1)
 	}
 	return &ParallelUnorderedSynchronizer{
-		inputs:            inputs,
-		cancelLocalInput:  make([]context.CancelFunc, len(inputs)),
-		tracingSpans:      make([]*tracing.Span, len(inputs)),
-		readNextBatch:     readNextBatch,
-		batches:           make([]coldata.Batch, len(inputs)),
-		nextBatch:         make([]func(), len(inputs)),
-		externalWaitGroup: wg,
-		internalWaitGroup: &sync.WaitGroup{},
+		flowCtx:             flowCtx,
+		processorID:         processorID,
+		streamingMemAcc:     streamingMemAcc,
+		inputs:              inputs,
+		cancelInputsOnDrain: cancelInputs,
+		tracingSpans:        make([]*tracing.Span, len(inputs)),
+		readNextBatch:       readNextBatch,
+		batches:             make([]coldata.Batch, len(inputs)),
+		nextBatch:           make([]func(), len(inputs)),
+		externalWaitGroup:   wg,
+		internalWaitGroup:   &sync.WaitGroup{},
 		// batchCh is a buffered channel in order to offer non-blocking writes to
 		// input goroutines. During normal operation, this channel will have at most
 		// len(inputs) messages. However, during DrainMeta, inputs might need to
@@ -166,18 +222,11 @@ func (s *ParallelUnorderedSynchronizer) Init(ctx context.Context) {
 	}
 	for i, input := range s.inputs {
 		var inputCtx context.Context
-		inputCtx, s.tracingSpans[i] = execinfra.ProcessorSpan(s.Ctx, fmt.Sprintf("parallel unordered sync input %d", i))
-		if s.LocalPlan {
-			// If there plan is local, there are no colrpc.Inboxes in this input
-			// tree, and the synchronizer can cancel the current work eagerly
-			// when transitioning into draining.
-			//
-			// If there plan is distributed, there might be an inbox in the
-			// input tree, and the synchronizer cannot cancel the work eagerly
-			// because canceling the context would break the gRPC stream and
-			// make it impossible to fetch the remote metadata. Furthermore, it
-			// will result in the remote flow cancellation.
-			inputCtx, s.cancelLocalInput[i] = context.WithCancel(inputCtx)
+		inputCtx, s.tracingSpans[i] = execinfra.ProcessorSpan(
+			s.Ctx, s.flowCtx, fmt.Sprintf("parallel unordered sync input %d", i), s.processorID,
+		)
+		if s.cancelInputsOnDrain != nil {
+			inputCtx, s.cancelInputsOnDrain[i] = context.WithCancel(inputCtx)
 		}
 		input.Root.Init(inputCtx)
 		s.nextBatch[i] = func(inputOp colexecop.Operator, inputIdx int) func() {
@@ -214,15 +263,12 @@ func (s *ParallelUnorderedSynchronizer) init() {
 		go func(input colexecargs.OpWithMetaInfo, inputIdx int) {
 			span := s.tracingSpans[inputIdx]
 			defer func() {
-				if span != nil {
-					span.Finish()
-				}
 				if int(atomic.AddUint32(&s.numFinishedInputs, 1)) == len(s.inputs) {
 					close(s.batchCh)
 				}
-				// We need to close all of the closers of this input before we
-				// notify the wait groups.
-				input.ToClose.CloseAndLogOnErr(s.Ctx, "parallel unordered synchronizer input")
+				if span != nil {
+					span.Finish()
+				}
 				s.internalWaitGroup.Done()
 				s.externalWaitGroup.Done()
 			}()
@@ -247,7 +293,7 @@ func (s *ParallelUnorderedSynchronizer) init() {
 				switch state {
 				case parallelUnorderedSynchronizerStateRunning:
 					if err := colexecerror.CatchVectorizedRuntimeError(s.nextBatch[inputIdx]); err != nil {
-						if s.getState() == parallelUnorderedSynchronizerStateDraining && s.Ctx.Err() == nil && s.cancelLocalInput[inputIdx] != nil {
+						if s.getState() == parallelUnorderedSynchronizerStateDraining && s.Ctx.Err() == nil && s.cancelInputsOnDrain != nil {
 							// The synchronizer has just transitioned into the
 							// draining state and eagerly canceled work of this
 							// input. That cancellation is likely to manifest
@@ -259,7 +305,13 @@ func (s *ParallelUnorderedSynchronizer) init() {
 							continue
 						}
 						sendErr(err)
-						return
+						// After we encounter an error, we proceed to draining.
+						// If this is a context cancellation, we'll realize that
+						// in the select below, so the drained meta will be
+						// ignored, for all other errors the drained meta will
+						// be sent to the coordinator goroutine.
+						s.setState(parallelUnorderedSynchronizerStateDraining)
+						continue
 					}
 					msg.b = s.batches[inputIdx]
 					if s.batches[inputIdx].Length() != 0 {
@@ -278,7 +330,7 @@ func (s *ParallelUnorderedSynchronizer) init() {
 						for _, s := range input.StatsCollectors {
 							span.RecordStructured(s.GetStats())
 						}
-						if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
+						if meta := execinfra.GetTraceDataAsMetadata(s.flowCtx, span); meta != nil {
 							msg.meta = append(msg.meta, *meta)
 						}
 					}
@@ -340,6 +392,9 @@ func (s *ParallelUnorderedSynchronizer) Next() coldata.Batch {
 			// is safe to retrieve the next batch. Since Next has been called, we can
 			// reuse memory instead of making safe copies of batches returned.
 			s.notifyInputToReadNextBatch(s.lastReadInputIdx)
+		case parallelUnorderedSynchronizerStateDraining:
+			// One of the inputs has just encountered an error. We do nothing
+			// here and will read that error from the errCh below.
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("unhandled state in ParallelUnorderedSynchronizer Next goroutine: %d", state))
 		}
@@ -369,6 +424,7 @@ func (s *ParallelUnorderedSynchronizer) Next() coldata.Batch {
 			}
 			s.lastReadInputIdx = msg.inputIdx
 			if msg.meta != nil {
+				s.metadataAccountedFor += colexecutils.AccountForMetadata(s.Ctx, s.streamingMemAcc, msg.meta)
 				s.bufferedMeta = append(s.bufferedMeta, msg.meta...)
 				continue
 			}
@@ -397,10 +453,11 @@ func (s *ParallelUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetada
 	if prevState == parallelUnorderedSynchronizerStateUninitialized {
 		s.init()
 	}
-	// Cancel all local inputs (we will still wait for all remote ones to
-	// return the next batch).
-	for _, cancelFunc := range s.cancelLocalInput {
+	// Cancel all inputs if eager cancellation is allowed.
+	for _, cancelFunc := range s.cancelInputsOnDrain {
 		if cancelFunc != nil {
+			// Note that if Init was never called, cancelFunc will be nil, in
+			// which case there is nothing to cancel.
 			cancelFunc()
 		}
 	}
@@ -456,36 +513,33 @@ func (s *ParallelUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetada
 
 	// Done.
 	s.setState(parallelUnorderedSynchronizerStateDone)
-	return s.bufferedMeta
+	bufferedMeta := s.bufferedMeta
+	// Eagerly lose the reference to the metadata since it might be of
+	// non-trivial footprint.
+	s.bufferedMeta = nil
+	// The caller takes ownership of the metadata, so we can release all of the
+	// allocations.
+	s.streamingMemAcc.Shrink(s.Ctx, s.metadataAccountedFor)
+	s.metadataAccountedFor = 0
+	return bufferedMeta
 }
 
 // Close is part of the colexecop.ClosableOperator interface.
-func (s *ParallelUnorderedSynchronizer) Close() error {
+func (s *ParallelUnorderedSynchronizer) Close(ctx context.Context) error {
 	if state := s.getState(); state != parallelUnorderedSynchronizerStateUninitialized {
-		// Input goroutines have been started and will take care of closing the
-		// closers from the corresponding input trees, so we don't need to do
-		// anything.
+		// Input goroutines have been started and will take care of finishing
+		// the tracing spans.
 		return nil
 	}
 	// If the synchronizer is in "uninitialized" state, it means that the
 	// goroutines for each input haven't been started, so they won't be able to
-	// close the Closers from the corresponding trees. In such a scenario the
-	// synchronizer must close all of them from all input trees. Note that it is
-	// ok to close some input trees even if they haven't been initialized.
-	//
-	// Note that at this point we know that the input goroutines won't be
-	// spawned up (our consumer won't call Next/DrainMeta after calling Close),
-	// so it is safe to close all closers from this goroutine.
-	for _, span := range s.tracingSpans {
+	// finish their tracing spans. In such a scenario the synchronizer must do
+	// that on its own.
+	for i, span := range s.tracingSpans {
 		if span != nil {
 			span.Finish()
+			s.tracingSpans[i] = nil
 		}
 	}
-	var lastErr error
-	for _, input := range s.inputs {
-		if err := input.ToClose.Close(); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
+	return nil
 }

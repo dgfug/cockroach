@@ -1,24 +1,18 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow
 
 import (
 	"context"
+	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
@@ -28,31 +22,42 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/stretchr/testify/require"
 )
 
 type callbackRemoteComponentCreator struct {
-	newOutboxFn func(*colmem.Allocator, colexecargs.OpWithMetaInfo, []*types.T) (*colrpc.Outbox, error)
+	newOutboxFn func(*colmem.Allocator, *mon.BoundAccount, colexecargs.OpWithMetaInfo, []*types.T) (*colrpc.Outbox, error)
 	newInboxFn  func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
+var _ remoteComponentCreator = &callbackRemoteComponentCreator{}
+
 func (c callbackRemoteComponentCreator) newOutbox(
+	_ *execinfra.FlowCtx,
+	_ int32,
 	allocator *colmem.Allocator,
+	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
-	_ func() []*execinfrapb.ComponentStats,
+	_ func(context.Context) []*execinfrapb.ComponentStats,
 ) (*colrpc.Outbox, error) {
-	return c.newOutboxFn(allocator, input, typs)
+	return c.newOutboxFn(allocator, converterMemAcc, input, typs)
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
-	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID, _ admissionOptions,
+	allocator *colmem.Allocator,
+	typs []*types.T,
+	streamID execinfrapb.StreamID,
+	_ <-chan struct{},
+	_ admissionOptions,
 ) (*colrpc.Inbox, error) {
 	return c.newInboxFn(allocator, typs, streamID)
 }
@@ -81,34 +86,39 @@ func intCols(numCols int) []*types.T {
 // not important). If it drains the depicted inbox, that is pulling from node 2
 // which is in turn pulling from an outbox, a cycle is created and the flow is
 // blocked.
-//          +------------+
-//          |  Node 3    |
-//          +-----+------+
-//                ^
-//      Node 1    |           Node 2
+//
+//	    +------------+
+//	    |  Node 3    |
+//	    +-----+------+
+//	          ^
+//	Node 1    |           Node 2
+//
 // +------------------------+-----------------+
-//          +------------+  |
-//     Spec C +--------+ |  |
-//          | |  noop  | |  |
-//          | +---+----+ |  |
-//          |     ^      |  |
-//          |  +--+---+  |  |
-//          |  |outbox|  +<----------+
-//          |  +------+  |  |        |
-//          +------------+  |        |
+//
+//	     +------------+  |
+//	Spec C +--------+ |  |
+//	     | |  noop  | |  |
+//	     | +---+----+ |  |
+//	     |     ^      |  |
+//	     |  +--+---+  |  |
+//	     |  |outbox|  +<----------+
+//	     |  +------+  |  |        |
+//	     +------------+  |        |
+//
 // Drain cycle!---+         |   +----+-----------------+
-//                v         |   |Any group of operators|
-//          +------------+  |   +----+-----------------+
-//          |  +------+  |  |        ^
-//     Spec A  |inbox +--------------+
-//          |  +------+  |  |
-//          +------------+  |
-//                ^         |
-//                |         |
-//          +-----+------+  |
-//     Spec B    noop    |  |
-//          |materializer|  +
-//          +------------+
+//
+//	           v         |   |Any group of operators|
+//	     +------------+  |   +----+-----------------+
+//	     |  +------+  |  |        ^
+//	Spec A  |inbox +--------------+
+//	     |  +------+  |  |
+//	     +------------+  |
+//	           ^         |
+//	           |         |
+//	     +-----+------+  |
+//	Spec B    noop    |  |
+//	     |materializer|  +
+//	     +------------+
 func TestDrainOnlyInputDAG(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -192,6 +202,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	componentCreator := callbackRemoteComponentCreator{
 		newOutboxFn: func(
 			allocator *colmem.Allocator,
+			converterMemAcc *mon.BoundAccount,
 			input colexecargs.OpWithMetaInfo,
 			typs []*types.T,
 		) (*colrpc.Outbox, error) {
@@ -204,7 +215,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			require.Len(t, input.MetadataSources, 1)
 			inbox := colexec.MaybeUnwrapInvariantsChecker(input.MetadataSources[0].(colexecop.Operator)).(*colrpc.Inbox)
 			require.Len(t, inboxToNumInputTypes[inbox], numInputTypesToOutbox)
-			return colrpc.NewOutbox(allocator, input, typs, nil /* getStats */)
+			return colrpc.NewOutbox(&execinfra.FlowCtx{Gateway: false}, 0 /* processorID */, allocator, converterMemAcc, input, typs, nil /* getStats */)
 		},
 		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
 			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
@@ -214,24 +225,31 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
-	f := &flowinfra.FlowBase{
-		FlowCtx: execinfra.FlowCtx{
+	flowBase := flowinfra.NewFlowBase(
+		execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			NodeID:  base.TestingIDContainer,
 		},
-	}
-	var wg sync.WaitGroup
+		nil,                     /* sp */
+		nil,                     /* flowReg */
+		&execinfra.RowChannel{}, /* rowSyncFlowConsumer */
+		nil,                     /* batchSyncFlowConsumer */
+		nil,                     /* localProcessors */
+		nil,                     /* localVectorSources */
+		nil,                     /* onFlowCleanupEnd */
+		"",                      /* statementSQL */
+	)
 	vfc := newVectorizedFlowCreator(
-		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
-		nil /* batchSyncFlowConsumer */, nil /* nodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-		nil /* fdSemaphore */, descs.DistSQLTypeResolver{}, admission.WorkInfo{},
+		flowBase, componentCreator, false, /* recordingStats */
+		colcontainer.DiskQueueCfg{}, nil, /* fdSemaphore */
 	)
 
-	_, _, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, flowinfra.FuseNormally)
+	_, _, err := vfc.setupFlow(ctx, procs, flowinfra.FuseNormally)
 	defer vfc.cleanup(ctx)
 	require.NoError(t, err)
 
@@ -244,31 +262,35 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 // subtests for a more thorough explanation.
 func TestVectorizedFlowTempDirectory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 
 	// We use an on-disk engine for this test since we're testing FS interactions
 	// and want to get the same behavior as a non-testing environment.
 	tempPath, dirCleanup := testutils.TempDir(t)
-	ngn, err := storage.Open(ctx, storage.Filesystem(tempPath), storage.CacheSize(0))
-	require.NoError(t, err)
-	defer ngn.Close()
+	env := fs.MustInitPhysicalTestingEnv(tempPath)
+	defer env.Close()
 	defer dirCleanup()
 
-	newVectorizedFlow := func() *vectorizedFlow {
+	newVectorizedFlow := func(queriesSpilled *metric.Counter) *vectorizedFlow {
 		return NewVectorizedFlow(
 			&flowinfra.FlowBase{
 				FlowCtx: execinfra.FlowCtx{
 					Cfg: &execinfra.ServerConfig{
-						TempFS:          ngn,
+						Settings:        st,
+						TempFS:          env,
 						TempStoragePath: tempPath,
 						VecFDSemaphore:  &colexecop.TestingSemaphore{},
-						Metrics:         &execinfra.DistSQLMetrics{},
+						Metrics: &execinfra.DistSQLMetrics{
+							QueriesSpilled: queriesSpilled,
+						},
 					},
 					EvalCtx:     &evalCtx,
+					Mon:         evalCtx.TestingMon,
 					NodeID:      base.TestingIDContainer,
 					DiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
 				},
@@ -276,12 +298,12 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		).(*vectorizedFlow)
 	}
 
-	dirs, err := ngn.List(tempPath)
+	dirs, err := env.List(tempPath)
 	require.NoError(t, err)
 	numDirsTheTestStartedWith := len(dirs)
 	checkDirs := func(t *testing.T, numExtraDirs int) {
 		t.Helper()
-		dirs, err := ngn.List(tempPath)
+		dirs, err := env.List(tempPath)
 		require.NoError(t, err)
 		expectedNumDirs := numDirsTheTestStartedWith + numExtraDirs
 		require.Equal(t, expectedNumDirs, len(dirs), "expected %d directories but found %d: %s", expectedNumDirs, len(dirs), dirs)
@@ -290,7 +312,8 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	// LazilyCreated asserts that a directory is not created during flow Setup
 	// but is done so when an operator spills to disk.
 	t.Run("LazilyCreated", func(t *testing.T) {
-		vf := newVectorizedFlow()
+		spilledCounter := metric.NewCounter(metric.Metadata{})
+		vf := newVectorizedFlow(spilledCounter)
 		var creator *vectorizedFlowCreator
 		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
 			creator = c
@@ -301,6 +324,9 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 
 		// No directory should have been created.
 		checkDirs(t, 0)
+
+		// The spilling hasn't happened yet.
+		require.Equal(t, int64(0), spilledCounter.Count())
 
 		// After the call to Setup, creator should be non-nil (i.e. the testing knob
 		// should have been called).
@@ -313,6 +339,9 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		// We should now have one directory, the flow's temporary storage directory.
 		checkDirs(t, 1)
 
+		// The metric must have been incremented.
+		require.Equal(t, int64(1), spilledCounter.Count())
+
 		// Another operator calling GetPath again should not create a new
 		// directory.
 		creator.diskQueueCfg.GetPather.GetPath(ctx)
@@ -324,7 +353,8 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	})
 
 	t.Run("DirCreationRace", func(t *testing.T) {
-		vf := newVectorizedFlow()
+		spilledCounter := metric.NewCounter(metric.Metadata{})
+		vf := newVectorizedFlow(spilledCounter)
 		var creator *vectorizedFlowCreator
 		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
 			creator = c
@@ -337,14 +367,17 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		errCh := make(chan error)
 		go func() {
 			createTempDir(ctx)
-			errCh <- ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "async"))
+			errCh <- env.MkdirAll(filepath.Join(vf.GetPath(ctx), "async"), os.ModePerm)
 		}()
 		createTempDir(ctx)
 		// Both goroutines should be able to create their subdirectories within the
 		// flow's temporary directory.
-		require.NoError(t, ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "main_goroutine")))
+		require.NoError(t, env.MkdirAll(filepath.Join(vf.GetPath(ctx), "main_goroutine"), os.ModePerm))
 		require.NoError(t, <-errCh)
 		vf.Cleanup(ctx)
 		checkDirs(t, 0)
+
+		// The metric must have been incremented exactly once.
+		require.Equal(t, int64(1), spilledCounter.Count())
 	})
 }

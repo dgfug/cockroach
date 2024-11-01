@@ -1,10 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdctest
 
@@ -18,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,7 +26,14 @@ import (
 // duplicates, which the two cdctest.Validator implementations verify for the
 // real output of a changefeed. The output rows and resolved timestamps of the
 // tested feed are fed into them to check for anomalies.
-func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, error) {
+func RunNemesis(
+	f TestFeedFactory,
+	db *gosql.DB,
+	isSinkless bool,
+	isCloudstorage bool,
+	withLegacySchemaChanger bool,
+	rng *rand.Rand,
+) (Validator, error) {
 	// possible additional nemeses:
 	// - schema changes
 	// - merges
@@ -42,7 +45,6 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, er
 	// - sink chaos
 
 	ctx := context.Background()
-	rng, _ := randutil.NewPseudoRand()
 
 	eventPauseCount := 10
 	if isSinkless {
@@ -54,9 +56,10 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, er
 		eventPauseCount = 0
 	}
 	ns := &nemeses{
-		maxTestColumnCount: 10,
-		rowCount:           4,
-		db:                 db,
+		withLegacySchemaChanger: withLegacySchemaChanger,
+		maxTestColumnCount:      10,
+		rowCount:                4,
+		db:                      db,
 		// eventMix does not have to add to 100
 		eventMix: map[fsm.Event]int{
 			// We don't want `eventFinished` to ever be returned by `nextEvent` so we set
@@ -124,7 +127,7 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, er
 	if _, err := db.Exec(`CREATE TABLE foo (id INT PRIMARY KEY, ts STRING DEFAULT '0')`); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(`SET CLUSTER SETTING kv.range_merge.queue_enabled = false`); err != nil {
+	if _, err := db.Exec(`SET CLUSTER SETTING kv.range_merge.queue.enabled = false`); err != nil {
 		return nil, err
 	}
 	if _, err := db.Exec(`ALTER TABLE foo SPLIT AT VALUES ($1)`, ns.rowCount/2); err != nil {
@@ -154,7 +157,11 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, er
 		}
 	}
 
-	foo, err := f.Feed(`CREATE CHANGEFEED FOR foo WITH updated, resolved, diff`)
+	withFormatParquet := ""
+	if isCloudstorage && rand.Intn(2) < 1 {
+		withFormatParquet = ", format=parquet"
+	}
+	foo, err := f.Feed(fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH updated, resolved, diff %s`, withFormatParquet))
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +184,7 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, er
 	if err != nil {
 		return nil, err
 	}
-	ns.v = MakeCountValidator(Validators{
+	ns.v = NewCountValidator(Validators{
 		NewOrderValidator(`foo`),
 		baV,
 		fprintV,
@@ -258,6 +265,8 @@ type addColumnPayload struct {
 }
 
 type nemeses struct {
+	withLegacySchemaChanger bool
+
 	rowCount           int
 	maxTestColumnCount int
 	eventMix           map[fsm.Event]int
@@ -688,9 +697,14 @@ func addColumn(a fsm.Args) error {
 	if err := ns.db.QueryRow(`SELECT count(*) FROM foo`).Scan(&rows); err != nil {
 		return err
 	}
-	// We expect one table scan that corresponds to the schema change backfill, and one
-	// scan that corresponds to the changefeed level backfill.
-	ns.availableRows += 2 * rows
+	if ns.withLegacySchemaChanger {
+		// We expect one table scan that corresponds to the schema change backfill, and one
+		// scan that corresponds to the changefeed level backfill.
+		ns.availableRows += 2 * rows
+	} else {
+		// We expect to see a backfill
+		ns.availableRows += rows
+	}
 	return nil
 }
 
@@ -711,9 +725,14 @@ func removeColumn(a fsm.Args) error {
 	if err := ns.db.QueryRow(`SELECT count(*) FROM foo`).Scan(&rows); err != nil {
 		return err
 	}
-	// We expect one table scan that corresponds to the schema change backfill, and one
-	// scan that corresponds to the changefeed level backfill.
-	ns.availableRows += 2 * rows
+	if ns.withLegacySchemaChanger {
+		// We expect one table scan that corresponds to the schema change backfill, and one
+		// scan that corresponds to the changefeed level backfill.
+		ns.availableRows += 2 * rows
+	} else {
+		// We expect to see a backfill
+		ns.availableRows += rows
+	}
 	return nil
 }
 

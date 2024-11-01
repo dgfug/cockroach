@@ -1,19 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats
 
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 )
@@ -23,20 +18,20 @@ import (
 // fields populated, memStmtStatsIterator overrides the
 // sslocal.StmtStatsIterator's Cur() method to populate the aggregated_ts
 // and aggregation_interval fields on the returning
-// roachpb.CollectedStatementStatistics.
+// appstatspb.CollectedStatementStatistics.
 type memStmtStatsIterator struct {
-	*sslocal.StmtStatsIterator
+	sslocal.StmtStatsIterator
 	aggregatedTs time.Time
 	aggInterval  time.Duration
 }
 
 func newMemStmtStatsIterator(
 	stats *sslocal.SQLStats,
-	options *sqlstats.IteratorOptions,
+	options sqlstats.IteratorOptions,
 	aggregatedTS time.Time,
 	aggInterval time.Duration,
-) *memStmtStatsIterator {
-	return &memStmtStatsIterator{
+) memStmtStatsIterator {
+	return memStmtStatsIterator{
 		StmtStatsIterator: stats.StmtStatsIterator(options),
 		aggregatedTs:      aggregatedTS,
 		aggInterval:       aggInterval,
@@ -45,7 +40,7 @@ func newMemStmtStatsIterator(
 
 // Cur calls the m.StmtStatsIterator.Cur() and populates the c.AggregatedTs
 // field and c.AggregationInterval field.
-func (m *memStmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
+func (m *memStmtStatsIterator) Cur() *appstatspb.CollectedStatementStatistics {
 	c := m.StmtStatsIterator.Cur()
 	c.AggregatedTs = m.aggregatedTs
 	c.AggregationInterval = m.aggInterval
@@ -57,20 +52,20 @@ func (m *memStmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
 // fields populated, memTxnStatsIterator overrides the
 // sslocal.TxnStatsIterator's Cur() method to populate the aggregated_ts and
 // aggregatoin_interval fields fields on the returning
-// roachpb.CollectedTransactionStatistics.
+// appstatspb.CollectedTransactionStatistics.
 type memTxnStatsIterator struct {
-	*sslocal.TxnStatsIterator
+	sslocal.TxnStatsIterator
 	aggregatedTs time.Time
 	aggInterval  time.Duration
 }
 
 func newMemTxnStatsIterator(
 	stats *sslocal.SQLStats,
-	options *sqlstats.IteratorOptions,
+	options sqlstats.IteratorOptions,
 	aggregatedTS time.Time,
 	aggInterval time.Duration,
-) *memTxnStatsIterator {
-	return &memTxnStatsIterator{
+) memTxnStatsIterator {
+	return memTxnStatsIterator{
 		TxnStatsIterator: stats.TxnStatsIterator(options),
 		aggregatedTs:     aggregatedTS,
 		aggInterval:      aggInterval,
@@ -79,7 +74,7 @@ func newMemTxnStatsIterator(
 
 // Cur calls the m.TxnStatsIterator.Cur() and populates the stats.AggregatedTs
 // and stats.AggregationInterval fields.
-func (m *memTxnStatsIterator) Cur() *roachpb.CollectedTransactionStatistics {
+func (m *memTxnStatsIterator) Cur() *appstatspb.CollectedTransactionStatistics {
 	stats := m.TxnStatsIterator.Cur()
 	stats.AggregatedTs = m.aggregatedTs
 	stats.AggregationInterval = m.aggInterval

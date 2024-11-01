@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -14,7 +9,6 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -22,23 +16,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 )
 
-var issueRegexp = regexp.MustCompile(`See: https://[^\s]+issues?/(\d+)`)
-
-type status int
-
-const (
-	statusPass status = iota
-	statusFail
-	statusSkip
-)
-
 // extractFailureFromJUnitXML parses an XML report to find all failed tests. The
 // return values are:
-// - slice of all test names.
-// - slice of status for each test.
-// - map from name of a failed test to a github issue that explains the failure,
-//   if the error message contained a reference to an issue.
-// - error if there was a problem parsing the XML.
+//   - slice of all test names.
+//   - slice of status for each test.
+//   - map from name of a failed test to a github issue that explains the failure,
+//     if the error message contained a reference to an issue.
+//   - error if there was a problem parsing the XML.
 func extractFailureFromJUnitXML(contents []byte) ([]string, []status, map[string]string, error) {
 	type Failure struct {
 		Message string `xml:"message,attr"`
@@ -139,29 +123,29 @@ func (r *ormTestsResults) parseJUnitXML(
 		if len(issue) == 0 || issue == "unknown" {
 			issue = issueHints[test]
 		}
-		status := statuses[i]
+		statusCode := statuses[i]
 		switch {
 		case expectedIgnored:
 			r.results[test] = fmt.Sprintf("--- IGNORE: %s due to %s (expected)", test, ignoredIssue)
 			r.ignoredCount++
-		case status == statusSkip:
+		case statusCode == statusSkip:
 			r.results[test] = fmt.Sprintf("--- SKIP: %s", test)
 			r.skipCount++
-		case status == statusPass && !expectedFailure:
+		case statusCode == statusPass && !expectedFailure:
 			r.results[test] = fmt.Sprintf("--- PASS: %s (expected)", test)
 			r.passExpectedCount++
-		case status == statusPass && expectedFailure:
+		case statusCode == statusPass && expectedFailure:
 			r.results[test] = fmt.Sprintf("--- PASS: %s - %s (unexpected)",
 				test, maybeAddGithubLink(issue),
 			)
 			r.passUnexpectedCount++
-		case status == statusFail && expectedFailure:
+		case statusCode == statusFail && expectedFailure:
 			r.results[test] = fmt.Sprintf("--- FAIL: %s - %s (expected)",
 				test, maybeAddGithubLink(issue),
 			)
 			r.failExpectedCount++
 			r.currentFailures = append(r.currentFailures, test)
-		case status == statusFail && !expectedFailure:
+		case statusCode == statusFail && !expectedFailure:
 			r.results[test] = fmt.Sprintf("--- FAIL: %s - %s (unexpected)",
 				test, maybeAddGithubLink(issue))
 			r.failUnexpectedCount++
@@ -202,7 +186,11 @@ func parseAndSummarizeJavaORMTestsResults(
 	}
 	for i, file := range files {
 		t.L().Printf("Parsing %d of %d: %s\n", i+1, len(files), file)
-		fileOutput, err := repeatRunWithBuffer(
+		// NB: It is necessary to escape `$` in case the name contains them so they
+		// aren't treated as environment variables. We avoid using single quotes
+		// because we still want `~` to be expanded to the home directory.
+		file = strings.ReplaceAll(file, "$", "\\$")
+		result, err := repeatRunWithDetailsSingleNode(
 			ctx,
 			c,
 			t,
@@ -214,7 +202,7 @@ func parseAndSummarizeJavaORMTestsResults(
 			t.Fatal(err)
 		}
 
-		results.parseJUnitXML(t, expectedFailures, ignorelist, fileOutput)
+		results.parseJUnitXML(t, expectedFailures, ignorelist, []byte(result.Stdout))
 	}
 
 	results.summarizeAll(

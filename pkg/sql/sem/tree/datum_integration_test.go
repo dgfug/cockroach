@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree_test
 
@@ -14,12 +9,14 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -27,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -42,19 +40,19 @@ func prepareExpr(t *testing.T, datumExpr string) tree.Datum {
 	// Type checking ensures constant folding is performed and type
 	// annotations have come into effect.
 	ctx := context.Background()
-	sema := tree.MakeSemaContext()
+	sema := tree.MakeSemaContext(nil /* resolver */)
 	typedExpr, err := tree.TypeCheck(ctx, expr, &sema, types.Any)
 	if err != nil {
 		t.Fatalf("%s: %v", datumExpr, err)
 	}
 	// Normalization ensures that casts are processed.
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	defer evalCtx.Stop(context.Background())
-	typedExpr, err = evalCtx.NormalizeExpr(typedExpr)
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(ctx)
+	typedExpr, err = normalize.Expr(ctx, evalCtx, typedExpr)
 	if err != nil {
 		t.Fatalf("%s: %v", datumExpr, err)
 	}
-	d, err := typedExpr.Eval(evalCtx)
+	d, err := eval.Expr(ctx, evalCtx, typedExpr)
 	if err != nil {
 		t.Fatalf("%s: %v", datumExpr, err)
 	}
@@ -109,7 +107,7 @@ func TestDatumOrdering(t *testing.T) {
 		{`'0001-01-01':::date`, `'0001-12-31 BC'`, `'0001-01-02'`, `'-infinity'`, `'infinity'`},
 		{`'4000-01-01 BC':::date`, `'4001-12-31 BC'`, `'4000-01-02 BC'`, `'-infinity'`, `'infinity'`},
 		{`'2006-01-02 03:04:05.123123':::timestamp`,
-			`'2006-01-02 03:04:05.123122'`, `'2006-01-02 03:04:05.123124'`, `'-4713-11-24 00:00:00'`, `'294276-12-31 23:59:59.999999'`},
+			`'2006-01-02 03:04:05.123122'`, `'2006-01-02 03:04:05.123124'`, `'4714-11-24 00:00:00 BC'`, `'294276-12-31 23:59:59.999999'`},
 
 		// Geospatial types
 		{`'BOX(1 2,3 4)'::box2d`, noPrev, noNext, noMin, noMax},
@@ -237,15 +235,16 @@ func TestDatumOrdering(t *testing.T) {
 		{`((false,), ARRAY[true])`, noPrev, `((false,), ARRAY[true,NULL])`,
 			`((false,), ARRAY[])`, noMax},
 	}
-	ctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	ctx := context.Background()
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	for _, td := range testData {
 		d := prepareExpr(t, td.datumExpr)
 
-		prevVal, hasPrev := d.Prev(ctx)
-		nextVal, hasNext := d.Next(ctx)
+		prevVal, hasPrev := d.Prev(ctx, evalCtx)
+		nextVal, hasNext := d.Next(ctx, evalCtx)
 		if td.prev == noPrev {
 			if hasPrev {
-				if !d.IsMin(ctx) {
+				if !d.IsMin(ctx, evalCtx) {
 					t.Errorf("%s: value should not have a prev, yet hasPrev true and IsMin() false (expected (!hasPrev || IsMin()))", td.datumExpr)
 				}
 			}
@@ -254,7 +253,7 @@ func TestDatumOrdering(t *testing.T) {
 				t.Errorf("%s: hasPrev: got false, expected true", td.datumExpr)
 				continue
 			}
-			isMin := d.IsMin(ctx)
+			isMin := d.IsMin(ctx, evalCtx)
 			if isMin != (td.prev == valIsMin) {
 				t.Errorf("%s: IsMin() %v, expected %v", td.datumExpr, isMin, (td.prev == valIsMin))
 				continue
@@ -268,7 +267,7 @@ func TestDatumOrdering(t *testing.T) {
 		}
 		if td.next == noNext {
 			if hasNext {
-				if !d.IsMax(ctx) {
+				if !d.IsMax(ctx, evalCtx) {
 					t.Errorf("%s: value should not have a next, yet hasNext true and IsMax() false (expected (!hasNext || IsMax()))", td.datumExpr)
 				}
 			}
@@ -277,7 +276,7 @@ func TestDatumOrdering(t *testing.T) {
 				t.Errorf("%s: HasNext(): got false, expected true", td.datumExpr)
 				continue
 			}
-			isMax := d.IsMax(ctx)
+			isMax := d.IsMax(ctx, evalCtx)
 			if isMax != (td.next == valIsMax) {
 				t.Errorf("%s: IsMax() %v, expected %v", td.datumExpr, isMax, (td.next == valIsMax))
 				continue
@@ -290,8 +289,8 @@ func TestDatumOrdering(t *testing.T) {
 			}
 		}
 
-		minVal, hasMin := d.Min(ctx)
-		maxVal, hasMax := d.Max(ctx)
+		minVal, hasMin := d.Min(ctx, evalCtx)
+		maxVal, hasMax := d.Max(ctx, evalCtx)
 
 		if td.min == noMin {
 			if hasMin {
@@ -331,10 +330,13 @@ func TestDFloatCompare(t *testing.T) {
 			} else if i > j {
 				expected = 1
 			}
-			evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			defer evalCtx.Stop(context.Background())
-			got := x.Compare(evalCtx, y)
-			if got != expected {
+			ctx := context.Background()
+			evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			defer evalCtx.Stop(ctx)
+			got, err := x.Compare(ctx, evalCtx, y)
+			if err != nil {
+				t.Fatal(err)
+			} else if got != expected {
 				t.Errorf("comparing DFloats %s and %s: expected %d, got %d", x, y, expected, got)
 			}
 		}
@@ -417,9 +419,12 @@ func TestParseDIntervalWithTypeMetadata(t *testing.T) {
 			t.Errorf("unexpected error while parsing expected value INTERVAL %s: %s", td.expected, err)
 			continue
 		}
-		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-		defer evalCtx.Stop(context.Background())
-		if expected.Compare(evalCtx, actual) != 0 {
+		ctx := context.Background()
+		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		defer evalCtx.Stop(ctx)
+		if cmp, err := expected.Compare(ctx, evalCtx, actual); err != nil {
+			t.Fatal(err)
+		} else if cmp != 0 {
 			t.Errorf("INTERVAL %s %#v: got %s, expected %s", td.str, td.dtype, actual, expected)
 		}
 	}
@@ -429,7 +434,7 @@ func TestParseDDate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := tree.NewParseTimeContext(
+	ctx := tree.NewParseContext(
 		time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", -18000)),
 	)
 
@@ -474,9 +479,11 @@ func TestParseDDate(t *testing.T) {
 			t.Errorf("unexpected error while parsing expected value DATE %s: %s", td.expected, err)
 			continue
 		}
-		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
-		if expected.Compare(evalCtx, actual) != 0 {
+		if cmp, err := expected.Compare(context.Background(), evalCtx, actual); err != nil {
+			t.Fatal(err)
+		} else if cmp != 0 {
 			t.Errorf("DATE %s: got %s, expected %s", td.str, actual, expected)
 		}
 		if td.expectedDepOnCtx != depOnCtx {
@@ -552,7 +559,7 @@ func TestParseDTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := tree.NewParseTimeContext(
+	ctx := tree.NewParseContext(
 		time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", -18000)),
 	)
 	// Since ParseDTime shares most of the underlying parsing logic to
@@ -625,7 +632,7 @@ func TestParseDTimeError(t *testing.T) {
 
 func TestParseDTimeTZ(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := tree.NewParseTimeContext(
+	ctx := tree.NewParseContext(
 		time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", 18000)),
 	)
 
@@ -703,7 +710,7 @@ func TestParseDTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := tree.NewParseTimeContext(
+	ctx := tree.NewParseContext(
 		time.Date(2001, time.February, 3, 4, 5, 6, 1000, time.FixedZone("foo", -18000)),
 	)
 
@@ -787,7 +794,7 @@ func TestParseDTimestampTZ(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	local := time.FixedZone("foo", -18000)
-	ctx := tree.NewParseTimeContext(time.Date(2001, time.February, 3, 4, 5, 6, 1000, local))
+	ctx := tree.NewParseContext(time.Date(2001, time.February, 3, 4, 5, 6, 1000, local))
 
 	testData := []struct {
 		str              string
@@ -873,7 +880,10 @@ func TestMakeDJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j1.Compare(tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), j2) != -1 {
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	if cmp, err := j1.Compare(context.Background(), evalCtx, j2); err != nil {
+		t.Fatal(err)
+	} else if cmp != -1 {
 		t.Fatal("expected JSON 1 < 2")
 	}
 }
@@ -882,24 +892,25 @@ func TestDTimeTZ(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := &tree.EvalContext{
+	ctx := context.Background()
+	evalCtx := &eval.Context{
 		SessionDataStack: sessiondata.NewStack(&sessiondata.SessionData{
 			Location: time.UTC,
 		}),
 	}
 
-	maxTime, depOnCtx, err := tree.ParseDTimeTZ(ctx, "24:00:00-1559", time.Microsecond)
+	maxTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "24:00:00-1559", time.Microsecond)
 	require.NoError(t, err)
 	require.False(t, depOnCtx)
-	minTime, depOnCtx, err := tree.ParseDTimeTZ(ctx, "00:00:00+1559", time.Microsecond)
+	minTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "00:00:00+1559", time.Microsecond)
 	require.NoError(t, err)
 	require.False(t, depOnCtx)
 
 	// These are all the same UTC time equivalents.
-	utcTime, depOnCtx, err := tree.ParseDTimeTZ(ctx, "11:14:15+0", time.Microsecond)
+	utcTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "11:14:15+0", time.Microsecond)
 	require.NoError(t, err)
 	require.False(t, depOnCtx)
-	sydneyTime, depOnCtx, err := tree.ParseDTimeTZ(ctx, "21:14:15+10", time.Microsecond)
+	sydneyTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "21:14:15+10", time.Microsecond)
 	require.NoError(t, err)
 	require.False(t, depOnCtx)
 
@@ -970,7 +981,7 @@ func TestDTimeTZ(t *testing.T) {
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("#%d %s", i, tc.t.String()), func(t *testing.T) {
 			var largerThan []tree.Datum
-			prev, ok := tc.t.Prev(ctx)
+			prev, ok := tc.t.Prev(ctx, evalCtx)
 			if !tc.isMin {
 				assert.True(t, ok)
 				largerThan = append(largerThan, prev)
@@ -978,11 +989,13 @@ func TestDTimeTZ(t *testing.T) {
 				assert.False(t, ok)
 			}
 			for _, largerThan := range append(largerThan, tc.largerThan...) {
-				assert.Equal(t, 1, tc.t.Compare(ctx, largerThan), "%s > %s", tc.t.String(), largerThan.String())
+				cmp, err := tc.t.Compare(ctx, evalCtx, largerThan)
+				assert.NoError(t, err)
+				assert.Equal(t, 1, cmp, "%s > %s", tc.t.String(), largerThan.String())
 			}
 
 			var smallerThan []tree.Datum
-			next, ok := tc.t.Next(ctx)
+			next, ok := tc.t.Next(ctx, evalCtx)
 			if !tc.isMax {
 				assert.True(t, ok)
 				smallerThan = append(smallerThan, next)
@@ -990,114 +1003,182 @@ func TestDTimeTZ(t *testing.T) {
 				assert.False(t, ok)
 			}
 			for _, smallerThan := range append(smallerThan, tc.smallerThan...) {
-				assert.Equal(t, -1, tc.t.Compare(ctx, smallerThan), "%s < %s", tc.t.String(), smallerThan.String())
+				cmp, err := tc.t.Compare(ctx, evalCtx, smallerThan)
+				assert.NoError(t, err)
+				assert.Equal(t, -1, cmp, "%s < %s", tc.t.String(), smallerThan.String())
 			}
 
 			for _, equalTo := range tc.equalTo {
-				assert.Equal(t, 0, tc.t.Compare(ctx, equalTo), "%s = %s", tc.t.String(), equalTo.String())
+				cmp, err := tc.t.Compare(ctx, evalCtx, equalTo)
+				assert.NoError(t, err)
+				assert.Equal(t, 0, cmp, "%s = %s", tc.t.String(), equalTo.String())
 			}
 
-			assert.Equal(t, tc.isMax, tc.t.IsMax(ctx))
-			assert.Equal(t, tc.isMin, tc.t.IsMin(ctx))
+			assert.Equal(t, tc.isMax, tc.t.IsMax(ctx, evalCtx))
+			assert.Equal(t, tc.isMin, tc.t.IsMin(ctx, evalCtx))
 		})
 	}
 }
 
-func TestIsDistinctFrom(t *testing.T) {
+func checkTimeTZ(t *testing.T, d *tree.DTimeTZ) {
+	t.Helper()
+	if d.OffsetSecs < timetz.MinTimeTZOffsetSecs || d.OffsetSecs > timetz.MaxTimeTZOffsetSecs {
+		t.Fatalf("d.OffsetSecs out of range: %d", d.OffsetSecs)
+	}
+	if d.TimeOfDay < timeofday.Min || d.TimeOfDay > timeofday.Max {
+		t.Fatalf("d.TimeOfDay out of range: %d", d.TimeOfDay)
+	}
+}
+
+func TestDTimeTZPrev(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testData := []struct {
-		a        string // comma separated list of strings, `NULL` is converted to a NULL
-		b        string // same as a
-		expected bool
-	}{
-		{"a", "a", false},
-		{"a", "b", true},
-		{"b", "b", false},
-		{"a,a", "a,a", false},
-		{"a,a", "a,b", true},
-		{"a,a", "b,a", true},
-		{"a,a,a", "a,a,a", false},
-		{"a,a,a", "a,a,b", true},
-		{"a,a,a", "a,b,a", true},
-		{"a,a,a", "a,b,b", true},
-		{"a,a,a", "b,a,a", true},
-		{"a,a,a", "b,a,b", true},
-		{"a,a,a", "b,b,a", true},
-		{"a,a,a", "b,b,b", true},
-		{"NULL", "NULL", false},
-		{"a", "NULL", true},
-		{"a,a", "a,NULL", true},
-		{"a,a", "NULL,a", true},
-		{"a,a", "NULL,NULL", true},
-		{"a,NULL", "a,a", true},
-		{"a,NULL", "a,NULL", false},
-		{"a,NULL", "NULL,a", true},
-		{"a,NULL", "NULL,NULL", true},
-		{"NULL,a", "a,a", true},
-		{"NULL,a", "a,NULL", true},
-		{"NULL,a", "NULL,a", false},
-		{"NULL,a", "NULL,NULL", true},
-		{"NULL,NULL", "a,a", true},
-		{"NULL,NULL", "a,NULL", true},
-		{"NULL,NULL", "NULL,a", true},
-		{"NULL,NULL", "NULL,NULL", false},
-		{"a,a,a", "a,a,NULL", true},
-		{"a,a,a", "a,NULL,a", true},
-		{"a,a,a", "a,NULL,NULL", true},
-		{"a,a,a", "NULL,a,a", true},
-		{"a,a,a", "NULL,a,NULL", true},
-		{"a,a,a", "NULL,NULL,a", true},
-		{"a,a,a", "NULL,NULL,NULL", true},
-		{"a,NULL,a", "a,a,a", true},
-		{"a,NULL,a", "a,a,NULL", true},
-		{"a,NULL,a", "a,NULL,a", false},
-		{"a,NULL,a", "a,NULL,NULL", true},
-		{"a,NULL,a", "NULL,a,a", true},
-		{"a,NULL,a", "NULL,a,NULL", true},
-		{"a,NULL,a", "NULL,NULL,a", true},
-		{"a,NULL,a", "NULL,NULL,NULL", true},
-		{"NULL,a,NULL", "a,a,a", true},
-		{"NULL,a,NULL", "a,a,NULL", true},
-		{"NULL,a,NULL", "a,NULL,a", true},
-		{"NULL,a,NULL", "a,NULL,NULL", true},
-		{"NULL,a,NULL", "NULL,a,a", true},
-		{"NULL,a,NULL", "NULL,a,NULL", false},
-		{"NULL,a,NULL", "NULL,NULL,a", true},
-		{"NULL,a,NULL", "NULL,NULL,NULL", true},
-		{"NULL,NULL,NULL", "a,a,a", true},
-		{"NULL,NULL,NULL", "a,a,NULL", true},
-		{"NULL,NULL,NULL", "a,NULL,a", true},
-		{"NULL,NULL,NULL", "a,NULL,NULL", true},
-		{"NULL,NULL,NULL", "NULL,a,a", true},
-		{"NULL,NULL,NULL", "NULL,a,NULL", true},
-		{"NULL,NULL,NULL", "NULL,NULL,a", true},
-		{"NULL,NULL,NULL", "NULL,NULL,NULL", false},
+
+	rng, _ := randutil.NewTestRand()
+	ctx := context.Background()
+	evalCtx := &eval.Context{
+		SessionDataStack: sessiondata.NewStack(&sessiondata.SessionData{
+			Location: time.UTC,
+		}),
 	}
-	convert := func(s string) tree.Datums {
-		splits := strings.Split(s, ",")
-		result := make(tree.Datums, len(splits))
-		for i, value := range splits {
-			if value == "NULL" {
-				result[i] = tree.DNull
-				continue
-			}
-			result[i] = tree.NewDString(value)
+
+	// Check a few specific values.
+	closeToMidnight, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "23:59:59.865326-03:15:29", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	prev, ok := closeToMidnight.Prev(ctx, evalCtx)
+	require.True(t, ok)
+	require.Equal(t, "'11:16:28.865325-15:59'", prev.String())
+	prevPrev, ok := prev.Prev(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, "'11:16:29.865325-15:58:59'", prevPrev.String())
+
+	maxTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "24:00:00-1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	prev, ok = maxTime.Prev(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, "'23:59:59.999999-15:59'", prev.String())
+
+	minTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "00:00:00+1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	_, ok = minTime.Prev(ctx, evalCtx)
+	assert.False(t, ok)
+
+	minTimePlusOne, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "00:00:00.000001+1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	prev, ok = minTimePlusOne.Prev(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, minTime, prev)
+
+	// Choose a random start time, and run Prev for 10000 iterations.
+	startTime := randgen.RandDatum(rng, types.TimeTZ, false /* nullOk */)
+	var total int
+	for datum, ok := startTime, true; ok && total < 10000; datum, ok = datum.Prev(ctx, evalCtx) {
+		total++
+
+		// Check that the result of calling Prev is valid.
+		timeTZ, ok := datum.(*tree.DTimeTZ)
+		require.True(t, ok)
+		checkTimeTZ(t, timeTZ)
+
+		// Check that the result of calling Next on this new value is valid.
+		nextDatum, nextOk := timeTZ.Next(ctx, evalCtx)
+		if !nextOk {
+			assert.Equal(t, timeTZ, tree.DMaxTimeTZ)
+			continue
 		}
-		return result
+		nextTimeTZ, ok := nextDatum.(*tree.DTimeTZ)
+		require.True(t, ok)
+		checkTimeTZ(t, nextTimeTZ)
+
+		// Check that the two datums have the expected relationship to one another.
+		assert.True(t, nextTimeTZ.After(timeTZ.TimeTZ))
+		assert.True(t, timeTZ.Before(nextTimeTZ.TimeTZ))
+		if nextTimeTZ.OffsetSecs == timetz.MinTimeTZOffsetSecs ||
+			nextTimeTZ.TimeOfDay+duration.MicrosPerSec > timeofday.Max {
+			assert.True(t, nextTimeTZ.ToTime().Sub(timeTZ.ToTime()) == time.Microsecond)
+		} else {
+			assert.True(t, nextTimeTZ.ToTime().Equal(timeTZ.ToTime()))
+		}
 	}
-	for _, td := range testData {
-		t.Run(fmt.Sprintf("%s to %s", td.a, td.b), func(t *testing.T) {
-			datumsA := convert(td.a)
-			datumsB := convert(td.b)
-			if e, a := td.expected, datumsA.IsDistinctFrom(&tree.EvalContext{}, datumsB); e != a {
-				if e {
-					t.Errorf("expected %s to be distinct from %s, but got %t", datumsA, datumsB, e)
-				} else {
-					t.Errorf("expected %s to not be distinct from %s, but got %t", datumsA, datumsB, e)
-				}
-			}
-		})
+}
+
+func TestDTimeTZNext(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	rng, _ := randutil.NewTestRand()
+	ctx := context.Background()
+	evalCtx := &eval.Context{
+		SessionDataStack: sessiondata.NewStack(&sessiondata.SessionData{
+			Location: time.UTC,
+		}),
+	}
+
+	// Check a few specific values.
+	closeToMidnight, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "00:00:00.865326+03:15:29", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	next, ok := closeToMidnight.Next(ctx, evalCtx)
+	require.True(t, ok)
+	require.Equal(t, "'12:43:31.865327+15:59'", next.String())
+	nextNext, ok := next.Next(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, "'12:43:30.865327+15:58:59'", nextNext.String())
+
+	minTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "00:00:00+1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	next, ok = minTime.Next(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, "'00:00:00.000001+15:59'", next.String())
+
+	maxTime, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "24:00:00-1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	_, ok = maxTime.Next(ctx, evalCtx)
+	assert.False(t, ok)
+
+	maxTimeMinusOne, depOnCtx, err := tree.ParseDTimeTZ(evalCtx, "23:59:59.999999-1559", time.Microsecond)
+	require.NoError(t, err)
+	require.False(t, depOnCtx)
+	next, ok = maxTimeMinusOne.Next(ctx, evalCtx)
+	require.True(t, ok)
+	assert.Equal(t, maxTime, next)
+
+	// Choose a random start time, and run Next for 10000 iterations.
+	startTime := randgen.RandDatum(rng, types.TimeTZ, false /* nullOk */)
+	var total int
+	for datum, ok := startTime, true; ok && total < 10000; datum, ok = datum.Next(ctx, evalCtx) {
+		total++
+
+		// Check that the result of calling Next is valid.
+		timeTZ, ok := datum.(*tree.DTimeTZ)
+		require.True(t, ok)
+		checkTimeTZ(t, timeTZ)
+
+		// Check that the result of calling Prev on this new value is valid.
+		prevDatum, prevOk := timeTZ.Prev(ctx, evalCtx)
+		if !prevOk {
+			assert.Equal(t, timeTZ, tree.DMinTimeTZ)
+			continue
+		}
+		prevTimeTZ, ok := prevDatum.(*tree.DTimeTZ)
+		require.True(t, ok)
+		checkTimeTZ(t, prevTimeTZ)
+
+		// Check that the two datums have the expected relationship to one another.
+		assert.True(t, prevTimeTZ.Before(timeTZ.TimeTZ))
+		assert.True(t, timeTZ.After(prevTimeTZ.TimeTZ))
+		if prevTimeTZ.OffsetSecs == timetz.MaxTimeTZOffsetSecs ||
+			prevTimeTZ.TimeOfDay-duration.MicrosPerSec < timeofday.Min {
+			assert.True(t, timeTZ.ToTime().Sub(prevTimeTZ.ToTime()) == time.Microsecond)
+		} else {
+			assert.True(t, timeTZ.ToTime().Equal(prevTimeTZ.ToTime()))
+		}
 	}
 }
 
@@ -1122,7 +1203,7 @@ func TestNewDefaultDatum(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
 	testCases := []struct {
@@ -1143,7 +1224,7 @@ func TestNewDefaultDatum(t *testing.T) {
 		{t: types.String, expected: "'':::STRING"},
 		{t: types.MakeChar(3), expected: "'':::STRING"},
 		{t: types.Bytes, expected: "'\\x':::BYTES"},
-		{t: types.TimestampTZ, expected: "'0001-01-01 00:00:00+00:00':::TIMESTAMPTZ"},
+		{t: types.TimestampTZ, expected: "'0001-01-01 00:00:00+00':::TIMESTAMPTZ"},
 		{t: types.MakeCollatedString(types.MakeVarChar(10), "de"), expected: "'' COLLATE de"},
 		{t: types.MakeCollatedString(types.VarChar, "en_US"), expected: "'' COLLATE en_US"},
 		{t: types.Oid, expected: "26:::OID"},
@@ -1156,7 +1237,7 @@ func TestNewDefaultDatum(t *testing.T) {
 		{t: types.INet, expected: "'0.0.0.0/0':::INET"},
 		{t: types.Time, expected: "'00:00:00':::TIME"},
 		{t: types.Jsonb, expected: "'null':::JSONB"},
-		{t: types.TimeTZ, expected: "'00:00:00+00:00:00':::TIMETZ"},
+		{t: types.TimeTZ, expected: "'00:00:00+00':::TIMETZ"},
 		{t: types.MakeTuple([]*types.T{}), expected: "()"},
 		{t: types.MakeTuple([]*types.T{types.Int, types.MakeChar(1)}), expected: "(0:::INT8, '':::STRING)"},
 		{t: types.MakeTuple([]*types.T{types.OidVector, types.MakeTuple([]*types.T{types.Float})}), expected: "(ARRAY[]:::OID[], (0.0:::FLOAT8,))"},
@@ -1166,7 +1247,7 @@ func TestNewDefaultDatum(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("#%d %s", i, tc.t.SQLString()), func(t *testing.T) {
-			datum, err := tree.NewDefaultDatum(evalCtx, tc.t)
+			datum, err := tree.NewDefaultDatum(&evalCtx.CollationEnv, tc.t)
 			if err != nil {
 				t.Errorf("unexpected error: %s", err)
 			}
@@ -1182,11 +1263,12 @@ func TestNewDefaultDatum(t *testing.T) {
 func TestGeospatialSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testCases := []struct {
-		wkt      string
-		expected uintptr
+		wkt               string
+		size              uintptr
+		deterministicSize uintptr
 	}{
-		{"SRID=4004;POINT EMPTY", 73},
-		{"SRID=4326;LINESTRING(0 0, 10 0)", 125},
+		{"SRID=4004;POINT EMPTY", 112, 73},
+		{"SRID=4326;LINESTRING(0 0, 10 0)", 144, 125},
 	}
 
 	for _, tc := range testCases {
@@ -1194,12 +1276,14 @@ func TestGeospatialSize(t *testing.T) {
 			t.Run("geometry", func(t *testing.T) {
 				g, err := tree.ParseDGeometry(tc.wkt)
 				require.NoError(t, err)
-				require.Equal(t, tc.expected, g.Size())
+				require.Equal(t, tc.size, g.Size())
+				require.Equal(t, tc.deterministicSize, g.DeterministicMemSize())
 			})
 			t.Run("geography", func(t *testing.T) {
 				g, err := tree.ParseDGeography(tc.wkt)
 				require.NoError(t, err)
-				require.Equal(t, tc.expected, g.Size())
+				require.Equal(t, tc.size, g.Size())
+				require.Equal(t, tc.deterministicSize, g.DeterministicMemSize())
 			})
 		})
 	}

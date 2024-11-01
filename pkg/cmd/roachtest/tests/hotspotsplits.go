@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,8 +11,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -29,14 +27,9 @@ func registerHotSpotSplits(r registry.Registry) {
 	// to force a large range. We then make sure that the largest range isn't larger than a threshold and
 	// that backpressure is working correctly.
 	runHotSpot := func(ctx context.Context, t test.Test, c cluster.Cluster, duration time.Duration, concurrency int) {
-		roachNodes := c.Range(1, c.Spec().NodeCount-1)
-		appNode := c.Node(c.Spec().NodeCount)
+		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
 
-		c.Put(ctx, t.Cockroach(), "./cockroach", roachNodes)
-		c.Start(ctx, roachNodes)
-
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload", appNode)
-		c.Run(ctx, appNode, `./workload init kv --drop {pgurl:1}`)
+		c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload init kv --drop {pgurl:1}`)
 
 		var m *errgroup.Group // see comment in version.go
 		m, ctx = errgroup.WithContext(ctx)
@@ -45,17 +38,17 @@ func registerHotSpotSplits(r registry.Registry) {
 			t.L().Printf("starting load generator\n")
 
 			const blockSize = 1 << 18 // 256 KB
-			return c.RunE(ctx, appNode, fmt.Sprintf(
-				"./workload run kv --read-percent=0 --tolerate-errors --concurrency=%d "+
-					"--min-block-bytes=%d --max-block-bytes=%d --duration=%s {pgurl:1-3}",
-				concurrency, blockSize, blockSize, duration.String()))
+			return c.RunE(ctx, option.WithNodes(c.WorkloadNode()), fmt.Sprintf(
+				"./cockroach workload run kv --read-percent=0 --tolerate-errors --concurrency=%d "+
+					"--min-block-bytes=%d --max-block-bytes=%d --duration=%s {pgurl%s}",
+				concurrency, blockSize, blockSize, duration.String(), c.CRDBNodes()))
 		})
 
 		m.Go(func() error {
 			t.Status("starting checks for range sizes")
 			const sizeLimit = 3 * (1 << 29) // 3*512 MB (512 mb is default size)
 
-			db := c.Conn(ctx, 1)
+			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
 
 			var size = float64(0)
@@ -96,7 +89,10 @@ func registerHotSpotSplits(r registry.Registry) {
 		// Test OOMs below this version because of scans over the large rows.
 		// No problem in 20.1 thanks to:
 		// https://github.com/cockroachdb/cockroach/pull/45323.
-		Cluster: r.MakeClusterSpec(numNodes),
+		Cluster:          r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if c.IsLocal() {
 				concurrency = 32

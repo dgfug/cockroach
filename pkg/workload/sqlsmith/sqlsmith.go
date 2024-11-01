@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
@@ -26,11 +21,12 @@ import (
 	"github.com/spf13/pflag"
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type sqlSmith struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed          int64
 	tables        int
 	errorSettings int
 }
@@ -51,13 +47,14 @@ var sqlSmithMeta = workload.Meta{
 	Name:        `sqlsmith`,
 	Description: `sqlsmith is a random SQL query generator`,
 	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &sqlSmith{}
 		g.flags.FlagSet = pflag.NewFlagSet(`sqlsmith`, pflag.ContinueOnError)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.tables, `tables`, 1, `Number of tables.`)
 		g.flags.IntVar(&g.errorSettings, `error-sensitivity`, 0,
 			`SQLSmith's sensitivity to errors. 0=ignore all errors. 1=quit on internal errors. 2=quit on any error.`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -69,23 +66,30 @@ func (*sqlSmith) Meta() workload.Meta { return sqlSmithMeta }
 // Flags implements the Flagser interface.
 func (g *sqlSmith) Flags() workload.Flags { return g.flags }
 
+// ConnFlags implements the ConnFlagser interface.
+func (g *sqlSmith) ConnFlags() *workload.ConnFlags { return g.connFlags }
+
+// Hooks implements the Hookser interface.
 func (g *sqlSmith) Hooks() workload.Hooks {
 	return workload.Hooks{}
 }
 
 // Tables implements the Generator interface.
 func (g *sqlSmith) Tables() []workload.Table {
-	rng := rand.New(rand.NewSource(g.seed))
+	rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 	var tables []workload.Table
 	for idx := 0; idx < g.tables; idx++ {
-		schema := randgen.RandCreateTable(rng, "table", idx)
+		schema := randgen.RandCreateTable(context.Background(), rng, "table", idx, randgen.TableOptNone)
+		// workload expects the schema to be missing the 'CREATE TABLE "name"', so
+		// we only want to format the schema, not the whole statement.
+		fmtCtx := tree.NewFmtCtx(tree.FmtSerializable)
+		schema.FormatBody(fmtCtx)
+		schemaSQL := fmtCtx.CloseAndGetString()
+
 		table := workload.Table{
-			Name:   schema.Table.String(),
-			Schema: tree.Serialize(schema),
+			Name:   string(schema.Table.ObjectName),
+			Schema: schemaSQL,
 		}
-		// workload expects the schema to be missing the CREATE TABLE "name", so
-		// drop everything before the first `(`.
-		table.Schema = table.Schema[strings.Index(table.Schema, `(`):]
 		tables = append(tables, table)
 	}
 	return tables
@@ -125,10 +129,6 @@ func (g *sqlSmith) Ops(
 	if err := g.validateErrorSetting(); err != nil {
 		return workload.QueryLoad{}, err
 	}
-	sqlDatabase, err := workload.SanitizeUrls(g, g.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	db, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -137,9 +137,9 @@ func (g *sqlSmith) Ops(
 	db.SetMaxOpenConns(g.connFlags.Concurrency + 1)
 	db.SetMaxIdleConns(g.connFlags.Concurrency + 1)
 
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
+	ql := workload.QueryLoad{}
 	for i := 0; i < g.connFlags.Concurrency; i++ {
-		rng := rand.New(rand.NewSource(g.seed + int64(i)))
+		rng := rand.New(rand.NewSource(RandomSeed.Seed() + int64(i)))
 		smither, err := sqlsmith.NewSmither(db, rng)
 		if err != nil {
 			return workload.QueryLoad{}, err

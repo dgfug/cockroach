@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package nstree
 
@@ -31,16 +26,25 @@ func (t byIDMap) get(id descpb.ID) catalog.NameEntry {
 }
 
 func (t byIDMap) delete(id descpb.ID) (removed catalog.NameEntry) {
-	removed, _ = delete(t.t, byIDItem{id: id}.get()).(catalog.NameEntry)
+	removed, _ = remove(t.t, byIDItem{id: id}.get()).(catalog.NameEntry)
 	return removed
 }
 
 func (t byIDMap) clear() {
 	clear(t.t)
+	btreeSyncPool.Put(t.t)
 }
 
 func (t byIDMap) ascend(f EntryIterator) error {
 	return ascend(t.t, func(k interface{}) error {
 		return f(k.(catalog.NameEntry))
 	})
+}
+
+func (t byIDMap) initialized() bool {
+	return t != byIDMap{}
+}
+
+func makeByIDMap() byIDMap {
+	return byIDMap{t: btreeSyncPool.Get().(*btree.BTree)}
 }

@@ -7,13 +7,8 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -23,11 +18,12 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	"strings"
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
 )
@@ -92,11 +88,9 @@ func LocaleNamesAreEqual(a, b string) bool {
 // If the skipHexPrefix argument is set, the hexadecimal encoding does not
 // prefix the output with "\x". This is suitable e.g. for the encode()
 // built-in.
-func EncodeByteArrayToRawBytes(
-	data string, be sessiondatapb.BytesEncodeFormat, skipHexPrefix bool,
-) string {
+func EncodeByteArrayToRawBytes(data string, be BytesEncodeFormat, skipHexPrefix bool) string {
 	switch be {
-	case sessiondatapb.BytesEncodeHex:
+	case BytesEncodeHex:
 		head := 2
 		if skipHexPrefix {
 			head = 0
@@ -109,7 +103,7 @@ func EncodeByteArrayToRawBytes(
 		hex.Encode(res[head:], []byte(data))
 		return string(res)
 
-	case sessiondatapb.BytesEncodeEscape:
+	case BytesEncodeEscape:
 		// PostgreSQL does not allow all the escapes formats recognized by
 		// CockroachDB's scanner. It only recognizes octal and \\ for the
 		// backslash itself.
@@ -131,7 +125,7 @@ func EncodeByteArrayToRawBytes(
 		}
 		return string(res)
 
-	case sessiondatapb.BytesEncodeBase64:
+	case BytesEncodeBase64:
 		return base64.StdEncoding.EncodeToString([]byte(data))
 
 	default:
@@ -143,27 +137,38 @@ func EncodeByteArrayToRawBytes(
 // according to the encoding specification in "be".
 // When using the Hex format, the caller is responsible for skipping the
 // "\x" prefix, if any. See DecodeRawBytesToByteArrayAuto() below for
-// an alternative.
-func DecodeRawBytesToByteArray(data string, be sessiondatapb.BytesEncodeFormat) ([]byte, error) {
+// an alternative. If no conversion is necessary the input is returned,
+// callers should not assume a copy is made.
+func DecodeRawBytesToByteArray(data []byte, be BytesEncodeFormat) ([]byte, error) {
 	switch be {
-	case sessiondatapb.BytesEncodeHex:
-		return hex.DecodeString(data)
+	case BytesEncodeHex:
+		res := make([]byte, hex.DecodedLen(len(data)))
+		n, err := hex.Decode(res, data)
+		return res[:n], err
 
-	case sessiondatapb.BytesEncodeEscape:
+	case BytesEncodeEscape:
 		// PostgreSQL does not allow all the escapes formats recognized by
 		// CockroachDB's scanner. It only recognizes octal and \\ for the
 		// backslash itself.
 		// See https://www.postgresql.org/docs/current/static/datatype-binary.html#AEN5667
-		res := make([]byte, 0, len(data))
+		res := data
+		copied := false
 		for i := 0; i < len(data); i++ {
 			ch := data[i]
 			if ch != '\\' {
-				res = append(res, ch)
+				if copied {
+					res = append(res, ch)
+				}
 				continue
 			}
 			if i >= len(data)-1 {
 				return nil, pgerror.New(pgcode.InvalidEscapeSequence,
 					"bytea encoded value ends with escape character")
+			}
+			if !copied {
+				res = make([]byte, 0, len(data))
+				res = append(res, data[:i]...)
+				copied = true
 			}
 			if data[i+1] == '\\' {
 				res = append(res, '\\')
@@ -188,8 +193,10 @@ func DecodeRawBytesToByteArray(data string, be sessiondatapb.BytesEncodeFormat) 
 		}
 		return res, nil
 
-	case sessiondatapb.BytesEncodeBase64:
-		return base64.StdEncoding.DecodeString(data)
+	case BytesEncodeBase64:
+		res := make([]byte, base64.StdEncoding.DecodedLen(len(data)))
+		n, err := base64.StdEncoding.Decode(res, data)
+		return res[:n], err
 
 	default:
 		return nil, errors.AssertionFailedf("unhandled format: %s", be)
@@ -201,7 +208,34 @@ func DecodeRawBytesToByteArray(data string, be sessiondatapb.BytesEncodeFormat) 
 // and escape.
 func DecodeRawBytesToByteArrayAuto(data []byte) ([]byte, error) {
 	if len(data) >= 2 && data[0] == '\\' && (data[1] == 'x' || data[1] == 'X') {
-		return DecodeRawBytesToByteArray(string(data[2:]), sessiondatapb.BytesEncodeHex)
+		return DecodeRawBytesToByteArray(data[2:], BytesEncodeHex)
 	}
-	return DecodeRawBytesToByteArray(string(data), sessiondatapb.BytesEncodeEscape)
+	return DecodeRawBytesToByteArray(data, BytesEncodeEscape)
+}
+
+func (f BytesEncodeFormat) String() string {
+	switch f {
+	case BytesEncodeHex:
+		return "hex"
+	case BytesEncodeEscape:
+		return "escape"
+	case BytesEncodeBase64:
+		return "base64"
+	default:
+		return fmt.Sprintf("invalid (%d)", f)
+	}
+}
+
+// BytesEncodeFormatFromString converts a string into a BytesEncodeFormat.
+func BytesEncodeFormatFromString(val string) (_ BytesEncodeFormat, ok bool) {
+	switch strings.ToUpper(val) {
+	case "HEX":
+		return BytesEncodeHex, true
+	case "ESCAPE":
+		return BytesEncodeEscape, true
+	case "BASE64":
+		return BytesEncodeBase64, true
+	default:
+		return -1, false
+	}
 }

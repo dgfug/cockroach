@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessionphase
 
@@ -59,9 +54,9 @@ const (
 	// have no execution, like SHOW TRANSACTION STATUS.
 	SessionQueryServiced
 
-	// SessionTransactionReceived is the SessionPhase when a transaction is
-	// received.
-	SessionTransactionReceived
+	// SessionTransactionStarted is the SessionPhase when a transaction is
+	// started.
+	SessionTransactionStarted
 
 	// SessionFirstStartExecTransaction is the SessionPhase when a transaction
 	// is started for the first time.
@@ -197,7 +192,7 @@ func (t *Times) GetTransactionRetryLatency() time.Duration {
 // GetTransactionServiceLatency returns the total time to service the
 // transaction.
 func (t *Times) GetTransactionServiceLatency() time.Duration {
-	return t.times[SessionEndExecTransaction].Sub(t.times[SessionTransactionReceived])
+	return t.times[SessionEndExecTransaction].Sub(t.times[SessionTransactionStarted])
 }
 
 // GetCommitLatency returns the total time spent for the transaction to
@@ -209,4 +204,50 @@ func (t *Times) GetCommitLatency() time.Duration {
 // GetSessionAge returns the age of the current session since initialization.
 func (t *Times) GetSessionAge() time.Duration {
 	return t.times[PlannerEndExecStmt].Sub(t.times[SessionInit])
+}
+
+// GetIdleLatency deduces the rough amount of time spent waiting for the client
+// while the transaction is open. (For implicit transactions, this value is 0.)
+func (t *Times) GetIdleLatency(previous *Times) time.Duration {
+	queryReceived := t.times[SessionQueryReceived]
+
+	previousQueryReceived := time.Time{}
+	previousQueryServiced := time.Time{}
+	if previous != nil {
+		previousQueryReceived = previous.times[SessionQueryReceived]
+		previousQueryServiced = previous.times[SessionQueryServiced]
+	}
+
+	// If we were received at the same time as the previous execution
+	// (i.e., as part of a compound statement), we didn't have to wait
+	// for the client at all.
+	if queryReceived == previousQueryReceived {
+		return 0
+	}
+
+	// In general, we have been waiting for the client since the end
+	// of the previous execution.
+	waitingSince := previousQueryServiced
+
+	transactionStarted := t.times[SessionTransactionStarted]
+	// Transaction started is not set. Assume it's an implicit
+	// transaction so there is no idle time.
+	if transactionStarted.IsZero() {
+		return 0
+	}
+
+	// Although we really only want to measure idle latency *within*
+	// an open transaction. So if we're in a new transaction, measure
+	// from its start time instead.
+	if transactionStarted.After(waitingSince) {
+		waitingSince = transactionStarted
+	}
+
+	// And if we were received before we started waiting for the client,
+	// then there is no idle latency at all.
+	if waitingSince.After(queryReceived) {
+		return 0
+	}
+
+	return queryReceived.Sub(waitingSince)
 }

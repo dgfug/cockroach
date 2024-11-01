@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package ui embeds the assets for the web UI into the Cockroach binary.
 //
@@ -19,20 +14,45 @@ package ui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"net/http"
+	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
+
+const (
+	utc int64 = iota
+	americaNewYork
+)
+
+var _ = settings.RegisterEnumSetting(
+	settings.ApplicationLevel,
+	"ui.display_timezone",
+	"the timezone used to format timestamps in the ui",
+	"Etc/UTC",
+	map[int64]string{
+		utc:            "Etc/UTC",
+		americaNewYork: "America/New_York",
+		// Adding new timezones?
+		// Add them to the allowlist of included timezones!
+		// See pkg/ui/workspaces/cluster-ui/webpack.config.js
+		// and pkg/ui/workspaces/db-console/webpack.config.js.
+	},
+	settings.WithPublic)
 
 // Assets is used for embedded JS assets required for UI.
 // In case the binary is built without UI, it provides single index.html file with
-// the same content as indexHTMLTemplate as a fallback.
+// the same content as indexHTML as a fallback.
 var Assets fs.FS
 
 // HaveUI tells whether the admin UI has been linked into the binary.
@@ -42,7 +62,7 @@ var HaveUI = false
 // which includes the UI JavaScript bundles, plus a script tag which sets the
 // currently logged in user so that the UI JavaScript can decide whether to show
 // a login page.
-var indexHTMLTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE html>
+var indexHTML = []byte(`<!DOCTYPE html>
 <html>
 	<head>
 		<title>Cockroach Console</title>
@@ -51,28 +71,28 @@ var indexHTMLTemplate = template.Must(template.New("index").Parse(`<!DOCTYPE htm
 	</head>
 	<body>
 		<div id="react-layout"></div>
-
-		<script>
-			window.dataFromServer = {{.}};
-		</script>
-
-		<script src="protos.dll.js" type="text/javascript"></script>
-		<script src="vendor.dll.js" type="text/javascript"></script>
 		<script src="bundle.js" type="text/javascript"></script>
 	</body>
 </html>
-`))
+`)
 
 type indexHTMLArgs struct {
-	ExperimentalUseLogin bool
-	LoginEnabled         bool
-	LoggedInUser         *string
-	Tag                  string
-	Version              string
-	NodeID               string
-	OIDCAutoLogin        bool
-	OIDCLoginEnabled     bool
-	OIDCButtonText       string
+	// Insecure means disable auth entirely - anyone can use.
+	Insecure         bool
+	LoggedInUser     *string
+	Tag              string
+	Version          string
+	NodeID           string
+	OIDCAutoLogin    bool
+	OIDCLoginEnabled bool
+	OIDCButtonText   string
+	FeatureFlags     serverpb.FeatureFlags
+
+	OIDCGenerateJWTAuthTokenEnabled bool
+
+	LicenseType               string
+	SecondsUntilLicenseExpiry int64
+	IsManaged                 bool
 }
 
 // OIDCUIConf is a variable that stores data required by the
@@ -83,6 +103,8 @@ type OIDCUIConf struct {
 	ButtonText string
 	AutoLogin  bool
 	Enabled    bool
+
+	GenerateJWTAuthTokenEnabled bool
 }
 
 // OIDCUI is an interface that our OIDC configuration must implement in order to be able
@@ -103,47 +125,100 @@ Binary built without web UI.
 
 // Config contains the configuration parameters for Handler.
 type Config struct {
-	ExperimentalUseLogin bool
-	LoginEnabled         bool
-	NodeID               *base.NodeIDContainer
-	GetUser              func(ctx context.Context) *string
-	OIDC                 OIDCUI
+	Insecure bool
+	NodeID   *base.NodeIDContainer
+	GetUser  func(ctx context.Context) *string
+	OIDC     OIDCUI
+	Flags    serverpb.FeatureFlags
+	Settings *cluster.Settings
 }
+
+var uiConfigPath = regexp.MustCompile("^/uiconfig$")
 
 // Handler returns an http.Handler that serves the UI,
 // including index.html, which has some login-related variables
 // templated into it, as well as static assets.
 func Handler(cfg Config) http.Handler {
-	fileServer := http.FileServer(http.FS(Assets))
+	// etags is used to provide a unique per-file checksum for each served file,
+	// which enables client-side caching using Cache-Control and ETag headers.
+	etags := make(map[string]string)
+
+	if HaveUI && Assets != nil {
+		// Only compute hashes for UI-enabled builds
+		err := httputil.ComputeEtags(Assets, etags)
+		if err != nil {
+			log.Errorf(context.Background(), "Unable to compute asset hashes: %+v", err)
+		}
+	}
+
+	fileHandlerChain := httputil.EtagHandler(
+		etags,
+		http.FileServer(
+			http.FS(Assets),
+		),
+	)
 	buildInfo := build.GetInfo()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		licenseType, err := base.LicenseType(cfg.Settings)
+		if err != nil {
+			log.Errorf(context.Background(), "unable to get license type: %+v", err)
+		}
+		licenseTTL := base.GetLicenseTTL(r.Context(), cfg.Settings, timeutil.DefaultTimeSource{})
+		oidcConf := cfg.OIDC.GetOIDCConf()
+		major, minor := build.BranchReleaseSeries()
+		args := indexHTMLArgs{
+			Insecure:         cfg.Insecure,
+			LoggedInUser:     cfg.GetUser(r.Context()),
+			Tag:              buildInfo.Tag,
+			Version:          fmt.Sprintf("v%d.%d", major, minor),
+			OIDCAutoLogin:    oidcConf.AutoLogin,
+			OIDCLoginEnabled: oidcConf.Enabled,
+			OIDCButtonText:   oidcConf.ButtonText,
+			FeatureFlags:     cfg.Flags,
+
+			OIDCGenerateJWTAuthTokenEnabled: oidcConf.GenerateJWTAuthTokenEnabled,
+
+			LicenseType:               licenseType,
+			SecondsUntilLicenseExpiry: licenseTTL,
+			// log.RedactionPolicyManaged is set to true only when cluster is running under
+			// managed service control.
+			IsManaged: log.RedactionPolicyManaged,
+		}
+		if cfg.NodeID != nil {
+			args.NodeID = cfg.NodeID.String()
+		}
+		if uiConfigPath.MatchString(r.URL.Path) {
+			argBytes, err := json.Marshal(args)
+			if err != nil {
+				log.Errorf(r.Context(), "unable to deserialize ui config args: %v", err)
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			_, err = w.Write(argBytes)
+			if err != nil {
+				log.Errorf(r.Context(), "unable to write ui config args: %v", err)
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			return
+		}
+
+		if r.Header.Get("Crdb-Development") != "" {
+			http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
+			return
+		}
+
 		if !HaveUI {
 			http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(bareIndexHTML))
 			return
 		}
 
 		if r.URL.Path != "/" {
-			fileServer.ServeHTTP(w, r)
+			fileHandlerChain.ServeHTTP(w, r)
 			return
 		}
 
-		oidcConf := cfg.OIDC.GetOIDCConf()
-
-		if err := indexHTMLTemplate.Execute(w, indexHTMLArgs{
-			ExperimentalUseLogin: cfg.ExperimentalUseLogin,
-			LoginEnabled:         cfg.LoginEnabled,
-			LoggedInUser:         cfg.GetUser(r.Context()),
-			Tag:                  buildInfo.Tag,
-			Version:              build.BinaryVersionPrefix(),
-			NodeID:               cfg.NodeID.String(),
-			OIDCAutoLogin:        oidcConf.AutoLogin,
-			OIDCLoginEnabled:     oidcConf.Enabled,
-			OIDCButtonText:       oidcConf.ButtonText,
-		}); err != nil {
-			err = errors.Wrap(err, "templating index.html")
-			http.Error(w, err.Error(), 500)
-			log.Errorf(r.Context(), "%v", err)
-		}
+		http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
 	})
 }

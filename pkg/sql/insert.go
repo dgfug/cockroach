@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,9 +11,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/errors"
 )
 
 var insertNodePool = sync.Pool{
@@ -82,6 +84,73 @@ type insertRun struct {
 
 	// traceKV caches the current KV tracing flag.
 	traceKV bool
+
+	// regionLocalInfo handles erroring out the INSERT when the
+	// enforce_home_region setting is on.
+	regionLocalInfo regionLocalInfoType
+}
+
+// regionLocalInfoType contains common items needed for determining the home region
+// of an insert or update operation.
+type regionLocalInfoType struct {
+
+	// regionMustBeLocalColID indicates the id of the column which must use a
+	// home region matching the gateway region in a REGIONAL BY ROW table.
+	regionMustBeLocalColID descpb.ColumnID
+
+	// gatewayRegion is the string representation of the gateway region when
+	// regionMustBeLocalColID is non-zero.
+	gatewayRegion string
+
+	// colIDtoRowIndex is the map to use to decode regionMustBeLocalColID into
+	// an index into the Datums slice corresponding with the crdb_region column.
+	colIDtoRowIndex catalog.TableColMap
+}
+
+// setupEnforceHomeRegion sets regionMustBeLocalColID and the gatewayRegion name
+// if we're enforcing a home region for this insert run. The colIDtoRowIndex map
+// to use to when translating column id to row index is also set up.
+func (r *regionLocalInfoType) setupEnforceHomeRegion(
+	p *planner, table cat.Table, cols []catalog.Column, colIDtoRowIndex catalog.TableColMap,
+) {
+	if p.EnforceHomeRegion() {
+		if gatewayRegion, ok := p.EvalContext().Locality.Find("region"); ok {
+			if homeRegionColName, ok := table.HomeRegionColName(); ok {
+				for _, col := range cols {
+					if col.ColName() == tree.Name(homeRegionColName) {
+						r.regionMustBeLocalColID = col.GetID()
+						r.gatewayRegion = gatewayRegion
+						r.colIDtoRowIndex = colIDtoRowIndex
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+// checkHomeRegion errors out the insert or update if the enforce_home_region session setting is on and
+// the row's locality doesn't match the gateway region.
+func (r *regionLocalInfoType) checkHomeRegion(row tree.Datums) error {
+	if r.regionMustBeLocalColID != 0 {
+		if regionColIdx, ok := r.colIDtoRowIndex.Get(r.regionMustBeLocalColID); ok {
+			if regionEnum, regionColIsEnum := row[regionColIdx].(*tree.DEnum); regionColIsEnum {
+				if regionEnum.LogicalRep != r.gatewayRegion {
+					return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+						`Query has no home region. Try running the query from region '%s'. %s`,
+						regionEnum.LogicalRep,
+						sqlerrors.EnforceHomeRegionFurtherInfo,
+					)
+				}
+			} else {
+				return errors.AssertionFailedf(
+					`expected REGIONAL BY ROW AS column id %d to be an enum but found: %v`,
+					r.regionMustBeLocalColID, row[regionColIdx].ResolvedType(),
+				)
+			}
+		}
+	}
+	return nil
 }
 
 func (r *insertRun) initRowContainer(params runParams, columns colinfo.ResultColumns) {
@@ -89,7 +158,7 @@ func (r *insertRun) initRowContainer(params runParams, columns colinfo.ResultCol
 		return
 	}
 	r.ti.rows = rowcontainer.NewRowContainer(
-		params.EvalContext().Mon.MakeBoundAccount(),
+		params.p.Mon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(columns),
 	)
 
@@ -123,7 +192,8 @@ func (r *insertRun) initRowContainer(params runParams, columns colinfo.ResultCol
 // processSourceRow processes one row from the source for insertion and, if
 // result rows are needed, saves it in the result row container.
 func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) error {
-	if err := enforceLocalColumnConstraints(rowVals, r.insertCols, false /* isUpdate */); err != nil {
+	insertVals := rowVals[:len(r.insertCols)]
+	if err := enforceNotNullConstraints(insertVals, r.insertCols); err != nil {
 		return err
 	}
 
@@ -135,35 +205,39 @@ func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) erro
 		offset := len(r.insertCols) + r.checkOrds.Len()
 		partialIndexPutVals := rowVals[offset : offset+n]
 
-		err := pm.Init(partialIndexPutVals, tree.Datums{}, r.ti.tableDesc())
+		err := pm.Init(partialIndexPutVals, nil /* partialIndexDelVals */, r.ti.tableDesc())
 		if err != nil {
 			return err
 		}
-
-		// Truncate rowVals so that it no longer includes partial index predicate
-		// values.
-		rowVals = rowVals[:len(r.insertCols)+r.checkOrds.Len()]
 	}
 
 	// Verify the CHECK constraint results, if any.
-	if !r.checkOrds.Empty() {
-		checkVals := rowVals[len(r.insertCols):]
+	if n := r.checkOrds.Len(); n > 0 {
+		// CHECK constraint results are after the insert columns.
+		offset := len(r.insertCols)
+		checkVals := rowVals[offset : offset+n]
 		if err := checkMutationInput(
-			params.ctx, &params.p.semaCtx, params.p.SessionData(), r.ti.tableDesc(), r.checkOrds, checkVals,
+			params.ctx, params.p.EvalContext(), &params.p.semaCtx, params.p.SessionData(),
+			r.ti.tableDesc(), r.checkOrds, checkVals,
 		); err != nil {
 			return err
 		}
-		rowVals = rowVals[:len(r.insertCols)]
+	}
+
+	// Error out the insert if the enforce_home_region session setting is on and
+	// the row's locality doesn't match the gateway region.
+	if err := r.regionLocalInfo.checkHomeRegion(insertVals); err != nil {
+		return err
 	}
 
 	// Queue the insert in the KV batch.
-	if err := r.ti.row(params.ctx, rowVals, pm, r.traceKV); err != nil {
+	if err := r.ti.row(params.ctx, insertVals, pm, r.traceKV); err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
 	if r.ti.rows != nil {
-		for i, val := range rowVals {
+		for i, val := range insertVals {
 			// The downstream consumer will want the rows in the order of
 			// the table descriptor, not that of insertCols. Reorder them
 			// and ignore non-public columns.
@@ -188,7 +262,7 @@ func (n *insertNode) startExec(params runParams) error {
 
 	n.run.initRowContainer(params, n.columns)
 
-	return n.run.ti.init(params.ctx, params.p.txn, params.EvalContext(), &params.EvalContext().Settings.SV)
+	return n.run.ti.init(params.ctx, params.p.txn, params.EvalContext())
 }
 
 // Next is required because batchedPlanNode inherits from planNode, but
@@ -230,6 +304,13 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 				return false, err
 			}
 			break
+		}
+
+		if buildutil.CrdbTestBuild {
+			// This testing knob allows us to suspend execution to force a race condition.
+			if fn := params.ExecCfg().TestingKnobs.AfterArbiterRead; fn != nil {
+				fn()
+			}
 		}
 
 		// Process the insertion for the current source row, potentially
